@@ -579,6 +579,35 @@ fn versions_are_parsed_and_pinned() -> TestResult {
     assert_eq!(error.code(), SidecarErrorCode::UnsupportedVersion);
     assert!(!error.to_string().contains("2.0.0"));
 
+    let exact_layout = TestLayout::new()?;
+    let mut exact = fixture_command(&exact_layout, "strict-jsonl", "1.2.3");
+    exact.version_output = VersionOutputFormat::ExactPrefixedVersion {
+        prefix: "carl-sidecar-fixture",
+        version: "1.2.3",
+    };
+    assert_eq!(
+        run_async(detect_version(
+            &exact,
+            &exact_layout.data,
+            &exact_layout.workspace,
+        ))?,
+        Version::parse("1.2.3")?
+    );
+
+    let modified_layout = TestLayout::new()?;
+    let mut modified = fixture_command(&modified_layout, "strict-jsonl", "1.2.3+modified");
+    modified.version_output = VersionOutputFormat::ExactPrefixedVersion {
+        prefix: "carl-sidecar-fixture",
+        version: "1.2.3",
+    };
+    let error = run_async(detect_version(
+        &modified,
+        &modified_layout.data,
+        &modified_layout.workspace,
+    ))
+    .expect_err("an exact version format must reject build metadata");
+    assert_eq!(error.code(), SidecarErrorCode::UnsupportedVersion);
+
     let malformed_layout = TestLayout::new()?;
     let malformed = fixture_command(&malformed_layout, "strict-jsonl", "not-a-version");
     let error = run_async(detect_version(

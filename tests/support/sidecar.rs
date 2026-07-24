@@ -182,6 +182,7 @@ pub fn dispatch_codex_auth_fixture(arguments: &[OsString]) -> Option<i32> {
     if arguments == [OsString::from("--version")] {
         match scenario {
             "unsupported-version" => println!("codex-cli 0.135.0"),
+            "version-build-metadata" => println!("codex-cli 0.136.0+modified"),
             "version-wrong-prefix" => println!("codex 0.136.0"),
             "version-extra-token" => println!("codex-cli 0.136.0 stable"),
             "version-malformed" => println!("codex-cli release"),
@@ -213,6 +214,7 @@ fn codex_auth_jsonl_fixture(home: &Path, scenario: &str) -> i32 {
     let mut account_reads = 0_u64;
     let mut login_started = false;
     let mut cancel_raced = false;
+    let mut logged_out = false;
     for input in io::stdin().lock().lines() {
         let input = match input {
             Ok(input) => input,
@@ -342,8 +344,13 @@ fn codex_auth_jsonl_fixture(home: &Path, scenario: &str) -> i32 {
                     return 65;
                 }
                 account_reads = account_reads.saturating_add(1);
-                let account =
-                    codex_fixture_account(scenario, account_reads, login_started, cancel_raced);
+                let account = codex_fixture_account(
+                    scenario,
+                    account_reads,
+                    login_started,
+                    cancel_raced,
+                    logged_out,
+                );
                 let requires_openai_auth = scenario != "requires-openai-auth-false";
                 let mut result = serde_json::json!({
                     "account": account,
@@ -387,6 +394,9 @@ fn codex_auth_jsonl_fixture(home: &Path, scenario: &str) -> i32 {
                     }
                     continue;
                 }
+                if scenario == "start-response-timeout" {
+                    continue;
+                }
 
                 let login_type = object
                     .get("params")
@@ -402,7 +412,7 @@ fn codex_auth_jsonl_fixture(home: &Path, scenario: &str) -> i32 {
                     "mixed-response-id" => serde_json::json!(id.to_string()),
                     _ => id,
                 };
-                let result = match login_type {
+                let mut result = match login_type {
                     "chatgpt" => serde_json::json!({
                         "type": "chatgpt",
                         "loginId": CODEX_LOGIN_ID,
@@ -416,6 +426,12 @@ fn codex_auth_jsonl_fixture(home: &Path, scenario: &str) -> i32 {
                     }),
                     _ => return 65,
                 };
+                if scenario == "start-missing-login-id" {
+                    result
+                        .as_object_mut()
+                        .expect("login fixture result is an object")
+                        .remove("loginId");
+                }
                 let response = match scenario {
                     "response-method-bearing" => serde_json::json!({
                         "id": response_id,
@@ -674,6 +690,38 @@ fn codex_auth_jsonl_fixture(home: &Path, scenario: &str) -> i32 {
                             return 74;
                         }
                     }
+                    "confirmation-timeout-then-reload" => {
+                        if write_login_completion(CODEX_LOGIN_ID, true).is_err() {
+                            return 74;
+                        }
+                    }
+                    "advisory-flood" => {
+                        for _ in 0..40 {
+                            if write_account_updated().is_err() {
+                                return 74;
+                            }
+                        }
+                    }
+                    "paced-advisory-flood" => {
+                        thread::spawn(|| {
+                            for _ in 0..80 {
+                                if write_account_updated().is_err() {
+                                    return;
+                                }
+                                thread::sleep(Duration::from_millis(2));
+                            }
+                        });
+                    }
+                    "completion-advisory-flood" => {
+                        if write_login_completion(CODEX_LOGIN_ID, true).is_err() {
+                            return 74;
+                        }
+                        for _ in 0..40 {
+                            if write_account_updated().is_err() {
+                                return 74;
+                            }
+                        }
+                    }
                     "child-exit" => return 0,
                     _ => {}
                 }
@@ -685,7 +733,7 @@ fn codex_auth_jsonl_fixture(home: &Path, scenario: &str) -> i32 {
                     return 65;
                 }
                 let status = match scenario {
-                    "cancel-not-found-success" => {
+                    "cancel-not-found-success" | "logout-pending-race" => {
                         cancel_raced = true;
                         if write_login_completion(CODEX_LOGIN_ID, true).is_err()
                             || write_account_updated().is_err()
@@ -719,6 +767,12 @@ fn codex_auth_jsonl_fixture(home: &Path, scenario: &str) -> i32 {
                 if object.len() != 2 {
                     return 65;
                 }
+                logged_out = true;
+                if scenario == "logout-pending-race"
+                    && write_login_completion(CODEX_LOGIN_ID, true).is_err()
+                {
+                    return 74;
+                }
                 if write_codex_message(&serde_json::json!({"id": id, "result": {}})).is_err() {
                     return 74;
                 }
@@ -734,7 +788,11 @@ fn codex_fixture_account(
     account_reads: u64,
     login_started: bool,
     cancel_raced: bool,
+    logged_out: bool,
 ) -> serde_json::Value {
+    if logged_out {
+        return serde_json::Value::Null;
+    }
     if let Some(plan) = scenario.strip_prefix("account-plan-") {
         return serde_json::json!({
             "type": "chatgpt",
@@ -748,7 +806,15 @@ fn codex_fixture_account(
         "account-unknown-type" => serde_json::json!({"type": "personalAccessToken"}),
         "stale-account-then-updated" if account_reads < 3 => serde_json::Value::Null,
         "confirmation-timeout" => serde_json::Value::Null,
+        "confirmation-timeout-then-reload" if account_reads <= 9 => serde_json::Value::Null,
         "cancel-not-found-success" if !cancel_raced => serde_json::Value::Null,
+        "logout-pending-race" if !cancel_raced => serde_json::Value::Null,
+        "cancel-canceled" | "cancel-canceled-late-success" => serde_json::Value::Null,
+        "cancel-canceled-preexisting" => serde_json::json!({
+            "type": "chatgpt",
+            "email": CODEX_SECRET_SENTINEL,
+            "planType": "plus",
+        }),
         _ if login_started => serde_json::json!({
             "type": "chatgpt",
             "email": CODEX_SECRET_SENTINEL,
@@ -869,6 +935,7 @@ fn record_codex_launch(home: &Path) -> io::Result<()> {
     let record = serde_json::json!({
         "cwd": cwd,
         "environment": environment,
+        "processId": process::id(),
     });
     let mut options = OpenOptions::new();
     options.create_new(true).write(true);

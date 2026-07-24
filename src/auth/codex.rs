@@ -24,7 +24,7 @@ const MAX_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_LOGIN_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const MAX_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_CONFIRMATION_READS: usize = 8;
-const MAX_STALE_NOTIFICATIONS: usize = 16;
+const MAX_NOTIFICATIONS_PER_OPERATION: usize = 32;
 const CODEX_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const CODEX_OAUTH_SCOPE: &str =
     "openid profile email offline_access api.connectors.read api.connectors.invoke";
@@ -118,6 +118,70 @@ struct TerminalRecord {
     success: bool,
 }
 
+#[derive(Clone, Copy)]
+enum LoginLifecycle {
+    Idle,
+    AwaitingCompletion(PendingLogin),
+    CompletedAwaitingReload(LoginId),
+}
+
+impl LoginLifecycle {
+    fn login_id(self) -> Option<LoginId> {
+        match self {
+            Self::Idle => None,
+            Self::AwaitingCompletion(pending) => Some(pending.id),
+            Self::CompletedAwaitingReload(id) => Some(id),
+        }
+    }
+}
+
+struct NotificationOperation {
+    deadline: Instant,
+    consumed: usize,
+}
+
+impl NotificationOperation {
+    fn for_duration(duration: Duration) -> Result<Self, AuthError> {
+        Ok(Self {
+            deadline: Instant::now()
+                .checked_add(duration)
+                .ok_or_else(protocol_mismatch)?,
+            consumed: 0,
+        })
+    }
+
+    fn with_deadline(deadline: Instant) -> Self {
+        Self {
+            deadline,
+            consumed: 0,
+        }
+    }
+
+    fn reset_deadline(&mut self, duration: Duration) -> Result<(), AuthError> {
+        self.deadline = Instant::now()
+            .checked_add(duration)
+            .ok_or_else(protocol_mismatch)?;
+        Ok(())
+    }
+
+    fn check_deadline(&self) -> Result<(), AuthError> {
+        remaining(self.deadline).map(|_| ())
+    }
+
+    fn remaining(&self) -> Result<Duration, AuthError> {
+        remaining(self.deadline)
+    }
+
+    fn consume_notification(&mut self) -> Result<(), AuthError> {
+        self.check_deadline()?;
+        self.consumed = self.consumed.checked_add(1).ok_or_else(protocol_mismatch)?;
+        if self.consumed > MAX_NOTIFICATIONS_PER_OPERATION {
+            return Err(protocol_mismatch());
+        }
+        Ok(())
+    }
+}
+
 enum Notification {
     LoginCompleted { id: Option<LoginId>, success: bool },
     AccountUpdated,
@@ -137,8 +201,9 @@ pub struct CodexAuth {
     timeouts: CodexAuthTimeouts,
     next_request_id: i64,
     cached_state: AuthState,
-    pending: Option<PendingLogin>,
+    lifecycle: LoginLifecycle,
     terminal: Option<TerminalRecord>,
+    poisoned: bool,
 }
 
 impl fmt::Debug for CodexAuth {
@@ -147,7 +212,8 @@ impl fmt::Debug for CodexAuth {
             .debug_struct("CodexAuth")
             .field("service", &SubscriptionService::OpenAiCodex)
             .field("cached_state", &self.cached_state)
-            .field("pending", &self.pending.is_some())
+            .field("pending", &!matches!(self.lifecycle, LoginLifecycle::Idle))
+            .field("poisoned", &self.poisoned)
             .finish_non_exhaustive()
     }
 }
@@ -174,7 +240,10 @@ impl CodexAuth {
                 OsString::from("stdio://"),
             ],
             version_arguments: vec![OsString::from("--version")],
-            version_output: VersionOutputFormat::ExactPrefix("codex-cli"),
+            version_output: VersionOutputFormat::ExactPrefixedVersion {
+                prefix: "codex-cli",
+                version: "0.136.0",
+            },
             // `spawn_in_home` uses the held capability instead of reopening this path.
             isolated_home: PathBuf::new(),
             supported_versions: VersionReq::parse(CODEX_VERSION)
@@ -196,8 +265,9 @@ impl CodexAuth {
             timeouts,
             next_request_id: 0,
             cached_state: AuthState::SignedOut,
-            pending: None,
+            lifecycle: LoginLifecycle::Idle,
             terminal: None,
+            poisoned: false,
         };
         auth.initialize().await?;
         auth.cached_state = auth.read_account_until(None).await?;
@@ -241,15 +311,14 @@ impl CodexAuth {
             .notify(json!({"method": "initialized"}))
             .map_err(map_sidecar_error)?;
 
-        let deadline = Instant::now()
-            .checked_add(self.timeouts.request)
-            .ok_or_else(protocol_mismatch)?;
+        let mut operation = NotificationOperation::for_duration(self.timeouts.request)?;
         loop {
-            let wait = remaining(deadline)?;
+            let wait = operation.remaining()?;
             let notification = tokio::time::timeout(wait, self.sidecar.next_notification())
                 .await
                 .map_err(|_| timed_out())?
                 .map_err(map_sidecar_error)?;
+            operation.consume_notification()?;
             match parse_notification(notification)? {
                 Notification::ConfigWarning => {}
                 Notification::RemoteControlStatus => return Ok(()),
@@ -301,7 +370,8 @@ impl CodexAuth {
     }
 
     async fn start_login_inner(&mut self, method: AuthMethod) -> Result<LoginChallenge, AuthError> {
-        if self.pending.is_some() {
+        self.ensure_usable()?;
+        if !matches!(self.lifecycle, LoginLifecycle::Idle) {
             return Err(AuthError::from_code(AuthErrorCode::ProviderRejected));
         }
         let login_type = match method {
@@ -311,33 +381,72 @@ impl CodexAuth {
                 return Err(AuthError::from_code(AuthErrorCode::ProviderRejected));
             }
         };
-        let result = self
+        let result = match self
             .request_result(
                 "account/login/start",
                 Some(json!({"type": login_type})),
                 None,
             )
-            .await?;
-        let (id, challenge) = parse_login_challenge(result, method)?;
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                self.stop_and_poison().await;
+                return Err(error);
+            }
+        };
+        let recoverable_id = recover_login_id(&result);
+        let (id, challenge) = match parse_login_challenge(result, method) {
+            Ok(challenge) => challenge,
+            Err(error) => {
+                let canceled = if let Some(id) = recoverable_id {
+                    self.cancel_failed_start(id).await.is_ok()
+                } else {
+                    false
+                };
+                if !canceled {
+                    self.stop_and_poison().await;
+                }
+                return Err(error);
+            }
+        };
         let deadline = Instant::now()
             .checked_add(self.timeouts.login)
             .ok_or_else(protocol_mismatch)?;
-        self.pending = Some(PendingLogin { id, deadline });
+        self.lifecycle = LoginLifecycle::AwaitingCompletion(PendingLogin { id, deadline });
         self.terminal = None;
         self.cached_state = AuthState::Pending;
         Ok(challenge)
     }
 
     async fn query_state(&mut self) -> Result<AuthState, AuthError> {
-        let Some(pending) = self.pending else {
-            self.drain_idle_notifications().await?;
-            let state = self.read_account_until(None).await?;
-            self.cached_state = state;
-            return Ok(state);
-        };
+        self.ensure_usable()?;
+        match self.lifecycle {
+            LoginLifecycle::Idle => {
+                let mut operation = NotificationOperation::for_duration(self.timeouts.request)?;
+                self.drain_idle_notifications(&mut operation).await?;
+                let state = self.read_account_until(Some(operation.deadline)).await?;
+                self.cached_state = state;
+                Ok(state)
+            }
+            LoginLifecycle::CompletedAwaitingReload(id) => {
+                let mut operation =
+                    NotificationOperation::for_duration(self.timeouts.confirmation)?;
+                self.confirm_login(id, &mut operation).await
+            }
+            LoginLifecycle::AwaitingCompletion(pending) => {
+                self.await_login_completion(pending).await
+            }
+        }
+    }
 
-        let mut stale = 0_usize;
+    async fn await_login_completion(
+        &mut self,
+        pending: PendingLogin,
+    ) -> Result<AuthState, AuthError> {
+        let mut operation = NotificationOperation::with_deadline(pending.deadline);
         loop {
+            operation.check_deadline()?;
             let notification = if let Some(notification) = self
                 .sidecar
                 .try_next_notification()
@@ -346,26 +455,23 @@ impl CodexAuth {
             {
                 parse_notification(notification)?
             } else {
-                let wait = remaining(pending.deadline)?;
+                let wait = operation.remaining()?;
                 let notification = tokio::time::timeout(wait, self.sidecar.next_notification())
                     .await
                     .map_err(|_| timed_out())?
                     .map_err(map_sidecar_error)?;
                 parse_notification(notification)?
             };
+            operation.consume_notification()?;
             match notification {
                 Notification::AccountUpdated
                 | Notification::ConfigWarning
                 | Notification::RemoteControlStatus => {}
-                Notification::LoginCompleted { id: None, .. } => {
-                    count_stale(&mut stale)?;
-                }
+                Notification::LoginCompleted { id: None, .. } => {}
                 Notification::LoginCompleted {
                     id: Some(id),
                     success: _,
-                } if id != pending.id => {
-                    count_stale(&mut stale)?;
-                }
+                } if id != pending.id => {}
                 Notification::LoginCompleted {
                     id: Some(id),
                     success,
@@ -373,11 +479,13 @@ impl CodexAuth {
                     let record = TerminalRecord { id, success };
                     self.record_terminal(record)?;
                     if !record.success {
-                        self.pending = None;
+                        self.lifecycle = LoginLifecycle::Idle;
                         self.cached_state = AuthState::SignedOut;
                         return Err(AuthError::from_code(AuthErrorCode::ProviderRejected));
                     }
-                    return self.confirm_login(pending, stale).await;
+                    self.lifecycle = LoginLifecycle::CompletedAwaitingReload(id);
+                    operation.reset_deadline(self.timeouts.confirmation)?;
+                    return self.confirm_login(id, &mut operation).await;
                 }
             }
         }
@@ -385,42 +493,39 @@ impl CodexAuth {
 
     async fn confirm_login(
         &mut self,
-        pending: PendingLogin,
-        mut stale: usize,
+        login_id: LoginId,
+        operation: &mut NotificationOperation,
     ) -> Result<AuthState, AuthError> {
-        let deadline = Instant::now()
-            .checked_add(self.timeouts.confirmation)
-            .ok_or_else(protocol_mismatch)?;
         for _ in 0..MAX_CONFIRMATION_READS {
-            let state = self.read_account_until(Some(deadline)).await?;
+            operation.check_deadline()?;
+            let state = self.read_account_until(Some(operation.deadline)).await?;
             if matches!(state, AuthState::SignedIn { .. }) {
-                self.drain_confirmation_notifications(pending.id, &mut stale)
+                self.drain_confirmation_notifications(login_id, operation)
                     .await?;
-                self.pending = None;
+                self.lifecycle = LoginLifecycle::Idle;
                 self.cached_state = state;
                 return Ok(state);
             }
 
-            let wait = bounded_wait(self.timeouts.retry_interval, Some(deadline))?;
+            let wait = bounded_wait(self.timeouts.retry_interval, Some(operation.deadline))?;
             match tokio::time::timeout(wait, self.sidecar.next_notification()).await {
-                Ok(Ok(notification)) => match parse_notification(notification)? {
-                    Notification::AccountUpdated
-                    | Notification::ConfigWarning
-                    | Notification::RemoteControlStatus => {}
-                    Notification::LoginCompleted { id: None, .. } => {
-                        count_stale(&mut stale)?;
+                Ok(Ok(notification)) => {
+                    operation.consume_notification()?;
+                    match parse_notification(notification)? {
+                        Notification::AccountUpdated
+                        | Notification::ConfigWarning
+                        | Notification::RemoteControlStatus => {}
+                        Notification::LoginCompleted { id: None, .. } => {}
+                        Notification::LoginCompleted {
+                            id: Some(id),
+                            success: _,
+                        } if id != login_id => {}
+                        Notification::LoginCompleted {
+                            id: Some(id),
+                            success,
+                        } => self.record_terminal(TerminalRecord { id, success })?,
                     }
-                    Notification::LoginCompleted {
-                        id: Some(id),
-                        success: _,
-                    } if id != pending.id => {
-                        count_stale(&mut stale)?;
-                    }
-                    Notification::LoginCompleted {
-                        id: Some(id),
-                        success,
-                    } => self.record_terminal(TerminalRecord { id, success })?,
-                },
+                }
                 Ok(Err(error)) => return Err(map_sidecar_error(error)),
                 Err(_) => {}
             }
@@ -430,52 +535,57 @@ impl CodexAuth {
 
     async fn drain_confirmation_notifications(
         &mut self,
-        pending: LoginId,
-        stale: &mut usize,
+        login_id: LoginId,
+        operation: &mut NotificationOperation,
     ) -> Result<(), AuthError> {
-        while let Some(notification) = self
-            .sidecar
-            .try_next_notification()
-            .await
-            .map_err(map_sidecar_error)?
-        {
+        loop {
+            operation.check_deadline()?;
+            let Some(notification) = self
+                .sidecar
+                .try_next_notification()
+                .await
+                .map_err(map_sidecar_error)?
+            else {
+                return Ok(());
+            };
+            operation.consume_notification()?;
             match parse_notification(notification)? {
                 Notification::AccountUpdated
                 | Notification::ConfigWarning
                 | Notification::RemoteControlStatus => {}
-                Notification::LoginCompleted { id: None, .. } => {
-                    count_stale(stale)?;
-                }
+                Notification::LoginCompleted { id: None, .. } => {}
                 Notification::LoginCompleted {
                     id: Some(id),
                     success: _,
-                } if id != pending => {
-                    count_stale(stale)?;
-                }
+                } if id != login_id => {}
                 Notification::LoginCompleted {
                     id: Some(id),
                     success,
                 } => self.record_terminal(TerminalRecord { id, success })?,
             }
         }
-        Ok(())
     }
 
-    async fn drain_idle_notifications(&mut self) -> Result<(), AuthError> {
-        let mut stale = 0_usize;
-        while let Some(notification) = self
-            .sidecar
-            .try_next_notification()
-            .await
-            .map_err(map_sidecar_error)?
-        {
+    async fn drain_idle_notifications(
+        &mut self,
+        operation: &mut NotificationOperation,
+    ) -> Result<(), AuthError> {
+        loop {
+            operation.check_deadline()?;
+            let Some(notification) = self
+                .sidecar
+                .try_next_notification()
+                .await
+                .map_err(map_sidecar_error)?
+            else {
+                return Ok(());
+            };
+            operation.consume_notification()?;
             match parse_notification(notification)? {
                 Notification::AccountUpdated
                 | Notification::ConfigWarning
                 | Notification::RemoteControlStatus => {}
-                Notification::LoginCompleted { id: None, .. } => {
-                    count_stale(&mut stale)?;
-                }
+                Notification::LoginCompleted { id: None, .. } => {}
                 Notification::LoginCompleted {
                     id: Some(id),
                     success,
@@ -485,13 +595,10 @@ impl CodexAuth {
                         && terminal.id == id
                     {
                         self.record_terminal(record)?;
-                    } else {
-                        count_stale(&mut stale)?;
                     }
                 }
             }
         }
-        Ok(())
     }
 
     fn record_terminal(&mut self, record: TerminalRecord) -> Result<(), AuthError> {
@@ -507,46 +614,80 @@ impl CodexAuth {
         Ok(())
     }
 
+    fn ensure_usable(&self) -> Result<(), AuthError> {
+        if self.poisoned {
+            return Err(AuthError::from_code(AuthErrorCode::SidecarExited));
+        }
+        Ok(())
+    }
+
+    async fn stop_and_poison(&mut self) {
+        self.poisoned = true;
+        self.lifecycle = LoginLifecycle::Idle;
+        self.terminal = None;
+        let _ = self.sidecar.cancel().await;
+    }
+
+    async fn cancel_failed_start(&mut self, login_id: LoginId) -> Result<(), AuthError> {
+        let result = self
+            .request_result(
+                "account/login/cancel",
+                Some(json!({"loginId": login_id.into_wire()})),
+                None,
+            )
+            .await?;
+        if parse_cancel_status(result)? != "canceled" {
+            return Err(protocol_mismatch());
+        }
+        Ok(())
+    }
+
     async fn cancel_login_inner(&mut self) -> Result<(), AuthError> {
-        let Some(pending) = self.pending else {
+        self.ensure_usable()?;
+        let Some(login_id) = self.lifecycle.login_id() else {
             return Ok(());
         };
         let result = self
             .request_result(
                 "account/login/cancel",
-                Some(json!({"loginId": pending.id.into_wire()})),
+                Some(json!({"loginId": login_id.into_wire()})),
                 None,
             )
             .await?;
-        let mut result = into_object(result)?;
-        if !has_exact_keys(&result, &["status"]) {
-            return Err(protocol_mismatch());
-        }
-        let status = take_string(&mut result, "status")?;
-        match status.as_str() {
+        match parse_cancel_status(result)?.as_str() {
             "canceled" => {
-                self.reconcile_canceled(pending.id).await?;
+                let mut operation =
+                    NotificationOperation::for_duration(self.timeouts.confirmation)?;
+                self.reconcile_canceled(login_id, &mut operation).await?;
                 self.record_terminal(TerminalRecord {
-                    id: pending.id,
+                    id: login_id,
                     success: false,
                 })?;
-                self.pending = None;
-                self.cached_state = AuthState::SignedOut;
+                self.lifecycle = LoginLifecycle::Idle;
+                self.cached_state = self.read_account_until(Some(operation.deadline)).await?;
                 Ok(())
             }
-            "notFound" => self.reconcile_not_found(pending).await,
+            "notFound" => self.reconcile_not_found(login_id).await,
             _ => Err(protocol_mismatch()),
         }
     }
 
-    async fn reconcile_canceled(&mut self, login_id: LoginId) -> Result<(), AuthError> {
-        let mut stale = 0_usize;
-        while let Some(notification) = self
-            .sidecar
-            .try_next_notification()
-            .await
-            .map_err(map_sidecar_error)?
-        {
+    async fn reconcile_canceled(
+        &mut self,
+        login_id: LoginId,
+        operation: &mut NotificationOperation,
+    ) -> Result<(), AuthError> {
+        loop {
+            operation.check_deadline()?;
+            let Some(notification) = self
+                .sidecar
+                .try_next_notification()
+                .await
+                .map_err(map_sidecar_error)?
+            else {
+                return Ok(());
+            };
+            operation.consume_notification()?;
             match parse_notification(notification)? {
                 Notification::AccountUpdated
                 | Notification::ConfigWarning
@@ -561,42 +702,56 @@ impl CodexAuth {
                         return Err(protocol_mismatch());
                     }
                 }
-                Notification::LoginCompleted { .. } => count_stale(&mut stale)?,
+                Notification::LoginCompleted { .. } => {}
             }
         }
-        Ok(())
     }
 
-    async fn reconcile_not_found(&mut self, pending: PendingLogin) -> Result<(), AuthError> {
-        let deadline = Instant::now()
-            .checked_add(self.timeouts.confirmation)
-            .ok_or_else(protocol_mismatch)?;
-        let mut stale = 0_usize;
-        self.drain_confirmation_notifications(pending.id, &mut stale)
+    async fn reconcile_not_found(&mut self, login_id: LoginId) -> Result<(), AuthError> {
+        let mut operation = NotificationOperation::for_duration(self.timeouts.confirmation)?;
+        self.drain_confirmation_notifications(login_id, &mut operation)
             .await?;
         if self
             .terminal
-            .is_some_and(|record| record.id == pending.id && record.success)
+            .is_some_and(|record| record.id == login_id && record.success)
         {
-            self.confirm_login(pending, stale).await?;
+            self.lifecycle = LoginLifecycle::CompletedAwaitingReload(login_id);
+            self.confirm_login(login_id, &mut operation).await?;
             return Ok(());
         }
 
-        let state = self.read_account_until(Some(deadline)).await?;
-        self.pending = None;
+        let state = self.read_account_until(Some(operation.deadline)).await?;
+        self.lifecycle = LoginLifecycle::Idle;
         self.cached_state = state;
         Ok(())
     }
 
     async fn logout_inner(&mut self) -> Result<(), AuthError> {
-        let result = self.request_result("account/logout", None, None).await?;
-        let result = into_object(result)?;
-        if !result.is_empty() {
-            return Err(protocol_mismatch());
+        self.ensure_usable()?;
+        let cancel_error = if self.lifecycle.login_id().is_some() {
+            self.cancel_login_inner().await.err()
+        } else {
+            None
+        };
+        let logout_result = self
+            .request_result("account/logout", None, None)
+            .await
+            .and_then(|result| {
+                if into_object(result)?.is_empty() {
+                    Ok(())
+                } else {
+                    Err(protocol_mismatch())
+                }
+            });
+        if logout_result.is_ok() {
+            self.lifecycle = LoginLifecycle::Idle;
+            self.terminal = None;
+            self.cached_state = AuthState::SignedOut;
         }
-        self.pending = None;
-        self.terminal = None;
-        self.cached_state = AuthState::SignedOut;
+        logout_result?;
+        if let Some(error) = cancel_error {
+            return Err(error);
+        }
         Ok(())
     }
 }
@@ -737,6 +892,22 @@ fn parse_login_challenge(
         }
         _ => Err(protocol_mismatch()),
     }
+}
+
+fn recover_login_id(result: &Value) -> Option<LoginId> {
+    result
+        .as_object()
+        .and_then(|result| result.get("loginId"))
+        .and_then(Value::as_str)
+        .and_then(|login_id| LoginId::parse(login_id).ok())
+}
+
+fn parse_cancel_status(result: Value) -> Result<String, AuthError> {
+    let mut result = into_object(result)?;
+    if !has_exact_keys(&result, &["status"]) {
+        return Err(protocol_mismatch());
+    }
+    take_string(&mut result, "status")
 }
 
 fn parse_notification(notification: Value) -> Result<Notification, AuthError> {
@@ -1025,14 +1196,6 @@ fn remaining(deadline: Instant) -> Result<Duration, AuthError> {
         .checked_duration_since(Instant::now())
         .filter(|remaining| !remaining.is_zero())
         .ok_or_else(timed_out)
-}
-
-fn count_stale(stale: &mut usize) -> Result<(), AuthError> {
-    *stale = stale.checked_add(1).ok_or_else(protocol_mismatch)?;
-    if *stale > MAX_STALE_NOTIFICATIONS {
-        return Err(protocol_mismatch());
-    }
-    Ok(())
 }
 
 fn map_sidecar_error(error: SidecarError) -> AuthError {

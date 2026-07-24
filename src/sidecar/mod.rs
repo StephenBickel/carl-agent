@@ -126,6 +126,12 @@ const ALLOWED_ENVIRONMENT: &[&str] = &[
 pub enum VersionOutputFormat {
     /// Accept exactly `<prefix> <semver>`, apart from surrounding ASCII whitespace.
     ExactPrefix(&'static str),
+    /// Accept exactly `<prefix> <version>`, including the version token's literal
+    /// spelling, apart from surrounding ASCII whitespace.
+    ExactPrefixedVersion {
+        prefix: &'static str,
+        version: &'static str,
+    },
     /// Accept output containing exactly one whitespace-delimited semantic-version token.
     SingleSemverToken,
 }
@@ -1257,6 +1263,26 @@ fn parse_version_output(
                 return Err(parse_error());
             }
             Version::parse(version).map_err(|_| parse_error())
+        }
+        VersionOutputFormat::ExactPrefixedVersion {
+            prefix,
+            version: expected,
+        } => {
+            let mut tokens = output.split_ascii_whitespace();
+            if tokens.next() != Some(prefix) {
+                return Err(parse_error());
+            }
+            let version = tokens.next().ok_or_else(parse_error)?;
+            if tokens.next().is_some() {
+                return Err(parse_error());
+            }
+            let parsed = Version::parse(version).map_err(|_| parse_error())?;
+            if version != expected {
+                return Err(SidecarError::from_code(
+                    SidecarErrorCode::UnsupportedVersion,
+                ));
+            }
+            Ok(parsed)
         }
         VersionOutputFormat::SingleSemverToken => {
             let mut versions = output.split_ascii_whitespace().filter_map(|token| {

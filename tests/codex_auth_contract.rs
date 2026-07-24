@@ -22,7 +22,7 @@ use libtest_mimic::{Arguments, Failed, Trial};
 use serde_json::{Value, json};
 use support::{
     CODEX_LOGIN_ID, CODEX_SECRET_SENTINEL, PATH_SENTINEL, SECRET_SENTINEL, TestLayout, TestResult,
-    dispatch_codex_auth_fixture, fixture_command, short_limits,
+    dispatch_codex_auth_fixture, fixture_command, short_limits, wait_until_processes_reaped,
 };
 
 fn main() {
@@ -85,6 +85,18 @@ fn main() {
         test(
             "account updated is advisory and confirmation retries are bounded",
             account_updated_is_advisory_and_retries_are_bounded,
+        ),
+        test(
+            "confirmation resumes after an AuthManager reload timeout",
+            confirmation_resumes_after_reload_timeout,
+        ),
+        test(
+            "notification floods cannot bypass operation bounds",
+            notification_floods_are_bounded,
+        ),
+        test(
+            "failed login starts cancel or reap the ceremony",
+            failed_login_starts_are_cleaned_up,
         ),
         test(
             "cancel responses and completion races are reconciled",
@@ -244,6 +256,7 @@ fn only_codex_0136_is_accepted() -> TestResult {
     run_async(async {
         for (scenario, expected) in [
             ("unsupported-version", AuthErrorCode::UnsupportedVersion),
+            ("version-build-metadata", AuthErrorCode::UnsupportedVersion),
             ("version-wrong-prefix", AuthErrorCode::ProtocolMismatch),
             ("version-extra-token", AuthErrorCode::ProtocolMismatch),
             ("version-malformed", AuthErrorCode::ProtocolMismatch),
@@ -382,6 +395,14 @@ fn codex_authorization_urls_fail_closed() -> TestResult {
                 .expect_err("invalid browser URL must be rejected");
             assert_eq!(error.code(), AuthErrorCode::InvalidAuthorizationUrl);
             assert_contains_no_secret(&format!("{error:?}"));
+            assert_eq!(
+                read_requests(&fixture.layout)?
+                    .last()
+                    .and_then(|request| request.get("method"))
+                    .and_then(Value::as_str),
+                Some("account/login/cancel"),
+                "a recoverable login ID must be canceled after rejecting {scenario}"
+            );
         }
         let mut alternate_port = Fixture::connect("browser-port-1457").await?;
         let challenge = alternate_port
@@ -641,6 +662,78 @@ fn account_updated_is_advisory_and_retries_are_bounded() -> TestResult {
     })
 }
 
+fn confirmation_resumes_after_reload_timeout() -> TestResult {
+    run_async(async {
+        let mut fixture = Fixture::connect("confirmation-timeout-then-reload").await?;
+        fixture.broker.start_login(AuthMethod::BrowserOAuth).await?;
+        let first = fixture
+            .broker
+            .auth_state()
+            .await
+            .expect_err("the first bounded confirmation window must expire");
+        assert_eq!(first.code(), AuthErrorCode::TimedOut);
+        assert_eq!(fixture.broker.cached_state(), AuthState::Pending);
+        assert_eq!(
+            fixture.broker.auth_state().await?,
+            AuthState::SignedIn {
+                method: AuthMethod::ProviderManaged,
+                plan: Some(SubscriptionPlan::Plus),
+            },
+            "a later state query must resume account confirmation without another completion"
+        );
+        Ok(())
+    })
+}
+
+fn notification_floods_are_bounded() -> TestResult {
+    run_async(async {
+        for scenario in [
+            "advisory-flood",
+            "paced-advisory-flood",
+            "completion-advisory-flood",
+        ] {
+            let mut fixture = Fixture::connect(scenario).await?;
+            fixture.broker.start_login(AuthMethod::BrowserOAuth).await?;
+            let started = Instant::now();
+            let error = fixture
+                .broker
+                .auth_state()
+                .await
+                .expect_err("valid advisory floods must exhaust the operation budget");
+            assert_eq!(error.code(), AuthErrorCode::ProtocolMismatch);
+            assert!(started.elapsed() < Duration::from_secs(1));
+        }
+        Ok(())
+    })
+}
+
+fn failed_login_starts_are_cleaned_up() -> TestResult {
+    run_async(async {
+        for (scenario, expected) in [
+            ("start-response-timeout", AuthErrorCode::TimedOut),
+            ("start-missing-login-id", AuthErrorCode::ProtocolMismatch),
+            ("response-method-bearing", AuthErrorCode::ProtocolMismatch),
+        ] {
+            let mut fixture = Fixture::connect(scenario).await?;
+            let pid = read_codex_pid(&fixture.layout)?;
+            let error = fixture
+                .broker
+                .start_login(AuthMethod::BrowserOAuth)
+                .await
+                .expect_err("an unrecoverable start failure must fail");
+            assert_eq!(error.code(), expected);
+            wait_until_processes_reaped(&[pid]).await?;
+            let poisoned = fixture
+                .broker
+                .auth_state()
+                .await
+                .expect_err("a terminated login sidecar must poison the broker");
+            assert_eq!(poisoned.code(), AuthErrorCode::SidecarExited);
+        }
+        Ok(())
+    })
+}
+
 fn cancel_responses_and_races_are_reconciled() -> TestResult {
     run_async(async {
         let mut canceled = Fixture::connect("cancel-canceled").await?;
@@ -650,6 +743,25 @@ fn cancel_responses_and_races_are_reconciled() -> TestResult {
             .await?;
         canceled.broker.cancel_login().await?;
         assert_eq!(canceled.broker.cached_state(), AuthState::SignedOut);
+
+        let mut preexisting = Fixture::connect("cancel-canceled-preexisting").await?;
+        assert!(matches!(
+            preexisting.broker.cached_state(),
+            AuthState::SignedIn { .. }
+        ));
+        preexisting
+            .broker
+            .start_login(AuthMethod::BrowserOAuth)
+            .await?;
+        preexisting.broker.cancel_login().await?;
+        assert_eq!(
+            preexisting.broker.cached_state(),
+            AuthState::SignedIn {
+                method: AuthMethod::ProviderManaged,
+                plan: Some(SubscriptionPlan::Plus),
+            },
+            "canceling a ceremony must reconcile the pre-existing account"
+        );
 
         let mut raced = Fixture::connect("cancel-not-found-success").await?;
         raced.broker.start_login(AuthMethod::BrowserOAuth).await?;
@@ -695,6 +807,46 @@ fn logout_omits_params() -> TestResult {
         assert_eq!(logout["method"], "account/logout");
         assert!(logout.get("params").is_none());
         assert_eq!(logout.as_object().map(serde_json::Map::len), Some(2));
+
+        let mut pending = Fixture::connect("logout-pending-race").await?;
+        pending.broker.start_login(AuthMethod::BrowserOAuth).await?;
+        pending.broker.logout().await?;
+        assert_eq!(pending.broker.cached_state(), AuthState::SignedOut);
+        assert_eq!(pending.broker.auth_state().await?, AuthState::SignedOut);
+        let requests = read_requests(&pending.layout)?;
+        let cancel_index = requests
+            .iter()
+            .position(|request| request["method"] == "account/login/cancel")
+            .ok_or("logout did not cancel its pending login")?;
+        let logout_index = requests
+            .iter()
+            .position(|request| request["method"] == "account/logout")
+            .ok_or("logout request was not sent")?;
+        assert!(
+            cancel_index < logout_index,
+            "logout must reconcile the login before clearing the provider account"
+        );
+
+        let mut cancel_failure = Fixture::connect("cancel-invalid-status").await?;
+        cancel_failure
+            .broker
+            .start_login(AuthMethod::BrowserOAuth)
+            .await?;
+        let error = cancel_failure
+            .broker
+            .logout()
+            .await
+            .expect_err("logout must report a malformed cancellation response");
+        assert_eq!(error.code(), AuthErrorCode::ProtocolMismatch);
+        assert_eq!(cancel_failure.broker.cached_state(), AuthState::SignedOut);
+        assert_eq!(
+            read_requests(&cancel_failure.layout)?
+                .last()
+                .and_then(|request| request.get("method"))
+                .and_then(Value::as_str),
+            Some("account/logout"),
+            "account/logout must be issued even when cancellation reconciliation fails"
+        );
         TestResult::Ok(())
     })
 }
@@ -744,6 +896,14 @@ fn read_requests(layout: &TestLayout) -> TestResult<Vec<Value>> {
         .lines()
         .map(|line| serde_json::from_str(line).map_err(Into::into))
         .collect()
+}
+
+fn read_codex_pid(layout: &TestLayout) -> TestResult<u32> {
+    let launch: Value = serde_json::from_slice(&fs::read(layout.home.join("codex-launch.json"))?)?;
+    launch["processId"]
+        .as_u64()
+        .and_then(|pid| u32::try_from(pid).ok())
+        .ok_or_else(|| "Codex fixture process ID was unavailable".into())
 }
 
 fn assert_contains_no_secret(value: &str) {
