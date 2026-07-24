@@ -236,11 +236,11 @@ fn codex_launch_and_handshake_are_exact() -> TestResult {
         let launch: Value =
             serde_json::from_slice(&fs::read(fixture.layout.home.join("codex-launch.json"))?)?;
         assert_eq!(
-            Path::new(
+            fs::canonicalize(Path::new(
                 launch["cwd"]
                     .as_str()
                     .ok_or("launch cwd must be a string")?
-            ),
+            ))?,
             fs::canonicalize(&fixture.layout.home)?
         );
         let environment = launch["environment"]
