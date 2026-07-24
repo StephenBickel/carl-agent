@@ -101,9 +101,9 @@ enum InitializeOutcome {
 /// caller must establish executable publisher trust before constructing
 /// [`TrustedExecutable`].
 ///
-/// Provider-home operation serialization is process-local in V1. The embedding
-/// Carl CLI must enforce a single Carl process per data root; cross-process locking
-/// is a follow-up requirement.
+/// Provider-home operation serialization is process-local. Every public CLI or daemon
+/// entry point must also retain a [`crate::sidecar::DataRootLock`] for its Carl data
+/// root through provider shutdown and reconciliation.
 pub struct GrokAuth {
     executable: TrustedExecutable,
     home: ProviderHome,
