@@ -1730,7 +1730,10 @@ fn strict_jsonl(write_stderr: bool, ignore_term: bool) -> i32 {
             .get("delay_ms")
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0);
-        if method == "delay-after-received" {
+        if matches!(
+            method.as_str(),
+            "delay-after-received" | "delay-after-received-and-confirm-response"
+        ) {
             let mut stdout = stdout.lock().expect("fixture stdout lock is not poisoned");
             serde_json::to_writer(
                 &mut *stdout,
@@ -1759,10 +1762,21 @@ fn strict_jsonl(write_stderr: bool, ignore_term: bool) -> i32 {
             }
             serde_json::to_writer(
                 &mut *stdout,
-                &serde_json::json!({"id": id, "result": result}),
+                &serde_json::json!({"id": id.clone(), "result": result}),
             )
             .expect("fixture response serializes");
             writeln!(stdout).expect("fixture response newline writes");
+            if method == "delay-after-received-and-confirm-response" {
+                serde_json::to_writer(
+                    &mut *stdout,
+                    &serde_json::json!({
+                        "method": "fixture/responded",
+                        "params": {"id": id},
+                    }),
+                )
+                .expect("fixture response confirmation serializes");
+                writeln!(stdout).expect("fixture response confirmation newline writes");
+            }
             stdout.flush().expect("fixture response flushes");
         });
     }

@@ -1842,7 +1842,7 @@ fn abandoned_written_request_consumes_one_late_response() -> TestResult {
             abandoned_sidecar
                 .request(json!({
                     "id": "reusable",
-                    "method": "delay-after-received",
+                    "method": "delay-after-received-and-confirm-response",
                     "value": "late",
                     "delay_ms": 100,
                 }))
@@ -1863,7 +1863,11 @@ fn abandoned_written_request_consumes_one_late_response() -> TestResult {
             .request(json!({"id": "survivor", "value": "still-running"}))
             .await?;
         assert_eq!(survivor["result"], "still-running");
-        tokio::time::sleep(Duration::from_millis(125)).await;
+        let responded = tokio::time::timeout(Duration::from_secs(5), sidecar.next_notification())
+            .await
+            .map_err(|_| "fixture did not confirm the late response")??;
+        assert_eq!(responded["method"], "fixture/responded");
+        assert_eq!(responded["params"]["id"], "reusable");
 
         let reused = sidecar
             .request(json!({"id": "reusable", "value": "safe-now"}))
