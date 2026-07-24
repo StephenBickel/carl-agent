@@ -21,9 +21,10 @@ use carl::sidecar::{
 use libtest_mimic::{Arguments, Failed, Trial};
 use serde_json::{Value, json};
 use support::{
-    CODEX_LOGIN_ID, CODEX_NOTIFICATION_FLOOD_READY, CODEX_SECRET_SENTINEL, PATH_SENTINEL,
-    SECRET_SENTINEL, TestLayout, TestResult, dispatch_codex_auth_fixture, fixture_command,
-    short_limits, wait_for_fixture_marker, wait_until_processes_reaped,
+    CODEX_AUTH_MANAGER_RELOADED, CODEX_DELAYED_CONFIRMATION_READY_ON_READ, CODEX_LOGIN_ID,
+    CODEX_NOTIFICATION_FLOOD_READY, CODEX_SECRET_SENTINEL, PATH_SENTINEL, SECRET_SENTINEL,
+    TestLayout, TestResult, dispatch_codex_auth_fixture, fixture_command, short_limits,
+    wait_for_fixture_marker, wait_until_processes_reaped, write_fixture_marker,
 };
 
 fn main() {
@@ -718,19 +719,45 @@ fn account_updated_is_advisory_and_retries_are_bounded() -> TestResult {
 
 fn confirmation_resumes_after_reload_timeout() -> TestResult {
     run_async(async {
-        let mut delayed = Fixture::connect("confirmation-delayed-within-deadline").await?;
-        delayed.broker.start_login(AuthMethod::BrowserOAuth).await?;
+        let mut delayed = Fixture::connect("confirmation-delayed-within-deadline")
+            .await
+            .map_err(|error| format!("within-deadline fixture connect failed: {error}"))?;
+        delayed
+            .broker
+            .start_login(AuthMethod::BrowserOAuth)
+            .await
+            .map_err(|error| format!("within-deadline login start failed: {error}"))?;
+        let delayed_state = delayed
+            .broker
+            .auth_state()
+            .await
+            .map_err(|error| format!("within-deadline confirmation failed: {error}"))?;
         assert_eq!(
-            delayed.broker.auth_state().await?,
+            delayed_state,
             AuthState::SignedIn {
                 method: AuthMethod::ProviderManaged,
                 plan: Some(SubscriptionPlan::Plus),
             },
             "confirmation must keep polling beyond eight intervals until its absolute deadline"
         );
+        let delayed_account_reads = read_requests(&delayed.layout)?
+            .iter()
+            .filter(|request| request.get("method").and_then(Value::as_str) == Some("account/read"))
+            .count();
+        assert!(
+            delayed_account_reads.saturating_sub(1) > 8
+                && delayed_account_reads >= CODEX_DELAYED_CONFIRMATION_READY_ON_READ as usize,
+            "fixture must prove confirmation performed more than eight post-login account reads"
+        );
 
-        let mut fixture = Fixture::connect("confirmation-timeout-then-reload").await?;
-        fixture.broker.start_login(AuthMethod::BrowserOAuth).await?;
+        let mut fixture = Fixture::connect("confirmation-timeout-then-reload")
+            .await
+            .map_err(|error| format!("reload fixture connect failed: {error}"))?;
+        fixture
+            .broker
+            .start_login(AuthMethod::BrowserOAuth)
+            .await
+            .map_err(|error| format!("reload login start failed: {error}"))?;
         let first = fixture
             .broker
             .auth_state()
@@ -738,8 +765,14 @@ fn confirmation_resumes_after_reload_timeout() -> TestResult {
             .expect_err("the first bounded confirmation window must expire");
         assert_eq!(first.code(), AuthErrorCode::TimedOut);
         assert_eq!(fixture.broker.cached_state(), AuthState::Pending);
+        write_fixture_marker(&fixture.layout.home, CODEX_AUTH_MANAGER_RELOADED)?;
+        let reloaded_state = fixture
+            .broker
+            .auth_state()
+            .await
+            .map_err(|error| format!("reload confirmation failed: {error}"))?;
         assert_eq!(
-            fixture.broker.auth_state().await?,
+            reloaded_state,
             AuthState::SignedIn {
                 method: AuthMethod::ProviderManaged,
                 plan: Some(SubscriptionPlan::Plus),

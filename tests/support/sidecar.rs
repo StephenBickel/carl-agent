@@ -25,6 +25,8 @@ pub const GROK_SECRET_SENTINEL: &str =
     "Bearer grok-access-token-sentinel refresh-token-sentinel stephen@example.test";
 pub const CODEX_LOGIN_ID: &str = "94d0b241-47d6-4bec-b77a-29d023cf4f2f";
 pub const CODEX_STALE_LOGIN_ID: &str = "40dfe52d-9789-4aec-88bd-4f7510b2c06e";
+pub const CODEX_AUTH_MANAGER_RELOADED: &str = "auth-manager-reloaded";
+pub const CODEX_DELAYED_CONFIRMATION_READY_ON_READ: u64 = 10;
 pub const CODEX_NOTIFICATION_FLOOD_READY: &str = "notification-flood-ready";
 #[cfg(unix)]
 pub const PATH_SENTINEL: &str = "/carl-untrusted-path-sentinel";
@@ -846,7 +848,6 @@ fn codex_auth_jsonl_fixture(home: &Path, scenario: &str) -> i32 {
 
     let mut account_reads = 0_u64;
     let mut login_started = false;
-    let mut login_started_at = None;
     let mut cancel_raced = false;
     let mut logged_out = false;
     for input in io::stdin().lock().lines() {
@@ -982,7 +983,7 @@ fn codex_auth_jsonl_fixture(home: &Path, scenario: &str) -> i32 {
                     scenario,
                     account_reads,
                     login_started,
-                    login_started_at.map(|started: Instant| started.elapsed()),
+                    fixture_marker_is_ready(home, CODEX_AUTH_MANAGER_RELOADED),
                     cancel_raced,
                     logged_out,
                 );
@@ -1006,7 +1007,16 @@ fn codex_auth_jsonl_fixture(home: &Path, scenario: &str) -> i32 {
                 {
                     return 74;
                 }
-                if write_codex_message(&serde_json::json!({"id": id, "result": result})).is_err() {
+                let response = serde_json::json!({"id": id, "result": result});
+                let write_result = if scenario == "confirmation-delayed-within-deadline"
+                    && login_started
+                    && account_reads < CODEX_DELAYED_CONFIRMATION_READY_ON_READ
+                {
+                    write_codex_message_then_account_updated(&response)
+                } else {
+                    write_codex_message(&response)
+                };
+                if write_result.is_err() {
                     return 74;
                 }
             }
@@ -1015,7 +1025,6 @@ fn codex_auth_jsonl_fixture(home: &Path, scenario: &str) -> i32 {
                     return 65;
                 }
                 login_started = true;
-                login_started_at = Some(Instant::now());
                 if matches!(scenario, "provider-error" | "provider-protocol-error") {
                     let code = if scenario == "provider-protocol-error" {
                         -32602
@@ -1465,7 +1474,7 @@ fn codex_fixture_account(
     scenario: &str,
     account_reads: u64,
     login_started: bool,
-    login_elapsed: Option<Duration>,
+    auth_manager_reloaded: bool,
     cancel_raced: bool,
     logged_out: bool,
 ) -> serde_json::Value {
@@ -1485,13 +1494,9 @@ fn codex_fixture_account(
         "account-unknown-type" => serde_json::json!({"type": "personalAccessToken"}),
         "stale-account-then-updated" if account_reads < 3 => serde_json::Value::Null,
         "confirmation-timeout" => serde_json::Value::Null,
-        "confirmation-timeout-then-reload"
-            if login_elapsed.is_none_or(|elapsed| elapsed < Duration::from_millis(320)) =>
-        {
-            serde_json::Value::Null
-        }
+        "confirmation-timeout-then-reload" if !auth_manager_reloaded => serde_json::Value::Null,
         "confirmation-delayed-within-deadline"
-            if login_elapsed.is_none_or(|elapsed| elapsed < Duration::from_millis(150)) =>
+            if account_reads < CODEX_DELAYED_CONFIRMATION_READY_ON_READ =>
         {
             serde_json::Value::Null
         }
@@ -1596,22 +1601,41 @@ fn write_login_completion(login_id: &str, success: bool) -> io::Result<()> {
 }
 
 fn write_account_updated() -> io::Result<()> {
-    write_codex_message(&serde_json::json!({
+    write_codex_message(&account_updated_message())
+}
+
+fn account_updated_message() -> serde_json::Value {
+    serde_json::json!({
         "method": "account/updated",
         "params": {"authMode": "chatgpt", "planType": "plus"},
-    }))
+    })
+}
+
+fn write_codex_message_then_account_updated(value: &serde_json::Value) -> io::Result<()> {
+    let account_updated = account_updated_message();
+    write_codex_messages(&[value, &account_updated])
 }
 
 fn write_codex_message(value: &serde_json::Value) -> io::Result<()> {
+    write_codex_messages(&[value])
+}
+
+fn write_codex_messages(values: &[&serde_json::Value]) -> io::Result<()> {
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
-    serde_json::to_writer(&mut stdout, value)?;
-    writeln!(stdout)?;
+    for value in values {
+        serde_json::to_writer(&mut stdout, value)?;
+        writeln!(stdout)?;
+    }
     stdout.flush()
 }
 
-fn write_fixture_marker(home: &Path, name: &str) -> io::Result<()> {
+pub fn write_fixture_marker(home: &Path, name: &str) -> io::Result<()> {
     write_private_fixture_file(home.join(name), b"ready")
+}
+
+fn fixture_marker_is_ready(home: &Path, name: &str) -> bool {
+    fs::read(home.join(name)).is_ok_and(|contents| contents == b"ready")
 }
 
 fn record_codex_launch(home: &Path) -> io::Result<()> {
