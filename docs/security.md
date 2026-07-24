@@ -89,15 +89,18 @@ nor updates provider executables.
 On Windows, every existing executable-path component rejects reparse points and
 broad deletion or security-descriptor control. The executable's immediate parent
 also rejects broad child-creation rights to prevent adjacent DLL, configuration, or
-plugin planting. Every non-root ancestor follows that same strict policy. The only
-exception is a local disk or verbatim-disk volume root, where the standard
-create-subdirectory right may add a sibling but cannot replace the already-existing
-first path component. UNC roots do not receive this exception. Create-file,
-metadata-write, deletion, and security-descriptor control rights remain rejected at
-the volume root because they can mutate the component, participate in reparse-point
-creation, or remove an existing child. The residual boundary is limited to creating
-an unrelated sibling at the local volume root; the selected first component and every
-directory below it are independently checked under the strict policy.
+plugin planting. Owners are limited to the current user, SYSTEM, Administrators, or
+the exact `NT SERVICE\TrustedInstaller` principal resolved by Windows; arbitrary
+service SIDs and unknown owners are rejected. Every non-root ancestor follows that
+same strict policy. The only exception is a local disk or verbatim-disk volume root,
+where the standard create-subdirectory right may add a sibling but cannot replace the
+already-existing first path component. UNC roots do not receive this exception.
+Create-file, metadata-write, deletion, and security-descriptor control rights remain
+rejected at the volume root because they can mutate the component, participate in
+reparse-point creation, or remove an existing child. The residual boundary is limited
+to creating an unrelated sibling at the local volume root; the selected first
+component and every directory below it are independently checked under the strict
+policy.
 
 Every public auth or future daemon entry point holds one cross-process exclusive OS
 lock for the canonical `CARL_DATA_DIR`. It retains the lock through provider cleanup,

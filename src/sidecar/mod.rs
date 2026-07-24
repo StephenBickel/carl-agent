@@ -4522,12 +4522,12 @@ mod windows_security {
         ACL, ACL_REVISION, AccessCheck, AddAccessAllowedAceEx, CONTAINER_INHERIT_ACE,
         DACL_SECURITY_INFORMATION, DuplicateToken, EqualSid, GENERIC_MAPPING,
         GROUP_SECURITY_INFORMATION, GetAce, GetLengthSid, GetTokenInformation, INHERIT_ONLY_ACE,
-        InitializeAcl, InitializeSecurityDescriptor, IsValidSid, IsWellKnownSid, MapGenericMask,
-        OBJECT_INHERIT_ACE, OWNER_SECURITY_INFORMATION, PRIVILEGE_SET, PSECURITY_DESCRIPTOR, PSID,
-        SE_DACL_PROTECTED, SECURITY_DESCRIPTOR, SecurityImpersonation,
-        SetSecurityDescriptorControl, SetSecurityDescriptorDacl, SetSecurityDescriptorOwner,
-        TOKEN_DUPLICATE, TOKEN_QUERY, TOKEN_USER, TokenUser, WinBuiltinAdministratorsSid,
-        WinLocalSystemSid,
+        InitializeAcl, InitializeSecurityDescriptor, IsValidSid, IsWellKnownSid,
+        LookupAccountNameW, MapGenericMask, OBJECT_INHERIT_ACE, OWNER_SECURITY_INFORMATION,
+        PRIVILEGE_SET, PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED, SECURITY_DESCRIPTOR,
+        SECURITY_MAX_SID_SIZE, SecurityImpersonation, SetSecurityDescriptorControl,
+        SetSecurityDescriptorDacl, SetSecurityDescriptorOwner, TOKEN_DUPLICATE, TOKEN_QUERY,
+        TOKEN_USER, TokenUser, WinBuiltinAdministratorsSid, WinLocalSystemSid,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         DELETE, FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY, FILE_ALL_ACCESS, FILE_APPEND_DATA,
@@ -4891,10 +4891,7 @@ mod windows_security {
         // SAFETY: owner and current-user SIDs are valid and live with their buffers.
         let owner_is_current = unsafe { EqualSid(owner, current_user.sid()) } != 0;
         // SAFETY: owner was returned by GetNamedSecurityInfoW in the live descriptor.
-        let owner_is_privileged = unsafe {
-            IsWellKnownSid(owner, WinLocalSystemSid) != 0
-                || IsWellKnownSid(owner, WinBuiltinAdministratorsSid) != 0
-        };
+        let owner_is_privileged = is_privileged_sid(owner);
         let owner_allowed = match owner_policy {
             OwnerPolicy::TrustedExecutable => owner_is_current || owner_is_privileged,
             OwnerPolicy::CurrentUserPrivate => owner_is_current,
@@ -4915,6 +4912,78 @@ mod windows_security {
         .ok_or(DaclVerificationFailure::BroadWriter)?;
         verify_effective_current_user_access(descriptor, current_user, owner_policy, object_kind)
             .map_err(|()| DaclVerificationFailure::EffectiveAccess)
+    }
+
+    fn is_trusted_installer_sid(candidate: PSID) -> bool {
+        const TRUSTED_INSTALLER: &str = r"NT SERVICE\TrustedInstaller";
+        const MAX_DOMAIN_CHARS: u32 = 256;
+
+        let account: Vec<u16> = TRUSTED_INSTALLER.encode_utf16().chain(Some(0)).collect();
+        let mut sid_bytes = 0_u32;
+        let mut domain_chars = 0_u32;
+        let mut sid_type = 0;
+        // SAFETY: null output buffers with zero lengths perform the documented size query.
+        let _ = unsafe {
+            LookupAccountNameW(
+                ptr::null(),
+                account.as_ptr(),
+                ptr::null_mut(),
+                &mut sid_bytes,
+                ptr::null_mut(),
+                &mut domain_chars,
+                &mut sid_type,
+            )
+        };
+        if sid_bytes == 0 || sid_bytes > SECURITY_MAX_SID_SIZE || domain_chars > MAX_DOMAIN_CHARS {
+            return false;
+        }
+
+        let word = std::mem::size_of::<usize>();
+        let Some(sid_words) = usize::try_from(sid_bytes)
+            .ok()
+            .and_then(|bytes| bytes.checked_add(word - 1))
+            .map(|bytes| bytes / word)
+        else {
+            return false;
+        };
+        let Ok(domain_len) = usize::try_from(domain_chars) else {
+            return false;
+        };
+        let mut sid = vec![0_usize; sid_words];
+        let mut domain = vec![0_u16; domain_len];
+        let domain_pointer = if domain.is_empty() {
+            ptr::null_mut()
+        } else {
+            domain.as_mut_ptr()
+        };
+        // SAFETY: both output buffers are aligned and sized by the preceding query.
+        if unsafe {
+            LookupAccountNameW(
+                ptr::null(),
+                account.as_ptr(),
+                sid.as_mut_ptr().cast(),
+                &mut sid_bytes,
+                domain_pointer,
+                &mut domain_chars,
+                &mut sid_type,
+            )
+        } == 0
+        {
+            return false;
+        }
+        let trusted_installer: PSID = sid.as_mut_ptr().cast();
+        // SAFETY: the successful lookup initialized the bounded SID buffer; candidate
+        // comes from a live security descriptor and was validated by Windows.
+        unsafe { IsValidSid(trusted_installer) != 0 && EqualSid(candidate, trusted_installer) != 0 }
+    }
+
+    fn is_privileged_sid(candidate: PSID) -> bool {
+        // SAFETY: candidate comes from a size-checked ACE or a live Windows
+        // security descriptor and has already passed SID validation.
+        (unsafe {
+            IsWellKnownSid(candidate, WinLocalSystemSid) != 0
+                || IsWellKnownSid(candidate, WinBuiltinAdministratorsSid) != 0
+        }) || is_trusted_installer_sid(candidate)
     }
 
     unsafe fn dacl_has_safe_writers(
@@ -4990,10 +5059,7 @@ mod windows_security {
             // SAFETY: both SIDs have been validated and are live.
             let is_current_user = unsafe { EqualSid(sid, current_user) } != 0;
             // SAFETY: sid passed IsValidSid above.
-            let is_privileged = unsafe {
-                IsWellKnownSid(sid, WinLocalSystemSid) != 0
-                    || IsWellKnownSid(sid, WinBuiltinAdministratorsSid) != 0
-            };
+            let is_privileged = is_privileged_sid(sid);
             if private && mask != 0 && !is_current_user && !is_privileged {
                 return false;
             }
