@@ -4524,13 +4524,14 @@ mod windows_security {
     use windows_sys::Win32::Security::{
         ACCESS_ALLOWED_ACE, ACE_HEADER, ACE_INHERITED_OBJECT_TYPE_PRESENT, ACE_OBJECT_TYPE_PRESENT,
         ACL, ACL_REVISION, AccessCheck, AddAccessAllowedAceEx, CONTAINER_INHERIT_ACE,
-        DACL_SECURITY_INFORMATION, DuplicateToken, EqualSid, GENERIC_MAPPING, GetAce, GetLengthSid,
-        GetTokenInformation, INHERIT_ONLY_ACE, InitializeAcl, InitializeSecurityDescriptor,
-        IsValidSid, IsWellKnownSid, MapGenericMask, OBJECT_INHERIT_ACE, OWNER_SECURITY_INFORMATION,
-        PRIVILEGE_SET, PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED, SECURITY_DESCRIPTOR,
-        SecurityImpersonation, SetSecurityDescriptorControl, SetSecurityDescriptorDacl,
-        SetSecurityDescriptorOwner, TOKEN_DUPLICATE, TOKEN_QUERY, TOKEN_USER, TokenUser,
-        WinBuiltinAdministratorsSid, WinLocalSystemSid,
+        DACL_SECURITY_INFORMATION, DuplicateToken, EqualSid, GENERIC_MAPPING,
+        GROUP_SECURITY_INFORMATION, GetAce, GetLengthSid, GetTokenInformation, INHERIT_ONLY_ACE,
+        InitializeAcl, InitializeSecurityDescriptor, IsValidSid, IsWellKnownSid, MapGenericMask,
+        OBJECT_INHERIT_ACE, OWNER_SECURITY_INFORMATION, PRIVILEGE_SET, PSECURITY_DESCRIPTOR, PSID,
+        SE_DACL_PROTECTED, SECURITY_DESCRIPTOR, SecurityImpersonation,
+        SetSecurityDescriptorControl, SetSecurityDescriptorDacl, SetSecurityDescriptorOwner,
+        TOKEN_DUPLICATE, TOKEN_QUERY, TOKEN_USER, TokenUser, WinBuiltinAdministratorsSid,
+        WinLocalSystemSid,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         DELETE, FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY, FILE_ALL_ACCESS, FILE_APPEND_DATA,
@@ -4556,6 +4557,13 @@ mod windows_security {
         File,
         Directory,
     }
+
+    // AccessCheck rejects a descriptor without both owner and primary-group SIDs.
+    // GROUP_SECURITY_INFORMATION populates the group inside ppSecurityDescriptor;
+    // its separate ppGroup output pointer may remain null because callers do not
+    // inspect that component directly.
+    const ACCESS_CHECK_SECURITY_INFORMATION: u32 =
+        DACL_SECURITY_INFORMATION | OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION;
 
     pub(super) fn verify_no_broad_write_file(path: &Path) -> Result<(), ()> {
         verify_dacl(path, OwnerPolicy::TrustedExecutable, ObjectKind::File)
@@ -4587,7 +4595,7 @@ mod windows_security {
             GetSecurityInfo(
                 file.as_raw_handle(),
                 SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION | OWNER_SECURITY_INFORMATION,
+                ACCESS_CHECK_SECURITY_INFORMATION,
                 &mut owner,
                 ptr::null_mut(),
                 &mut dacl,
@@ -4814,7 +4822,7 @@ mod windows_security {
             GetNamedSecurityInfoW(
                 path.as_ptr(),
                 SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION | OWNER_SECURITY_INFORMATION,
+                ACCESS_CHECK_SECURITY_INFORMATION,
                 &mut owner,
                 ptr::null_mut(),
                 &mut dacl,
@@ -5433,6 +5441,28 @@ mod windows_static_file_tests {
     use super::*;
     use std::ffi::OsStr;
     use std::io::Write;
+
+    #[test]
+    fn owner_only_file_handle_verification_uses_a_complete_descriptor() {
+        let serial = NEXT_STATIC_FILE.fetch_add(1, Ordering::Relaxed);
+        let root = env::temp_dir().join(format!(
+            "carl-windows-private-handle-{}-{serial}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir(&root).expect("test root is created");
+        let directory = open_identity_directory(&root).expect("test root opens by identity");
+        let temporary_name = OsStr::new("owner-only.tmp");
+        let temporary = create_relative_private_file(&directory, temporary_name)
+            .expect("owner-only temporary file is created");
+
+        windows_security::verify_private_file_handle(&temporary)
+            .expect("AccessCheck receives owner, group, and DACL for the exact created handle");
+
+        delete_file_on_close(&temporary).expect("temporary file is marked for deletion");
+        drop(temporary);
+        fs::remove_dir_all(root).expect("test root is removed");
+    }
 
     #[test]
     fn static_temporary_creation_and_cleanup_remain_bound_to_open_handles() {
