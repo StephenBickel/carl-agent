@@ -4019,8 +4019,8 @@ fn create_relative_private_file(directory: &File, name: &std::ffi::OsStr) -> Res
     };
     use windows_sys::Win32::Security::SECURITY_DESCRIPTOR;
     use windows_sys::Win32::Storage::FileSystem::{
-        DELETE, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_WRITE, FILE_SHARE_DELETE, FILE_SHARE_READ,
-        FILE_SHARE_WRITE, READ_CONTROL, SYNCHRONIZE,
+        DELETE, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, READ_CONTROL, SYNCHRONIZE,
     };
     use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
@@ -4057,7 +4057,7 @@ fn create_relative_private_file(directory: &File, name: &std::ffi::OsStr) -> Res
     let result = unsafe {
         NtCreateFile(
             &mut handle,
-            FILE_GENERIC_WRITE | DELETE | READ_CONTROL | SYNCHRONIZE,
+            FILE_GENERIC_WRITE | FILE_READ_ATTRIBUTES | DELETE | READ_CONTROL | SYNCHRONIZE,
             &attributes,
             &mut status,
             ptr::null(),
@@ -5746,6 +5746,9 @@ mod windows_static_file_tests {
         let temporary = create_relative_private_file(&directory, temporary_name)
             .expect("owner-only temporary file is created");
 
+        let identity = windows_file_identity(&temporary)
+            .expect("the creation handle permits exact identity inspection");
+        assert_eq!(identity.links, 1);
         windows_security::verify_private_file_handle(&temporary)
             .expect("AccessCheck receives owner, group, and DACL for the exact created handle");
 
