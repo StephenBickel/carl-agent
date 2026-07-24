@@ -4191,9 +4191,10 @@ fn write_static_provider_file(
     use std::os::windows::fs::OpenOptionsExt;
     use std::os::windows::io::AsRawHandle;
 
-    use windows_sys::Win32::Storage::FileSystem::{
-        FILE_RENAME_INFO, FileRenameInfo, SetFileInformationByHandle,
+    use windows_sys::Wdk::Storage::FileSystem::{
+        FILE_RENAME_INFORMATION, FileRenameInformation, NtSetInformationFile,
     };
+    use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
     const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 
@@ -4283,20 +4284,19 @@ fn write_static_provider_file(
         // Windows requires at least the complete fixed structure plus the supplied
         // filename bytes, even though FileName begins before the structure's trailing
         // alignment padding.
-        let bytes = std::mem::size_of::<FILE_RENAME_INFO>()
+        let bytes = std::mem::size_of::<FILE_RENAME_INFORMATION>()
             .checked_add(filename_bytes)
             .ok_or_else(unsafe_file)?;
         let words = bytes.div_ceil(std::mem::size_of::<usize>());
         let mut storage = vec![0_usize; words];
-        let information = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+        let information = storage.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
         let filename_bytes = u32::try_from(filename_bytes).map_err(|_| unsafe_file())?;
         // SAFETY: storage is aligned and sized for the fixed structure plus target name.
         unsafe {
             (*information).Anonymous.ReplaceIfExists = true;
-            // Resolve the validated simple name relative to the exact held
-            // provider-home directory, which was opened with the narrow access
-            // Windows requires for a rename root.
-            (*information).RootDirectory = home.directory.as_raw_handle();
+            // NtSetInformationFile interprets a simple name with a null root as a
+            // rename within the already-open source file's actual parent directory.
+            (*information).RootDirectory = std::ptr::null_mut();
             (*information).FileNameLength = filename_bytes;
             std::ptr::copy_nonoverlapping(
                 target_name.as_ptr(),
@@ -4305,17 +4305,25 @@ fn write_static_provider_file(
             );
         }
         let bytes = u32::try_from(bytes).map_err(|_| unsafe_file())?;
-        // SAFETY: the temporary file remains open, and information points to a
-        // correctly sized FILE_RENAME_INFO containing a simple same-directory name.
-        if unsafe {
-            SetFileInformationByHandle(
+        let mut io_status = IO_STATUS_BLOCK::default();
+        // SAFETY: the temporary file remains open, io_status is writable, and
+        // information points to a correctly sized FILE_RENAME_INFORMATION containing
+        // a simple same-directory name.
+        let rename_status = unsafe {
+            NtSetInformationFile(
                 temporary_file.as_raw_handle(),
-                FileRenameInfo,
+                &mut io_status,
                 information.cast(),
                 bytes,
+                FileRenameInformation,
             )
-        } == 0
-        {
+        };
+        if rename_status < 0 {
+            #[cfg(debug_assertions)]
+            eprintln!(
+                "carl Windows static-file diagnostic: rename_ntstatus=0x{:08x}",
+                rename_status as u32
+            );
             return Err(unsafe_file());
         }
         let after = windows_file_identity(&temporary_file).map_err(|()| unsafe_file())?;
