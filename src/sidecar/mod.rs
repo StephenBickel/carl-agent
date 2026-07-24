@@ -61,10 +61,12 @@ const MAX_STDERR_BYTES: usize = 64 * 1024;
 const MAX_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_PROCESS_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const PRIVATE_TEMP_DIRECTORY: &str = ".carl-tmp";
+const DATA_ROOT_LOCK_FILENAME: &str = ".carl-instance.lock";
 static NEXT_STATIC_FILE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static PROVIDER_HOME_OPERATION_LOCKS: OnceLock<
     Mutex<HashMap<DirectoryIdentity, Weak<AsyncMutex<()>>>>,
 > = OnceLock::new();
+static HELD_DATA_ROOT_LOCKS: OnceLock<Mutex<HashMap<DirectoryIdentity, ()>>> = OnceLock::new();
 
 #[cfg(target_os = "linux")]
 const ALLOWED_ENVIRONMENT: &[&str] = &[
@@ -789,6 +791,130 @@ impl SidecarError {
     }
 }
 
+/// Closed, non-sensitive failures from acquiring Carl's data-root instance lock.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DataRootLockErrorCode {
+    /// The supplied root was not absolute, pre-existing, owner-private, or a directory.
+    InvalidDataRoot,
+    /// The persistent lock component was not an owner-only, single-link regular file.
+    UnsafeLockFile,
+    /// Another live holder owns the lock for this data root.
+    Contended,
+    /// The operating system could not establish the lock.
+    Unavailable,
+}
+
+impl DataRootLockErrorCode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidDataRoot => "invalid_data_root",
+            Self::UnsafeLockFile => "unsafe_data_root_lock",
+            Self::Contended => "data_root_lock_contended",
+            Self::Unavailable => "data_root_lock_unavailable",
+        }
+    }
+}
+
+impl fmt::Display for DataRootLockErrorCode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// A sanitized failure to acquire [`DataRootLock`].
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+#[error("Carl data-root lock failed: {code}")]
+pub struct DataRootLockError {
+    code: DataRootLockErrorCode,
+}
+
+impl DataRootLockError {
+    const fn from_code(code: DataRootLockErrorCode) -> Self {
+        Self { code }
+    }
+
+    #[must_use]
+    pub const fn code(self) -> DataRootLockErrorCode {
+        self.code
+    }
+}
+
+/// An opaque exclusive capability for one verified Carl data root.
+///
+/// Acquisition is nonblocking. The persistent lock file is never read or unlinked;
+/// the operating system releases exclusivity when this capability is dropped or the
+/// process exits. Callers must retain the capability through all provider cleanup and
+/// reconciliation that belongs to the protected operation.
+///
+/// This is cooperative process exclusivity, not isolation from the account that owns
+/// the private root. In particular, that owner can rename or unlink the lock component
+/// on Unix and thereby defeat future path-based acquisition.
+#[must_use = "dropping the data-root lock releases process exclusivity"]
+pub struct DataRootLock {
+    _root_directory: File,
+    lock_file: Option<File>,
+    root_identity: DirectoryIdentity,
+}
+
+impl fmt::Debug for DataRootLock {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DataRootLock")
+            .finish_non_exhaustive()
+    }
+}
+
+impl DataRootLock {
+    /// Acquire Carl's fixed exclusive lock beneath an absolute, pre-existing,
+    /// owner-private data root.
+    pub fn acquire(data_root: impl AsRef<Path>) -> Result<Self, DataRootLockError> {
+        let data_root = data_root.as_ref();
+        if !data_root.is_absolute() {
+            return Err(DataRootLockError::from_code(
+                DataRootLockErrorCode::InvalidDataRoot,
+            ));
+        }
+        let root_directory = open_private_data_root(data_root)?;
+        let root_identity = directory_identity(&root_directory)
+            .map_err(|_| DataRootLockError::from_code(DataRootLockErrorCode::InvalidDataRoot))?;
+
+        let held = HELD_DATA_ROOT_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+        if lock(held).insert(root_identity, ()).is_some() {
+            return Err(DataRootLockError::from_code(
+                DataRootLockErrorCode::Contended,
+            ));
+        }
+
+        let lock_file = match open_and_lock_data_root_file(&root_directory) {
+            Ok(lock_file) => lock_file,
+            Err(error) => {
+                lock(held).remove(&root_identity);
+                return Err(error);
+            }
+        };
+        Ok(Self {
+            _root_directory: root_directory,
+            lock_file: Some(lock_file),
+            root_identity,
+        })
+    }
+}
+
+impl Drop for DataRootLock {
+    fn drop(&mut self) {
+        // Explicitly unlock before close so a concurrently forked pre-exec child
+        // cannot transiently retain a duplicated Unix open-file description.
+        if let Some(lock_file) = self.lock_file.as_ref() {
+            release_data_root_file(lock_file);
+        }
+        drop(self.lock_file.take());
+        if let Some(held) = HELD_DATA_ROOT_LOCKS.get() {
+            lock(held).remove(&self.root_identity);
+        }
+    }
+}
+
 /// Closed set of environment names that a provider child may receive.
 ///
 /// Most values are synthesized. On Linux, Codex's keyring transport variables are
@@ -1069,6 +1195,221 @@ fn provider_home_operation_lock(identity: DirectoryIdentity) -> Arc<AsyncMutex<(
     let operation_lock = Arc::new(AsyncMutex::new(()));
     locks.insert(identity, Arc::downgrade(&operation_lock));
     operation_lock
+}
+
+#[cfg(unix)]
+fn open_private_data_root(path: &Path) -> Result<File, DataRootLockError> {
+    use std::fs::OpenOptions;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let invalid = || DataRootLockError::from_code(DataRootLockErrorCode::InvalidDataRoot);
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|_| invalid())?;
+    let mut status = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: the descriptor is live and status points to writable stat storage.
+    if unsafe { libc::fstat(directory.as_raw_fd(), status.as_mut_ptr()) } != 0 {
+        return Err(invalid());
+    }
+    // SAFETY: fstat succeeded and initialized status.
+    let status = unsafe { status.assume_init() };
+    // SAFETY: geteuid has no preconditions.
+    if status.st_uid != unsafe { libc::geteuid() }
+        || status.st_mode & libc::S_IFMT != libc::S_IFDIR
+        || status.st_mode & 0o777 != 0o700
+    {
+        return Err(invalid());
+    }
+    Ok(directory)
+}
+
+#[cfg(windows)]
+fn open_private_data_root(path: &Path) -> Result<File, DataRootLockError> {
+    let invalid = || DataRootLockError::from_code(DataRootLockErrorCode::InvalidDataRoot);
+    let directory = open_identity_directory(path).map_err(|_| invalid())?;
+    windows_security::verify_private_directory_handle(&directory).map_err(|()| invalid())?;
+    Ok(directory)
+}
+
+#[cfg(unix)]
+fn open_and_lock_data_root_file(root: &File) -> Result<File, DataRootLockError> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    let unsafe_file = || DataRootLockError::from_code(DataRootLockErrorCode::UnsafeLockFile);
+    let name = CString::new(DATA_ROOT_LOCK_FILENAME).map_err(|_| unsafe_file())?;
+    let flags = libc::O_RDWR | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK;
+    // Create exclusively first so a hostile existing component is never repaired.
+    // SAFETY: root is live, name is a component-only C string, and mode is supplied
+    // because O_CREAT is set.
+    let mut descriptor = unsafe {
+        libc::openat(
+            root.as_raw_fd(),
+            name.as_ptr(),
+            flags | libc::O_CREAT | libc::O_EXCL,
+            0o600,
+        )
+    };
+    let created = descriptor >= 0;
+    if descriptor < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::AlreadyExists {
+            return Err(unsafe_file());
+        }
+        // SAFETY: root is live and name is a component-only C string.
+        descriptor = unsafe { libc::openat(root.as_raw_fd(), name.as_ptr(), flags) };
+        if descriptor < 0 {
+            return Err(unsafe_file());
+        }
+    }
+    // SAFETY: openat returned one newly owned descriptor.
+    let file = unsafe { File::from_raw_fd(descriptor) };
+    if created {
+        // A restrictive ambient umask may remove owner bits; set the exact private
+        // mode only on the file this call created exclusively.
+        // SAFETY: file owns a live descriptor for the exclusively created component.
+        if unsafe { libc::fchmod(file.as_raw_fd(), 0o600) } != 0 {
+            return Err(unsafe_file());
+        }
+    }
+    verify_unix_data_root_lock_file(root, &file, &name)?;
+
+    // SAFETY: file owns a live descriptor. LOCK_NB makes acquisition nonblocking.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let error = std::io::Error::last_os_error();
+        return if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+            Err(DataRootLockError::from_code(
+                DataRootLockErrorCode::Contended,
+            ))
+        } else {
+            Err(DataRootLockError::from_code(
+                DataRootLockErrorCode::Unavailable,
+            ))
+        };
+    }
+    verify_unix_data_root_lock_file(root, &file, &name)?;
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn verify_unix_data_root_lock_file(
+    root: &File,
+    file: &File,
+    name: &std::ffi::CStr,
+) -> Result<(), DataRootLockError> {
+    use std::os::fd::AsRawFd;
+
+    let unsafe_file = || DataRootLockError::from_code(DataRootLockErrorCode::UnsafeLockFile);
+    let mut held = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: file is live and held points to writable stat storage.
+    if unsafe { libc::fstat(file.as_raw_fd(), held.as_mut_ptr()) } != 0 {
+        return Err(unsafe_file());
+    }
+    // SAFETY: fstat succeeded.
+    let held = unsafe { held.assume_init() };
+    let mut named = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: root is live, name is NUL-terminated, and named is writable.
+    if unsafe {
+        libc::fstatat(
+            root.as_raw_fd(),
+            name.as_ptr(),
+            named.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        return Err(unsafe_file());
+    }
+    // SAFETY: fstatat succeeded.
+    let named = unsafe { named.assume_init() };
+    // SAFETY: geteuid has no preconditions.
+    let effective_user = unsafe { libc::geteuid() };
+    let safe = |status: &libc::stat| {
+        status.st_mode & libc::S_IFMT == libc::S_IFREG
+            && status.st_uid == effective_user
+            && status.st_nlink == 1
+            && status.st_mode & 0o777 == 0o600
+    };
+    if !safe(&held) || !safe(&named) || held.st_dev != named.st_dev || held.st_ino != named.st_ino {
+        return Err(unsafe_file());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn release_data_root_file(file: &File) {
+    use std::os::fd::AsRawFd;
+
+    // SAFETY: file owns the live descriptor on which this process acquired flock.
+    let _ = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+}
+
+#[cfg(windows)]
+fn open_and_lock_data_root_file(root: &File) -> Result<File, DataRootLockError> {
+    use std::os::windows::io::AsRawHandle;
+
+    use windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION;
+    use windows_sys::Win32::Storage::FileSystem::{
+        LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
+    };
+    use windows_sys::Win32::System::IO::OVERLAPPED;
+
+    let unsafe_file = || DataRootLockError::from_code(DataRootLockErrorCode::UnsafeLockFile);
+    let file = open_or_create_relative_private_lock_file(root).map_err(|()| unsafe_file())?;
+    verify_windows_data_root_lock_file(&file)?;
+    let mut overlapped = OVERLAPPED::default();
+    // SAFETY: file is live, overlapped is writable and remains live for this
+    // synchronous nonblocking call, and the byte range covers the lock namespace.
+    if unsafe {
+        LockFileEx(
+            file.as_raw_handle(),
+            LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+            0,
+            u32::MAX,
+            u32::MAX,
+            &mut overlapped,
+        )
+    } == 0
+    {
+        let error = std::io::Error::last_os_error();
+        return if error.raw_os_error() == Some(ERROR_LOCK_VIOLATION as i32) {
+            Err(DataRootLockError::from_code(
+                DataRootLockErrorCode::Contended,
+            ))
+        } else {
+            Err(DataRootLockError::from_code(
+                DataRootLockErrorCode::Unavailable,
+            ))
+        };
+    }
+    verify_windows_data_root_lock_file(&file)?;
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn verify_windows_data_root_lock_file(file: &File) -> Result<(), DataRootLockError> {
+    let unsafe_file = || DataRootLockError::from_code(DataRootLockErrorCode::UnsafeLockFile);
+    let metadata = file.metadata().map_err(|_| unsafe_file())?;
+    let identity = windows_file_identity(file).map_err(|()| unsafe_file())?;
+    if !metadata.file_type().is_file() || is_link_or_reparse(&metadata) || identity.links != 1 {
+        return Err(unsafe_file());
+    }
+    windows_security::verify_private_file_handle(file).map_err(|()| unsafe_file())
+}
+
+#[cfg(windows)]
+fn release_data_root_file(file: &File) {
+    use std::os::windows::io::AsRawHandle;
+
+    use windows_sys::Win32::Storage::FileSystem::UnlockFileEx;
+    use windows_sys::Win32::System::IO::OVERLAPPED;
+
+    let mut overlapped = OVERLAPPED::default();
+    // SAFETY: file is live and overlapped remains writable for this synchronous call.
+    let _ = unsafe { UnlockFileEx(file.as_raw_handle(), 0, u32::MAX, u32::MAX, &mut overlapped) };
 }
 
 fn discover_executable(candidate: &Path) -> Result<PathBuf, SidecarError> {
@@ -3660,6 +4001,78 @@ fn create_relative_private_file(directory: &File, name: &std::ffi::OsStr) -> Res
 }
 
 #[cfg(windows)]
+fn open_or_create_relative_private_lock_file(directory: &File) -> Result<File, ()> {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle};
+    use std::ptr;
+
+    use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
+    use windows_sys::Wdk::Storage::FileSystem::{
+        FILE_NON_DIRECTORY_FILE, FILE_OPEN_IF, FILE_OPEN_REPARSE_POINT,
+        FILE_SYNCHRONOUS_IO_NONALERT, NtCreateFile,
+    };
+    use windows_sys::Win32::Foundation::{
+        HANDLE, INVALID_HANDLE_VALUE, OBJ_CASE_INSENSITIVE, UNICODE_STRING,
+    };
+    use windows_sys::Win32::Security::SECURITY_DESCRIPTOR;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, READ_CONTROL, SYNCHRONIZE,
+    };
+    use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
+
+    let mut name: Vec<u16> = OsStr::new(DATA_ROOT_LOCK_FILENAME).encode_wide().collect();
+    let name_bytes = name
+        .len()
+        .checked_mul(std::mem::size_of::<u16>())
+        .ok_or(())?;
+    let maximum_bytes = name_bytes
+        .checked_add(std::mem::size_of::<u16>())
+        .ok_or(())?;
+    name.push(0);
+    let object_name = UNICODE_STRING {
+        Length: u16::try_from(name_bytes).map_err(|_| ())?,
+        MaximumLength: u16::try_from(maximum_bytes).map_err(|_| ())?,
+        Buffer: name.as_mut_ptr(),
+    };
+    let security = windows_security::owner_only_file_security_descriptor()?;
+    let attributes = OBJECT_ATTRIBUTES {
+        Length: u32::try_from(std::mem::size_of::<OBJECT_ATTRIBUTES>()).map_err(|_| ())?,
+        RootDirectory: directory.as_raw_handle(),
+        ObjectName: &object_name,
+        Attributes: OBJ_CASE_INSENSITIVE,
+        SecurityDescriptor: security.as_ptr().cast::<SECURITY_DESCRIPTOR>(),
+        SecurityQualityOfService: ptr::null(),
+    };
+    let mut status = IO_STATUS_BLOCK::default();
+    let mut handle: HANDLE = ptr::null_mut();
+    // SAFETY: all structures and buffers remain live, RootDirectory is a held
+    // owner-private directory, and FILE_OPEN_IF atomically opens or creates only the
+    // fixed non-reparse component.
+    let result = unsafe {
+        NtCreateFile(
+            &mut handle,
+            FILE_GENERIC_READ | FILE_GENERIC_WRITE | READ_CONTROL | SYNCHRONIZE,
+            &attributes,
+            &mut status,
+            ptr::null(),
+            FILE_ATTRIBUTE_NORMAL,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            FILE_OPEN_IF,
+            FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT,
+            ptr::null(),
+            0,
+        )
+    };
+    if result < 0 || handle.is_null() || handle == INVALID_HANDLE_VALUE {
+        return Err(());
+    }
+    // SAFETY: NtCreateFile returned one new owned non-inheritable file handle.
+    Ok(unsafe { File::from_raw_handle(handle) })
+}
+
+#[cfg(windows)]
 fn delete_file_on_close(file: &File) -> Result<(), ()> {
     use std::os::windows::io::AsRawHandle;
 
@@ -4077,6 +4490,14 @@ mod windows_security {
     }
 
     pub(super) fn verify_private_file_handle(file: &File) -> Result<(), ()> {
+        verify_private_handle(file, ObjectKind::File)
+    }
+
+    pub(super) fn verify_private_directory_handle(file: &File) -> Result<(), ()> {
+        verify_private_handle(file, ObjectKind::Directory)
+    }
+
+    fn verify_private_handle(file: &File, object_kind: ObjectKind) -> Result<(), ()> {
         let current_user = CurrentUser::query()?;
         let mut dacl = ptr::null_mut::<ACL>();
         let mut owner: PSID = ptr::null_mut();
@@ -4104,7 +4525,7 @@ mod windows_security {
             owner,
             &current_user,
             OwnerPolicy::CurrentUserPrivate,
-            ObjectKind::File,
+            object_kind,
         )
     }
 

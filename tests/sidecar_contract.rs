@@ -7,17 +7,16 @@ use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::process;
+use std::process::{self, Command as StdCommand, ExitStatus, Stdio};
 use std::time::Duration;
-#[cfg(unix)]
 use std::time::Instant;
 
 #[cfg(unix)]
 use carl::sidecar::ExecutableMetadataRisk;
 use carl::sidecar::{
-    ExecutableTrustDecision, JsonlSidecar, NotificationPolicy, ProviderEnvironmentProfile,
-    ProviderFileMetadata, ProviderHome, SidecarCommand, SidecarError, SidecarErrorCode,
-    SidecarLimits, VersionOutputFormat,
+    DataRootLock, DataRootLockErrorCode, ExecutableTrustDecision, JsonlSidecar, NotificationPolicy,
+    ProviderEnvironmentProfile, ProviderFileMetadata, ProviderHome, SidecarCommand, SidecarError,
+    SidecarErrorCode, SidecarLimits, VersionOutputFormat,
 };
 use libtest_mimic::{Arguments, Failed, Trial};
 use semver::{Version, VersionReq};
@@ -32,6 +31,9 @@ use support::{
 
 fn main() {
     let arguments: Vec<OsString> = env::args_os().skip(1).collect();
+    if let Some(exit_code) = dispatch_data_root_lock_fixture(&arguments) {
+        process::exit(exit_code);
+    }
     if let Some(exit_code) = dispatch_fixture(&arguments) {
         process::exit(exit_code);
     }
@@ -61,6 +63,26 @@ fn main() {
     }
 
     let trials = vec![
+        test(
+            "data-root lock requires a private absolute root",
+            data_root_lock_requires_a_private_absolute_root,
+        ),
+        test(
+            "data-root lock contends in process and releases on drop",
+            data_root_lock_contends_in_process_and_releases_on_drop,
+        ),
+        test(
+            "data-root lock rejects an unsafe persistent component",
+            data_root_lock_rejects_an_unsafe_persistent_component,
+        ),
+        test(
+            "data-root lock contends across processes and releases after crash",
+            data_root_lock_contends_across_processes_and_releases_after_crash,
+        ),
+        test(
+            "data-root locks for distinct roots do not contend",
+            data_root_locks_for_distinct_roots_do_not_contend,
+        ),
         test("missing executable is typed", missing_executable_is_typed),
         test(
             "executable is canonical regular and trusted",
@@ -227,6 +249,299 @@ fn run_async<T>(future: impl Future<Output = T>) -> T {
         .build()
         .expect("the test Tokio runtime builds")
         .block_on(future)
+}
+
+const DATA_ROOT_LOCK_FIXTURE_ARGUMENT: &str = "--carl-private-data-root-lock-fixture";
+const DATA_ROOT_LOCK_FILENAME: &str = ".carl-instance.lock";
+const LOCK_ATTEMPT_ACQUIRED: i32 = 0;
+const LOCK_ATTEMPT_CONTENDED: i32 = 23;
+
+fn dispatch_data_root_lock_fixture(arguments: &[OsString]) -> Option<i32> {
+    if arguments.first().map(OsString::as_os_str)
+        != Some(OsStr::new(DATA_ROOT_LOCK_FIXTURE_ARGUMENT))
+    {
+        return None;
+    }
+    let scenario = arguments.get(1)?.as_os_str();
+    let data_root = PathBuf::from(arguments.get(2)?);
+    match scenario {
+        scenario if scenario == OsStr::new("hold") => {
+            let ready = PathBuf::from(arguments.get(3)?);
+            let _lock = DataRootLock::acquire(&data_root).ok()?;
+            fs::write(ready, b"ready").ok()?;
+            loop {
+                std::thread::sleep(Duration::from_secs(60));
+            }
+        }
+        scenario if scenario == OsStr::new("attempt") => {
+            Some(match DataRootLock::acquire(&data_root) {
+                Ok(_lock) => {
+                    println!("acquired");
+                    LOCK_ATTEMPT_ACQUIRED
+                }
+                Err(error) if error.code() == DataRootLockErrorCode::Contended => {
+                    println!("contended");
+                    LOCK_ATTEMPT_CONTENDED
+                }
+                Err(_) => 24,
+            })
+        }
+        _ => Some(64),
+    }
+}
+
+fn data_root_lock_requires_a_private_absolute_root() -> TestResult {
+    let layout = TestLayout::new()?;
+    make_data_root_private(&layout.data)?;
+
+    let missing = layout.data.join("missing");
+    let missing_error = DataRootLock::acquire(&missing).expect_err("missing root is rejected");
+    assert_eq!(missing_error.code(), DataRootLockErrorCode::InvalidDataRoot);
+    let relative_error =
+        DataRootLock::acquire(Path::new("relative-data-root")).expect_err("relative root fails");
+    assert_eq!(
+        relative_error.code(),
+        DataRootLockErrorCode::InvalidDataRoot
+    );
+    let diagnostics = format!("{missing_error:?} {missing_error}");
+    assert!(!diagnostics.contains(&layout.data.to_string_lossy().into_owned()));
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::set_permissions(&layout.data, fs::Permissions::from_mode(0o755))?;
+        let error = DataRootLock::acquire(&layout.data).expect_err("shared root is rejected");
+        assert_eq!(error.code(), DataRootLockErrorCode::InvalidDataRoot);
+        fs::set_permissions(&layout.data, fs::Permissions::from_mode(0o700))?;
+    }
+
+    let lock = DataRootLock::acquire(&layout.data)?;
+    let diagnostics = format!("{lock:?}");
+    assert!(!diagnostics.contains(&layout.data.to_string_lossy().into_owned()));
+    drop(lock);
+    assert_lock_file_is_private(&layout.data.join(DATA_ROOT_LOCK_FILENAME))?;
+    Ok(())
+}
+
+fn data_root_lock_contends_in_process_and_releases_on_drop() -> TestResult {
+    let layout = TestLayout::new()?;
+    make_data_root_private(&layout.data)?;
+    let first =
+        DataRootLock::acquire(&layout.data).expect("the first same-process holder acquires");
+    let lock_path = layout.data.join(DATA_ROOT_LOCK_FILENAME);
+    let identity = lock_file_identity(&lock_path)?;
+
+    let error = DataRootLock::acquire(&layout.data).expect_err("second holder must contend");
+    assert_eq!(error.code(), DataRootLockErrorCode::Contended);
+    assert!(!format!("{error:?} {error}").contains(&layout.data.to_string_lossy().into_owned()));
+
+    drop(first);
+    let second = DataRootLock::acquire(&layout.data)
+        .expect("dropping the first same-process holder releases the lock");
+    assert_eq!(lock_file_identity(&lock_path)?, identity);
+    drop(second);
+    assert!(
+        lock_path.exists(),
+        "the persistent lock file is never unlinked"
+    );
+    Ok(())
+}
+
+fn data_root_lock_rejects_an_unsafe_persistent_component() -> TestResult {
+    let layout = TestLayout::new()?;
+    make_data_root_private(&layout.data)?;
+    let lock_path = layout.data.join(DATA_ROOT_LOCK_FILENAME);
+    let alias = layout.data.join("lock-hard-link");
+    drop(DataRootLock::acquire(&layout.data)?);
+    fs::hard_link(&lock_path, &alias)?;
+
+    let error = DataRootLock::acquire(&layout.data).expect_err("hard-linked lock is rejected");
+    assert_eq!(error.code(), DataRootLockErrorCode::UnsafeLockFile);
+    assert!(!format!("{error:?} {error}").contains(&layout.data.to_string_lossy().into_owned()));
+    fs::remove_file(alias)?;
+    drop(DataRootLock::acquire(&layout.data)?);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+
+        fs::remove_file(&lock_path)?;
+        symlink(layout.workspace.join("redirected-lock"), &lock_path)?;
+        let error = DataRootLock::acquire(&layout.data).expect_err("symlink lock is rejected");
+        assert_eq!(error.code(), DataRootLockErrorCode::UnsafeLockFile);
+    }
+    Ok(())
+}
+
+fn data_root_lock_contends_across_processes_and_releases_after_crash() -> TestResult {
+    let layout = TestLayout::new()?;
+    make_data_root_private(&layout.data)?;
+    let ready = layout.workspace.join("lock-holder-ready");
+    let mut holder = spawn_lock_holder(&layout.data, &ready)?;
+    wait_for_lock_holder(&mut holder, &ready)?;
+    let lock_path = layout.data.join(DATA_ROOT_LOCK_FILENAME);
+    let identity = lock_file_identity(&lock_path)?;
+
+    let (status, stdout, elapsed) = run_lock_attempt(&layout.data)?;
+    assert_eq!(status.code(), Some(LOCK_ATTEMPT_CONTENDED));
+    assert_eq!(stdout, "contended\n");
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "lock contention must fail promptly"
+    );
+
+    holder.kill()?;
+    let _ = holder.wait()?;
+
+    let (status, stdout, elapsed) = run_lock_attempt(&layout.data)?;
+    assert_eq!(status.code(), Some(LOCK_ATTEMPT_ACQUIRED));
+    assert_eq!(stdout, "acquired\n");
+    assert!(elapsed < Duration::from_secs(2));
+    assert_eq!(lock_file_identity(&lock_path)?, identity);
+    assert!(
+        lock_path.exists(),
+        "crash recovery must not unlink the lock"
+    );
+    drop(
+        DataRootLock::acquire(&layout.data)
+            .expect("the successful contender's normal exit releases the OS lock"),
+    );
+    Ok(())
+}
+
+fn data_root_locks_for_distinct_roots_do_not_contend() -> TestResult {
+    let first = TestLayout::new()?;
+    let second = TestLayout::new()?;
+    make_data_root_private(&first.data)?;
+    make_data_root_private(&second.data)?;
+    let ready = first.workspace.join("lock-holder-ready");
+    let mut holder = spawn_lock_holder(&first.data, &ready)?;
+    wait_for_lock_holder(&mut holder, &ready)?;
+
+    let (status, stdout, elapsed) = run_lock_attempt(&second.data)?;
+    holder.kill()?;
+    let _ = holder.wait()?;
+    assert_eq!(status.code(), Some(LOCK_ATTEMPT_ACQUIRED));
+    assert_eq!(stdout, "acquired\n");
+    assert!(elapsed < Duration::from_secs(2));
+    Ok(())
+}
+
+#[cfg(unix)]
+fn make_data_root_private(data_root: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(data_root, fs::Permissions::from_mode(0o700))
+}
+
+#[cfg(windows)]
+fn make_data_root_private(_data_root: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+fn spawn_lock_holder(data_root: &Path, ready: &Path) -> std::io::Result<process::Child> {
+    StdCommand::new(env::current_exe()?)
+        .arg(DATA_ROOT_LOCK_FIXTURE_ARGUMENT)
+        .arg("hold")
+        .arg(data_root)
+        .arg(ready)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+}
+
+fn wait_for_lock_holder(holder: &mut process::Child, ready: &Path) -> TestResult {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if ready.exists() {
+            return Ok(());
+        }
+        if let Some(status) = holder.try_wait()? {
+            return Err(format!("lock holder exited before readiness: {status}").into());
+        }
+        if Instant::now() >= deadline {
+            let _ = holder.kill();
+            let _ = holder.wait();
+            return Err("lock holder did not become ready".into());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn run_lock_attempt(data_root: &Path) -> TestResult<(ExitStatus, String, Duration)> {
+    let start = Instant::now();
+    let mut child = StdCommand::new(env::current_exe()?)
+        .arg(DATA_ROOT_LOCK_FIXTURE_ARGUMENT)
+        .arg("attempt")
+        .arg(data_root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let deadline = start + Duration::from_secs(5);
+    loop {
+        if child.try_wait()?.is_some() {
+            let elapsed = start.elapsed();
+            let output = child.wait_with_output()?;
+            return Ok((output.status, String::from_utf8(output.stdout)?, elapsed));
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("lock attempt did not finish promptly".into());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(unix)]
+fn lock_file_identity(path: &Path) -> std::io::Result<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = fs::metadata(path)?;
+    Ok((metadata.dev(), metadata.ino()))
+}
+
+#[cfg(windows)]
+fn lock_file_identity(path: &Path) -> std::io::Result<(u32, u64)> {
+    use std::fs::File;
+    use std::os::windows::io::AsRawHandle;
+
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+
+    let file = File::open(path)?;
+    let mut information = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
+    // SAFETY: file owns a live handle and information points to writable storage.
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle().cast(), information.as_mut_ptr()) }
+        == 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: GetFileInformationByHandle succeeded.
+    let information = unsafe { information.assume_init() };
+    Ok((
+        information.dwVolumeSerialNumber,
+        (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow),
+    ))
+}
+
+fn assert_lock_file_is_private(path: &Path) -> TestResult {
+    let metadata = fs::symlink_metadata(path)?;
+    assert!(metadata.file_type().is_file());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        // SAFETY: geteuid has no preconditions.
+        assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
+        assert_eq!(metadata.mode() & 0o777, 0o600);
+        assert_eq!(metadata.nlink(), 1);
+    }
+    Ok(())
 }
 
 async fn detect_version(
