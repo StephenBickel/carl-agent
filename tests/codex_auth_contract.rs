@@ -162,7 +162,7 @@ fn contract_timeouts() -> CodexAuthTimeouts {
     CodexAuthTimeouts::new(
         Duration::from_millis(300),
         Duration::from_millis(120),
-        Duration::from_millis(120),
+        Duration::from_millis(250),
         Duration::from_millis(10),
     )
 }
@@ -617,8 +617,8 @@ fn terminal_notification_correlation_is_strict() -> TestResult {
                 .broker
                 .auth_state()
                 .await
-                .expect_err("a null or omitted login ID cannot correlate");
-            assert_eq!(error.code(), AuthErrorCode::TimedOut);
+                .expect_err("a null or omitted login ID is lifecycle-impossible");
+            assert_eq!(error.code(), AuthErrorCode::ProtocolMismatch);
         }
         Ok(())
     })
@@ -664,6 +664,17 @@ fn account_updated_is_advisory_and_retries_are_bounded() -> TestResult {
 
 fn confirmation_resumes_after_reload_timeout() -> TestResult {
     run_async(async {
+        let mut delayed = Fixture::connect("confirmation-delayed-within-deadline").await?;
+        delayed.broker.start_login(AuthMethod::BrowserOAuth).await?;
+        assert_eq!(
+            delayed.broker.auth_state().await?,
+            AuthState::SignedIn {
+                method: AuthMethod::ProviderManaged,
+                plan: Some(SubscriptionPlan::Plus),
+            },
+            "confirmation must keep polling beyond eight intervals until its absolute deadline"
+        );
+
         let mut fixture = Fixture::connect("confirmation-timeout-then-reload").await?;
         fixture.broker.start_login(AuthMethod::BrowserOAuth).await?;
         let first = fixture
@@ -832,6 +843,7 @@ fn logout_omits_params() -> TestResult {
             .broker
             .start_login(AuthMethod::BrowserOAuth)
             .await?;
+        let cancel_failure_pid = read_codex_pid(&cancel_failure.layout)?;
         let error = cancel_failure
             .broker
             .logout()
@@ -847,6 +859,40 @@ fn logout_omits_params() -> TestResult {
             Some("account/logout"),
             "account/logout must be issued even when cancellation reconciliation fails"
         );
+        wait_until_processes_reaped(&[cancel_failure_pid]).await?;
+        let poisoned = cancel_failure
+            .broker
+            .auth_state()
+            .await
+            .expect_err("a failed pending cancellation must poison the broker after logout");
+        assert_eq!(poisoned.code(), AuthErrorCode::SidecarExited);
+
+        let mut double_failure = Fixture::connect("logout-double-failure").await?;
+        double_failure
+            .broker
+            .start_login(AuthMethod::BrowserOAuth)
+            .await?;
+        let double_failure_pid = read_codex_pid(&double_failure.layout)?;
+        let error = double_failure
+            .broker
+            .logout()
+            .await
+            .expect_err("logout failure must take precedence after teardown");
+        assert_eq!(error.code(), AuthErrorCode::ProviderRejected);
+        assert_eq!(
+            read_requests(&double_failure.layout)?
+                .last()
+                .and_then(|request| request.get("method"))
+                .and_then(Value::as_str),
+            Some("account/logout")
+        );
+        wait_until_processes_reaped(&[double_failure_pid]).await?;
+        let poisoned = double_failure
+            .broker
+            .auth_state()
+            .await
+            .expect_err("double failure must poison the broker");
+        assert_eq!(poisoned.code(), AuthErrorCode::SidecarExited);
         TestResult::Ok(())
     })
 }

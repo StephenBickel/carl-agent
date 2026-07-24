@@ -23,7 +23,6 @@ const KEYRING_CONFIG: &[u8] = b"cli_auth_credentials_store = \"keyring\"\n";
 const MAX_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_LOGIN_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const MAX_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(30);
-const MAX_CONFIRMATION_READS: usize = 8;
 const MAX_NOTIFICATIONS_PER_OPERATION: usize = 32;
 const CODEX_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const CODEX_OAUTH_SCOPE: &str =
@@ -467,7 +466,9 @@ impl CodexAuth {
                 Notification::AccountUpdated
                 | Notification::ConfigWarning
                 | Notification::RemoteControlStatus => {}
-                Notification::LoginCompleted { id: None, .. } => {}
+                Notification::LoginCompleted { id: None, .. } => {
+                    return Err(protocol_mismatch());
+                }
                 Notification::LoginCompleted {
                     id: Some(id),
                     success: _,
@@ -496,7 +497,7 @@ impl CodexAuth {
         login_id: LoginId,
         operation: &mut NotificationOperation,
     ) -> Result<AuthState, AuthError> {
-        for _ in 0..MAX_CONFIRMATION_READS {
+        loop {
             operation.check_deadline()?;
             let state = self.read_account_until(Some(operation.deadline)).await?;
             if matches!(state, AuthState::SignedIn { .. }) {
@@ -515,7 +516,9 @@ impl CodexAuth {
                         Notification::AccountUpdated
                         | Notification::ConfigWarning
                         | Notification::RemoteControlStatus => {}
-                        Notification::LoginCompleted { id: None, .. } => {}
+                        Notification::LoginCompleted { id: None, .. } => {
+                            return Err(protocol_mismatch());
+                        }
                         Notification::LoginCompleted {
                             id: Some(id),
                             success: _,
@@ -530,7 +533,6 @@ impl CodexAuth {
                 Err(_) => {}
             }
         }
-        Err(timed_out())
     }
 
     async fn drain_confirmation_notifications(
@@ -553,7 +555,9 @@ impl CodexAuth {
                 Notification::AccountUpdated
                 | Notification::ConfigWarning
                 | Notification::RemoteControlStatus => {}
-                Notification::LoginCompleted { id: None, .. } => {}
+                Notification::LoginCompleted { id: None, .. } => {
+                    return Err(protocol_mismatch());
+                }
                 Notification::LoginCompleted {
                     id: Some(id),
                     success: _,
@@ -692,6 +696,9 @@ impl CodexAuth {
                 Notification::AccountUpdated
                 | Notification::ConfigWarning
                 | Notification::RemoteControlStatus => {}
+                Notification::LoginCompleted { id: None, .. } => {
+                    return Err(protocol_mismatch());
+                }
                 Notification::LoginCompleted {
                     id: Some(id),
                     success,
@@ -747,6 +754,9 @@ impl CodexAuth {
             self.lifecycle = LoginLifecycle::Idle;
             self.terminal = None;
             self.cached_state = AuthState::SignedOut;
+        }
+        if cancel_error.is_some() {
+            self.stop_and_poison().await;
         }
         logout_result?;
         if let Some(error) = cancel_error {

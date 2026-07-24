@@ -213,6 +213,7 @@ fn codex_auth_jsonl_fixture(home: &Path, scenario: &str) -> i32 {
 
     let mut account_reads = 0_u64;
     let mut login_started = false;
+    let mut login_started_at = None;
     let mut cancel_raced = false;
     let mut logged_out = false;
     for input in io::stdin().lock().lines() {
@@ -348,6 +349,7 @@ fn codex_auth_jsonl_fixture(home: &Path, scenario: &str) -> i32 {
                     scenario,
                     account_reads,
                     login_started,
+                    login_started_at.map(|started: Instant| started.elapsed()),
                     cancel_raced,
                     logged_out,
                 );
@@ -374,6 +376,7 @@ fn codex_auth_jsonl_fixture(home: &Path, scenario: &str) -> i32 {
                     return 65;
                 }
                 login_started = true;
+                login_started_at = Some(Instant::now());
                 if matches!(scenario, "provider-error" | "provider-protocol-error") {
                     let code = if scenario == "provider-protocol-error" {
                         -32602
@@ -695,6 +698,11 @@ fn codex_auth_jsonl_fixture(home: &Path, scenario: &str) -> i32 {
                             return 74;
                         }
                     }
+                    "confirmation-delayed-within-deadline" => {
+                        if write_login_completion(CODEX_LOGIN_ID, true).is_err() {
+                            return 74;
+                        }
+                    }
                     "advisory-flood" => {
                         for _ in 0..40 {
                             if write_account_updated().is_err() {
@@ -742,7 +750,7 @@ fn codex_auth_jsonl_fixture(home: &Path, scenario: &str) -> i32 {
                         }
                         "notFound"
                     }
-                    "cancel-invalid-status" => "alreadyDone",
+                    "cancel-invalid-status" | "logout-double-failure" => "alreadyDone",
                     "cancel-canceled-late-success" => "canceled",
                     _ => {
                         if write_login_completion(CODEX_LOGIN_ID, false).is_err() {
@@ -767,6 +775,24 @@ fn codex_auth_jsonl_fixture(home: &Path, scenario: &str) -> i32 {
                 if object.len() != 2 {
                     return 65;
                 }
+                if scenario == "logout-double-failure" {
+                    if write_codex_message(&serde_json::json!({
+                        "id": id,
+                        "error": {
+                            "code": -32000,
+                            "message": CODEX_SECRET_SENTINEL,
+                        },
+                    }))
+                    .is_err()
+                    {
+                        return 74;
+                    }
+                    thread::spawn(|| {
+                        thread::sleep(Duration::from_millis(20));
+                        let _ = write_login_completion(CODEX_LOGIN_ID, true);
+                    });
+                    continue;
+                }
                 logged_out = true;
                 if scenario == "logout-pending-race"
                     && write_login_completion(CODEX_LOGIN_ID, true).is_err()
@@ -775,6 +801,12 @@ fn codex_auth_jsonl_fixture(home: &Path, scenario: &str) -> i32 {
                 }
                 if write_codex_message(&serde_json::json!({"id": id, "result": {}})).is_err() {
                     return 74;
+                }
+                if scenario == "cancel-invalid-status" {
+                    thread::spawn(|| {
+                        thread::sleep(Duration::from_millis(20));
+                        let _ = write_login_completion(CODEX_LOGIN_ID, true);
+                    });
                 }
             }
             _ => return 65,
@@ -787,6 +819,7 @@ fn codex_fixture_account(
     scenario: &str,
     account_reads: u64,
     login_started: bool,
+    login_elapsed: Option<Duration>,
     cancel_raced: bool,
     logged_out: bool,
 ) -> serde_json::Value {
@@ -806,7 +839,16 @@ fn codex_fixture_account(
         "account-unknown-type" => serde_json::json!({"type": "personalAccessToken"}),
         "stale-account-then-updated" if account_reads < 3 => serde_json::Value::Null,
         "confirmation-timeout" => serde_json::Value::Null,
-        "confirmation-timeout-then-reload" if account_reads <= 9 => serde_json::Value::Null,
+        "confirmation-timeout-then-reload"
+            if login_elapsed.is_none_or(|elapsed| elapsed < Duration::from_millis(320)) =>
+        {
+            serde_json::Value::Null
+        }
+        "confirmation-delayed-within-deadline"
+            if login_elapsed.is_none_or(|elapsed| elapsed < Duration::from_millis(150)) =>
+        {
+            serde_json::Value::Null
+        }
         "cancel-not-found-success" if !cancel_raced => serde_json::Value::Null,
         "logout-pending-race" if !cancel_raced => serde_json::Value::Null,
         "cancel-canceled" | "cancel-canceled-late-success" => serde_json::Value::Null,
