@@ -29,10 +29,14 @@ use std::time::{Duration, Instant};
 use carl::auth::codex::CODEX_LOGOUT_WARNING;
 use carl::cli::Cli;
 #[cfg(windows)]
-use carl::sidecar::DataRootLock;
+use carl::sidecar::{
+    DataRootLock, ExecutableTrustDecision, ProviderEnvironmentProfile, ProviderHome,
+};
 use clap::{CommandFactory, Parser};
 use libtest_mimic::{Arguments, Failed, Trial};
 use serde_json::Value;
+#[cfg(windows)]
+use support::fixture_command;
 use support::{
     CODEX_SECRET_SENTINEL, GROK_SECRET_SENTINEL, TestLayout, dispatch_codex_auth_fixture,
     dispatch_fixture, dispatch_grok_auth_fixture, processes_have_been_reaped,
@@ -90,8 +94,8 @@ fn main() {
     ));
     #[cfg(windows)]
     trials.push(test(
-        "Windows auth fixture data root satisfies the production lock policy",
-        windows_auth_fixture_data_root_is_private,
+        "Windows auth fixture prerequisites satisfy production security policy",
+        windows_auth_fixture_prerequisites_are_safe,
     ));
     #[cfg(unix)]
     trials.push(test(
@@ -227,11 +231,40 @@ fn status_missing_configuration_is_safe() -> TestResult {
 }
 
 #[cfg(windows)]
-fn windows_auth_fixture_data_root_is_private() -> TestResult {
+fn windows_auth_fixture_prerequisites_are_safe() -> TestResult {
     let layout = TestLayout::new()?;
     drop(
         DataRootLock::acquire(&layout.data)
-            .expect("the Windows auth fixture data root must be owner-private"),
+            .map_err(|error| format!("Windows fixture data-root lock: {}", error.code()))?,
+    );
+
+    for (profile, directory) in [
+        (ProviderEnvironmentProfile::Codex, "prerequisite-codex"),
+        (ProviderEnvironmentProfile::Grok, "prerequisite-grok"),
+    ] {
+        drop(
+            ProviderHome::prepare(
+                profile,
+                &layout.data,
+                &layout.workspace,
+                layout.data.join("providers").join(directory),
+            )
+            .map_err(|error| {
+                format!(
+                    "Windows {directory} provider-home preparation: {}",
+                    error.code()
+                )
+            })?,
+        );
+    }
+
+    let resolved = fixture_command(&layout, "strict-jsonl", "1.2.3")
+        .resolve_executable()
+        .map_err(|error| format!("Windows fixture executable resolution: {}", error.code()))?;
+    drop(
+        resolved
+            .trust(ExecutableTrustDecision::TrustCanonicalPath)
+            .map_err(|error| format!("Windows fixture executable trust: {}", error.code()))?,
     );
     Ok(())
 }
