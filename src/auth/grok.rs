@@ -481,6 +481,9 @@ impl GrokAuth {
     }
 
     async fn cancel_login_inner(&mut self) -> Result<(), AuthError> {
+        if self.local_foreground.is_none() {
+            return Err(AuthError::from_code(AuthErrorCode::ForegroundRequired));
+        }
         if self.foreground_action.is_none() {
             return Ok(());
         }

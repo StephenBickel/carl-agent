@@ -509,6 +509,12 @@ fn grok_login_requires_local_foreground() -> TestResult {
             .await
             .expect_err("a status-only broker initiated provider logout");
         assert_eq!(logout.code(), AuthErrorCode::ForegroundRequired);
+        let cancel = fixture
+            .broker
+            .cancel_login()
+            .await
+            .expect_err("a status-only broker cancelled a foreground ceremony");
+        assert_eq!(cancel.code(), AuthErrorCode::ForegroundRequired);
         assert_eq!(
             fixture.broker.auth_state().await?,
             AuthState::SignedOut,
