@@ -233,29 +233,41 @@ fn status_missing_configuration_is_safe() -> TestResult {
 #[cfg(windows)]
 fn windows_auth_fixture_prerequisites_are_safe() -> TestResult {
     let layout = TestLayout::new()?;
+    let canonical_data = fs::canonicalize(&layout.data)?;
+    let canonical_workspace = fs::canonicalize(&layout.workspace)?;
     drop(
         DataRootLock::acquire(&layout.data)
             .map_err(|error| format!("Windows fixture data-root lock: {}", error.code()))?,
     );
+    drop(
+        DataRootLock::acquire(&canonical_data)
+            .map_err(|error| format!("Windows canonical data-root lock: {}", error.code()))?,
+    );
 
     for (profile, directory) in [
-        (ProviderEnvironmentProfile::Codex, "prerequisite-codex"),
-        (ProviderEnvironmentProfile::Grok, "prerequisite-grok"),
+        (ProviderEnvironmentProfile::Codex, "codex"),
+        (ProviderEnvironmentProfile::Grok, "grok"),
     ] {
-        drop(
-            ProviderHome::prepare(
-                profile,
-                &layout.data,
-                &layout.workspace,
-                layout.data.join("providers").join(directory),
+        write_provider_scenario(&layout, directory, "signed-out")?;
+        let home = ProviderHome::prepare(
+            profile,
+            &canonical_data,
+            &canonical_workspace,
+            canonical_data.join("providers").join(directory),
+        )
+        .map_err(|error| {
+            format!(
+                "Windows {directory} provider-home preparation: {}",
+                error.code()
             )
+        })?;
+        home.write_static_file("fixture-static.toml", b"fixture = true\n")
             .map_err(|error| {
                 format!(
-                    "Windows {directory} provider-home preparation: {}",
+                    "Windows {directory} provider static-file write: {}",
                     error.code()
                 )
-            })?,
-        );
+            })?;
     }
 
     let command = fixture_command(&layout, "strict-jsonl", "1.2.3");
@@ -272,8 +284,8 @@ fn windows_auth_fixture_prerequisites_are_safe() -> TestResult {
         .block_on(command.detect_trusted_version(
             &trusted,
             ProviderEnvironmentProfile::Codex,
-            &layout.data,
-            &layout.workspace,
+            &canonical_data,
+            &canonical_workspace,
             SidecarLimits::default(),
         ))
         .map_err(|error| format!("Windows fixture version process: {}", error.code()))?;
