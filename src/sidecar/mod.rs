@@ -1218,10 +1218,16 @@ fn open_identity_directory(path: &Path) -> Result<File, SidecarError> {
     use std::fs::OpenOptions;
     use std::os::windows::fs::OpenOptionsExt;
 
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_READ_ATTRIBUTES, FILE_TRAVERSE, READ_CONTROL, SYNCHRONIZE,
+    };
+
     const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
     const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
     let directory = OpenOptions::new()
-        .read(true)
+        // Relative creates and renames require traverse access on their held root;
+        // identity and DACL revalidation require attributes and READ_CONTROL.
+        .access_mode(FILE_TRAVERSE | FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)
         .map_err(|_| SidecarError::from_code(SidecarErrorCode::InvalidProviderHome))?;
@@ -4287,11 +4293,10 @@ fn write_static_provider_file(
         // SAFETY: storage is aligned and sized for the fixed structure plus target name.
         unsafe {
             (*information).Anonymous.ReplaceIfExists = true;
-            // A simple name with a null root renames the already-open source within
-            // its current directory. The source was created relative to the held
-            // provider-home handle, so the operation remains capability-bound without
-            // asking Windows to reopen a target directory.
-            (*information).RootDirectory = std::ptr::null_mut();
+            // Resolve the validated simple name relative to the exact held
+            // provider-home directory, which was opened with the narrow access
+            // Windows requires for a rename root.
+            (*information).RootDirectory = home.directory.as_raw_handle();
             (*information).FileNameLength = filename_bytes;
             std::ptr::copy_nonoverlapping(
                 target_name.as_ptr(),
