@@ -64,6 +64,10 @@ fn main() {
             executable_is_canonical_regular_and_trusted,
         ),
         test(
+            "official Codex package wrappers resolve to packaged native binaries",
+            official_codex_package_wrappers_resolve_to_packaged_native_binaries,
+        ),
+        test(
             "executable trust precedes every execution",
             executable_trust_precedes_every_execution,
         ),
@@ -78,6 +82,10 @@ fn main() {
         test(
             "provider home is isolated and private",
             provider_home_is_isolated_and_private,
+        ),
+        test(
+            "shared workspaces use identity-only validation",
+            shared_workspaces_use_identity_only_validation,
         ),
         test(
             "provider home writes static files through its capability",
@@ -328,6 +336,104 @@ fn executable_is_canonical_regular_and_trusted() -> TestResult {
     Ok(())
 }
 
+fn official_codex_package_wrappers_resolve_to_packaged_native_binaries() -> TestResult {
+    #[cfg(all(
+        unix,
+        any(
+            all(target_os = "macos", target_arch = "aarch64"),
+            all(target_os = "macos", target_arch = "x86_64"),
+            all(target_os = "linux", target_arch = "aarch64"),
+            all(target_os = "linux", target_arch = "x86_64")
+        )
+    ))]
+    {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let layout = TestLayout::new()?;
+        let package_root = layout
+            .data
+            .join("lib")
+            .join("node_modules")
+            .join("@openai")
+            .join("codex");
+        let wrapper = package_root.join("bin").join("codex.js");
+        let native = package_root
+            .join("node_modules")
+            .join("@openai")
+            .join(codex_native_package_name())
+            .join("vendor")
+            .join(codex_native_target_triple())
+            .join("bin")
+            .join("codex");
+        fs::create_dir_all(wrapper.parent().ok_or("wrapper has no parent")?)?;
+        fs::create_dir_all(native.parent().ok_or("native binary has no parent")?)?;
+        fs::write(&wrapper, b"#!/usr/bin/env node\nprocess.exit(86)\n")?;
+        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755))?;
+        fs::copy(env::current_exe()?, &native)?;
+        fs::set_permissions(&native, fs::Permissions::from_mode(0o755))?;
+        let launcher = layout.data.join("bin").join("codex");
+        fs::create_dir_all(launcher.parent().ok_or("launcher has no parent")?)?;
+        symlink(&wrapper, &launcher)?;
+
+        let mut command = fixture_command(&layout, "strict-jsonl", "1.2.3");
+        command.executable = launcher;
+        let resolved = command.resolve_executable()?;
+        assert_eq!(resolved.canonical_path(), fs::canonicalize(&native)?);
+        let trusted = resolved.trust(ExecutableTrustDecision::TrustCanonicalPath)?;
+        assert_eq!(
+            run_async(command.detect_trusted_version(
+                &trusted,
+                ProviderEnvironmentProfile::Codex,
+                &layout.data,
+                &layout.workspace,
+                short_limits(),
+            ))?,
+            Version::parse("1.2.3")?
+        );
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn codex_native_package_name() -> &'static str {
+    "codex-darwin-arm64"
+}
+
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+fn codex_native_package_name() -> &'static str {
+    "codex-darwin-x64"
+}
+
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+fn codex_native_package_name() -> &'static str {
+    "codex-linux-arm64"
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn codex_native_package_name() -> &'static str {
+    "codex-linux-x64"
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn codex_native_target_triple() -> &'static str {
+    "aarch64-apple-darwin"
+}
+
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+fn codex_native_target_triple() -> &'static str {
+    "x86_64-apple-darwin"
+}
+
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+fn codex_native_target_triple() -> &'static str {
+    "aarch64-unknown-linux-musl"
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn codex_native_target_triple() -> &'static str {
+    "x86_64-unknown-linux-musl"
+}
+
 fn executable_trust_precedes_every_execution() -> TestResult {
     run_async(async {
         let layout = TestLayout::new()?;
@@ -535,6 +641,29 @@ fn provider_home_is_isolated_and_private() -> TestResult {
         sidecar.cancel().await?;
         TestResult::Ok(())
     })
+}
+
+fn shared_workspaces_use_identity_only_validation() -> TestResult {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let layout = TestLayout::new()?;
+        fs::set_permissions(&layout.workspace, fs::Permissions::from_mode(0o775))?;
+        let home = ProviderHome::prepare(
+            ProviderEnvironmentProfile::Codex,
+            &layout.data,
+            &layout.workspace,
+            &layout.home,
+        )?;
+        assert!(home.matches_path(&layout.home));
+        assert_eq!(
+            fs::metadata(&layout.workspace)?.permissions().mode() & 0o777,
+            0o775,
+            "workspace permissions must remain outside provider-private policy"
+        );
+    }
+    Ok(())
 }
 
 fn provider_home_writes_static_files_through_its_capability() -> TestResult {
@@ -805,6 +934,40 @@ fn unsafe_provider_homes_are_rejected() -> TestResult {
         assert_eq!(
             fs::metadata(&nested_workspace)?.permissions().mode() & 0o777,
             mode_before
+        );
+
+        let workspace_inside_home = TestLayout::new()?;
+        fs::create_dir_all(&workspace_inside_home.home)?;
+        fs::set_permissions(
+            &workspace_inside_home.home,
+            fs::Permissions::from_mode(0o750),
+        )?;
+        let nested_workspace = workspace_inside_home.home.join("project");
+        fs::create_dir(&nested_workspace)?;
+        fs::set_permissions(&nested_workspace, fs::Permissions::from_mode(0o700))?;
+        let home_mode_before = fs::metadata(&workspace_inside_home.home)?
+            .permissions()
+            .mode()
+            & 0o777;
+        let error = ProviderHome::prepare(
+            ProviderEnvironmentProfile::Codex,
+            &workspace_inside_home.data,
+            &nested_workspace,
+            &workspace_inside_home.home,
+        )
+        .expect_err("a provider home containing the workspace must be rejected");
+        assert_eq!(error.code(), SidecarErrorCode::InvalidProviderHome);
+        assert_eq!(
+            fs::metadata(&workspace_inside_home.home)?
+                .permissions()
+                .mode()
+                & 0o777,
+            home_mode_before,
+            "containment must fail before provider-home permissions are mutated"
+        );
+        assert!(
+            !workspace_inside_home.home.join(".carl-tmp").exists(),
+            "containment must fail before provider children are created"
         );
 
         let unsafe_temp = TestLayout::new()?;

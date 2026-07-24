@@ -9,8 +9,8 @@
 //!
 //! Unix provider-home creation walks from an already-open Carl data-root directory
 //! using `openat`/`mkdirat` and `O_NOFOLLOW`. Windows rejects reparse points and
-//! verifies inherited DACLs after each creation step, but its path walk assumes the
-//! Carl-owned data root remains trusted during creation. A prepared home retains
+//! creates protected owner-only DACLs at each creation step, but its path walk assumes
+//! the Carl-owned data root remains trusted during creation. A prepared home retains
 //! directory identities and rejects ambient path replacement before each provider
 //! invocation or file operation.
 
@@ -244,6 +244,8 @@ impl ResolvedExecutable {
                 SidecarError::from_code(SidecarErrorCode::ExecutableUnavailable)
             }
         })?;
+        let canonical_path =
+            resolve_packaged_codex_native_binary(&canonical_path)?.unwrap_or(canonical_path);
         let metadata = fs::symlink_metadata(&canonical_path)
             .map_err(|_| SidecarError::from_code(SidecarErrorCode::ExecutableUnavailable))?;
         if !metadata.file_type().is_file() || is_link_or_reparse(&metadata) {
@@ -872,20 +874,33 @@ impl ProviderHome {
 
 #[cfg(unix)]
 fn open_provider_directory(path: &Path) -> Result<File, SidecarError> {
-    use std::fs::OpenOptions;
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let directory = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(path)
-        .map_err(|_| SidecarError::from_code(SidecarErrorCode::InvalidProviderHome))?;
+    let directory = open_identity_directory(path)?;
     verify_owned_directory(&directory)?;
     Ok(directory)
 }
 
+#[cfg(unix)]
+fn open_identity_directory(path: &Path) -> Result<File, SidecarError> {
+    use std::fs::OpenOptions;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|_| SidecarError::from_code(SidecarErrorCode::InvalidProviderHome))
+}
+
 #[cfg(windows)]
 fn open_provider_directory(path: &Path) -> Result<File, SidecarError> {
+    let directory = open_identity_directory(path)?;
+    windows_security::verify_private_directory(path)
+        .map_err(|()| SidecarError::from_code(SidecarErrorCode::InvalidProviderHome))?;
+    Ok(directory)
+}
+
+#[cfg(windows)]
+fn open_identity_directory(path: &Path) -> Result<File, SidecarError> {
     use std::fs::OpenOptions;
     use std::os::windows::fs::OpenOptionsExt;
 
@@ -896,8 +911,14 @@ fn open_provider_directory(path: &Path) -> Result<File, SidecarError> {
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)
         .map_err(|_| SidecarError::from_code(SidecarErrorCode::InvalidProviderHome))?;
-    windows_security::verify_private_directory(path)
-        .map_err(|()| SidecarError::from_code(SidecarErrorCode::InvalidProviderHome))?;
+    let metadata = directory
+        .metadata()
+        .map_err(|_| SidecarError::from_code(SidecarErrorCode::InvalidProviderHome))?;
+    if !metadata.is_dir() || is_link_or_reparse(&metadata) {
+        return Err(SidecarError::from_code(
+            SidecarErrorCode::InvalidProviderHome,
+        ));
+    }
     Ok(directory)
 }
 
@@ -971,6 +992,101 @@ fn discover_executable(candidate: &Path) -> Result<PathBuf, SidecarError> {
     }
 
     Err(SidecarError::from_code(SidecarErrorCode::ExecutableMissing))
+}
+
+fn resolve_packaged_codex_native_binary(
+    canonical_candidate: &Path,
+) -> Result<Option<PathBuf>, SidecarError> {
+    let unavailable = || SidecarError::from_code(SidecarErrorCode::ExecutableUnavailable);
+    if canonical_candidate.file_name() != Some(std::ffi::OsStr::new("codex.js")) {
+        return Ok(None);
+    }
+    let bin = canonical_candidate.parent().ok_or_else(unavailable)?;
+    let package_root = bin.parent().ok_or_else(unavailable)?;
+    if bin.file_name() != Some(std::ffi::OsStr::new("bin"))
+        || package_root.file_name() != Some(std::ffi::OsStr::new("codex"))
+        || package_root.parent().and_then(Path::file_name) != Some(std::ffi::OsStr::new("@openai"))
+        || package_root
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::file_name)
+            != Some(std::ffi::OsStr::new("node_modules"))
+    {
+        return Ok(None);
+    }
+    let (platform_package, target, binary_name) =
+        codex_native_platform_layout().ok_or_else(unavailable)?;
+    let optional_package_vendor = package_root
+        .join("node_modules")
+        .join("@openai")
+        .join(platform_package)
+        .join("vendor");
+    let local_vendor = package_root.join("vendor");
+    let candidates = [
+        optional_package_vendor
+            .join(target)
+            .join("bin")
+            .join(binary_name),
+        optional_package_vendor
+            .join(target)
+            .join("codex")
+            .join(binary_name),
+        local_vendor.join(target).join("bin").join(binary_name),
+        local_vendor.join(target).join("codex").join(binary_name),
+    ];
+    let native = candidates
+        .into_iter()
+        .find(|candidate| {
+            fs::symlink_metadata(candidate).is_ok_and(|metadata| {
+                metadata.file_type().is_file() && !is_link_or_reparse(&metadata)
+            })
+        })
+        .ok_or_else(unavailable)?;
+    fs::canonicalize(native)
+        .map(Some)
+        .map_err(|_| unavailable())
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const fn codex_native_platform_layout() -> Option<(&'static str, &'static str, &'static str)> {
+    Some(("codex-darwin-arm64", "aarch64-apple-darwin", "codex"))
+}
+
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+const fn codex_native_platform_layout() -> Option<(&'static str, &'static str, &'static str)> {
+    Some(("codex-darwin-x64", "x86_64-apple-darwin", "codex"))
+}
+
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+const fn codex_native_platform_layout() -> Option<(&'static str, &'static str, &'static str)> {
+    Some(("codex-linux-arm64", "aarch64-unknown-linux-musl", "codex"))
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const fn codex_native_platform_layout() -> Option<(&'static str, &'static str, &'static str)> {
+    Some(("codex-linux-x64", "x86_64-unknown-linux-musl", "codex"))
+}
+
+#[cfg(all(windows, target_arch = "aarch64"))]
+const fn codex_native_platform_layout() -> Option<(&'static str, &'static str, &'static str)> {
+    Some(("codex-win32-arm64", "aarch64-pc-windows-msvc", "codex.exe"))
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+const fn codex_native_platform_layout() -> Option<(&'static str, &'static str, &'static str)> {
+    Some(("codex-win32-x64", "x86_64-pc-windows-msvc", "codex.exe"))
+}
+
+#[cfg(not(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(target_os = "macos", target_arch = "x86_64"),
+    all(target_os = "linux", target_arch = "aarch64"),
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(windows, target_arch = "aarch64"),
+    all(windows, target_arch = "x86_64")
+)))]
+const fn codex_native_platform_layout() -> Option<(&'static str, &'static str, &'static str)> {
+    None
 }
 
 #[cfg(unix)]
@@ -2575,7 +2691,7 @@ fn validated_linux_keyring_environment(
         return None;
     }
 
-    let workspace = open_provider_directory(workspace).ok()?;
+    let workspace = open_identity_directory(workspace).ok()?;
     let provider_home = open_provider_directory(provider_home).ok()?;
     let workspace_identity = directory_identity(&workspace).ok()?;
     let provider_identity = directory_identity(&provider_home).ok()?;
@@ -2584,6 +2700,9 @@ fn validated_linux_keyring_environment(
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open("/")
         .ok()?;
+    if !linux_runtime_ancestor_is_replacement_safe(&directory.metadata().ok()?) {
+        return None;
+    }
     let root_identity = directory_identity(&directory).ok()?;
     if root_identity == workspace_identity || root_identity == provider_identity {
         return None;
@@ -2607,6 +2726,9 @@ fn validated_linux_keyring_environment(
                 }
                 // SAFETY: openat returned a new owned descriptor.
                 directory = unsafe { File::from_raw_fd(descriptor) };
+                if !linux_runtime_ancestor_is_replacement_safe(&directory.metadata().ok()?) {
+                    return None;
+                }
                 let identity = directory_identity(&directory).ok()?;
                 if identity == workspace_identity || identity == provider_identity {
                     return None;
@@ -2644,7 +2766,25 @@ fn validated_linux_keyring_environment(
     {
         return None;
     }
+    let held_runtime_identity = directory_identity(&directory).ok()?;
+    let rebound_runtime = open_identity_directory(&runtime).ok()?;
+    if directory_identity(&rebound_runtime).ok()? != held_runtime_identity {
+        return None;
+    }
     Some((runtime.into_os_string(), address))
+}
+
+#[cfg(any(target_os = "linux", all(test, unix)))]
+fn linux_runtime_ancestor_is_replacement_safe(metadata: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    // SAFETY: geteuid has no preconditions.
+    let effective_user = unsafe { libc::geteuid() };
+    if !metadata.is_dir() || (metadata.uid() != 0 && metadata.uid() != effective_user) {
+        return false;
+    }
+    let mode = metadata.mode();
+    mode & 0o022 == 0 || (metadata.uid() == 0 && mode & 0o1000 != 0)
 }
 
 #[cfg(unix)]
@@ -2740,13 +2880,13 @@ fn prepare_provider_home(
         .map_err(|_| SidecarError::from_code(SidecarErrorCode::InvalidProviderHome))?;
     let canonical_home = fs::canonicalize(provider_home)
         .map_err(|_| SidecarError::from_code(SidecarErrorCode::InvalidProviderHome))?;
+    if directory_paths_overlap(&canonical_home, &canonical_workspace)? {
+        return Err(SidecarError::from_code(
+            SidecarErrorCode::InvalidProviderHome,
+        ));
+    }
     let mut found_data_root = false;
     for ancestor in canonical_home.ancestors() {
-        if same_directory_identity(ancestor, &canonical_workspace)? {
-            return Err(SidecarError::from_code(
-                SidecarErrorCode::InvalidProviderHome,
-            ));
-        }
         if same_directory_identity(ancestor, &canonical_root)? {
             found_data_root = true;
         }
@@ -2802,12 +2942,10 @@ fn preflight_provider_home(
         .map_err(|_| SidecarError::from_code(SidecarErrorCode::InvalidProviderHome))?;
     let canonical_workspace = fs::canonicalize(workspace)
         .map_err(|_| SidecarError::from_code(SidecarErrorCode::InvalidProviderHome))?;
-    for ancestor in canonical_root.ancestors() {
-        if same_directory_identity(ancestor, &canonical_workspace)? {
-            return Err(SidecarError::from_code(
-                SidecarErrorCode::InvalidProviderHome,
-            ));
-        }
+    if directory_is_same_or_ancestor(&canonical_workspace, &canonical_root)? {
+        return Err(SidecarError::from_code(
+            SidecarErrorCode::InvalidProviderHome,
+        ));
     }
     preflight_existing_provider_prefixes(data_root, &relative, &canonical_workspace)?;
     Ok(relative)
@@ -2829,8 +2967,9 @@ fn preflight_existing_provider_prefixes(
         SidecarError::from_code(SidecarErrorCode::InvalidProviderHome)
     }
 
-    let workspace = open_provider_directory(workspace)?;
-    let workspace_identity = directory_identity(&workspace)?;
+    let workspace_directory = open_identity_directory(workspace)?;
+    let workspace_identity = directory_identity(&workspace_directory)?;
+    let workspace_ancestors = directory_ancestor_identities(workspace)?;
     let mut directory = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
@@ -2863,7 +3002,7 @@ fn preflight_existing_provider_prefixes(
         // SAFETY: openat returned a new owned descriptor.
         let next = unsafe { File::from_raw_fd(descriptor) };
         verify_owned_directory(&next)?;
-        if directory_identity(&next)? == workspace_identity {
+        if workspace_ancestors.contains(&directory_identity(&next)?) {
             return Err(invalid_home());
         }
         directory = next;
@@ -2877,8 +3016,7 @@ fn preflight_existing_provider_prefixes(
     relative: &Path,
     workspace: &Path,
 ) -> Result<(), SidecarError> {
-    let workspace = open_provider_directory(workspace)?;
-    let workspace_identity = directory_identity(&workspace)?;
+    let workspace_ancestors = directory_ancestor_identities(workspace)?;
     let mut path = data_root.to_path_buf();
     for component in relative.components() {
         let Component::Normal(component) = component else {
@@ -2890,7 +3028,7 @@ fn preflight_existing_provider_prefixes(
         match fs::symlink_metadata(&path) {
             Ok(metadata) if metadata.is_dir() && !is_link_or_reparse(&metadata) => {
                 let directory = open_provider_directory(&path)?;
-                if directory_identity(&directory)? == workspace_identity {
+                if workspace_ancestors.contains(&directory_identity(&directory)?) {
                     return Err(SidecarError::from_code(
                         SidecarErrorCode::InvalidProviderHome,
                     ));
@@ -2905,6 +3043,28 @@ fn preflight_existing_provider_prefixes(
         }
     }
     Ok(())
+}
+
+fn directory_ancestor_identities(path: &Path) -> Result<Vec<DirectoryIdentity>, SidecarError> {
+    path.ancestors()
+        .map(|ancestor| {
+            let directory = open_identity_directory(ancestor)?;
+            directory_identity(&directory)
+        })
+        .collect()
+}
+
+fn directory_is_same_or_ancestor(ancestor: &Path, path: &Path) -> Result<bool, SidecarError> {
+    for candidate in path.ancestors() {
+        if same_directory_identity(ancestor, candidate)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn directory_paths_overlap(left: &Path, right: &Path) -> Result<bool, SidecarError> {
+    Ok(directory_is_same_or_ancestor(left, right)? || directory_is_same_or_ancestor(right, left)?)
 }
 
 #[cfg(unix)]
@@ -3145,6 +3305,105 @@ fn windows_file_identity(file: &File) -> Result<WindowsFileIdentity, ()> {
 }
 
 #[cfg(windows)]
+fn create_relative_private_file(directory: &File, name: &std::ffi::OsStr) -> Result<File, ()> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle};
+    use std::ptr;
+
+    use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
+    use windows_sys::Wdk::Storage::FileSystem::{
+        FILE_CREATE, FILE_NON_DIRECTORY_FILE, FILE_OPEN_REPARSE_POINT,
+        FILE_SYNCHRONOUS_IO_NONALERT, NtCreateFile,
+    };
+    use windows_sys::Win32::Foundation::{
+        HANDLE, INVALID_HANDLE_VALUE, OBJ_CASE_INSENSITIVE, UNICODE_STRING,
+    };
+    use windows_sys::Win32::Security::SECURITY_DESCRIPTOR;
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_WRITE, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, READ_CONTROL, SYNCHRONIZE,
+    };
+    use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
+
+    let mut name: Vec<u16> = name.encode_wide().collect();
+    if name.is_empty() || name.contains(&0) {
+        return Err(());
+    }
+    let name_bytes = name
+        .len()
+        .checked_mul(std::mem::size_of::<u16>())
+        .ok_or(())?;
+    let maximum_bytes = name_bytes
+        .checked_add(std::mem::size_of::<u16>())
+        .ok_or(())?;
+    name.push(0);
+    let object_name = UNICODE_STRING {
+        Length: u16::try_from(name_bytes).map_err(|_| ())?,
+        MaximumLength: u16::try_from(maximum_bytes).map_err(|_| ())?,
+        Buffer: name.as_mut_ptr(),
+    };
+    let security = windows_security::owner_only_file_security_descriptor()?;
+    let attributes = OBJECT_ATTRIBUTES {
+        Length: u32::try_from(std::mem::size_of::<OBJECT_ATTRIBUTES>()).map_err(|_| ())?,
+        RootDirectory: directory.as_raw_handle(),
+        ObjectName: &object_name,
+        Attributes: OBJ_CASE_INSENSITIVE,
+        SecurityDescriptor: security.as_ptr().cast::<SECURITY_DESCRIPTOR>(),
+        SecurityQualityOfService: ptr::null(),
+    };
+    let mut status = IO_STATUS_BLOCK::default();
+    let mut handle: HANDLE = ptr::null_mut();
+    // SAFETY: all structures and buffers remain live for the call, RootDirectory is
+    // an owned directory handle, and FILE_CREATE makes the component exclusive.
+    let result = unsafe {
+        NtCreateFile(
+            &mut handle,
+            FILE_GENERIC_WRITE | DELETE | READ_CONTROL | SYNCHRONIZE,
+            &attributes,
+            &mut status,
+            ptr::null(),
+            FILE_ATTRIBUTE_NORMAL,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_CREATE,
+            FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT,
+            ptr::null(),
+            0,
+        )
+    };
+    if result < 0 || handle.is_null() || handle == INVALID_HANDLE_VALUE {
+        return Err(());
+    }
+    // SAFETY: NtCreateFile returned one new owned file handle.
+    Ok(unsafe { File::from_raw_handle(handle) })
+}
+
+#[cfg(windows)]
+fn delete_file_on_close(file: &File) -> Result<(), ()> {
+    use std::os::windows::io::AsRawHandle;
+
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_DISPOSITION_INFO, FileDispositionInfo, SetFileInformationByHandle,
+    };
+
+    let information = FILE_DISPOSITION_INFO { DeleteFile: true };
+    // SAFETY: the file handle is live and was opened with DELETE access; information
+    // points to a correctly sized disposition structure for the duration of the call.
+    if unsafe {
+        SetFileInformationByHandle(
+            file.as_raw_handle(),
+            FileDispositionInfo,
+            (&raw const information).cast(),
+            u32::try_from(std::mem::size_of::<FILE_DISPOSITION_INFO>()).map_err(|_| ())?,
+        )
+    } == 0
+    {
+        Err(())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
 fn write_static_provider_file(
     home: &ProviderHome,
     filename: &Path,
@@ -3156,8 +3415,7 @@ fn write_static_provider_file(
     use std::os::windows::io::AsRawHandle;
 
     use windows_sys::Win32::Storage::FileSystem::{
-        DELETE, FILE_GENERIC_WRITE, FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ,
-        FILE_SHARE_WRITE, FileRenameInfo, READ_CONTROL, SetFileInformationByHandle,
+        FILE_RENAME_INFO, FileRenameInfo, SetFileInformationByHandle,
     };
 
     const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
@@ -3204,23 +3462,19 @@ fn write_static_provider_file(
     let target = home.canonical_path.join(filename);
     let before = inspect(&target)?;
     let serial = NEXT_STATIC_FILE.fetch_add(1, Ordering::Relaxed);
-    let temporary = home
-        .canonical_path
-        .join(format!(".carl-static-{}-{serial}.tmp", std::process::id()));
-    let mut temporary_file = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .access_mode(FILE_GENERIC_WRITE | DELETE | READ_CONTROL)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(&temporary)
-        .map_err(|_| unsafe_file())?;
-    let temporary_identity = windows_file_identity(&temporary_file).map_err(|()| unsafe_file())?;
-    if temporary_identity.links != 1 {
-        return Err(unsafe_file());
-    }
-    home.revalidate_bindings().map_err(|_| unsafe_file())?;
+    let temporary_name =
+        OsString::from(format!(".carl-static-{}-{serial}.tmp", std::process::id()));
+    let mut temporary_file = create_relative_private_file(&home.directory, &temporary_name)
+        .map_err(|()| unsafe_file())?;
     let result = (|| {
+        let temporary_identity =
+            windows_file_identity(&temporary_file).map_err(|()| unsafe_file())?;
+        if temporary_identity.links != 1 {
+            return Err(unsafe_file());
+        }
+        windows_security::verify_private_file_handle(&temporary_file)
+            .map_err(|()| unsafe_file())?;
+        home.revalidate_bindings().map_err(|_| unsafe_file())?;
         temporary_file
             .write_all(contents)
             .map_err(|_| unsafe_file())?;
@@ -3284,8 +3538,8 @@ fn write_static_provider_file(
         home.revalidate_bindings().map_err(|_| unsafe_file())?;
         Ok(())
     })();
-    if result.is_err() && temporary.exists() {
-        let _ = fs::remove_file(&temporary);
+    if result.is_err() {
+        let _ = delete_file_on_close(&temporary_file);
     }
     result
 }
@@ -3425,6 +3679,11 @@ fn verify_owned_directory(directory: &std::fs::File) -> Result<(), SidecarError>
 
 #[cfg(windows)]
 fn create_provider_home(data_root: &Path, relative: &Path) -> Result<(), SidecarError> {
+    use std::os::windows::ffi::OsStrExt;
+
+    use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+    use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
+
     let mut path = data_root.to_path_buf();
     windows_security::verify_private_directory(&path)
         .map_err(|()| SidecarError::from_code(SidecarErrorCode::InvalidProviderHome))?;
@@ -3435,10 +3694,21 @@ fn create_provider_home(data_root: &Path, relative: &Path) -> Result<(), Sidecar
             ));
         };
         path.push(component);
-        match fs::create_dir(&path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(_) => {
+        let security = windows_security::owner_only_directory_security_descriptor()
+            .map_err(|()| SidecarError::from_code(SidecarErrorCode::InvalidProviderHome))?;
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: u32::try_from(std::mem::size_of::<SECURITY_ATTRIBUTES>())
+                .map_err(|_| SidecarError::from_code(SidecarErrorCode::InvalidProviderHome))?,
+            lpSecurityDescriptor: security.as_ptr().cast_mut().cast(),
+            bInheritHandle: 0,
+        };
+        let mut wide_path: Vec<u16> = path.as_os_str().encode_wide().collect();
+        wide_path.push(0);
+        // SAFETY: wide_path is NUL-terminated and attributes references a live,
+        // protected owner-only security descriptor for the duration of the call.
+        if unsafe { CreateDirectoryW(wide_path.as_ptr(), &attributes) } == 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::AlreadyExists {
                 return Err(SidecarError::from_code(
                     SidecarErrorCode::InvalidProviderHome,
                 ));
@@ -3477,11 +3747,14 @@ mod windows_security {
         GetNamedSecurityInfoW, GetSecurityInfo, SE_FILE_OBJECT,
     };
     use windows_sys::Win32::Security::{
-        ACE_HEADER, ACE_INHERITED_OBJECT_TYPE_PRESENT, ACE_OBJECT_TYPE_PRESENT, ACL, AccessCheck,
+        ACCESS_ALLOWED_ACE, ACE_HEADER, ACE_INHERITED_OBJECT_TYPE_PRESENT, ACE_OBJECT_TYPE_PRESENT,
+        ACL, ACL_REVISION, AccessCheck, AddAccessAllowedAceEx, CONTAINER_INHERIT_ACE,
         DACL_SECURITY_INFORMATION, DuplicateToken, EqualSid, GENERIC_MAPPING, GetAce, GetLengthSid,
-        GetTokenInformation, INHERIT_ONLY_ACE, IsValidSid, IsWellKnownSid, MapGenericMask,
-        OWNER_SECURITY_INFORMATION, PRIVILEGE_SET, PSECURITY_DESCRIPTOR, PSID,
-        SecurityImpersonation, TOKEN_DUPLICATE, TOKEN_QUERY, TOKEN_USER, TokenUser,
+        GetTokenInformation, INHERIT_ONLY_ACE, InitializeAcl, InitializeSecurityDescriptor,
+        IsValidSid, IsWellKnownSid, MapGenericMask, OBJECT_INHERIT_ACE, OWNER_SECURITY_INFORMATION,
+        PRIVILEGE_SET, PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED, SECURITY_DESCRIPTOR,
+        SecurityImpersonation, SetSecurityDescriptorControl, SetSecurityDescriptorDacl,
+        SetSecurityDescriptorOwner, TOKEN_DUPLICATE, TOKEN_QUERY, TOKEN_USER, TokenUser,
         WinBuiltinAdministratorsSid, WinLocalSystemSid,
     };
     use windows_sys::Win32::Storage::FileSystem::{
@@ -3493,7 +3766,7 @@ mod windows_security {
     use windows_sys::Win32::System::SystemServices::{
         ACCESS_ALLOWED_ACE_TYPE, ACCESS_ALLOWED_CALLBACK_ACE_TYPE,
         ACCESS_ALLOWED_CALLBACK_OBJECT_ACE_TYPE, ACCESS_ALLOWED_COMPOUND_ACE_TYPE,
-        ACCESS_ALLOWED_OBJECT_ACE_TYPE,
+        ACCESS_ALLOWED_OBJECT_ACE_TYPE, SECURITY_DESCRIPTOR_REVISION,
     };
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -3656,6 +3929,92 @@ mod windows_security {
         }
     }
 
+    pub(super) struct OwnerOnlySecurityDescriptor {
+        _current_user: CurrentUser,
+        _acl: Vec<usize>,
+        descriptor: SECURITY_DESCRIPTOR,
+    }
+
+    impl OwnerOnlySecurityDescriptor {
+        pub(super) fn as_ptr(&self) -> *const SECURITY_DESCRIPTOR {
+            &raw const self.descriptor
+        }
+    }
+
+    pub(super) fn owner_only_file_security_descriptor() -> Result<OwnerOnlySecurityDescriptor, ()> {
+        owner_only_security_descriptor(0)
+    }
+
+    pub(super) fn owner_only_directory_security_descriptor()
+    -> Result<OwnerOnlySecurityDescriptor, ()> {
+        owner_only_security_descriptor(OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE)
+    }
+
+    fn owner_only_security_descriptor(ace_flags: u32) -> Result<OwnerOnlySecurityDescriptor, ()> {
+        let current_user = CurrentUser::query()?;
+        // SAFETY: CurrentUser::query validated the SID and its backing storage is live.
+        let sid_bytes =
+            usize::try_from(unsafe { GetLengthSid(current_user.sid()) }).map_err(|_| ())?;
+        let acl_bytes = std::mem::size_of::<ACL>()
+            .checked_add(std::mem::size_of::<ACCESS_ALLOWED_ACE>())
+            .and_then(|bytes| bytes.checked_sub(std::mem::size_of::<u32>()))
+            .and_then(|bytes| bytes.checked_add(sid_bytes))
+            .ok_or(())?;
+        let word = std::mem::size_of::<usize>();
+        let words = acl_bytes.checked_add(word - 1).ok_or(())? / word;
+        let mut acl = vec![0_usize; words];
+        let acl_pointer = acl.as_mut_ptr().cast::<ACL>();
+        let acl_length = u32::try_from(acl_bytes).map_err(|_| ())?;
+        // SAFETY: acl is aligned writable storage of acl_length bytes.
+        if unsafe { InitializeAcl(acl_pointer, acl_length, ACL_REVISION) } == 0 {
+            return Err(());
+        }
+        // SAFETY: initialized ACL has capacity for one full allow ACE and the SID
+        // remains live in current_user for the lifetime of the resulting descriptor.
+        if unsafe {
+            AddAccessAllowedAceEx(
+                acl_pointer,
+                ACL_REVISION,
+                ace_flags,
+                FILE_ALL_ACCESS,
+                current_user.sid(),
+            )
+        } == 0
+        {
+            return Err(());
+        }
+        let mut descriptor = SECURITY_DESCRIPTOR::default();
+        let descriptor_pointer = (&raw mut descriptor).cast::<c_void>();
+        // SAFETY: descriptor is writable storage for a SECURITY_DESCRIPTOR.
+        if unsafe { InitializeSecurityDescriptor(descriptor_pointer, SECURITY_DESCRIPTOR_REVISION) }
+            == 0
+        {
+            return Err(());
+        }
+        // SAFETY: descriptor is initialized and the owner SID remains live in the
+        // CurrentUser field stored alongside it.
+        if unsafe { SetSecurityDescriptorOwner(descriptor_pointer, current_user.sid(), 0) } == 0 {
+            return Err(());
+        }
+        // SAFETY: descriptor and initialized ACL are live and stored together.
+        if unsafe { SetSecurityDescriptorDacl(descriptor_pointer, 1, acl_pointer, 0) } == 0 {
+            return Err(());
+        }
+        // SAFETY: descriptor is initialized; protecting its DACL prevents inherited
+        // parent ACEs from being merged during object creation.
+        if unsafe {
+            SetSecurityDescriptorControl(descriptor_pointer, SE_DACL_PROTECTED, SE_DACL_PROTECTED)
+        } == 0
+        {
+            return Err(());
+        }
+        Ok(OwnerOnlySecurityDescriptor {
+            _current_user: current_user,
+            _acl: acl,
+            descriptor,
+        })
+    }
+
     fn verify_dacl(
         path: &Path,
         owner_policy: OwnerPolicy,
@@ -3750,7 +4109,11 @@ mod windows_security {
             }
             // SAFETY: GetAce returned a pointer to at least an ACE header.
             let header = unsafe { &*(ace.cast::<ACE_HEADER>()) };
-            if !ace_applies_to_object(u32::from(header.AceFlags)) {
+            if !allow_ace_requires_private_policy_check(
+                u32::from(header.AceFlags),
+                private,
+                object_kind,
+            ) {
                 continue;
             }
             let ace_size = usize::from(header.AceSize);
@@ -3832,6 +4195,17 @@ mod windows_security {
 
     const fn ace_applies_to_object(flags: u32) -> bool {
         flags & INHERIT_ONLY_ACE == 0
+    }
+
+    const fn allow_ace_requires_private_policy_check(
+        flags: u32,
+        private: bool,
+        object_kind: ObjectKind,
+    ) -> bool {
+        ace_applies_to_object(flags)
+            || (private
+                && matches!(object_kind, ObjectKind::Directory)
+                && flags & (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE) != 0)
     }
 
     const fn dangerous_mask(object_kind: ObjectKind) -> u32 {
@@ -3934,6 +4308,133 @@ mod windows_security {
         fn inherit_only_allow_aces_do_not_apply_to_the_current_object() {
             assert!(!ace_applies_to_object(INHERIT_ONLY_ACE));
             assert!(ace_applies_to_object(0));
+        }
+
+        #[test]
+        fn private_directories_reject_broad_inheritable_allow_aces() {
+            use windows_sys::Win32::Security::{
+                CreateWellKnownSid, SECURITY_MAX_SID_SIZE, WinWorldSid,
+            };
+
+            for inheritance in [OBJECT_INHERIT_ACE, CONTAINER_INHERIT_ACE] {
+                assert!(allow_ace_requires_private_policy_check(
+                    INHERIT_ONLY_ACE | inheritance,
+                    true,
+                    ObjectKind::Directory,
+                ));
+                assert!(!allow_ace_requires_private_policy_check(
+                    INHERIT_ONLY_ACE | inheritance,
+                    true,
+                    ObjectKind::File,
+                ));
+                assert!(!allow_ace_requires_private_policy_check(
+                    INHERIT_ONLY_ACE | inheritance,
+                    false,
+                    ObjectKind::Directory,
+                ));
+
+                let word = std::mem::size_of::<usize>();
+                let sid_words = usize::try_from(SECURITY_MAX_SID_SIZE)
+                    .expect("maximum SID size fits usize")
+                    .div_ceil(word);
+                let mut sid = vec![0_usize; sid_words];
+                let mut sid_bytes = SECURITY_MAX_SID_SIZE;
+                // SAFETY: sid is aligned writable storage of SECURITY_MAX_SID_SIZE bytes.
+                assert_ne!(
+                    unsafe {
+                        CreateWellKnownSid(
+                            WinWorldSid,
+                            ptr::null_mut(),
+                            sid.as_mut_ptr().cast(),
+                            &mut sid_bytes,
+                        )
+                    },
+                    0
+                );
+                let acl_bytes = std::mem::size_of::<ACL>()
+                    + std::mem::size_of::<ACCESS_ALLOWED_ACE>()
+                    - std::mem::size_of::<u32>()
+                    + usize::try_from(sid_bytes).expect("SID size fits usize");
+                let mut acl = vec![0_usize; acl_bytes.div_ceil(word)];
+                let acl_pointer = acl.as_mut_ptr().cast::<ACL>();
+                // SAFETY: ACL storage is aligned, writable, and large enough.
+                assert_ne!(
+                    unsafe {
+                        InitializeAcl(
+                            acl_pointer,
+                            u32::try_from(acl_bytes).expect("ACL size fits u32"),
+                            ACL_REVISION,
+                        )
+                    },
+                    0
+                );
+                // SAFETY: ACL is initialized and the world SID remains live.
+                assert_ne!(
+                    unsafe {
+                        AddAccessAllowedAceEx(
+                            acl_pointer,
+                            ACL_REVISION,
+                            INHERIT_ONLY_ACE | inheritance,
+                            FILE_GENERIC_READ,
+                            sid.as_mut_ptr().cast(),
+                        )
+                    },
+                    0
+                );
+                let current_user = CurrentUser::query().expect("current user SID is available");
+                // SAFETY: ACL and both SID buffers remain live for validation.
+                assert!(!unsafe {
+                    dacl_has_safe_writers(
+                        acl_pointer,
+                        current_user.sid(),
+                        true,
+                        ObjectKind::Directory,
+                    )
+                });
+            }
+        }
+
+        #[test]
+        fn owner_only_directory_descriptor_propagates_private_access() {
+            use windows_sys::Win32::Security::GetSecurityDescriptorDacl;
+
+            fn ace_flags(descriptor: &OwnerOnlySecurityDescriptor) -> u32 {
+                let mut present = 0;
+                let mut defaulted = 0;
+                let mut dacl = ptr::null_mut::<ACL>();
+                // SAFETY: descriptor and every output pointer remain live for the call.
+                assert_ne!(
+                    unsafe {
+                        GetSecurityDescriptorDacl(
+                            descriptor.as_ptr().cast_mut().cast(),
+                            &mut present,
+                            &mut dacl,
+                            &mut defaulted,
+                        )
+                    },
+                    0
+                );
+                assert_ne!(present, 0);
+                assert!(!dacl.is_null());
+                let mut ace = ptr::null_mut();
+                // SAFETY: the initialized owner-only DACL contains exactly one ACE.
+                assert_ne!(unsafe { GetAce(dacl, 0, &mut ace) }, 0);
+                // SAFETY: GetAce returned a live ACE header in descriptor-owned storage.
+                u32::from(unsafe { (*(ace.cast::<ACE_HEADER>())).AceFlags })
+            }
+
+            let directory = owner_only_directory_security_descriptor()
+                .expect("owner-only directory descriptor is built");
+            assert_eq!(
+                ace_flags(&directory) & (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE),
+                OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE
+            );
+            let file =
+                owner_only_file_security_descriptor().expect("owner-only file descriptor is built");
+            assert_eq!(
+                ace_flags(&file) & (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE),
+                0
+            );
         }
 
         #[test]
@@ -4050,6 +4551,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn runtime_ancestor_policy_rejects_current_user_writable_parents() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = env::temp_dir().join(format!(
+            "carl-runtime-ancestor-policy-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir(&root).expect("test ancestor is created");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o777))
+            .expect("replaceable mode is installed");
+        assert!(!linux_runtime_ancestor_is_replacement_safe(
+            &fs::metadata(&root).expect("replaceable ancestor metadata is available")
+        ));
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
+            .expect("private mode is installed");
+        assert!(linux_runtime_ancestor_is_replacement_safe(
+            &fs::metadata(&root).expect("private ancestor metadata is available")
+        ));
+        fs::remove_dir(root).expect("test ancestor is removed");
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_keyring_environment_requires_exact_private_socket_transport() {
@@ -4093,6 +4617,80 @@ mod tests {
             )
             .is_none()
         );
+
+        let unsafe_parent = root.join("unsafe-parent");
+        let nested_runtime = unsafe_parent.join("runtime");
+        fs::create_dir_all(&nested_runtime).expect("nested runtime is created");
+        fs::set_permissions(&unsafe_parent, fs::Permissions::from_mode(0o777))
+            .expect("unsafe ancestor mode is installed");
+        fs::set_permissions(&nested_runtime, fs::Permissions::from_mode(0o700))
+            .expect("nested runtime remains private");
+        let nested_bus = nested_runtime.join("bus");
+        let _nested_listener = UnixListener::bind(&nested_bus).expect("nested D-Bus socket binds");
+        let nested_address = OsString::from(format!(
+            "unix:path={}",
+            nested_bus.to_str().expect("nested test path is UTF-8")
+        ));
+        assert!(
+            validated_linux_keyring_environment(
+                Some(nested_runtime.into_os_string()),
+                Some(nested_address),
+                &workspace,
+                &home,
+            )
+            .is_none(),
+            "a private runtime below a replaceable ancestor must be rejected"
+        );
         fs::remove_dir_all(root).expect("test directories are removed");
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_static_file_tests {
+    use super::*;
+    use std::ffi::OsStr;
+    use std::io::Write;
+
+    #[test]
+    fn static_temporary_creation_and_cleanup_remain_bound_to_open_handles() {
+        let serial = NEXT_STATIC_FILE.fetch_add(1, Ordering::Relaxed);
+        let root = env::temp_dir().join(format!(
+            "carl-windows-relative-static-{}-{serial}",
+            std::process::id()
+        ));
+        let moved_root = root.with_extension("moved");
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&moved_root);
+        fs::create_dir(&root).expect("test root is created");
+        let directory = open_identity_directory(&root).expect("test root opens by identity");
+        fs::rename(&root, &moved_root).expect("held root is renamed");
+        fs::create_dir(&root).expect("ambient replacement root is created");
+
+        let temporary_name = OsStr::new("same-name.tmp");
+        let mut temporary = create_relative_private_file(&directory, temporary_name)
+            .expect("temporary file is created below the held directory");
+        windows_security::verify_private_file_handle(&temporary)
+            .expect("temporary file is atomically owner-only");
+        temporary
+            .write_all(b"held")
+            .expect("held temporary is writable");
+        assert!(moved_root.join(temporary_name).is_file());
+        assert!(!root.join(temporary_name).exists());
+
+        let renamed = moved_root.join("renamed.tmp");
+        fs::rename(moved_root.join(temporary_name), &renamed).expect("the held file is renamed");
+        fs::write(moved_root.join(temporary_name), b"replacement")
+            .expect("same-name replacement is created");
+        delete_file_on_close(&temporary).expect("held temporary is marked for deletion");
+        drop(temporary);
+        assert!(!renamed.exists(), "the exact held file is deleted");
+        assert_eq!(
+            fs::read(moved_root.join(temporary_name)).expect("replacement remains readable"),
+            b"replacement",
+            "cleanup must not delete an ambient same-name replacement"
+        );
+
+        fs::remove_dir_all(root).expect("ambient replacement root is removed");
+        fs::remove_dir_all(moved_root).expect("moved root is removed");
     }
 }
