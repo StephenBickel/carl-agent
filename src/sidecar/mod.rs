@@ -876,6 +876,24 @@ impl ProviderHome {
         })
     }
 
+    /// Require that this capability was prepared for the adapter that will use it.
+    ///
+    /// Provider profiles carry different environment and credential-isolation
+    /// contracts, so adapters must reject a mismatched capability before writing
+    /// configuration or starting a provider process.
+    pub(crate) fn require_profile(
+        &self,
+        expected: ProviderEnvironmentProfile,
+    ) -> Result<(), SidecarError> {
+        if self.profile == expected {
+            Ok(())
+        } else {
+            Err(SidecarError::from_code(
+                SidecarErrorCode::InvalidProviderHome,
+            ))
+        }
+    }
+
     /// Compare a provider-reported path with this capability without exposing the
     /// capability's path to higher-level adapters.
     pub fn matches_path(&self, path: impl AsRef<Path>) -> bool {

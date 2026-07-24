@@ -190,7 +190,11 @@ pub fn dispatch_fixture(arguments: &[OsString]) -> Option<i32> {
 }
 
 pub fn dispatch_codex_auth_fixture(arguments: &[OsString]) -> Option<i32> {
-    let home = env::var_os(FIXTURE_HOME_VARIABLE).map(PathBuf::from)?;
+    // The fallback makes a wrong-profile child observable to the adapter's
+    // no-launch regression instead of letting the fixture exit before recording it.
+    let home = env::var_os(FIXTURE_HOME_VARIABLE)
+        .or_else(|| env::var_os("GROK_HOME"))
+        .map(PathBuf::from)?;
     let scenario = fs::read_to_string(home.join("fixture-scenario")).ok()?;
     let scenario = scenario.trim();
 
@@ -225,7 +229,11 @@ pub fn dispatch_grok_auth_fixture(arguments: &[OsString]) -> Option<i32> {
     if arguments.first().map(OsString::as_os_str) != Some(OsStr::new("--no-auto-update")) {
         return None;
     }
-    let home = env::var_os("GROK_HOME").map(PathBuf::from)?;
+    // See the matching Codex fallback: this is a negative-control fixture path,
+    // never an accepted production environment contract.
+    let home = env::var_os("GROK_HOME")
+        .or_else(|| env::var_os(FIXTURE_HOME_VARIABLE))
+        .map(PathBuf::from)?;
     let scenario = fs::read_to_string(home.join("fixture-scenario")).ok()?;
     let scenario = scenario.trim();
     let arguments_as_strings: Vec<_> = arguments

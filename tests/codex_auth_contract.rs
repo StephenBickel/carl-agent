@@ -51,6 +51,10 @@ fn main() {
             codex_launch_and_handshake_are_exact,
         ),
         test(
+            "Codex rejects a Grok provider home before launch",
+            codex_rejects_grok_provider_home_before_launch,
+        ),
+        test(
             "only Codex 0.136.0 is accepted",
             only_codex_0136_is_accepted,
         ),
@@ -253,6 +257,36 @@ fn codex_launch_and_handshake_are_exact() -> TestResult {
         assert!(!raw.contains("\"jsonrpc\""));
         assert_redacted_broker(&fixture);
         TestResult::Ok(())
+    })
+}
+
+fn codex_rejects_grok_provider_home_before_launch() -> TestResult {
+    run_async(async {
+        let layout = TestLayout::new()?;
+        let trusted = trusted_fixture_executable(&layout)?;
+        let home = ProviderHome::prepare(
+            ProviderEnvironmentProfile::Grok,
+            &layout.data,
+            &layout.workspace,
+            &layout.home,
+        )?;
+        home.write_static_file("fixture-scenario", b"signed-out")?;
+
+        let error = CodexAuth::connect(&trusted, home, short_limits(), contract_timeouts())
+            .await
+            .expect_err("Codex accepted a Grok provider-home capability");
+        assert_eq!(error.code(), AuthErrorCode::ProviderRejected);
+        assert!(
+            !layout.home.join("codex-launch.json").exists(),
+            "Codex launched before rejecting the wrong provider profile"
+        );
+        assert!(
+            !layout.home.join("config.toml").exists(),
+            "Codex wrote provider policy before rejecting the wrong profile"
+        );
+        assert_contains_no_secret(&error.to_string());
+        assert_contains_no_secret(&format!("{error:?}"));
+        Ok(())
     })
 }
 

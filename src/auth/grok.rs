@@ -166,6 +166,8 @@ impl GrokAuth {
         timeouts: GrokAuthTimeouts,
         local_foreground: Option<LocalForegroundAuthorization>,
     ) -> Result<Self, AuthError> {
+        home.require_profile(crate::sidecar::ProviderEnvironmentProfile::Grok)
+            .map_err(map_sidecar_error)?;
         let timeouts = timeouts.validate()?;
         let operation_lock = home.operation_lock();
         let mut broker = Self {

@@ -226,6 +226,8 @@ impl CodexAuth {
         sidecar_limits: SidecarLimits,
         timeouts: CodexAuthTimeouts,
     ) -> Result<Self, AuthError> {
+        home.require_profile(crate::sidecar::ProviderEnvironmentProfile::Codex)
+            .map_err(map_sidecar_error)?;
         let timeouts = timeouts.validate()?;
         home.write_static_file("config.toml", KEYRING_CONFIG)
             .map_err(map_sidecar_error)?;
