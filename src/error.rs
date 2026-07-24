@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use thiserror::Error;
 
+use crate::auth::{AuthError, AuthErrorCode};
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum ErrorCode {
     #[serde(rename = "configuration_error")]
@@ -136,6 +138,39 @@ impl CarlError {
             Self::Timeout { .. } => "The operation timed out.",
             Self::Cancelled { .. } => "The operation was cancelled.",
             Self::BudgetExceeded { .. } => "The turn reached its configured budget.",
+        }
+    }
+}
+
+impl From<AuthError> for CarlError {
+    fn from(error: AuthError) -> Self {
+        match error.code() {
+            AuthErrorCode::InvalidAuthorizationUrl | AuthErrorCode::InvalidUserCode => {
+                Self::Validation {
+                    detail: "The subscription login challenge is invalid.".into(),
+                }
+            }
+            AuthErrorCode::ExecutableMissing | AuthErrorCode::UnsupportedVersion => {
+                Self::Configuration {
+                    detail: "The subscription authentication sidecar is unavailable.".into(),
+                }
+            }
+            AuthErrorCode::TimedOut => Self::Timeout {
+                detail: "Subscription authentication timed out.".into(),
+            },
+            AuthErrorCode::Cancelled => Self::Cancelled {
+                detail: "Subscription authentication was cancelled.".into(),
+            },
+            AuthErrorCode::ForegroundRequired => Self::Channel {
+                detail: "Subscription login requires a local foreground terminal.".into(),
+            },
+            AuthErrorCode::KeyringUnavailable
+            | AuthErrorCode::ProtocolMismatch
+            | AuthErrorCode::ProviderRejected
+            | AuthErrorCode::UnsafeCredentialStore
+            | AuthErrorCode::SidecarExited => Self::Authentication {
+                detail: "The subscription authentication sidecar failed.".into(),
+            },
         }
     }
 }

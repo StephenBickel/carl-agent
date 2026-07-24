@@ -396,17 +396,38 @@ calls, usage, finish reason, and typed errors.
 V1 production adapters:
 
 - OpenAI Responses API using a documented OpenAI Platform API key;
+- xAI Responses API using a documented xAI API key;
 - a configurable OpenAI-compatible adapter;
 - Ollama and LM Studio presets over that compatible adapter.
 
-The interface supports `none`, `api_key`, and a future `oauth` credential mode. Carl
-will not read Codex or ChatGPT credential stores or call private authentication
-endpoints. OpenAI OAuth may be added only if OpenAI publishes a third-party flow
-intended for this use.
+The native provider interface supports `none` and `api_key` credential modes.
+Subscription authentication is a separate delegated-agent boundary because the
+supported provider protocols expose coding agents rather than raw model sampling:
+
+- ChatGPT subscription login is owned by a Carl-isolated Codex sidecar. Carl uses the
+  documented Codex app-server authentication surface and stable `codex mcp-server`
+  delegation without receiving or reading tokens.
+- Grok subscription login is owned by a Carl-isolated Grok Build sidecar. Carl uses
+  `grok --no-auto-update login` and the documented
+  `grok --no-auto-update agent stdio` ACP surface without receiving or reading tokens.
+
+Carl will not read Codex, ChatGPT, or Grok credential stores; copy provider OAuth client
+identities; or call private authentication endpoints. A native xAI OAuth adapter may be
+enabled after xAI registers or explicitly authorizes a Carl client identity. A native
+OpenAI subscription adapter requires a future public third-party sampling flow.
 
 Provider capabilities are explicit: streaming, native tools, parallel proposals,
 reasoning items, usage reporting, context window, prompt caching, and structured
 output. Carl snapshots the provider and model capability set used by each turn.
+
+Delegates are tools inside Carl's native loop, never alternate top-level engines. Each
+invocation passes through Carl policy and bound approval and operates only on a
+content-scanned staging copy. V1 returns bounded, inert exact-replacement proposals for
+existing text files; it rejects create/delete/rename operations. Each replacement
+changes the live workspace only through a separate native patch proposal after
+independent policy, approval, stale-state, and verification checks. The event journal
+and UI identify Codex and Grok delegate work, and Carl does not attribute a delegate's
+inner tool execution or verification to its own trusted core.
 
 Provider contract tests use deterministic scripted streams and redacted HTTP cassettes.
 Cassettes contain no bearer tokens, cookies, personal prompts, or identifying request
@@ -441,19 +462,25 @@ sandbox, approval mode, environment, or artifact retention policy.
 
 `fs.apply_patch` is Carl's preferred mutation primitive. It:
 
-1. canonicalizes every path beneath the workspace;
+1. resolves every path relative to an open workspace capability without following
+   escaping symlinks;
 2. rejects `.git` and configured protected paths;
-3. captures expected hashes for all existing target files;
+3. captures the expected hash for the existing target file;
 4. parses the patch without changing disk state;
-5. produces an exact diff and policy request;
-6. binds approval to the normalized patch, path set, hashes, and workspace;
-7. rechecks hashes immediately before application;
-8. applies all changes atomically or none;
+5. produces an exact diff and policy request without fuzzy matching;
+6. binds approval to the normalized patch, path, hash, and workspace;
+7. serializes Carl-owned mutations and rechecks the hash while holding that lock;
+8. atomically replaces one file and rejects multi-file patch requests in V1;
 9. stores before/after hashes and a recovery artifact;
 10. creates a checkpoint event.
 
-A stale file fails closed and requires a newly generated patch. Fuzzy application,
-partial success, hidden writes, and approval reuse are prohibited.
+Stale state visible at the locked execution precondition fails closed and requires a
+newly generated patch. Fuzzy application, partial single-file writes, hidden writes,
+and approval reuse are prohibited. Mainstream portable filesystems do not expose an
+atomic conditional replace keyed by both inode identity and content hash, so a
+non-cooperating external writer can race the final check-to-rename interval. Carl keeps
+that interval minimal and verifies the postcondition, but does not claim a portable
+compare-and-swap guarantee against such an external writer.
 
 ### Shell and process tools
 
@@ -722,6 +749,18 @@ post-V1 and opt-in.
 - Implement context assembly, one live provider, tool routing, read/search/patch,
   verification evidence, and a final response.
 - Prove one end-to-end repository fix through a deterministic scenario.
+- Establish the native-provider versus subscription-delegate boundary.
+
+### Phase 2B: Subscription delegates
+
+- Add isolated provider homes and authentication status without exposing delegate
+  execution.
+- Add ChatGPT browser/device login through Codex-owned authentication and expose Codex
+  as a delegated specialist through `codex mcp-server` after Phase 3.
+- Add Grok browser/device login through Grok Build and expose Grok as a delegated
+  specialist through ACP after Phase 3.
+- Prove login-state, protocol-compatibility, cancellation, redaction, and fake-sidecar
+  scenarios without live credentials in CI.
 
 ### Phase 3: Policy, approvals, and sandbox
 
@@ -779,8 +818,10 @@ V1 is complete only when all of the following are true:
   feature patch, survives interruption, and rejects adversarial policy scenarios.
 - Every workspace mutation has a durable proposal, policy decision, applicable
   approval, precondition check, result, and checkpoint.
-- File patching is atomic and rejects stale content, traversal, symlink escape, and
-  protected paths.
+- Single-file patch replacement is atomic; every stale condition visible at Carl's
+  locked precondition is rejected, as are traversal, symlink escape, multi-file patch
+  requests, and protected paths. The documented external-writer race is not presented
+  as a portable compare-and-swap guarantee.
 - Shell cancellation terminates child process trees and leaves no test-owned orphan.
 - Secrets do not appear in stored events, diagnostics, exported traces, child
   environments, provider cassettes, or Telegram output.

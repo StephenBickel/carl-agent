@@ -40,5 +40,10 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      # Carl intentionally rejects provider executables beneath broadly writable
+      # ancestors. GitHub's Windows checkout root does not satisfy that boundary.
+      - name: Select a private Windows target directory
+        if: runner.os == 'Windows'
+        run: '"CARGO_TARGET_DIR=$env:USERPROFILE\carl-ci-target" >> $env:GITHUB_ENV'
       - name: Test all features
         run: cargo test --all-features

@@ -13,21 +13,83 @@ path = "src/lib.rs"
 name = "carl"
 path = "src/main.rs"
 
+[[test]]
+name = "sidecar_contract"
+path = "tests/sidecar_contract.rs"
+harness = false
+
+[[test]]
+name = "codex_auth_contract"
+path = "tests/codex_auth_contract.rs"
+harness = false
+
+[[test]]
+name = "grok_auth_contract"
+path = "tests/grok_auth_contract.rs"
+harness = false
+
+[[test]]
+name = "auth_cli_contract"
+path = "tests/auth_cli_contract.rs"
+harness = false
+
 [dependencies]
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5", features = ["derive"] }
 futures-core = "0.3"
+# Dependency review: process-wrap is pinned to 9.1.0 with only Tokio, Unix process
+# groups, and its reviewed Windows Job Object code enabled. Do not enable its
+# kill-on-drop or creation-flags wrappers until watchexec/process-wrap#35 is
+# resolved. Carl uses ProcessGroup on Unix and a local Job Object wrapper on Windows
+# whose try_wait remains pending until the job's active-process count reaches zero.
+process-wrap = { version = "=9.1.0", default-features = false, features = [
+    "tokio1",
+    "process-group",
+    "job-object",
+] }
+semver = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 rusqlite = { version = "0.37", features = ["bundled"] }
 sha2 = "0.10"
 thiserror = "2.0"
+tokio = { version = "1.47", features = [
+    "process",
+    "io-util",
+    "sync",
+    "time",
+    "rt",
+    "macros",
+    "signal",
+] }
 tokio-util = "0.7"
+url = "2.5"
 uuid = { version = "1.18", features = ["serde", "v4"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Wdk_Foundation",
+    "Wdk_Storage_FileSystem",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_JobObjects",
+    "Win32_System_IO",
+    "Win32_System_SystemInformation",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+] }
 
 [dev-dependencies]
 assert_cmd = "2.0"
 futures-util = "0.3"
+libtest-mimic = "0.8"
 predicates = "3.1"
 serde_yaml_ng = "0.10.0"
-tokio = { version = "1.47", features = ["macros", "rt"] }
+tokio = { version = "1.47", features = ["macros"] }
