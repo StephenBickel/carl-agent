@@ -9,6 +9,7 @@ use thiserror::Error;
 use url::Url;
 
 pub mod codex;
+pub mod grok;
 
 const MAX_AUTHORIZATION_URL_BYTES: usize = 8_192;
 const MAX_USER_CODE_BYTES: usize = 128;
@@ -251,6 +252,9 @@ pub enum LoginChallenge {
         verification_url: AuthorizationUrl,
         user_code: UserCode,
     },
+    /// The provider owns the foreground terminal ceremony and exposes no credential
+    /// material or navigation target to Carl.
+    ProviderManaged,
 }
 
 pub trait SubscriptionAuthBroker: Send {

@@ -27,7 +27,7 @@ use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -62,6 +62,9 @@ const MAX_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_PROCESS_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const PRIVATE_TEMP_DIRECTORY: &str = ".carl-tmp";
 static NEXT_STATIC_FILE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PROVIDER_HOME_OPERATION_LOCKS: OnceLock<
+    Mutex<HashMap<DirectoryIdentity, Weak<AsyncMutex<()>>>>,
+> = OnceLock::new();
 
 #[cfg(target_os = "linux")]
 const ALLOWED_ENVIRONMENT: &[&str] = &[
@@ -134,6 +137,9 @@ pub enum VersionOutputFormat {
     },
     /// Accept output containing exactly one whitespace-delimited semantic-version token.
     SingleSemverToken,
+    /// Accept output containing exactly one semantic-version token whose literal
+    /// spelling matches the pinned stable release.
+    SingleExactSemverToken { version: &'static str },
 }
 
 /// How inbound ID-less JSONL notifications are handled.
@@ -344,6 +350,19 @@ impl TrustedExecutable {
         Ok(())
     }
 
+    #[cfg(all(test, unix))]
+    pub(crate) fn for_test(canonical_path: PathBuf) -> Self {
+        let canonical_path =
+            fs::canonicalize(canonical_path).expect("the test executable path is canonicalizable");
+        let (metadata_risk, file_identity) = inspect_trusted_executable(&canonical_path)
+            .expect("the test executable satisfies executable metadata checks");
+        Self {
+            canonical_path,
+            metadata_risk,
+            file_identity,
+        }
+    }
+
     /// Spawn a supervised provider command attached directly to the authorized local
     /// foreground terminal.
     pub fn spawn_foreground(
@@ -367,16 +386,20 @@ impl TrustedExecutable {
         set_owner_only_child_umask(&mut command);
         let child = spawn_trusted_grouped(self, command)?;
         #[cfg(unix)]
-        let terminal = match child
-            .id()
-            .ok_or_else(|| SidecarError::from_code(SidecarErrorCode::SpawnFailed))
-            .and_then(ForegroundTerminalLease::transfer_to)
-        {
-            Ok(terminal) => Some(terminal),
-            Err(error) => {
-                let mut child = SidecarProcessGuard::new(child);
-                child.start_kill();
-                return Err(error);
+        let terminal = if authorization.is_test_only() {
+            None
+        } else {
+            match child
+                .id()
+                .ok_or_else(|| SidecarError::from_code(SidecarErrorCode::SpawnFailed))
+                .and_then(ForegroundTerminalLease::transfer_to)
+            {
+                Ok(terminal) => Some(terminal),
+                Err(error) => {
+                    let mut child = SidecarProcessGuard::new(child);
+                    child.start_kill();
+                    return Err(error);
+                }
             }
         };
         #[cfg(windows)]
@@ -395,18 +418,48 @@ impl TrustedExecutable {
 /// capability merely because the daemon happens to have terminal handles.
 pub struct LocalForegroundAuthorization {
     _private: (),
+    #[cfg(test)]
+    test_only: bool,
 }
 
 impl LocalForegroundAuthorization {
     fn validate(&self) -> Result<(), SidecarError> {
+        #[cfg(test)]
+        if self.test_only {
+            return Ok(());
+        }
         validate_local_foreground()
+    }
+
+    #[cfg(unix)]
+    const fn is_test_only(&self) -> bool {
+        #[cfg(test)]
+        {
+            self.test_only
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
     }
 }
 
 #[allow(dead_code)]
 pub(crate) fn authorize_local_foreground() -> Result<LocalForegroundAuthorization, SidecarError> {
     validate_local_foreground()?;
-    Ok(LocalForegroundAuthorization { _private: () })
+    Ok(LocalForegroundAuthorization {
+        _private: (),
+        #[cfg(test)]
+        test_only: false,
+    })
+}
+
+#[cfg(all(test, unix))]
+pub(crate) const fn authorize_test_foreground() -> LocalForegroundAuthorization {
+    LocalForegroundAuthorization {
+        _private: (),
+        test_only: true,
+    }
 }
 
 fn validate_local_foreground() -> Result<(), SidecarError> {
@@ -769,6 +822,7 @@ pub struct ProviderHome {
     private_temp_directory: File,
     private_temp_identity: DirectoryIdentity,
     canonical_workspace: PathBuf,
+    operation_lock: Arc<AsyncMutex<()>>,
 }
 
 impl fmt::Debug for ProviderHome {
@@ -806,6 +860,7 @@ impl ProviderHome {
         let home_identity = directory_identity(&directory)?;
         let private_temp_directory = open_provider_directory(&private_temp)?;
         let private_temp_identity = directory_identity(&private_temp_directory)?;
+        let operation_lock = provider_home_operation_lock(home_identity);
         let canonical_workspace = fs::canonicalize(workspace)
             .map_err(|_| SidecarError::from_code(SidecarErrorCode::InvalidProviderHome))?;
         Ok(Self {
@@ -817,6 +872,7 @@ impl ProviderHome {
             private_temp_directory,
             private_temp_identity,
             canonical_workspace,
+            operation_lock,
         })
     }
 
@@ -869,6 +925,12 @@ impl ProviderHome {
         }
         self.revalidate_bindings()?;
         inspect_provider_file(self, filename, maximum_bytes)
+    }
+
+    /// Return the in-process operation lock shared by every capability holding this
+    /// exact provider-home directory identity.
+    pub(crate) fn operation_lock(&self) -> Arc<AsyncMutex<()>> {
+        Arc::clone(&self.operation_lock)
     }
 
     fn configure_command(&self, command: &mut Command) -> Result<(), SidecarError> {
@@ -951,7 +1013,7 @@ fn open_identity_directory(path: &Path) -> Result<File, SidecarError> {
 }
 
 #[cfg(unix)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct DirectoryIdentity {
     device: u64,
     inode: u64,
@@ -977,6 +1039,18 @@ type DirectoryIdentity = WindowsFileIdentity;
 fn directory_identity(directory: &File) -> Result<DirectoryIdentity, SidecarError> {
     windows_file_identity(directory)
         .map_err(|()| SidecarError::from_code(SidecarErrorCode::InvalidProviderHome))
+}
+
+fn provider_home_operation_lock(identity: DirectoryIdentity) -> Arc<AsyncMutex<()>> {
+    let locks = PROVIDER_HOME_OPERATION_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut locks = lock(locks);
+    locks.retain(|_, operation_lock| operation_lock.strong_count() > 0);
+    if let Some(operation_lock) = locks.get(&identity).and_then(Weak::upgrade) {
+        return operation_lock;
+    }
+    let operation_lock = Arc::new(AsyncMutex::new(()));
+    locks.insert(identity, Arc::downgrade(&operation_lock));
+    operation_lock
 }
 
 fn discover_executable(candidate: &Path) -> Result<PathBuf, SidecarError> {
@@ -1364,17 +1438,59 @@ fn parse_version_output(
             Ok(parsed)
         }
         VersionOutputFormat::SingleSemverToken => {
-            let mut versions = output.split_ascii_whitespace().filter_map(|token| {
-                let token = token.trim_matches(|character: char| {
-                    matches!(character, '(' | ')' | '[' | ']' | ',' | ';')
-                });
-                Version::parse(token).ok()
-            });
-            let version = versions.next().ok_or_else(parse_error)?;
-            if versions.next().is_some() {
-                return Err(parse_error());
-            }
+            let (_, version) = parse_single_semver_token(output)?;
             Ok(version)
+        }
+        VersionOutputFormat::SingleExactSemverToken { version: expected } => {
+            let (literal, parsed) = parse_single_semver_token(output)?;
+            if literal != expected {
+                return Err(SidecarError::from_code(
+                    SidecarErrorCode::UnsupportedVersion,
+                ));
+            }
+            Ok(parsed)
+        }
+    }
+}
+
+fn parse_single_semver_token(output: &str) -> Result<(&str, Version), SidecarError> {
+    let mut versions = output.split_ascii_whitespace().filter_map(|token| {
+        let literal = token
+            .trim_matches(|character: char| matches!(character, '(' | ')' | '[' | ']' | ',' | ';'));
+        Version::parse(literal)
+            .ok()
+            .map(|version| (literal, version))
+    });
+    let version = versions
+        .next()
+        .ok_or_else(|| SidecarError::from_code(SidecarErrorCode::ProtocolViolation))?;
+    if versions.next().is_some() {
+        return Err(SidecarError::from_code(SidecarErrorCode::ProtocolViolation));
+    }
+    Ok(version)
+}
+
+/// Static policy and provider-owned credential metadata to check immediately
+/// before a compatibility-verified provider process is spawned.
+pub(crate) struct ProviderFilePreflight<'a> {
+    policy_filename: &'a Path,
+    policy_contents: &'a [u8],
+    provider_filename: &'a Path,
+    maximum_bytes: u64,
+}
+
+impl<'a> ProviderFilePreflight<'a> {
+    pub(crate) const fn new(
+        policy_filename: &'a Path,
+        policy_contents: &'a [u8],
+        provider_filename: &'a Path,
+        maximum_bytes: u64,
+    ) -> Self {
+        Self {
+            policy_filename,
+            policy_contents,
+            provider_filename,
+            maximum_bytes,
         }
     }
 }
@@ -1445,7 +1561,38 @@ impl JsonlSidecar {
     ) -> Result<Self, SidecarError> {
         let limits = limits.validate()?;
         detect_version(&specification, executable, home, limits).await?;
+        Self::spawn_prechecked(specification, executable, home, notification_policy, limits)
+    }
 
+    /// Spawn without another version probe after a provider adapter has already
+    /// verified compatibility for this exact [`TrustedExecutable`] capability.
+    ///
+    /// The caller must perform its pinned compatibility check while constructing
+    /// the adapter and must retain the same executable capability. This path still
+    /// rewrites static policy, validates credential metadata, and revalidates the
+    /// executable's file identity immediately before the auth-bearing spawn.
+    /// It is crate-private so ordinary sidecar callers cannot bypass version checks.
+    pub(crate) fn spawn_in_home_after_compatibility_check_with_provider_file_preflight(
+        specification: SidecarCommand,
+        executable: &TrustedExecutable,
+        home: &ProviderHome,
+        preflight: ProviderFilePreflight<'_>,
+        notification_policy: NotificationPolicy,
+        limits: SidecarLimits,
+    ) -> Result<Self, SidecarError> {
+        let limits = limits.validate()?;
+        home.write_static_file(preflight.policy_filename, preflight.policy_contents)?;
+        home.inspect_owner_only_file(preflight.provider_filename, preflight.maximum_bytes)?;
+        Self::spawn_prechecked(specification, executable, home, notification_policy, limits)
+    }
+
+    fn spawn_prechecked(
+        specification: SidecarCommand,
+        executable: &TrustedExecutable,
+        home: &ProviderHome,
+        notification_policy: NotificationPolicy,
+        limits: SidecarLimits,
+    ) -> Result<Self, SidecarError> {
         let mut command = Command::new(&executable.canonical_path);
         command
             .args(&specification.arguments)
@@ -3389,7 +3536,7 @@ fn same_directory_identity(left: &Path, right: &Path) -> Result<bool, SidecarErr
 }
 
 #[cfg(windows)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct WindowsFileIdentity {
     volume_serial: u32,
     file_index: u64,

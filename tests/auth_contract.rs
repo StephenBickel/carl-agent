@@ -30,6 +30,7 @@ assert_not_impl!(AuthorizationUrl: fmt::Display);
 assert_not_impl!(AuthorizationUrl: serde::Serialize);
 assert_not_impl!(UserCode: fmt::Display);
 assert_not_impl!(UserCode: serde::Serialize);
+assert_not_impl!(LoginChallenge: serde::Serialize);
 
 const ACCOUNT_EMAIL: &str = "stephen@example.test";
 const OAUTH_QUERY: &str = "client_id=carl-review&state=oauth-state-secret";
@@ -244,6 +245,13 @@ fn domain_login_challenge_is_redacted_until_explicitly_consumed()
         verification_url_string()
     );
     assert_eq!(user_code.into_foreground_string(), USER_CODE);
+
+    let provider_managed = LoginChallenge::ProviderManaged;
+    assert_eq!(
+        format!("{provider_managed:?}"),
+        "ProviderManaged",
+        "the terminal-owned challenge must remain fieldless"
+    );
 
     Ok(())
 }

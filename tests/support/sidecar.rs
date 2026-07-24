@@ -21,6 +21,8 @@ pub const FIXTURE_HOME_VARIABLE: &str = "CODEX_HOME";
 pub const SECRET_SENTINEL: &str = "sk-sidecar-contract-secret";
 pub const CODEX_SECRET_SENTINEL: &str =
     "Bearer codex-access-token-sentinel refresh-token-sentinel stephen@example.test";
+pub const GROK_SECRET_SENTINEL: &str =
+    "Bearer grok-access-token-sentinel refresh-token-sentinel stephen@example.test";
 pub const CODEX_LOGIN_ID: &str = "94d0b241-47d6-4bec-b77a-29d023cf4f2f";
 pub const CODEX_STALE_LOGIN_ID: &str = "40dfe52d-9789-4aec-88bd-4f7510b2c06e";
 #[cfg(unix)]
@@ -217,6 +219,431 @@ pub fn dispatch_codex_auth_fixture(arguments: &[OsString]) -> Option<i32> {
     }
 
     Some(codex_auth_jsonl_fixture(&home, scenario))
+}
+
+pub fn dispatch_grok_auth_fixture(arguments: &[OsString]) -> Option<i32> {
+    if arguments.first().map(OsString::as_os_str) != Some(OsStr::new("--no-auto-update")) {
+        return None;
+    }
+    let home = env::var_os("GROK_HOME").map(PathBuf::from)?;
+    let scenario = fs::read_to_string(home.join("fixture-scenario")).ok()?;
+    let scenario = scenario.trim();
+    let arguments_as_strings: Vec<_> = arguments
+        .iter()
+        .map(|argument| argument.to_string_lossy().into_owned())
+        .collect();
+
+    if record_grok_launch(&home, &arguments_as_strings).is_err() {
+        return Some(73);
+    }
+
+    let version_arguments = ["--no-auto-update", "version"];
+    if arguments_as_strings == version_arguments {
+        match scenario {
+            "unsupported-version" => println!("Grok Build CLI release 0.2.110 (stable)"),
+            "prerelease-version" => println!("Grok Build CLI release 0.2.111-alpha.1"),
+            "version-build-metadata" => {
+                println!("Grok Build CLI release 0.2.111+modified")
+            }
+            "version-multiple" => println!("Grok Build 0.2.111 runtime 1.0.0"),
+            "version-malformed" => println!("Grok Build development release"),
+            "version-oversized" => println!("{}", "x".repeat(16 * 1_024)),
+            _ => println!("Grok Build CLI release 0.2.111 (stable)"),
+        }
+        return Some(0);
+    }
+
+    let agent_arguments = ["--no-auto-update", "agent", "stdio"];
+    if arguments_as_strings == agent_arguments {
+        return Some(grok_auth_jsonl_fixture(&home, scenario));
+    }
+
+    let browser_login = ["--no-auto-update", "login"];
+    let device_login = ["--no-auto-update", "login", "--device-auth"];
+    if arguments_as_strings == browser_login || arguments_as_strings == device_login {
+        return Some(grok_login_fixture(&home, scenario));
+    }
+
+    let logout_arguments = ["--no-auto-update", "logout"];
+    if arguments_as_strings == logout_arguments {
+        let _ = fs::remove_file(home.join("auth.json"));
+        let _ = fs::remove_file(home.join("fixture-login-complete"));
+        return Some(if scenario == "logout-decline" { 19 } else { 0 });
+    }
+
+    Some(64)
+}
+
+fn grok_auth_jsonl_fixture(home: &Path, scenario: &str) -> i32 {
+    for input in io::stdin().lock().lines() {
+        let input = match input {
+            Ok(input) => input,
+            Err(_) => return 74,
+        };
+        if record_grok_request(home, &input).is_err() {
+            return 73;
+        }
+        let request: serde_json::Value = match serde_json::from_str(&input) {
+            Ok(request) => request,
+            Err(_) => return 65,
+        };
+        let Some(id) = request.get("id").cloned() else {
+            return 65;
+        };
+        let method = request.get("method").and_then(serde_json::Value::as_str);
+        match method {
+            Some("initialize") => {
+                if scenario == "unsupported-request" {
+                    if write_grok_message(&serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": 991,
+                        "method": "fs/read_text_file",
+                        "params": {"path": GROK_SECRET_SENTINEL},
+                    }))
+                    .is_err()
+                    {
+                        return 74;
+                    }
+                    continue;
+                }
+
+                let protocol_version = match scenario {
+                    "protocol-version-string" => serde_json::Value::String("1".to_owned()),
+                    "wrong-protocol-version" => serde_json::Value::from(2),
+                    _ => serde_json::Value::from(1),
+                };
+                let agent_version = match scenario {
+                    "wrong-agent-version" => "0.2.110",
+                    "agent-version-build" => "0.2.111+modified",
+                    _ => "0.2.111",
+                };
+                let auth_methods = match scenario {
+                    "missing-auth-method" => serde_json::json!([]),
+                    "other-auth-method" => serde_json::json!([{
+                        "id": "browser_oauth",
+                        "name": "Browser OAuth",
+                        "description": "Interactive provider login"
+                    }]),
+                    "xai-api-key-lookalike" => serde_json::json!([{
+                        "id": "xai.api_key.v2",
+                        "name": "Future provider method",
+                        "description": "Unknown but well formed"
+                    }]),
+                    "cached-with-other" => serde_json::json!([
+                        {
+                            "id": "browser_oauth",
+                            "name": "Browser OAuth",
+                            "description": "Interactive provider login"
+                        },
+                        {
+                            "id": "cached_token",
+                            "name": "Cached token",
+                            "description": "Provider managed"
+                        }
+                    ]),
+                    "xai-api-key" => serde_json::json!([
+                        {
+                            "id": "cached_token",
+                            "name": "Cached token",
+                            "description": "Provider managed"
+                        },
+                        {
+                            "id": "xai.api_key",
+                            "name": "API key",
+                            "description": GROK_SECRET_SENTINEL
+                        }
+                    ]),
+                    "xai-api-key-alone" => serde_json::json!([{
+                        "id": "xai.api_key",
+                        "name": "API key",
+                        "description": GROK_SECRET_SENTINEL
+                    }]),
+                    "duplicate-auth-method" => serde_json::json!([
+                        {
+                            "id": "cached_token",
+                            "name": "Cached token",
+                            "description": "Provider managed"
+                        },
+                        {
+                            "id": "cached_token",
+                            "name": "Duplicate",
+                            "description": GROK_SECRET_SENTINEL
+                        }
+                    ]),
+                    "duplicate-other-auth-method" => serde_json::json!([
+                        {
+                            "id": "browser_oauth",
+                            "name": "Browser OAuth",
+                            "description": "Interactive provider login"
+                        },
+                        {
+                            "id": "browser_oauth",
+                            "name": "Duplicate",
+                            "description": GROK_SECRET_SENTINEL
+                        }
+                    ]),
+                    "too-many-auth-methods" => serde_json::Value::Array(
+                        (0..33)
+                            .map(|index| {
+                                serde_json::json!({
+                                    "id": format!("future_method_{index}"),
+                                    "name": "Future method",
+                                    "description": "Unknown but well formed"
+                                })
+                            })
+                            .collect(),
+                    ),
+                    "malformed-auth-method" => serde_json::json!([{"id": 7}]),
+                    _ => serde_json::json!([{
+                        "id": "cached_token",
+                        "name": "Cached token",
+                        "description": "Provider managed"
+                    }]),
+                };
+                let mut result = serde_json::json!({
+                    "protocolVersion": protocol_version,
+                    "agentCapabilities": {},
+                    "agentInfo": {
+                        "name": "grok-build",
+                        "title": "Grok Build",
+                        "version": agent_version
+                    },
+                    "authMethods": auth_methods,
+                });
+                match scenario {
+                    "agent-capabilities-non-object" => {
+                        result["agentCapabilities"] = serde_json::json!([]);
+                    }
+                    "agent-capabilities-oversized" => {
+                        result["agentCapabilities"] =
+                            serde_json::json!({"padding": "x".repeat(5 * 1_024)});
+                    }
+                    "agent-capabilities-deep" => {
+                        result["agentCapabilities"] =
+                            serde_json::json!({"a": {"b": {"c": {"d": {"e": true}}}}});
+                    }
+                    _ => {}
+                }
+                if scenario == "missing-agent-info" {
+                    result
+                        .as_object_mut()
+                        .expect("fixture initialize result is an object")
+                        .remove("agentInfo");
+                } else if scenario == "missing-agent-version" {
+                    result["agentInfo"]
+                        .as_object_mut()
+                        .expect("fixture agent info is an object")
+                        .remove("version");
+                } else if scenario == "malformed-agent-info" {
+                    result["agentInfo"] = serde_json::json!({"version": 211});
+                }
+                let response = if scenario == "initialize-mixed-result-error" {
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": result,
+                        "error": {"code": -32600, "message": GROK_SECRET_SENTINEL},
+                    })
+                } else if scenario == "initialize-auth-required" {
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": {"code": -32000, "message": GROK_SECRET_SENTINEL},
+                    })
+                } else if scenario == "initialize-wrong-id" {
+                    serde_json::json!({"jsonrpc": "2.0", "id": 91, "result": result})
+                } else if scenario == "initialize-wrong-jsonrpc" {
+                    serde_json::json!({"jsonrpc": "1.0", "id": id, "result": result})
+                } else if scenario == "response-method-confusion" {
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "method": "fs/read_text_file",
+                        "params": {"path": GROK_SECRET_SENTINEL},
+                    })
+                } else {
+                    serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result})
+                };
+                if write_grok_message(&response).is_err() {
+                    return 74;
+                }
+            }
+            Some("authenticate") => {
+                let logged_in = fs::symlink_metadata(home.join("fixture-login-complete")).is_ok();
+                if scenario == "postflight-unsafe" {
+                    let target = home.join("auth-target");
+                    if write_private_fixture_file(target.clone(), GROK_SECRET_SENTINEL.as_bytes())
+                        .is_err()
+                        || fs::hard_link(target, home.join("auth.json")).is_err()
+                    {
+                        return 73;
+                    }
+                }
+                let response = match scenario {
+                    "authenticate-wrong-id" => {
+                        serde_json::json!({"jsonrpc": "2.0", "id": 92, "result": {}})
+                    }
+                    "authenticate-mixed-result-error" => serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {},
+                        "error": {"code": -32000, "message": GROK_SECRET_SENTINEL},
+                    }),
+                    "authenticate-extra-field" => serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {"credential": GROK_SECRET_SENTINEL},
+                    }),
+                    "authenticate-malformed-meta" => serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {"_meta": GROK_SECRET_SENTINEL},
+                    }),
+                    "authenticate-meta" => serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {"_meta": {"provider": "grok"}},
+                    }),
+                    "authenticate-meta-oversized" => serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {"_meta": {"padding": "x".repeat(5 * 1_024)}},
+                    }),
+                    "authenticate-meta-deep" => serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {"_meta": {"a": {"b": {"c": {"d": {"e": true}}}}}},
+                    }),
+                    "provider-rejected" => serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": {"code": -32042, "message": GROK_SECRET_SENTINEL},
+                    }),
+                    "protocol-error" => serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": {"code": -32602, "message": GROK_SECRET_SENTINEL},
+                    }),
+                    "cached-with-other" => {
+                        serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {}})
+                    }
+                    "signed-in-missing-auth-file" => {
+                        serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {}})
+                    }
+                    "signed-in" if !logged_in => {
+                        serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {}})
+                    }
+                    _ if logged_in => {
+                        serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {}})
+                    }
+                    _ => serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": {"code": -32000, "message": GROK_SECRET_SENTINEL},
+                    }),
+                };
+                if write_grok_message(&response).is_err() {
+                    return 74;
+                }
+            }
+            _ => {
+                if write_grok_message(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": {"code": -32601, "message": GROK_SECRET_SENTINEL},
+                }))
+                .is_err()
+                {
+                    return 74;
+                }
+            }
+        }
+    }
+    0
+}
+
+fn grok_login_fixture(home: &Path, scenario: &str) -> i32 {
+    if matches!(scenario, "login-timeout" | "login-cancel") {
+        return grandchild_leader(false);
+    }
+    if scenario == "login-decline" {
+        eprintln!("{GROK_SECRET_SENTINEL}");
+        return 19;
+    }
+    if write_private_fixture_file(home.join("auth.json"), GROK_SECRET_SENTINEL.as_bytes()).is_err()
+        || write_private_fixture_file(home.join("fixture-login-complete"), b"complete").is_err()
+    {
+        return 73;
+    }
+    println!("{GROK_SECRET_SENTINEL}");
+    0
+}
+
+fn write_grok_message(value: &serde_json::Value) -> io::Result<()> {
+    let stdout = io::stdout();
+    let mut stdout = stdout.lock();
+    serde_json::to_writer(&mut stdout, value)?;
+    writeln!(stdout)?;
+    stdout.flush()
+}
+
+fn record_grok_launch(home: &Path, arguments: &[String]) -> io::Result<()> {
+    let environment: BTreeMap<_, _> = env::vars_os()
+        .map(|(key, value)| {
+            (
+                key.to_string_lossy().into_owned(),
+                value.to_string_lossy().into_owned(),
+            )
+        })
+        .collect();
+    let requirements_match = fs::read(home.join("requirements.toml")).is_ok_and(|contents| {
+        contents
+            == b"[cli]\nauto_update = false\n\n[grok_com_config]\ndisable_api_key_auth = true\n"
+    });
+    let record = serde_json::json!({
+        "arguments": arguments,
+        "cwd": env::current_dir()?,
+        "environment": environment,
+        "processId": process::id(),
+        "requirementsMatch": requirements_match,
+    });
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(home.join("grok-launches.jsonl"))?;
+    serde_json::to_writer(&mut file, &record)?;
+    writeln!(file)?;
+    file.flush()
+}
+
+fn record_grok_request(home: &Path, input: &str) -> io::Result<()> {
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(home.join("grok-requests.jsonl"))?;
+    writeln!(file, "{input}")?;
+    file.flush()
+}
+
+fn write_private_fixture_file(path: PathBuf, contents: &[u8]) -> io::Result<()> {
+    let mut options = OpenOptions::new();
+    options.create(true).truncate(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(contents)?;
+    file.flush()
 }
 
 fn codex_auth_jsonl_fixture(home: &Path, scenario: &str) -> i32 {

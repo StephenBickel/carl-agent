@@ -820,6 +820,24 @@ fn versions_are_parsed_and_pinned() -> TestResult {
         Version::parse("1.8.2")?
     );
 
+    let exact_token_layout = TestLayout::new()?;
+    let mut exact_token = fixture_command(&exact_token_layout, "strict-jsonl", "1.8.2+modified");
+    exact_token.version_arguments = vec![
+        OsString::from(support::FIXTURE_ARGUMENT),
+        OsString::from("version-grok"),
+        OsString::from("1.8.2+modified"),
+        OsString::from("--no-auto-update"),
+        OsString::from("version"),
+    ];
+    exact_token.version_output = VersionOutputFormat::SingleExactSemverToken { version: "1.8.2" };
+    let error = run_async(detect_version(
+        &exact_token,
+        &exact_token_layout.data,
+        &exact_token_layout.workspace,
+    ))
+    .expect_err("an exact single-token format must reject build metadata");
+    assert_eq!(error.code(), SidecarErrorCode::UnsupportedVersion);
+
     let closed_format_layout = TestLayout::new()?;
     let mut closed_format = fixture_command(&closed_format_layout, "strict-jsonl", "1.8.2");
     closed_format.version_arguments = vec![
