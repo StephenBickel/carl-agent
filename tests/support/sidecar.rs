@@ -200,6 +200,7 @@ pub fn dispatch_codex_auth_fixture(arguments: &[OsString]) -> Option<i32> {
 
     if arguments == [OsString::from("--version")] {
         match scenario {
+            "status-hold" => return Some(hold_status_version(&home)),
             "unsupported-version" => println!("codex-cli 0.135.0"),
             "version-build-metadata" => println!("codex-cli 0.136.0+modified"),
             "version-wrong-prefix" => println!("codex 0.136.0"),
@@ -225,6 +226,21 @@ pub fn dispatch_codex_auth_fixture(arguments: &[OsString]) -> Option<i32> {
     Some(codex_auth_jsonl_fixture(&home, scenario))
 }
 
+fn hold_status_version(home: &Path) -> i32 {
+    if fs::write(
+        home.join("status-hold-pid"),
+        process::id().to_string().as_bytes(),
+    )
+    .is_err()
+    {
+        return 73;
+    }
+    while !home.join("status-hold-stop").exists() {
+        thread::sleep(Duration::from_millis(10));
+    }
+    0
+}
+
 pub fn dispatch_grok_auth_fixture(arguments: &[OsString]) -> Option<i32> {
     if arguments.first().map(OsString::as_os_str) != Some(OsStr::new("--no-auto-update")) {
         return None;
@@ -248,6 +264,13 @@ pub fn dispatch_grok_auth_fixture(arguments: &[OsString]) -> Option<i32> {
     let version_arguments = ["--no-auto-update", "version"];
     if arguments_as_strings == version_arguments {
         match scenario {
+            "connect-delay" => {
+                if fs::write(home.join("connect-delay-ready"), b"ready").is_err() {
+                    return Some(73);
+                }
+                thread::sleep(Duration::from_millis(350));
+                println!("Grok Build CLI release 0.2.111 (stable)");
+            }
             "unsupported-version" => println!("Grok Build CLI release 0.2.110 (stable)"),
             "prerelease-version" => println!("Grok Build CLI release 0.2.111-alpha.1"),
             "version-build-metadata" => {
@@ -1848,7 +1871,6 @@ pub async fn wait_until_processes_exit(pids: &[u32]) -> TestResult {
     }
 }
 
-#[cfg(windows)]
 pub fn processes_have_exited(pids: &[u32]) -> bool {
     pids.iter().all(|pid| !process_is_alive(*pid))
 }
@@ -1864,6 +1886,10 @@ pub async fn wait_until_processes_reaped(pids: &[u32]) -> TestResult {
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+}
+
+pub fn processes_have_been_reaped(pids: &[u32]) -> bool {
+    pids.iter().all(|pid| !process_exists(*pid))
 }
 
 #[cfg(unix)]

@@ -553,6 +553,16 @@ impl SubscriptionAuthBroker for GrokAuth {
     fn cancel_login(&mut self) -> AuthFuture<'_, ()> {
         Box::pin(async move { self.cancel_login_inner().await })
     }
+
+    fn shutdown(&mut self) -> AuthFuture<'_, ()> {
+        Box::pin(async move {
+            if self.foreground_action.is_some() {
+                self.cancel_login_inner().await
+            } else {
+                Ok(())
+            }
+        })
+    }
 }
 
 fn parse_rpc_response(response: Value, expected_id: i64) -> Result<RpcResponse, AuthError> {

@@ -272,9 +272,21 @@ impl CodexAuth {
             terminal: None,
             poisoned: false,
         };
-        auth.initialize().await?;
-        auth.cached_state = auth.read_account_until(None).await?;
+        if let Err(primary) = auth.initialize().await {
+            return Err(auth.cleanup_connect_failure(primary).await);
+        }
+        auth.cached_state = match auth.read_account_until(None).await {
+            Ok(state) => state,
+            Err(primary) => return Err(auth.cleanup_connect_failure(primary).await),
+        };
         Ok(auth)
+    }
+
+    async fn cleanup_connect_failure(&self, primary: AuthError) -> AuthError {
+        match self.sidecar.cancel().await {
+            Ok(()) => primary,
+            Err(error) => map_sidecar_error(error),
+        }
     }
 
     #[must_use]
@@ -789,6 +801,15 @@ impl SubscriptionAuthBroker for CodexAuth {
 
     fn cancel_login(&mut self) -> AuthFuture<'_, ()> {
         Box::pin(async move { self.cancel_login_inner().await })
+    }
+
+    fn shutdown(&mut self) -> AuthFuture<'_, ()> {
+        Box::pin(async move {
+            self.poisoned = true;
+            self.lifecycle = LoginLifecycle::Idle;
+            self.terminal = None;
+            self.sidecar.cancel().await.map_err(map_sidecar_error)
+        })
     }
 }
 

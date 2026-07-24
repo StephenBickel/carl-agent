@@ -267,6 +267,9 @@ pub trait SubscriptionAuthBroker: Send {
     fn logout(&mut self) -> AuthFuture<'_, ()>;
 
     fn cancel_login(&mut self) -> AuthFuture<'_, ()>;
+
+    /// Boundedly stop and reap every provider process owned by this broker.
+    fn shutdown(&mut self) -> AuthFuture<'_, ()>;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]

@@ -250,7 +250,7 @@ impl fmt::Debug for ResolvedExecutable {
 }
 
 impl ResolvedExecutable {
-    fn resolve(candidate: &Path) -> Result<Self, SidecarError> {
+    pub(crate) fn resolve(candidate: &Path) -> Result<Self, SidecarError> {
         let discovered = discover_executable(candidate)?;
         let canonical_path = fs::canonicalize(discovered).map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
@@ -367,7 +367,7 @@ impl TrustedExecutable {
 
     /// Spawn a supervised provider command attached directly to the authorized local
     /// foreground terminal.
-    pub fn spawn_foreground(
+    pub(crate) fn spawn_foreground(
         &self,
         authorization: &LocalForegroundAuthorization,
         arguments: &[OsString],
@@ -376,13 +376,15 @@ impl TrustedExecutable {
     ) -> Result<ForegroundProcess, SidecarError> {
         let limits = limits.validate()?;
         authorization.validate()?;
+        let provider_stdout = duplicate_verified_stderr()?;
+        let provider_stderr = duplicate_verified_stderr()?;
         let mut command = Command::new(&self.canonical_path);
         command
             .args(arguments)
             .env_clear()
             .stdin(Stdio::inherit())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
+            .stdout(provider_stdout)
+            .stderr(provider_stderr)
             .kill_on_drop(true);
         home.configure_command(&mut command)?;
         set_owner_only_child_umask(&mut command);
@@ -418,7 +420,7 @@ impl TrustedExecutable {
 ///
 /// The constructor is crate-private so remote adapters cannot manufacture this
 /// capability merely because the daemon happens to have terminal handles.
-pub struct LocalForegroundAuthorization {
+pub(crate) struct LocalForegroundAuthorization {
     _private: (),
     #[cfg(test)]
     test_only: bool,
@@ -456,6 +458,26 @@ pub(crate) fn authorize_local_foreground() -> Result<LocalForegroundAuthorizatio
     })
 }
 
+/// Report whether this process currently owns three local terminal streams.
+///
+/// This is an early no-spawn check only. Callers cannot derive a foreground
+/// authorization capability from it; mutation paths validate again at the actual
+/// provider spawn.
+#[must_use]
+pub fn local_foreground_terminal_available() -> bool {
+    validate_local_foreground().is_ok()
+}
+
+pub(crate) fn write_local_foreground_stderr(message: &[u8]) -> Result<(), SidecarError> {
+    validate_local_foreground()?;
+    let stderr = std::io::stderr();
+    let mut stderr = stderr.lock();
+    stderr
+        .write_all(message)
+        .and_then(|()| stderr.flush())
+        .map_err(|_| SidecarError::from_code(SidecarErrorCode::ForegroundRequired))
+}
+
 #[cfg(all(test, unix))]
 pub(crate) const fn authorize_test_foreground() -> LocalForegroundAuthorization {
     LocalForegroundAuthorization {
@@ -486,6 +508,64 @@ fn validate_local_foreground() -> Result<(), SidecarError> {
         }
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn duplicate_verified_stderr() -> Result<Stdio, SidecarError> {
+    use std::os::fd::{FromRawFd, OwnedFd};
+
+    // SAFETY: STDERR_FILENO names the stderr terminal just verified above. The
+    // returned descriptor is uniquely owned and immediately wrapped in OwnedFd.
+    let descriptor = unsafe { libc::fcntl(libc::STDERR_FILENO, libc::F_DUPFD_CLOEXEC, 0) };
+    if descriptor < 0 {
+        return Err(SidecarError::from_code(
+            SidecarErrorCode::ForegroundRequired,
+        ));
+    }
+    // SAFETY: fcntl returned a fresh owned descriptor on success.
+    let descriptor = unsafe { OwnedFd::from_raw_fd(descriptor) };
+    Ok(Stdio::from(descriptor))
+}
+
+#[cfg(windows)]
+fn duplicate_verified_stderr() -> Result<Stdio, SidecarError> {
+    use std::os::windows::io::{FromRawHandle, OwnedHandle};
+    use windows_sys::Win32::Foundation::{
+        DUPLICATE_SAME_ACCESS, DuplicateHandle, INVALID_HANDLE_VALUE,
+    };
+    use windows_sys::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    // SAFETY: GetStdHandle and GetCurrentProcess have no pointer preconditions.
+    let source = unsafe { GetStdHandle(STD_ERROR_HANDLE) };
+    if source.is_null() || source == INVALID_HANDLE_VALUE {
+        return Err(SidecarError::from_code(
+            SidecarErrorCode::ForegroundRequired,
+        ));
+    }
+    let process = unsafe { GetCurrentProcess() };
+    let mut duplicate = std::ptr::null_mut();
+    // SAFETY: source is the verified stderr handle, duplicate points to writable
+    // handle storage, and both process pseudo-handles refer to this process.
+    let duplicated = unsafe {
+        DuplicateHandle(
+            process,
+            source,
+            process,
+            &mut duplicate,
+            0,
+            1,
+            DUPLICATE_SAME_ACCESS,
+        )
+    };
+    if duplicated == 0 || duplicate.is_null() {
+        return Err(SidecarError::from_code(
+            SidecarErrorCode::ForegroundRequired,
+        ));
+    }
+    // SAFETY: DuplicateHandle returned a fresh owned handle on success.
+    let duplicate = unsafe { OwnedHandle::from_raw_handle(duplicate) };
+    Ok(Stdio::from(duplicate))
 }
 
 /// A terminal-inherited, process-group/job-owned provider process.

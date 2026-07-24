@@ -598,4 +598,8 @@ impl SubscriptionAuthBroker for FakeBroker {
         self.state = AuthState::SignedOut;
         Box::pin(async { Ok(()) })
     }
+
+    fn shutdown(&mut self) -> AuthFuture<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
 }
