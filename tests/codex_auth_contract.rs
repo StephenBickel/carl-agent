@@ -8,6 +8,7 @@ use std::fs;
 use std::future::Future;
 use std::path::Path;
 use std::process;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use carl::auth::codex::{CodexAuth, CodexAuthTimeouts};
@@ -22,10 +23,13 @@ use libtest_mimic::{Arguments, Failed, Trial};
 use serde_json::{Value, json};
 use support::{
     CODEX_AUTH_MANAGER_RELOADED, CODEX_DELAYED_CONFIRMATION_READY_ON_READ, CODEX_LOGIN_ID,
-    CODEX_NOTIFICATION_FLOOD_READY, CODEX_SECRET_SENTINEL, PATH_SENTINEL, SECRET_SENTINEL,
-    TestLayout, TestResult, dispatch_codex_auth_fixture, fixture_command, short_limits,
-    wait_for_fixture_marker, wait_until_processes_reaped, write_fixture_marker,
+    CODEX_LOGIN_START_RECEIVED, CODEX_NOTIFICATION_FLOOD_READY, CODEX_SECRET_SENTINEL,
+    PATH_SENTINEL, SECRET_SENTINEL, TestLayout, TestResult, dispatch_codex_auth_fixture,
+    fixture_command, short_limits, wait_for_fixture_marker, wait_until_processes_reaped,
+    write_fixture_marker,
 };
+
+static CODEX_FIXTURE_SETUP_GATE: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
 fn main() {
     let arguments: Vec<OsString> = env::args_os().skip(1).collect();
@@ -101,8 +105,16 @@ fn main() {
             notification_floods_are_bounded,
         ),
         test(
-            "failed login starts cancel or reap the ceremony",
-            failed_login_starts_are_cleaned_up,
+            "timed-out login start reaps its ceremony",
+            timed_out_login_start_is_cleaned_up,
+        ),
+        test(
+            "login start without an ID reaps its ceremony",
+            missing_id_login_start_is_cleaned_up,
+        ),
+        test(
+            "malformed login start response reaps its ceremony",
+            malformed_login_start_is_cleaned_up,
         ),
         test(
             "cancel responses and completion races are reconciled",
@@ -161,6 +173,13 @@ impl Fixture {
             &layout.home,
         )?;
         home.write_static_file("fixture-scenario", scenario.as_bytes())?;
+        // Contract trials intentionally use a production-strong 300 ms request
+        // deadline. Serialize only their process-heavy fixture setup so scheduler
+        // contention cannot consume that deadline before the child is responsive.
+        let _setup = CODEX_FIXTURE_SETUP_GATE
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
         let broker = CodexAuth::connect(&trusted, home, short_limits(), timeouts).await?;
         Ok(Self { broker, layout })
     }
@@ -811,29 +830,45 @@ fn notification_floods_are_bounded() -> TestResult {
     })
 }
 
-fn failed_login_starts_are_cleaned_up() -> TestResult {
+fn timed_out_login_start_is_cleaned_up() -> TestResult {
+    failed_login_start_is_cleaned_up("start-response-timeout", AuthErrorCode::TimedOut)
+}
+
+fn missing_id_login_start_is_cleaned_up() -> TestResult {
+    failed_login_start_is_cleaned_up("start-missing-login-id", AuthErrorCode::ProtocolMismatch)
+}
+
+fn malformed_login_start_is_cleaned_up() -> TestResult {
+    failed_login_start_is_cleaned_up("response-method-bearing", AuthErrorCode::ProtocolMismatch)
+}
+
+fn failed_login_start_is_cleaned_up(scenario: &'static str, expected: AuthErrorCode) -> TestResult {
     run_async(async {
-        for (scenario, expected) in [
-            ("start-response-timeout", AuthErrorCode::TimedOut),
-            ("start-missing-login-id", AuthErrorCode::ProtocolMismatch),
-            ("response-method-bearing", AuthErrorCode::ProtocolMismatch),
-        ] {
-            let mut fixture = Fixture::connect(scenario).await?;
-            let pid = read_codex_pid(&fixture.layout)?;
-            let error = fixture
-                .broker
-                .start_login(AuthMethod::BrowserOAuth)
-                .await
-                .expect_err("an unrecoverable start failure must fail");
-            assert_eq!(error.code(), expected);
-            wait_until_processes_reaped(&[pid]).await?;
-            let poisoned = fixture
-                .broker
-                .auth_state()
-                .await
-                .expect_err("a terminated login sidecar must poison the broker");
-            assert_eq!(poisoned.code(), AuthErrorCode::SidecarExited);
-        }
+        let mut fixture = Fixture::connect(scenario)
+            .await
+            .map_err(|error| format!("{scenario} fixture connect failed: {error}"))?;
+        let pid = read_codex_pid(&fixture.layout)?;
+        let home = fixture.layout.home.clone();
+        let (start, received) = tokio::join!(
+            fixture.broker.start_login(AuthMethod::BrowserOAuth),
+            wait_for_fixture_marker(&home, CODEX_LOGIN_START_RECEIVED),
+        );
+        received.map_err(|error| format!("{scenario} login-start barrier failed: {error}"))?;
+        let error = start.expect_err("an unrecoverable start failure must fail");
+        assert_eq!(error.code(), expected, "scenario {scenario}");
+        wait_until_processes_reaped(&[pid])
+            .await
+            .map_err(|error| format!("{scenario} fixture reap failed: {error}"))?;
+        let poisoned = fixture
+            .broker
+            .auth_state()
+            .await
+            .expect_err("a terminated login sidecar must poison the broker");
+        assert_eq!(
+            poisoned.code(),
+            AuthErrorCode::SidecarExited,
+            "scenario {scenario}"
+        );
         Ok(())
     })
 }

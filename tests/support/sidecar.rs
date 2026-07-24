@@ -27,6 +27,7 @@ pub const CODEX_LOGIN_ID: &str = "94d0b241-47d6-4bec-b77a-29d023cf4f2f";
 pub const CODEX_STALE_LOGIN_ID: &str = "40dfe52d-9789-4aec-88bd-4f7510b2c06e";
 pub const CODEX_AUTH_MANAGER_RELOADED: &str = "auth-manager-reloaded";
 pub const CODEX_DELAYED_CONFIRMATION_READY_ON_READ: u64 = 10;
+pub const CODEX_LOGIN_START_RECEIVED: &str = "login-start-received";
 pub const CODEX_NOTIFICATION_FLOOD_READY: &str = "notification-flood-ready";
 #[cfg(unix)]
 pub const PATH_SENTINEL: &str = "/carl-untrusted-path-sentinel";
@@ -1025,6 +1026,9 @@ fn codex_auth_jsonl_fixture(home: &Path, scenario: &str) -> i32 {
                     return 65;
                 }
                 login_started = true;
+                if write_fixture_marker(home, CODEX_LOGIN_START_RECEIVED).is_err() {
+                    return 73;
+                }
                 if matches!(scenario, "provider-error" | "provider-protocol-error") {
                     let code = if scenario == "provider-protocol-error" {
                         -32602
