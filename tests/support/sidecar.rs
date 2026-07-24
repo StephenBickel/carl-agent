@@ -10,11 +10,14 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use carl::sidecar::{SidecarCommand, SidecarLimits, VersionOutputFormat};
+use carl::sidecar::{
+    ExecutableTrustDecision, JsonlSidecar, SidecarCommand, SidecarError, SidecarLimits,
+    VersionOutputFormat,
+};
 use semver::VersionReq;
 
 pub const FIXTURE_ARGUMENT: &str = "--carl-private-sidecar-fixture";
-pub const FIXTURE_HOME_VARIABLE: &str = "CARL_TEST_PROVIDER_HOME";
+pub const FIXTURE_HOME_VARIABLE: &str = "CODEX_HOME";
 pub const SECRET_SENTINEL: &str = "sk-sidecar-contract-secret";
 #[cfg(unix)]
 pub const PATH_SENTINEL: &str = "/carl-untrusted-path-sentinel";
@@ -22,6 +25,7 @@ pub const PATH_SENTINEL: &str = "/carl-untrusted-path-sentinel";
 pub const PATH_SENTINEL: &str = r"C:\carl-untrusted-path-sentinel";
 
 static NEXT_TEMPORARY_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+static RECEIVED_REQUESTS: AtomicU64 = AtomicU64::new(0);
 
 pub type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -72,11 +76,21 @@ pub fn fixture_command(layout: &TestLayout, scenario: &str, version: &str) -> Si
             OsString::from("--version"),
         ],
         version_output: VersionOutputFormat::ExactPrefix("carl-sidecar-fixture"),
-        home_variable: FIXTURE_HOME_VARIABLE,
         isolated_home: layout.home.clone(),
         supported_versions: VersionReq::parse(">=1.2.0, <2.0.0")
             .expect("the fixture version requirement is valid"),
     }
+}
+
+pub async fn spawn_fixture(
+    command: SidecarCommand,
+    layout: &TestLayout,
+    limits: SidecarLimits,
+) -> Result<JsonlSidecar, SidecarError> {
+    let trusted = command
+        .resolve_executable()?
+        .trust(ExecutableTrustDecision::TrustCanonicalPath);
+    JsonlSidecar::spawn_trusted(command, &trusted, &layout.data, &layout.workspace, limits).await
 }
 
 pub fn short_limits() -> SidecarLimits {
@@ -139,6 +153,7 @@ pub fn dispatch_fixture(arguments: &[OsString]) -> Option<i32> {
         "oversized" => malformed_response(true),
         "unknown-id" => unknown_id_response(),
         "blocked-stdin" => blocked_stdin(),
+        "final-response-exit" => final_response_exit(),
         "exit-with-pending" => exit_with_pending(),
         "grandchild" => grandchild_leader(false),
         "grandchild-exit" => grandchild_leader(true),
@@ -169,14 +184,24 @@ fn strict_jsonl(write_stderr: bool, ignore_term: bool) -> i32 {
             Ok(request) => request,
             Err(_) => return 65,
         };
-        let Some(id) = request.get("id").cloned() else {
-            return 65;
-        };
         let method = request
             .get("method")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("echo")
             .to_owned();
+        let Some(id) = request.get("id").cloned() else {
+            if method == "client/ready" {
+                let home = match fixture_home() {
+                    Ok(home) => home,
+                    Err(_) => return 73,
+                };
+                if fs::write(home.join("outbound-notification.json"), input).is_err() {
+                    return 73;
+                }
+                continue;
+            }
+            return 65;
+        };
 
         if write_stderr {
             let mut stderr = io::stderr().lock();
@@ -213,6 +238,21 @@ fn strict_jsonl(write_stderr: bool, ignore_term: bool) -> i32 {
             .get("delay_ms")
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0);
+        if method == "delay-after-received" {
+            let mut stdout = stdout.lock().expect("fixture stdout lock is not poisoned");
+            serde_json::to_writer(
+                &mut *stdout,
+                &serde_json::json!({"method": "fixture/received"}),
+            )
+            .expect("fixture received notification serializes");
+            writeln!(stdout).expect("fixture received notification newline writes");
+            stdout
+                .flush()
+                .expect("fixture received notification flushes");
+        }
+        if method == "delay-recorded" && record_received_request().is_err() {
+            return 73;
+        }
         let stdout = Arc::clone(&stdout);
         thread::spawn(move || {
             thread::sleep(Duration::from_millis(delay));
@@ -233,6 +273,75 @@ fn strict_jsonl(write_stderr: bool, ignore_term: bool) -> i32 {
             writeln!(stdout).expect("fixture response newline writes");
             stdout.flush().expect("fixture response flushes");
         });
+    }
+    0
+}
+
+fn record_received_request() -> io::Result<()> {
+    let count = RECEIVED_REQUESTS.fetch_add(1, Ordering::Relaxed) + 1;
+    let home = fixture_home()?;
+    let mut options = OpenOptions::new();
+    options.create(true).truncate(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(home.join("received-count"))?;
+    write!(file, "{count}")?;
+    file.flush()
+}
+
+fn final_response_exit() -> i32 {
+    let executable = match env::current_exe() {
+        Ok(executable) => executable,
+        Err(_) => return 71,
+    };
+    let grandchild = match Command::new(executable)
+        .arg(FIXTURE_ARGUMENT)
+        .arg("grandchild-process")
+        .arg("1.2.3")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(grandchild) => grandchild,
+        Err(_) => return 71,
+    };
+    if write_fixture_pids(process::id(), grandchild.id()).is_err() {
+        return 73;
+    }
+    let mut input = String::new();
+    if io::stdin().read_line(&mut input).is_err() {
+        return 74;
+    }
+    let request: serde_json::Value = match serde_json::from_str(&input) {
+        Ok(request) => request,
+        Err(_) => return 65,
+    };
+    let Some(id) = request.get("id").cloned() else {
+        return 65;
+    };
+    if record_received_request().is_err() {
+        return 73;
+    }
+    thread::sleep(Duration::from_millis(75));
+    let result = request
+        .get("value")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    if serde_json::to_writer(
+        io::stdout(),
+        &serde_json::json!({"id": id, "result": result}),
+    )
+    .is_err()
+    {
+        return 74;
+    }
+    println!();
+    if io::stdout().flush().is_err() {
+        return 74;
     }
     0
 }
@@ -335,9 +444,7 @@ fn grandchild_process() -> i32 {
 }
 
 fn write_fixture_pids(leader: u32, grandchild: u32) -> io::Result<()> {
-    let home = env::var_os(FIXTURE_HOME_VARIABLE)
-        .map(PathBuf::from)
-        .ok_or_else(|| io::Error::other("fixture home is missing"))?;
+    let home = fixture_home()?;
     let mut options = OpenOptions::new();
     options.create(true).truncate(true).write(true);
     #[cfg(unix)]
@@ -354,9 +461,7 @@ fn write_fixture_pids(leader: u32, grandchild: u32) -> io::Result<()> {
 }
 
 fn record_version_executable() -> io::Result<()> {
-    let home = env::var_os(FIXTURE_HOME_VARIABLE)
-        .map(PathBuf::from)
-        .ok_or_else(|| io::Error::other("fixture version probe home is missing"))?;
+    let home = fixture_home()?;
     if fs::canonicalize(env::current_dir()?)? != fs::canonicalize(&home)? {
         return Err(io::Error::other(
             "fixture version probe working directory is not isolated",
@@ -373,6 +478,29 @@ fn record_version_executable() -> io::Result<()> {
     let mut file = options.open(home.join("version-executable-path"))?;
     file.write_all(executable.to_string_lossy().as_bytes())?;
     file.flush()
+}
+
+fn fixture_home() -> io::Result<PathBuf> {
+    env::var_os("CODEX_HOME")
+        .or_else(|| env::var_os("GROK_HOME"))
+        .map(PathBuf::from)
+        .ok_or_else(|| io::Error::other("fixture home is missing"))
+}
+
+pub async fn wait_for_received_count(home: &Path, expected: u64) -> TestResult {
+    let path = home.join("received-count");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Ok(value) = fs::read_to_string(&path)
+            && value.trim().parse::<u64>().ok() == Some(expected)
+        {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("fixture did not receive request {expected}").into());
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
 }
 
 pub async fn wait_for_fixture_pids(home: &Path) -> TestResult<(u32, u32)> {
