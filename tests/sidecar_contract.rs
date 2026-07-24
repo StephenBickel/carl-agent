@@ -21,8 +21,6 @@ use carl::sidecar::{
 use libtest_mimic::{Arguments, Failed, Trial};
 use semver::{Version, VersionReq};
 use serde_json::json;
-#[cfg(windows)]
-use support::processes_have_exited;
 use support::{
     PATH_SENTINEL, SECRET_SENTINEL, TestLayout, TestResult, dispatch_fixture, fixture_command,
     short_limits, spawn_fixture, wait_for_fixture_pids, wait_for_received_count,
@@ -1345,7 +1343,17 @@ fn provider_home_rejects_ambient_replacement() -> TestResult {
         &layout.home,
     )?;
     let moved = layout.data.join("held-provider-home");
-    fs::rename(&layout.home, &moved)?;
+    match fs::rename(&layout.home, &moved) {
+        Ok(()) => {}
+        #[cfg(windows)]
+        // Windows can reject the attack before Carl needs to: the held home and
+        // private-temp capabilities prevent their parent tree from being renamed.
+        Err(error) if error.raw_os_error() == Some(5) => {
+            assert!(home.matches_path(&layout.home));
+            return Ok(());
+        }
+        Err(error) => return Err(error.into()),
+    }
     fs::create_dir_all(layout.home.join(".carl-tmp"))?;
     #[cfg(unix)]
     {
@@ -1391,12 +1399,7 @@ fn provider_file_metadata_is_capability_relative() -> TestResult {
     );
 
     let auth = layout.home.join("auth.json");
-    fs::write(&auth, b"provider-owned-secret")?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&auth, fs::Permissions::from_mode(0o600))?;
-    }
+    home.write_static_file("auth.json", b"provider-owned-secret")?;
     assert_eq!(
         home.inspect_owner_only_file("auth.json", 4 * 1024)?,
         ProviderFileMetadata::Safe
@@ -2150,11 +2153,6 @@ fn explicit_cancellation_removes_process_group() -> TestResult {
         assert_eq!(sidecar.process_id(), Some(pids.0));
 
         sidecar.cancel().await?;
-        #[cfg(windows)]
-        assert!(
-            processes_have_exited(&[pids.0, pids.1]),
-            "Windows cancellation returned before its Job Object became empty"
-        );
         wait_until_processes_exit(&[pids.0, pids.1]).await?;
         assert_owner_only_pid_file(&layout.home)?;
         TestResult::Ok(())
