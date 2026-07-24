@@ -17,7 +17,18 @@ const PUBLIC_DOCS: &[&str] = &[
     "docs/adr/0001-event-sourced-runtime.md",
     "docs/adr/0002-single-process-v1.md",
     "docs/adr/0003-no-undocumented-oauth.md",
+    "docs/adr/0004-subscription-authentication-through-provider-sidecars.md",
     "docs/superpowers/specs/2026-07-23-carl-top-tier-harness-design.md",
+];
+
+const AUTH_COMMANDS: &[&str] = &[
+    "carl auth status",
+    "carl auth login openai",
+    "carl auth login openai --device",
+    "carl auth logout openai",
+    "carl auth login grok",
+    "carl auth login grok --device",
+    "carl auth logout grok",
 ];
 
 const ACTIVE_IDENTITY_SURFACES: &[&str] = &[
@@ -33,6 +44,7 @@ const ACTIVE_IDENTITY_SURFACES: &[&str] = &[
     "docs/telegram.md",
     "docs/adr/0002-single-process-v1.md",
     "docs/adr/0003-no-undocumented-oauth.md",
+    "docs/adr/0004-subscription-authentication-through-provider-sidecars.md",
     "src/cli.rs",
     "src/error.rs",
     "src/main.rs",
@@ -54,9 +66,32 @@ fn repository_root() -> PathBuf {
 }
 
 fn read_readme() -> String {
-    let path = repository_root().join("README.md");
+    read_document("README.md")
+}
+
+fn read_document(relative_path: &str) -> String {
+    let path = repository_root().join(relative_path);
     fs::read_to_string(&path)
         .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()))
+}
+
+fn normalized_document(relative_path: &str) -> String {
+    read_document(relative_path)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+fn assert_document_contains(relative_path: &str, required_statements: &[&str]) {
+    let normalized = normalized_document(relative_path);
+
+    for required_statement in required_statements {
+        assert!(
+            normalized.contains(required_statement),
+            "{relative_path} is missing critical statement fragment: {required_statement:?}"
+        );
+    }
 }
 
 #[test]
@@ -121,6 +156,28 @@ fn fenced_carl_command_checker_rejects_unknown_option_only_invocations() {
     assert!(error.contains("--bogus"));
 }
 
+#[test]
+fn all_documented_auth_invocations_match_the_clap_command_tree() {
+    for invocation in AUTH_COMMANDS {
+        Cli::try_parse_from(invocation.split_whitespace()).unwrap_or_else(|error| {
+            panic!("documented auth invocation must parse: `{invocation}`: {error}")
+        });
+    }
+}
+
+#[test]
+fn readme_includes_all_seven_auth_invocations() {
+    let readme = read_readme();
+    let fenced_commands: BTreeSet<_> = fenced_carl_commands(&readme).into_iter().collect();
+
+    for invocation in AUTH_COMMANDS {
+        assert!(
+            fenced_commands.contains(invocation),
+            "README is missing fenced auth invocation: `{invocation}`"
+        );
+    }
+}
+
 fn validate_fenced_carl_commands(markdown: &str) -> Result<(), String> {
     let mut command = Cli::command();
     let clap_commands: BTreeSet<_> = command
@@ -172,33 +229,126 @@ fn validate_fenced_carl_commands(markdown: &str) -> Result<(), String> {
 
 #[test]
 fn readme_states_the_current_status_and_security_boundaries() {
-    let normalized = read_readme()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_lowercase();
+    assert_document_contains(
+        "README.md",
+        &[
+            "pre-alpha",
+            "not yet a usable end-user agent",
+            "api-key access and consumer subscription access are separate products and billing paths",
+            "openai platform api key",
+            "xai api key",
+            "chatgpt, supergrok, or eligible x subscription",
+            "codex cli `0.136.0`",
+            "grok build `0.2.111`",
+            "carl never installs or updates provider executables",
+            "`carl_data_dir`",
+            "`carl_codex_executable`",
+            "`carl_grok_executable`",
+            "`$carl_data_dir/providers/codex`",
+            "`$carl_data_dir/providers/grok`",
+            "codex owns its credentials in the operating-system keyring",
+            "grok owns `$grok_home/auth.json`",
+            "foreground-only mutations",
+            "authentication does not enable model execution or delegates",
+            "neither proves current subscription/model entitlement nor enables model execution or delegates",
+            "undocumented oauth",
+            "not a complete security sandbox",
+            "http/openai adapters",
+            "runtime tool loop",
+            "tui interaction",
+            "telegram gateway",
+            "only the four placeholder commands",
+            "`serve`, `pair`, `doctor`, and `sessions` return not-implemented errors",
+            "clap's built-in `help` command displays help",
+        ],
+    );
 
-    for required_statement in [
-        "pre-alpha",
-        "foundation",
-        "not yet a usable end-user agent",
-        "openai platform api key",
-        "will not reuse codex or chatgpt credentials",
-        "undocumented oauth",
-        "not a complete security sandbox",
-        "http/openai adapters",
-        "runtime tool loop",
-        "tui interaction",
-        "telegram gateway",
-        "only the five placeholder commands",
-        "`serve`, `auth`, `pair`, `doctor`, and `sessions` return not-implemented errors",
-        "clap's built-in `help` command displays help",
-    ] {
-        assert!(
-            normalized.contains(required_statement),
-            "README is missing critical statement fragment: {required_statement:?}"
-        );
-    }
+    assert!(
+        !normalized_document("README.md").contains("only the five placeholder commands"),
+        "README must not describe `auth` as a fifth placeholder command"
+    );
+}
+
+#[test]
+fn configuration_documents_the_implemented_auth_boundary() {
+    assert_document_contains(
+        "docs/configuration.md",
+        &[
+            "accepts exactly three non-secret process variables",
+            "`carl_data_dir`",
+            "required absolute path to a pre-existing, trusted carl data directory",
+            "`carl_codex_executable`",
+            "`carl_grok_executable`",
+            "`$carl_data_dir/providers/codex`",
+            "`$carl_data_dir/providers/grok`",
+            "there is no arbitrary provider-home override",
+            "codex cli `0.136.0`",
+            "grok build `0.2.111`",
+            "version matching is compatibility evidence, not publisher attestation",
+            "one operating-system-backed exclusive lock",
+            "a crashed owner does not leave a stale logical lock",
+            "it is not a cross-process lock",
+            "api keys have their own provider access and billing",
+            "authentication does not enable model execution or subscription-backed delegates",
+            "general configuration is accepted today",
+        ],
+    );
+}
+
+#[test]
+fn architecture_separates_authentication_from_execution() {
+    assert_document_contains(
+        "docs/architecture.md",
+        &[
+            "isolated provider homes",
+            "provider-owned authentication brokers",
+            "composition for the seven `auth` commands",
+            "authentication status performs only provider-owned local handshakes",
+            "model runtime, delegate execution",
+            "implemented authentication does not enable model/runtime/delegate execution",
+            "one exclusive os lock per canonical data root",
+        ],
+    );
+}
+
+#[test]
+fn security_documents_credential_foreground_and_process_boundaries() {
+    assert_document_contains(
+        "docs/security.md",
+        &[
+            "carl never receives, reads, copies, logs, persists, or forwards subscription bearer or refresh tokens",
+            "codex owns chatgpt subscription tokens in the operating-system keyring",
+            "`codex_home` isolates filesystem-backed state but does not prove keyring isolation",
+            "logging out through carl can therefore affect another codex cli or ide session",
+            "grok owns `$grok_home/auth.json`",
+            "it never opens or reads the file",
+            "does not suppress trusted root-owned `/etc/grok` policy",
+            "grok login and logout additionally require a crate-private foreground capability",
+            "a status-only grok broker cannot upgrade itself or mutate authentication",
+            "stdout is reserved for one deterministic safe json value",
+            "provider-owned terminal output go only to the verified local stderr terminal",
+            "version matching is compatibility evidence, not publisher attestation",
+            "task 4's provider-home mutex remains in-process only",
+            "process groups on unix and job objects on windows",
+            "authentication state does not prove current subscription or model entitlement",
+            "authentication does not enable model execution or subscription-backed delegates",
+        ],
+    );
+}
+
+#[test]
+fn changelog_records_auth_without_claiming_delegate_execution() {
+    assert_document_contains(
+        "CHANGELOG.md",
+        &[
+            "isolated provider sidecar supervision",
+            "codex-owned chatgpt subscription authentication",
+            "grok-owned supergrok or eligible x subscription authentication",
+            "seven `carl auth` status/login/logout commands",
+            "deterministic safe json status",
+            "delegate execution; both remain unavailable",
+        ],
+    );
 }
 
 #[test]

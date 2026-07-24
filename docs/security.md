@@ -15,8 +15,14 @@ Carl does not attempt to defend a host account from an attacker who already cont
 - SQLite migrations are forward-only and checksum-verified, and the store rejects unknown future schemas;
 - session events are append-only and lifecycle changes are transactional;
 - the scripted provider supports deterministic tests without a network or live credentials.
+- provider-owned authentication sidecars run with fixed isolated homes, closed child
+  environments, canonical executable identity checks, and supervised process trees;
+- the auth CLI emits deterministic safe JSON and keeps provider challenges, warnings,
+  and terminal output on verified local stderr.
 
-These properties improve auditability and failure behavior. They do not implement provider authentication, redaction of all runtime data, filesystem confinement, approvals, or process isolation.
+These properties improve auditability and failure behavior. They do not implement
+model-provider access, redaction of all future runtime data, filesystem confinement,
+approvals, or a complete process sandbox.
 
 ## Planned v1 controls
 
@@ -39,9 +45,58 @@ Every one of these controls requires implementation and adversarial tests before
 
 ## Credentials and authentication
 
-The target design stores secret references in configuration and values in the operating system credential store, with environment variables supported for automation. Environment credentials must not be copied into configuration, events, logs, diagnostics, fixtures, or exported traces.
+Subscription authentication stays inside provider-owned executables. Carl never
+receives, reads, copies, logs, persists, or forwards subscription bearer or refresh
+tokens.
 
-OpenAI access will use an OpenAI Platform API key. Carl will not reuse Codex or ChatGPT credentials and will not call undocumented OAuth endpoints. See [ADR 0003](adr/0003-no-undocumented-oauth.md).
+- Codex owns ChatGPT subscription tokens in the operating-system keyring.
+  `CODEX_HOME` isolates filesystem-backed state but does not prove keyring isolation.
+  Logging out through Carl can therefore affect another Codex CLI or IDE session for
+  the same OS user, and Carl displays a local warning before logout.
+- Grok owns `$GROK_HOME/auth.json`. Carl validates only the credential file's metadata
+  as a regular, non-linked, owner-only file; it never opens or reads the file.
+  Isolating `GROK_HOME` does not suppress trusted root-owned `/etc/grok` policy.
+
+API keys are a separate security and billing boundary. Future native OpenAI and xAI
+adapters will use user-supplied OpenAI Platform and xAI API keys, not ChatGPT,
+SuperGrok, or X subscription tokens. Carl does not call undocumented OAuth endpoints.
+See [ADR 0003](adr/0003-no-undocumented-oauth.md) and
+[ADR 0004](adr/0004-subscription-authentication-through-provider-sidecars.md).
+
+Authentication state does not prove current subscription or model entitlement.
+Authentication does not enable model execution or subscription-backed delegates.
+
+## Foreground and output boundary
+
+Login requires a verified local foreground terminal. Grok login and logout additionally
+require a crate-private foreground capability at the point the provider process is
+spawned. A status-only Grok broker cannot upgrade itself or mutate authentication;
+`carl auth status` may run without a terminal and can call only the local
+provider-owned status handshake.
+
+Stdout is reserved for one deterministic safe JSON value. Validated challenges,
+shared-keyring warnings, and provider-owned terminal output go only to the verified
+local stderr terminal. Provider terminal text is not captured, parsed, relayed,
+serialized, persisted, or logged by Carl.
+
+## Executable and process boundaries
+
+Carl pins Codex CLI `0.136.0` and Grok Build `0.2.111`, validates a canonical
+executable identity once, and revalidates that exact identity before use. Version
+matching is compatibility evidence, not publisher attestation. Carl neither installs
+nor updates provider executables.
+
+Every public auth or future daemon entry point holds one cross-process exclusive OS
+lock for the canonical `CARL_DATA_DIR`. It retains the lock through provider cleanup,
+child reaping, state reconciliation, and shutdown. The lock is released automatically
+when the owning process exits or crashes. Task 4's provider-home mutex remains
+in-process only and cannot replace this data-root lock.
+
+Provider children are supervised as process groups on Unix and Job Objects on
+Windows. These mechanisms support cancellation and bounded cleanup, but they are
+lifecycle containment rather than privilege separation: they do not prevent provider
+children from exercising the ambient authority that survives the closed environment,
+isolated working directory, and OS access controls.
 
 ## Remote channel boundary
 
