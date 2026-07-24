@@ -441,6 +441,7 @@ impl CodexAuth {
                 let mut operation = NotificationOperation::for_duration(self.timeouts.request)?;
                 self.drain_idle_notifications(&mut operation).await?;
                 let state = self.read_account_until(Some(operation.deadline)).await?;
+                self.drain_idle_notifications(&mut operation).await?;
                 self.cached_state = state;
                 Ok(state)
             }

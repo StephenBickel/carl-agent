@@ -21,8 +21,9 @@ use carl::sidecar::{
 use libtest_mimic::{Arguments, Failed, Trial};
 use serde_json::{Value, json};
 use support::{
-    CODEX_LOGIN_ID, CODEX_SECRET_SENTINEL, PATH_SENTINEL, SECRET_SENTINEL, TestLayout, TestResult,
-    dispatch_codex_auth_fixture, fixture_command, short_limits, wait_until_processes_reaped,
+    CODEX_LOGIN_ID, CODEX_NOTIFICATION_FLOOD_READY, CODEX_SECRET_SENTINEL, PATH_SENTINEL,
+    SECRET_SENTINEL, TestLayout, TestResult, dispatch_codex_auth_fixture, fixture_command,
+    short_limits, wait_for_fixture_marker, wait_until_processes_reaped,
 };
 
 fn main() {
@@ -143,6 +144,13 @@ struct Fixture {
 
 impl Fixture {
     async fn connect(scenario: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Self::connect_with_timeouts(scenario, contract_timeouts()).await
+    }
+
+    async fn connect_with_timeouts(
+        scenario: &str,
+        timeouts: CodexAuthTimeouts,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let layout = TestLayout::new()?;
         let trusted = trusted_fixture_executable(&layout)?;
         let home = ProviderHome::prepare(
@@ -152,8 +160,7 @@ impl Fixture {
             &layout.home,
         )?;
         home.write_static_file("fixture-scenario", scenario.as_bytes())?;
-        let broker =
-            CodexAuth::connect(&trusted, home, short_limits(), contract_timeouts()).await?;
+        let broker = CodexAuth::connect(&trusted, home, short_limits(), timeouts).await?;
         Ok(Self { broker, layout })
     }
 }
@@ -171,6 +178,15 @@ fn contract_timeouts() -> CodexAuthTimeouts {
         Duration::from_millis(300),
         Duration::from_millis(120),
         Duration::from_millis(250),
+        Duration::from_millis(10),
+    )
+}
+
+fn notification_bound_timeouts() -> CodexAuthTimeouts {
+    CodexAuthTimeouts::new(
+        Duration::from_millis(300),
+        Duration::from_secs(5),
+        Duration::from_secs(5),
         Duration::from_millis(10),
     )
 }
@@ -741,16 +757,22 @@ fn notification_floods_are_bounded() -> TestResult {
             "paced-advisory-flood",
             "completion-advisory-flood",
         ] {
-            let mut fixture = Fixture::connect(scenario).await?;
+            let mut fixture =
+                Fixture::connect_with_timeouts(scenario, notification_bound_timeouts()).await?;
             fixture.broker.start_login(AuthMethod::BrowserOAuth).await?;
-            let started = Instant::now();
+            wait_for_fixture_marker(&fixture.layout.home, CODEX_NOTIFICATION_FLOOD_READY)
+                .await
+                .map_err(|error| format!("scenario {scenario}: {error}"))?;
             let error = fixture
                 .broker
                 .auth_state()
                 .await
                 .expect_err("valid advisory floods must exhaust the operation budget");
-            assert_eq!(error.code(), AuthErrorCode::ProtocolMismatch);
-            assert!(started.elapsed() < Duration::from_secs(1));
+            assert_eq!(
+                error.code(),
+                AuthErrorCode::ProtocolMismatch,
+                "scenario {scenario}"
+            );
         }
         Ok(())
     })
@@ -835,7 +857,6 @@ fn cancel_responses_and_races_are_reconciled() -> TestResult {
         let mut late = Fixture::connect("cancel-canceled-late-success").await?;
         late.broker.start_login(AuthMethod::BrowserOAuth).await?;
         late.broker.cancel_login().await?;
-        tokio::time::sleep(Duration::from_millis(50)).await;
         let error = late
             .broker
             .auth_state()

@@ -25,6 +25,7 @@ pub const GROK_SECRET_SENTINEL: &str =
     "Bearer grok-access-token-sentinel refresh-token-sentinel stephen@example.test";
 pub const CODEX_LOGIN_ID: &str = "94d0b241-47d6-4bec-b77a-29d023cf4f2f";
 pub const CODEX_STALE_LOGIN_ID: &str = "40dfe52d-9789-4aec-88bd-4f7510b2c06e";
+pub const CODEX_NOTIFICATION_FLOOD_READY: &str = "notification-flood-ready";
 #[cfg(unix)]
 pub const PATH_SENTINEL: &str = "/carl-untrusted-path-sentinel";
 #[cfg(windows)]
@@ -842,6 +843,12 @@ fn codex_auth_jsonl_fixture(home: &Path, scenario: &str) -> i32 {
                             serde_json::json!(CODEX_SECRET_SENTINEL),
                         );
                 }
+                if scenario == "cancel-canceled-late-success"
+                    && account_reads == 3
+                    && write_login_completion(CODEX_LOGIN_ID, true).is_err()
+                {
+                    return 74;
+                }
                 if write_codex_message(&serde_json::json!({"id": id, "result": result})).is_err() {
                     return 74;
                 }
@@ -1184,11 +1191,21 @@ fn codex_auth_jsonl_fixture(home: &Path, scenario: &str) -> i32 {
                                 return 74;
                             }
                         }
+                        if write_fixture_marker(home, CODEX_NOTIFICATION_FLOOD_READY).is_err() {
+                            return 73;
+                        }
                     }
                     "paced-advisory-flood" => {
-                        thread::spawn(|| {
-                            for _ in 0..80 {
+                        let home = home.to_path_buf();
+                        thread::spawn(move || {
+                            for notification in 0..80 {
                                 if write_account_updated().is_err() {
+                                    return;
+                                }
+                                if notification == 32
+                                    && write_fixture_marker(&home, CODEX_NOTIFICATION_FLOOD_READY)
+                                        .is_err()
+                                {
                                     return;
                                 }
                                 thread::sleep(Duration::from_millis(2));
@@ -1203,6 +1220,9 @@ fn codex_auth_jsonl_fixture(home: &Path, scenario: &str) -> i32 {
                             if write_account_updated().is_err() {
                                 return 74;
                             }
+                        }
+                        if write_fixture_marker(home, CODEX_NOTIFICATION_FLOOD_READY).is_err() {
+                            return 73;
                         }
                     }
                     "child-exit" => return 0,
@@ -1238,12 +1258,6 @@ fn codex_auth_jsonl_fixture(home: &Path, scenario: &str) -> i32 {
                     .is_err()
                 {
                     return 74;
-                }
-                if scenario == "cancel-canceled-late-success" {
-                    thread::spawn(|| {
-                        thread::sleep(Duration::from_millis(20));
-                        let _ = write_login_completion(CODEX_LOGIN_ID, true);
-                    });
                 }
             }
             "account/logout" => {
@@ -1437,6 +1451,10 @@ fn write_codex_message(value: &serde_json::Value) -> io::Result<()> {
     serde_json::to_writer(&mut stdout, value)?;
     writeln!(stdout)?;
     stdout.flush()
+}
+
+fn write_fixture_marker(home: &Path, name: &str) -> io::Result<()> {
+    write_private_fixture_file(home.join(name), b"ready")
 }
 
 fn record_codex_launch(home: &Path) -> io::Result<()> {
@@ -1833,6 +1851,20 @@ pub async fn wait_for_received_count(home: &Path, expected: u64) -> TestResult {
         }
         if Instant::now() >= deadline {
             return Err(format!("fixture did not receive request {expected}").into());
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+pub async fn wait_for_fixture_marker(home: &Path, name: &str) -> TestResult {
+    let path = home.join(name);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if fs::read(&path).is_ok_and(|contents| contents == b"ready") {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("fixture marker {name:?} was not created").into());
         }
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
