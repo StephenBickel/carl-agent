@@ -110,6 +110,10 @@ fn main() {
             "login and child exit deadlines are typed",
             login_and_child_exit_deadlines_are_typed,
         ),
+        test(
+            "hostile retry intervals are rejected before launch",
+            hostile_retry_intervals_are_rejected,
+        ),
     ];
     libtest_mimic::run(&Arguments::from_args(), trials).exit();
 }
@@ -933,6 +937,35 @@ fn login_and_child_exit_deadlines_are_typed() -> TestResult {
             .await
             .expect_err("child exit must wake login");
         assert_eq!(error.code(), AuthErrorCode::SidecarExited);
+        Ok(())
+    })
+}
+
+fn hostile_retry_intervals_are_rejected() -> TestResult {
+    run_async(async {
+        let layout = TestLayout::new()?;
+        let trusted = trusted_fixture_executable(&layout)?;
+        let home = ProviderHome::prepare(
+            ProviderEnvironmentProfile::Codex,
+            &layout.data,
+            &layout.workspace,
+            &layout.home,
+        )?;
+        home.write_static_file("fixture-scenario", b"signed-out")?;
+        let hostile = CodexAuthTimeouts::new(
+            Duration::from_millis(300),
+            Duration::from_millis(120),
+            Duration::from_millis(250),
+            Duration::from_nanos(1),
+        );
+        let error = CodexAuth::connect(&trusted, home, short_limits(), hostile)
+            .await
+            .expect_err("near-zero retry intervals must be rejected");
+        assert_eq!(error.code(), AuthErrorCode::ProtocolMismatch);
+        assert!(
+            !layout.home.join("codex-launch.json").exists(),
+            "invalid polling configuration must fail before provider execution"
+        );
         Ok(())
     })
 }

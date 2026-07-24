@@ -23,6 +23,8 @@ const KEYRING_CONFIG: &[u8] = b"cli_auth_credentials_store = \"keyring\"\n";
 const MAX_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_LOGIN_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const MAX_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(30);
+// Bound AuthManager reload polling to at most 100 account reads per second.
+const MIN_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 const MAX_NOTIFICATIONS_PER_OPERATION: usize = 32;
 const CODEX_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const CODEX_OAUTH_SCOPE: &str =
@@ -64,7 +66,7 @@ impl CodexAuthTimeouts {
             || self.login > MAX_LOGIN_TIMEOUT
             || self.confirmation.is_zero()
             || self.confirmation > MAX_CONFIRMATION_TIMEOUT
-            || self.retry_interval.is_zero()
+            || self.retry_interval < MIN_RETRY_INTERVAL
             || self.retry_interval > self.confirmation
         {
             return Err(protocol_mismatch());
