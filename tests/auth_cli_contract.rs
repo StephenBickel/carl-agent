@@ -827,10 +827,24 @@ fn configured_carl_command(layout: &TestLayout) -> process::Command {
 
 fn write_provider_scenario(layout: &TestLayout, provider: &str, scenario: &str) -> TestResult {
     let home = layout.data.join("providers").join(provider);
-    fs::create_dir_all(&home)?;
-    fs::write(home.join("fixture-scenario"), scenario)?;
-    assert!(Path::new(&home).is_absolute());
-    Ok(())
+    #[cfg(windows)]
+    {
+        let profile = match provider {
+            "codex" => ProviderEnvironmentProfile::Codex,
+            "grok" => ProviderEnvironmentProfile::Grok,
+            _ => return Err(format!("unknown provider fixture {provider:?}").into()),
+        };
+        let home = ProviderHome::prepare(profile, &layout.data, &layout.workspace, &home)?;
+        home.write_static_file("fixture-scenario", scenario.as_bytes())?;
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        fs::create_dir_all(&home)?;
+        fs::write(home.join("fixture-scenario"), scenario)?;
+        assert!(Path::new(&home).is_absolute());
+        Ok(())
+    }
 }
 
 #[cfg(unix)]
