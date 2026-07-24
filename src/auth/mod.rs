@@ -8,6 +8,8 @@ use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 use url::Url;
 
+pub mod codex;
+
 const MAX_AUTHORIZATION_URL_BYTES: usize = 8_192;
 const MAX_USER_CODE_BYTES: usize = 128;
 const INVALID_AUTH_DATA: &str = "invalid subscription authentication data";

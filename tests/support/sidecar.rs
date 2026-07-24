@@ -19,6 +19,10 @@ use semver::VersionReq;
 pub const FIXTURE_ARGUMENT: &str = "--carl-private-sidecar-fixture";
 pub const FIXTURE_HOME_VARIABLE: &str = "CODEX_HOME";
 pub const SECRET_SENTINEL: &str = "sk-sidecar-contract-secret";
+pub const CODEX_SECRET_SENTINEL: &str =
+    "Bearer codex-access-token-sentinel refresh-token-sentinel stephen@example.test";
+pub const CODEX_LOGIN_ID: &str = "94d0b241-47d6-4bec-b77a-29d023cf4f2f";
+pub const CODEX_STALE_LOGIN_ID: &str = "40dfe52d-9789-4aec-88bd-4f7510b2c06e";
 #[cfg(unix)]
 pub const PATH_SENTINEL: &str = "/carl-untrusted-path-sentinel";
 #[cfg(windows)]
@@ -168,6 +172,727 @@ pub fn dispatch_fixture(arguments: &[OsString]) -> Option<i32> {
         "grandchild-process" => grandchild_process(),
         _ => 64,
     })
+}
+
+pub fn dispatch_codex_auth_fixture(arguments: &[OsString]) -> Option<i32> {
+    let home = env::var_os(FIXTURE_HOME_VARIABLE).map(PathBuf::from)?;
+    let scenario = fs::read_to_string(home.join("fixture-scenario")).ok()?;
+    let scenario = scenario.trim();
+
+    if arguments == [OsString::from("--version")] {
+        match scenario {
+            "unsupported-version" => println!("codex-cli 0.135.0"),
+            "version-wrong-prefix" => println!("codex 0.136.0"),
+            "version-extra-token" => println!("codex-cli 0.136.0 stable"),
+            "version-malformed" => println!("codex-cli release"),
+            _ => println!("codex-cli 0.136.0"),
+        }
+        return Some(0);
+    }
+
+    let expected = [
+        OsString::from("app-server"),
+        OsString::from("--strict-config"),
+        OsString::from("-c"),
+        OsString::from("cli_auth_credentials_store=\"keyring\""),
+        OsString::from("--listen"),
+        OsString::from("stdio://"),
+    ];
+    if arguments != expected {
+        return None;
+    }
+
+    Some(codex_auth_jsonl_fixture(&home, scenario))
+}
+
+fn codex_auth_jsonl_fixture(home: &Path, scenario: &str) -> i32 {
+    if record_codex_launch(home).is_err() {
+        return 73;
+    }
+
+    let mut account_reads = 0_u64;
+    let mut login_started = false;
+    let mut cancel_raced = false;
+    for input in io::stdin().lock().lines() {
+        let input = match input {
+            Ok(input) => input,
+            Err(_) => return 74,
+        };
+        let request: serde_json::Value = match serde_json::from_str(&input) {
+            Ok(request) => request,
+            Err(_) => return 65,
+        };
+        if record_codex_request(home, &input).is_err() {
+            return 73;
+        }
+
+        let Some(object) = request.as_object() else {
+            return 65;
+        };
+        let Some(method) = object.get("method").and_then(serde_json::Value::as_str) else {
+            return 65;
+        };
+        if method == "initialized" {
+            if object.len() != 1 {
+                return 65;
+            }
+            if scenario == "startup-no-remote" {
+                continue;
+            }
+            if scenario == "startup-config-warning"
+                && write_codex_message(&serde_json::json!({
+                    "method": "configWarning",
+                    "params": {
+                        "summary": CODEX_SECRET_SENTINEL,
+                        "details": null,
+                    },
+                }))
+                .is_err()
+            {
+                return 74;
+            }
+            let startup_event = match scenario {
+                "startup-account-updated" => Some(serde_json::json!({
+                    "method": "account/updated",
+                    "params": {},
+                })),
+                "startup-login-completed" => Some(serde_json::json!({
+                    "method": "account/login/completed",
+                    "params": {
+                        "loginId": CODEX_LOGIN_ID,
+                        "success": true,
+                        "error": null,
+                    },
+                })),
+                "startup-unknown-notification" => Some(serde_json::json!({
+                    "method": "thread/started",
+                    "params": {},
+                })),
+                "startup-malformed-config-warning" => Some(serde_json::json!({
+                    "method": "configWarning",
+                    "params": {
+                        "details": CODEX_SECRET_SENTINEL,
+                    },
+                })),
+                _ => None,
+            };
+            if startup_event
+                .as_ref()
+                .is_some_and(|event| write_codex_message(event).is_err())
+            {
+                return 74;
+            }
+            let remote_status = if scenario == "malformed-remote-control-status" {
+                serde_json::json!({
+                    "method": "remoteControl/status/changed",
+                    "params": {
+                        "installationId": "fixture-installation",
+                        "serverName": "fixture",
+                        "status": "online",
+                        "unexpected": CODEX_SECRET_SENTINEL,
+                    },
+                })
+            } else {
+                serde_json::json!({
+                    "method": "remoteControl/status/changed",
+                    "params": {
+                        "installationId": "fixture-installation",
+                        "serverName": "fixture",
+                        "status": "disabled",
+                        "environmentId": null,
+                    },
+                })
+            };
+            if write_codex_message(&remote_status).is_err() {
+                return 74;
+            }
+            continue;
+        }
+        let Some(id) = object.get("id").cloned() else {
+            return 65;
+        };
+
+        match method {
+            "initialize" => {
+                let codex_home = if scenario == "wrong-codex-home" {
+                    home.join("different-home")
+                } else {
+                    home.to_path_buf()
+                };
+                let mut result = serde_json::json!({
+                    "userAgent": "codex_cli_rs/0.136.0",
+                    "codexHome": codex_home,
+                    "platformFamily": "unix",
+                    "platformOs": "fixture",
+                });
+                if scenario == "initialize-unknown-field" {
+                    result
+                        .as_object_mut()
+                        .expect("initialize fixture result is an object")
+                        .insert("unexpected".into(), serde_json::json!(true));
+                }
+                if write_codex_message(&serde_json::json!({"id": id, "result": result})).is_err() {
+                    return 74;
+                }
+            }
+            "account/read" => {
+                if object.len() != 3
+                    || object.get("params") != Some(&serde_json::json!({"refreshToken": false}))
+                {
+                    return 65;
+                }
+                account_reads = account_reads.saturating_add(1);
+                let account =
+                    codex_fixture_account(scenario, account_reads, login_started, cancel_raced);
+                let requires_openai_auth = scenario != "requires-openai-auth-false";
+                let mut result = serde_json::json!({
+                    "account": account,
+                    "requiresOpenaiAuth": requires_openai_auth,
+                });
+                if scenario == "account-read-unknown-field" {
+                    result
+                        .as_object_mut()
+                        .expect("account fixture result is an object")
+                        .insert(
+                            "unexpected".into(),
+                            serde_json::json!(CODEX_SECRET_SENTINEL),
+                        );
+                }
+                if write_codex_message(&serde_json::json!({"id": id, "result": result})).is_err() {
+                    return 74;
+                }
+            }
+            "account/login/start" => {
+                if object.len() != 3 {
+                    return 65;
+                }
+                login_started = true;
+                if matches!(scenario, "provider-error" | "provider-protocol-error") {
+                    let code = if scenario == "provider-protocol-error" {
+                        -32602
+                    } else {
+                        -32000
+                    };
+                    if write_codex_message(&serde_json::json!({
+                        "id": id,
+                        "error": {
+                            "code": code,
+                            "message": CODEX_SECRET_SENTINEL,
+                            "data": {"credential": CODEX_SECRET_SENTINEL},
+                        }
+                    }))
+                    .is_err()
+                    {
+                        return 74;
+                    }
+                    continue;
+                }
+
+                let login_type = object
+                    .get("params")
+                    .and_then(serde_json::Value::as_object)
+                    .and_then(|params| params.get("type"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                if object.get("params") != Some(&serde_json::json!({"type": login_type})) {
+                    return 65;
+                }
+                let response_id = match scenario {
+                    "wrong-response-id" => serde_json::json!(999),
+                    "mixed-response-id" => serde_json::json!(id.to_string()),
+                    _ => id,
+                };
+                let result = match login_type {
+                    "chatgpt" => serde_json::json!({
+                        "type": "chatgpt",
+                        "loginId": CODEX_LOGIN_ID,
+                        "authUrl": browser_authorization_url(scenario),
+                    }),
+                    "chatgptDeviceCode" => serde_json::json!({
+                        "type": "chatgptDeviceCode",
+                        "loginId": CODEX_LOGIN_ID,
+                        "verificationUrl": device_verification_url(scenario),
+                        "userCode": "CARL-1360",
+                    }),
+                    _ => return 65,
+                };
+                let response = match scenario {
+                    "response-method-bearing" => serde_json::json!({
+                        "id": response_id,
+                        "method": "account/login/start",
+                        "result": result,
+                    }),
+                    "response-result-and-error" => serde_json::json!({
+                        "id": response_id,
+                        "result": result,
+                        "error": {
+                            "code": -32000,
+                            "message": CODEX_SECRET_SENTINEL,
+                            "data": CODEX_SECRET_SENTINEL,
+                        },
+                    }),
+                    "response-neither-result-nor-error" => {
+                        serde_json::json!({"id": response_id})
+                    }
+                    _ => serde_json::json!({"id": response_id, "result": result}),
+                };
+                if write_codex_message(&response).is_err() {
+                    return 74;
+                }
+
+                match scenario {
+                    "browser-success"
+                    | "browser-port-1457"
+                    | "device-success"
+                    | "stale-account-then-updated"
+                    | "startup-config-warning" => {
+                        if write_login_completion(CODEX_LOGIN_ID, true).is_err() {
+                            return 74;
+                        }
+                        if scenario == "stale-account-then-updated"
+                            && write_account_updated().is_err()
+                        {
+                            return 74;
+                        }
+                    }
+                    "advisory-before-completion" => {
+                        if write_account_updated().is_err()
+                            || write_login_completion(CODEX_LOGIN_ID, true).is_err()
+                        {
+                            return 74;
+                        }
+                    }
+                    "success-without-error" => {
+                        if write_codex_message(&serde_json::json!({
+                            "method": "account/login/completed",
+                            "params": {
+                                "loginId": CODEX_LOGIN_ID,
+                                "success": true,
+                            }
+                        }))
+                        .is_err()
+                        {
+                            return 74;
+                        }
+                    }
+                    "success-with-error" => {
+                        if write_codex_message(&serde_json::json!({
+                            "method": "account/login/completed",
+                            "params": {
+                                "loginId": CODEX_LOGIN_ID,
+                                "success": true,
+                                "error": CODEX_SECRET_SENTINEL,
+                            }
+                        }))
+                        .is_err()
+                        {
+                            return 74;
+                        }
+                    }
+                    "failure-without-error" => {
+                        if write_codex_message(&serde_json::json!({
+                            "method": "account/login/completed",
+                            "params": {
+                                "loginId": CODEX_LOGIN_ID,
+                                "success": false,
+                            }
+                        }))
+                        .is_err()
+                        {
+                            return 74;
+                        }
+                    }
+                    "failure-with-null-error" => {
+                        if write_codex_message(&serde_json::json!({
+                            "method": "account/login/completed",
+                            "params": {
+                                "loginId": CODEX_LOGIN_ID,
+                                "success": false,
+                                "error": null,
+                            }
+                        }))
+                        .is_err()
+                        {
+                            return 74;
+                        }
+                    }
+                    "empty-advisory-before-completion" => {
+                        if write_codex_message(&serde_json::json!({
+                            "method": "account/updated",
+                            "params": {},
+                        }))
+                        .is_err()
+                            || write_login_completion(CODEX_LOGIN_ID, true).is_err()
+                        {
+                            return 74;
+                        }
+                    }
+                    "config-warning-before-completion" => {
+                        if write_codex_message(&serde_json::json!({
+                            "method": "configWarning",
+                            "params": {
+                                "summary": CODEX_SECRET_SENTINEL,
+                                "details": CODEX_SECRET_SENTINEL,
+                                "path": CODEX_SECRET_SENTINEL,
+                                "range": {
+                                    "start": {"line": 1, "column": 2},
+                                    "end": {"line": 3, "column": 4},
+                                },
+                            }
+                        }))
+                        .is_err()
+                            || write_login_completion(CODEX_LOGIN_ID, true).is_err()
+                        {
+                            return 74;
+                        }
+                    }
+                    "remote-status-before-completion" => {
+                        if write_codex_message(&serde_json::json!({
+                            "method": "remoteControl/status/changed",
+                            "params": {
+                                "installationId": "fixture-installation",
+                                "serverName": "fixture",
+                                "status": "connected",
+                                "environmentId": "fixture-environment",
+                            },
+                        }))
+                        .is_err()
+                            || write_login_completion(CODEX_LOGIN_ID, true).is_err()
+                        {
+                            return 74;
+                        }
+                    }
+                    "duplicate-completion" => {
+                        if write_login_completion(CODEX_LOGIN_ID, true).is_err()
+                            || write_login_completion(CODEX_LOGIN_ID, true).is_err()
+                        {
+                            return 74;
+                        }
+                    }
+                    "conflicting-duplicate-completion" => {
+                        if write_login_completion(CODEX_LOGIN_ID, true).is_err()
+                            || write_login_completion(CODEX_LOGIN_ID, false).is_err()
+                        {
+                            return 74;
+                        }
+                    }
+                    "stale-completion" => {
+                        if write_login_completion(CODEX_STALE_LOGIN_ID, true).is_err() {
+                            return 74;
+                        }
+                    }
+                    "login-rejected" => {
+                        if write_codex_message(&serde_json::json!({
+                            "method": "account/login/completed",
+                            "params": {
+                                "loginId": CODEX_LOGIN_ID,
+                                "success": false,
+                                "error": CODEX_SECRET_SENTINEL,
+                            }
+                        }))
+                        .is_err()
+                        {
+                            return 74;
+                        }
+                    }
+                    "malformed-notification" => {
+                        if write_codex_message(&serde_json::json!({
+                            "method": "account/login/completed",
+                            "params": {
+                                "loginId": CODEX_LOGIN_ID,
+                                "success": true,
+                                "error": null,
+                                "unexpected": CODEX_SECRET_SENTINEL,
+                            }
+                        }))
+                        .is_err()
+                        {
+                            return 74;
+                        }
+                    }
+                    "completion-null-login-id" => {
+                        if write_codex_message(&serde_json::json!({
+                            "method": "account/login/completed",
+                            "params": {
+                                "loginId": null,
+                                "success": true,
+                                "error": null,
+                            }
+                        }))
+                        .is_err()
+                        {
+                            return 74;
+                        }
+                    }
+                    "completion-missing-login-id" => {
+                        if write_codex_message(&serde_json::json!({
+                            "method": "account/login/completed",
+                            "params": {
+                                "success": true,
+                                "error": null,
+                            }
+                        }))
+                        .is_err()
+                        {
+                            return 74;
+                        }
+                    }
+                    "completion-missing-success" => {
+                        if write_codex_message(&serde_json::json!({
+                            "method": "account/login/completed",
+                            "params": {
+                                "loginId": CODEX_LOGIN_ID,
+                                "error": null,
+                            }
+                        }))
+                        .is_err()
+                        {
+                            return 74;
+                        }
+                    }
+                    "completion-wrong-success-type" => {
+                        if write_codex_message(&serde_json::json!({
+                            "method": "account/login/completed",
+                            "params": {
+                                "loginId": CODEX_LOGIN_ID,
+                                "success": "true",
+                                "error": null,
+                            }
+                        }))
+                        .is_err()
+                        {
+                            return 74;
+                        }
+                    }
+                    "advisory-only" => {
+                        if write_account_updated().is_err() {
+                            return 74;
+                        }
+                    }
+                    "confirmation-timeout" => {
+                        if write_login_completion(CODEX_LOGIN_ID, true).is_err() {
+                            return 74;
+                        }
+                    }
+                    "child-exit" => return 0,
+                    _ => {}
+                }
+            }
+            "account/login/cancel" => {
+                if object.len() != 3
+                    || object.get("params") != Some(&serde_json::json!({"loginId": CODEX_LOGIN_ID}))
+                {
+                    return 65;
+                }
+                let status = match scenario {
+                    "cancel-not-found-success" => {
+                        cancel_raced = true;
+                        if write_login_completion(CODEX_LOGIN_ID, true).is_err()
+                            || write_account_updated().is_err()
+                        {
+                            return 74;
+                        }
+                        "notFound"
+                    }
+                    "cancel-invalid-status" => "alreadyDone",
+                    "cancel-canceled-late-success" => "canceled",
+                    _ => {
+                        if write_login_completion(CODEX_LOGIN_ID, false).is_err() {
+                            return 74;
+                        }
+                        "canceled"
+                    }
+                };
+                if write_codex_message(&serde_json::json!({"id": id, "result": {"status": status}}))
+                    .is_err()
+                {
+                    return 74;
+                }
+                if scenario == "cancel-canceled-late-success" {
+                    thread::spawn(|| {
+                        thread::sleep(Duration::from_millis(20));
+                        let _ = write_login_completion(CODEX_LOGIN_ID, true);
+                    });
+                }
+            }
+            "account/logout" => {
+                if object.len() != 2 {
+                    return 65;
+                }
+                if write_codex_message(&serde_json::json!({"id": id, "result": {}})).is_err() {
+                    return 74;
+                }
+            }
+            _ => return 65,
+        }
+    }
+    0
+}
+
+fn codex_fixture_account(
+    scenario: &str,
+    account_reads: u64,
+    login_started: bool,
+    cancel_raced: bool,
+) -> serde_json::Value {
+    if let Some(plan) = scenario.strip_prefix("account-plan-") {
+        return serde_json::json!({
+            "type": "chatgpt",
+            "email": CODEX_SECRET_SENTINEL,
+            "planType": plan,
+        });
+    }
+    match scenario {
+        "account-api-key" => serde_json::json!({"type": "apiKey"}),
+        "account-amazon-bedrock" => serde_json::json!({"type": "amazonBedrock"}),
+        "account-unknown-type" => serde_json::json!({"type": "personalAccessToken"}),
+        "stale-account-then-updated" if account_reads < 3 => serde_json::Value::Null,
+        "confirmation-timeout" => serde_json::Value::Null,
+        "cancel-not-found-success" if !cancel_raced => serde_json::Value::Null,
+        _ if login_started => serde_json::json!({
+            "type": "chatgpt",
+            "email": CODEX_SECRET_SENTINEL,
+            "planType": "plus",
+        }),
+        _ => serde_json::Value::Null,
+    }
+}
+
+fn browser_authorization_url(scenario: &str) -> String {
+    let mut base = "https://auth.openai.com/oauth/authorize";
+    let mut query = vec![
+        ("response_type", "code".to_owned()),
+        ("client_id", "app_EMoamEEZ73f0CkXaXp7hrann".to_owned()),
+        (
+            "redirect_uri",
+            "http://localhost:1455/auth/callback".to_owned(),
+        ),
+        (
+            "scope",
+            "openid profile email offline_access api.connectors.read api.connectors.invoke"
+                .to_owned(),
+        ),
+        ("code_challenge", "A".repeat(43)),
+        ("code_challenge_method", "S256".to_owned()),
+        ("id_token_add_organizations", "true".to_owned()),
+        ("codex_cli_simplified_flow", "true".to_owned()),
+        ("state", "B".repeat(43)),
+        ("originator", "carl".to_owned()),
+    ];
+    match scenario {
+        "browser-wrong-host" => base = "https://evil.example/oauth/authorize",
+        "browser-wrong-path" => base = "https://auth.openai.com/oauth/token",
+        "browser-duplicate-query" => query.push(("client_id", "duplicate".to_owned())),
+        "browser-invalid-callback" => {
+            query[2].1 = "https://evil.example/auth/callback".to_owned();
+        }
+        "browser-invalid-callback-port" => {
+            query[2].1 = "http://localhost:1456/auth/callback".to_owned();
+        }
+        "browser-port-1457" => {
+            query[2].1 = "http://localhost:1457/auth/callback".to_owned();
+        }
+        "browser-wrong-response-type" => query[0].1 = "token".to_owned(),
+        "browser-wrong-client-id" => query[1].1 = "carl".to_owned(),
+        "browser-wrong-scope" => query[3].1 = "openid profile email offline_access".to_owned(),
+        "browser-invalid-code-challenge" => query[4].1 = "not_base64url".to_owned(),
+        "browser-wrong-code-challenge-method" => query[5].1 = "plain".to_owned(),
+        "browser-organizations-disabled" => query[6].1 = "false".to_owned(),
+        "browser-simplified-flow-disabled" => query[7].1 = "false".to_owned(),
+        "browser-invalid-state" => query[8].1 = "not_base64url".to_owned(),
+        "browser-wrong-originator" => query[9].1 = "codex_cli_rs".to_owned(),
+        "browser-extra-nonce" => query.push(("nonce", CODEX_SECRET_SENTINEL.to_owned())),
+        "browser-extra-prompt" => query.push(("prompt", "login".to_owned())),
+        "browser-extra-audience" => query.push(("audience", "codex".to_owned())),
+        "browser-extra-resource" => query.push(("resource", "codex".to_owned())),
+        "browser-extra-workspace" => {
+            query.push(("allowed_workspace_id", CODEX_SECRET_SENTINEL.to_owned()));
+        }
+        "browser-wrong-order" => query.swap(0, 1),
+        _ => {}
+    }
+
+    let encoded = url::form_urlencoded::Serializer::new(String::new())
+        .extend_pairs(query)
+        .finish();
+    format!("{base}?{encoded}")
+}
+
+fn device_verification_url(scenario: &str) -> &'static str {
+    match scenario {
+        "device-wrong-path" => "https://auth.openai.com/device",
+        "device-query" => "https://auth.openai.com/codex/device?code=secret",
+        _ => "https://auth.openai.com/codex/device",
+    }
+}
+
+fn write_login_completion(login_id: &str, success: bool) -> io::Result<()> {
+    write_codex_message(&serde_json::json!({
+        "method": "account/login/completed",
+        "params": {
+            "loginId": login_id,
+            "success": success,
+            "error": if success {
+                serde_json::Value::Null
+            } else {
+                serde_json::Value::String(CODEX_SECRET_SENTINEL.to_owned())
+            },
+        }
+    }))
+}
+
+fn write_account_updated() -> io::Result<()> {
+    write_codex_message(&serde_json::json!({
+        "method": "account/updated",
+        "params": {"authMode": "chatgpt", "planType": "plus"},
+    }))
+}
+
+fn write_codex_message(value: &serde_json::Value) -> io::Result<()> {
+    let stdout = io::stdout();
+    let mut stdout = stdout.lock();
+    serde_json::to_writer(&mut stdout, value)?;
+    writeln!(stdout)?;
+    stdout.flush()
+}
+
+fn record_codex_launch(home: &Path) -> io::Result<()> {
+    let cwd = env::current_dir()?;
+    let environment: BTreeMap<_, _> = env::vars_os()
+        .map(|(key, value)| {
+            (
+                key.to_string_lossy().into_owned(),
+                value.to_string_lossy().into_owned(),
+            )
+        })
+        .collect();
+    let record = serde_json::json!({
+        "cwd": cwd,
+        "environment": environment,
+    });
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(home.join("codex-launch.json"))?;
+    serde_json::to_writer(&mut file, &record)?;
+    file.flush()
+}
+
+fn record_codex_request(home: &Path, input: &str) -> io::Result<()> {
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(home.join("codex-requests.jsonl"))?;
+    writeln!(file, "{input}")?;
+    file.flush()
 }
 
 fn strict_jsonl(write_stderr: bool, ignore_term: bool) -> i32 {

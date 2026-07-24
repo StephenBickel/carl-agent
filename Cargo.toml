@@ -18,6 +18,11 @@ name = "sidecar_contract"
 path = "tests/sidecar_contract.rs"
 harness = false
 
+[[test]]
+name = "codex_auth_contract"
+path = "tests/codex_auth_contract.rs"
+harness = false
+
 [dependencies]
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5", features = ["derive"] }

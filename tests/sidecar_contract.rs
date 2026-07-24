@@ -1,3 +1,4 @@
+#[allow(dead_code)]
 #[path = "support/sidecar.rs"]
 mod support;
 
@@ -389,6 +390,55 @@ fn official_codex_package_wrappers_resolve_to_packaged_native_binaries() -> Test
                 short_limits(),
             ))?,
             Version::parse("1.2.3")?
+        );
+
+        let homebrew_layout = TestLayout::new()?;
+        let homebrew_package_root = homebrew_layout
+            .data
+            .join("Cellar")
+            .join("codex")
+            .join("0.136.0")
+            .join("libexec")
+            .join("lib")
+            .join("node_modules")
+            .join("@openai")
+            .join("codex");
+        let homebrew_wrapper = homebrew_package_root.join("bin").join("codex.js");
+        let homebrew_native = homebrew_package_root
+            .join("vendor")
+            .join(codex_native_target_triple())
+            .join("codex")
+            .join("codex");
+        fs::create_dir_all(
+            homebrew_wrapper
+                .parent()
+                .ok_or("Homebrew wrapper has no parent")?,
+        )?;
+        fs::create_dir_all(
+            homebrew_native
+                .parent()
+                .ok_or("Homebrew native binary has no parent")?,
+        )?;
+        fs::write(
+            &homebrew_wrapper,
+            b"#!/usr/bin/env node\nprocess.exit(86)\n",
+        )?;
+        fs::set_permissions(&homebrew_wrapper, fs::Permissions::from_mode(0o755))?;
+        fs::copy(env::current_exe()?, &homebrew_native)?;
+        fs::set_permissions(&homebrew_native, fs::Permissions::from_mode(0o755))?;
+        let homebrew_launcher = homebrew_layout.data.join("homebrew-bin").join("codex");
+        fs::create_dir_all(
+            homebrew_launcher
+                .parent()
+                .ok_or("Homebrew launcher has no parent")?,
+        )?;
+        symlink(&homebrew_wrapper, &homebrew_launcher)?;
+
+        let mut homebrew_command = fixture_command(&homebrew_layout, "strict-jsonl", "1.2.3");
+        homebrew_command.executable = homebrew_launcher;
+        assert_eq!(
+            homebrew_command.resolve_executable()?.canonical_path(),
+            fs::canonicalize(homebrew_native)?
         );
     }
     Ok(())
