@@ -850,10 +850,10 @@ if [ "$*" = "--no-auto-update agent stdio" ]; then
   IFS= read -r authenticate || exit 74
   printf '%s\n' "$authenticate" >> "$GROK_HOME/requests.log"
   if [ "$scenario" = "reconcile-hang" ]; then
-    : > "$GROK_HOME/reconcile-started"
     /bin/sleep 60 &
     child=$!
     printf '%s %s\n' "$$" "$child" > "$GROK_HOME/reconcile-pids"
+    : > "$GROK_HOME/reconcile-started"
     wait "$child"
     exit $?
   fi
@@ -918,10 +918,16 @@ exit 64
             foreground_timeout: Duration,
         ) -> Self {
             let serial = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
-            let root = std::env::temp_dir().join(format!(
-                "carl-grok-auth-unit-{}-{serial}",
-                std::process::id()
-            ));
+            // Executable trust validates every ancestor; Linux's system temp
+            // directory is intentionally world-writable.
+            let root = std::env::current_exe()
+                .expect("the Grok unit-test executable has a path")
+                .parent()
+                .expect("the Grok unit-test executable has a parent")
+                .join(format!(
+                    "carl-grok-auth-unit-{}-{serial}",
+                    std::process::id()
+                ));
             let data = root.join("data");
             let workspace = root.join("workspace");
             let home_path = data.join("providers").join("grok");

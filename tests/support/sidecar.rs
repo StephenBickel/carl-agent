@@ -45,8 +45,12 @@ pub struct TestLayout {
 impl TestLayout {
     pub fn new() -> TestResult<Self> {
         let serial = NEXT_TEMPORARY_DIRECTORY.fetch_add(1, Ordering::Relaxed);
-        let root =
-            env::temp_dir().join(format!("carl-sidecar-contract-{}-{serial}", process::id()));
+        // Executable trust validates every ancestor; Linux's system temp
+        // directory is intentionally world-writable.
+        let root = env::current_exe()?
+            .parent()
+            .ok_or("the contract-test executable has no parent")?
+            .join(format!("carl-sidecar-contract-{}-{serial}", process::id()));
         let data = root.join("data");
         let workspace = root.join("workspace");
         let home = data.join("providers").join("fixture");

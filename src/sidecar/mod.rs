@@ -3336,17 +3336,17 @@ fn configure_provider_environment(
     #[cfg(unix)]
     command.env("TMPDIR", private_temp);
     #[cfg(target_os = "linux")]
-    if profile == ProviderEnvironmentProfile::Codex {
-        if let Some((runtime, address)) = validated_linux_keyring_environment(
+    if profile == ProviderEnvironmentProfile::Codex
+        && let Some((runtime, address)) = validated_linux_keyring_environment(
             env::var_os("XDG_RUNTIME_DIR"),
             env::var_os("DBUS_SESSION_BUS_ADDRESS"),
             workspace,
             provider_home,
-        ) {
-            command
-                .env("XDG_RUNTIME_DIR", runtime)
-                .env("DBUS_SESSION_BUS_ADDRESS", address);
-        }
+        )
+    {
+        command
+            .env("XDG_RUNTIME_DIR", runtime)
+            .env("DBUS_SESSION_BUS_ADDRESS", address);
     }
     #[cfg(not(target_os = "linux"))]
     let _ = workspace;
@@ -3386,7 +3386,7 @@ fn validated_linux_keyring_environment(
     }
     let bus_path = runtime.join("bus");
     let bus_path = bus_path.to_str()?;
-    if bus_path.contains(|character| matches!(character, ',' | ';')) {
+    if bus_path.contains([',', ';']) {
         return None;
     }
     let expected = format!("unix:path={bus_path}");
