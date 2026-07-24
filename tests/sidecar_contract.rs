@@ -9,14 +9,18 @@ use std::path::{Path, PathBuf};
 use std::process;
 use std::time::Duration;
 
+#[cfg(unix)]
+use carl::sidecar::ExecutableMetadataRisk;
 use carl::sidecar::{
     ExecutableTrustDecision, JsonlSidecar, NotificationPolicy, ProviderEnvironmentProfile,
-    ProviderHome, SidecarCommand, SidecarError, SidecarErrorCode, SidecarLimits,
-    VersionOutputFormat,
+    ProviderFileMetadata, ProviderHome, SidecarCommand, SidecarError, SidecarErrorCode,
+    SidecarLimits, VersionOutputFormat,
 };
 use libtest_mimic::{Arguments, Failed, Trial};
 use semver::{Version, VersionReq};
 use serde_json::json;
+#[cfg(windows)]
+use support::processes_have_exited;
 use support::{
     PATH_SENTINEL, SECRET_SENTINEL, TestLayout, TestResult, dispatch_fixture, fixture_command,
     short_limits, spawn_fixture, wait_for_fixture_pids, wait_for_received_count,
@@ -37,6 +41,14 @@ fn main() {
         env::set_var("AWS_ACCESS_KEY_ID", SECRET_SENTINEL);
         env::set_var("CODEX_HOME", "/parent/credential/home");
         env::set_var("GROK_HOME", "/parent/credential/home");
+        #[cfg(target_os = "linux")]
+        {
+            env::set_var("XDG_RUNTIME_DIR", "/tmp/carl-poisoned-runtime");
+            env::set_var(
+                "DBUS_SESSION_BUS_ADDRESS",
+                "unix:path=/tmp/carl-poisoned-runtime/bus;tcp:host=attacker",
+            );
+        }
         let inherited_path = env::var_os("PATH").unwrap_or_default();
         let poisoned_path = env::join_paths(
             std::iter::once(PathBuf::from(PATH_SENTINEL)).chain(env::split_paths(&inherited_path)),
@@ -72,6 +84,14 @@ fn main() {
             provider_home_writes_static_files_through_its_capability,
         ),
         test(
+            "provider home rejects ambient replacement",
+            provider_home_rejects_ambient_replacement,
+        ),
+        test(
+            "provider file metadata is capability relative",
+            provider_file_metadata_is_capability_relative,
+        ),
+        test(
             "unsafe provider homes are rejected",
             unsafe_provider_homes_are_rejected,
         ),
@@ -82,6 +102,10 @@ fn main() {
         test(
             "Grok environment profile is closed",
             grok_environment_profile_is_closed,
+        ),
+        test(
+            "convenience APIs honor Grok environment profile",
+            convenience_apis_honor_grok_environment_profile,
         ),
         test(
             "responses correlate out of order",
@@ -180,9 +204,15 @@ async fn detect_version(
 ) -> Result<Version, SidecarError> {
     let trusted = command
         .resolve_executable()?
-        .trust(ExecutableTrustDecision::TrustCanonicalPath);
+        .trust(ExecutableTrustDecision::TrustCanonicalPath)?;
     command
-        .detect_trusted_version(&trusted, data_root, workspace, short_limits())
+        .detect_trusted_version(
+            &trusted,
+            ProviderEnvironmentProfile::Codex,
+            data_root,
+            workspace,
+            short_limits(),
+        )
         .await
 }
 
@@ -271,6 +301,28 @@ fn executable_is_canonical_regular_and_trusted() -> TestResult {
             .resolve_executable()
             .expect_err("an executable under a broadly writable parent must be rejected");
         assert_eq!(error.code(), SidecarErrorCode::UnsafeExecutable);
+
+        let metadata_risk_layout = TestLayout::new()?;
+        let metadata_risk_parent = metadata_risk_layout.data.join("native-prefix");
+        fs::create_dir(&metadata_risk_parent)?;
+        fs::set_permissions(&metadata_risk_parent, fs::Permissions::from_mode(0o775))?;
+        let metadata_risk_executable = metadata_risk_parent.join("provider");
+        fs::copy(env::current_exe()?, &metadata_risk_executable)?;
+        fs::set_permissions(&metadata_risk_executable, fs::Permissions::from_mode(0o755))?;
+        let mut metadata_risk = fixture_command(&metadata_risk_layout, "strict-jsonl", "1.2.3");
+        metadata_risk.executable = metadata_risk_executable;
+        let resolved = metadata_risk.resolve_executable()?;
+        assert_eq!(
+            resolved.metadata_risk(),
+            Some(ExecutableMetadataRisk::GroupWritableInstallDirectory)
+        );
+        let error = resolved
+            .trust(ExecutableTrustDecision::TrustCanonicalPath)
+            .expect_err("metadata risk requires its own explicit trust decision");
+        assert_eq!(error.code(), SidecarErrorCode::UnsafeExecutable);
+        metadata_risk
+            .resolve_executable()?
+            .trust(ExecutableTrustDecision::TrustCanonicalPathWithMetadataRisk)?;
     }
 
     Ok(())
@@ -288,10 +340,16 @@ fn executable_trust_precedes_every_execution() -> TestResult {
             "resolving a candidate must not execute it"
         );
 
-        let trusted = resolved.trust(ExecutableTrustDecision::TrustCanonicalPath);
+        let trusted = resolved.trust(ExecutableTrustDecision::TrustCanonicalPath)?;
         assert_eq!(
             command
-                .detect_trusted_version(&trusted, &layout.data, &layout.workspace, short_limits(),)
+                .detect_trusted_version(
+                    &trusted,
+                    ProviderEnvironmentProfile::Codex,
+                    &layout.data,
+                    &layout.workspace,
+                    short_limits(),
+                )
                 .await?,
             Version::parse("1.2.3")?
         );
@@ -324,10 +382,11 @@ fn sidecar_limits_reject_unbounded_configurations() -> TestResult {
             let command = fixture_command(&layout, "strict-jsonl", "1.2.3");
             let trusted = command
                 .resolve_executable()?
-                .trust(ExecutableTrustDecision::TrustCanonicalPath);
+                .trust(ExecutableTrustDecision::TrustCanonicalPath)?;
             let error = JsonlSidecar::spawn_trusted(
                 command,
                 &trusted,
+                ProviderEnvironmentProfile::Codex,
                 &layout.data,
                 &layout.workspace,
                 limits,
@@ -549,6 +608,137 @@ fn provider_home_writes_static_files_through_its_capability() -> TestResult {
     Ok(())
 }
 
+fn provider_home_rejects_ambient_replacement() -> TestResult {
+    let layout = TestLayout::new()?;
+    let command = fixture_command(&layout, "strict-jsonl", "1.2.3");
+    let trusted = command
+        .resolve_executable()?
+        .trust(ExecutableTrustDecision::TrustCanonicalPath)?;
+    let home = ProviderHome::prepare(
+        ProviderEnvironmentProfile::Codex,
+        &layout.data,
+        &layout.workspace,
+        &layout.home,
+    )?;
+    let moved = layout.data.join("held-provider-home");
+    fs::rename(&layout.home, &moved)?;
+    fs::create_dir_all(layout.home.join(".carl-tmp"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&layout.home, fs::Permissions::from_mode(0o700))?;
+        fs::set_permissions(
+            layout.home.join(".carl-tmp"),
+            fs::Permissions::from_mode(0o700),
+        )?;
+    }
+
+    assert!(!home.matches_path(&layout.home));
+    let error = home
+        .write_static_file("replacement-must-stay-empty.toml", b"unsafe = true\n")
+        .expect_err("an ambient replacement must invalidate the capability");
+    assert_eq!(error.code(), SidecarErrorCode::InvalidProviderHome);
+    assert!(
+        !layout
+            .home
+            .join("replacement-must-stay-empty.toml")
+            .exists()
+    );
+    assert!(!moved.join("replacement-must-stay-empty.toml").exists());
+    let error = run_async(command.detect_version_in_home(&trusted, &home, short_limits()))
+        .expect_err("version probing must reject a replaced provider home");
+    assert_eq!(error.code(), SidecarErrorCode::InvalidProviderHome);
+    assert!(!layout.home.join("version-executable-path").exists());
+    assert!(!moved.join("version-executable-path").exists());
+    Ok(())
+}
+
+fn provider_file_metadata_is_capability_relative() -> TestResult {
+    let layout = TestLayout::new()?;
+    let home = ProviderHome::prepare(
+        ProviderEnvironmentProfile::Grok,
+        &layout.data,
+        &layout.workspace,
+        &layout.home,
+    )?;
+    assert_eq!(
+        home.inspect_owner_only_file("auth.json", 4 * 1024)?,
+        ProviderFileMetadata::Missing
+    );
+
+    let auth = layout.home.join("auth.json");
+    fs::write(&auth, b"provider-owned-secret")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&auth, fs::Permissions::from_mode(0o600))?;
+    }
+    assert_eq!(
+        home.inspect_owner_only_file("auth.json", 4 * 1024)?,
+        ProviderFileMetadata::Safe
+    );
+    let alias = layout.home.join("auth-alias.json");
+    fs::hard_link(&auth, &alias)?;
+    let error = home
+        .inspect_owner_only_file("auth.json", 4 * 1024)
+        .expect_err("a hard-linked provider credential file must fail closed");
+    assert_eq!(error.code(), SidecarErrorCode::UnsafeProviderFile);
+    fs::remove_file(alias)?;
+
+    let error = home
+        .inspect_owner_only_file("auth.json", 4)
+        .expect_err("an oversized provider credential file must fail closed");
+    assert_eq!(error.code(), SidecarErrorCode::UnsafeProviderFile);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        fs::set_permissions(&auth, fs::Permissions::from_mode(0o644))?;
+        let error = home
+            .inspect_owner_only_file("auth.json", 4 * 1024)
+            .expect_err("a broadly readable provider credential file must fail closed");
+        assert_eq!(error.code(), SidecarErrorCode::UnsafeProviderFile);
+        fs::set_permissions(&auth, fs::Permissions::from_mode(0o600))?;
+
+        fs::remove_file(&auth)?;
+        let outside = layout.data.join("outside-auth.json");
+        fs::write(&outside, b"outside-secret")?;
+        symlink(&outside, &auth)?;
+        let error = home
+            .inspect_owner_only_file("auth.json", 4 * 1024)
+            .expect_err("a symlinked provider credential file must fail closed");
+        assert_eq!(error.code(), SidecarErrorCode::UnsafeProviderFile);
+        fs::remove_file(&auth)?;
+        fs::create_dir(&auth)?;
+        let error = home
+            .inspect_owner_only_file("auth.json", 4 * 1024)
+            .expect_err("a provider credential directory must fail closed");
+        assert_eq!(error.code(), SidecarErrorCode::UnsafeProviderFile);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::symlink_file;
+
+        fs::remove_file(&auth)?;
+        let outside = layout.data.join("outside-auth.json");
+        fs::write(&outside, b"outside-secret")?;
+        if symlink_file(&outside, &auth).is_ok() {
+            let error = home
+                .inspect_owner_only_file("auth.json", 4 * 1024)
+                .expect_err("a reparse-point provider credential file must fail closed");
+            assert_eq!(error.code(), SidecarErrorCode::UnsafeProviderFile);
+            fs::remove_file(&auth)?;
+        }
+        fs::create_dir(&auth)?;
+        let error = home
+            .inspect_owner_only_file("auth.json", 4 * 1024)
+            .expect_err("a provider credential directory must fail closed");
+        assert_eq!(error.code(), SidecarErrorCode::UnsafeProviderFile);
+    }
+    Ok(())
+}
+
 fn unsafe_provider_homes_are_rejected() -> TestResult {
     let inside_workspace = TestLayout::new()?;
     let mut command = fixture_command(&inside_workspace, "strict-jsonl", "1.2.3");
@@ -561,10 +751,11 @@ fn unsafe_provider_homes_are_rejected() -> TestResult {
     let command = fixture_command(&relative_root, "strict-jsonl", "1.2.3");
     let trusted = command
         .resolve_executable()?
-        .trust(ExecutableTrustDecision::TrustCanonicalPath);
+        .trust(ExecutableTrustDecision::TrustCanonicalPath)?;
     let error = run_async(JsonlSidecar::spawn_trusted(
         command,
         &trusted,
+        ProviderEnvironmentProfile::Codex,
         PathBuf::from("relative-data-root"),
         &relative_root.workspace,
         short_limits(),
@@ -574,7 +765,65 @@ fn unsafe_provider_homes_are_rejected() -> TestResult {
 
     #[cfg(unix)]
     {
-        use std::os::unix::fs::symlink;
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let root_inside_workspace = TestLayout::new()?;
+        let nested_root = root_inside_workspace.workspace.join("data");
+        fs::create_dir(&nested_root)?;
+        fs::set_permissions(&nested_root, fs::Permissions::from_mode(0o750))?;
+        let mode_before = fs::metadata(&nested_root)?.permissions().mode() & 0o777;
+        let nested_home = nested_root.join("providers").join("fixture");
+        let error = ProviderHome::prepare(
+            ProviderEnvironmentProfile::Codex,
+            &nested_root,
+            &root_inside_workspace.workspace,
+            &nested_home,
+        )
+        .expect_err("a data root below the workspace must fail before mutation");
+        assert_eq!(error.code(), SidecarErrorCode::InvalidProviderHome);
+        assert!(!nested_home.exists());
+        assert_eq!(
+            fs::metadata(&nested_root)?.permissions().mode() & 0o777,
+            mode_before
+        );
+
+        let workspace_inside_root = TestLayout::new()?;
+        let nested_workspace = workspace_inside_root.data.join("workspace-alias");
+        fs::create_dir(&nested_workspace)?;
+        fs::set_permissions(&nested_workspace, fs::Permissions::from_mode(0o750))?;
+        let mode_before = fs::metadata(&nested_workspace)?.permissions().mode() & 0o777;
+        let nested_home = nested_workspace.join("providers").join("fixture");
+        let error = ProviderHome::prepare(
+            ProviderEnvironmentProfile::Codex,
+            &workspace_inside_root.data,
+            &nested_workspace,
+            &nested_home,
+        )
+        .expect_err("an existing workspace prefix must fail before creating children");
+        assert_eq!(error.code(), SidecarErrorCode::InvalidProviderHome);
+        assert!(!nested_home.exists());
+        assert_eq!(
+            fs::metadata(&nested_workspace)?.permissions().mode() & 0o777,
+            mode_before
+        );
+
+        let unsafe_temp = TestLayout::new()?;
+        fs::create_dir_all(&unsafe_temp.home)?;
+        fs::set_permissions(&unsafe_temp.home, fs::Permissions::from_mode(0o750))?;
+        symlink(&unsafe_temp.workspace, unsafe_temp.home.join(".carl-tmp"))?;
+        let mode_before = fs::metadata(&unsafe_temp.home)?.permissions().mode() & 0o777;
+        let error = ProviderHome::prepare(
+            ProviderEnvironmentProfile::Codex,
+            &unsafe_temp.data,
+            &unsafe_temp.workspace,
+            &unsafe_temp.home,
+        )
+        .expect_err("an unsafe temp prefix must fail before mutating its parent home");
+        assert_eq!(error.code(), SidecarErrorCode::InvalidProviderHome);
+        assert_eq!(
+            fs::metadata(&unsafe_temp.home)?.permissions().mode() & 0o777,
+            mode_before
+        );
 
         let symlinked = TestLayout::new()?;
         let actual = symlinked.data.join("actual");
@@ -626,6 +875,13 @@ fn child_environment_is_allowlisted() -> TestResult {
             assert!(
                 !environment.contains_key(forbidden),
                 "forbidden parent variable reached the child: {forbidden}"
+            );
+        }
+        #[cfg(target_os = "linux")]
+        for invalid_keyring_transport in ["DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR"] {
+            assert!(
+                !environment.contains_key(invalid_keyring_transport),
+                "invalid Linux keyring transport reached the child"
             );
         }
         let mut allowed = carl::sidecar::allowed_environment_variables()
@@ -680,7 +936,7 @@ fn grok_environment_profile_is_closed() -> TestResult {
         let command = fixture_command(&layout, "strict-jsonl", "1.2.3");
         let trusted = command
             .resolve_executable()?
-            .trust(ExecutableTrustDecision::TrustCanonicalPath);
+            .trust(ExecutableTrustDecision::TrustCanonicalPath)?;
         let home = ProviderHome::prepare(
             ProviderEnvironmentProfile::Grok,
             &layout.data,
@@ -729,6 +985,43 @@ fn grok_environment_profile_is_closed() -> TestResult {
         }
         assert!(!environment.contains_key("CODEX_HOME"));
         assert!(!environment.contains_key("BROWSER"));
+        sidecar.cancel().await?;
+        TestResult::Ok(())
+    })
+}
+
+fn convenience_apis_honor_grok_environment_profile() -> TestResult {
+    run_async(async {
+        let layout = TestLayout::new()?;
+        let mut command = fixture_command(&layout, "strict-jsonl", "1.8.2");
+        command.version_arguments = vec![
+            OsString::from(support::FIXTURE_ARGUMENT),
+            OsString::from("version-grok"),
+            OsString::from("1.8.2"),
+            OsString::from("--no-auto-update"),
+            OsString::from("version"),
+        ];
+        command.version_output = VersionOutputFormat::SingleSemverToken;
+        let trusted = command
+            .resolve_executable()?
+            .trust(ExecutableTrustDecision::TrustCanonicalPath)?;
+        let sidecar = JsonlSidecar::spawn_trusted(
+            command,
+            &trusted,
+            ProviderEnvironmentProfile::Grok,
+            &layout.data,
+            &layout.workspace,
+            short_limits(),
+        )
+        .await?;
+        let response = sidecar
+            .request(json!({"id": "grok-convenience", "method": "environment"}))
+            .await?;
+        let environment = response["result"]
+            .as_object()
+            .ok_or("Grok convenience environment was not an object")?;
+        assert!(environment.contains_key("GROK_HOME"));
+        assert!(!environment.contains_key("CODEX_HOME"));
         sidecar.cancel().await?;
         TestResult::Ok(())
     })
@@ -973,7 +1266,7 @@ fn notification_rejection_policy_fails_closed() -> TestResult {
         let command = fixture_command(&layout, "strict-jsonl", "1.2.3");
         let trusted = command
             .resolve_executable()?
-            .trust(ExecutableTrustDecision::TrustCanonicalPath);
+            .trust(ExecutableTrustDecision::TrustCanonicalPath)?;
         let home = ProviderHome::prepare(
             ProviderEnvironmentProfile::Codex,
             &layout.data,
@@ -1095,6 +1388,11 @@ fn explicit_cancellation_removes_process_group() -> TestResult {
         assert_eq!(sidecar.process_id(), Some(pids.0));
 
         sidecar.cancel().await?;
+        #[cfg(windows)]
+        assert!(
+            processes_have_exited(&[pids.0, pids.1]),
+            "Windows cancellation returned before its Job Object became empty"
+        );
         wait_until_processes_exit(&[pids.0, pids.1]).await?;
         assert_owner_only_pid_file(&layout.home)?;
         TestResult::Ok(())
@@ -1166,5 +1464,7 @@ fn assert_owner_only_pid_file(home: &std::path::Path) -> TestResult {
             & 0o777;
         assert_eq!(mode, 0o600);
     }
+    #[cfg(windows)]
+    let _ = home;
     Ok(())
 }

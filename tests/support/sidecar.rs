@@ -11,8 +11,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use carl::sidecar::{
-    ExecutableTrustDecision, JsonlSidecar, SidecarCommand, SidecarError, SidecarLimits,
-    VersionOutputFormat,
+    ExecutableTrustDecision, JsonlSidecar, ProviderEnvironmentProfile, SidecarCommand,
+    SidecarError, SidecarLimits, VersionOutputFormat,
 };
 use semver::VersionReq;
 
@@ -89,8 +89,16 @@ pub async fn spawn_fixture(
 ) -> Result<JsonlSidecar, SidecarError> {
     let trusted = command
         .resolve_executable()?
-        .trust(ExecutableTrustDecision::TrustCanonicalPath);
-    JsonlSidecar::spawn_trusted(command, &trusted, &layout.data, &layout.workspace, limits).await
+        .trust(ExecutableTrustDecision::TrustCanonicalPath)?;
+    JsonlSidecar::spawn_trusted(
+        command,
+        &trusted,
+        ProviderEnvironmentProfile::Codex,
+        &layout.data,
+        &layout.workspace,
+        limits,
+    )
+    .await
 }
 
 pub fn short_limits() -> SidecarLimits {
@@ -538,6 +546,11 @@ pub async fn wait_until_processes_exit(pids: &[u32]) -> TestResult {
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+}
+
+#[cfg(windows)]
+pub fn processes_have_exited(pids: &[u32]) -> bool {
+    pids.iter().all(|pid| !process_is_alive(*pid))
 }
 
 pub async fn wait_until_processes_reaped(pids: &[u32]) -> TestResult {

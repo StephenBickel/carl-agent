@@ -23,9 +23,10 @@ chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5", features = ["derive"] }
 futures-core = "0.3"
 # Dependency review: process-wrap is pinned to 9.1.0 with only Tokio, Unix process
-# groups, and Windows Job Objects enabled. Do not enable its kill-on-drop or
-# creation-flags wrappers until watchexec/process-wrap#35 is resolved; Carl uses
-# Tokio's leader-only fallback plus its own group-aware guard.
+# groups, and its reviewed Windows Job Object code enabled. Do not enable its
+# kill-on-drop or creation-flags wrappers until watchexec/process-wrap#35 is
+# resolved. Carl uses ProcessGroup on Unix and a local Job Object wrapper on Windows
+# whose try_wait remains pending until the job's active-process count reaches zero.
 process-wrap = { version = "=9.1.0", default-features = false, features = [
     "tokio1",
     "process-group",
@@ -51,6 +52,8 @@ windows-sys = { version = "0.61", features = [
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_JobObjects",
     "Win32_System_SystemInformation",
     "Win32_System_SystemServices",
     "Win32_System_Threading",
