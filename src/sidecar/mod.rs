@@ -4257,24 +4257,28 @@ fn write_static_provider_file(
         }
         home.revalidate_bindings().map_err(|_| unsafe_file())?;
         let target_name: Vec<u16> = filename.as_os_str().encode_wide().collect();
-        let base = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
-        let bytes = base
-            .checked_add(
-                target_name
-                    .len()
-                    .checked_mul(std::mem::size_of::<u16>())
-                    .ok_or_else(unsafe_file)?,
-            )
+        let filename_bytes = target_name
+            .len()
+            .checked_mul(std::mem::size_of::<u16>())
+            .ok_or_else(unsafe_file)?;
+        // Windows requires at least the complete fixed structure plus the supplied
+        // filename bytes, even though FileName begins before the structure's trailing
+        // alignment padding.
+        let bytes = std::mem::size_of::<FILE_RENAME_INFO>()
+            .checked_add(filename_bytes)
             .ok_or_else(unsafe_file)?;
         let words = bytes.div_ceil(std::mem::size_of::<usize>());
         let mut storage = vec![0_usize; words];
         let information = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
-        let filename_bytes = u32::try_from(target_name.len() * std::mem::size_of::<u16>())
-            .map_err(|_| unsafe_file())?;
+        let filename_bytes = u32::try_from(filename_bytes).map_err(|_| unsafe_file())?;
         // SAFETY: storage is aligned and sized for the fixed structure plus target name.
         unsafe {
             (*information).Anonymous.ReplaceIfExists = true;
-            (*information).RootDirectory = home.directory.as_raw_handle();
+            // A simple name with a null root renames the already-open source within
+            // its current directory. The source was created relative to the held
+            // provider-home handle, so the operation remains capability-bound without
+            // asking Windows to reopen a target directory.
+            (*information).RootDirectory = std::ptr::null_mut();
             (*information).FileNameLength = filename_bytes;
             std::ptr::copy_nonoverlapping(
                 target_name.as_ptr(),
@@ -4284,7 +4288,7 @@ fn write_static_provider_file(
         }
         let bytes = u32::try_from(bytes).map_err(|_| unsafe_file())?;
         // SAFETY: the temporary file remains open, and information points to a
-        // correctly sized FILE_RENAME_INFO naming a component under held home.
+        // correctly sized FILE_RENAME_INFO containing a simple same-directory name.
         if unsafe {
             SetFileInformationByHandle(
                 temporary_file.as_raw_handle(),
