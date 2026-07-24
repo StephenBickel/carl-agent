@@ -181,6 +181,8 @@ fn domain_closed_enums_have_stable_wire_values() -> Result<(), Box<dyn std::erro
             AuthUnavailableCode::KeyringUnavailable,
             AuthUnavailableCode::ProtocolMismatch,
             AuthUnavailableCode::ProviderRejected,
+            AuthUnavailableCode::ForegroundRequired,
+            AuthUnavailableCode::UnsafeCredentialStore,
             AuthUnavailableCode::TimedOut,
         ],
         &[
@@ -189,6 +191,8 @@ fn domain_closed_enums_have_stable_wire_values() -> Result<(), Box<dyn std::erro
             "keyring_unavailable",
             "protocol_mismatch",
             "provider_rejected",
+            "foreground_required",
+            "unsafe_credential_store",
             "timed_out",
         ],
     )?;
@@ -352,6 +356,11 @@ fn domain_auth_errors_are_typed_serializable_and_sanitized()
         (AuthErrorCode::KeyringUnavailable, ErrorCode::Authentication),
         (AuthErrorCode::ProtocolMismatch, ErrorCode::Authentication),
         (AuthErrorCode::ProviderRejected, ErrorCode::Authentication),
+        (AuthErrorCode::ForegroundRequired, ErrorCode::Channel),
+        (
+            AuthErrorCode::UnsafeCredentialStore,
+            ErrorCode::Authentication,
+        ),
         (AuthErrorCode::TimedOut, ErrorCode::Timeout),
         (AuthErrorCode::Cancelled, ErrorCode::Cancelled),
         (AuthErrorCode::SidecarExited, ErrorCode::Authentication),
@@ -411,6 +420,14 @@ fn domain_unavailable_codes_convert_without_provider_details() {
         (
             AuthUnavailableCode::ProviderRejected,
             AuthErrorCode::ProviderRejected,
+        ),
+        (
+            AuthUnavailableCode::ForegroundRequired,
+            AuthErrorCode::ForegroundRequired,
+        ),
+        (
+            AuthUnavailableCode::UnsafeCredentialStore,
+            AuthErrorCode::UnsafeCredentialStore,
         ),
         (AuthUnavailableCode::TimedOut, AuthErrorCode::TimedOut),
     ];

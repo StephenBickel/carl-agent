@@ -101,6 +101,10 @@ pub enum AuthUnavailableCode {
     ProtocolMismatch,
     #[serde(rename = "provider_rejected")]
     ProviderRejected,
+    #[serde(rename = "foreground_required")]
+    ForegroundRequired,
+    #[serde(rename = "unsafe_credential_store")]
+    UnsafeCredentialStore,
     #[serde(rename = "timed_out")]
     TimedOut,
 }
@@ -275,6 +279,10 @@ pub enum AuthErrorCode {
     ProtocolMismatch,
     #[serde(rename = "provider_rejected")]
     ProviderRejected,
+    #[serde(rename = "foreground_required")]
+    ForegroundRequired,
+    #[serde(rename = "unsafe_credential_store")]
+    UnsafeCredentialStore,
     #[serde(rename = "timed_out")]
     TimedOut,
     #[serde(rename = "cancelled")]
@@ -294,6 +302,8 @@ impl AuthErrorCode {
             Self::KeyringUnavailable => "keyring_unavailable",
             Self::ProtocolMismatch => "protocol_mismatch",
             Self::ProviderRejected => "provider_rejected",
+            Self::ForegroundRequired => "foreground_required",
+            Self::UnsafeCredentialStore => "unsafe_credential_store",
             Self::TimedOut => "timed_out",
             Self::Cancelled => "cancelled",
             Self::SidecarExited => "sidecar_exited",
@@ -334,6 +344,8 @@ impl From<AuthUnavailableCode> for AuthErrorCode {
             AuthUnavailableCode::KeyringUnavailable => Self::KeyringUnavailable,
             AuthUnavailableCode::ProtocolMismatch => Self::ProtocolMismatch,
             AuthUnavailableCode::ProviderRejected => Self::ProviderRejected,
+            AuthUnavailableCode::ForegroundRequired => Self::ForegroundRequired,
+            AuthUnavailableCode::UnsafeCredentialStore => Self::UnsafeCredentialStore,
             AuthUnavailableCode::TimedOut => Self::TimedOut,
         }
     }
@@ -410,6 +422,8 @@ impl_closed_auth_deserialize!(
     "keyring_unavailable" => AuthUnavailableCode::KeyringUnavailable,
     "protocol_mismatch" => AuthUnavailableCode::ProtocolMismatch,
     "provider_rejected" => AuthUnavailableCode::ProviderRejected,
+    "foreground_required" => AuthUnavailableCode::ForegroundRequired,
+    "unsafe_credential_store" => AuthUnavailableCode::UnsafeCredentialStore,
     "timed_out" => AuthUnavailableCode::TimedOut,
 );
 
@@ -422,6 +436,8 @@ impl_closed_auth_deserialize!(
     "keyring_unavailable" => AuthErrorCode::KeyringUnavailable,
     "protocol_mismatch" => AuthErrorCode::ProtocolMismatch,
     "provider_rejected" => AuthErrorCode::ProviderRejected,
+    "foreground_required" => AuthErrorCode::ForegroundRequired,
+    "unsafe_credential_store" => AuthErrorCode::UnsafeCredentialStore,
     "timed_out" => AuthErrorCode::TimedOut,
     "cancelled" => AuthErrorCode::Cancelled,
     "sidecar_exited" => AuthErrorCode::SidecarExited,

@@ -161,9 +161,13 @@ impl From<AuthError> for CarlError {
             AuthErrorCode::Cancelled => Self::Cancelled {
                 detail: "Subscription authentication was cancelled.".into(),
             },
+            AuthErrorCode::ForegroundRequired => Self::Channel {
+                detail: "Subscription login requires a local foreground terminal.".into(),
+            },
             AuthErrorCode::KeyringUnavailable
             | AuthErrorCode::ProtocolMismatch
             | AuthErrorCode::ProviderRejected
+            | AuthErrorCode::UnsafeCredentialStore
             | AuthErrorCode::SidecarExited => Self::Authentication {
                 detail: "The subscription authentication sidecar failed.".into(),
             },
