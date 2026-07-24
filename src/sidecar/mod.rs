@@ -4555,6 +4555,15 @@ mod windows_security {
         LocalDriveRoot,
     }
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum DaclVerificationFailure {
+        CurrentUser,
+        SecurityInfo,
+        OwnerPolicy,
+        BroadWriter,
+        EffectiveAccess,
+    }
+
     // AccessCheck rejects a descriptor without both owner and primary-group SIDs.
     // GROUP_SECURITY_INFORMATION populates the group inside ppSecurityDescriptor;
     // its separate ppGroup output pointer may remain null because callers do not
@@ -4571,6 +4580,7 @@ mod windows_security {
             OwnerPolicy::TrustedExecutable,
             executable_component_kind(path, ancestor_depth),
         )
+        .map_err(|_| ())
     }
 
     fn executable_component_kind(path: &Path, ancestor_depth: usize) -> ObjectKind {
@@ -4596,7 +4606,7 @@ mod windows_security {
     }
 
     pub(super) fn verify_private_directory(path: &Path) -> Result<(), ()> {
-        verify_dacl(path, OwnerPolicy::CurrentUserPrivate, ObjectKind::Directory)
+        verify_dacl(path, OwnerPolicy::CurrentUserPrivate, ObjectKind::Directory).map_err(|_| ())
     }
 
     pub(super) fn verify_private_file_handle(file: &File) -> Result<(), ()> {
@@ -4637,6 +4647,7 @@ mod windows_security {
             OwnerPolicy::CurrentUserPrivate,
             object_kind,
         )
+        .map_err(|_| ())
     }
 
     struct LocalDescriptor(PSECURITY_DESCRIPTOR);
@@ -4832,8 +4843,9 @@ mod windows_security {
         path: &Path,
         owner_policy: OwnerPolicy,
         object_kind: ObjectKind,
-    ) -> Result<(), ()> {
-        let current_user = CurrentUser::query()?;
+    ) -> Result<(), DaclVerificationFailure> {
+        let current_user =
+            CurrentUser::query().map_err(|()| DaclVerificationFailure::CurrentUser)?;
         let mut path: Vec<u16> = path.as_os_str().encode_wide().collect();
         path.push(0);
         let mut dacl = ptr::null_mut::<ACL>();
@@ -4856,7 +4868,7 @@ mod windows_security {
         // validation failure.
         let _descriptor = LocalDescriptor(descriptor);
         if result != 0 || dacl.is_null() || owner.is_null() || descriptor.is_null() {
-            return Err(());
+            return Err(DaclVerificationFailure::SecurityInfo);
         }
         validate_descriptor(
             descriptor,
@@ -4875,7 +4887,7 @@ mod windows_security {
         current_user: &CurrentUser,
         owner_policy: OwnerPolicy,
         object_kind: ObjectKind,
-    ) -> Result<(), ()> {
+    ) -> Result<(), DaclVerificationFailure> {
         // SAFETY: owner and current-user SIDs are valid and live with their buffers.
         let owner_is_current = unsafe { EqualSid(owner, current_user.sid()) } != 0;
         // SAFETY: owner was returned by GetNamedSecurityInfoW in the live descriptor.
@@ -4888,7 +4900,7 @@ mod windows_security {
             OwnerPolicy::CurrentUserPrivate => owner_is_current,
         };
         if !owner_allowed {
-            return Err(());
+            return Err(DaclVerificationFailure::OwnerPolicy);
         }
         // SAFETY: DACL and all owner/current-user storage remain live for this call.
         unsafe {
@@ -4900,8 +4912,9 @@ mod windows_security {
             )
         }
         .then_some(())
-        .ok_or(())?;
+        .ok_or(DaclVerificationFailure::BroadWriter)?;
         verify_effective_current_user_access(descriptor, current_user, owner_policy, object_kind)
+            .map_err(|()| DaclVerificationFailure::EffectiveAccess)
     }
 
     unsafe fn dacl_has_safe_writers(
@@ -5134,6 +5147,23 @@ mod windows_security {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn current_test_executable_ancestry_satisfies_policy() {
+            let executable = std::env::current_exe().expect("current test executable has a path");
+            for (ancestor_depth, component) in executable.ancestors().enumerate() {
+                let object_kind = executable_component_kind(component, ancestor_depth);
+                if let Err(error) =
+                    verify_dacl(component, OwnerPolicy::TrustedExecutable, object_kind)
+                {
+                    panic!(
+                        "trusted-executable policy rejected {} at ancestor depth \
+                         {ancestor_depth}: {error:?}",
+                        component.display()
+                    );
+                }
+            }
+        }
 
         fn world_allow_acl_is_safe(
             mask: u32,
