@@ -258,37 +258,15 @@ fn windows_auth_fixture_prerequisites_are_safe() -> TestResult {
         );
     }
 
-    let command = fixture_command(&layout, "strict-jsonl", "1.2.3");
-    let resolved = command.resolve_executable().map_err(|error| {
-        format!(
-            "Windows fixture executable resolution: {}\n{}",
-            error.code(),
-            windows_acl_report(&command.executable)
-        )
-    })?;
+    let resolved = fixture_command(&layout, "strict-jsonl", "1.2.3")
+        .resolve_executable()
+        .map_err(|error| format!("Windows fixture executable resolution: {}", error.code()))?;
     drop(
         resolved
             .trust(ExecutableTrustDecision::TrustCanonicalPath)
             .map_err(|error| format!("Windows fixture executable trust: {}", error.code()))?,
     );
     Ok(())
-}
-
-#[cfg(windows)]
-fn windows_acl_report(path: &Path) -> String {
-    path.ancestors()
-        .map(
-            |ancestor| match process::Command::new("icacls").arg(ancestor).output() {
-                Ok(output) => format!(
-                    "{}\n{}{}",
-                    ancestor.display(),
-                    String::from_utf8_lossy(&output.stdout),
-                    String::from_utf8_lossy(&output.stderr)
-                ),
-                Err(error) => format!("{}\nicacls failed: {error}\n", ancestor.display()),
-            },
-        )
-        .collect()
 }
 
 fn redirected_login_requires_foreground() -> TestResult {

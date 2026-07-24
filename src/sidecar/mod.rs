@@ -1682,11 +1682,7 @@ fn verify_executable_metadata(
         if is_link_or_reparse(&metadata) {
             return Err(SidecarError::from_code(SidecarErrorCode::UnsafeExecutable));
         }
-        let verification = if index == 0 {
-            windows_security::verify_no_broad_write_file(component)
-        } else {
-            windows_security::verify_no_broad_write_directory(component)
-        };
+        let verification = windows_security::verify_trusted_executable_component(component, index);
         verification.map_err(|()| SidecarError::from_code(SidecarErrorCode::UnsafeExecutable))?;
     }
     Ok(None)
@@ -4514,7 +4510,7 @@ mod windows_security {
     use std::fs::File;
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::io::AsRawHandle;
-    use std::path::Path;
+    use std::path::{Component, Path, Prefix};
     use std::ptr;
 
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, LocalFree};
@@ -4556,6 +4552,7 @@ mod windows_security {
     enum ObjectKind {
         File,
         Directory,
+        LocalDriveRoot,
     }
 
     // AccessCheck rejects a descriptor without both owner and primary-group SIDs.
@@ -4565,12 +4562,37 @@ mod windows_security {
     const ACCESS_CHECK_SECURITY_INFORMATION: u32 =
         DACL_SECURITY_INFORMATION | OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION;
 
-    pub(super) fn verify_no_broad_write_file(path: &Path) -> Result<(), ()> {
-        verify_dacl(path, OwnerPolicy::TrustedExecutable, ObjectKind::File)
+    pub(super) fn verify_trusted_executable_component(
+        path: &Path,
+        ancestor_depth: usize,
+    ) -> Result<(), ()> {
+        verify_dacl(
+            path,
+            OwnerPolicy::TrustedExecutable,
+            executable_component_kind(path, ancestor_depth),
+        )
     }
 
-    pub(super) fn verify_no_broad_write_directory(path: &Path) -> Result<(), ()> {
-        verify_dacl(path, OwnerPolicy::TrustedExecutable, ObjectKind::Directory)
+    fn executable_component_kind(path: &Path, ancestor_depth: usize) -> ObjectKind {
+        if ancestor_depth == 0 {
+            ObjectKind::File
+        } else if is_local_drive_root(path) {
+            ObjectKind::LocalDriveRoot
+        } else {
+            // All non-root directories stay closed to adjacent DLL, configuration,
+            // plugin, metadata, and reparse-point planting.
+            ObjectKind::Directory
+        }
+    }
+
+    fn is_local_drive_root(path: &Path) -> bool {
+        let mut components = path.components();
+        matches!(
+            components.next(),
+            Some(Component::Prefix(prefix))
+                if matches!(prefix.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_))
+        ) && matches!(components.next(), Some(Component::RootDir))
+            && components.next().is_none()
     }
 
     pub(super) fn verify_private_directory(path: &Path) -> Result<(), ()> {
@@ -4995,7 +5017,10 @@ mod windows_security {
     ) -> bool {
         ace_applies_to_object(flags)
             || (private
-                && matches!(object_kind, ObjectKind::Directory)
+                && matches!(
+                    object_kind,
+                    ObjectKind::Directory | ObjectKind::LocalDriveRoot
+                )
                 && flags & (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE) != 0)
     }
 
@@ -5013,6 +5038,17 @@ mod windows_security {
             ObjectKind::Directory => {
                 FILE_ADD_FILE
                     | FILE_ADD_SUBDIRECTORY
+                    | FILE_WRITE_EA
+                    | FILE_WRITE_ATTRIBUTES
+                    | FILE_DELETE_CHILD
+                    | DELETE
+                    | WRITE_DAC
+                    | WRITE_OWNER
+            }
+            ObjectKind::LocalDriveRoot => {
+                FILE_ADD_FILE
+                    | FILE_WRITE_EA
+                    | FILE_WRITE_ATTRIBUTES
                     | FILE_DELETE_CHILD
                     | DELETE
                     | WRITE_DAC
@@ -5031,13 +5067,17 @@ mod windows_security {
             (OwnerPolicy::TrustedExecutable, ObjectKind::File) => {
                 FILE_READ_DATA | FILE_EXECUTE | FILE_READ_ATTRIBUTES | READ_CONTROL
             }
-            (OwnerPolicy::TrustedExecutable, ObjectKind::Directory) => {
-                FILE_EXECUTE | FILE_READ_ATTRIBUTES | READ_CONTROL
-            }
+            (
+                OwnerPolicy::TrustedExecutable,
+                ObjectKind::Directory | ObjectKind::LocalDriveRoot,
+            ) => FILE_EXECUTE | FILE_READ_ATTRIBUTES | READ_CONTROL,
             (OwnerPolicy::CurrentUserPrivate, ObjectKind::File) => {
                 FILE_READ_DATA | FILE_WRITE_DATA | FILE_READ_ATTRIBUTES | READ_CONTROL
             }
-            (OwnerPolicy::CurrentUserPrivate, ObjectKind::Directory) => {
+            (
+                OwnerPolicy::CurrentUserPrivate,
+                ObjectKind::Directory | ObjectKind::LocalDriveRoot,
+            ) => {
                 FILE_READ_DATA
                     | FILE_ADD_FILE
                     | FILE_ADD_SUBDIRECTORY
@@ -5094,6 +5134,66 @@ mod windows_security {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        fn world_allow_acl_is_safe(
+            mask: u32,
+            object_kind: ObjectKind,
+            current_user: &CurrentUser,
+        ) -> bool {
+            use windows_sys::Win32::Security::{
+                CreateWellKnownSid, SECURITY_MAX_SID_SIZE, WinWorldSid,
+            };
+
+            let word = std::mem::size_of::<usize>();
+            let sid_words = usize::try_from(SECURITY_MAX_SID_SIZE)
+                .expect("maximum SID size fits usize")
+                .div_ceil(word);
+            let mut sid = vec![0_usize; sid_words];
+            let mut sid_bytes = SECURITY_MAX_SID_SIZE;
+            // SAFETY: sid is aligned writable storage of SECURITY_MAX_SID_SIZE bytes.
+            assert_ne!(
+                unsafe {
+                    CreateWellKnownSid(
+                        WinWorldSid,
+                        ptr::null_mut(),
+                        sid.as_mut_ptr().cast(),
+                        &mut sid_bytes,
+                    )
+                },
+                0
+            );
+            let acl_bytes = std::mem::size_of::<ACL>() + std::mem::size_of::<ACCESS_ALLOWED_ACE>()
+                - std::mem::size_of::<u32>()
+                + usize::try_from(sid_bytes).expect("SID size fits usize");
+            let mut acl = vec![0_usize; acl_bytes.div_ceil(word)];
+            let acl_pointer = acl.as_mut_ptr().cast::<ACL>();
+            // SAFETY: ACL storage is aligned, writable, and large enough.
+            assert_ne!(
+                unsafe {
+                    InitializeAcl(
+                        acl_pointer,
+                        u32::try_from(acl_bytes).expect("ACL size fits u32"),
+                        ACL_REVISION,
+                    )
+                },
+                0
+            );
+            // SAFETY: ACL is initialized and the world SID remains live.
+            assert_ne!(
+                unsafe {
+                    AddAccessAllowedAceEx(
+                        acl_pointer,
+                        ACL_REVISION,
+                        0,
+                        mask,
+                        sid.as_mut_ptr().cast(),
+                    )
+                },
+                0
+            );
+            // SAFETY: ACL and both SID buffers remain live for validation.
+            unsafe { dacl_has_safe_writers(acl_pointer, current_user.sid(), false, object_kind) }
+        }
 
         #[test]
         fn inherit_only_allow_aces_do_not_apply_to_the_current_object() {
@@ -5233,7 +5333,84 @@ mod windows_security {
             assert_eq!(dangerous_mask(ObjectKind::File) & FILE_DELETE_CHILD, 0);
             assert_ne!(dangerous_mask(ObjectKind::Directory) & FILE_DELETE_CHILD, 0);
             assert_ne!(dangerous_mask(ObjectKind::File) & FILE_WRITE_EA, 0);
-            assert_eq!(dangerous_mask(ObjectKind::Directory) & FILE_WRITE_EA, 0);
+            assert_ne!(dangerous_mask(ObjectKind::Directory) & FILE_WRITE_EA, 0);
+        }
+
+        #[test]
+        fn local_drive_root_subdirectory_creation_does_not_imply_replacement() {
+            let mask = dangerous_mask(ObjectKind::LocalDriveRoot);
+            assert_eq!(mask & FILE_ADD_SUBDIRECTORY, 0);
+            for replacement_right in [
+                FILE_ADD_FILE,
+                FILE_WRITE_EA,
+                FILE_WRITE_ATTRIBUTES,
+                FILE_DELETE_CHILD,
+                DELETE,
+                WRITE_DAC,
+                WRITE_OWNER,
+            ] {
+                assert_ne!(mask & replacement_right, 0);
+            }
+        }
+
+        #[test]
+        fn broad_acl_drive_root_exception_is_subdirectory_only() {
+            let current_user = CurrentUser::query().expect("current user SID is available");
+
+            assert!(world_allow_acl_is_safe(
+                FILE_ADD_SUBDIRECTORY,
+                ObjectKind::LocalDriveRoot,
+                &current_user,
+            ));
+            assert!(!world_allow_acl_is_safe(
+                FILE_ADD_SUBDIRECTORY,
+                ObjectKind::Directory,
+                &current_user,
+            ));
+            for rejected_mask in [
+                FILE_ADD_FILE,
+                FILE_WRITE_ATTRIBUTES,
+                FILE_WRITE_EA,
+                FILE_DELETE_CHILD,
+                DELETE,
+                WRITE_DAC,
+                WRITE_OWNER,
+                windows_sys::Win32::Foundation::GENERIC_WRITE,
+            ] {
+                assert!(!world_allow_acl_is_safe(
+                    rejected_mask,
+                    ObjectKind::LocalDriveRoot,
+                    &current_user,
+                ));
+            }
+        }
+
+        #[test]
+        fn local_drive_root_classifier_excludes_ancestors_and_unc_roots() {
+            for root in [Path::new(r"C:\"), Path::new(r"\\?\C:\")] {
+                assert!(is_local_drive_root(root));
+            }
+            for not_root in [
+                Path::new(r"C:\Users"),
+                Path::new(r"\\server\share\"),
+                Path::new(r"\\?\UNC\server\share\"),
+            ] {
+                assert!(!is_local_drive_root(not_root));
+            }
+        }
+
+        #[test]
+        fn every_non_root_directory_keeps_creation_and_generic_write_dangerous() {
+            let mask = dangerous_mask(ObjectKind::Directory);
+            assert_ne!(mask & FILE_ADD_FILE, 0);
+            assert_ne!(mask & FILE_ADD_SUBDIRECTORY, 0);
+            assert_ne!(mask & FILE_WRITE_EA, 0);
+            assert_ne!(mask & FILE_WRITE_ATTRIBUTES, 0);
+
+            let mut generic_write = windows_sys::Win32::Foundation::GENERIC_WRITE;
+            // SAFETY: generic_write is writable and generic_mapping is initialized.
+            unsafe { MapGenericMask(&mut generic_write, &generic_mapping()) };
+            assert_ne!(mask & generic_write, 0);
         }
     }
 }
