@@ -159,6 +159,19 @@ pub fn dispatch_fixture(arguments: &[OsString]) -> Option<i32> {
             0
         }
         "version-hanging" if arguments.len() == 3 => hanging_version(),
+        #[cfg(unix)]
+        "version-swap-executable"
+            if arguments.get(3).map(OsString::as_os_str) == Some(OsStr::new("--version"))
+                && arguments.len() == 4 =>
+        {
+            if record_version_executable().is_err() || swap_version_executable().is_err() {
+                return Some(78);
+            }
+            println!("carl-sidecar-fixture {version}");
+            0
+        }
+        #[cfg(unix)]
+        "replacement-execution-marker" => replacement_execution_marker(),
         "strict-jsonl" => strict_jsonl(false, false),
         "stderr" => strict_jsonl(true, false),
         "malformed" => malformed_response(false),
@@ -1204,6 +1217,18 @@ fn blocked_stdin() -> i32 {
     0
 }
 
+#[cfg(unix)]
+fn replacement_execution_marker() -> i32 {
+    let home = match fixture_home() {
+        Ok(home) => home,
+        Err(_) => return 73,
+    };
+    if fs::write(home.join("replacement-executed"), b"replacement-ran").is_err() {
+        return 73;
+    }
+    strict_jsonl(false, false)
+}
+
 fn malformed_response(oversized: bool) -> i32 {
     let mut input = String::new();
     if io::stdin().read_line(&mut input).is_err() {
@@ -1320,6 +1345,12 @@ fn record_version_executable() -> io::Result<()> {
     let mut file = options.open(home.join("version-executable-path"))?;
     file.write_all(executable.to_string_lossy().as_bytes())?;
     file.flush()
+}
+
+#[cfg(unix)]
+fn swap_version_executable() -> io::Result<()> {
+    let home = fixture_home()?;
+    fs::rename(home.join("replacement-provider"), env::current_exe()?)
 }
 
 fn fixture_home() -> io::Result<PathBuf> {

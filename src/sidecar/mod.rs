@@ -228,6 +228,7 @@ pub enum ExecutableMetadataRisk {
 pub struct ResolvedExecutable {
     canonical_path: PathBuf,
     metadata_risk: Option<ExecutableMetadataRisk>,
+    file_identity: ExecutableFileIdentity,
 }
 
 impl fmt::Debug for ResolvedExecutable {
@@ -260,9 +261,11 @@ impl ResolvedExecutable {
             ));
         }
         let metadata_risk = verify_executable_metadata(&canonical_path, &metadata)?;
+        let file_identity = executable_file_identity(&canonical_path, &metadata)?;
         Ok(Self {
             canonical_path,
             metadata_risk,
+            file_identity,
         })
     }
 
@@ -293,17 +296,29 @@ impl ResolvedExecutable {
         if !accepted {
             return Err(SidecarError::from_code(SidecarErrorCode::UnsafeExecutable));
         }
-        Ok(TrustedExecutable {
+        let trusted = TrustedExecutable {
             canonical_path: self.canonical_path,
-        })
+            metadata_risk: self.metadata_risk,
+            file_identity: self.file_identity,
+        };
+        trusted.revalidate_for_spawn()?;
+        Ok(trusted)
     }
 }
 
 /// An explicitly trusted executable capability reusable across version, JSONL, and
 /// foreground provider invocations.
+///
+/// The capability retains the regular file's platform identity and revalidates its
+/// canonical path immediately before each spawn. This narrows path-replacement races,
+/// but it is not content or publisher attestation: an owner can modify an owner-writable
+/// file without changing its identity, and the path check cannot be made atomic with the
+/// operating system's later executable open.
 #[derive(Clone)]
 pub struct TrustedExecutable {
     canonical_path: PathBuf,
+    metadata_risk: Option<ExecutableMetadataRisk>,
+    file_identity: ExecutableFileIdentity,
 }
 
 impl fmt::Debug for TrustedExecutable {
@@ -319,6 +334,14 @@ impl TrustedExecutable {
     #[must_use]
     pub fn canonical_path(&self) -> &Path {
         &self.canonical_path
+    }
+
+    fn revalidate_for_spawn(&self) -> Result<(), SidecarError> {
+        let (metadata_risk, file_identity) = inspect_trusted_executable(&self.canonical_path)?;
+        if metadata_risk != self.metadata_risk || file_identity != self.file_identity {
+            return Err(SidecarError::from_code(SidecarErrorCode::UnsafeExecutable));
+        }
+        Ok(())
     }
 
     /// Spawn a supervised provider command attached directly to the authorized local
@@ -342,8 +365,7 @@ impl TrustedExecutable {
             .kill_on_drop(true);
         home.configure_command(&mut command)?;
         set_owner_only_child_umask(&mut command);
-        let child = spawn_grouped(command)
-            .map_err(|_| SidecarError::from_code(SidecarErrorCode::SpawnFailed))?;
+        let child = spawn_trusted_grouped(self, command)?;
         #[cfg(unix)]
         let terminal = match child
             .id()
@@ -1157,6 +1179,66 @@ fn verify_executable_metadata(
     Ok(None)
 }
 
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ExecutableFileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(windows)]
+type ExecutableFileIdentity = WindowsFileIdentity;
+
+fn inspect_trusted_executable(
+    path: &Path,
+) -> Result<(Option<ExecutableMetadataRisk>, ExecutableFileIdentity), SidecarError> {
+    let unsafe_executable = || SidecarError::from_code(SidecarErrorCode::UnsafeExecutable);
+    let metadata = fs::symlink_metadata(path).map_err(|_| unsafe_executable())?;
+    if !metadata.file_type().is_file() || is_link_or_reparse(&metadata) {
+        return Err(unsafe_executable());
+    }
+    let metadata_risk =
+        verify_executable_metadata(path, &metadata).map_err(|_| unsafe_executable())?;
+    let file_identity =
+        executable_file_identity(path, &metadata).map_err(|_| unsafe_executable())?;
+    Ok((metadata_risk, file_identity))
+}
+
+#[cfg(unix)]
+fn executable_file_identity(
+    _path: &Path,
+    metadata: &fs::Metadata,
+) -> Result<ExecutableFileIdentity, SidecarError> {
+    use std::os::unix::fs::MetadataExt;
+
+    Ok(ExecutableFileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+#[cfg(windows)]
+fn executable_file_identity(
+    path: &Path,
+    _metadata: &fs::Metadata,
+) -> Result<ExecutableFileIdentity, SidecarError> {
+    use std::fs::OpenOptions;
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    let unsafe_executable = || SidecarError::from_code(SidecarErrorCode::UnsafeExecutable);
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(|_| unsafe_executable())?;
+    let metadata = file.metadata().map_err(|_| unsafe_executable())?;
+    if !metadata.file_type().is_file() || is_link_or_reparse(&metadata) {
+        return Err(unsafe_executable());
+    }
+    windows_file_identity(&file).map_err(|()| unsafe_executable())
+}
+
 async fn detect_version(
     specification: &SidecarCommand,
     executable: &TrustedExecutable,
@@ -1174,10 +1256,7 @@ async fn detect_version(
     provider_home.configure_command(&mut command)?;
     set_owner_only_child_umask(&mut command);
 
-    let mut process = SidecarProcessGuard::new(
-        spawn_grouped(command)
-            .map_err(|_| SidecarError::from_code(SidecarErrorCode::SpawnFailed))?,
-    );
+    let mut process = SidecarProcessGuard::new(spawn_trusted_grouped(executable, command)?);
     let mut stdout = process
         .child
         .stdout()
@@ -1378,8 +1457,7 @@ impl JsonlSidecar {
         home.configure_command(&mut command)?;
         set_owner_only_child_umask(&mut command);
 
-        let mut child = spawn_grouped(command)
-            .map_err(|_| SidecarError::from_code(SidecarErrorCode::SpawnFailed))?;
+        let mut child = spawn_trusted_grouped(executable, command)?;
         let process_id = child.id();
         let stdin = child
             .stdin()
@@ -2634,7 +2712,20 @@ fn resume_process_threads(process: windows_sys::Win32::Foundation::HANDLE) -> st
     result
 }
 
-fn spawn_grouped(command: Command) -> std::io::Result<Box<dyn ChildWrapper>> {
+/// The sole production bridge from a trusted executable capability to an OS spawn.
+///
+/// Revalidation intentionally sits immediately beside the spawn. It still cannot make
+/// the path check and the operating system's executable open one atomic operation.
+fn spawn_trusted_grouped(
+    executable: &TrustedExecutable,
+    command: Command,
+) -> Result<Box<dyn ChildWrapper>, SidecarError> {
+    executable.revalidate_for_spawn()?;
+    spawn_grouped_unchecked(command)
+        .map_err(|_| SidecarError::from_code(SidecarErrorCode::SpawnFailed))
+}
+
+fn spawn_grouped_unchecked(command: Command) -> std::io::Result<Box<dyn ChildWrapper>> {
     let mut command = CommandWrap::from(command);
     #[cfg(unix)]
     command.wrap(ProcessGroup::leader());
@@ -4486,7 +4577,7 @@ mod tests {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .kill_on_drop(true);
-        let child = spawn_grouped(command).expect("foreground fixture spawns");
+        let child = spawn_grouped_unchecked(command).expect("foreground fixture spawns");
         let process_id = child.id().expect("foreground fixture has a PID");
         let limits = SidecarLimits {
             graceful_shutdown_timeout: Duration::from_millis(25),
@@ -4545,7 +4636,7 @@ mod tests {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .kill_on_drop(true);
-        let child = spawn_grouped(command).expect("foreground fixture spawns");
+        let child = spawn_grouped_unchecked(command).expect("foreground fixture spawns");
         let mut foreground = ForegroundProcess {
             process: Arc::new(Mutex::new(SidecarProcessGuard::new(child))),
             terminal: Some(ForegroundTerminalLease {

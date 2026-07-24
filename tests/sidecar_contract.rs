@@ -9,6 +9,8 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::time::Duration;
+#[cfg(unix)]
+use std::time::Instant;
 
 #[cfg(unix)]
 use carl::sidecar::ExecutableMetadataRisk;
@@ -71,6 +73,14 @@ fn main() {
         test(
             "executable trust precedes every execution",
             executable_trust_precedes_every_execution,
+        ),
+        test(
+            "trusted executable rejects same-path replacement before version",
+            trusted_executable_rejects_same_path_replacement_before_version,
+        ),
+        test(
+            "trust rejects replacement after executable resolution",
+            trust_rejects_replacement_after_executable_resolution,
         ),
         test(
             "versions are parsed and pinned",
@@ -189,6 +199,19 @@ fn main() {
             dropping_supervisor_removes_process_group,
         ),
     ];
+    #[cfg(unix)]
+    let trials = {
+        let mut trials = trials;
+        trials.push(test(
+            "trusted executable revalidates metadata before version",
+            trusted_executable_revalidates_metadata_before_version,
+        ));
+        trials.push(test(
+            "trusted executable rejects replacement between version and JSONL spawn",
+            trusted_executable_rejects_replacement_between_version_and_jsonl_spawn,
+        ));
+        trials
+    };
     libtest_mimic::run(&Arguments::from_args(), trials).exit();
 }
 
@@ -510,6 +533,166 @@ fn executable_trust_precedes_every_execution() -> TestResult {
             Version::parse("1.2.3")?
         );
         assert!(layout.home.join("version-executable-path").is_file());
+        TestResult::Ok(())
+    })
+}
+
+fn trusted_executable_rejects_same_path_replacement_before_version() -> TestResult {
+    run_async(async {
+        let layout = TestLayout::new()?;
+        let executable = layout.data.join("trusted-provider");
+        fs::copy(env::current_exe()?, &executable)?;
+        let replacement = layout.data.join("replacement-provider");
+        fs::copy(env::current_exe()?, &replacement)?;
+
+        let mut command = fixture_command(&layout, "strict-jsonl", "1.2.3");
+        command.executable = executable.clone();
+        let trusted = command
+            .resolve_executable()?
+            .trust(ExecutableTrustDecision::TrustCanonicalPath)?;
+
+        fs::remove_file(&executable)?;
+        fs::rename(&replacement, &executable)?;
+
+        let error = command
+            .detect_trusted_version(
+                &trusted,
+                ProviderEnvironmentProfile::Codex,
+                &layout.data,
+                &layout.workspace,
+                short_limits(),
+            )
+            .await
+            .expect_err("replacing a trusted executable at the same path must fail");
+        assert_eq!(error.code(), SidecarErrorCode::UnsafeExecutable);
+        assert!(
+            !layout.home.join("version-executable-path").exists(),
+            "the replacement executable must not run"
+        );
+        TestResult::Ok(())
+    })
+}
+
+fn trust_rejects_replacement_after_executable_resolution() -> TestResult {
+    let layout = TestLayout::new()?;
+    let executable = layout.data.join("resolved-provider");
+    fs::copy(env::current_exe()?, &executable)?;
+    let replacement = layout.data.join("replacement-provider");
+    fs::copy(env::current_exe()?, &replacement)?;
+
+    let mut command = fixture_command(&layout, "strict-jsonl", "1.2.3");
+    command.executable = executable.clone();
+    let resolved = command.resolve_executable()?;
+    fs::remove_file(&executable)?;
+    fs::rename(&replacement, &executable)?;
+
+    let error = resolved
+        .trust(ExecutableTrustDecision::TrustCanonicalPath)
+        .expect_err("the trust decision must remain bound to the inspected file");
+    assert_eq!(error.code(), SidecarErrorCode::UnsafeExecutable);
+    Ok(())
+}
+
+#[cfg(unix)]
+fn trusted_executable_revalidates_metadata_before_version() -> TestResult {
+    use std::os::unix::fs::PermissionsExt;
+
+    run_async(async {
+        let layout = TestLayout::new()?;
+        let executable = layout.data.join("trusted-provider");
+        fs::copy(env::current_exe()?, &executable)?;
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755))?;
+
+        let mut command = fixture_command(&layout, "strict-jsonl", "1.2.3");
+        command.executable = executable.clone();
+        let trusted = command
+            .resolve_executable()?
+            .trust(ExecutableTrustDecision::TrustCanonicalPath)?;
+
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o777))?;
+        let error = command
+            .detect_trusted_version(
+                &trusted,
+                ProviderEnvironmentProfile::Codex,
+                &layout.data,
+                &layout.workspace,
+                short_limits(),
+            )
+            .await
+            .expect_err("unsafe metadata introduced after trust must fail");
+        assert_eq!(error.code(), SidecarErrorCode::UnsafeExecutable);
+        assert!(
+            !layout.home.join("version-executable-path").exists(),
+            "an executable that became writable must not run"
+        );
+        TestResult::Ok(())
+    })
+}
+
+#[cfg(unix)]
+fn trusted_executable_rejects_replacement_between_version_and_jsonl_spawn() -> TestResult {
+    use std::os::unix::fs::PermissionsExt;
+
+    run_async(async {
+        let layout = TestLayout::new()?;
+        let executable = layout.data.join("trusted-provider");
+        fs::copy(env::current_exe()?, &executable)?;
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755))?;
+        let home = ProviderHome::prepare(
+            ProviderEnvironmentProfile::Codex,
+            &layout.data,
+            &layout.workspace,
+            &layout.home,
+        )?;
+        let replacement = layout.home.join("replacement-provider");
+        fs::copy(env::current_exe()?, &replacement)?;
+        fs::set_permissions(&replacement, fs::Permissions::from_mode(0o755))?;
+
+        let mut command = fixture_command(&layout, "replacement-execution-marker", "1.2.3");
+        command.executable = executable;
+        command.version_arguments = vec![
+            OsString::from(support::FIXTURE_ARGUMENT),
+            OsString::from("version-swap-executable"),
+            OsString::from("1.2.3"),
+            OsString::from("--version"),
+        ];
+        let trusted = command
+            .resolve_executable()?
+            .trust(ExecutableTrustDecision::TrustCanonicalPath)?;
+
+        let error = match JsonlSidecar::spawn_in_home(
+            command,
+            &trusted,
+            &home,
+            NotificationPolicy::Reject,
+            short_limits(),
+        )
+        .await
+        {
+            Err(error) => error,
+            Ok(sidecar) => {
+                let replacement_marker = layout.home.join("replacement-executed");
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while !replacement_marker.exists() && Instant::now() < deadline {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                let replacement_ran = replacement_marker.exists();
+                let version_path = fs::read_to_string(layout.home.join("version-executable-path"))?;
+                let configured_path = fs::canonicalize(layout.data.join("trusted-provider"))?;
+                let _ = sidecar.cancel().await;
+                return Err(format!(
+                    "the replaced JSONL executable was accepted (replacement ran: \
+                     {replacement_ran}, version path: {version_path}, configured path: {})",
+                    configured_path.display()
+                )
+                .into());
+            }
+        };
+        assert_eq!(error.code(), SidecarErrorCode::UnsafeExecutable);
+        assert!(
+            !layout.home.join("replacement-executed").exists(),
+            "the replacement executable must not run"
+        );
         TestResult::Ok(())
     })
 }
