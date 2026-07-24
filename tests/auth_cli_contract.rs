@@ -30,7 +30,7 @@ use carl::auth::codex::CODEX_LOGOUT_WARNING;
 use carl::cli::Cli;
 #[cfg(windows)]
 use carl::sidecar::{
-    DataRootLock, ExecutableTrustDecision, ProviderEnvironmentProfile, ProviderHome,
+    DataRootLock, ExecutableTrustDecision, ProviderEnvironmentProfile, ProviderHome, SidecarLimits,
 };
 use clap::{CommandFactory, Parser};
 use libtest_mimic::{Arguments, Failed, Trial};
@@ -258,14 +258,26 @@ fn windows_auth_fixture_prerequisites_are_safe() -> TestResult {
         );
     }
 
-    let resolved = fixture_command(&layout, "strict-jsonl", "1.2.3")
+    let command = fixture_command(&layout, "strict-jsonl", "1.2.3");
+    let resolved = command
         .resolve_executable()
         .map_err(|error| format!("Windows fixture executable resolution: {}", error.code()))?;
-    drop(
-        resolved
-            .trust(ExecutableTrustDecision::TrustCanonicalPath)
-            .map_err(|error| format!("Windows fixture executable trust: {}", error.code()))?,
-    );
+    let trusted = resolved
+        .trust(ExecutableTrustDecision::TrustCanonicalPath)
+        .map_err(|error| format!("Windows fixture executable trust: {}", error.code()))?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let detected = runtime
+        .block_on(command.detect_trusted_version(
+            &trusted,
+            ProviderEnvironmentProfile::Codex,
+            &layout.data,
+            &layout.workspace,
+            SidecarLimits::default(),
+        ))
+        .map_err(|error| format!("Windows fixture version process: {}", error.code()))?;
+    assert_eq!(detected.to_string(), "1.2.3");
     Ok(())
 }
 
