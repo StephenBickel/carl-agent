@@ -4198,20 +4198,7 @@ fn write_static_provider_file(
 
     const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 
-    #[track_caller]
     fn unsafe_file() -> SidecarError {
-        #[cfg(debug_assertions)]
-        {
-            let caller = std::panic::Location::caller();
-            let os_error = std::io::Error::last_os_error()
-                .raw_os_error()
-                .unwrap_or_default();
-            eprintln!(
-                "carl Windows static-file diagnostic: line={}, column={}, os_error={os_error}",
-                caller.line(),
-                caller.column()
-            );
-        }
         SidecarError::from_code(SidecarErrorCode::UnsafeProviderFile)
     }
 
@@ -4319,11 +4306,6 @@ fn write_static_provider_file(
             )
         };
         if rename_status < 0 {
-            #[cfg(debug_assertions)]
-            eprintln!(
-                "carl Windows static-file diagnostic: rename_ntstatus=0x{:08x}",
-                rename_status as u32
-            );
             return Err(unsafe_file());
         }
         let after = windows_file_identity(&temporary_file).map_err(|()| unsafe_file())?;

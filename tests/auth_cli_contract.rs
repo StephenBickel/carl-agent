@@ -270,7 +270,11 @@ fn windows_auth_fixture_prerequisites_are_safe() -> TestResult {
             })?;
     }
 
-    let command = fixture_command(&layout, "strict-jsonl", "1.2.3");
+    let mut command = fixture_command(&layout, "strict-jsonl", "1.2.3");
+    // Production canonicalizes the data root before deriving provider homes.
+    // Keep both paths in the same Windows namespace (`\\?\...` versus `C:\...`
+    // paths do not have a lexical prefix relationship).
+    command.isolated_home = canonical_data.join("providers").join("fixture");
     let resolved = command
         .resolve_executable()
         .map_err(|error| format!("Windows fixture executable resolution: {}", error.code()))?;
