@@ -46,6 +46,10 @@ pub struct TestLayout {
 impl TestLayout {
     pub fn new() -> TestResult<Self> {
         let serial = NEXT_TEMPORARY_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+        #[cfg(windows)]
+        let root =
+            env::temp_dir().join(format!("carl-sidecar-contract-{}-{serial}", process::id()));
+        #[cfg(not(windows))]
         // Executable trust validates every ancestor; Linux's system temp
         // directory is intentionally world-writable.
         let root = env::current_exe()?
@@ -55,6 +59,10 @@ impl TestLayout {
         let data = root.join("data");
         let workspace = root.join("workspace");
         let home = data.join("providers").join("fixture");
+        fs::create_dir_all(&root)?;
+        #[cfg(windows)]
+        create_owner_private_test_directory(&data)?;
+        #[cfg(not(windows))]
         fs::create_dir_all(&data)?;
         fs::create_dir_all(&workspace)?;
         Ok(Self {
@@ -64,6 +72,155 @@ impl TestLayout {
             home,
         })
     }
+}
+
+#[cfg(windows)]
+fn create_owner_private_test_directory(path: &Path) -> io::Result<()> {
+    use std::ffi::c_void;
+    use std::os::windows::ffi::OsStrExt;
+    use std::ptr;
+
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::Security::{
+        ACCESS_ALLOWED_ACE, ACL, ACL_REVISION, AddAccessAllowedAceEx, CONTAINER_INHERIT_ACE,
+        GetLengthSid, GetTokenInformation, InitializeAcl, InitializeSecurityDescriptor, IsValidSid,
+        OBJECT_INHERIT_ACE, PSID, SE_DACL_PROTECTED, SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR,
+        SetSecurityDescriptorControl, SetSecurityDescriptorDacl, SetSecurityDescriptorOwner,
+        TOKEN_QUERY, TOKEN_USER, TokenUser,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{CreateDirectoryW, FILE_ALL_ACCESS};
+    use windows_sys::Win32::System::SystemServices::SECURITY_DESCRIPTOR_REVISION;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    struct OwnedHandle(HANDLE);
+
+    impl Drop for OwnedHandle {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                // SAFETY: OpenProcessToken returned this owned handle and it is closed once.
+                let _ = unsafe { CloseHandle(self.0) };
+            }
+        }
+    }
+
+    fn invalid_security_descriptor() -> io::Error {
+        io::Error::other("failed to build the Windows test security descriptor")
+    }
+
+    let mut token = ptr::null_mut();
+    // SAFETY: token points to writable handle storage.
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0
+        || token.is_null()
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let token = OwnedHandle(token);
+    let mut required = 0_u32;
+    // SAFETY: the first call intentionally queries the required byte count.
+    let _ = unsafe { GetTokenInformation(token.0, TokenUser, ptr::null_mut(), 0, &mut required) };
+    if required
+        < u32::try_from(std::mem::size_of::<TOKEN_USER>())
+            .map_err(|_| invalid_security_descriptor())?
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let word = std::mem::size_of::<usize>();
+    let words = usize::try_from(required)
+        .map_err(|_| invalid_security_descriptor())?
+        .checked_add(word - 1)
+        .ok_or_else(invalid_security_descriptor)?
+        / word;
+    let mut user_storage = vec![0_usize; words];
+    // SAFETY: user_storage is aligned and large enough for the requested TOKEN_USER bytes.
+    if unsafe {
+        GetTokenInformation(
+            token.0,
+            TokenUser,
+            user_storage.as_mut_ptr().cast::<c_void>(),
+            required,
+            &mut required,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the successful query initialized TOKEN_USER at the buffer start.
+    let current_user: PSID = unsafe { (*(user_storage.as_ptr().cast::<TOKEN_USER>())).User.Sid };
+    // SAFETY: current_user points into the live user_storage buffer.
+    if unsafe { IsValidSid(current_user) } == 0 {
+        return Err(invalid_security_descriptor());
+    }
+
+    // SAFETY: current_user is a valid SID backed by user_storage.
+    let sid_bytes = usize::try_from(unsafe { GetLengthSid(current_user) })
+        .map_err(|_| invalid_security_descriptor())?;
+    let acl_bytes = std::mem::size_of::<ACL>()
+        .checked_add(std::mem::size_of::<ACCESS_ALLOWED_ACE>())
+        .and_then(|bytes| bytes.checked_sub(std::mem::size_of::<u32>()))
+        .and_then(|bytes| bytes.checked_add(sid_bytes))
+        .ok_or_else(invalid_security_descriptor)?;
+    let acl_words = acl_bytes
+        .checked_add(word - 1)
+        .ok_or_else(invalid_security_descriptor)?
+        / word;
+    let mut acl_storage = vec![0_usize; acl_words];
+    let acl = acl_storage.as_mut_ptr().cast::<ACL>();
+    let acl_length = u32::try_from(acl_bytes).map_err(|_| invalid_security_descriptor())?;
+    // SAFETY: acl_storage is aligned writable storage of acl_length bytes.
+    if unsafe { InitializeAcl(acl, acl_length, ACL_REVISION) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the initialized ACL has space for this ACE and current_user remains live.
+    if unsafe {
+        AddAccessAllowedAceEx(
+            acl,
+            ACL_REVISION,
+            OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE,
+            FILE_ALL_ACCESS,
+            current_user,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+
+    let mut descriptor = SECURITY_DESCRIPTOR::default();
+    let descriptor_pointer = (&raw mut descriptor).cast::<c_void>();
+    // SAFETY: descriptor is writable SECURITY_DESCRIPTOR storage.
+    if unsafe { InitializeSecurityDescriptor(descriptor_pointer, SECURITY_DESCRIPTOR_REVISION) }
+        == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: descriptor is initialized and current_user remains live through creation.
+    if unsafe { SetSecurityDescriptorOwner(descriptor_pointer, current_user, 0) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: descriptor and ACL are both initialized and remain live through creation.
+    if unsafe { SetSecurityDescriptorDacl(descriptor_pointer, 1, acl, 0) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: protecting the DACL prevents broad ACEs from the temp parent being merged.
+    if unsafe {
+        SetSecurityDescriptorControl(descriptor_pointer, SE_DACL_PROTECTED, SE_DACL_PROTECTED)
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+
+    let attributes = SECURITY_ATTRIBUTES {
+        nLength: u32::try_from(std::mem::size_of::<SECURITY_ATTRIBUTES>())
+            .map_err(|_| invalid_security_descriptor())?,
+        lpSecurityDescriptor: descriptor_pointer,
+        bInheritHandle: 0,
+    };
+    let mut path: Vec<u16> = path.as_os_str().encode_wide().collect();
+    path.push(0);
+    // SAFETY: path is NUL-terminated and attributes references live descriptor storage.
+    if unsafe { CreateDirectoryW(path.as_ptr(), &attributes) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 impl Drop for TestLayout {

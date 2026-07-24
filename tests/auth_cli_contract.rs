@@ -28,6 +28,8 @@ use std::time::{Duration, Instant};
 #[cfg(unix)]
 use carl::auth::codex::CODEX_LOGOUT_WARNING;
 use carl::cli::Cli;
+#[cfg(windows)]
+use carl::sidecar::DataRootLock;
 use clap::{CommandFactory, Parser};
 use libtest_mimic::{Arguments, Failed, Trial};
 use serde_json::Value;
@@ -85,6 +87,11 @@ fn main() {
     trials.push(test(
         "real auth commands contend per root and recover after a crash",
         public_auth_lock_contends_and_recovers,
+    ));
+    #[cfg(windows)]
+    trials.push(test(
+        "Windows auth fixture data root satisfies the production lock policy",
+        windows_auth_fixture_data_root_is_private,
     ));
     #[cfg(unix)]
     trials.push(test(
@@ -216,6 +223,16 @@ fn status_missing_configuration_is_safe() -> TestResult {
         )
     );
     assert_eq!(output.stderr, b"");
+    Ok(())
+}
+
+#[cfg(windows)]
+fn windows_auth_fixture_data_root_is_private() -> TestResult {
+    let layout = TestLayout::new()?;
+    drop(
+        DataRootLock::acquire(&layout.data)
+            .expect("the Windows auth fixture data root must be owner-private"),
+    );
     Ok(())
 }
 
