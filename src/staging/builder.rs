@@ -103,7 +103,9 @@ impl SanitizedStageBuilder {
         };
 
         let mut state = BuildState::new(self.limits, self.secret_filter);
-        if let Err(error) = walk_directory(&self.source, &destination, "", 0, &mut state) {
+        let walk_result = walk_directory(&self.source, &destination, "", 0, &mut state);
+        drop(destination);
+        if let Err(error) = walk_result {
             let _ = self.stage_parent.remove_dir_all(&directory_name);
             return Err(error);
         }
