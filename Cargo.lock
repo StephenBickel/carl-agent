@@ -170,6 +170,7 @@ name = "carl-agent"
 version = "0.1.0"
 dependencies = [
  "assert_cmd",
+ "cap-primitives",
  "cap-std",
  "chrono",
  "clap",

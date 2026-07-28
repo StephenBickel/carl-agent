@@ -2,12 +2,16 @@ use std::fmt;
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 
+#[cfg(windows)]
+use cap_primitives::fs::_WindowsByHandle;
 use cap_std::ambient_authority;
 #[cfg(unix)]
-use cap_std::fs::PermissionsExt;
-use cap_std::fs::{Dir, Metadata, OpenOptions, Permissions};
-#[cfg(any(unix, windows))]
-use cap_std::fs::{MetadataExt, OpenOptionsExt};
+use cap_std::fs::OpenOptionsExt;
+#[cfg(windows)]
+use cap_std::fs::OpenOptionsExt;
+use cap_std::fs::{Dir, Metadata, OpenOptions};
+#[cfg(unix)]
+use cap_std::fs::{MetadataExt, Permissions, PermissionsExt};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 

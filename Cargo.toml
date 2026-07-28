@@ -79,6 +79,9 @@ uuid = { version = "1.18", features = ["serde", "v4"] }
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
+# cap-std does not re-export cap-primitives' Windows-by-handle metadata
+# extension trait; staging imports it to verify link count and file identity.
+cap-primitives = "3.4"
 windows-sys = { version = "0.61", features = [
     "Wdk_Foundation",
     "Wdk_Storage_FileSystem",
