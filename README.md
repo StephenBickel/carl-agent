@@ -13,7 +13,7 @@ The intended v1 experience is one continuous session across a local terminal UI 
 ## Status: pre-alpha foundation
 
 > [!WARNING]
-> Carl is currently a **pre-alpha foundation** and is not yet a usable end-user agent. The authentication command surface and an inert library-level Codex exec adapter are implemented, but the HTTP/OpenAI adapters, runtime tool loop, user-reachable subscription execution, staging and promotion pipeline, built-in tools, TUI interaction, and Telegram gateway are not implemented. Only the four placeholder commands `serve`, `pair`, `doctor`, and `sessions` return not-implemented errors; Clap's built-in `help` command displays help.
+> Carl is currently a **pre-alpha foundation** and is not yet a usable end-user agent. The authentication command surface, an inert library-level Codex exec adapter, and external-agent safety foundations are implemented, but the HTTP/OpenAI adapters, runtime tool loop, user-reachable subscription execution, proposal/verification/promotion pipeline, built-in tools, TUI interaction, and Telegram gateway are not implemented. Only the four placeholder commands `serve`, `pair`, `doctor`, and `sessions` return not-implemented errors; Clap's built-in `help` command displays help.
 
 Authentication and adapter code do not enable a live coding task. The auth and Codex
 exec boundaries are tested with offline provider fakes; this repository does not
@@ -34,9 +34,21 @@ Implemented and covered by deterministic tests:
 - a deterministic JSON authentication CLI for status, login, and logout;
 - layered Codex model/reasoning settings plus an inert, version-pinned
   `codex exec --json` adapter with bounded normalized events;
+- normalized external-agent policy that makes safe external-agent requests default to
+  exact owner approval and denies writable live-workspace access, environment grants,
+  and provider-network mismatch;
+- expiring actor/session/turn/request-bound approvals that are atomically single-use,
+  plus non-retaining high-confidence secret detection;
+- deterministic, bounded, owner-only, capability-relative, secret-filtered staging
+  copies that exclude credentials, provider configuration, VCS metadata, links,
+  special files, hooks, plugins, skills, and compatibility instructions;
 - a Clap command/help shell for the remaining planned top-level interface.
 
 The approved v1 design adds a shared runtime loop, OpenAI and OpenAI-compatible HTTP adapters, bounded workspace tools, a TUI, explicit memory, and an owner-only Telegram gateway. These are roadmap items, not current capabilities.
+
+No subscription coding task is CLI-reachable. The implemented safety modules are
+library boundaries only; proposal inspection, independent verification, and
+stale-safe promotion remain unavailable.
 
 ## Quick start
 
@@ -106,10 +118,11 @@ Telegram (planned) ---+       |
 ```
 
 Today, the event model, storage layer, budget primitives, provider boundary, scripted
-adapter, provider-owned authentication sidecars, and an inert Codex exec adapter
-exist. The subscription run engine, sanitized staging, policy and approval boundary,
-verification and promotion pipeline, native runtime, production adapters, and
-frontends remain planned. See the [architecture guide](docs/architecture.md), the
+adapter, provider-owned authentication sidecars, an inert Codex exec adapter,
+external-agent policy, exact approvals, secret filtering, and sanitized staging
+exist. The subscription run engine, proposal inspection, independent verification
+and promotion pipeline, native runtime, production adapters, and frontends remain
+planned. See the [architecture guide](docs/architecture.md), the
 [approved Carl design](docs/superpowers/specs/2026-07-23-carl-top-tier-harness-design.md),
 and the decisions on [event-sourced execution](docs/adr/0001-event-sourced-runtime.md),
 a [single-process v1](docs/adr/0002-single-process-v1.md), and
@@ -117,7 +130,12 @@ a [single-process v1](docs/adr/0002-single-process-v1.md), and
 
 ## Security model
 
-Carl treats model output, remote messages, fetched content, and tool arguments as untrusted. The v1 design requires workspace-confined file access, bounded output, explicit approval for consequential actions, credential redaction, and stricter remote policy. Most of those enforcement layers are not implemented yet; see the [security model](docs/security.md) and [security policy](SECURITY.md).
+Carl treats model output, remote messages, fetched content, and tool arguments as
+untrusted. External-agent requests now have a closed policy, exact durable approvals,
+non-retaining secret checks, and isolated sanitized staging. These controls are not a
+general runtime policy engine or a process sandbox, and they do not make delegate
+execution user-reachable. See the [security model](docs/security.md) and
+[security policy](SECURITY.md).
 
 **Shell isolation is policy- and process-based in the v1 design; it is not a complete security sandbox.** A future `shell.exec` tool must not be treated as containment for hostile code, even after its workspace, timeout, environment-filtering, and cancellation controls are implemented.
 
@@ -159,6 +177,7 @@ Public behavior should be developed test-first with deterministic fixtures; norm
 - [x] Provider-neutral domain contracts, budgets, and durable event storage
 - [x] Provider interface and deterministic scripted provider
 - [x] Provider-owned subscription authentication CLI and sidecar supervision
+- [x] External-agent policy, exact approval, secret-filter, and staging foundations
 - [ ] Production HTTP/OpenAI-compatible adapters
 - [ ] Subscription-backed delegate execution
 - [ ] Runtime tool/approval loop, policy engine, and bounded built-in tools

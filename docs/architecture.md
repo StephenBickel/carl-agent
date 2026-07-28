@@ -10,7 +10,7 @@ Carl is designed as one Rust package with a library and one executable. Frontend
 TUI (planned) --------+
                       +--> runtime (planned) --> provider boundary
 Telegram (planned) ---+            |
-                                   +--> policy (planned) --> tools (planned)
+                                   +--> policy (partial library foundation) --> tools (planned)
                                    |
                                    +--> event log (implemented) --> projections
 
@@ -20,7 +20,10 @@ auth CLI (implemented) --> data-root lock --> provider auth broker
 
 SubscriptionRunEngine (planned safety boundary)
         |
-        +--> Codex exec adapter (implemented, inert) --> sanitized staging (planned)
+        +--> policy + exact approval (implemented, not orchestrated)
+        +--> sanitized staging (implemented, library only)
+        +--> Codex exec adapter (implemented, inert)
+        +--> proposal / verify / promote (planned)
 ```
 
 This layout keeps user interfaces replaceable, provider wire formats contained, policy centralized, and scenario tests deterministic.
@@ -30,7 +33,9 @@ This layout keeps user interfaces replaceable, provider wire formats contained, 
 - `events`: schema-versioned envelopes, provider-neutral event payloads, and stable serialized IDs.
 - `error`: stable public error codes with sanitized user messages and separate internal detail.
 - `runtime::budget`: hard counters for turn iterations and tool-call limits.
-- `storage`: SQLite WAL, forward migrations verified by checksum, transactional append-only events, and durable session, memory, and approval lifecycle records.
+- `storage`: SQLite WAL, forward migrations verified by checksum, transactional
+  append-only events, durable session and memory lifecycles, and expiring
+  actor/session/turn/request-bound approvals that are atomically consumed once.
 - `providers`: a normalized provider request/event trait and a scripted adapter that replays sanitized JSON fixtures with cancellation support.
 - `sidecar`: isolated provider homes, executable identity/version checks, closed child
   environments, process-tree supervision, bounded cleanup, and provider-owned
@@ -40,6 +45,13 @@ This layout keeps user interfaces replaceable, provider wire formats contained, 
 - `delegates`: bounded model and reasoning settings, stateful Codex JSONL
   normalization, and an inert version-pinned `codex exec --json` adapter that sends
   tasks only over stdin and reuses provider-owned subscription authentication.
+- `policy`: normalized external-agent capability requests, deterministic SHA-256
+  request identities, and a closed evaluator that requires approval for safe requests
+  while denying live-workspace exposure, environment grants, and provider mismatch.
+- `security`: a non-retaining high-confidence secret filter that reports only a
+  stable rule classification.
+- `staging`: bounded, capability-relative construction of deterministic disposable
+  copies containing only permitted single-link UTF-8 regular files.
 - `cli`: composition for the seven `auth` commands, local foreground checks,
   cross-process data-root locking, and deterministic safe JSON output; the other
   top-level commands remain placeholders.
@@ -47,9 +59,10 @@ This layout keeps user interfaces replaceable, provider wire formats contained, 
 Authentication status performs only provider-owned local handshakes with the pinned
 executables. It does not issue prompts, start sessions, invoke inference, or validate
 live model entitlement. There is no production HTTP adapter, context assembler, turn
-state machine, policy evaluator, tool executor, user-reachable subscription run
-engine, staging/promote pipeline, TUI, general configuration loader, diagnostics
-command, or Telegram transport yet.
+state machine, integrated general tool-policy evaluator, tool executor,
+user-reachable subscription run engine, exact replacement proposal inspector,
+independent verification runner, stale-safe promotion path, TUI, general
+configuration loader, diagnostics command, or Telegram transport yet.
 
 ## Authentication composition
 
@@ -68,9 +81,11 @@ was published by OpenAI or xAI.
 The library now includes a separate one-way JSONL worker and Codex exec adapter for
 the subscription path described in
 [ADR 0004](adr/0004-subscription-authentication-through-provider-sidecars.md). It is
-deliberately not connected to the CLI. Implemented authentication and adapter code do
-not enable a live coding task until `SubscriptionRunEngine`, sanitized staging,
-policy, approval, independent verification, and stale-safe promotion exist.
+deliberately not connected to the CLI. The policy, approval, secret-filter, and
+sanitized-stage contracts now exist independently, but they are not orchestrated.
+Implemented authentication and adapter code do not enable a live coding task until
+`SubscriptionRunEngine`, exact replacement proposal inspection, independent
+verification, and stale-safe promotion exist.
 
 ## Planned turn boundary
 
