@@ -1,5 +1,6 @@
 pub mod auth;
 pub mod cli;
+pub mod delegates;
 pub mod error;
 pub mod events;
 pub mod providers;
