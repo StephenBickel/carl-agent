@@ -3,6 +3,7 @@ pub mod cli;
 pub mod delegates;
 pub mod error;
 pub mod events;
+pub mod policy;
 pub mod providers;
 pub mod runtime;
 pub mod sidecar;
