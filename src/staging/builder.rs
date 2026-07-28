@@ -251,7 +251,7 @@ fn copy_regular_file(
     state: &mut BuildState,
 ) -> Result<(), StageError> {
     let before = entry.metadata().map_err(|_| io_error(&relative))?;
-    if link_count(&before) != Some(1) {
+    if matches!(pre_open_link_count(&before), Some(count) if count != 1) {
         state.exclude(relative, StageExclusionReason::HardLink);
         return Ok(());
     }
@@ -272,27 +272,43 @@ fn copy_regular_file(
     let mut read_options = OpenOptions::new();
     read_options.read(true);
     set_no_follow(&mut read_options);
-    let source_file = entry
+    let mut source_file = entry
         .open_with(&read_options)
         .map_err(|_| StageError::at(StageErrorCode::InvalidEntry, relative.clone()))?;
     let after = source_file
         .metadata()
         .map_err(|_| StageError::at(StageErrorCode::InvalidEntry, relative.clone()))?;
-    if !after.is_file()
-        || link_count(&after) != Some(1)
-        || !same_file(&before, &after)
+    if !opened_metadata_is_regular(&after)
+        || !pre_open_matches_opened(&before, &after)
         || before.len() != after.len()
     {
         return Err(StageError::at(StageErrorCode::InvalidEntry, relative));
     }
+    if link_count(&after) != Some(1) {
+        state.exclude(relative, StageExclusionReason::HardLink);
+        return Ok(());
+    }
 
     let read_limit = state.limits.max_file_bytes().saturating_add(1);
     let mut contents = Vec::with_capacity(after.len() as usize);
-    source_file
+    (&mut source_file)
         .take(read_limit)
         .read_to_end(&mut contents)
         .map_err(|_| io_error(&relative))?;
     if contents.len() as u64 != after.len() || contents.len() as u64 > state.limits.max_file_bytes()
+    {
+        return Err(StageError::at(StageErrorCode::InvalidEntry, relative));
+    }
+    let final_metadata = source_file
+        .metadata()
+        .map_err(|_| StageError::at(StageErrorCode::InvalidEntry, relative.clone()))?;
+    let named_entry_matches = named_entry_matches(entry, &read_options, &final_metadata)
+        .map_err(|_| StageError::at(StageErrorCode::InvalidEntry, relative.clone()))?;
+    if !opened_metadata_is_regular(&final_metadata)
+        || link_count(&final_metadata) != Some(1)
+        || final_metadata.len() != after.len()
+        || !same_file(&after, &final_metadata)
+        || !named_entry_matches
     {
         return Err(StageError::at(StageErrorCode::InvalidEntry, relative));
     }
@@ -481,6 +497,16 @@ fn set_no_follow(options: &mut OpenOptions) {
 fn set_no_follow(_options: &mut OpenOptions) {}
 
 #[cfg(unix)]
+fn pre_open_link_count(metadata: &Metadata) -> Option<u64> {
+    Some(metadata.nlink())
+}
+
+#[cfg(not(unix))]
+fn pre_open_link_count(_metadata: &Metadata) -> Option<u64> {
+    None
+}
+
+#[cfg(unix)]
 fn link_count(metadata: &Metadata) -> Option<u64> {
     Some(metadata.nlink())
 }
@@ -493,6 +519,29 @@ fn link_count(metadata: &Metadata) -> Option<u64> {
 #[cfg(not(any(unix, windows)))]
 fn link_count(_metadata: &Metadata) -> Option<u64> {
     None
+}
+
+#[cfg(windows)]
+fn opened_metadata_is_regular(metadata: &Metadata) -> bool {
+    metadata.is_file()
+        && metadata.file_attributes()
+            & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+            == 0
+}
+
+#[cfg(not(windows))]
+fn opened_metadata_is_regular(metadata: &Metadata) -> bool {
+    metadata.is_file()
+}
+
+#[cfg(unix)]
+fn pre_open_matches_opened(before: &Metadata, opened: &Metadata) -> bool {
+    same_file(before, opened)
+}
+
+#[cfg(not(unix))]
+fn pre_open_matches_opened(_before: &Metadata, _opened: &Metadata) -> bool {
+    true
 }
 
 #[cfg(unix)]
@@ -511,4 +560,17 @@ fn same_file(left: &Metadata, right: &Metadata) -> bool {
 #[cfg(not(any(unix, windows)))]
 fn same_file(left: &Metadata, right: &Metadata) -> bool {
     left.len() == right.len()
+}
+
+fn named_entry_matches(
+    entry: &cap_std::fs::DirEntry,
+    read_options: &OpenOptions,
+    expected: &Metadata,
+) -> std::io::Result<bool> {
+    let validation_file = entry.open_with(read_options)?;
+    let validation_metadata = validation_file.metadata()?;
+    Ok(opened_metadata_is_regular(&validation_metadata)
+        && link_count(&validation_metadata) == Some(1)
+        && validation_metadata.len() == expected.len()
+        && same_file(expected, &validation_metadata))
 }
