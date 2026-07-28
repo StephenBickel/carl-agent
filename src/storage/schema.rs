@@ -1,12 +1,27 @@
 use chrono::{SecondsFormat, Utc};
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 
 use crate::error::CarlError;
 
-const INITIAL_VERSION: i64 = 1;
-const INITIAL_NAME: &str = "initial schema";
-const INITIAL_MIGRATION: &str = include_str!("../../migrations/0001_init.sql");
+struct Migration {
+    version: i64,
+    name: &'static str,
+    sql: &'static str,
+}
+
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "initial schema",
+        sql: include_str!("../../migrations/0001_init.sql"),
+    },
+    Migration {
+        version: 2,
+        name: "bound approvals",
+        sql: include_str!("../../migrations/0002_bound_approvals.sql"),
+    },
+];
 
 pub(crate) fn migrate(connection: &mut Connection) -> Result<(), CarlError> {
     let transaction = connection
@@ -24,81 +39,76 @@ pub(crate) fn migrate(connection: &mut Connection) -> Result<(), CarlError> {
         )
         .map_err(storage_error)?;
 
-    let highest_version = transaction
-        .query_row("SELECT MAX(version) FROM migrations", [], |row| {
-            row.get::<_, Option<i64>>(0)
-        })
-        .map_err(storage_error)?;
-    if let Some(version) = highest_version
-        && version > INITIAL_VERSION
+    let applied = {
+        let mut statement = transaction
+            .prepare("SELECT version, name, checksum FROM migrations ORDER BY version")
+            .map_err(storage_error)?;
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })
+            .map_err(storage_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(storage_error)?
+    };
+
+    if let Some((version, _, _)) = applied.last()
+        && usize::try_from(*version).map_or(true, |version| version > MIGRATIONS.len())
     {
         return Err(CarlError::Storage {
             detail: format!("unsupported database migration version {version}"),
         });
     }
 
-    let applied = transaction
-        .query_row(
-            "SELECT name, checksum FROM migrations WHERE version = ?1",
-            [INITIAL_VERSION],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
-        )
-        .optional()
-        .map_err(storage_error)?;
-    let migration_count = transaction
-        .query_row("SELECT COUNT(*) FROM migrations", [], |row| {
-            row.get::<_, i64>(0)
-        })
-        .map_err(storage_error)?;
-
-    if let Some((name, checksum)) = applied {
-        if migration_count != INITIAL_VERSION {
+    for (index, (version, name, checksum)) in applied.iter().enumerate() {
+        let expected = &MIGRATIONS[index];
+        if *version != expected.version {
             return Err(CarlError::Storage {
                 detail: format!(
-                    "inconsistent migration ledger: expected {INITIAL_VERSION} row, found {migration_count}"
+                    "inconsistent migration ledger: expected version {}, found {version}",
+                    expected.version
                 ),
             });
         }
-        if name != INITIAL_NAME {
+        if name != expected.name {
             return Err(CarlError::Storage {
-                detail: format!("migration 1 name mismatch: found {name:?}"),
+                detail: format!("migration {version} name mismatch: found {name:?}"),
             });
         }
-
-        let expected_checksum = initial_checksum();
+        let expected_checksum = migration_checksum(expected);
         match checksum {
-            Some(checksum) if checksum == expected_checksum => {}
+            Some(checksum) if *checksum == expected_checksum => {}
             Some(checksum) => {
                 return Err(CarlError::Storage {
                     detail: format!(
-                        "migration 1 checksum mismatch: expected {expected_checksum}, found {checksum}"
+                        "migration {version} checksum mismatch: expected {expected_checksum}, found {checksum}"
                     ),
                 });
             }
             None => {
                 return Err(CarlError::Storage {
-                    detail: "migration 1 checksum is missing".to_owned(),
+                    detail: format!("migration {version} checksum is missing"),
                 });
             }
         }
-    } else if migration_count != 0 {
-        return Err(CarlError::Storage {
-            detail: format!(
-                "inconsistent migration ledger: migration 1 is missing but {migration_count} other rows exist"
-            ),
-        });
-    } else {
-        let checksum = initial_checksum();
+    }
+
+    for migration in &MIGRATIONS[applied.len()..] {
+        let checksum = migration_checksum(migration);
         transaction
-            .execute_batch(INITIAL_MIGRATION)
+            .execute_batch(migration.sql)
             .map_err(storage_error)?;
         transaction
             .execute(
                 "INSERT INTO migrations (version, name, applied_at, checksum)
                  VALUES (?1, ?2, ?3, ?4)",
                 params![
-                    INITIAL_VERSION,
-                    INITIAL_NAME,
+                    migration.version,
+                    migration.name,
                     Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
                     checksum,
                 ],
@@ -109,8 +119,8 @@ pub(crate) fn migrate(connection: &mut Connection) -> Result<(), CarlError> {
     transaction.commit().map_err(storage_error)
 }
 
-fn initial_checksum() -> String {
-    format!("{:x}", Sha256::digest(INITIAL_MIGRATION.as_bytes()))
+fn migration_checksum(migration: &Migration) -> String {
+    format!("{:x}", Sha256::digest(migration.sql.as_bytes()))
 }
 
 fn storage_error(error: rusqlite::Error) -> CarlError {

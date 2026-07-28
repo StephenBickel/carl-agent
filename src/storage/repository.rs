@@ -10,10 +10,13 @@ use crate::error::CarlError;
 use crate::events::{
     ApprovalId, EVENT_SCHEMA_VERSION, Event, EventEnvelope, EventId, SessionId, ToolCallId, TurnId,
 };
+use crate::policy::{ActorId, Sha256Digest};
 
 use super::schema;
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_BOUND_APPROVAL_LIFETIME: chrono::TimeDelta = chrono::TimeDelta::minutes(15);
+const MAX_APPROVAL_SUMMARY_BYTES: usize = 4 * 1_024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionRecord {
@@ -61,6 +64,126 @@ pub struct ApprovalRecord {
     pub status: ApprovalStatus,
     pub created_at: DateTime<Utc>,
     pub resolved_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub struct BoundApprovalBinding {
+    session_id: SessionId,
+    turn_id: TurnId,
+    tool_call_id: ToolCallId,
+    actor_id: ActorId,
+    request_digest: Sha256Digest,
+    created_at: DateTime<Utc>,
+    expires_at: DateTime<Utc>,
+}
+
+impl BoundApprovalBinding {
+    pub fn new(
+        session_id: SessionId,
+        turn_id: TurnId,
+        tool_call_id: ToolCallId,
+        actor_id: ActorId,
+        request_digest: Sha256Digest,
+        created_at: DateTime<Utc>,
+        expires_at: DateTime<Utc>,
+    ) -> Result<Self, CarlError> {
+        let lifetime = expires_at.signed_duration_since(created_at);
+        if lifetime <= chrono::TimeDelta::zero() || lifetime > MAX_BOUND_APPROVAL_LIFETIME {
+            return Err(CarlError::Validation {
+                detail: "bound approval lifetime is invalid".to_owned(),
+            });
+        }
+        Ok(Self {
+            session_id,
+            turn_id,
+            tool_call_id,
+            actor_id,
+            request_digest,
+            created_at,
+            expires_at,
+        })
+    }
+
+    #[must_use]
+    pub const fn session_id(&self) -> SessionId {
+        self.session_id
+    }
+
+    #[must_use]
+    pub const fn turn_id(&self) -> TurnId {
+        self.turn_id
+    }
+
+    #[must_use]
+    pub const fn tool_call_id(&self) -> ToolCallId {
+        self.tool_call_id
+    }
+
+    #[must_use]
+    pub const fn actor_id(&self) -> &ActorId {
+        &self.actor_id
+    }
+
+    #[must_use]
+    pub const fn request_digest(&self) -> Sha256Digest {
+        self.request_digest
+    }
+
+    #[must_use]
+    pub const fn created_at(&self) -> DateTime<Utc> {
+        self.created_at
+    }
+
+    #[must_use]
+    pub const fn expires_at(&self) -> DateTime<Utc> {
+        self.expires_at
+    }
+}
+
+impl std::fmt::Debug for BoundApprovalBinding {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BoundApprovalBinding")
+            .field("session_id", &self.session_id)
+            .field("turn_id", &self.turn_id)
+            .field("tool_call_id", &self.tool_call_id)
+            .field("actor_id", &"<redacted>")
+            .field("request_digest", &"<redacted>")
+            .field("created_at", &self.created_at)
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub struct BoundApprovalRecord {
+    pub id: ApprovalId,
+    pub binding: BoundApprovalBinding,
+    pub summary: String,
+    pub status: ApprovalStatus,
+    pub resolved_at: Option<DateTime<Utc>>,
+    pub consumed_at: Option<DateTime<Utc>>,
+}
+
+impl std::fmt::Debug for BoundApprovalRecord {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BoundApprovalRecord")
+            .field("id", &self.id)
+            .field("binding", &self.binding)
+            .field("summary", &"<redacted>")
+            .field("status", &self.status)
+            .field("resolved_at", &self.resolved_at)
+            .field("consumed_at", &self.consumed_at)
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConsumedApproval {
+    pub id: ApprovalId,
+    pub request_digest: Sha256Digest,
+    pub consumed_at: DateTime<Utc>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -393,6 +516,172 @@ impl Store {
         })
     }
 
+    pub fn create_bound_approval(
+        &self,
+        id: ApprovalId,
+        binding: BoundApprovalBinding,
+        summary: impl Into<String>,
+    ) -> Result<BoundApprovalRecord, CarlError> {
+        let summary = summary.into();
+        if summary.trim().is_empty() || summary.len() > MAX_APPROVAL_SUMMARY_BYTES {
+            return Err(CarlError::Validation {
+                detail: "bound approval summary is invalid".to_owned(),
+            });
+        }
+        let record = BoundApprovalRecord {
+            id,
+            binding,
+            summary,
+            status: ApprovalStatus::Pending,
+            resolved_at: None,
+            consumed_at: None,
+        };
+        self.connection
+            .execute(
+                "INSERT INTO bound_approvals (
+                    id, session_id, turn_id, tool_call_id, actor_id, request_digest,
+                    summary, status, created_at, expires_at, resolved_at, consumed_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8, ?9, NULL, NULL)",
+                params![
+                    record.id.to_string(),
+                    record.binding.session_id.to_string(),
+                    record.binding.turn_id.to_string(),
+                    record.binding.tool_call_id.to_string(),
+                    record.binding.actor_id.as_str(),
+                    record.binding.request_digest.to_string(),
+                    record.summary,
+                    format_timestamp(record.binding.created_at),
+                    format_timestamp(record.binding.expires_at),
+                ],
+            )
+            .map_err(storage_error)?;
+        Ok(record)
+    }
+
+    pub fn get_bound_approval(
+        &self,
+        id: ApprovalId,
+    ) -> Result<Option<BoundApprovalRecord>, CarlError> {
+        let raw = self
+            .connection
+            .query_row(
+                "SELECT session_id, turn_id, tool_call_id, actor_id, request_digest,
+                        summary, status, created_at, expires_at, resolved_at, consumed_at
+                 FROM bound_approvals
+                 WHERE id = ?1",
+                [id.to_string()],
+                raw_bound_approval,
+            )
+            .optional()
+            .map_err(storage_error)?;
+        raw.map(|raw| bound_record_from_raw(id, raw)).transpose()
+    }
+
+    pub fn resolve_bound_approval(
+        &self,
+        id: ApprovalId,
+        status: ApprovalStatus,
+        resolved_at: DateTime<Utc>,
+    ) -> Result<BoundApprovalRecord, CarlError> {
+        if status == ApprovalStatus::Pending {
+            return Err(CarlError::Validation {
+                detail: "a bound approval must resolve to a terminal status".to_owned(),
+            });
+        }
+        let existing = self
+            .get_bound_approval(id)?
+            .ok_or_else(|| policy_error("bound approval is unavailable"))?;
+        if resolved_at < existing.binding.created_at
+            || (resolved_at >= existing.binding.expires_at && status != ApprovalStatus::Expired)
+        {
+            return Err(policy_error(
+                "bound approval resolution is outside its lifetime",
+            ));
+        }
+        let changed = self
+            .connection
+            .execute(
+                "UPDATE bound_approvals
+                 SET status = ?2, resolved_at = ?3
+                 WHERE id = ?1 AND status = 'pending' AND consumed_at IS NULL",
+                params![
+                    id.to_string(),
+                    status.as_str(),
+                    format_timestamp(resolved_at)
+                ],
+            )
+            .map_err(storage_error)?;
+        if changed != 1 {
+            return Err(policy_error("bound approval is unavailable"));
+        }
+        self.get_bound_approval(id)?
+            .ok_or_else(|| storage_invariant("bound approval disappeared after resolution"))
+    }
+
+    pub fn consume_bound_approval(
+        &mut self,
+        id: ApprovalId,
+        binding: &BoundApprovalBinding,
+        now: DateTime<Utc>,
+    ) -> Result<ConsumedApproval, CarlError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage_error)?;
+        let raw = transaction
+            .query_row(
+                "SELECT session_id, turn_id, tool_call_id, actor_id, request_digest,
+                        summary, status, created_at, expires_at, resolved_at, consumed_at
+                 FROM bound_approvals
+                 WHERE id = ?1",
+                [id.to_string()],
+                raw_bound_approval,
+            )
+            .optional()
+            .map_err(storage_error)?
+            .ok_or_else(|| policy_error("bound approval is unavailable"))?;
+        let record = bound_record_from_raw(id, raw)?;
+        if record.binding != *binding
+            || record.status != ApprovalStatus::Allowed
+            || record.consumed_at.is_some()
+        {
+            return Err(policy_error("bound approval does not match the request"));
+        }
+        if now >= record.binding.expires_at {
+            transaction
+                .execute(
+                    "UPDATE bound_approvals
+                     SET status = 'expired', resolved_at = COALESCE(resolved_at, ?2)
+                     WHERE id = ?1 AND consumed_at IS NULL",
+                    params![id.to_string(), format_timestamp(now)],
+                )
+                .map_err(storage_error)?;
+            transaction.commit().map_err(storage_error)?;
+            return Err(policy_error("bound approval has expired"));
+        }
+        let consumed_at = format_timestamp(now);
+        let changed = transaction
+            .execute(
+                "UPDATE bound_approvals
+                 SET consumed_at = ?2
+                 WHERE id = ?1
+                   AND status = 'allowed'
+                   AND consumed_at IS NULL
+                   AND expires_at > ?2",
+                params![id.to_string(), consumed_at],
+            )
+            .map_err(storage_error)?;
+        if changed != 1 {
+            return Err(policy_error("bound approval is unavailable"));
+        }
+        transaction.commit().map_err(storage_error)?;
+        Ok(ConsumedApproval {
+            id,
+            request_digest: binding.request_digest,
+            consumed_at: now,
+        })
+    }
+
     pub fn remember_explicit(
         &self,
         content: impl Into<String>,
@@ -551,6 +840,78 @@ fn raw_memory(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawMemory> {
     })
 }
 
+type RawBoundApproval = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+);
+
+fn raw_bound_approval(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawBoundApproval> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+        row.get(8)?,
+        row.get(9)?,
+        row.get(10)?,
+    ))
+}
+
+fn bound_record_from_raw(
+    id: ApprovalId,
+    raw: RawBoundApproval,
+) -> Result<BoundApprovalRecord, CarlError> {
+    let (
+        session_id,
+        turn_id,
+        tool_call_id,
+        actor_id,
+        request_digest,
+        summary,
+        status,
+        created_at,
+        expires_at,
+        resolved_at,
+        consumed_at,
+    ) = raw;
+    let created_at = parse_timestamp(&created_at)?;
+    let expires_at = parse_timestamp(&expires_at)?;
+    let actor_id = ActorId::parse(actor_id)
+        .map_err(|_| storage_invariant("stored bound approval actor is invalid"))?;
+    let request_digest = Sha256Digest::parse(request_digest)
+        .map_err(|_| storage_invariant("stored bound approval digest is invalid"))?;
+    Ok(BoundApprovalRecord {
+        id,
+        binding: BoundApprovalBinding::new(
+            parse_id("session ID", &session_id)?,
+            parse_id("turn ID", &turn_id)?,
+            parse_id("tool call ID", &tool_call_id)?,
+            actor_id,
+            request_digest,
+            created_at,
+            expires_at,
+        )
+        .map_err(|_| storage_invariant("stored bound approval lifetime is invalid"))?,
+        summary,
+        status: ApprovalStatus::parse(&status)?,
+        resolved_at: resolved_at.as_deref().map(parse_timestamp).transpose()?,
+        consumed_at: consumed_at.as_deref().map(parse_timestamp).transpose()?,
+    })
+}
+
 fn format_timestamp(timestamp: DateTime<Utc>) -> String {
     timestamp.to_rfc3339_opts(SecondsFormat::Nanos, true)
 }
@@ -574,6 +935,18 @@ where
 fn invalid_stored_value(kind: &str, value: &str) -> CarlError {
     CarlError::Storage {
         detail: format!("invalid stored {kind} {value:?}"),
+    }
+}
+
+fn policy_error(detail: &str) -> CarlError {
+    CarlError::Policy {
+        detail: detail.to_owned(),
+    }
+}
+
+fn storage_invariant(detail: &str) -> CarlError {
+    CarlError::Storage {
+        detail: detail.to_owned(),
     }
 }
 
