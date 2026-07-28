@@ -2069,6 +2069,25 @@ pub async fn wait_for_fixture_marker(home: &Path, name: &str) -> TestResult {
     }
 }
 
+pub async fn wait_for_fixture_json(path: &Path) -> TestResult<serde_json::Value> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Ok(contents) = fs::read(path)
+            && let Ok(value) = serde_json::from_slice(&contents)
+        {
+            return Ok(value);
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "timed out waiting for complete fixture JSON {}",
+                path.display()
+            )
+            .into());
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
 pub async fn wait_for_fixture_pids(home: &Path) -> TestResult<(u32, u32)> {
     let path = home.join("fixture-pids.json");
     let deadline = Instant::now() + Duration::from_secs(5);
