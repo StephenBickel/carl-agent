@@ -6,5 +6,6 @@ pub mod events;
 pub mod policy;
 pub mod providers;
 pub mod runtime;
+pub mod security;
 pub mod sidecar;
 pub mod storage;
