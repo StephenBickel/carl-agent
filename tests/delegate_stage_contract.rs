@@ -358,12 +358,16 @@ fn make_owner_only(path: &Path) -> std::io::Result<()> {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
     }
+    #[cfg(not(unix))]
+    let _ = path;
     Ok(())
 }
 
 fn assert_owner_only(path: &Path) -> TestResult {
     #[cfg(unix)]
     assert_eq!(permissions(path)? & 0o077, 0);
+    #[cfg(not(unix))]
+    let _ = path;
     Ok(())
 }
 

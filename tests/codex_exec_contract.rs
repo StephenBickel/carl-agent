@@ -378,7 +378,7 @@ fn process_streams_ordered_json_and_closes_stdin() -> TestResult {
         assert_eq!(received["openai_api_key"], serde_json::Value::Null);
         assert_eq!(received["codex_api_key"], serde_json::Value::Null);
         assert_eq!(
-            PathBuf::from(received["cwd"].as_str().ok_or("cwd is not a string")?),
+            PathBuf::from(received["cwd"].as_str().ok_or("cwd is not a string")?).canonicalize()?,
             layout.workspace.canonicalize()?
         );
         assert_eq!(
