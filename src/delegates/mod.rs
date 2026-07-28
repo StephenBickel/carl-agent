@@ -1,3 +1,5 @@
+pub mod codex;
+
 mod settings;
 
 pub use settings::{
