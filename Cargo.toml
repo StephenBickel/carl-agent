@@ -39,6 +39,10 @@ path = "tests/codex_exec_contract.rs"
 harness = false
 
 [dependencies]
+# Dependency review: cap-std 3.x supplies the held-directory, relative-path
+# filesystem API used to build disposable delegate stages without handing
+# ambient live-workspace authority to external agents.
+cap-std = "3.4"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5", features = ["derive"] }
 futures-core = "0.3"
