@@ -13,11 +13,11 @@ The intended v1 experience is one continuous session across a local terminal UI 
 ## Status: pre-alpha foundation
 
 > [!WARNING]
-> Carl is currently a **pre-alpha foundation** and is not yet a usable end-user agent. The authentication command surface is implemented, but the HTTP/OpenAI adapters, runtime tool loop, model execution, delegate execution, built-in tools, TUI interaction, and Telegram gateway are not implemented. Only the four placeholder commands `serve`, `pair`, `doctor`, and `sessions` return not-implemented errors; Clap's built-in `help` command displays help.
+> Carl is currently a **pre-alpha foundation** and is not yet a usable end-user agent. The authentication command surface and an inert library-level Codex exec adapter are implemented, but the HTTP/OpenAI adapters, runtime tool loop, user-reachable subscription execution, staging and promotion pipeline, built-in tools, TUI interaction, and Telegram gateway are not implemented. Only the four placeholder commands `serve`, `pair`, `doctor`, and `sessions` return not-implemented errors; Clap's built-in `help` command displays help.
 
-Authentication does not enable model execution or delegates. The auth implementation
-is tested with offline provider fakes; this repository does not claim that a live
-OpenAI or xAI OAuth ceremony has succeeded.
+Authentication and adapter code do not enable a live coding task. The auth and Codex
+exec boundaries are tested with offline provider fakes; this repository does not
+claim that a live OAuth ceremony or subscription-backed coding task has succeeded.
 
 The repository is being developed in public so the storage, event, provider, and policy boundaries can be reviewed before consequential tool execution exists.
 
@@ -32,6 +32,8 @@ Implemented and covered by deterministic tests:
 - a provider trait and deterministic scripted provider for offline contract tests;
 - supervised, isolated provider sidecars for provider-owned authentication;
 - a deterministic JSON authentication CLI for status, login, and logout;
+- layered Codex model/reasoning settings plus an inert, version-pinned
+  `codex exec --json` adapter with bounded normalized events;
 - a Clap command/help shell for the remaining planned top-level interface.
 
 The approved v1 design adds a shared runtime loop, OpenAI and OpenAI-compatible HTTP adapters, bounded workspace tools, a TUI, explicit memory, and an owner-only Telegram gateway. These are roadmap items, not current capabilities.
@@ -104,9 +106,10 @@ Telegram (planned) ---+       |
 ```
 
 Today, the event model, storage layer, budget primitives, provider boundary, scripted
-adapter, and provider-owned authentication sidecars exist. The runtime, policy
-evaluator, tools, model/delegate execution, production adapters, and frontends remain
-planned. See the [architecture guide](docs/architecture.md), the
+adapter, provider-owned authentication sidecars, and an inert Codex exec adapter
+exist. The subscription run engine, sanitized staging, policy and approval boundary,
+verification and promotion pipeline, native runtime, production adapters, and
+frontends remain planned. See the [architecture guide](docs/architecture.md), the
 [approved Carl design](docs/superpowers/specs/2026-07-23-carl-top-tier-harness-design.md),
 and the decisions on [event-sourced execution](docs/adr/0001-event-sourced-runtime.md),
 a [single-process v1](docs/adr/0002-single-process-v1.md), and

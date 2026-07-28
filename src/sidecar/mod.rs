@@ -14,7 +14,10 @@
 //! directory identities and rejects ambient path replacement before each provider
 //! invocation or file operation.
 
+mod exec_jsonl;
 mod jsonl;
+
+pub use exec_jsonl::{ExecutionWorkspace, JsonlEventProcess, JsonlProcessOutcome};
 
 use std::collections::{HashMap, VecDeque, hash_map::Entry};
 use std::env;

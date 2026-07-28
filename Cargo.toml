@@ -33,6 +33,11 @@ name = "auth_cli_contract"
 path = "tests/auth_cli_contract.rs"
 harness = false
 
+[[test]]
+name = "codex_exec_contract"
+path = "tests/codex_exec_contract.rs"
+harness = false
+
 [dependencies]
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5", features = ["derive"] }
