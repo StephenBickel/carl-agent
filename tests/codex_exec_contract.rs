@@ -11,8 +11,12 @@ use std::path::PathBuf;
 use std::process::{self, Command, Stdio};
 
 use carl::delegates::codex::{
-    CodexEventNormalizer, CodexProtocolErrorCode, DelegateActivityKind, DelegateEvent,
-    DelegateItemPhase, DelegateTerminal, DelegateUsage,
+    CodexEventNormalizer, CodexExecAdapter, CodexExecRequest, CodexProtocolErrorCode,
+    DelegateActivityKind, DelegateErrorCode, DelegateEvent, DelegateItemPhase, DelegateTerminal,
+    DelegateUsage,
+};
+use carl::delegates::{
+    BoundedDelegateTask, DelegateSettings, DelegateSettingsLayers, ModelId, ReasoningEffort,
 };
 use carl::sidecar::{
     ExecutableTrustDecision, ExecutionWorkspace, JsonlEventProcess, JsonlProcessOutcome,
@@ -109,6 +113,38 @@ fn main() {
         test(
             "process cancellation terminates descendants",
             process_cancellation_terminates_descendants,
+        ),
+        test(
+            "adapter composes a private subscription-backed Codex run",
+            adapter_composes_a_private_subscription_backed_codex_run,
+        ),
+        test(
+            "adapter omits unset model overrides",
+            adapter_omits_unset_model_overrides,
+        ),
+        test(
+            "adapter rejects a non-Codex provider home",
+            adapter_rejects_a_non_codex_provider_home,
+        ),
+        test(
+            "adapter rejects an incompatible version before task input",
+            adapter_rejects_an_incompatible_version_before_task_input,
+        ),
+        test(
+            "adapter requires exactly one terminal event",
+            adapter_requires_exactly_one_terminal_event,
+        ),
+        test(
+            "adapter maps authentication failures",
+            adapter_maps_authentication_failures,
+        ),
+        test(
+            "adapter maps worker and protocol failures",
+            adapter_maps_worker_and_protocol_failures,
+        ),
+        test(
+            "adapter cancellation is stable and redacted",
+            adapter_cancellation_is_stable_and_redacted,
         ),
     ];
     libtest_mimic::run(&Arguments::from_iter(env::args_os().skip(1)), trials).exit();
@@ -518,6 +554,305 @@ fn process_cancellation_terminates_descendants() -> TestResult {
     })
 }
 
+fn adapter_composes_a_private_subscription_backed_codex_run() -> TestResult {
+    run_async(async {
+        let layout = TestLayout::new()?;
+        let adapter = codex_adapter_fixture(&layout, ProviderEnvironmentProfile::Codex)?;
+        let session = DelegateSettings::new(
+            Some(ModelId::parse("gpt-5.6")?),
+            Some(ReasoningEffort::High),
+        );
+        let per_run = DelegateSettings::new(
+            Some(ModelId::parse("gpt-5.6-terra")?),
+            Some(ReasoningEffort::Low),
+        );
+        let settings = DelegateSettingsLayers {
+            personal: None,
+            project: None,
+            session: Some(&session),
+            per_run: Some(&per_run),
+        }
+        .resolve();
+        let workspace = ExecutionWorkspace::open(&layout.workspace)?;
+        let task = "Fix the private sentinel regression";
+        let request = CodexExecRequest {
+            task: BoundedDelegateTask::parse(task)?,
+            settings,
+        };
+        assert!(!format!("{request:?}").contains(task));
+        let mut run = adapter.start(&workspace, request).await?;
+
+        let mut events = Vec::new();
+        while let Some(event) = run.next_event().await? {
+            events.push(event);
+        }
+        let usage = run.finish().await?;
+        assert_eq!(usage.output_tokens, 3);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            DelegateEvent::AgentMessage { text } if text == "Fixture completed."
+        )));
+
+        let record: serde_json::Value =
+            serde_json::from_slice(&fs::read(layout.home.join("exec-record.json"))?)?;
+        let arguments = record["arguments"]
+            .as_array()
+            .ok_or("fixture arguments are not an array")?;
+        assert_eq!(
+            arguments,
+            &[
+                json!("--strict-config"),
+                json!("--model"),
+                json!("gpt-5.6-terra"),
+                json!("-c"),
+                json!("model_reasoning_effort=\"low\""),
+                json!("exec"),
+                json!("--json"),
+                json!("--ephemeral"),
+                json!("--sandbox"),
+                json!("workspace-write"),
+                json!("--ask-for-approval"),
+                json!("never"),
+                json!("--skip-git-repo-check"),
+                json!("-"),
+            ]
+        );
+        assert!(
+            arguments
+                .iter()
+                .all(|argument| argument.as_str() != Some(task))
+        );
+        assert!(
+            record["stdin"]
+                .as_str()
+                .is_some_and(|stdin| stdin.contains(task))
+        );
+        assert_eq!(record["openai_api_key"], serde_json::Value::Null);
+        assert_eq!(record["codex_api_key"], serde_json::Value::Null);
+        assert_eq!(
+            fs::read_to_string(layout.home.join("config.toml"))?,
+            concat!(
+                "cli_auth_credentials_store = \"keyring\"\n",
+                "approval_policy = \"never\"\n",
+                "sandbox_mode = \"workspace-write\"\n",
+                "\n",
+                "[sandbox_workspace_write]\n",
+                "network_access = false\n",
+            )
+        );
+        assert!(!format!("{adapter:?}").contains(layout.home.to_string_lossy().as_ref()));
+        Ok(())
+    })
+}
+
+fn adapter_omits_unset_model_overrides() -> TestResult {
+    run_async(async {
+        let layout = TestLayout::new()?;
+        let adapter = codex_adapter_fixture(&layout, ProviderEnvironmentProfile::Codex)?;
+        let workspace = ExecutionWorkspace::open(&layout.workspace)?;
+        let mut run = adapter
+            .start(
+                &workspace,
+                CodexExecRequest {
+                    task: BoundedDelegateTask::parse("Run with provider defaults")?,
+                    settings: DelegateSettingsLayers::default().resolve(),
+                },
+            )
+            .await?;
+        while run.next_event().await?.is_some() {}
+        run.finish().await?;
+
+        let record: serde_json::Value =
+            serde_json::from_slice(&fs::read(layout.home.join("exec-record.json"))?)?;
+        let arguments = record["arguments"]
+            .as_array()
+            .ok_or("fixture arguments are not an array")?;
+        assert!(!arguments.iter().any(|argument| argument == "--model"));
+        assert!(!arguments.iter().any(|argument| {
+            argument
+                .as_str()
+                .is_some_and(|value| value.starts_with("model_reasoning_effort="))
+        }));
+        Ok(())
+    })
+}
+
+fn adapter_rejects_a_non_codex_provider_home() -> TestResult {
+    let layout = TestLayout::new()?;
+    let specification = SidecarCommand {
+        executable: env::current_exe()?,
+        arguments: Vec::new(),
+        version_arguments: Vec::new(),
+        version_output: VersionOutputFormat::SingleSemverToken,
+        isolated_home: layout.home.clone(),
+        supported_versions: VersionReq::parse("=0.136.0")?,
+    };
+    let trusted = specification
+        .resolve_executable()?
+        .trust(ExecutableTrustDecision::TrustCanonicalPath)?;
+    let home = ProviderHome::prepare(
+        ProviderEnvironmentProfile::Grok,
+        &layout.data,
+        &layout.workspace,
+        &layout.home,
+    )?;
+    let error = CodexExecAdapter::new(trusted, home, short_limits())
+        .expect_err("a Grok provider home must be rejected");
+    assert_eq!(error.code(), DelegateErrorCode::Configuration);
+    Ok(())
+}
+
+fn adapter_rejects_an_incompatible_version_before_task_input() -> TestResult {
+    run_async(async {
+        let layout = TestLayout::new()?;
+        fs::write(layout.data.join("fixture-version"), b"0.135.0")?;
+        let adapter = codex_adapter_fixture(&layout, ProviderEnvironmentProfile::Codex)?;
+        let workspace = ExecutionWorkspace::open(&layout.workspace)?;
+        let error = adapter
+            .start(
+                &workspace,
+                CodexExecRequest {
+                    task: BoundedDelegateTask::parse("This must not be sent")?,
+                    settings: DelegateSettingsLayers::default().resolve(),
+                },
+            )
+            .await
+            .expect_err("an incompatible Codex CLI must fail");
+        assert_eq!(error.code(), DelegateErrorCode::Incompatible);
+        assert!(!layout.home.join("exec-record.json").exists());
+        Ok(())
+    })
+}
+
+fn adapter_requires_exactly_one_terminal_event() -> TestResult {
+    run_async(async {
+        let layout = TestLayout::new()?;
+        fs::write(
+            layout.workspace.join(".fixture-scenario"),
+            b"missing-terminal",
+        )?;
+        let adapter = codex_adapter_fixture(&layout, ProviderEnvironmentProfile::Codex)?;
+        let workspace = ExecutionWorkspace::open(&layout.workspace)?;
+        let mut run = adapter
+            .start(
+                &workspace,
+                CodexExecRequest {
+                    task: BoundedDelegateTask::parse("Exercise the protocol")?,
+                    settings: DelegateSettingsLayers::default().resolve(),
+                },
+            )
+            .await?;
+        while run.next_event().await?.is_some() {}
+        let error = run
+            .finish()
+            .await
+            .expect_err("a missing terminal event must fail");
+        assert_eq!(error.code(), DelegateErrorCode::ProtocolFailed);
+        Ok(())
+    })
+}
+
+fn adapter_maps_authentication_failures() -> TestResult {
+    run_async(async {
+        let layout = TestLayout::new()?;
+        fs::write(layout.workspace.join(".fixture-scenario"), b"auth-failure")?;
+        let adapter = codex_adapter_fixture(&layout, ProviderEnvironmentProfile::Codex)?;
+        let workspace = ExecutionWorkspace::open(&layout.workspace)?;
+        let mut run = adapter
+            .start(
+                &workspace,
+                CodexExecRequest {
+                    task: BoundedDelegateTask::parse("Exercise auth mapping")?,
+                    settings: DelegateSettingsLayers::default().resolve(),
+                },
+            )
+            .await?;
+        while run.next_event().await?.is_some() {}
+        let error = run
+            .finish()
+            .await
+            .expect_err("the fixture reports missing authentication");
+        assert_eq!(error.code(), DelegateErrorCode::AuthenticationRequired);
+        Ok(())
+    })
+}
+
+fn adapter_maps_worker_and_protocol_failures() -> TestResult {
+    run_async(async {
+        for (scenario, expected) in [
+            ("nonzero", DelegateErrorCode::ProviderFailed),
+            ("malformed", DelegateErrorCode::ProtocolFailed),
+            ("oversized", DelegateErrorCode::ProtocolFailed),
+        ] {
+            let layout = TestLayout::new()?;
+            fs::write(layout.workspace.join(".fixture-scenario"), scenario)?;
+            let adapter = codex_adapter_fixture(&layout, ProviderEnvironmentProfile::Codex)?;
+            let workspace = ExecutionWorkspace::open(&layout.workspace)?;
+            let run = adapter
+                .start(
+                    &workspace,
+                    CodexExecRequest {
+                        task: BoundedDelegateTask::parse("Exercise failure mapping")?,
+                        settings: DelegateSettingsLayers::default().resolve(),
+                    },
+                )
+                .await?;
+            let error = run.finish().await.expect_err("the fixture must fail");
+            assert_eq!(error.code(), expected, "scenario: {scenario}");
+        }
+        Ok(())
+    })
+}
+
+fn adapter_cancellation_is_stable_and_redacted() -> TestResult {
+    run_async(async {
+        let layout = TestLayout::new()?;
+        fs::write(layout.workspace.join(".fixture-scenario"), b"hanging")?;
+        let adapter = codex_adapter_fixture(&layout, ProviderEnvironmentProfile::Codex)?;
+        let workspace = ExecutionWorkspace::open(&layout.workspace)?;
+        let task = "private cancellation task";
+        let mut run = adapter
+            .start(
+                &workspace,
+                CodexExecRequest {
+                    task: BoundedDelegateTask::parse(task)?,
+                    settings: DelegateSettingsLayers::default().resolve(),
+                },
+            )
+            .await?;
+        assert!(!format!("{run:?}").contains(task));
+        assert!(!format!("{run:?}").contains(layout.workspace.to_string_lossy().as_ref()));
+
+        run.cancel().await?;
+        let error = run
+            .finish()
+            .await
+            .expect_err("a cancelled run must stay cancelled");
+        assert_eq!(error.code(), DelegateErrorCode::Cancelled);
+        assert!(!format!("{error:?}").contains(task));
+        Ok(())
+    })
+}
+
+fn codex_adapter_fixture(
+    layout: &TestLayout,
+    profile: ProviderEnvironmentProfile,
+) -> Result<CodexExecAdapter, Box<dyn Error + Send + Sync>> {
+    let specification = SidecarCommand {
+        executable: env::current_exe()?,
+        arguments: Vec::new(),
+        version_arguments: Vec::new(),
+        version_output: VersionOutputFormat::SingleSemverToken,
+        isolated_home: layout.home.clone(),
+        supported_versions: VersionReq::parse("=0.136.0")?,
+    };
+    let trusted = specification
+        .resolve_executable()?
+        .trust(ExecutableTrustDecision::TrustCanonicalPath)?;
+    let home = ProviderHome::prepare(profile, &layout.data, &layout.workspace, &layout.home)?;
+    Ok(CodexExecAdapter::new(trusted, home, short_limits())?)
+}
+
 fn execution_fixture(
     layout: &TestLayout,
     scenario: &str,
@@ -566,6 +901,30 @@ fn run_async<T>(future: impl std::future::Future<Output = T>) -> T {
 }
 
 fn dispatch_exec_fixture(arguments: &[OsString]) -> Option<i32> {
+    if arguments == [OsString::from("--version")] {
+        let version = env::var_os("CODEX_HOME")
+            .map(PathBuf::from)
+            .and_then(|home| {
+                home.parent()?
+                    .parent()?
+                    .join("fixture-version")
+                    .is_file()
+                    .then(|| {
+                        fs::read_to_string(home.parent()?.parent()?.join("fixture-version")).ok()
+                    })
+                    .flatten()
+            })
+            .unwrap_or_else(|| "0.136.0".to_owned());
+        println!("codex-cli {}", version.trim());
+        return Some(0);
+    }
+    if arguments
+        .iter()
+        .any(|argument| argument == OsStr::new("exec"))
+        && arguments.last().map(OsString::as_os_str) == Some(OsStr::new("-"))
+    {
+        return Some(adapter_exec_fixture(arguments));
+    }
     if arguments.first().map(OsString::as_os_str) != Some(OsStr::new(EXEC_FIXTURE_ARGUMENT)) {
         return None;
     }
@@ -641,4 +1000,108 @@ fn dispatch_exec_fixture(arguments: &[OsString]) -> Option<i32> {
         },
         _ => 64,
     })
+}
+
+fn adapter_exec_fixture(arguments: &[OsString]) -> i32 {
+    let mut input = String::new();
+    if io::stdin().read_to_string(&mut input).is_err() {
+        return 74;
+    }
+    let Some(home) = env::var_os("CODEX_HOME").map(PathBuf::from) else {
+        return 78;
+    };
+    let record = json!({
+        "arguments": arguments
+            .iter()
+            .map(|argument| argument.to_string_lossy())
+            .collect::<Vec<_>>(),
+        "stdin": input,
+        "openai_api_key": env::var("OPENAI_API_KEY").ok(),
+        "codex_api_key": env::var("CODEX_API_KEY").ok(),
+    });
+    if fs::write(
+        home.join("exec-record.json"),
+        serde_json::to_vec(&record).expect("fixture launch record serializes"),
+    )
+    .is_err()
+    {
+        return 73;
+    }
+
+    let scenario = env::current_dir()
+        .ok()
+        .and_then(|workspace| fs::read_to_string(workspace.join(".fixture-scenario")).ok())
+        .unwrap_or_else(|| "success".to_owned());
+    match scenario.trim() {
+        "success" => {
+            println!(
+                "{}",
+                json!({
+                    "type": "thread.started",
+                    "thread_id": "0199a213-81c0-7800-8aa1-bbab2a035a53"
+                })
+            );
+            println!("{}", json!({"type": "turn.started"}));
+            println!(
+                "{}",
+                json!({
+                    "type": "item.completed",
+                    "item": {
+                        "id": "item_1",
+                        "type": "agent_message",
+                        "text": "Fixture completed."
+                    }
+                })
+            );
+            println!(
+                "{}",
+                json!({
+                    "type": "turn.completed",
+                    "usage": {
+                        "input_tokens": 10,
+                        "cached_input_tokens": 2,
+                        "output_tokens": 3
+                    }
+                })
+            );
+            0
+        }
+        "missing-terminal" => {
+            println!(
+                "{}",
+                json!({
+                    "type": "thread.started",
+                    "thread_id": "0199a213-81c0-7800-8aa1-bbab2a035a53"
+                })
+            );
+            println!("{}", json!({"type": "turn.started"}));
+            0
+        }
+        "auth-failure" => {
+            println!(
+                "{}",
+                json!({
+                    "type": "turn.failed",
+                    "error": {"code": "authentication_required"}
+                })
+            );
+            1
+        }
+        "nonzero" => 17,
+        "malformed" => {
+            println!("{{not-json");
+            0
+        }
+        "oversized" => {
+            println!(
+                "{}",
+                json!({"type": "fixture.oversized", "payload": "x".repeat(9 * 1_024)})
+            );
+            0
+        }
+        "hanging" => loop {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        },
+        _ => 64,
+    }
 }

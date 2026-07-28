@@ -249,7 +249,7 @@ fn readme_states_the_current_status_and_security_boundaries() {
             "codex owns its credentials in the operating-system keyring",
             "grok owns `$grok_home/auth.json`",
             "foreground-only mutations",
-            "authentication does not enable model execution or delegates",
+            "authentication and adapter code do not enable a live coding task",
             "neither proves current subscription/model entitlement nor enables model execution or delegates",
             "undocumented oauth",
             "not a complete security sandbox",
@@ -304,8 +304,10 @@ fn architecture_separates_authentication_from_execution() {
             "provider-owned authentication brokers",
             "composition for the seven `auth` commands",
             "authentication status performs only provider-owned local handshakes",
-            "model runtime, delegate execution",
-            "implemented authentication does not enable model/runtime/delegate execution",
+            "bounded model and reasoning settings",
+            "codex exec --json",
+            "deliberately not connected to the cli",
+            "do not enable a live coding task",
             "one exclusive os lock per canonical data root",
         ],
     );
@@ -346,7 +348,8 @@ fn changelog_records_auth_without_claiming_delegate_execution() {
             "grok-owned supergrok or eligible x subscription authentication",
             "seven `carl auth` status/login/logout commands",
             "deterministic safe json status",
-            "delegate execution; both remain unavailable",
+            "inert, library-level subscription-backed codex exec adapter",
+            "subscription-backed coding is not exposed through the cli",
         ],
     );
 }

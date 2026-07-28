@@ -14,7 +14,8 @@ Those mechanisms are not interchangeable. OpenAI does not document a public flow
 turns a ChatGPT subscription into a bearer token for an arbitrary third-party
 Responses API client. OpenAI does document Codex app-server as an embedding interface
 for custom products, including managed ChatGPT browser and device-code login, and
-documents `codex mcp-server` for using Codex as a specialist inside another agent.
+documents non-interactive `codex exec --json` for automation with structured JSONL
+events.
 
 xAI publicly supports SuperGrok and eligible X subscriptions in OpenCode and Kilo
 through OAuth. Its OIDC metadata documents authorization-code, refresh-token, and
@@ -50,8 +51,8 @@ Carl uses a dedicated, provider-owned Codex sidecar:
 
 - a version-pinned `codex app-server` process over local stdio owns ChatGPT browser or
   device-code login and reports only login status, plan type, and rate limits;
-- stable `codex mcp-server` exposes Codex as a policy-routed delegated tool inside
-  Carl's native loop;
+- stable, non-interactive `codex exec --json` performs one bounded delegated coding
+  task and reuses provider-owned ChatGPT authentication;
 - every Codex process receives a Carl-specific `CODEX_HOME`, which isolates
   filesystem-backed configuration and state;
 - Codex stores and refreshes its own tokens in the operating-system keyring;
@@ -67,6 +68,13 @@ workspace, and returns bounded exact-replacement proposals for existing text fil
 Each proposal is inert until Carl submits it through the native patch path with its own
 policy, approval, stale-state, and verification checks. V1 delegate proposals do not
 create, delete, or rename files.
+
+Carl's first subscription-only execution path enters through a
+`SubscriptionRunEngine`, rather than requiring an API-key-backed native model loop to
+invoke Codex as a tool. The engine will own staging, policy, bound approval,
+verification, and promotion around the provider-owned inner agent. The library-level
+Codex exec adapter and supervised JSONL boundary are implemented, but remain inert:
+there is no CLI route to run a coding task until those outer safety boundaries exist.
 
 ### Grok subscription delegate
 
@@ -131,7 +139,7 @@ CLI, OpenCode, or Kilo client identity.
 
 - [OpenAI Codex authentication](https://learn.chatgpt.com/docs/auth)
 - [OpenAI Codex app-server protocol](https://learn.chatgpt.com/docs/app-server)
-- [Running Codex as an MCP server](https://learn.chatgpt.com/docs/mcp-server)
+- [OpenAI Codex non-interactive mode](https://developers.openai.com/codex/noninteractive/)
 - [xAI Grok Build CLI reference](https://docs.x.ai/build/cli/reference)
 - [xAI Grok Build headless and ACP integration](https://docs.x.ai/build/cli/headless-scripting)
 - [xAI Grok Build settings and `GROK_HOME`](https://docs.x.ai/build/settings)

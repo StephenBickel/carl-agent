@@ -17,6 +17,10 @@ Telegram (planned) ---+            |
 auth CLI (implemented) --> data-root lock --> provider auth broker
                                               |
                                               +--> supervised Codex/Grok sidecar
+
+SubscriptionRunEngine (planned safety boundary)
+        |
+        +--> Codex exec adapter (implemented, inert) --> sanitized staging (planned)
 ```
 
 This layout keeps user interfaces replaceable, provider wire formats contained, policy centralized, and scenario tests deterministic.
@@ -33,6 +37,9 @@ This layout keeps user interfaces replaceable, provider wire formats contained, 
   authentication protocols.
 - `auth`: provider-owned authentication brokers for Codex and Grok that expose only
   sanitized state, login, logout, and cancellation boundaries.
+- `delegates`: bounded model and reasoning settings, stateful Codex JSONL
+  normalization, and an inert version-pinned `codex exec --json` adapter that sends
+  tasks only over stdin and reuses provider-owned subscription authentication.
 - `cli`: composition for the seven `auth` commands, local foreground checks,
   cross-process data-root locking, and deterministic safe JSON output; the other
   top-level commands remain placeholders.
@@ -40,8 +47,9 @@ This layout keeps user interfaces replaceable, provider wire formats contained, 
 Authentication status performs only provider-owned local handshakes with the pinned
 executables. It does not issue prompts, start sessions, invoke inference, or validate
 live model entitlement. There is no production HTTP adapter, context assembler, turn
-state machine, policy evaluator, tool executor, model runtime, delegate execution,
-TUI, general configuration loader, diagnostics command, or Telegram transport yet.
+state machine, policy evaluator, tool executor, user-reachable subscription run
+engine, staging/promote pipeline, TUI, general configuration loader, diagnostics
+command, or Telegram transport yet.
 
 ## Authentication composition
 
@@ -57,10 +65,12 @@ cancellation and exit can terminate and boundedly reap provider process trees. T
 is lifecycle containment, not a sandbox and not proof that a version-matching binary
 was published by OpenAI or xAI.
 
-The same sidecar protocols may later support policy-routed subscription delegates, as
-described in [ADR 0004](adr/0004-subscription-authentication-through-provider-sidecars.md).
-That future composition is deliberately absent: implemented authentication does not
-enable model/runtime/delegate execution.
+The library now includes a separate one-way JSONL worker and Codex exec adapter for
+the subscription path described in
+[ADR 0004](adr/0004-subscription-authentication-through-provider-sidecars.md). It is
+deliberately not connected to the CLI. Implemented authentication and adapter code do
+not enable a live coding task until `SubscriptionRunEngine`, sanitized staging,
+policy, approval, independent verification, and stale-safe promotion exist.
 
 ## Planned turn boundary
 

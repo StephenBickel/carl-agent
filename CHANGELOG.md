@@ -22,8 +22,12 @@ All notable changes to Carl will be recorded here. The project is pre-alpha and 
   X subscription authentication; Carl never receives their tokens.
 - Seven `carl auth` status/login/logout commands with deterministic safe JSON status
   and foreground-only authentication mutation.
+- An inert, library-level subscription-backed Codex exec adapter with layered
+  model/reasoning settings, pinned CLI compatibility, private stdin task delivery,
+  bounded normalized JSONL events, and supervised process-tree cancellation.
 
 ### Not yet available
 
-- Authentication does not enable native model execution or subscription-backed
-  delegate execution; both remain unavailable.
+- Native model execution remains unavailable.
+- Subscription-backed coding is not exposed through the CLI until staging, policy,
+  bound approval, independent verification, and stale-safe promotion are implemented.
