@@ -524,7 +524,20 @@ fn make_owner_only(path: &Path) -> std::io::Result<()> {
         .map_or(identity.stdout.len(), |offset| sid_start + offset);
     let sid = std::str::from_utf8(&identity.stdout[sid_start..sid_end])
         .map_err(|_| std::io::Error::other("whoami returned an invalid SID"))?;
-    let grant = format!("*{sid}:(OI)(CI)F");
+    let numeric_identity = format!("*{sid}");
+    let owner_status = std::process::Command::new("icacls")
+        .arg(path)
+        .arg("/setowner")
+        .arg(&numeric_identity)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()?;
+    if !owner_status.success() {
+        return Err(std::io::Error::other(
+            "the Windows fixture could not set the current user as owner",
+        ));
+    }
+    let grant = format!("{numeric_identity}:(OI)(CI)F");
     let status = std::process::Command::new("icacls")
         .arg(path)
         .args(["/inheritance:r", "/grant:r"])
