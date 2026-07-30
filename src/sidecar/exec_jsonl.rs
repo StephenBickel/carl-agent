@@ -49,8 +49,42 @@ impl ExecutionWorkspace {
         })
     }
 
+    pub(crate) fn open_matching_held(
+        path: impl AsRef<Path>,
+        held: &cap_std::fs::Dir,
+    ) -> Result<Self, SidecarError> {
+        let held = held
+            .try_clone()
+            .map_err(|_| invalid_workspace())?
+            .into_std_file();
+        let held_identity = directory_identity(&held)?;
+        let workspace = Self::open(path)?;
+        if directory_identity(&workspace.directory)? != held_identity {
+            return Err(invalid_workspace());
+        }
+        Ok(workspace)
+    }
+
     fn configure_command(&self, command: &mut Command) -> Result<(), SidecarError> {
         self.revalidate()?;
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+
+            let directory = self.directory.as_raw_fd();
+            // SAFETY: the held directory remains alive through spawn, fchdir is
+            // async-signal-safe, and the closure performs no allocation.
+            unsafe {
+                command.pre_exec(move || {
+                    if libc::fchdir(directory) == 0 {
+                        Ok(())
+                    } else {
+                        Err(std::io::Error::last_os_error())
+                    }
+                });
+            }
+        }
+        #[cfg(not(unix))]
         command.current_dir(&self.canonical_path);
         Ok(())
     }
@@ -139,6 +173,7 @@ impl JsonlEventProcess {
         workspace.configure_command(&mut command)?;
         set_owner_only_child_umask(&mut command);
 
+        workspace.revalidate()?;
         let mut child = spawn_trusted_grouped(executable, command)?;
         let mut stdin = child
             .stdin()

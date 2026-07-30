@@ -34,12 +34,29 @@ Carl does not attempt to defend a host account from an attacker who already cont
   families fail closed. Stages accept only permitted single-link UTF-8 regular files,
   exclude known sensitive and executable configuration surfaces, and a
   high-confidence secret finding rejects the entire stage.
+- each accepted source file and the deterministic content-manifest preimage are
+  sealed in an owner-private content-addressed store outside the mutable stage.
+  Published objects are create-new, flushed, single-link, and read-only where the
+  platform supports it. Every later read reopens the named object, checks held file
+  identity and private metadata, and re-hashes its bytes. A separate sealed
+  source-precondition artifact covers source identity and ownership evidence.
+  Runtime startup removes canonical objects without durable SQLite roots and prunes
+  orphan registry rows while holding both exclusive roots. Aggregate object storage
+  is capped at 1 GiB and 200,000 entries, with a separate bounded recovery scan;
+- proposal inspection executes no repository code and never reads promotion bytes
+  back from the agent-mutated stage after inspection. It either reports no changes
+  or persists one inert exact-replacement envelope for an existing UTF-8 file.
+  Structural changes, protected paths, redirects, hard links, binary content,
+  metadata-only drift, generated secrets, oversized content, and unstable path
+  identity fail closed with path-and-rule-only diagnostics. Preparation and
+  inspection also cap aggregate relative-path metadata at 8 MiB per snapshot.
 
 These properties improve auditability and failure behavior. They do not implement
 model-provider access, a general runtime tool-policy system, redaction of all future
-runtime data, live-workspace promotion, or a complete process sandbox. Proposal
-inspection, verification, and promotion are not implemented, so no subscription
-coding task is user-reachable.
+runtime data, live-workspace promotion, or a complete process sandbox. Independent
+verification and promotion are not implemented, and the proposal inspector is not
+orchestrated by a user-reachable subscription run engine, so no subscription coding
+task is user-reachable.
 
 ## Planned v1 controls
 

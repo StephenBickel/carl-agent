@@ -1001,6 +1001,48 @@ impl DataRootLock {
     pub(crate) fn runtime_data_root(&self) -> &Path {
         &self.data_root
     }
+
+    pub(crate) fn try_clone_root_directory(&self) -> std::io::Result<File> {
+        self._root_directory.try_clone()
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn try_open_root_directory_for_writes(&self) -> std::io::Result<File> {
+        self.try_clone_root_directory()
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn try_open_root_directory_for_writes(&self) -> std::io::Result<File> {
+        use std::fs::OpenOptions;
+        use std::os::windows::fs::OpenOptionsExt;
+
+        use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+            FILE_SHARE_WRITE,
+        };
+
+        let invalid = || {
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "private writable root verification failed",
+            )
+        };
+        let directory = OpenOptions::new()
+            .access_mode(GENERIC_READ | GENERIC_WRITE)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&self.data_root)?;
+        let metadata = directory.metadata()?;
+        if !metadata.is_dir()
+            || is_link_or_reparse(&metadata)
+            || windows_security::verify_private_directory_handle(&directory).is_err()
+            || directory_identity(&directory).map_err(|_| invalid())? != self.root_identity
+        {
+            return Err(invalid());
+        }
+        Ok(directory)
+    }
 }
 
 impl Drop for DataRootLock {
@@ -1285,12 +1327,33 @@ fn directory_identity(directory: &File) -> Result<DirectoryIdentity, SidecarErro
 }
 
 #[cfg(windows)]
-type DirectoryIdentity = WindowsFileIdentity;
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct DirectoryIdentity {
+    volume_serial: u32,
+    file_index: u64,
+}
 
 #[cfg(windows)]
 fn directory_identity(directory: &File) -> Result<DirectoryIdentity, SidecarError> {
-    windows_file_identity(directory)
-        .map_err(|()| SidecarError::from_code(SidecarErrorCode::InvalidProviderHome))
+    let identity = windows_file_identity(directory)
+        .map_err(|()| SidecarError::from_code(SidecarErrorCode::InvalidProviderHome))?;
+    Ok(DirectoryIdentity {
+        volume_serial: identity.volume_serial,
+        file_index: identity.file_index,
+    })
+}
+
+pub(crate) fn directory_path_matches_held(path: &Path, held: &cap_std::fs::Dir) -> bool {
+    let Ok(named) = open_identity_directory(path) else {
+        return false;
+    };
+    let Ok(held) = held.try_clone().map(cap_std::fs::Dir::into_std_file) else {
+        return false;
+    };
+    match (directory_identity(&named), directory_identity(&held)) {
+        (Ok(named), Ok(held)) => named == held,
+        _ => false,
+    }
 }
 
 fn provider_home_operation_lock(identity: DirectoryIdentity) -> Arc<AsyncMutex<()>> {
@@ -3790,7 +3853,7 @@ fn directory_is_same_or_ancestor(ancestor: &Path, path: &Path) -> Result<bool, S
     Ok(false)
 }
 
-fn directory_paths_overlap(left: &Path, right: &Path) -> Result<bool, SidecarError> {
+pub(crate) fn directory_paths_overlap(left: &Path, right: &Path) -> Result<bool, SidecarError> {
     Ok(directory_is_same_or_ancestor(left, right)? || directory_is_same_or_ancestor(right, left)?)
 }
 
@@ -4037,7 +4100,7 @@ pub(crate) fn create_relative_private_file(
     name: &std::ffi::OsStr,
 ) -> Result<File, ()> {
     use std::os::windows::ffi::OsStrExt;
-    use std::os::windows::io::{AsRawHandle, FromRawHandle};
+    use std::os::windows::io::FromRawHandle;
     use std::ptr;
 
     use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
@@ -4112,21 +4175,45 @@ pub(crate) fn create_relative_private_directory(
     directory: &impl std::os::windows::io::AsRawHandle,
     name: &std::ffi::OsStr,
 ) -> Result<File, ()> {
+    open_relative_private_directory_with_disposition(
+        directory,
+        name,
+        windows_sys::Wdk::Storage::FileSystem::FILE_CREATE,
+    )
+}
+
+#[cfg(windows)]
+pub(crate) fn open_relative_private_directory(
+    directory: &impl std::os::windows::io::AsRawHandle,
+    name: &std::ffi::OsStr,
+) -> Result<File, ()> {
+    open_relative_private_directory_with_disposition(
+        directory,
+        name,
+        windows_sys::Wdk::Storage::FileSystem::FILE_OPEN,
+    )
+}
+
+#[cfg(windows)]
+fn open_relative_private_directory_with_disposition(
+    directory: &impl std::os::windows::io::AsRawHandle,
+    name: &std::ffi::OsStr,
+    disposition: windows_sys::Wdk::Storage::FileSystem::NTCREATEFILE_CREATE_DISPOSITION,
+) -> Result<File, ()> {
     use std::os::windows::ffi::OsStrExt;
-    use std::os::windows::io::{AsRawHandle, FromRawHandle};
+    use std::os::windows::io::FromRawHandle;
     use std::ptr;
 
     use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
     use windows_sys::Wdk::Storage::FileSystem::{
-        FILE_CREATE, FILE_DIRECTORY_FILE, FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT,
-        NtCreateFile,
+        FILE_DIRECTORY_FILE, FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT, NtCreateFile,
     };
     use windows_sys::Win32::Foundation::{
         HANDLE, INVALID_HANDLE_VALUE, OBJ_CASE_INSENSITIVE, UNICODE_STRING,
     };
     use windows_sys::Win32::Security::SECURITY_DESCRIPTOR;
     use windows_sys::Win32::Storage::FileSystem::{
-        DELETE, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_READ,
+        FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_READ,
         FILE_SHARE_WRITE, READ_CONTROL, SYNCHRONIZE,
     };
     use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
@@ -4160,18 +4247,23 @@ pub(crate) fn create_relative_private_directory(
     let mut status = IO_STATUS_BLOCK::default();
     let mut handle: HANDLE = ptr::null_mut();
     // SAFETY: every structure and backing buffer remains live for the call,
-    // RootDirectory is a held private directory, and FILE_CREATE makes the single
-    // component exclusive with a protected current-user DACL at creation time.
+    // RootDirectory is a held private directory, and disposition is either FILE_OPEN
+    // or FILE_CREATE. Creation is exclusive and applies the protected current-user
+    // DACL; opening preserves the existing descriptor for subsequent verification.
+    // Do not request DELETE here: later identity checks open a second directory
+    // handle without FILE_SHARE_DELETE, and Windows requires that handle to share
+    // every access requested by this one. Omitting FILE_SHARE_DELETE still pins the
+    // directory against rename and deletion while the capability remains live.
     let result = unsafe {
         NtCreateFile(
             &mut handle,
-            FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE | READ_CONTROL | SYNCHRONIZE,
+            FILE_GENERIC_READ | FILE_GENERIC_WRITE | READ_CONTROL | SYNCHRONIZE,
             &attributes,
             &mut status,
             ptr::null(),
             FILE_ATTRIBUTE_NORMAL,
             FILE_SHARE_READ | FILE_SHARE_WRITE,
-            FILE_CREATE,
+            disposition,
             FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT,
             ptr::null(),
             0,

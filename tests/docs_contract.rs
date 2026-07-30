@@ -366,7 +366,7 @@ fn documents_the_inert_external_agent_safety_foundation() {
             "capability-relative",
             "secret-filtered",
             "no subscription coding task is cli-reachable",
-            "proposal inspection, independent verification, and stale-safe promotion remain unavailable",
+            "independent verification, stale-safe promotion, and run-engine orchestration remain unavailable",
         ],
     );
     assert_document_contains(
@@ -388,7 +388,9 @@ fn documents_the_inert_external_agent_safety_foundation() {
             "single exact request digest",
             "atomically consumed at most once",
             "high-confidence secret finding rejects the entire stage",
-            "proposal inspection, verification, and promotion are not implemented",
+            "every later read reopens the named object",
+            "structural changes, protected paths, redirects, hard links",
+            "independent verification and promotion are not implemented",
         ],
     );
     assert_document_contains(
@@ -398,6 +400,7 @@ fn documents_the_inert_external_agent_safety_foundation() {
             "expiring single-use approvals",
             "non-retaining secret detection",
             "capability-built sanitized staging",
+            "content-addressed baseline and proposal artifacts",
             "no subscription coding task is cli-reachable",
         ],
     );

@@ -31,11 +31,16 @@ All notable changes to Carl will be recorded here. The project is pre-alpha and 
   request digest, and lifetime.
 - Non-retaining secret detection that reports only stable rule classifications.
 - Capability-built sanitized staging with deterministic content-addressed manifests,
-  strict file/byte bounds, protected-path exclusions, and automatic cleanup.
+  strict file/byte/path-metadata bounds, physical root-disjointness checks,
+  protected-path exclusions, and automatic cleanup.
+- Owner-private, read-only, content-addressed baseline and proposal artifacts with
+  verified reopen/rehash, sealed source-identity evidence, startup reachability
+  cleanup, aggregate storage limits, plus a process-free one-file exact-replacement
+  inspector.
 
 ### Not yet available
 
 - Native model execution remains unavailable.
 - Subscription-backed coding is not exposed through the CLI: no subscription coding
-  task is CLI-reachable until exact replacement proposal inspection, independent
-  verification, stale-safe promotion, and run-engine orchestration are implemented.
+  task is CLI-reachable until independent verification, stale-safe promotion, and
+  run-engine orchestration are implemented.
