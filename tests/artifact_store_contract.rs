@@ -396,8 +396,8 @@ fn make_file_owner_private(path: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(windows)]
-fn make_file_owner_private(_path: &Path) -> std::io::Result<()> {
-    Ok(())
+fn make_file_owner_private(path: &Path) -> std::io::Result<()> {
+    make_owner_only_acl(path, false)
 }
 
 #[cfg(windows)]
@@ -497,6 +497,11 @@ fn make_owner_only(path: &Path) -> std::io::Result<()> {
 
 #[cfg(windows)]
 fn make_owner_only(path: &Path) -> std::io::Result<()> {
+    make_owner_only_acl(path, true)
+}
+
+#[cfg(windows)]
+fn make_owner_only_acl(path: &Path, inheritable: bool) -> std::io::Result<()> {
     let identity = std::process::Command::new("whoami")
         .args(["/user", "/fo", "csv", "/nh"])
         .output()?;
@@ -529,7 +534,11 @@ fn make_owner_only(path: &Path) -> std::io::Result<()> {
             "the Windows fixture could not set the current user as owner",
         ));
     }
-    let grant = format!("{numeric_identity}:(OI)(CI)F");
+    let grant = if inheritable {
+        format!("{numeric_identity}:(OI)(CI)F")
+    } else {
+        format!("{numeric_identity}:F")
+    };
     let status = std::process::Command::new("icacls")
         .arg(path)
         .args(["/inheritance:r", "/grant:r"])
