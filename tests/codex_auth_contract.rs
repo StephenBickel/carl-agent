@@ -8,7 +8,7 @@ use std::fs;
 use std::future::Future;
 use std::path::Path;
 use std::process;
-use std::sync::OnceLock;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use carl::auth::codex::{CodexAuth, CodexAuthTimeouts};
@@ -29,7 +29,7 @@ use support::{
     write_fixture_marker,
 };
 
-static CODEX_FIXTURE_SETUP_GATE: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+static CODEX_FIXTURE_TRIAL_GATE: Mutex<()> = Mutex::new(());
 
 fn main() {
     let arguments: Vec<OsString> = env::args_os().skip(1).collect();
@@ -138,6 +138,15 @@ fn main() {
 
 fn test(name: &'static str, body: fn() -> TestResult) -> Trial {
     Trial::test(name, move || {
+        // Each contract trial owns one or more real fixture processes with
+        // production-strength request deadlines. Windows CI can otherwise schedule
+        // all twenty process-heavy trials concurrently and consume those deadlines
+        // before a child receives its request. Serialize complete trials, and recover
+        // the gate after a failing assertion so one test cannot cascade into sibling
+        // timeouts.
+        let _trial = CODEX_FIXTURE_TRIAL_GATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         body().map_err(|error| Failed::from(error.to_string()))
     })
 }
@@ -173,13 +182,6 @@ impl Fixture {
             &layout.home,
         )?;
         home.write_static_file("fixture-scenario", scenario.as_bytes())?;
-        // Contract trials intentionally use a production-strong 300 ms request
-        // deadline. Serialize only their process-heavy fixture setup so scheduler
-        // contention cannot consume that deadline before the child is responsive.
-        let _setup = CODEX_FIXTURE_SETUP_GATE
-            .get_or_init(|| tokio::sync::Mutex::new(()))
-            .lock()
-            .await;
         let broker = CodexAuth::connect(&trusted, home, short_limits(), timeouts).await?;
         Ok(Self { broker, layout })
     }
