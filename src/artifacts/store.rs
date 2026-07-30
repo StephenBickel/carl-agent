@@ -841,9 +841,9 @@ fn sync_containing_directory(directory: &Dir) -> std::io::Result<()> {
     if result >= 0 {
         Ok(())
     } else {
-        Err(std::io::Error::other(
-            "directory metadata could not be flushed",
-        ))
+        Err(std::io::Error::other(format!(
+            "directory metadata could not be flushed: NTSTATUS {result:#010x}"
+        )))
     }
 }
 
@@ -1272,10 +1272,18 @@ mod tests {
 
         let objects = create_private_directory(&root_directory, OBJECT_DIRECTORY)
             .unwrap_or_else(|error| panic!("objects directory creation failed: {error:?}"));
+        assert!(
+            root_lock.guards_data_root(&canonical),
+            "data-root identity changed after objects directory creation"
+        );
         sync_containing_directory(&root_directory)
             .unwrap_or_else(|error| panic!("artifact-root directory flush failed: {error:?}"));
         let hashes = create_private_directory(&objects, super::HASH_DIRECTORY)
             .unwrap_or_else(|error| panic!("hash directory creation failed: {error:?}"));
+        assert!(
+            root_lock.guards_data_root(&canonical),
+            "data-root identity changed after hash directory creation"
+        );
         sync_containing_directory(&objects)
             .unwrap_or_else(|error| panic!("objects directory flush failed: {error:?}"));
 

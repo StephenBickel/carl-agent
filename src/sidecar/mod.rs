@@ -1289,12 +1289,20 @@ fn directory_identity(directory: &File) -> Result<DirectoryIdentity, SidecarErro
 }
 
 #[cfg(windows)]
-type DirectoryIdentity = WindowsFileIdentity;
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct DirectoryIdentity {
+    volume_serial: u32,
+    file_index: u64,
+}
 
 #[cfg(windows)]
 fn directory_identity(directory: &File) -> Result<DirectoryIdentity, SidecarError> {
-    windows_file_identity(directory)
-        .map_err(|()| SidecarError::from_code(SidecarErrorCode::InvalidProviderHome))
+    let identity = windows_file_identity(directory)
+        .map_err(|()| SidecarError::from_code(SidecarErrorCode::InvalidProviderHome))?;
+    Ok(DirectoryIdentity {
+        volume_serial: identity.volume_serial,
+        file_index: identity.file_index,
+    })
 }
 
 pub(crate) fn directory_path_matches_held(path: &Path, held: &cap_std::fs::Dir) -> bool {
@@ -4130,11 +4138,10 @@ pub(crate) fn reopen_private_directory_for_flush(
 ) -> std::io::Result<File> {
     use std::os::windows::io::{AsRawHandle, FromRawHandle};
 
-    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Foundation::{GENERIC_WRITE, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::Storage::FileSystem::{
-        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_WRITE,
-        FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, ReOpenFile,
-        SYNCHRONIZE,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, ReOpenFile,
     };
 
     let original = directory.try_clone()?.into_std_file();
@@ -4143,7 +4150,7 @@ pub(crate) fn reopen_private_directory_for_flush(
     let handle = unsafe {
         ReOpenFile(
             original.as_raw_handle(),
-            FILE_GENERIC_WRITE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            GENERIC_WRITE | FILE_READ_ATTRIBUTES,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
         )
