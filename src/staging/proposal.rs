@@ -988,6 +988,7 @@ mod tests {
     use super::*;
     use crate::staging::{SanitizedStageBuilder, StageLimits};
 
+    #[cfg(unix)]
     #[test]
     fn a_named_file_swap_between_metadata_and_open_fails_closed() {
         let layout = TestLayout::new();

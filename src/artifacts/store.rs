@@ -1166,17 +1166,26 @@ fn private_error() -> std::io::Error {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+    #[cfg(windows)]
+    use std::path::Path;
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     use uuid::Uuid;
 
     use super::{ArtifactErrorCode, ArtifactUsage, MAX_ARTIFACT_OBJECTS, MAX_ARTIFACT_STORE_BYTES};
     #[cfg(unix)]
     use super::{ArtifactStore, INJECT_DIRECTORY_SYNC_FAILURE};
+    #[cfg(windows)]
+    use super::{
+        OBJECT_DIRECTORY, create_private_directory, held_private_directory_is_verified,
+        private_root_is_verified, sync_containing_directory,
+    };
+    #[cfg(windows)]
+    use crate::sidecar::DataRootLock;
 
     #[test]
     fn aggregate_quota_admission_is_bounded_and_overflow_safe() {
@@ -1230,6 +1239,53 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn fresh_private_root_supports_each_artifact_bootstrap_boundary() {
+        let root = std::env::temp_dir().join(format!(
+            "carl-artifact-windows-bootstrap-{}",
+            Uuid::new_v4()
+        ));
+        fs::create_dir(&root).expect("create private artifact root");
+        make_owner_only(&root).expect("secure private artifact root");
+
+        let metadata = fs::symlink_metadata(&root).expect("inspect private artifact root");
+        assert!(
+            private_root_is_verified(&root, &metadata),
+            "path-based private-root verification failed"
+        );
+        let canonical = fs::canonicalize(&root).expect("canonicalize private artifact root");
+        let root_lock = DataRootLock::acquire(&canonical)
+            .unwrap_or_else(|error| panic!("data-root lock failed: {:?}", error.code()));
+        assert!(
+            root_lock.guards_data_root(&canonical),
+            "data-root lock did not retain the root identity"
+        );
+        let root_directory = root_lock
+            .try_clone_root_directory()
+            .map(cap_std::fs::Dir::from_std_file)
+            .expect("clone held artifact root");
+        assert!(
+            held_private_directory_is_verified(&root_directory),
+            "handle-based private-root verification failed"
+        );
+
+        let objects = create_private_directory(&root_directory, OBJECT_DIRECTORY)
+            .unwrap_or_else(|error| panic!("objects directory creation failed: {error:?}"));
+        sync_containing_directory(&root_directory)
+            .unwrap_or_else(|error| panic!("artifact-root directory flush failed: {error:?}"));
+        let hashes = create_private_directory(&objects, super::HASH_DIRECTORY)
+            .unwrap_or_else(|error| panic!("hash directory creation failed: {error:?}"));
+        sync_containing_directory(&objects)
+            .unwrap_or_else(|error| panic!("objects directory flush failed: {error:?}"));
+
+        drop(hashes);
+        drop(objects);
+        drop(root_directory);
+        drop(root_lock);
+        fs::remove_dir_all(root).expect("remove private artifact root");
+    }
+
     #[cfg(unix)]
     #[test]
     fn publication_propagates_a_directory_sync_failure() {
@@ -1266,5 +1322,56 @@ mod tests {
 
         drop(store);
         fs::remove_dir_all(root).expect("remove artifact fixture");
+    }
+
+    #[cfg(windows)]
+    fn make_owner_only(path: &Path) -> std::io::Result<()> {
+        let identity = std::process::Command::new("whoami")
+            .args(["/user", "/fo", "csv", "/nh"])
+            .output()?;
+        if !identity.status.success() {
+            return Err(std::io::Error::other(
+                "the Windows fixture could not resolve the current identity",
+            ));
+        }
+        let sid_start = identity
+            .stdout
+            .windows(4)
+            .position(|window| window == b"S-1-")
+            .ok_or_else(|| std::io::Error::other("whoami returned no current-user SID"))?;
+        let sid_end = identity.stdout[sid_start..]
+            .iter()
+            .position(|byte| !byte.is_ascii_digit() && *byte != b'-' && *byte != b'S')
+            .map_or(identity.stdout.len(), |offset| sid_start + offset);
+        let sid = std::str::from_utf8(&identity.stdout[sid_start..sid_end])
+            .map_err(|_| std::io::Error::other("whoami returned an invalid SID"))?;
+        let numeric_identity = format!("*{sid}");
+        let owner_status = std::process::Command::new("icacls")
+            .arg(path)
+            .arg("/setowner")
+            .arg(&numeric_identity)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()?;
+        if !owner_status.success() {
+            return Err(std::io::Error::other(
+                "the Windows fixture could not set the current user as owner",
+            ));
+        }
+        let grant = format!("{numeric_identity}:(OI)(CI)F");
+        let status = std::process::Command::new("icacls")
+            .arg(path)
+            .args(["/inheritance:r", "/grant:r"])
+            .arg(grant)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(std::io::Error::other(
+                "the Windows fixture could not install a private DACL",
+            ))
+        }
     }
 }

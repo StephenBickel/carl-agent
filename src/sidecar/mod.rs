@@ -4054,7 +4054,7 @@ pub(crate) fn create_relative_private_file(
     name: &std::ffi::OsStr,
 ) -> Result<File, ()> {
     use std::os::windows::ffi::OsStrExt;
-    use std::os::windows::io::{AsRawHandle, FromRawHandle};
+    use std::os::windows::io::FromRawHandle;
     use std::ptr;
 
     use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
@@ -4176,7 +4176,7 @@ pub(crate) fn create_relative_private_directory(
     name: &std::ffi::OsStr,
 ) -> Result<File, ()> {
     use std::os::windows::ffi::OsStrExt;
-    use std::os::windows::io::{AsRawHandle, FromRawHandle};
+    use std::os::windows::io::FromRawHandle;
     use std::ptr;
 
     use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
