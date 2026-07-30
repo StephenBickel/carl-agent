@@ -116,7 +116,7 @@ impl ArtifactStore {
             return Err(error(ArtifactErrorCode::InvalidRoot));
         }
         let root = root_lock
-            .try_clone_root_directory()
+            .try_open_root_directory_for_writes()
             .map(Dir::from_std_file)
             .map_err(|_| error(ArtifactErrorCode::InvalidRoot))?;
         if !held_private_directory_is_verified(&root) {
@@ -150,7 +150,7 @@ impl ArtifactStore {
             Ok(_) => {}
             Err(io_error) if io_error.kind() == std::io::ErrorKind::NotFound => {
                 let parent = data_root_lock
-                    .try_clone_root_directory()
+                    .try_open_root_directory_for_writes()
                     .map(Dir::from_std_file)
                     .map_err(|_| error(ArtifactErrorCode::InvalidRoot))?;
                 create_private_directory(&parent, "artifacts")
@@ -674,11 +674,10 @@ fn open_directory_nofollow(parent: &Dir, name: &str) -> std::io::Result<Dir> {
 
 #[cfg(windows)]
 fn open_directory_nofollow(parent: &Dir, name: &str) -> std::io::Result<Dir> {
-    let parent = parent.try_clone()?.into_std_file();
-    let directory = Dir::from_std_file(cap_primitives::fs::open_dir_nofollow(
-        &parent,
-        Path::new(name),
-    )?);
+    let directory =
+        crate::sidecar::open_relative_private_directory(parent, std::ffi::OsStr::new(name))
+            .map(Dir::from_std_file)
+            .map_err(|()| private_error())?;
     let metadata = directory.dir_metadata()?;
     if metadata.is_dir()
         && metadata.file_attributes()
@@ -824,7 +823,10 @@ fn sync_containing_directory(directory: &Dir) -> std::io::Result<()> {
             "injected artifact directory sync failure",
         ));
     }
-    let directory = crate::sidecar::reopen_private_directory_for_flush(directory)?;
+    if !held_private_directory_is_verified(directory) {
+        return Err(private_error());
+    }
+    let directory = directory.try_clone()?.into_std_file();
     let mut status = IO_STATUS_BLOCK::default();
     // SAFETY: directory owns a live filesystem handle, the normal flush mode
     // accepts directory handles, parameters are absent as required, and status
@@ -1262,9 +1264,9 @@ mod tests {
             "data-root lock did not retain the root identity"
         );
         let root_directory = root_lock
-            .try_clone_root_directory()
+            .try_open_root_directory_for_writes()
             .map(cap_std::fs::Dir::from_std_file)
-            .expect("clone held artifact root");
+            .expect("open write-capable held artifact root");
         assert!(
             held_private_directory_is_verified(&root_directory),
             "handle-based private-root verification failed"

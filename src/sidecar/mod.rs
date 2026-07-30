@@ -1005,6 +1005,44 @@ impl DataRootLock {
     pub(crate) fn try_clone_root_directory(&self) -> std::io::Result<File> {
         self._root_directory.try_clone()
     }
+
+    #[cfg(unix)]
+    pub(crate) fn try_open_root_directory_for_writes(&self) -> std::io::Result<File> {
+        self.try_clone_root_directory()
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn try_open_root_directory_for_writes(&self) -> std::io::Result<File> {
+        use std::fs::OpenOptions;
+        use std::os::windows::fs::OpenOptionsExt;
+
+        use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+            FILE_SHARE_WRITE,
+        };
+
+        let invalid = || {
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "private writable root verification failed",
+            )
+        };
+        let directory = OpenOptions::new()
+            .access_mode(GENERIC_READ | GENERIC_WRITE)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&self.data_root)?;
+        let metadata = directory.metadata()?;
+        if !metadata.is_dir()
+            || is_link_or_reparse(&metadata)
+            || windows_security::verify_private_directory_handle(&directory).is_err()
+            || directory_identity(&directory).map_err(|_| invalid())? != self.root_identity
+        {
+            return Err(invalid());
+        }
+        Ok(directory)
+    }
 }
 
 impl Drop for DataRootLock {
@@ -4133,54 +4171,34 @@ pub(crate) fn create_relative_private_file(
 }
 
 #[cfg(windows)]
-pub(crate) fn reopen_private_directory_for_flush(
-    directory: &cap_std::fs::Dir,
-) -> std::io::Result<File> {
-    use std::os::windows::io::{AsRawHandle, FromRawHandle};
-
-    use windows_sys::Win32::Foundation::{GENERIC_WRITE, INVALID_HANDLE_VALUE};
-    use windows_sys::Win32::Storage::FileSystem::{
-        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
-        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, ReOpenFile,
-    };
-
-    let original = directory.try_clone()?.into_std_file();
-    // SAFETY: original owns a live directory handle. ReOpenFile returns either
-    // INVALID_HANDLE_VALUE or one newly owned handle to the same filesystem object.
-    let handle = unsafe {
-        ReOpenFile(
-            original.as_raw_handle(),
-            GENERIC_WRITE | FILE_READ_ATTRIBUTES,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
-        )
-    };
-    if handle == INVALID_HANDLE_VALUE {
-        return Err(std::io::Error::last_os_error());
-    }
-    // SAFETY: ReOpenFile succeeded and transferred one owned handle.
-    let reopened = unsafe { File::from_raw_handle(handle) };
-    let metadata = reopened.metadata()?;
-    if !metadata.is_dir()
-        || is_link_or_reparse(&metadata)
-        || windows_file_identity(&original)
-            .map_err(|()| std::io::Error::other("identity failed"))?
-            != windows_file_identity(&reopened)
-                .map_err(|()| std::io::Error::other("identity failed"))?
-        || windows_security::verify_private_directory_handle(&reopened).is_err()
-    {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "private directory flush handle verification failed",
-        ));
-    }
-    Ok(reopened)
-}
-
-#[cfg(windows)]
 pub(crate) fn create_relative_private_directory(
     directory: &impl std::os::windows::io::AsRawHandle,
     name: &std::ffi::OsStr,
+) -> Result<File, ()> {
+    open_relative_private_directory_with_disposition(
+        directory,
+        name,
+        windows_sys::Wdk::Storage::FileSystem::FILE_CREATE,
+    )
+}
+
+#[cfg(windows)]
+pub(crate) fn open_relative_private_directory(
+    directory: &impl std::os::windows::io::AsRawHandle,
+    name: &std::ffi::OsStr,
+) -> Result<File, ()> {
+    open_relative_private_directory_with_disposition(
+        directory,
+        name,
+        windows_sys::Wdk::Storage::FileSystem::FILE_OPEN,
+    )
+}
+
+#[cfg(windows)]
+fn open_relative_private_directory_with_disposition(
+    directory: &impl std::os::windows::io::AsRawHandle,
+    name: &std::ffi::OsStr,
+    disposition: windows_sys::Wdk::Storage::FileSystem::NTCREATEFILE_CREATE_DISPOSITION,
 ) -> Result<File, ()> {
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::io::FromRawHandle;
@@ -4188,8 +4206,7 @@ pub(crate) fn create_relative_private_directory(
 
     use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
     use windows_sys::Wdk::Storage::FileSystem::{
-        FILE_CREATE, FILE_DIRECTORY_FILE, FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT,
-        NtCreateFile,
+        FILE_DIRECTORY_FILE, FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT, NtCreateFile,
     };
     use windows_sys::Win32::Foundation::{
         HANDLE, INVALID_HANDLE_VALUE, OBJ_CASE_INSENSITIVE, UNICODE_STRING,
@@ -4230,8 +4247,9 @@ pub(crate) fn create_relative_private_directory(
     let mut status = IO_STATUS_BLOCK::default();
     let mut handle: HANDLE = ptr::null_mut();
     // SAFETY: every structure and backing buffer remains live for the call,
-    // RootDirectory is a held private directory, and FILE_CREATE makes the single
-    // component exclusive with a protected current-user DACL at creation time.
+    // RootDirectory is a held private directory, and disposition is either FILE_OPEN
+    // or FILE_CREATE. Creation is exclusive and applies the protected current-user
+    // DACL; opening preserves the existing descriptor for subsequent verification.
     let result = unsafe {
         NtCreateFile(
             &mut handle,
@@ -4241,7 +4259,7 @@ pub(crate) fn create_relative_private_directory(
             ptr::null(),
             FILE_ATTRIBUTE_NORMAL,
             FILE_SHARE_READ | FILE_SHARE_WRITE,
-            FILE_CREATE,
+            disposition,
             FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT,
             ptr::null(),
             0,
