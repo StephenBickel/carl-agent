@@ -26,10 +26,14 @@ Carl does not attempt to defend a host account from an attacker who already cont
   single exact request digest, and an allowed approval is atomically consumed at most
   once;
 - secret findings retain only a stable classification, never matched bytes;
-- delegate stages are bounded, owner-only, capability-relative disposable copies.
-  They accept only permitted single-link UTF-8 regular files, exclude known sensitive
-  and executable configuration surfaces, and a high-confidence secret finding
-  rejects the entire stage.
+- delegate stages are bounded, capability-relative disposable copies whose private
+  containment is verified before they are returned. On Unix, the held stage parent
+  and every generated entry must be owned by the effective user with no group or
+  world access. On Windows, the held parent and generated entries must satisfy Carl's
+  current-user-private DACL policy and must not be reparse points. Other target
+  families fail closed. Stages accept only permitted single-link UTF-8 regular files,
+  exclude known sensitive and executable configuration surfaces, and a
+  high-confidence secret finding rejects the entire stage.
 
 These properties improve auditability and failure behavior. They do not implement
 model-provider access, a general runtime tool-policy system, redaction of all future

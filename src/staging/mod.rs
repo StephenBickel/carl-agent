@@ -17,6 +17,11 @@ use crate::sidecar::{ExecutionWorkspace, SidecarError};
 pub use builder::SanitizedStageBuilder;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StageContainment {
+    CurrentUserPrivateVerified,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StageErrorCode {
     InvalidRoot,
     InvalidLimits,
@@ -262,6 +267,7 @@ pub struct SanitizedStage {
     path: PathBuf,
     parent: Dir,
     directory_name: String,
+    containment: StageContainment,
     manifest: StageManifest,
     exclusions: Vec<StageExclusion>,
 }
@@ -271,6 +277,7 @@ impl SanitizedStage {
         path: PathBuf,
         parent: Dir,
         directory_name: String,
+        containment: StageContainment,
         manifest: StageManifest,
         exclusions: Vec<StageExclusion>,
     ) -> Self {
@@ -278,6 +285,7 @@ impl SanitizedStage {
             path,
             parent,
             directory_name,
+            containment,
             manifest,
             exclusions,
         }
@@ -286,6 +294,11 @@ impl SanitizedStage {
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    #[must_use]
+    pub const fn containment(&self) -> StageContainment {
+        self.containment
     }
 
     #[must_use]
@@ -308,6 +321,7 @@ impl fmt::Debug for SanitizedStage {
         formatter
             .debug_struct("SanitizedStage")
             .field("path", &"<opaque>")
+            .field("containment", &self.containment)
             .field("manifest", &self.manifest)
             .field("exclusions", &self.exclusions)
             .finish()
