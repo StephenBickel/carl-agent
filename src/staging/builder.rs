@@ -19,8 +19,8 @@ use crate::policy::Sha256Digest;
 use crate::security::{SecretFilter, SecretRule};
 
 use super::{
-    SanitizedStage, StageError, StageErrorCode, StageExclusion, StageExclusionReason, StageLimits,
-    StageManifest, StageManifestEntry,
+    SanitizedStage, StageContainment, StageError, StageErrorCode, StageExclusion,
+    StageExclusionReason, StageLimits, StageManifest, StageManifestEntry,
 };
 
 const MAX_DEPTH: usize = 64;
@@ -50,12 +50,12 @@ impl SanitizedStageBuilder {
             .map_err(|_| StageError::new(StageErrorCode::InvalidRoot))?;
         if !source_metadata.is_dir()
             || !parent_metadata.is_dir()
-            || source_metadata.file_type().is_symlink()
-            || parent_metadata.file_type().is_symlink()
+            || root_is_link_or_reparse(&source_metadata)
+            || root_is_link_or_reparse(&parent_metadata)
         {
             return Err(StageError::new(StageErrorCode::InvalidRoot));
         }
-        if !owner_only(&parent_metadata) {
+        if !private_parent_is_verified(stage_parent, &parent_metadata) {
             return Err(StageError::new(StageErrorCode::InvalidRoot));
         }
 
@@ -70,14 +70,16 @@ impl SanitizedStageBuilder {
             return Err(StageError::new(StageErrorCode::InvalidRoot));
         }
 
-        let stage_parent_display_path = stage_parent.to_path_buf();
         let source = Dir::open_ambient_dir(&source_path, ambient_authority())
             .map_err(|_| StageError::new(StageErrorCode::InvalidRoot))?;
         let stage_parent = Dir::open_ambient_dir(&stage_parent_path, ambient_authority())
             .map_err(|_| StageError::new(StageErrorCode::InvalidRoot))?;
+        if !held_private_directory_is_verified(&stage_parent) {
+            return Err(StageError::new(StageErrorCode::InvalidRoot));
+        }
 
         Ok(Self {
-            stage_parent_display_path,
+            stage_parent_display_path: stage_parent_path,
             source,
             stage_parent,
             limits,
@@ -87,14 +89,8 @@ impl SanitizedStageBuilder {
 
     pub fn prepare(self) -> Result<SanitizedStage, StageError> {
         let directory_name = format!("stage-{}", Uuid::new_v4());
-        self.stage_parent
-            .create_dir(&directory_name)
-            .map_err(|_| StageError::new(StageErrorCode::Io))?;
-        if set_directory_owner_only(&self.stage_parent, &directory_name).is_err() {
-            let _ = self.stage_parent.remove_dir_all(&directory_name);
-            return Err(StageError::new(StageErrorCode::Io));
-        }
-        let destination = match self.stage_parent.open_dir(&directory_name) {
+        let stage_path = self.stage_parent_display_path.join(&directory_name);
+        let destination = match create_private_directory(&self.stage_parent, &directory_name) {
             Ok(destination) => destination,
             Err(_) => {
                 let _ = self.stage_parent.remove_dir_all(&directory_name);
@@ -123,12 +119,11 @@ impl SanitizedStageBuilder {
                 return Err(error);
             }
         };
-        let path = self.stage_parent_display_path.join(&directory_name);
-
         Ok(SanitizedStage::new(
-            path,
+            stage_path,
             self.stage_parent,
             directory_name,
+            StageContainment::CurrentUserPrivateVerified,
             manifest,
             state.exclusions,
         ))
@@ -205,7 +200,7 @@ fn walk_directory(
         let relative = join_relative(relative_parent, name);
         let file_type = entry.file_type().map_err(|_| io_error(&relative))?;
 
-        if file_type.is_symlink() {
+        if entry_is_link_or_reparse(&entry, &file_type).map_err(|_| io_error(&relative))? {
             state.exclude(relative, StageExclusionReason::Symlink);
             continue;
         }
@@ -214,14 +209,10 @@ fn walk_directory(
                 state.exclude(relative, StageExclusionReason::ProtectedPath);
                 continue;
             }
-            destination
-                .create_dir(name)
-                .map_err(|_| io_error(&relative))?;
-            set_directory_owner_only(destination, name).map_err(|_| io_error(&relative))?;
-            let source_child = entry.open_dir().map_err(|_| io_error(&relative))?;
-            let destination_child = destination
-                .open_dir(name)
-                .map_err(|_| io_error(&relative))?;
+            let source_child =
+                open_directory_nofollow(source, name).map_err(|_| io_error(&relative))?;
+            let destination_child =
+                create_private_directory(destination, name).map_err(|_| io_error(&relative))?;
             walk_directory(
                 &source_child,
                 &destination_child,
@@ -326,16 +317,12 @@ fn copy_regular_file(
         return Err(StageError::secret(relative, finding.rule()));
     }
 
-    let mut write_options = OpenOptions::new();
-    write_options.write(true).create_new(true);
-    set_new_file_mode(&mut write_options);
-    let mut destination_file = destination
-        .open_with(name, &write_options)
-        .map_err(|_| io_error(&relative))?;
+    let mut destination_file =
+        create_private_file(destination, name).map_err(|_| io_error(&relative))?;
     destination_file
         .write_all(&contents)
         .map_err(|_| io_error(&relative))?;
-    set_file_owner_only(&destination_file).map_err(|_| io_error(&relative))?;
+    secure_created_file(&destination_file).map_err(|_| io_error(&relative))?;
 
     state.total_bytes = prospective_total;
     let content_digest = Sha256Digest::from_bytes(Sha256::digest(&contents).into());
@@ -446,43 +433,203 @@ fn io_error(path: &str) -> StageError {
     }
 }
 
-#[cfg(unix)]
-fn owner_only(metadata: &std::fs::Metadata) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    metadata.permissions().mode() & 0o077 == 0
+#[cfg(windows)]
+fn root_is_link_or_reparse(metadata: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt as _;
+
+    metadata.file_type().is_symlink()
+        || metadata.file_attributes()
+            & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+            != 0
 }
 
-#[cfg(not(unix))]
-fn owner_only(_metadata: &std::fs::Metadata) -> bool {
-    true
-}
-
-#[cfg(unix)]
-fn set_directory_owner_only(directory: &Dir, name: &str) -> std::io::Result<()> {
-    directory.set_permissions(name, Permissions::from_mode(0o700))
-}
-
-#[cfg(not(unix))]
-fn set_directory_owner_only(_directory: &Dir, _name: &str) -> std::io::Result<()> {
-    Ok(())
+#[cfg(not(windows))]
+fn root_is_link_or_reparse(metadata: &std::fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
 }
 
 #[cfg(unix)]
-fn set_new_file_mode(options: &mut OpenOptions) {
+fn private_parent_is_verified(_path: &Path, metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    metadata.is_dir()
+        && metadata.uid() == unsafe { libc::geteuid() }
+        && metadata.permissions().mode() & 0o077 == 0
+}
+
+#[cfg(windows)]
+fn private_parent_is_verified(path: &Path, metadata: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt as _;
+
+    metadata.is_dir()
+        && metadata.file_attributes()
+            & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+            == 0
+        && crate::sidecar::windows_security::verify_private_directory(path).is_ok()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn private_parent_is_verified(_path: &Path, _metadata: &std::fs::Metadata) -> bool {
+    false
+}
+
+#[cfg(unix)]
+fn held_private_directory_is_verified(directory: &Dir) -> bool {
+    directory.dir_metadata().is_ok_and(|metadata| {
+        metadata.is_dir()
+            && metadata.uid() == unsafe { libc::geteuid() }
+            && metadata.permissions().mode() & 0o077 == 0
+    })
+}
+
+#[cfg(windows)]
+fn held_private_directory_is_verified(directory: &Dir) -> bool {
+    directory.dir_metadata().is_ok_and(|metadata| {
+        metadata.is_dir()
+            && metadata.file_attributes()
+                & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+                == 0
+    }) && crate::sidecar::windows_security::verify_private_directory_handle(directory).is_ok()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn held_private_directory_is_verified(_directory: &Dir) -> bool {
+    false
+}
+
+#[cfg(unix)]
+fn create_private_directory(directory: &Dir, name: &str) -> std::io::Result<Dir> {
+    directory.create_dir(name)?;
+    directory.set_permissions(name, Permissions::from_mode(0o700))?;
+    let child = open_directory_nofollow(directory, name)?;
+    let metadata = child.dir_metadata()?;
+    if metadata.is_dir()
+        && metadata.uid() == unsafe { libc::geteuid() }
+        && metadata.permissions().mode() & 0o077 == 0
+    {
+        Ok(child)
+    } else {
+        Err(private_containment_error())
+    }
+}
+
+#[cfg(windows)]
+fn create_private_directory(directory: &Dir, name: &str) -> std::io::Result<Dir> {
+    let child =
+        crate::sidecar::create_relative_private_directory(directory, std::ffi::OsStr::new(name))
+            .map(Dir::from_std_file)
+            .map_err(|()| private_containment_error())?;
+    let metadata = child.dir_metadata()?;
+    if metadata.is_dir()
+        && metadata.file_attributes()
+            & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+            == 0
+        && crate::sidecar::windows_security::verify_private_directory_handle(&child).is_ok()
+    {
+        Ok(child)
+    } else {
+        Err(private_containment_error())
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn create_private_directory(_directory: &Dir, _name: &str) -> std::io::Result<Dir> {
+    Err(private_containment_error())
+}
+
+#[cfg(unix)]
+fn open_directory_nofollow(directory: &Dir, name: &str) -> std::io::Result<Dir> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    options.custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW);
+    let child = Dir::from_std_file(directory.open_with(name, &options)?.into_std());
+    if child.dir_metadata()?.is_dir() {
+        Ok(child)
+    } else {
+        Err(private_containment_error())
+    }
+}
+
+#[cfg(windows)]
+fn open_directory_nofollow(directory: &Dir, name: &str) -> std::io::Result<Dir> {
+    let parent = directory.try_clone()?.into_std_file();
+    let child = cap_primitives::fs::open_dir_nofollow(&parent, Path::new(name))?;
+    let child = Dir::from_std_file(child);
+    let metadata = child.dir_metadata()?;
+    if metadata.is_dir()
+        && metadata.file_attributes()
+            & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+            == 0
+    {
+        Ok(child)
+    } else {
+        Err(private_containment_error())
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_directory_nofollow(_directory: &Dir, _name: &str) -> std::io::Result<Dir> {
+    Err(private_containment_error())
+}
+
+#[cfg(unix)]
+fn create_private_file(directory: &Dir, name: &str) -> std::io::Result<cap_std::fs::File> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
     options.mode(0o600);
+    directory.open_with(name, &options)
 }
 
-#[cfg(not(unix))]
-fn set_new_file_mode(_options: &mut OpenOptions) {}
+#[cfg(windows)]
+fn create_private_file(directory: &Dir, name: &str) -> std::io::Result<cap_std::fs::File> {
+    crate::sidecar::create_relative_private_file(directory, std::ffi::OsStr::new(name))
+        .map(cap_std::fs::File::from_std)
+        .map_err(|()| private_containment_error())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn create_private_file(_directory: &Dir, _name: &str) -> std::io::Result<cap_std::fs::File> {
+    Err(private_containment_error())
+}
 
 #[cfg(unix)]
-fn set_file_owner_only(file: &cap_std::fs::File) -> std::io::Result<()> {
-    file.set_permissions(Permissions::from_mode(0o600))
+fn secure_created_file(file: &cap_std::fs::File) -> std::io::Result<()> {
+    file.set_permissions(Permissions::from_mode(0o600))?;
+    let metadata = file.metadata()?;
+    if metadata.is_file()
+        && metadata.uid() == unsafe { libc::geteuid() }
+        && metadata.permissions().mode() & 0o077 == 0
+        && metadata.nlink() == 1
+    {
+        Ok(())
+    } else {
+        Err(private_containment_error())
+    }
 }
 
-#[cfg(not(unix))]
-fn set_file_owner_only(_file: &cap_std::fs::File) -> std::io::Result<()> {
-    Ok(())
+#[cfg(windows)]
+fn secure_created_file(file: &cap_std::fs::File) -> std::io::Result<()> {
+    let metadata = file.metadata()?;
+    if opened_metadata_is_regular(&metadata)
+        && link_count(&metadata) == Some(1)
+        && crate::sidecar::windows_security::verify_private_file_handle(file).is_ok()
+    {
+        Ok(())
+    } else {
+        Err(private_containment_error())
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn secure_created_file(_file: &cap_std::fs::File) -> std::io::Result<()> {
+    Err(private_containment_error())
+}
+
+fn private_containment_error() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        "private stage containment verification failed",
+    )
 }
 
 #[cfg(unix)]
@@ -497,6 +644,25 @@ fn set_no_follow(options: &mut OpenOptions) {
 
 #[cfg(not(any(unix, windows)))]
 fn set_no_follow(_options: &mut OpenOptions) {}
+
+#[cfg(windows)]
+fn entry_is_link_or_reparse(
+    entry: &cap_std::fs::DirEntry,
+    file_type: &cap_std::fs::FileType,
+) -> std::io::Result<bool> {
+    Ok(file_type.is_symlink()
+        || entry.metadata()?.file_attributes()
+            & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+            != 0)
+}
+
+#[cfg(not(windows))]
+fn entry_is_link_or_reparse(
+    _entry: &cap_std::fs::DirEntry,
+    file_type: &cap_std::fs::FileType,
+) -> std::io::Result<bool> {
+    Ok(file_type.is_symlink())
+}
 
 #[cfg(unix)]
 fn pre_open_link_count(metadata: &Metadata) -> Option<u64> {

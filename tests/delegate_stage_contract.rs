@@ -4,7 +4,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use carl::security::{SecretFilter, SecretRule};
-use carl::staging::{SanitizedStageBuilder, StageErrorCode, StageExclusionReason, StageLimits};
+use carl::staging::{
+    SanitizedStageBuilder, StageContainment, StageErrorCode, StageExclusionReason, StageLimits,
+};
 use uuid::Uuid;
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -61,11 +63,16 @@ fn stage_is_owner_only_deterministic_and_disposable() -> TestResult {
     let first = StageLayout::new()?;
     first.write("src/lib.rs", b"pub fn answer() -> u32 { 42 }\n")?;
     first.write("README.md", b"hello\n")?;
+    #[cfg(unix)]
     let source_mode = permissions(&first.source.join("README.md"))?;
 
     let stage = builder(&first, StageLimits::new(10, 1_024, 4_096)?)?.prepare()?;
     assert_ne!(stage.path(), first.source);
-    assert!(stage.path().starts_with(&first.stages));
+    assert!(stage.path().starts_with(fs::canonicalize(&first.stages)?));
+    assert_eq!(
+        stage.containment(),
+        StageContainment::CurrentUserPrivateVerified
+    );
     assert_eq!(
         stage.manifest().digest().to_string(),
         EXPECTED_MANIFEST_DIGEST
@@ -96,9 +103,12 @@ fn stage_is_owner_only_deterministic_and_disposable() -> TestResult {
         fs::read(stage.path().join("src/lib.rs"))?,
         b"pub fn answer() -> u32 { 42 }\n".as_slice()
     );
-    assert_owner_only(stage.path())?;
-    assert_owner_only(&stage.path().join("README.md"))?;
-    assert_eq!(permissions(&first.source.join("README.md"))?, source_mode);
+    #[cfg(unix)]
+    {
+        assert_owner_only(stage.path())?;
+        assert_owner_only(&stage.path().join("README.md"))?;
+        assert_eq!(permissions(&first.source.join("README.md"))?, source_mode);
+    }
     let workspace_debug = format!("{:?}", stage.execution_workspace()?);
     assert!(!workspace_debug.contains(first.source.to_string_lossy().as_ref()));
 
@@ -151,6 +161,24 @@ fn protected_and_unsupported_entries_never_reach_the_stage() -> TestResult {
         layout.source.join("src/lib.rs"),
         layout.source.join("link.rs"),
     )?;
+    #[cfg(windows)]
+    {
+        let outside = layout.root.join("outside");
+        fs::create_dir(&outside)?;
+        fs::write(outside.join("must-not-copy.txt"), b"outside sentinel\n")?;
+        let junction = layout.source.join("outside-junction");
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&junction)
+            .arg(&outside)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()?;
+        assert!(
+            status.success(),
+            "the Windows junction fixture must be created"
+        );
+    }
     #[cfg(unix)]
     {
         use std::ffi::CString;
@@ -220,6 +248,11 @@ fn protected_and_unsupported_entries_never_reach_the_stage() -> TestResult {
             Some(StageExclusionReason::SpecialFile)
         );
     }
+    #[cfg(windows)]
+    assert_eq!(
+        exclusions.get("outside-junction").copied(),
+        Some(StageExclusionReason::Symlink)
+    );
     Ok(())
 }
 
@@ -342,6 +375,118 @@ fn source_and_stage_roots_must_be_absolute_disjoint_directories() -> TestResult 
             StageErrorCode::InvalidRoot
         );
     }
+    #[cfg(windows)]
+    {
+        let unsafe_parent = layout.root.join("unsafe-stages");
+        fs::create_dir(&unsafe_parent)?;
+        let status = std::process::Command::new("icacls")
+            .arg(&unsafe_parent)
+            .args(["/grant", "*S-1-1-0:(OI)(CI)F"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()?;
+        assert!(
+            status.success(),
+            "the Windows broad-DACL fixture must be created"
+        );
+        assert_eq!(
+            SanitizedStageBuilder::open(
+                &layout.source,
+                &unsafe_parent,
+                StageLimits::new(1, 1, 1)?,
+                SecretFilter,
+            )
+            .expect_err("a broadly writable Windows stage parent must fail")
+            .code(),
+            StageErrorCode::InvalidRoot
+        );
+
+        let real_parent = layout.root.join("real-stages");
+        fs::create_dir(&real_parent)?;
+        let junction_parent = layout.root.join("junction-stages");
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&junction_parent)
+            .arg(&real_parent)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()?;
+        assert!(
+            status.success(),
+            "the Windows stage-parent junction fixture must be created"
+        );
+        assert_eq!(
+            SanitizedStageBuilder::open(
+                &layout.source,
+                &junction_parent,
+                StageLimits::new(1, 1, 1)?,
+                SecretFilter,
+            )
+            .expect_err("a Windows stage-parent junction must fail")
+            .code(),
+            StageErrorCode::InvalidRoot
+        );
+
+        let real_source = layout.root.join("real-source");
+        fs::create_dir(&real_source)?;
+        fs::write(real_source.join("README.md"), b"junction source\n")?;
+        let junction_source = layout.root.join("junction-source");
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&junction_source)
+            .arg(&real_source)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()?;
+        assert!(
+            status.success(),
+            "the Windows source-root junction fixture must be created"
+        );
+        assert_eq!(
+            SanitizedStageBuilder::open(
+                &junction_source,
+                &layout.stages,
+                StageLimits::new(10, 1_024, 4_096)?,
+                SecretFilter,
+            )
+            .expect_err("a Windows source-root junction must fail")
+            .code(),
+            StageErrorCode::InvalidRoot
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn stage_path_is_anchored_to_the_canonical_held_parent() -> TestResult {
+    #[cfg(unix)]
+    {
+        let layout = StageLayout::new()?;
+        layout.write("README.md", b"hello\n")?;
+        let alias = layout
+            .root
+            .with_file_name(format!("carl-stage-alias-{}", Uuid::new_v4()));
+        std::os::unix::fs::symlink(&layout.root, &alias)?;
+        let aliased_stages = alias.join("stages");
+
+        let stage = SanitizedStageBuilder::open(
+            &layout.source,
+            &aliased_stages,
+            StageLimits::new(10, 1_024, 4_096)?,
+            SecretFilter,
+        )?
+        .prepare()?;
+        assert!(
+            stage.path().starts_with(fs::canonicalize(&layout.stages)?),
+            "the execution path must use the canonical held parent"
+        );
+        assert!(
+            !stage.path().starts_with(&alias),
+            "an ambient alias must not survive into the execution path"
+        );
+        drop(stage);
+        fs::remove_file(alias)?;
+    }
     Ok(())
 }
 
@@ -352,34 +497,58 @@ fn builder(
     SanitizedStageBuilder::open(&layout.source, &layout.stages, limits, SecretFilter)
 }
 
+#[cfg(unix)]
 fn make_owner_only(path: &Path) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
-    }
-    #[cfg(not(unix))]
-    let _ = path;
-    Ok(())
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
 }
 
+#[cfg(windows)]
+fn make_owner_only(path: &Path) -> std::io::Result<()> {
+    let identity = std::process::Command::new("whoami")
+        .args(["/user", "/fo", "csv", "/nh"])
+        .output()?;
+    if !identity.status.success() {
+        return Err(std::io::Error::other(
+            "the Windows fixture could not resolve the current identity",
+        ));
+    }
+    let sid_start = identity
+        .stdout
+        .windows(4)
+        .position(|window| window == b"S-1-")
+        .ok_or_else(|| std::io::Error::other("whoami returned no current-user SID"))?;
+    let sid_end = identity.stdout[sid_start..]
+        .iter()
+        .position(|byte| !byte.is_ascii_digit() && *byte != b'-' && *byte != b'S')
+        .map_or(identity.stdout.len(), |offset| sid_start + offset);
+    let sid = std::str::from_utf8(&identity.stdout[sid_start..sid_end])
+        .map_err(|_| std::io::Error::other("whoami returned an invalid SID"))?;
+    let grant = format!("*{sid}:(OI)(CI)F");
+    let status = std::process::Command::new("icacls")
+        .arg(path)
+        .args(["/inheritance:r", "/grant:r"])
+        .arg(grant)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(
+            "the Windows fixture could not install a private DACL",
+        ))
+    }
+}
+
+#[cfg(unix)]
 fn assert_owner_only(path: &Path) -> TestResult {
-    #[cfg(unix)]
     assert_eq!(permissions(path)? & 0o077, 0);
-    #[cfg(not(unix))]
-    let _ = path;
     Ok(())
 }
 
+#[cfg(unix)]
 fn permissions(path: &Path) -> std::io::Result<u32> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        Ok(fs::metadata(path)?.permissions().mode() & 0o777)
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-        Ok(0)
-    }
+    use std::os::unix::fs::PermissionsExt;
+    Ok(fs::metadata(path)?.permissions().mode() & 0o777)
 }

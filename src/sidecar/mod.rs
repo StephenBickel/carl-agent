@@ -4013,7 +4013,10 @@ fn windows_file_identity(file: &File) -> Result<WindowsFileIdentity, ()> {
 }
 
 #[cfg(windows)]
-fn create_relative_private_file(directory: &File, name: &std::ffi::OsStr) -> Result<File, ()> {
+pub(crate) fn create_relative_private_file(
+    directory: &impl std::os::windows::io::AsRawHandle,
+    name: &std::ffi::OsStr,
+) -> Result<File, ()> {
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::io::{AsRawHandle, FromRawHandle};
     use std::ptr;
@@ -4082,6 +4085,83 @@ fn create_relative_private_file(directory: &File, name: &std::ffi::OsStr) -> Res
         return Err(());
     }
     // SAFETY: NtCreateFile returned one new owned file handle.
+    Ok(unsafe { File::from_raw_handle(handle) })
+}
+
+#[cfg(windows)]
+pub(crate) fn create_relative_private_directory(
+    directory: &impl std::os::windows::io::AsRawHandle,
+    name: &std::ffi::OsStr,
+) -> Result<File, ()> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle};
+    use std::ptr;
+
+    use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
+    use windows_sys::Wdk::Storage::FileSystem::{
+        FILE_CREATE, FILE_DIRECTORY_FILE, FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT,
+        NtCreateFile,
+    };
+    use windows_sys::Win32::Foundation::{
+        HANDLE, INVALID_HANDLE_VALUE, OBJ_CASE_INSENSITIVE, UNICODE_STRING,
+    };
+    use windows_sys::Win32::Security::SECURITY_DESCRIPTOR;
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, READ_CONTROL, SYNCHRONIZE,
+    };
+    use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
+
+    let mut name: Vec<u16> = name.encode_wide().collect();
+    if name.is_empty() || name.contains(&0) {
+        return Err(());
+    }
+    let name_bytes = name
+        .len()
+        .checked_mul(std::mem::size_of::<u16>())
+        .ok_or(())?;
+    let maximum_bytes = name_bytes
+        .checked_add(std::mem::size_of::<u16>())
+        .ok_or(())?;
+    name.push(0);
+    let object_name = UNICODE_STRING {
+        Length: u16::try_from(name_bytes).map_err(|_| ())?,
+        MaximumLength: u16::try_from(maximum_bytes).map_err(|_| ())?,
+        Buffer: name.as_mut_ptr(),
+    };
+    let security = windows_security::owner_only_directory_security_descriptor()?;
+    let attributes = OBJECT_ATTRIBUTES {
+        Length: u32::try_from(std::mem::size_of::<OBJECT_ATTRIBUTES>()).map_err(|_| ())?,
+        RootDirectory: directory.as_raw_handle(),
+        ObjectName: &object_name,
+        Attributes: OBJ_CASE_INSENSITIVE,
+        SecurityDescriptor: security.as_ptr().cast::<SECURITY_DESCRIPTOR>(),
+        SecurityQualityOfService: ptr::null(),
+    };
+    let mut status = IO_STATUS_BLOCK::default();
+    let mut handle: HANDLE = ptr::null_mut();
+    // SAFETY: every structure and backing buffer remains live for the call,
+    // RootDirectory is a held private directory, and FILE_CREATE makes the single
+    // component exclusive with a protected current-user DACL at creation time.
+    let result = unsafe {
+        NtCreateFile(
+            &mut handle,
+            FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE | READ_CONTROL | SYNCHRONIZE,
+            &attributes,
+            &mut status,
+            ptr::null(),
+            FILE_ATTRIBUTE_NORMAL,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            FILE_CREATE,
+            FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT,
+            ptr::null(),
+            0,
+        )
+    };
+    if result < 0 || handle.is_null() || handle == INVALID_HANDLE_VALUE {
+        return Err(());
+    }
+    // SAFETY: NtCreateFile returned one owned non-inheritable directory handle.
     Ok(unsafe { File::from_raw_handle(handle) })
 }
 
@@ -4520,9 +4600,8 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 #[cfg(windows)]
-mod windows_security {
+pub(crate) mod windows_security {
     use std::ffi::c_void;
-    use std::fs::File;
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::io::AsRawHandle;
     use std::path::{Component, Path, Prefix};
@@ -4620,19 +4699,19 @@ mod windows_security {
             && components.next().is_none()
     }
 
-    pub(super) fn verify_private_directory(path: &Path) -> Result<(), ()> {
+    pub(crate) fn verify_private_directory(path: &Path) -> Result<(), ()> {
         verify_dacl(path, OwnerPolicy::CurrentUserPrivate, ObjectKind::Directory).map_err(|_| ())
     }
 
-    pub(super) fn verify_private_file_handle(file: &File) -> Result<(), ()> {
+    pub(crate) fn verify_private_file_handle(file: &impl AsRawHandle) -> Result<(), ()> {
         verify_private_handle(file, ObjectKind::File)
     }
 
-    pub(super) fn verify_private_directory_handle(file: &File) -> Result<(), ()> {
+    pub(crate) fn verify_private_directory_handle(file: &impl AsRawHandle) -> Result<(), ()> {
         verify_private_handle(file, ObjectKind::Directory)
     }
 
-    fn verify_private_handle(file: &File, object_kind: ObjectKind) -> Result<(), ()> {
+    fn verify_private_handle(file: &impl AsRawHandle, object_kind: ObjectKind) -> Result<(), ()> {
         let current_user = CurrentUser::query()?;
         let mut dacl = ptr::null_mut::<ACL>();
         let mut owner: PSID = ptr::null_mut();
