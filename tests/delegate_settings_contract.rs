@@ -94,6 +94,19 @@ fn model_deserialization_cannot_bypass_validation() {
 }
 
 #[test]
+fn settings_deserialization_rejects_unknown_fields_instead_of_silently_defaulting() {
+    assert!(
+        serde_json::from_str::<DelegateSettings>(r#"{"modle":"gpt-5.6"}"#).is_err(),
+        "a misspelled model field must not become an empty provider-default configuration"
+    );
+    assert_eq!(
+        serde_json::from_str::<DelegateSettings>(r#"{"effort":"high"}"#)
+            .expect("omitted optional fields remain supported"),
+        DelegateSettings::new(None, Some(ReasoningEffort::High))
+    );
+}
+
+#[test]
 fn reasoning_effort_uses_the_exact_codex_values() {
     let cases = [
         (ReasoningEffort::Low, "low"),

@@ -938,6 +938,7 @@ pub struct DataRootLock {
     _root_directory: File,
     lock_file: Option<File>,
     root_identity: DirectoryIdentity,
+    data_root: PathBuf,
 }
 
 impl fmt::Debug for DataRootLock {
@@ -980,7 +981,25 @@ impl DataRootLock {
             _root_directory: root_directory,
             lock_file: Some(lock_file),
             root_identity,
+            data_root: data_root.to_path_buf(),
         })
+    }
+
+    /// Returns whether this capability was acquired for the exact private root
+    /// represented by `data_root`, comparing held directory identities rather
+    /// than caller-controlled path text.
+    #[must_use]
+    pub fn guards_data_root(&self, data_root: impl AsRef<Path>) -> bool {
+        let Ok(directory) = open_private_data_root(data_root.as_ref()) else {
+            return false;
+        };
+        directory_identity(&directory)
+            .map(|identity| identity == self.root_identity)
+            .unwrap_or(false)
+    }
+
+    pub(crate) fn runtime_data_root(&self) -> &Path {
+        &self.data_root
     }
 }
 
