@@ -31,6 +31,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "proposal artifacts",
         sql: include_str!("../../migrations/0004_proposal_artifacts.sql"),
     },
+    Migration {
+        version: 5,
+        name: "verifications",
+        sql: include_str!("../../migrations/0005_verifications.sql"),
+    },
 ];
 
 pub(crate) fn migrate(connection: &mut Connection) -> Result<(), CarlError> {

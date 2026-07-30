@@ -23,8 +23,8 @@ Carl does not attempt to defend a host account from an attacker who already cont
   live-workspace access, environment grants, and provider-network mismatch fail
   closed before approval;
 - external-agent approvals bind an actor, session, turn, tool call, expiry, and a
-  single exact request digest, and an allowed approval is atomically consumed at most
-  once;
+  single exact request digest, including the exact verification-specification digest,
+  and an allowed approval is atomically consumed at most once;
 - secret findings retain only a stable classification, never matched bytes;
 - delegate stages are bounded, capability-relative disposable copies whose private
   containment is verified before they are returned. On Unix, the held stage parent
@@ -50,13 +50,38 @@ Carl does not attempt to defend a host account from an attacker who already cont
   metadata-only drift, generated secrets, oversized content, and unstable path
   identity fail closed with path-and-rule-only diagnostics. Preparation and
   inspection also cap aggregate relative-path metadata at 8 MiB per snapshot.
+- independent verification persists an immutable request that binds the exact
+  executable content and platform identity, literal argument vector, credential-free
+  environment profile, every execution and shutdown limit, the sealed baseline and
+  source-precondition artifacts, the exact proposal and payload artifacts, and both
+  file-content and directory-topology digests. A passing result can only be minted
+  inside the verifier from a private execution receipt; ordinary crate code has no
+  production constructor for a passing result.
+- verification reconstructs a new owner-private candidate exclusively from
+  re-verified content-addressed artifacts and the inert exact-replacement payload.
+  It preserves the sealed directory topology, including empty directories, and
+  never executes in the agent-mutated stage or live source tree. The approved
+  executable receives the approved arguments as a literal argv vector, a held
+  candidate working directory, a closed environment whose home and temporary
+  locations point at a separate disposable scratch directory, bounded aggregate
+  output, deadlines, and cancellation.
+- the verifier revalidates the originally approved executable attestation immediately
+  before and after supervised execution. After the process group or Job Object has
+  been fully reaped, it performs two stable candidate scans and compares file bytes,
+  metadata, identities, and exact directory topology with both the pre-execution
+  seal and durable expected digests. It also re-reads the baseline, precondition,
+  proposal, payload, and content artifacts. Candidate and scratch cleanup must
+  succeed before a passing result is returned.
+- verification stdout and stderr share one bounded byte budget. Each complete stream
+  must be UTF-8, NUL-free, and pass the high-confidence secret filter. Rejected
+  diagnostics are discarded in full; no matching substring is retained in the
+  durable result.
 
 These properties improve auditability and failure behavior. They do not implement
 model-provider access, a general runtime tool-policy system, redaction of all future
-runtime data, live-workspace promotion, or a complete process sandbox. Independent
-verification and promotion are not implemented, and the proposal inspector is not
-orchestrated by a user-reachable subscription run engine, so no subscription coding
-task is user-reachable.
+runtime data, live-workspace promotion, or a complete process sandbox. Verification
+is implemented as a runtime operation, but promotion is not implemented and no
+complete subscription coding task is user-reachable.
 
 ## Planned v1 controls
 
@@ -77,7 +102,13 @@ Every one of these controls requires implementation and adversarial tests before
 
 ## Shell boundary
 
-**Shell isolation in v1 is policy- and process-based; it is not a complete security sandbox.** Workspace selection, a filtered environment, timeouts, cancellation, and approvals reduce accidental harm but do not neutralize hostile programs running as the same OS user. Platform sandbox backends may be added later. Until then, never approve a command you would not run directly under the host account.
+**Shell isolation in v1 is policy- and process-based; it is not a complete security
+sandbox.** The independent verifier never interprets its approved argv as shell text,
+but the selected native executable still runs as the current OS user. Workspace
+selection, a closed environment, timeouts, cancellation, output bounds, and approvals
+reduce accidental harm; they do not neutralize hostile programs. Platform sandbox
+backends may be added later. Until then, never approve a verifier command you would
+not run directly under the host account.
 
 ## Credentials and authentication
 
@@ -122,6 +153,12 @@ executable identity once, and revalidates that exact identity before use. Versio
 matching is compatibility evidence, not publisher attestation. Carl neither installs
 nor updates provider executables.
 
+Verification adds a content attestation: canonical path, platform file identity,
+metadata-risk decision, byte length, and complete SHA-256 are bound into the approved
+specification and durable request. Unix shebang scripts and Windows `.bat`/`.cmd`
+files are rejected in v1 because their interpreter identity would otherwise be
+unbound. Native loaders and dynamic libraries are not recursively attested.
+
 On Windows, every existing executable-path component rejects reparse points and
 broad deletion or security-descriptor control. The executable's immediate parent
 also rejects broad child-creation rights to prevent adjacent DLL, configuration, or
@@ -144,11 +181,27 @@ child reaping, state reconciliation, and shutdown. The lock is released automati
 when the owning process exits or crashes. Task 4's provider-home mutex remains
 in-process only and cannot replace this data-root lock.
 
-Provider children are supervised as process groups on Unix and Job Objects on
-Windows. These mechanisms support cancellation and bounded cleanup, but they are
-lifecycle containment rather than privilege separation: they do not prevent provider
-children from exercising the ambient authority that survives the closed environment,
-isolated working directory, and OS access controls.
+Provider and verification children are supervised as process groups on Unix and Job
+Objects on Windows. These mechanisms support cancellation and bounded cleanup, but
+they are native lifecycle containment rather than an OS sandbox or privilege
+separation: they do not prevent children from exercising the ambient filesystem,
+network, keyring, and same-user process authority that survives the closed
+environment and isolated working directory.
+
+On Unix, a hostile descendant can escape ordinary process-group cleanup by creating
+a new session with `setsid` (or otherwise moving to another process group). On
+Windows, Job Objects contain descendants, but selecting a working directory still
+has a residual path-based race after Carl verifies its held directory identity.
+Executable verification similarly narrows but cannot eliminate the check-to-exec
+window between the last content/identity check and the kernel opening the image.
+
+Candidate comparison detects state that differs during a stable post-run scan,
+including same-content file replacement through retained file identities. It cannot
+prove that a command never made a transient mutation which it completely restored
+before inspection. Verification also says nothing about the current live workspace:
+future promotion must independently re-check live path identity, ownership, content
+preconditions, the committed verification result, and the exact proposal immediately
+before applying bytes.
 
 ## Remote channel boundary
 

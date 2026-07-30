@@ -13,8 +13,50 @@ type TestResult = Result<(), Box<dyn Error>>;
 
 const PROMPT_DIGEST: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const STAGE_DIGEST: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const VERIFICATION_SPEC_DIGEST: &str =
+    "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 const EXPECTED_REQUEST_DIGEST: &str =
-    "c13e74c2a625e317bd31813656739cd174e1de33a1d6f7ce140c44125277f7b2";
+    "3e5f468b675e43c10d5596657c78f41a0299409d7e39293484e1b31ac21567b8";
+
+#[test]
+fn delegate_approval_digest_binds_the_exact_verification_specification() -> TestResult {
+    let request = CapabilityRequest::external_agent(
+        "delegate.codex",
+        ActorIdentity::new(ActorId::parse("local-owner")?, Frontend::Cli),
+        session_id("11111111-1111-4111-8111-111111111111")?,
+        turn_id("22222222-2222-4222-8222-222222222222")?,
+        Sha256Digest::parse(PROMPT_DIGEST)?,
+        Sha256Digest::parse(STAGE_DIGEST)?,
+        Sha256Digest::parse(VERIFICATION_SPEC_DIGEST)?,
+        Some(ModelId::parse("gpt-5.6")?),
+        Some(ReasoningEffort::High),
+        ProviderNetwork::OpenAiCodex,
+        BTreeSet::new(),
+        false,
+    )?;
+    let changed = CapabilityRequest::external_agent(
+        "delegate.codex",
+        ActorIdentity::new(ActorId::parse("local-owner")?, Frontend::Cli),
+        session_id("11111111-1111-4111-8111-111111111111")?,
+        turn_id("22222222-2222-4222-8222-222222222222")?,
+        Sha256Digest::parse(PROMPT_DIGEST)?,
+        Sha256Digest::parse(STAGE_DIGEST)?,
+        Sha256Digest::parse("dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd")?,
+        Some(ModelId::parse("gpt-5.6")?),
+        Some(ReasoningEffort::High),
+        ProviderNetwork::OpenAiCodex,
+        BTreeSet::new(),
+        false,
+    )?;
+
+    let encoded = serde_json::to_value(&request)?;
+    assert_eq!(
+        encoded["verification_specification_digest"],
+        VERIFICATION_SPEC_DIGEST
+    );
+    assert_ne!(request.digest(), changed.digest());
+    Ok(())
+}
 
 #[test]
 fn normalized_request_digest_covers_every_security_relevant_field() -> TestResult {
@@ -189,6 +231,10 @@ fn serialized_requests_contain_no_prompt_or_ambient_path() -> TestResult {
 
     assert_eq!(object["prompt_digest"], PROMPT_DIGEST);
     assert_eq!(object["stage_manifest_digest"], STAGE_DIGEST);
+    assert_eq!(
+        object["verification_specification_digest"],
+        VERIFICATION_SPEC_DIGEST
+    );
     assert!(!encoded.to_string().contains("Fix the private regression"));
     assert!(!encoded.to_string().contains("/Users/"));
     assert!(object.get("task").is_none());
@@ -289,6 +335,7 @@ fn policy_values_are_bounded_and_debug_output_is_redacted() -> TestResult {
             turn_id("22222222-2222-4222-8222-222222222222")?,
             Sha256Digest::parse(PROMPT_DIGEST)?,
             Sha256Digest::parse(STAGE_DIGEST)?,
+            Sha256Digest::parse(VERIFICATION_SPEC_DIGEST)?,
             None,
             None,
             ProviderNetwork::OpenAiCodex,
@@ -303,6 +350,7 @@ fn policy_values_are_bounded_and_debug_output_is_redacted() -> TestResult {
     assert!(!debug.contains("local-owner"));
     assert!(!debug.contains(PROMPT_DIGEST));
     assert!(!debug.contains(STAGE_DIGEST));
+    assert!(!debug.contains(VERIFICATION_SPEC_DIGEST));
     assert!(!format!("{:?}", request.digest()).contains(EXPECTED_REQUEST_DIGEST));
     Ok(())
 }
@@ -344,6 +392,7 @@ fn request_with(
         turn_id(turn)?,
         Sha256Digest::parse(prompt_digest)?,
         Sha256Digest::parse(stage_digest)?,
+        Sha256Digest::parse(VERIFICATION_SPEC_DIGEST)?,
         model.map(ModelId::parse).transpose()?,
         effort,
         network,

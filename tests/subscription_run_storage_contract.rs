@@ -338,6 +338,83 @@ fn invalid_and_terminal_transitions_never_write() -> TestResult {
 }
 
 #[test]
+fn generic_transition_api_reserves_the_verification_lifecycle() -> TestResult {
+    let database = TemporaryDatabase::new();
+    let mut store = Store::open(database.path())?;
+    let session = store.create_session()?;
+    let run_id = create_default_run(&mut store, session.id, instant(1))?;
+    transition(
+        &mut store,
+        run_id,
+        1,
+        RunState::Prepared,
+        RunState::AwaitingDelegateApproval,
+        None,
+        instant(2),
+    )?;
+    transition(
+        &mut store,
+        run_id,
+        2,
+        RunState::AwaitingDelegateApproval,
+        RunState::Running,
+        None,
+        instant(3),
+    )?;
+    transition(
+        &mut store,
+        run_id,
+        3,
+        RunState::Running,
+        RunState::Inspecting,
+        None,
+        instant(4),
+    )?;
+
+    let entering = store
+        .compare_and_transition_subscription_run(
+            run_id,
+            RunState::Inspecting,
+            4,
+            RunTransition::new(RunState::Inspecting, RunState::Verifying, None)?,
+            RunTrustLabel::TrustedCarlState,
+            instant(5),
+        )
+        .expect_err("only the dedicated begin API may enter verification");
+    assert!(matches!(
+        entering,
+        CarlError::Validation { ref detail }
+            if detail.contains("dedicated verification")
+    ));
+
+    let exiting = store
+        .compare_and_transition_subscription_run(
+            run_id,
+            RunState::Verifying,
+            5,
+            RunTransition::new(
+                RunState::Verifying,
+                RunState::AwaitingPromotionApproval,
+                None,
+            )?,
+            RunTrustLabel::TrustedCarlVerification,
+            instant(6),
+        )
+        .expect_err("only the dedicated completion API may exit verification");
+    assert!(matches!(
+        exiting,
+        CarlError::Validation { ref detail }
+            if detail.contains("dedicated verification")
+    ));
+    assert_eq!(
+        store.get_subscription_run(run_id)?.unwrap().state,
+        RunState::Inspecting
+    );
+    assert_eq!(store.read_subscription_run_events(run_id)?.len(), 4);
+    Ok(())
+}
+
+#[test]
 fn exclusive_runtime_startup_recovers_nonterminals_once_and_retains_the_lock() -> TestResult {
     let database = RuntimeDatabase::new()?;
     let mut store = Store::open(database.path())?;

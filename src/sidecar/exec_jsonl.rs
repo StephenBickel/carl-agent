@@ -65,7 +65,7 @@ impl ExecutionWorkspace {
         Ok(workspace)
     }
 
-    fn configure_command(&self, command: &mut Command) -> Result<(), SidecarError> {
+    pub(super) fn configure_command(&self, command: &mut Command) -> Result<(), SidecarError> {
         self.revalidate()?;
         #[cfg(unix)]
         {
@@ -95,7 +95,7 @@ impl ExecutionWorkspace {
         Ok(directory_identity(&named)? == self.identity)
     }
 
-    fn revalidate(&self) -> Result<(), SidecarError> {
+    pub(super) fn revalidate(&self) -> Result<(), SidecarError> {
         let named = open_identity_directory(&self.canonical_path)?;
         if directory_identity(&self.directory)? != self.identity
             || directory_identity(&named)? != self.identity

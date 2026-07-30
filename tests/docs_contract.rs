@@ -366,7 +366,8 @@ fn documents_the_inert_external_agent_safety_foundation() {
             "capability-relative",
             "secret-filtered",
             "no subscription coding task is cli-reachable",
-            "independent verification, stale-safe promotion, and run-engine orchestration remain unavailable",
+            "stale-safe promotion and run-engine orchestration remain unavailable",
+            "independent bounded verification",
         ],
     );
     assert_document_contains(
@@ -390,7 +391,8 @@ fn documents_the_inert_external_agent_safety_foundation() {
             "high-confidence secret finding rejects the entire stage",
             "every later read reopens the named object",
             "structural changes, protected paths, redirects, hard links",
-            "independent verification and promotion are not implemented",
+            "verification reconstructs a new owner-private candidate",
+            "promotion is not implemented",
         ],
     );
     assert_document_contains(

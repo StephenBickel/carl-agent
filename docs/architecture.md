@@ -24,7 +24,8 @@ SubscriptionRunEngine (planned safety boundary)
         +--> sanitized staging (implemented, library only)
         +--> Codex exec adapter (implemented, inert)
         +--> sealed baseline + exact proposal (implemented, library only)
-        +--> verify / promote (planned)
+        +--> independent verify (implemented, library only)
+        +--> promote (planned)
 ```
 
 This layout keeps user interfaces replaceable, provider wire formats contained, policy centralized, and scenario tests deterministic.
@@ -37,8 +38,8 @@ This layout keeps user interfaces replaceable, provider wire formats contained, 
 - `storage`: SQLite WAL, forward migrations verified by checksum, transactional
   append-only events, durable session and memory lifecycles, and expiring
   actor/session/turn/request-bound approvals that are atomically consumed once.
-  Subscription runs, sealed-baseline references, and exact-proposal metadata are
-  durable projections.
+  Subscription runs, sealed-baseline references, exact-proposal metadata, and
+  independent-verification requests/results are durable projections.
 - `artifacts`: owner-private, read-only, content-addressed baseline and proposal
   objects. Every exact replacement proposal is inert. Every read reopens,
   identity-checks, and re-hashes the named object. Runtime startup reconciles
@@ -46,8 +47,9 @@ This layout keeps user interfaces replaceable, provider wire formats contained, 
   by a 1 GiB/200,000-entry aggregate quota.
 - `providers`: a normalized provider request/event trait and a scripted adapter that replays sanitized JSON fixtures with cancellation support.
 - `sidecar`: isolated provider homes, executable identity/version checks, closed child
-  environments, process-tree supervision, bounded cleanup, and provider-owned
-  authentication protocols.
+  environments, provider-owned authentication protocols, and a provider-neutral
+  exact-argv process supervisor with aggregate output, deadline, cancellation, and
+  process-tree cleanup bounds.
 - `auth`: provider-owned authentication brokers for Codex and Grok that expose only
   sanitized state, login, logout, and cancellation boundaries.
 - `delegates`: bounded model and reasoning settings, stateful Codex JSONL
@@ -56,6 +58,7 @@ This layout keeps user interfaces replaceable, provider wire formats contained, 
 - `policy`: normalized external-agent capability requests, deterministic SHA-256
   request identities, and a closed evaluator that requires approval for safe requests
   while denying live-workspace exposure, environment grants, and provider mismatch.
+  The request digest includes the exact verification-specification digest.
 - `security`: a non-retaining high-confidence secret filter that reports only a
   stable rule classification.
 - `staging`: bounded, capability-relative construction of deterministic disposable
@@ -63,6 +66,10 @@ This layout keeps user interfaces replaceable, provider wire formats contained, 
   no changes or one exact replacement of an existing UTF-8 file; creation, deletion,
   rename, multiple edits, redirected paths, hard links, metadata drift, secrets, and
   unstable named identities fail closed.
+- `verification`: fresh candidate reconstruction from sealed artifacts, approved
+  executable and literal-argv attestation, credential-free bounded execution through
+  the shared process supervisor, stable pre/post candidate inspection, sanitized
+  diagnostics, durable results, and post-commit-only verified-proposal minting.
 - `cli`: composition for the seven `auth` commands, local foreground checks,
   cross-process data-root locking, and deterministic safe JSON output; the other
   top-level commands remain placeholders.
@@ -71,9 +78,9 @@ Authentication status performs only provider-owned local handshakes with the pin
 executables. It does not issue prompts, start sessions, invoke inference, or validate
 live model entitlement. There is no production HTTP adapter, context assembler, turn
 state machine, integrated general tool-policy evaluator, tool executor,
-user-reachable subscription run engine, independent verification runner, stale-safe
-promotion path, TUI, general configuration loader, diagnostics command, or Telegram
-transport yet.
+user-reachable subscription run engine, stale-safe promotion path, TUI, general
+configuration loader, diagnostics command, or Telegram transport yet. Independent
+verification exists as an inert library boundary but is not CLI-reachable.
 
 ## Authentication composition
 
@@ -92,10 +99,11 @@ was published by OpenAI or xAI.
 The library now includes a separate one-way JSONL worker and Codex exec adapter for
 the subscription path described in
 [ADR 0004](adr/0004-subscription-authentication-through-provider-sidecars.md). It is
-deliberately not connected to the CLI. The policy, approval, secret-filter, and
-sanitized-stage contracts now exist independently, but they are not orchestrated.
+deliberately not connected to the CLI. The policy, approval, secret-filter,
+sanitized-stage, and independent-verification contracts now exist independently, but
+they are not orchestrated.
 Implemented authentication and adapter code do not enable a live coding task until
-`SubscriptionRunEngine`, independent verification, and stale-safe promotion exist.
+`SubscriptionRunEngine` and stale-safe promotion exist.
 
 ## Planned turn boundary
 

@@ -194,6 +194,7 @@ pub struct CapabilityRequest {
     turn_id: TurnId,
     prompt_digest: Sha256Digest,
     stage_manifest_digest: Sha256Digest,
+    verification_specification_digest: Sha256Digest,
     model: Option<ModelId>,
     effort: Option<ReasoningEffort>,
     provider_network: ProviderNetwork,
@@ -212,6 +213,7 @@ impl CapabilityRequest {
         turn_id: TurnId,
         prompt_digest: Sha256Digest,
         stage_manifest_digest: Sha256Digest,
+        verification_specification_digest: Sha256Digest,
         model: Option<ModelId>,
         effort: Option<ReasoningEffort>,
         provider_network: ProviderNetwork,
@@ -229,12 +231,13 @@ impl CapabilityRequest {
         }
         Ok(Self {
             tool,
-            schema_version: 1,
+            schema_version: 2,
             actor,
             session_id,
             turn_id,
             prompt_digest,
             stage_manifest_digest,
+            verification_specification_digest,
             model,
             effort,
             provider_network,
@@ -265,6 +268,11 @@ impl CapabilityRequest {
     #[must_use]
     pub const fn turn_id(&self) -> TurnId {
         self.turn_id
+    }
+
+    #[must_use]
+    pub const fn verification_specification_digest(&self) -> Sha256Digest {
+        self.verification_specification_digest
     }
 
     #[must_use]

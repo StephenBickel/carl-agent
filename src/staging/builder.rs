@@ -567,7 +567,7 @@ fn root_contains_protected_component(path: &Path) -> bool {
     })
 }
 
-fn named_path_matches_held(path: &Path, held: &Dir) -> bool {
+pub(super) fn named_path_matches_held(path: &Path, held: &Dir) -> bool {
     crate::sidecar::directory_path_matches_held(path, held)
 }
 
@@ -588,7 +588,7 @@ fn io_error(path: &str) -> StageError {
 }
 
 #[cfg(windows)]
-fn root_is_link_or_reparse(metadata: &std::fs::Metadata) -> bool {
+pub(super) fn root_is_link_or_reparse(metadata: &std::fs::Metadata) -> bool {
     use std::os::windows::fs::MetadataExt as _;
 
     metadata.file_type().is_symlink()
@@ -598,7 +598,7 @@ fn root_is_link_or_reparse(metadata: &std::fs::Metadata) -> bool {
 }
 
 #[cfg(not(windows))]
-fn root_is_link_or_reparse(metadata: &std::fs::Metadata) -> bool {
+pub(super) fn root_is_link_or_reparse(metadata: &std::fs::Metadata) -> bool {
     metadata.file_type().is_symlink()
 }
 
@@ -652,7 +652,7 @@ pub(super) fn held_private_directory_is_verified(_directory: &Dir) -> bool {
 }
 
 #[cfg(unix)]
-fn create_private_directory(directory: &Dir, name: &str) -> std::io::Result<Dir> {
+pub(super) fn create_private_directory(directory: &Dir, name: &str) -> std::io::Result<Dir> {
     directory.create_dir(name)?;
     directory.set_permissions(name, Permissions::from_mode(0o700))?;
     let child = open_directory_nofollow(directory, name)?;
@@ -668,7 +668,7 @@ fn create_private_directory(directory: &Dir, name: &str) -> std::io::Result<Dir>
 }
 
 #[cfg(windows)]
-fn create_private_directory(directory: &Dir, name: &str) -> std::io::Result<Dir> {
+pub(super) fn create_private_directory(directory: &Dir, name: &str) -> std::io::Result<Dir> {
     let child =
         crate::sidecar::create_relative_private_directory(directory, std::ffi::OsStr::new(name))
             .map(Dir::from_std_file)
@@ -687,7 +687,7 @@ fn create_private_directory(directory: &Dir, name: &str) -> std::io::Result<Dir>
 }
 
 #[cfg(not(any(unix, windows)))]
-fn create_private_directory(_directory: &Dir, _name: &str) -> std::io::Result<Dir> {
+pub(super) fn create_private_directory(_directory: &Dir, _name: &str) -> std::io::Result<Dir> {
     Err(private_containment_error())
 }
 
@@ -736,7 +736,10 @@ pub(super) fn open_directory_nofollow(
 }
 
 #[cfg(unix)]
-fn create_private_file(directory: &Dir, name: &str) -> std::io::Result<cap_std::fs::File> {
+pub(super) fn create_private_file(
+    directory: &Dir,
+    name: &str,
+) -> std::io::Result<cap_std::fs::File> {
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     options.mode(0o600);
@@ -744,19 +747,25 @@ fn create_private_file(directory: &Dir, name: &str) -> std::io::Result<cap_std::
 }
 
 #[cfg(windows)]
-fn create_private_file(directory: &Dir, name: &str) -> std::io::Result<cap_std::fs::File> {
+pub(super) fn create_private_file(
+    directory: &Dir,
+    name: &str,
+) -> std::io::Result<cap_std::fs::File> {
     crate::sidecar::create_relative_private_file(directory, std::ffi::OsStr::new(name))
         .map(cap_std::fs::File::from_std)
         .map_err(|()| private_containment_error())
 }
 
 #[cfg(not(any(unix, windows)))]
-fn create_private_file(_directory: &Dir, _name: &str) -> std::io::Result<cap_std::fs::File> {
+pub(super) fn create_private_file(
+    _directory: &Dir,
+    _name: &str,
+) -> std::io::Result<cap_std::fs::File> {
     Err(private_containment_error())
 }
 
 #[cfg(unix)]
-fn secure_created_file(file: &cap_std::fs::File) -> std::io::Result<()> {
+pub(super) fn secure_created_file(file: &cap_std::fs::File) -> std::io::Result<()> {
     file.set_permissions(Permissions::from_mode(0o600))?;
     let metadata = file.metadata()?;
     if metadata.is_file()
@@ -771,7 +780,7 @@ fn secure_created_file(file: &cap_std::fs::File) -> std::io::Result<()> {
 }
 
 #[cfg(windows)]
-fn secure_created_file(file: &cap_std::fs::File) -> std::io::Result<()> {
+pub(super) fn secure_created_file(file: &cap_std::fs::File) -> std::io::Result<()> {
     let metadata = file.metadata()?;
     if opened_metadata_is_regular(&metadata)
         && link_count(&metadata) == Some(1)
@@ -784,7 +793,7 @@ fn secure_created_file(file: &cap_std::fs::File) -> std::io::Result<()> {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn secure_created_file(_file: &cap_std::fs::File) -> std::io::Result<()> {
+pub(super) fn secure_created_file(_file: &cap_std::fs::File) -> std::io::Result<()> {
     Err(private_containment_error())
 }
 

@@ -11,3 +11,4 @@ pub mod security;
 pub mod sidecar;
 pub mod staging;
 pub mod storage;
+pub mod verification;
