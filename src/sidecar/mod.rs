@@ -4213,7 +4213,7 @@ fn open_relative_private_directory_with_disposition(
     };
     use windows_sys::Win32::Security::SECURITY_DESCRIPTOR;
     use windows_sys::Win32::Storage::FileSystem::{
-        DELETE, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_READ,
+        FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_READ,
         FILE_SHARE_WRITE, READ_CONTROL, SYNCHRONIZE,
     };
     use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
@@ -4250,10 +4250,14 @@ fn open_relative_private_directory_with_disposition(
     // RootDirectory is a held private directory, and disposition is either FILE_OPEN
     // or FILE_CREATE. Creation is exclusive and applies the protected current-user
     // DACL; opening preserves the existing descriptor for subsequent verification.
+    // Do not request DELETE here: later identity checks open a second directory
+    // handle without FILE_SHARE_DELETE, and Windows requires that handle to share
+    // every access requested by this one. Omitting FILE_SHARE_DELETE still pins the
+    // directory against rename and deletion while the capability remains live.
     let result = unsafe {
         NtCreateFile(
             &mut handle,
-            FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE | READ_CONTROL | SYNCHRONIZE,
+            FILE_GENERIC_READ | FILE_GENERIC_WRITE | READ_CONTROL | SYNCHRONIZE,
             &attributes,
             &mut status,
             ptr::null(),
