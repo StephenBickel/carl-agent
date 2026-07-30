@@ -22,6 +22,7 @@ const BASELINE_MANIFEST_DIGEST: &str =
 const PROPOSAL_ARTIFACT_ID: &str =
     "763ca7e546b9250a17059f9d900b8b9473a57cb302f7db2c4b0a4af4d3a40fd2";
 const SECRET_SENTINEL: &str = "sk-proj-0123456789abcdefghijklmnop";
+const DATA_ROOT_LOCK_FILENAME: &str = ".carl-instance.lock";
 
 struct ProposalLayout {
     root: PathBuf,
@@ -463,11 +464,18 @@ fn snapshot_files(root: &Path) -> TestResult<BTreeMap<PathBuf, Vec<u8>>> {
         entries.sort_by_key(fs::DirEntry::file_name);
         for entry in entries {
             let path = entry.path();
+            let relative = path.strip_prefix(root)?;
+            if relative == Path::new(DATA_ROOT_LOCK_FILENAME) {
+                // The live artifact store intentionally byte-range locks this
+                // coordination file. It is not artifact payload state, and
+                // Windows correctly rejects reads while the lock is held.
+                continue;
+            }
             let file_type = entry.file_type()?;
             if file_type.is_dir() {
                 visit(root, &path, files)?;
             } else if file_type.is_file() {
-                files.insert(path.strip_prefix(root)?.to_path_buf(), fs::read(path)?);
+                files.insert(relative.to_path_buf(), fs::read(path)?);
             }
         }
         Ok(())
