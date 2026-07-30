@@ -324,7 +324,7 @@ async fn supervise(
     state: Arc<AtomicU8>,
     mut stdout: mpsc::Receiver<StdoutMessage>,
     events: mpsc::Sender<Result<serde_json::Value, SidecarError>>,
-    mut stdout_task: JoinHandle<()>,
+    stdout_task: JoinHandle<()>,
     mut stderr_task: JoinHandle<()>,
     completion: oneshot::Sender<JsonlProcessOutcome>,
     limits: SidecarLimits,
@@ -364,14 +364,7 @@ async fn supervise(
                 match status {
                     Some(Ok(status)) => {
                         lock(&process).start_kill();
-                        break drain_after_exit(
-                            status,
-                            &mut stdout,
-                            &events,
-                            &mut stdout_task,
-                            limits,
-                        )
-                        .await;
+                        break drain_after_exit(status, &mut stdout, &events, limits).await;
                     }
                     Some(Err(())) => {
                         break protocol_failure(&process, &events, limits).await;
@@ -400,7 +393,6 @@ async fn drain_after_exit(
     status: ExitStatus,
     stdout: &mut mpsc::Receiver<StdoutMessage>,
     events: &mpsc::Sender<Result<serde_json::Value, SidecarError>>,
-    stdout_task: &mut JoinHandle<()>,
     limits: SidecarLimits,
 ) -> JsonlProcessOutcome {
     let deadline = Instant::now()
@@ -420,7 +412,6 @@ async fn drain_after_exit(
                 }
             }
             Ok(Some(StdoutMessage::Eof)) | Ok(None) => {
-                let _ = stdout_task.await;
                 return if status.success() {
                     JsonlProcessOutcome::Succeeded
                 } else {

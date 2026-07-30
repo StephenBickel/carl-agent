@@ -741,8 +741,7 @@ fn inflight_grok_sigint_reaps_process_tree() -> TestResult {
     command.args(["auth", "login", "grok"]);
     let child = spawn_in_terminals(command)?;
     let pid_path = layout.data.join("providers/grok/fixture-pids.json");
-    wait_for_path(&pid_path, Duration::from_secs(5))?;
-    let pids_value: Value = serde_json::from_slice(&fs::read(&pid_path)?)?;
+    let pids_value = wait_for_json_value(&pid_path, Duration::from_secs(5))?;
     let pids = ["leader", "grandchild"]
         .into_iter()
         .map(|field| {
@@ -1025,6 +1024,26 @@ fn wait_for_path(path: &Path, timeout: Duration) -> TestResult {
         thread::sleep(Duration::from_millis(10));
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn wait_for_json_value(path: &Path, timeout: Duration) -> TestResult<Value> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Ok(contents) = fs::read(path)
+            && let Ok(value) = serde_json::from_slice(&contents)
+        {
+            return Ok(value);
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "timed out waiting for complete fixture JSON {}",
+                path.display()
+            )
+            .into());
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 struct HoldingStatus {

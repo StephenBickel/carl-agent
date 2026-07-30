@@ -25,9 +25,17 @@ All notable changes to Carl will be recorded here. The project is pre-alpha and 
 - An inert, library-level subscription-backed Codex exec adapter with layered
   model/reasoning settings, pinned CLI compatibility, private stdin task delivery,
   bounded normalized JSONL events, and supervised process-tree cancellation.
+- A normalized external-agent policy that defaults safe requests to owner approval
+  and denies live-workspace, environment, and provider-network authority drift.
+- Expiring single-use approvals bound to the exact actor, session, turn, tool call,
+  request digest, and lifetime.
+- Non-retaining secret detection that reports only stable rule classifications.
+- Capability-built sanitized staging with deterministic content-addressed manifests,
+  strict file/byte bounds, protected-path exclusions, and automatic cleanup.
 
 ### Not yet available
 
 - Native model execution remains unavailable.
-- Subscription-backed coding is not exposed through the CLI until staging, policy,
-  bound approval, independent verification, and stale-safe promotion are implemented.
+- Subscription-backed coding is not exposed through the CLI: no subscription coding
+  task is CLI-reachable until exact replacement proposal inspection, independent
+  verification, stale-safe promotion, and run-engine orchestration are implemented.

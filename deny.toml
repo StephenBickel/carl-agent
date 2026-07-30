@@ -10,6 +10,9 @@ version = 2
 confidence-threshold = 0.8
 allow = [
     "Apache-2.0",
+    # cap-std's Windows support reaches winx under Apache-2.0 with the
+    # standard LLVM exception; both terms are permissive and compatible.
+    "Apache-2.0 WITH LLVM-exception",
     "MIT",
     "Unicode-3.0",
     "Zlib",

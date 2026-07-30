@@ -355,6 +355,55 @@ fn changelog_records_auth_without_claiming_delegate_execution() {
 }
 
 #[test]
+fn documents_the_inert_external_agent_safety_foundation() {
+    assert_document_contains(
+        "README.md",
+        &[
+            "external-agent requests default to exact owner approval",
+            "denies writable live-workspace access",
+            "actor/session/turn/request-bound",
+            "single-use",
+            "capability-relative",
+            "secret-filtered",
+            "no subscription coding task is cli-reachable",
+            "proposal inspection, independent verification, and stale-safe promotion remain unavailable",
+        ],
+    );
+    assert_document_contains(
+        "docs/architecture.md",
+        &[
+            "`policy`: normalized external-agent capability requests",
+            "`security`: a non-retaining high-confidence secret filter",
+            "`staging`: bounded, capability-relative construction",
+            "exact replacement proposal",
+            "independent verification",
+            "stale-safe promotion",
+        ],
+    );
+    assert_document_contains(
+        "docs/security.md",
+        &[
+            "safe external-agent requests require approval by default",
+            "writable live-workspace access",
+            "single exact request digest",
+            "atomically consumed at most once",
+            "high-confidence secret finding rejects the entire stage",
+            "proposal inspection, verification, and promotion are not implemented",
+        ],
+    );
+    assert_document_contains(
+        "CHANGELOG.md",
+        &[
+            "normalized external-agent policy",
+            "expiring single-use approvals",
+            "non-retaining secret detection",
+            "capability-built sanitized staging",
+            "no subscription coding task is cli-reachable",
+        ],
+    );
+}
+
+#[test]
 fn active_product_surfaces_do_not_use_the_retired_brand() {
     let retired_brand = ["arc", "wren"].concat();
 

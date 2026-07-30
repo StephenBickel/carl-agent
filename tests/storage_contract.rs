@@ -68,18 +68,18 @@ fn fresh_database_is_migrated_and_configured_for_durable_use() -> Result<(), Box
     let migrations = connection.query_row("SELECT COUNT(*) FROM migrations", [], |row| {
         row.get::<_, u64>(0)
     })?;
-    assert_eq!(migrations, 1);
-    let checksum = connection.query_row(
-        "SELECT checksum FROM migrations WHERE version = 1",
-        [],
-        |row| row.get::<_, String>(0),
-    )?;
-    assert_eq!(checksum.len(), 64);
-    assert!(
-        checksum
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    );
+    assert_eq!(migrations, 2);
+    let checksums = connection
+        .prepare("SELECT checksum FROM migrations ORDER BY version")?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(checksums.len(), 2);
+    assert!(checksums.iter().all(|checksum| {
+        checksum.len() == 64
+            && checksum
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }));
 
     drop(connection);
     drop(store);
@@ -89,7 +89,7 @@ fn fresh_database_is_migrated_and_configured_for_durable_use() -> Result<(), Box
     let migrations = connection.query_row("SELECT COUNT(*) FROM migrations", [], |row| {
         row.get::<_, u64>(0)
     })?;
-    assert_eq!(migrations, 1);
+    assert_eq!(migrations, 2);
 
     Ok(())
 }
@@ -113,7 +113,7 @@ fn store_open_rejects_a_future_database_migration() -> Result<(), Box<dyn Error>
     ensure_checksum_column(&connection)?;
     connection.execute(
         "INSERT INTO migrations (version, name, applied_at, checksum)
-         VALUES (2, 'future migration', '2026-07-13T12:00:00Z', ?1)",
+         VALUES (3, 'future migration', '2026-07-13T12:00:00Z', ?1)",
         ["ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"],
     )?;
     drop(connection);
@@ -122,7 +122,7 @@ fn store_open_rejects_a_future_database_migration() -> Result<(), Box<dyn Error>
     assert!(matches!(
         error,
         CarlError::Storage { ref detail }
-            if detail.contains("unsupported database migration version 2")
+            if detail.contains("unsupported database migration version 3")
     ));
     Ok(())
 }

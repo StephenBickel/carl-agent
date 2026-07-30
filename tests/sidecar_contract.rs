@@ -23,8 +23,8 @@ use semver::{Version, VersionReq};
 use serde_json::json;
 use support::{
     PATH_SENTINEL, SECRET_SENTINEL, TestLayout, TestResult, dispatch_fixture, fixture_command,
-    short_limits, spawn_fixture, wait_for_fixture_pids, wait_for_received_count,
-    wait_until_processes_exit, wait_until_processes_reaped,
+    short_limits, spawn_fixture, wait_for_fixture_json, wait_for_fixture_pids,
+    wait_for_received_count, wait_until_processes_exit, wait_until_processes_reaped,
 };
 
 fn main() {
@@ -1992,13 +1992,7 @@ fn outbound_notifications_and_nonblocking_receive_are_bounded() -> TestResult {
             "params": {"headless": true},
         }))?;
         let notification_path = layout.home.join("outbound-notification.json");
-        for _ in 0..500 {
-            if notification_path.is_file() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(2)).await;
-        }
-        let outbound: serde_json::Value = serde_json::from_slice(&fs::read(notification_path)?)?;
+        let outbound = wait_for_fixture_json(&notification_path).await?;
         assert_eq!(outbound["method"], "client/ready");
 
         let response = sidecar

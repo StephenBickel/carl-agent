@@ -19,18 +19,33 @@ Carl does not attempt to defend a host account from an attacker who already cont
   environments, canonical executable identity checks, and supervised process trees;
 - the auth CLI emits deterministic safe JSON and keeps provider challenges, warnings,
   and terminal output on verified local stderr.
+- safe external-agent requests require approval by default, while writable
+  live-workspace access, environment grants, and provider-network mismatch fail
+  closed before approval;
+- external-agent approvals bind an actor, session, turn, tool call, expiry, and a
+  single exact request digest, and an allowed approval is atomically consumed at most
+  once;
+- secret findings retain only a stable classification, never matched bytes;
+- delegate stages are bounded, owner-only, capability-relative disposable copies.
+  They accept only permitted single-link UTF-8 regular files, exclude known sensitive
+  and executable configuration surfaces, and a high-confidence secret finding
+  rejects the entire stage.
 
 These properties improve auditability and failure behavior. They do not implement
-model-provider access, redaction of all future runtime data, filesystem confinement,
-approvals, or a complete process sandbox.
+model-provider access, a general runtime tool-policy system, redaction of all future
+runtime data, live-workspace promotion, or a complete process sandbox. Proposal
+inspection, verification, and promotion are not implemented, so no subscription
+coding task is user-reachable.
 
 ## Planned v1 controls
 
 The approved design requires:
 
 - canonical workspace-relative file access with symlink escape rejection;
-- typed `allow`, `ask`, or `deny` policy decisions for every tool proposal;
-- exact, expiring approvals bound to one call and one argument set;
+- typed `allow`, `ask`, or `deny` policy decisions for every non-delegate tool
+  proposal, extending the implemented external-agent boundary;
+- exact, expiring approvals for all consequential native tools, extending the
+  implemented bound approval store;
 - filtered child-process environments, deadlines, output caps, and cancellation;
 - bounded HTTP(S) fetches, with private-network destinations denied remotely by default;
 - known-credential redaction before events reach storage or frontends;

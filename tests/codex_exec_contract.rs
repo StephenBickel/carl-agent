@@ -378,7 +378,7 @@ fn process_streams_ordered_json_and_closes_stdin() -> TestResult {
         assert_eq!(received["openai_api_key"], serde_json::Value::Null);
         assert_eq!(received["codex_api_key"], serde_json::Value::Null);
         assert_eq!(
-            PathBuf::from(received["cwd"].as_str().ok_or("cwd is not a string")?),
+            PathBuf::from(received["cwd"].as_str().ok_or("cwd is not a string")?).canonicalize()?,
             layout.workspace.canonicalize()?
         );
         assert_eq!(
@@ -900,6 +900,12 @@ fn run_async<T>(future: impl std::future::Future<Output = T>) -> T {
         .block_on(future)
 }
 
+fn drain_fixture_stdin() -> io::Result<()> {
+    let mut input = Vec::new();
+    io::stdin().read_to_end(&mut input)?;
+    Ok(())
+}
+
 fn dispatch_exec_fixture(arguments: &[OsString]) -> Option<i32> {
     if arguments == [OsString::from("--version")] {
         let version = env::var_os("CODEX_HOME")
@@ -950,12 +956,23 @@ fn dispatch_exec_fixture(arguments: &[OsString]) -> Option<i32> {
             println!("{}", json!({"type": "fixture.completed"}));
             0
         }
-        "nonzero" => 17,
+        "nonzero" => {
+            if drain_fixture_stdin().is_err() {
+                return Some(74);
+            }
+            17
+        }
         "malformed" => {
+            if drain_fixture_stdin().is_err() {
+                return Some(74);
+            }
             println!("{{not-json");
             0
         }
         "oversized" => {
+            if drain_fixture_stdin().is_err() {
+                return Some(74);
+            }
             println!(
                 "{}",
                 json!({"type": "fixture.oversized", "payload": "x".repeat(9 * 1_024)})
@@ -963,6 +980,9 @@ fn dispatch_exec_fixture(arguments: &[OsString]) -> Option<i32> {
             0
         }
         "stderr" => {
+            if drain_fixture_stdin().is_err() {
+                return Some(74);
+            }
             let _ = writeln!(io::stderr(), "{SECRET_SENTINEL}");
             println!("{}", json!({"type": "fixture.completed"}));
             0
