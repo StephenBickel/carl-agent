@@ -95,7 +95,8 @@ impl ReasoningEffort {
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct DelegateSettings {
     model: Option<ModelId>,
     effort: Option<ReasoningEffort>,
@@ -118,13 +119,38 @@ impl DelegateSettings {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SettingSource {
     ProviderDefault,
     Personal,
     Project,
     Session,
     PerRun,
+}
+
+impl SettingSource {
+    pub fn parse(value: &str) -> Result<Self, CarlError> {
+        match value {
+            "provider_default" => Ok(Self::ProviderDefault),
+            "personal" => Ok(Self::Personal),
+            "project" => Ok(Self::Project),
+            "session" => Ok(Self::Session),
+            "per_run" => Ok(Self::PerRun),
+            _ => Err(validation_error("delegate setting source is invalid")),
+        }
+    }
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ProviderDefault => "provider_default",
+            Self::Personal => "personal",
+            Self::Project => "project",
+            Self::Session => "session",
+            Self::PerRun => "per_run",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]

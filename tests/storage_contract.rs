@@ -1,7 +1,10 @@
+use carl::delegates::{DelegateSettings, DelegateSettingsLayers};
 use carl::error::CarlError;
 use carl::events::{ApprovalId, Event, EventId, SessionId, ToolCallId};
-use carl::storage::{ApprovalStatus, MemoryState, Store};
-use rusqlite::{Connection, params};
+use carl::runtime::subscription::{RunConfigSnapshot, RunId};
+use carl::storage::{ApprovalStatus, MemoryState, NewSubscriptionRun, Store};
+use chrono::{DateTime, Utc};
+use rusqlite::{Connection, ErrorCode as SqliteErrorCode, params};
 use std::collections::BTreeSet;
 use std::error::Error;
 use std::fs;
@@ -57,6 +60,9 @@ fn fresh_database_is_migrated_and_configured_for_durable_use() -> Result<(), Box
         "migrations".to_owned(),
         "processed_telegram_updates".to_owned(),
         "sessions".to_owned(),
+        "session_delegate_settings".to_owned(),
+        "subscription_run_events".to_owned(),
+        "subscription_runs".to_owned(),
         "telegram_state".to_owned(),
         "usage_observations".to_owned(),
     ]);
@@ -68,12 +74,20 @@ fn fresh_database_is_migrated_and_configured_for_durable_use() -> Result<(), Box
     let migrations = connection.query_row("SELECT COUNT(*) FROM migrations", [], |row| {
         row.get::<_, u64>(0)
     })?;
-    assert_eq!(migrations, 2);
+    assert_eq!(migrations, 3);
     let checksums = connection
         .prepare("SELECT checksum FROM migrations ORDER BY version")?
         .query_map([], |row| row.get::<_, String>(0))?
         .collect::<Result<Vec<_>, _>>()?;
-    assert_eq!(checksums.len(), 2);
+    assert_eq!(checksums.len(), 3);
+    assert_eq!(
+        checksums,
+        [
+            "82b335d14e7368e3eef97384e97f74cfac926f21e24c78f495ef90134c41c582",
+            "1dfd44f6bb2bc3f0f05f6263c6446eaa9e7974d96b86052d0d9bc74dc43c271d",
+            "bb944b6783aae22313498e4ad388db36c48863182c3abae6e87ba4204bd8a691",
+        ]
+    );
     assert!(checksums.iter().all(|checksum| {
         checksum.len() == 64
             && checksum
@@ -89,7 +103,7 @@ fn fresh_database_is_migrated_and_configured_for_durable_use() -> Result<(), Box
     let migrations = connection.query_row("SELECT COUNT(*) FROM migrations", [], |row| {
         row.get::<_, u64>(0)
     })?;
-    assert_eq!(migrations, 2);
+    assert_eq!(migrations, 3);
 
     Ok(())
 }
@@ -113,7 +127,7 @@ fn store_open_rejects_a_future_database_migration() -> Result<(), Box<dyn Error>
     ensure_checksum_column(&connection)?;
     connection.execute(
         "INSERT INTO migrations (version, name, applied_at, checksum)
-         VALUES (3, 'future migration', '2026-07-13T12:00:00Z', ?1)",
+         VALUES (4, 'future migration', '2026-07-13T12:00:00Z', ?1)",
         ["ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"],
     )?;
     drop(connection);
@@ -122,7 +136,7 @@ fn store_open_rejects_a_future_database_migration() -> Result<(), Box<dyn Error>
     assert!(matches!(
         error,
         CarlError::Storage { ref detail }
-            if detail.contains("unsupported database migration version 3")
+            if detail.contains("unsupported database migration version 4")
     ));
     Ok(())
 }
@@ -146,6 +160,251 @@ fn store_open_rejects_a_tampered_migration_checksum() -> Result<(), Box<dyn Erro
         CarlError::Storage { ref detail }
             if detail.contains("migration 1 checksum mismatch")
     ));
+    Ok(())
+}
+
+#[test]
+fn pre_subscription_run_database_upgrades_without_rewriting_old_migrations()
+-> Result<(), Box<dyn Error>> {
+    let database = TemporaryDatabase::new();
+    let legacy_session_id = SessionId::new();
+    let legacy_event_id = EventId::new();
+    let connection = Connection::open(database.path())?;
+    connection.execute_batch(include_str!("../migrations/0001_init.sql"))?;
+    connection.execute_batch(include_str!("../migrations/0002_bound_approvals.sql"))?;
+    connection.execute(
+        "INSERT INTO migrations (version, name, applied_at, checksum)
+         VALUES
+            (1, 'initial schema', '2026-07-29T12:00:00Z', ?1),
+            (2, 'bound approvals', '2026-07-29T12:00:01Z', ?2)",
+        params![
+            "82b335d14e7368e3eef97384e97f74cfac926f21e24c78f495ef90134c41c582",
+            "1dfd44f6bb2bc3f0f05f6263c6446eaa9e7974d96b86052d0d9bc74dc43c271d",
+        ],
+    )?;
+    connection.execute(
+        "INSERT INTO sessions (id, created_at, updated_at)
+         VALUES (?1, '2026-07-29T12:00:02Z', '2026-07-29T12:00:02Z')",
+        [legacy_session_id.to_string()],
+    )?;
+    connection.execute(
+        "INSERT INTO events (
+            id, session_id, turn_id, sequence, timestamp, schema_version, event_json
+         ) VALUES (?1, ?2, NULL, 1, '2026-07-29T12:00:03Z', 1, ?3)",
+        params![
+            legacy_event_id.to_string(),
+            legacy_session_id.to_string(),
+            r#"{"schema_version":1,"type":"user_input","text":"legacy event"}"#,
+        ],
+    )?;
+    connection.execute(
+        "UPDATE sessions SET next_sequence = 2 WHERE id = ?1",
+        [legacy_session_id.to_string()],
+    )?;
+    drop(connection);
+
+    let mut store = Store::open(database.path())?;
+    let legacy_events = store.read_events(legacy_session_id)?;
+    assert_eq!(legacy_events.len(), 1);
+    assert_eq!(legacy_events[0].id, legacy_event_id);
+    assert_eq!(
+        legacy_events[0].event,
+        Event::UserInput {
+            text: "legacy event".to_owned()
+        }
+    );
+    let resolved = DelegateSettingsLayers::default().resolve();
+    let created_at = DateTime::parse_from_rfc3339("2026-07-29T12:00:04Z")?.with_timezone(&Utc);
+    let run_id = RunId::new();
+    store.create_subscription_run(NewSubscriptionRun::new(
+        run_id,
+        legacy_session_id,
+        carl::events::TurnId::new(),
+        DelegateSettings::default(),
+        RunConfigSnapshot::from_resolved(&resolved),
+        created_at,
+    )?)?;
+    assert_eq!(store.read_subscription_run_events(run_id)?.len(), 1);
+    assert_eq!(store.read_events(legacy_session_id)?.len(), 2);
+    drop(store);
+
+    let connection = Connection::open(database.path())?;
+    assert_eq!(
+        connection.query_row("SELECT COUNT(*) FROM migrations", [], |row| {
+            row.get::<_, u64>(0)
+        })?,
+        3
+    );
+    assert_eq!(
+        connection.query_row(
+            "SELECT COUNT(*) FROM sessions WHERE id = ?1",
+            [legacy_session_id.to_string()],
+            |row| row.get::<_, u64>(0),
+        )?,
+        1
+    );
+    assert_eq!(
+        connection.query_row(
+            "SELECT COUNT(*)
+             FROM sqlite_master
+             WHERE type = 'table'
+               AND name IN (
+                    'session_delegate_settings',
+                    'subscription_runs',
+                    'subscription_run_events'
+               )",
+            [],
+            |row| row.get::<_, u64>(0),
+        )?,
+        3
+    );
+
+    Ok(())
+}
+
+#[test]
+fn subscription_run_schema_rejects_invalid_projection_values() -> Result<(), Box<dyn Error>> {
+    let database = TemporaryDatabase::new();
+    let store = Store::open(database.path())?;
+    let session = store.create_session()?;
+    drop(store);
+
+    let connection = Connection::open(database.path())?;
+    connection.execute_batch("PRAGMA foreign_keys = ON;")?;
+    connection.execute(
+        "INSERT INTO session_delegate_settings (
+            session_id, provider, model, effort, updated_at
+         ) VALUES (?1, 'codex', 'gpt-5.6', 'high', '2026-07-29T12:00:00Z')",
+        [session.id.to_string()],
+    )?;
+    connection.execute(
+        "INSERT INTO subscription_runs (
+            id, session_id, turn_id, provider, state, revision,
+            per_run_model, per_run_effort,
+            resolved_model, resolved_effort, model_source, effort_source,
+            provider_model_status, provider_model_value,
+            provider_effort_status, provider_effort_value,
+            failure_code, created_at, updated_at
+         ) VALUES (
+            'run-valid', ?1, 'turn-valid', 'codex', 'prepared', 1,
+            'gpt-5.6', 'high',
+            'gpt-5.6', 'high', 'per_run', 'per_run',
+            'not_reported', NULL,
+            'not_reported', NULL,
+            NULL, '2026-07-29T12:00:01Z', '2026-07-29T12:00:01Z'
+         )",
+        [session.id.to_string()],
+    )?;
+
+    assert_constraint_violation(connection.execute(
+        "UPDATE subscription_runs SET state = 'succeeded' WHERE id = 'run-valid'",
+        [],
+    ));
+    assert_constraint_violation(connection.execute(
+        "UPDATE subscription_runs
+         SET provider_model_status = 'reported'
+         WHERE id = 'run-valid'",
+        [],
+    ));
+    assert_constraint_violation(connection.execute(
+        "UPDATE subscription_runs
+         SET state = 'failed'
+         WHERE id = 'run-valid'",
+        [],
+    ));
+    assert_constraint_violation(connection.execute(
+        "UPDATE subscription_runs
+         SET failure_code = 'delegate_start_failed'
+         WHERE id = 'run-valid'",
+        [],
+    ));
+    assert_constraint_violation(connection.execute(
+        "UPDATE subscription_runs
+         SET state = 'failed', failure_code = 'untyped_failure'
+         WHERE id = 'run-valid'",
+        [],
+    ));
+    assert_constraint_violation(connection.execute(
+        "UPDATE subscription_runs
+         SET model_source = 'provider_default'
+         WHERE id = 'run-valid'",
+        [],
+    ));
+    assert_constraint_violation(connection.execute(
+        "UPDATE subscription_runs
+         SET revision = 0
+         WHERE id = 'run-valid'",
+        [],
+    ));
+    assert_constraint_violation(connection.execute(
+        "UPDATE session_delegate_settings
+         SET effort = 'extreme'
+         WHERE session_id = ?1 AND provider = 'codex'",
+        [session.id.to_string()],
+    ));
+
+    Ok(())
+}
+
+#[test]
+fn subscription_run_event_index_requires_ordered_unique_global_events() -> Result<(), Box<dyn Error>>
+{
+    let database = TemporaryDatabase::new();
+    let store = Store::open(database.path())?;
+    let session = store.create_session()?;
+    drop(store);
+
+    let connection = Connection::open(database.path())?;
+    connection.execute_batch("PRAGMA foreign_keys = ON;")?;
+    connection.execute(
+        "INSERT INTO subscription_runs (
+            id, session_id, turn_id, provider, state, revision,
+            per_run_model, per_run_effort,
+            resolved_model, resolved_effort, model_source, effort_source,
+            provider_model_status, provider_model_value,
+            provider_effort_status, provider_effort_value,
+            failure_code, created_at, updated_at
+         ) VALUES (
+            'run-events', ?1, 'turn-events', 'codex', 'prepared', 1,
+            NULL, NULL,
+            NULL, NULL, 'provider_default', 'provider_default',
+            'not_reported', NULL,
+            'not_reported', NULL,
+            NULL, '2026-07-29T12:00:00Z', '2026-07-29T12:00:00Z'
+         )",
+        [session.id.to_string()],
+    )?;
+    connection.execute(
+        "INSERT INTO events (
+            id, session_id, turn_id, sequence, timestamp, schema_version, event_json
+         ) VALUES (
+            'event-one', ?1, 'turn-events', 1, '2026-07-29T12:00:01Z', 1,
+            '{\"schema_version\":1,\"type\":\"user_input\",\"text\":\"fixture\"}'
+         )",
+        [session.id.to_string()],
+    )?;
+    connection.execute(
+        "INSERT INTO subscription_run_events (run_id, run_sequence, event_id)
+         VALUES ('run-events', 1, 'event-one')",
+        [],
+    )?;
+
+    assert_constraint_violation(connection.execute(
+        "INSERT INTO subscription_run_events (run_id, run_sequence, event_id)
+         VALUES ('run-events', 0, 'missing-event')",
+        [],
+    ));
+    assert_constraint_violation(connection.execute(
+        "INSERT INTO subscription_run_events (run_id, run_sequence, event_id)
+         VALUES ('run-events', 2, 'event-one')",
+        [],
+    ));
+    assert_constraint_violation(connection.execute(
+        "INSERT INTO subscription_run_events (run_id, run_sequence, event_id)
+         VALUES ('run-events', 2, 'missing-event')",
+        [],
+    ));
+
     Ok(())
 }
 
@@ -344,9 +603,36 @@ fn reading_rejects_a_future_event_schema_as_a_typed_storage_error() -> Result<()
     assert!(matches!(
         error,
         CarlError::Storage { ref detail }
-            if detail.contains("unsupported event schema version 2")
+            if detail.contains("unsupported event schema version 3")
     ));
 
+    Ok(())
+}
+
+#[test]
+fn reading_rejects_mismatched_outer_and_embedded_event_versions() -> Result<(), Box<dyn Error>> {
+    let database = TemporaryDatabase::new();
+    let store = Store::open(database.path())?;
+    let session = store.create_session()?;
+    let connection = Connection::open(database.path())?;
+    connection.execute(
+        "INSERT INTO events (
+            id, session_id, turn_id, sequence, timestamp, schema_version, event_json
+         ) VALUES (?1, ?2, NULL, 1, ?3, 2, ?4)",
+        params![
+            EventId::new().to_string(),
+            session.id.to_string(),
+            "2026-07-13T12:00:00Z",
+            r#"{"schema_version":1,"type":"user_input","text":"legacy"}"#,
+        ],
+    )?;
+
+    let error = store.read_events(session.id).unwrap_err();
+    assert!(matches!(
+        error,
+        CarlError::Storage { ref detail }
+            if detail.contains("schema versions do not match")
+    ));
     Ok(())
 }
 
@@ -355,12 +641,12 @@ fn inject_future_event(path: &Path, session_id: SessionId) -> Result<(), Box<dyn
     connection.execute(
         "INSERT INTO events (
             id, session_id, turn_id, sequence, timestamp, schema_version, event_json
-         ) VALUES (?1, ?2, NULL, 1, ?3, 2, ?4)",
+         ) VALUES (?1, ?2, NULL, 1, ?3, 3, ?4)",
         params![
             EventId::new().to_string(),
             session_id.to_string(),
             "2026-07-13T12:00:00Z",
-            r#"{"schema_version":2,"type":"user_input","text":"future"}"#,
+            r#"{"schema_version":3,"type":"user_input","text":"future"}"#,
         ],
     )?;
     Ok(())
@@ -385,4 +671,16 @@ fn open_error(path: impl AsRef<Path>) -> CarlError {
         Ok(_) => panic!("Store::open unexpectedly accepted an incompatible database"),
         Err(error) => error,
     }
+}
+
+fn assert_constraint_violation(result: rusqlite::Result<usize>) {
+    let error = result.expect_err("invalid stored subscription-run value was accepted");
+    assert!(
+        matches!(
+            error,
+            rusqlite::Error::SqliteFailure(ref failure, _)
+                if failure.code == SqliteErrorCode::ConstraintViolation
+        ),
+        "expected a SQLite constraint violation, got {error:?}"
+    );
 }

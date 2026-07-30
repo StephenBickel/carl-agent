@@ -1,5 +1,7 @@
 use carl::error::{BudgetResource, CarlError, ErrorCode};
-use carl::events::{ApprovalId, Event, EventEnvelope, EventId, SessionId, ToolCallId, TurnId};
+use carl::events::{
+    ApprovalId, EVENT_SCHEMA_VERSION, Event, EventEnvelope, EventId, SessionId, ToolCallId, TurnId,
+};
 use carl::runtime::budget::{BudgetTracker, TurnBudget};
 use chrono::{TimeZone, Utc};
 use serde_json::{Value, json};
@@ -18,7 +20,7 @@ fn every_event_has_a_stable_type_and_schema_version() -> Result<(), Box<dyn std:
                 text: "hello".into(),
             },
             json!({
-                "schema_version": 1,
+                "schema_version": 2,
                 "type": "user_input",
                 "text": "hello",
             }),
@@ -28,7 +30,7 @@ fn every_event_has_a_stable_type_and_schema_version() -> Result<(), Box<dyn std:
                 text: "world".into(),
             },
             json!({
-                "schema_version": 1,
+                "schema_version": 2,
                 "type": "assistant_text_delta",
                 "text": "world",
             }),
@@ -40,7 +42,7 @@ fn every_event_has_a_stable_type_and_schema_version() -> Result<(), Box<dyn std:
                 arguments: json!({"path": "notes.txt"}),
             },
             json!({
-                "schema_version": 1,
+                "schema_version": 2,
                 "type": "tool_proposed",
                 "tool_call_id": "11111111-1111-4111-8111-111111111111",
                 "tool_name": "fs.read",
@@ -54,7 +56,7 @@ fn every_event_has_a_stable_type_and_schema_version() -> Result<(), Box<dyn std:
                 summary: "Read notes.txt".into(),
             },
             json!({
-                "schema_version": 1,
+                "schema_version": 2,
                 "type": "approval_requested",
                 "approval_id": "22222222-2222-4222-8222-222222222222",
                 "tool_call_id": "11111111-1111-4111-8111-111111111111",
@@ -67,7 +69,7 @@ fn every_event_has_a_stable_type_and_schema_version() -> Result<(), Box<dyn std:
                 output: json!({"text": "contents"}),
             },
             json!({
-                "schema_version": 1,
+                "schema_version": 2,
                 "type": "tool_completed",
                 "tool_call_id": "11111111-1111-4111-8111-111111111111",
                 "output": {"text": "contents"},
@@ -76,7 +78,7 @@ fn every_event_has_a_stable_type_and_schema_version() -> Result<(), Box<dyn std:
         (
             Event::TurnCompleted,
             json!({
-                "schema_version": 1,
+                "schema_version": 2,
                 "type": "turn_completed",
             }),
         ),
@@ -85,7 +87,7 @@ fn every_event_has_a_stable_type_and_schema_version() -> Result<(), Box<dyn std:
                 reason: "cancelled".into(),
             },
             json!({
-                "schema_version": 1,
+                "schema_version": 2,
                 "type": "turn_interrupted",
                 "reason": "cancelled",
             }),
@@ -102,9 +104,40 @@ fn every_event_has_a_stable_type_and_schema_version() -> Result<(), Box<dyn std:
 }
 
 #[test]
+fn schema_v1_literal_fixture_remains_readable_and_reencodes_as_v2()
+-> Result<(), Box<dyn std::error::Error>> {
+    const V1_FIXTURE: &str = r#"{
+        "schema_version": 1,
+        "type": "tool_proposed",
+        "tool_call_id": "11111111-1111-4111-8111-111111111111",
+        "tool_name": "fs.read",
+        "arguments": {"path": "notes.txt"}
+    }"#;
+
+    let decoded = serde_json::from_str::<Event>(V1_FIXTURE)?;
+    assert_eq!(
+        decoded,
+        Event::ToolProposed {
+            tool_call_id: ToolCallId::from_uuid(uuid::Uuid::parse_str(
+                "11111111-1111-4111-8111-111111111111",
+            )?),
+            tool_name: "fs.read".into(),
+            arguments: json!({"path": "notes.txt"}),
+        }
+    );
+    assert_eq!(
+        serde_json::to_value(decoded)?["schema_version"],
+        EVENT_SCHEMA_VERSION
+    );
+    assert_eq!(EVENT_SCHEMA_VERSION, 2);
+
+    Ok(())
+}
+
+#[test]
 fn event_rejects_an_unknown_future_schema_version() {
     let error = serde_json::from_value::<Event>(json!({
-        "schema_version": 2,
+        "schema_version": 3,
         "type": "user_input",
         "text": "hello",
     }))
@@ -113,7 +146,7 @@ fn event_rejects_an_unknown_future_schema_version() {
     assert!(
         error
             .to_string()
-            .contains("unsupported event schema version 2")
+            .contains("unsupported event schema version 3")
     );
 }
 
@@ -140,12 +173,12 @@ fn event_envelope_serializes_metadata_and_a_flattened_payload()
     assert_eq!(encoded["session_id"], session_id.to_string());
     assert_eq!(encoded["turn_id"], turn_id.to_string());
     assert_eq!(encoded["sequence"], 7);
-    assert_eq!(encoded["schema_version"], 1);
+    assert_eq!(encoded["schema_version"], 2);
     assert_eq!(encoded["timestamp"], "2026-07-13T12:34:56Z");
     assert_eq!(encoded["type"], "user_input");
     assert_eq!(encoded["text"], "hello");
     assert!(encoded.get("event").is_none());
-    assert_eq!(envelope.schema_version(), 1);
+    assert_eq!(envelope.schema_version(), 2);
     assert_eq!(serde_json::from_value::<EventEnvelope>(encoded)?, envelope);
 
     Ok(())

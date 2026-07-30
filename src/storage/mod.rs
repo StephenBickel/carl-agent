@@ -3,5 +3,6 @@ mod schema;
 
 pub use repository::{
     ApprovalRecord, ApprovalStatus, BoundApprovalBinding, BoundApprovalRecord, ConsumedApproval,
-    MemoryRecord, MemoryState, SessionRecord, Store,
+    MemoryRecord, MemoryState, NewSubscriptionRun, RuntimeStore, SessionDelegateSettingsRecord,
+    SessionRecord, Store, SubscriptionRunRecord,
 };

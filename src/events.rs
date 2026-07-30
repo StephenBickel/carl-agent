@@ -6,7 +6,11 @@ use std::fmt;
 use std::str::FromStr;
 use uuid::Uuid;
 
-pub const EVENT_SCHEMA_VERSION: u32 = 1;
+use crate::runtime::subscription::{
+    RunConfigSnapshot, RunId, RunState, RunTransition, RunTrustLabel,
+};
+
+pub const EVENT_SCHEMA_VERSION: u32 = 2;
 
 macro_rules! define_id {
     ($name:ident) => {
@@ -97,6 +101,25 @@ pub enum Event {
     TurnInterrupted {
         reason: String,
     },
+    SubscriptionRunPrepared {
+        run_id: RunId,
+        run_sequence: u64,
+        configuration: RunConfigSnapshot,
+        state: RunState,
+        trust_label: RunTrustLabel,
+    },
+    SubscriptionRunConfigurationObserved {
+        run_id: RunId,
+        run_sequence: u64,
+        configuration: RunConfigSnapshot,
+        trust_label: RunTrustLabel,
+    },
+    SubscriptionRunTransitioned {
+        run_id: RunId,
+        run_sequence: u64,
+        transition: RunTransition,
+        trust_label: RunTrustLabel,
+    },
 }
 
 impl Event {
@@ -140,6 +163,25 @@ enum EventRef<'a> {
     TurnInterrupted {
         reason: &'a str,
     },
+    SubscriptionRunPrepared {
+        run_id: RunId,
+        run_sequence: u64,
+        configuration: &'a RunConfigSnapshot,
+        state: RunState,
+        trust_label: RunTrustLabel,
+    },
+    SubscriptionRunConfigurationObserved {
+        run_id: RunId,
+        run_sequence: u64,
+        configuration: &'a RunConfigSnapshot,
+        trust_label: RunTrustLabel,
+    },
+    SubscriptionRunTransitioned {
+        run_id: RunId,
+        run_sequence: u64,
+        transition: &'a RunTransition,
+        trust_label: RunTrustLabel,
+    },
 }
 
 impl<'a> From<&'a Event> for EventRef<'a> {
@@ -174,6 +216,41 @@ impl<'a> From<&'a Event> for EventRef<'a> {
             },
             Event::TurnCompleted => Self::TurnCompleted,
             Event::TurnInterrupted { reason } => Self::TurnInterrupted { reason },
+            Event::SubscriptionRunPrepared {
+                run_id,
+                run_sequence,
+                configuration,
+                state,
+                trust_label,
+            } => Self::SubscriptionRunPrepared {
+                run_id: *run_id,
+                run_sequence: *run_sequence,
+                configuration,
+                state: *state,
+                trust_label: *trust_label,
+            },
+            Event::SubscriptionRunConfigurationObserved {
+                run_id,
+                run_sequence,
+                configuration,
+                trust_label,
+            } => Self::SubscriptionRunConfigurationObserved {
+                run_id: *run_id,
+                run_sequence: *run_sequence,
+                configuration,
+                trust_label: *trust_label,
+            },
+            Event::SubscriptionRunTransitioned {
+                run_id,
+                run_sequence,
+                transition,
+                trust_label,
+            } => Self::SubscriptionRunTransitioned {
+                run_id: *run_id,
+                run_sequence: *run_sequence,
+                transition,
+                trust_label: *trust_label,
+            },
         }
     }
 }
@@ -192,15 +269,29 @@ impl Serialize for Event {
 }
 
 #[derive(Deserialize)]
-struct VersionedEvent {
+struct EventVersion {
     schema_version: u32,
+}
+
+#[derive(Deserialize)]
+struct VersionedEventV1 {
+    #[serde(rename = "schema_version")]
+    _schema_version: u32,
     #[serde(flatten)]
-    payload: EventPayload,
+    payload: EventPayloadV1,
+}
+
+#[derive(Deserialize)]
+struct VersionedEventV2 {
+    #[serde(rename = "schema_version")]
+    _schema_version: u32,
+    #[serde(flatten)]
+    payload: EventPayloadV2,
 }
 
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-enum EventPayload {
+enum EventPayloadV1 {
     UserInput {
         text: String,
     },
@@ -227,12 +318,12 @@ enum EventPayload {
     },
 }
 
-impl From<EventPayload> for Event {
-    fn from(payload: EventPayload) -> Self {
+impl From<EventPayloadV1> for Event {
+    fn from(payload: EventPayloadV1) -> Self {
         match payload {
-            EventPayload::UserInput { text } => Self::UserInput { text },
-            EventPayload::AssistantTextDelta { text } => Self::AssistantTextDelta { text },
-            EventPayload::ToolProposed {
+            EventPayloadV1::UserInput { text } => Self::UserInput { text },
+            EventPayloadV1::AssistantTextDelta { text } => Self::AssistantTextDelta { text },
+            EventPayloadV1::ToolProposed {
                 tool_call_id,
                 tool_name,
                 arguments,
@@ -241,7 +332,7 @@ impl From<EventPayload> for Event {
                 tool_name,
                 arguments,
             },
-            EventPayload::ApprovalRequested {
+            EventPayloadV1::ApprovalRequested {
                 approval_id,
                 tool_call_id,
                 summary,
@@ -250,15 +341,134 @@ impl From<EventPayload> for Event {
                 tool_call_id,
                 summary,
             },
-            EventPayload::ToolCompleted {
+            EventPayloadV1::ToolCompleted {
                 tool_call_id,
                 output,
             } => Self::ToolCompleted {
                 tool_call_id,
                 output,
             },
-            EventPayload::TurnCompleted => Self::TurnCompleted,
-            EventPayload::TurnInterrupted { reason } => Self::TurnInterrupted { reason },
+            EventPayloadV1::TurnCompleted => Self::TurnCompleted,
+            EventPayloadV1::TurnInterrupted { reason } => Self::TurnInterrupted { reason },
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum EventPayloadV2 {
+    UserInput {
+        text: String,
+    },
+    AssistantTextDelta {
+        text: String,
+    },
+    ToolProposed {
+        tool_call_id: ToolCallId,
+        tool_name: String,
+        arguments: Value,
+    },
+    ApprovalRequested {
+        approval_id: ApprovalId,
+        tool_call_id: ToolCallId,
+        summary: String,
+    },
+    ToolCompleted {
+        tool_call_id: ToolCallId,
+        output: Value,
+    },
+    TurnCompleted,
+    TurnInterrupted {
+        reason: String,
+    },
+    SubscriptionRunPrepared {
+        run_id: RunId,
+        run_sequence: u64,
+        configuration: RunConfigSnapshot,
+        state: RunState,
+        trust_label: RunTrustLabel,
+    },
+    SubscriptionRunConfigurationObserved {
+        run_id: RunId,
+        run_sequence: u64,
+        configuration: RunConfigSnapshot,
+        trust_label: RunTrustLabel,
+    },
+    SubscriptionRunTransitioned {
+        run_id: RunId,
+        run_sequence: u64,
+        transition: RunTransition,
+        trust_label: RunTrustLabel,
+    },
+}
+
+impl From<EventPayloadV2> for Event {
+    fn from(payload: EventPayloadV2) -> Self {
+        match payload {
+            EventPayloadV2::UserInput { text } => Self::UserInput { text },
+            EventPayloadV2::AssistantTextDelta { text } => Self::AssistantTextDelta { text },
+            EventPayloadV2::ToolProposed {
+                tool_call_id,
+                tool_name,
+                arguments,
+            } => Self::ToolProposed {
+                tool_call_id,
+                tool_name,
+                arguments,
+            },
+            EventPayloadV2::ApprovalRequested {
+                approval_id,
+                tool_call_id,
+                summary,
+            } => Self::ApprovalRequested {
+                approval_id,
+                tool_call_id,
+                summary,
+            },
+            EventPayloadV2::ToolCompleted {
+                tool_call_id,
+                output,
+            } => Self::ToolCompleted {
+                tool_call_id,
+                output,
+            },
+            EventPayloadV2::TurnCompleted => Self::TurnCompleted,
+            EventPayloadV2::TurnInterrupted { reason } => Self::TurnInterrupted { reason },
+            EventPayloadV2::SubscriptionRunPrepared {
+                run_id,
+                run_sequence,
+                configuration,
+                state,
+                trust_label,
+            } => Self::SubscriptionRunPrepared {
+                run_id,
+                run_sequence,
+                configuration,
+                state,
+                trust_label,
+            },
+            EventPayloadV2::SubscriptionRunConfigurationObserved {
+                run_id,
+                run_sequence,
+                configuration,
+                trust_label,
+            } => Self::SubscriptionRunConfigurationObserved {
+                run_id,
+                run_sequence,
+                configuration,
+                trust_label,
+            },
+            EventPayloadV2::SubscriptionRunTransitioned {
+                run_id,
+                run_sequence,
+                transition,
+                trust_label,
+            } => Self::SubscriptionRunTransitioned {
+                run_id,
+                run_sequence,
+                transition,
+                trust_label,
+            },
         }
     }
 }
@@ -268,14 +478,20 @@ impl<'de> Deserialize<'de> for Event {
     where
         D: Deserializer<'de>,
     {
-        let event = VersionedEvent::deserialize(deserializer)?;
-        if event.schema_version != EVENT_SCHEMA_VERSION {
-            return Err(D::Error::custom(format_args!(
-                "unsupported event schema version {}",
-                event.schema_version
-            )));
+        let value = Value::deserialize(deserializer)?;
+        let version = serde_json::from_value::<EventVersion>(value.clone())
+            .map_err(|error| D::Error::custom(error.to_string()))?;
+        match version.schema_version {
+            1 => serde_json::from_value::<VersionedEventV1>(value)
+                .map(|event| event.payload.into())
+                .map_err(|error| D::Error::custom(error.to_string())),
+            2 => serde_json::from_value::<VersionedEventV2>(value)
+                .map(|event| event.payload.into())
+                .map_err(|error| D::Error::custom(error.to_string())),
+            unsupported => Err(D::Error::custom(format_args!(
+                "unsupported event schema version {unsupported}"
+            ))),
         }
-        Ok(event.payload.into())
     }
 }
 
