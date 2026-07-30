@@ -1001,6 +1001,10 @@ impl DataRootLock {
     pub(crate) fn runtime_data_root(&self) -> &Path {
         &self.data_root
     }
+
+    pub(crate) fn try_clone_root_directory(&self) -> std::io::Result<File> {
+        self._root_directory.try_clone()
+    }
 }
 
 impl Drop for DataRootLock {
@@ -1291,6 +1295,19 @@ type DirectoryIdentity = WindowsFileIdentity;
 fn directory_identity(directory: &File) -> Result<DirectoryIdentity, SidecarError> {
     windows_file_identity(directory)
         .map_err(|()| SidecarError::from_code(SidecarErrorCode::InvalidProviderHome))
+}
+
+pub(crate) fn directory_path_matches_held(path: &Path, held: &cap_std::fs::Dir) -> bool {
+    let Ok(named) = open_identity_directory(path) else {
+        return false;
+    };
+    let Ok(held) = held.try_clone().map(cap_std::fs::Dir::into_std_file) else {
+        return false;
+    };
+    match (directory_identity(&named), directory_identity(&held)) {
+        (Ok(named), Ok(held)) => named == held,
+        _ => false,
+    }
 }
 
 fn provider_home_operation_lock(identity: DirectoryIdentity) -> Arc<AsyncMutex<()>> {
@@ -3790,7 +3807,7 @@ fn directory_is_same_or_ancestor(ancestor: &Path, path: &Path) -> Result<bool, S
     Ok(false)
 }
 
-fn directory_paths_overlap(left: &Path, right: &Path) -> Result<bool, SidecarError> {
+pub(crate) fn directory_paths_overlap(left: &Path, right: &Path) -> Result<bool, SidecarError> {
     Ok(directory_is_same_or_ancestor(left, right)? || directory_is_same_or_ancestor(right, left)?)
 }
 
@@ -4105,6 +4122,52 @@ pub(crate) fn create_relative_private_file(
     }
     // SAFETY: NtCreateFile returned one new owned file handle.
     Ok(unsafe { File::from_raw_handle(handle) })
+}
+
+#[cfg(windows)]
+pub(crate) fn reopen_private_directory_for_flush(
+    directory: &cap_std::fs::Dir,
+) -> std::io::Result<File> {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle};
+
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_WRITE,
+        FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, ReOpenFile,
+        SYNCHRONIZE,
+    };
+
+    let original = directory.try_clone()?.into_std_file();
+    // SAFETY: original owns a live directory handle. ReOpenFile returns either
+    // INVALID_HANDLE_VALUE or one newly owned handle to the same filesystem object.
+    let handle = unsafe {
+        ReOpenFile(
+            original.as_raw_handle(),
+            FILE_GENERIC_WRITE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: ReOpenFile succeeded and transferred one owned handle.
+    let reopened = unsafe { File::from_raw_handle(handle) };
+    let metadata = reopened.metadata()?;
+    if !metadata.is_dir()
+        || is_link_or_reparse(&metadata)
+        || windows_file_identity(&original)
+            .map_err(|()| std::io::Error::other("identity failed"))?
+            != windows_file_identity(&reopened)
+                .map_err(|()| std::io::Error::other("identity failed"))?
+        || windows_security::verify_private_directory_handle(&reopened).is_err()
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "private directory flush handle verification failed",
+        ));
+    }
+    Ok(reopened)
 }
 
 #[cfg(windows)]

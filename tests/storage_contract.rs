@@ -54,6 +54,7 @@ fn fresh_database_is_migrated_and_configured_for_durable_use() -> Result<(), Box
         .collect::<Result<BTreeSet<_>, _>>()?;
     let required = BTreeSet::from([
         "approvals".to_owned(),
+        "artifact_objects".to_owned(),
         "events".to_owned(),
         "memories".to_owned(),
         "messages".to_owned(),
@@ -61,7 +62,11 @@ fn fresh_database_is_migrated_and_configured_for_durable_use() -> Result<(), Box
         "processed_telegram_updates".to_owned(),
         "sessions".to_owned(),
         "session_delegate_settings".to_owned(),
+        "subscription_run_baseline_entries".to_owned(),
+        "subscription_run_baselines".to_owned(),
         "subscription_run_events".to_owned(),
+        "subscription_run_inspections".to_owned(),
+        "subscription_run_proposals".to_owned(),
         "subscription_runs".to_owned(),
         "telegram_state".to_owned(),
         "usage_observations".to_owned(),
@@ -74,19 +79,23 @@ fn fresh_database_is_migrated_and_configured_for_durable_use() -> Result<(), Box
     let migrations = connection.query_row("SELECT COUNT(*) FROM migrations", [], |row| {
         row.get::<_, u64>(0)
     })?;
-    assert_eq!(migrations, 3);
+    assert_eq!(migrations, 4);
     let checksums = connection
         .prepare("SELECT checksum FROM migrations ORDER BY version")?
         .query_map([], |row| row.get::<_, String>(0))?
         .collect::<Result<Vec<_>, _>>()?;
-    assert_eq!(checksums.len(), 3);
+    assert_eq!(checksums.len(), 4);
     assert_eq!(
-        checksums,
+        &checksums[..3],
         [
             "82b335d14e7368e3eef97384e97f74cfac926f21e24c78f495ef90134c41c582",
             "1dfd44f6bb2bc3f0f05f6263c6446eaa9e7974d96b86052d0d9bc74dc43c271d",
             "bb944b6783aae22313498e4ad388db36c48863182c3abae6e87ba4204bd8a691",
         ]
+    );
+    assert_eq!(
+        checksums[3],
+        "081dbc079c7cb22c3eb55771092ad6a924b0273f1c34f2328adaaec670f4014e"
     );
     assert!(checksums.iter().all(|checksum| {
         checksum.len() == 64
@@ -103,7 +112,7 @@ fn fresh_database_is_migrated_and_configured_for_durable_use() -> Result<(), Box
     let migrations = connection.query_row("SELECT COUNT(*) FROM migrations", [], |row| {
         row.get::<_, u64>(0)
     })?;
-    assert_eq!(migrations, 3);
+    assert_eq!(migrations, 4);
 
     Ok(())
 }
@@ -127,7 +136,7 @@ fn store_open_rejects_a_future_database_migration() -> Result<(), Box<dyn Error>
     ensure_checksum_column(&connection)?;
     connection.execute(
         "INSERT INTO migrations (version, name, applied_at, checksum)
-         VALUES (4, 'future migration', '2026-07-13T12:00:00Z', ?1)",
+         VALUES (5, 'future migration', '2026-07-13T12:00:00Z', ?1)",
         ["ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"],
     )?;
     drop(connection);
@@ -136,7 +145,7 @@ fn store_open_rejects_a_future_database_migration() -> Result<(), Box<dyn Error>
     assert!(matches!(
         error,
         CarlError::Storage { ref detail }
-            if detail.contains("unsupported database migration version 4")
+            if detail.contains("unsupported database migration version 5")
     ));
     Ok(())
 }
@@ -233,13 +242,15 @@ fn pre_subscription_run_database_upgrades_without_rewriting_old_migrations()
         connection.query_row("SELECT COUNT(*) FROM migrations", [], |row| {
             row.get::<_, u64>(0)
         })?,
-        3
+        4
     );
+    let checksums = connection
+        .prepare("SELECT checksum FROM migrations ORDER BY version")?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(checksums.len(), 4);
     assert_eq!(
-        connection
-            .prepare("SELECT checksum FROM migrations ORDER BY version")?
-            .query_map([], |row| row.get::<_, String>(0))?
-            .collect::<Result<Vec<_>, _>>()?,
+        &checksums[..3],
         [
             "e019c38bf699633416f7084691fa3686c3f3170725fe74afed751be50102201a",
             "157c7feae68f02ab41d598c777981560a123f6d95a26e9a6f13a5adae4e99c28",
@@ -261,14 +272,78 @@ fn pre_subscription_run_database_upgrades_without_rewriting_old_migrations()
              FROM sqlite_master
              WHERE type = 'table'
                AND name IN (
+                    'artifact_objects',
                     'session_delegate_settings',
+                    'subscription_run_baseline_entries',
+                    'subscription_run_baselines',
                     'subscription_runs',
-                    'subscription_run_events'
+                    'subscription_run_events',
+                    'subscription_run_inspections',
+                    'subscription_run_proposals'
                )",
             [],
             |row| row.get::<_, u64>(0),
         )?,
-        3
+        8
+    );
+
+    Ok(())
+}
+
+#[test]
+fn pre_proposal_artifact_database_upgrades_through_migration_four_and_reopens()
+-> Result<(), Box<dyn Error>> {
+    let database = TemporaryDatabase::new();
+    let connection = Connection::open(database.path())?;
+    connection.execute_batch(include_str!("../migrations/0001_init.sql"))?;
+    connection.execute_batch(include_str!("../migrations/0002_bound_approvals.sql"))?;
+    connection.execute_batch(include_str!("../migrations/0003_subscription_runs.sql"))?;
+    connection.execute(
+        "INSERT INTO migrations (version, name, applied_at, checksum)
+         VALUES
+            (1, 'initial schema', '2026-07-29T12:00:00Z', ?1),
+            (2, 'bound approvals', '2026-07-29T12:00:01Z', ?2),
+            (3, 'subscription runs', '2026-07-29T12:00:02Z', ?3)",
+        params![
+            "82b335d14e7368e3eef97384e97f74cfac926f21e24c78f495ef90134c41c582",
+            "1dfd44f6bb2bc3f0f05f6263c6446eaa9e7974d96b86052d0d9bc74dc43c271d",
+            "bb944b6783aae22313498e4ad388db36c48863182c3abae6e87ba4204bd8a691",
+        ],
+    )?;
+    drop(connection);
+
+    drop(Store::open(database.path())?);
+    let connection = Connection::open(database.path())?;
+    assert_eq!(
+        connection.query_row("SELECT COUNT(*) FROM migrations", [], |row| {
+            row.get::<_, u64>(0)
+        })?,
+        4
+    );
+    let tables = connection
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    let artifact_tables = BTreeSet::from([
+        "artifact_objects".to_owned(),
+        "subscription_run_baseline_entries".to_owned(),
+        "subscription_run_baselines".to_owned(),
+        "subscription_run_inspections".to_owned(),
+        "subscription_run_proposals".to_owned(),
+    ]);
+    assert!(
+        artifact_tables.is_subset(&tables),
+        "missing migration-4 tables: {artifact_tables:?} vs {tables:?}"
+    );
+    drop(connection);
+
+    drop(Store::open(database.path())?);
+    let connection = Connection::open(database.path())?;
+    assert_eq!(
+        connection.query_row("SELECT COUNT(*) FROM migrations", [], |row| {
+            row.get::<_, u64>(0)
+        })?,
+        4
     );
 
     Ok(())

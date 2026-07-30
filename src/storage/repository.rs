@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::ops::{Deref, DerefMut};
 use std::path::Path;
 use std::time::Duration;
@@ -6,8 +7,10 @@ use std::{fs, io};
 use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use crate::artifacts::{ArtifactId, ArtifactStore};
 use crate::delegates::{DelegateSettings, ModelId, ReasoningEffort, SettingSource};
 use crate::error::CarlError;
 use crate::events::{
@@ -18,7 +21,12 @@ use crate::runtime::subscription::{
     ProviderReported, RunConfigSnapshot, RunFailureCode, RunId, RunState, RunTransition,
     RunTrustLabel,
 };
+use crate::security::SecretFilter;
 use crate::sidecar::DataRootLock;
+use crate::staging::{
+    ExactReplacementProposal, ProposalLimits, ProposalOutcome, SanitizedStage, SealedBaseline,
+    SourcePreconditionRef, canonical_source_preconditions,
+};
 
 use super::schema;
 
@@ -26,6 +34,7 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_BOUND_APPROVAL_LIFETIME: chrono::TimeDelta = chrono::TimeDelta::minutes(15);
 const MAX_APPROVAL_SUMMARY_BYTES: usize = 4 * 1_024;
 const RUNTIME_DATABASE_FILENAME: &str = "carl.sqlite3";
+const EXACT_REPLACEMENT_DOMAIN: &[u8] = b"carl.exact-replacement.v1\0";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionRecord {
@@ -324,6 +333,83 @@ pub struct SubscriptionRunRecord {
     pub updated_at: DateTime<Utc>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubscriptionRunBaselineEntryRecord {
+    pub ordinal: u64,
+    pub path: String,
+    pub byte_length: u64,
+    pub content_digest: Sha256Digest,
+    pub content_artifact_id: ArtifactId,
+    pub identity_platform: String,
+    pub identity_a: String,
+    pub identity_b: String,
+    pub owner_id: String,
+    pub owner_mode: Option<u32>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubscriptionRunBaselineRecord {
+    pub run_id: RunId,
+    pub manifest_artifact_id: ArtifactId,
+    pub manifest_digest: Sha256Digest,
+    pub source_preconditions_artifact_id: ArtifactId,
+    pub source_preconditions_digest: Sha256Digest,
+    pub entry_count: u64,
+    pub total_bytes: u64,
+    pub entries: Vec<SubscriptionRunBaselineEntryRecord>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SubscriptionRunInspectionOutcome {
+    NoChanges,
+    ExactReplacement,
+}
+
+impl SubscriptionRunInspectionOutcome {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::NoChanges => "no_changes",
+            Self::ExactReplacement => "exact_replacement",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, CarlError> {
+        match value {
+            "no_changes" => Ok(Self::NoChanges),
+            "exact_replacement" => Ok(Self::ExactReplacement),
+            other => Err(invalid_stored_value(
+                "subscription run inspection outcome",
+                other,
+            )),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubscriptionRunInspectionRecord {
+    pub run_id: RunId,
+    pub outcome: SubscriptionRunInspectionOutcome,
+    pub stage_manifest_digest: Sha256Digest,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubscriptionRunProposalRecord {
+    pub run_id: RunId,
+    pub proposal_artifact_id: ArtifactId,
+    pub payload_artifact_id: ArtifactId,
+    pub baseline_manifest_artifact_id: ArtifactId,
+    pub candidate_manifest_digest: Sha256Digest,
+    pub path: String,
+    pub expected_live_hash: Sha256Digest,
+    pub before_hash: Sha256Digest,
+    pub after_hash: Sha256Digest,
+    pub payload_hash: Sha256Digest,
+    pub payload_bytes: u64,
+    pub created_at: DateTime<Utc>,
+}
+
 pub struct Store {
     connection: Connection,
 }
@@ -610,6 +696,266 @@ impl Store {
         let events = load_and_validate_subscription_run_events(&transaction, &projection)?;
         transaction.commit().map_err(storage_error)?;
         Ok(events)
+    }
+
+    fn record_subscription_run_baseline(
+        &mut self,
+        run_id: RunId,
+        expected_state: RunState,
+        expected_revision: u64,
+        baseline: &SealedBaseline,
+        artifacts: &ArtifactStore,
+        created_at: DateTime<Utc>,
+    ) -> Result<Option<SubscriptionRunBaselineRecord>, CarlError> {
+        if expected_state != RunState::Prepared {
+            return Err(CarlError::Validation {
+                detail: "a sealed baseline can only be recorded for a prepared run".to_owned(),
+            });
+        }
+        let (manifest_bytes, source_preconditions_bytes) = validate_sealed_baseline(baseline)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage_error)?;
+        if !subscription_run_matches(&transaction, run_id, expected_state, expected_revision)? {
+            transaction.commit().map_err(storage_error)?;
+            return Ok(None);
+        }
+        if subscription_run_has_baseline(&transaction, run_id)? {
+            return Err(CarlError::Validation {
+                detail: "the subscription run baseline is already recorded".to_owned(),
+            });
+        }
+
+        register_artifact_object(
+            &transaction,
+            baseline.manifest_artifact_id(),
+            usize_to_u64(manifest_bytes.len(), "baseline manifest length")?,
+            created_at,
+        )?;
+        register_artifact_object(
+            &transaction,
+            baseline.source_preconditions_artifact_id(),
+            usize_to_u64(
+                source_preconditions_bytes.len(),
+                "source preconditions length",
+            )?,
+            created_at,
+        )?;
+        transaction
+            .execute(
+                "INSERT INTO subscription_run_baselines (
+                    run_id, manifest_artifact_id, manifest_digest,
+                    source_preconditions_artifact_id, source_preconditions_digest,
+                    entry_count, total_bytes, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    run_id.to_string(),
+                    baseline.manifest_artifact_id().as_str(),
+                    baseline.manifest().digest().to_string(),
+                    baseline.source_preconditions_artifact_id().as_str(),
+                    baseline.source_preconditions_digest().to_string(),
+                    usize_to_sql(baseline.entries().len(), "baseline entry count")?,
+                    revision_to_sql(baseline.manifest().total_bytes())?,
+                    format_timestamp(created_at),
+                ],
+            )
+            .map_err(storage_error)?;
+        for (ordinal, entry) in baseline.entries().iter().enumerate() {
+            register_artifact_object(
+                &transaction,
+                entry.content_artifact_id(),
+                entry.bytes(),
+                created_at,
+            )?;
+            let identity = entry.source_identity();
+            transaction
+                .execute(
+                    "INSERT INTO subscription_run_baseline_entries (
+                        run_id, ordinal, path, byte_length,
+                        content_sha256, content_artifact_id,
+                        identity_platform, identity_a, identity_b,
+                        owner_id, owner_mode
+                     ) VALUES (
+                        ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11
+                     )",
+                    params![
+                        run_id.to_string(),
+                        usize_to_sql(ordinal, "baseline entry ordinal")?,
+                        entry.path(),
+                        revision_to_sql(entry.bytes())?,
+                        entry.content_digest().to_string(),
+                        entry.content_artifact_id().as_str(),
+                        identity.platform,
+                        identity.identity_a,
+                        identity.identity_b,
+                        identity.owner_id,
+                        identity.owner_mode.map(i64::from),
+                    ],
+                )
+                .map_err(storage_error)?;
+        }
+        verify_sealed_baseline_artifacts(artifacts, baseline)?;
+        transaction.commit().map_err(storage_error)?;
+
+        self.get_subscription_run_baseline(run_id)?
+            .map(Some)
+            .ok_or_else(|| storage_invariant("recorded subscription run baseline disappeared"))
+    }
+
+    fn get_subscription_run_baseline(
+        &self,
+        run_id: RunId,
+    ) -> Result<Option<SubscriptionRunBaselineRecord>, CarlError> {
+        load_subscription_run_baseline(&self.connection, run_id)
+    }
+
+    fn record_subscription_run_no_changes(
+        &mut self,
+        run_id: RunId,
+        expected_state: RunState,
+        expected_revision: u64,
+        created_at: DateTime<Utc>,
+    ) -> Result<Option<SubscriptionRunInspectionRecord>, CarlError> {
+        if expected_state != RunState::Inspecting {
+            return Err(CarlError::Validation {
+                detail: "a no-change result can only be recorded while inspecting".to_owned(),
+            });
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage_error)?;
+        if !subscription_run_matches(&transaction, run_id, expected_state, expected_revision)? {
+            transaction.commit().map_err(storage_error)?;
+            return Ok(None);
+        }
+        reject_existing_subscription_run_inspection(&transaction, run_id)?;
+        let baseline = load_subscription_run_baseline(&transaction, run_id)?
+            .ok_or_else(|| storage_invariant("subscription run has no sealed baseline"))?;
+        insert_subscription_run_inspection(
+            &transaction,
+            run_id,
+            SubscriptionRunInspectionOutcome::NoChanges,
+            baseline.manifest_digest,
+            created_at,
+        )?;
+        transaction.commit().map_err(storage_error)?;
+
+        self.get_subscription_run_inspection(run_id)?
+            .map(Some)
+            .ok_or_else(|| storage_invariant("recorded no-change inspection disappeared"))
+    }
+
+    fn record_subscription_run_exact_proposal(
+        &mut self,
+        run_id: RunId,
+        expected_state: RunState,
+        expected_revision: u64,
+        proposal: &ExactReplacementProposal,
+        artifacts: &ArtifactStore,
+        created_at: DateTime<Utc>,
+    ) -> Result<Option<SubscriptionRunProposalRecord>, CarlError> {
+        if expected_state != RunState::Inspecting {
+            return Err(CarlError::Validation {
+                detail: "an exact proposal can only be recorded while inspecting".to_owned(),
+            });
+        }
+        let proposal_envelope = validate_exact_replacement_proposal(proposal)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage_error)?;
+        if !subscription_run_matches(&transaction, run_id, expected_state, expected_revision)? {
+            transaction.commit().map_err(storage_error)?;
+            return Ok(None);
+        }
+        reject_existing_subscription_run_inspection(&transaction, run_id)?;
+        let baseline = load_subscription_run_baseline(&transaction, run_id)?
+            .ok_or_else(|| storage_invariant("subscription run has no sealed baseline"))?;
+        validate_proposal_against_baseline(proposal, &baseline)?;
+
+        register_artifact_object(
+            &transaction,
+            proposal.artifact_id(),
+            usize_to_u64(proposal_envelope.len(), "proposal envelope length")?,
+            created_at,
+        )?;
+        register_artifact_object(
+            &transaction,
+            proposal.payload_artifact_id(),
+            usize_to_u64(proposal.payload().len(), "proposal payload length")?,
+            created_at,
+        )?;
+        insert_subscription_run_inspection(
+            &transaction,
+            run_id,
+            SubscriptionRunInspectionOutcome::ExactReplacement,
+            proposal.candidate_manifest_digest(),
+            created_at,
+        )?;
+        transaction
+            .execute(
+                "INSERT INTO subscription_run_proposals (
+                    run_id, outcome, proposal_artifact_id,
+                    baseline_manifest_artifact_id, path,
+                    expected_live_sha256, before_sha256, after_sha256,
+                    payload_sha256, payload_bytes, created_at
+                 ) VALUES (
+                    ?1, 'exact_replacement', ?2, ?3, ?4,
+                    ?5, ?6, ?7, ?8, ?9, ?10
+                 )",
+                params![
+                    run_id.to_string(),
+                    proposal.artifact_id().as_str(),
+                    baseline.manifest_artifact_id.as_str(),
+                    proposal.path(),
+                    proposal.expected_live_hash().to_string(),
+                    proposal.before_hash().to_string(),
+                    proposal.after_hash().to_string(),
+                    proposal.payload_hash().to_string(),
+                    usize_to_sql(proposal.payload().len(), "proposal payload length")?,
+                    format_timestamp(created_at),
+                ],
+            )
+            .map_err(storage_error)?;
+        verify_exact_proposal_artifacts(artifacts, proposal)?;
+        transaction.commit().map_err(storage_error)?;
+
+        self.get_subscription_run_proposal(run_id)?
+            .map(Some)
+            .ok_or_else(|| storage_invariant("recorded exact proposal disappeared"))
+    }
+
+    fn get_subscription_run_inspection(
+        &self,
+        run_id: RunId,
+    ) -> Result<Option<SubscriptionRunInspectionRecord>, CarlError> {
+        let inspection = load_subscription_run_inspection(&self.connection, run_id)?;
+        let has_proposal = subscription_run_has_proposal(&self.connection, run_id)?;
+        if has_proposal
+            != inspection.as_ref().is_some_and(|inspection| {
+                inspection.outcome == SubscriptionRunInspectionOutcome::ExactReplacement
+            })
+        {
+            return Err(storage_invariant(
+                "subscription run inspection and proposal disagree",
+            ));
+        }
+        Ok(inspection)
+    }
+
+    fn get_subscription_run_proposal(
+        &self,
+        run_id: RunId,
+    ) -> Result<Option<SubscriptionRunProposalRecord>, CarlError> {
+        let proposal = load_subscription_run_proposal(&self.connection, run_id)?;
+        if proposal.is_none() && subscription_run_has_proposal(&self.connection, run_id)? {
+            return Err(storage_invariant(
+                "subscription run proposal has no matching inspection",
+            ));
+        }
+        Ok(proposal)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1230,6 +1576,7 @@ impl Store {
 /// capability, performs startup recovery, and retains exclusivity until drop.
 pub struct RuntimeStore {
     store: Store,
+    artifacts: ArtifactStore,
     startup_recoveries: Vec<RunId>,
     _data_root_lock: DataRootLock,
 }
@@ -1245,6 +1592,8 @@ impl RuntimeStore {
                 "runtime data root changed after lock acquisition",
             ));
         }
+        let artifacts = ArtifactStore::open_or_create_for_runtime(&data_root_lock)
+            .map_err(artifact_storage_error)?;
         let path = data_root.join(RUNTIME_DATABASE_FILENAME);
         match fs::symlink_metadata(&path) {
             Ok(metadata) if !metadata.file_type().is_file() => {
@@ -1264,6 +1613,7 @@ impl RuntimeStore {
                 "runtime data root changed while opening durable state",
             ));
         }
+        reconcile_runtime_artifacts(&mut store, &artifacts)?;
         let startup_recoveries = store
             .interrupt_abandoned_subscription_runs(startup_at)?
             .into_iter()
@@ -1271,6 +1621,7 @@ impl RuntimeStore {
             .collect();
         Ok(Self {
             store,
+            artifacts,
             startup_recoveries,
             _data_root_lock: data_root_lock,
         })
@@ -1287,9 +1638,241 @@ impl RuntimeStore {
     }
 
     #[must_use]
+    pub const fn artifacts(&self) -> &ArtifactStore {
+        &self.artifacts
+    }
+
+    pub fn record_subscription_run_baseline(
+        &mut self,
+        run_id: RunId,
+        expected_state: RunState,
+        expected_revision: u64,
+        baseline: &SealedBaseline,
+        created_at: DateTime<Utc>,
+    ) -> Result<Option<SubscriptionRunBaselineRecord>, CarlError> {
+        verify_sealed_baseline_artifacts(&self.artifacts, baseline)?;
+        match self.store.record_subscription_run_baseline(
+            run_id,
+            expected_state,
+            expected_revision,
+            baseline,
+            &self.artifacts,
+            created_at,
+        )? {
+            None => Ok(None),
+            Some(_) => self
+                .get_subscription_run_baseline(run_id)?
+                .map(Some)
+                .ok_or_else(|| storage_invariant("recorded subscription run baseline disappeared")),
+        }
+    }
+
+    pub fn get_subscription_run_baseline(
+        &self,
+        run_id: RunId,
+    ) -> Result<Option<SubscriptionRunBaselineRecord>, CarlError> {
+        let baseline = self.store.get_subscription_run_baseline(run_id)?;
+        if let Some(baseline) = &baseline {
+            verify_loaded_baseline_artifacts(&self.artifacts, baseline)?;
+        }
+        Ok(baseline)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_subscription_run_no_changes(
+        &mut self,
+        run_id: RunId,
+        expected_state: RunState,
+        expected_revision: u64,
+        stage: &SanitizedStage,
+        limits: ProposalLimits,
+        secret_filter: SecretFilter,
+        created_at: DateTime<Utc>,
+    ) -> Result<Option<SubscriptionRunInspectionRecord>, CarlError> {
+        match stage
+            .inspect_proposal(&self.artifacts, limits, secret_filter)
+            .map_err(proposal_storage_error)?
+        {
+            ProposalOutcome::NoChanges => {}
+            ProposalOutcome::ExactReplacement(_) => {
+                return Err(artifact_validation_error(
+                    "a changed stage cannot be recorded as no changes",
+                ));
+            }
+        }
+        verify_sealed_baseline_artifacts(&self.artifacts, stage.sealed_baseline())?;
+        let persisted = self
+            .get_subscription_run_baseline(run_id)?
+            .ok_or_else(|| storage_invariant("subscription run has no sealed baseline"))?;
+        if persisted.manifest_artifact_id != *stage.sealed_baseline().manifest_artifact_id()
+            || persisted.manifest_digest != stage.baseline_manifest().digest()
+        {
+            return Err(artifact_validation_error(
+                "no-change inspection references a different sealed baseline",
+            ));
+        }
+        match self.store.record_subscription_run_no_changes(
+            run_id,
+            expected_state,
+            expected_revision,
+            created_at,
+        )? {
+            None => Ok(None),
+            Some(_) => self
+                .get_subscription_run_inspection(run_id)?
+                .map(Some)
+                .ok_or_else(|| storage_invariant("recorded no-change inspection disappeared")),
+        }
+    }
+
+    pub fn record_subscription_run_exact_proposal(
+        &mut self,
+        run_id: RunId,
+        expected_state: RunState,
+        expected_revision: u64,
+        proposal: &ExactReplacementProposal,
+        created_at: DateTime<Utc>,
+    ) -> Result<Option<SubscriptionRunProposalRecord>, CarlError> {
+        verify_exact_proposal_artifacts(&self.artifacts, proposal)?;
+        let baseline = self
+            .get_subscription_run_baseline(run_id)?
+            .ok_or_else(|| storage_invariant("subscription run has no sealed baseline"))?;
+        validate_proposal_against_baseline(proposal, &baseline)?;
+        if candidate_manifest_digest(
+            &baseline,
+            proposal.path(),
+            proposal.payload(),
+            proposal.payload_hash(),
+        )? != proposal.candidate_manifest_digest()
+        {
+            return Err(artifact_validation_error(
+                "proposal candidate manifest digest is inconsistent",
+            ));
+        }
+        match self.store.record_subscription_run_exact_proposal(
+            run_id,
+            expected_state,
+            expected_revision,
+            proposal,
+            &self.artifacts,
+            created_at,
+        )? {
+            None => Ok(None),
+            Some(_) => self
+                .get_subscription_run_proposal(run_id)?
+                .map(Some)
+                .ok_or_else(|| storage_invariant("recorded exact proposal disappeared")),
+        }
+    }
+
+    pub fn get_subscription_run_inspection(
+        &self,
+        run_id: RunId,
+    ) -> Result<Option<SubscriptionRunInspectionRecord>, CarlError> {
+        let inspection = self.store.get_subscription_run_inspection(run_id)?;
+        if let Some(inspection) = &inspection {
+            match inspection.outcome {
+                SubscriptionRunInspectionOutcome::NoChanges => {
+                    let baseline =
+                        self.get_subscription_run_baseline(run_id)?.ok_or_else(|| {
+                            storage_invariant("no-change inspection has no sealed baseline")
+                        })?;
+                    if inspection.stage_manifest_digest != baseline.manifest_digest {
+                        return Err(storage_invariant(
+                            "no-change inspection digest disagrees with its sealed baseline",
+                        ));
+                    }
+                }
+                SubscriptionRunInspectionOutcome::ExactReplacement => {
+                    self.get_subscription_run_proposal(run_id)?.ok_or_else(|| {
+                        storage_invariant("exact inspection has no verified proposal")
+                    })?;
+                }
+            }
+        }
+        Ok(inspection)
+    }
+
+    pub fn get_subscription_run_proposal(
+        &self,
+        run_id: RunId,
+    ) -> Result<Option<SubscriptionRunProposalRecord>, CarlError> {
+        let proposal = self.store.get_subscription_run_proposal(run_id)?;
+        let Some(proposal) = proposal else {
+            return Ok(None);
+        };
+        let baseline = self
+            .get_subscription_run_baseline(run_id)?
+            .ok_or_else(|| storage_invariant("stored proposal has no sealed baseline"))?;
+        verify_loaded_proposal_artifacts(&self.artifacts, &baseline, &proposal)?;
+        Ok(Some(proposal))
+    }
+
+    #[must_use]
     pub fn startup_recoveries(&self) -> &[RunId] {
         &self.startup_recoveries
     }
+}
+
+fn reconcile_runtime_artifacts(
+    store: &mut Store,
+    artifacts: &ArtifactStore,
+) -> Result<(), CarlError> {
+    let transaction = store
+        .connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(storage_error)?;
+    let referenced = referenced_artifact_ids(&transaction)?;
+    artifacts
+        .retain_only(&referenced)
+        .map_err(artifact_storage_error)?;
+    transaction
+        .execute(
+            "DELETE FROM artifact_objects
+             WHERE id NOT IN (
+                 SELECT manifest_artifact_id FROM subscription_run_baselines
+                 UNION
+                 SELECT source_preconditions_artifact_id FROM subscription_run_baselines
+                 UNION
+                 SELECT content_artifact_id FROM subscription_run_baseline_entries
+                 UNION
+                 SELECT proposal_artifact_id FROM subscription_run_proposals
+                 UNION
+                 SELECT payload_sha256 FROM subscription_run_proposals
+             )",
+            [],
+        )
+        .map_err(storage_error)?;
+    transaction.commit().map_err(storage_error)
+}
+
+fn referenced_artifact_ids(connection: &Connection) -> Result<HashSet<ArtifactId>, CarlError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT manifest_artifact_id FROM subscription_run_baselines
+             UNION
+             SELECT source_preconditions_artifact_id FROM subscription_run_baselines
+             UNION
+             SELECT content_artifact_id FROM subscription_run_baseline_entries
+             UNION
+             SELECT proposal_artifact_id FROM subscription_run_proposals
+             UNION
+             SELECT payload_sha256 FROM subscription_run_proposals
+             ORDER BY 1",
+        )
+        .map_err(storage_error)?;
+    let identifiers = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(storage_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(storage_error)?;
+    identifiers
+        .into_iter()
+        .map(|identifier| {
+            ArtifactId::parse(identifier)
+                .map_err(|_| storage_invariant("durable artifact identifier is invalid"))
+        })
+        .collect()
 }
 
 impl Deref for RuntimeStore {
@@ -1304,6 +1887,966 @@ impl DerefMut for RuntimeStore {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.store_mut()
     }
+}
+
+fn subscription_run_matches(
+    connection: &Connection,
+    run_id: RunId,
+    expected_state: RunState,
+    expected_revision: u64,
+) -> Result<bool, CarlError> {
+    Ok(
+        load_subscription_run(connection, run_id)?.is_some_and(|record| {
+            record.state == expected_state && record.revision == expected_revision
+        }),
+    )
+}
+
+fn subscription_run_has_baseline(
+    connection: &Connection,
+    run_id: RunId,
+) -> Result<bool, CarlError> {
+    connection
+        .query_row(
+            "SELECT 1 FROM subscription_run_baselines WHERE run_id = ?1",
+            [run_id.to_string()],
+            |_| Ok(()),
+        )
+        .optional()
+        .map(|row| row.is_some())
+        .map_err(storage_error)
+}
+
+fn subscription_run_has_proposal(
+    connection: &Connection,
+    run_id: RunId,
+) -> Result<bool, CarlError> {
+    connection
+        .query_row(
+            "SELECT 1 FROM subscription_run_proposals WHERE run_id = ?1",
+            [run_id.to_string()],
+            |_| Ok(()),
+        )
+        .optional()
+        .map(|row| row.is_some())
+        .map_err(storage_error)
+}
+
+fn reject_existing_subscription_run_inspection(
+    connection: &Connection,
+    run_id: RunId,
+) -> Result<(), CarlError> {
+    let exists = connection
+        .query_row(
+            "SELECT 1 FROM subscription_run_inspections WHERE run_id = ?1",
+            [run_id.to_string()],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(storage_error)?
+        .is_some();
+    if exists {
+        Err(CarlError::Validation {
+            detail: "the subscription run inspection is already recorded".to_owned(),
+        })
+    } else {
+        Ok(())
+    }
+}
+
+fn register_artifact_object(
+    transaction: &Transaction<'_>,
+    id: &ArtifactId,
+    byte_length: u64,
+    created_at: DateTime<Utc>,
+) -> Result<(), CarlError> {
+    transaction
+        .execute(
+            "INSERT INTO artifact_objects (id, byte_length, created_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT (id) DO NOTHING",
+            params![
+                id.as_str(),
+                revision_to_sql(byte_length)?,
+                format_timestamp(created_at),
+            ],
+        )
+        .map_err(storage_error)?;
+    let stored_length = transaction
+        .query_row(
+            "SELECT byte_length FROM artifact_objects WHERE id = ?1",
+            [id.as_str()],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(storage_error)?;
+    if u64::try_from(stored_length).ok() != Some(byte_length) {
+        return Err(storage_invariant(
+            "content-addressed artifact length is inconsistent",
+        ));
+    }
+    Ok(())
+}
+
+fn require_registered_artifact_object(
+    connection: &Connection,
+    id: &ArtifactId,
+    byte_length: u64,
+) -> Result<(), CarlError> {
+    let stored_length = connection
+        .query_row(
+            "SELECT byte_length FROM artifact_objects WHERE id = ?1",
+            [id.as_str()],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(storage_error)?;
+    if stored_length.and_then(|length| u64::try_from(length).ok()) != Some(byte_length) {
+        return Err(storage_invariant(
+            "content-addressed artifact registration is missing or inconsistent",
+        ));
+    }
+    Ok(())
+}
+
+fn insert_subscription_run_inspection(
+    transaction: &Transaction<'_>,
+    run_id: RunId,
+    outcome: SubscriptionRunInspectionOutcome,
+    stage_manifest_digest: Sha256Digest,
+    created_at: DateTime<Utc>,
+) -> Result<(), CarlError> {
+    transaction
+        .execute(
+            "INSERT INTO subscription_run_inspections (
+                run_id, outcome, stage_manifest_digest, created_at
+             ) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                run_id.to_string(),
+                outcome.as_str(),
+                stage_manifest_digest.to_string(),
+                format_timestamp(created_at),
+            ],
+        )
+        .map_err(storage_error)?;
+    Ok(())
+}
+
+fn validate_sealed_baseline(baseline: &SealedBaseline) -> Result<(Vec<u8>, Vec<u8>), CarlError> {
+    let manifest = baseline.manifest();
+    let manifest_bytes = manifest
+        .canonical_bytes()
+        .map_err(|_| artifact_validation_error("sealed baseline manifest is invalid"))?;
+    let manifest_id = artifact_id_for_bytes(&manifest_bytes)?;
+    if &manifest_id != baseline.manifest_artifact_id()
+        || manifest_id.as_str() != manifest.digest().to_string()
+        || manifest.entries().len() != baseline.entries().len()
+    {
+        return Err(artifact_validation_error(
+            "sealed baseline manifest and artifact disagree",
+        ));
+    }
+
+    let mut total_bytes = 0_u64;
+    let mut previous_path: Option<&str> = None;
+    for (manifest_entry, sealed_entry) in manifest.entries().iter().zip(baseline.entries().iter()) {
+        if manifest_entry.path() != sealed_entry.path()
+            || manifest_entry.bytes() != sealed_entry.bytes()
+            || manifest_entry.content_digest() != sealed_entry.content_digest()
+            || sealed_entry.content_artifact_id().as_str()
+                != sealed_entry.content_digest().to_string()
+            || previous_path.is_some_and(|previous| previous >= sealed_entry.path())
+        {
+            return Err(artifact_validation_error(
+                "sealed baseline entry metadata is inconsistent",
+            ));
+        }
+        let identity = sealed_entry.source_identity();
+        let valid_identity = !identity.identity_a.is_empty()
+            && !identity.identity_b.is_empty()
+            && !identity.owner_id.is_empty()
+            && matches!(
+                (identity.platform, identity.owner_mode),
+                ("unix", Some(0..=0o7777)) | ("windows", None)
+            );
+        if !valid_identity {
+            return Err(artifact_validation_error(
+                "sealed baseline source identity is invalid",
+            ));
+        }
+        total_bytes = total_bytes
+            .checked_add(sealed_entry.bytes())
+            .ok_or_else(|| artifact_validation_error("sealed baseline size overflows"))?;
+        previous_path = Some(sealed_entry.path());
+    }
+    if total_bytes != manifest.total_bytes() {
+        return Err(artifact_validation_error(
+            "sealed baseline total size is inconsistent",
+        ));
+    }
+    let source_preconditions = canonical_source_preconditions(
+        manifest.digest(),
+        baseline.entries().iter().map(|entry| {
+            let identity = entry.source_identity();
+            SourcePreconditionRef {
+                path: entry.path(),
+                bytes: entry.bytes(),
+                content_digest: entry.content_digest(),
+                platform: identity.platform,
+                identity_a: &identity.identity_a,
+                identity_b: &identity.identity_b,
+                owner_id: &identity.owner_id,
+                owner_mode: identity.owner_mode,
+            }
+        }),
+    )
+    .map_err(|_| artifact_validation_error("source precondition evidence is invalid"))?;
+    let source_preconditions_id = artifact_id_for_bytes(&source_preconditions)?;
+    if &source_preconditions_id != baseline.source_preconditions_artifact_id()
+        || source_preconditions_id.as_str() != baseline.source_preconditions_digest().to_string()
+    {
+        return Err(artifact_validation_error(
+            "source precondition evidence and artifact disagree",
+        ));
+    }
+    Ok((manifest_bytes, source_preconditions))
+}
+
+fn verify_sealed_baseline_artifacts(
+    artifacts: &ArtifactStore,
+    baseline: &SealedBaseline,
+) -> Result<(), CarlError> {
+    let (canonical_manifest, canonical_preconditions) = validate_sealed_baseline(baseline)?;
+    let manifest = artifacts
+        .read_verified(baseline.manifest_artifact_id())
+        .map_err(artifact_storage_error)?;
+    if manifest.bytes() != canonical_manifest {
+        return Err(artifact_validation_error(
+            "sealed baseline manifest object is unavailable or inconsistent",
+        ));
+    }
+    let preconditions = artifacts
+        .read_verified(baseline.source_preconditions_artifact_id())
+        .map_err(artifact_storage_error)?;
+    if preconditions.bytes() != canonical_preconditions {
+        return Err(artifact_validation_error(
+            "source precondition evidence object is unavailable or inconsistent",
+        ));
+    }
+    for entry in baseline.entries() {
+        let content = artifacts
+            .read_verified(entry.content_artifact_id())
+            .map_err(artifact_storage_error)?;
+        if usize_to_u64(content.bytes().len(), "baseline content length")? != entry.bytes()
+            || digest_bytes(content.bytes()) != entry.content_digest()
+        {
+            return Err(artifact_validation_error(
+                "sealed baseline content object is inconsistent",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn verify_loaded_baseline_artifacts(
+    artifacts: &ArtifactStore,
+    baseline: &SubscriptionRunBaselineRecord,
+) -> Result<(), CarlError> {
+    let canonical_manifest = canonical_manifest_bytes(&baseline.entries)?;
+    if digest_bytes(&canonical_manifest) != baseline.manifest_digest
+        || artifact_id_for_bytes(&canonical_manifest)? != baseline.manifest_artifact_id
+    {
+        return Err(storage_invariant(
+            "stored baseline manifest metadata is inconsistent",
+        ));
+    }
+    let manifest = artifacts
+        .read_verified(&baseline.manifest_artifact_id)
+        .map_err(artifact_storage_error)?;
+    if manifest.bytes() != canonical_manifest {
+        return Err(storage_invariant(
+            "stored baseline manifest object is inconsistent",
+        ));
+    }
+    let canonical_preconditions = canonical_source_preconditions(
+        baseline.manifest_digest,
+        baseline.entries.iter().map(|entry| SourcePreconditionRef {
+            path: &entry.path,
+            bytes: entry.byte_length,
+            content_digest: entry.content_digest,
+            platform: &entry.identity_platform,
+            identity_a: &entry.identity_a,
+            identity_b: &entry.identity_b,
+            owner_id: &entry.owner_id,
+            owner_mode: entry.owner_mode,
+        }),
+    )
+    .map_err(|_| storage_invariant("stored source precondition evidence is invalid"))?;
+    if digest_bytes(&canonical_preconditions) != baseline.source_preconditions_digest
+        || artifact_id_for_bytes(&canonical_preconditions)?
+            != baseline.source_preconditions_artifact_id
+    {
+        return Err(storage_invariant(
+            "stored source precondition evidence metadata is inconsistent",
+        ));
+    }
+    let preconditions = artifacts
+        .read_verified(&baseline.source_preconditions_artifact_id)
+        .map_err(artifact_storage_error)?;
+    if preconditions.bytes() != canonical_preconditions {
+        return Err(storage_invariant(
+            "stored source precondition evidence object is inconsistent",
+        ));
+    }
+    for entry in &baseline.entries {
+        let content = artifacts
+            .read_verified(&entry.content_artifact_id)
+            .map_err(artifact_storage_error)?;
+        if usize_to_u64(content.bytes().len(), "stored baseline content length")?
+            != entry.byte_length
+            || digest_bytes(content.bytes()) != entry.content_digest
+        {
+            return Err(storage_invariant(
+                "stored baseline content object is inconsistent",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_exact_replacement_proposal(
+    proposal: &ExactReplacementProposal,
+) -> Result<Vec<u8>, CarlError> {
+    let envelope = proposal.canonical_envelope();
+    if artifact_id_for_bytes(&envelope)? != *proposal.artifact_id()
+        || artifact_id_for_bytes(proposal.payload())? != *proposal.payload_artifact_id()
+        || digest_bytes(proposal.payload()) != proposal.payload_hash()
+        || proposal.expected_live_hash() != proposal.before_hash()
+        || proposal.after_hash() != proposal.payload_hash()
+    {
+        return Err(artifact_validation_error(
+            "exact replacement proposal metadata is inconsistent",
+        ));
+    }
+    Ok(envelope)
+}
+
+fn verify_exact_proposal_artifacts(
+    artifacts: &ArtifactStore,
+    proposal: &ExactReplacementProposal,
+) -> Result<(), CarlError> {
+    let canonical_envelope = validate_exact_replacement_proposal(proposal)?;
+    let envelope = artifacts
+        .read_verified(proposal.artifact_id())
+        .map_err(artifact_storage_error)?;
+    if envelope.bytes() != canonical_envelope {
+        return Err(artifact_validation_error(
+            "exact proposal envelope object is inconsistent",
+        ));
+    }
+    let payload = artifacts
+        .read_verified(proposal.payload_artifact_id())
+        .map_err(artifact_storage_error)?;
+    if payload.bytes() != proposal.payload() {
+        return Err(artifact_validation_error(
+            "exact proposal payload object is inconsistent",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_proposal_against_baseline(
+    proposal: &ExactReplacementProposal,
+    baseline: &SubscriptionRunBaselineRecord,
+) -> Result<(), CarlError> {
+    if proposal.baseline_manifest_digest() != baseline.manifest_digest
+        || proposal.baseline_manifest_digest().to_string() != baseline.manifest_artifact_id.as_str()
+    {
+        return Err(artifact_validation_error(
+            "proposal references a different sealed baseline",
+        ));
+    }
+    let Some(entry) = baseline
+        .entries
+        .iter()
+        .find(|entry| entry.path == proposal.path())
+    else {
+        return Err(artifact_validation_error(
+            "proposal path is absent from the sealed baseline",
+        ));
+    };
+    if entry.content_digest != proposal.before_hash()
+        || proposal.expected_live_hash() != entry.content_digest
+    {
+        return Err(artifact_validation_error(
+            "proposal before hash disagrees with the sealed baseline",
+        ));
+    }
+    Ok(())
+}
+
+fn verify_loaded_proposal_artifacts(
+    artifacts: &ArtifactStore,
+    baseline: &SubscriptionRunBaselineRecord,
+    proposal: &SubscriptionRunProposalRecord,
+) -> Result<(), CarlError> {
+    if proposal.baseline_manifest_artifact_id != baseline.manifest_artifact_id {
+        return Err(storage_invariant(
+            "stored proposal references a different baseline object",
+        ));
+    }
+    let payload = artifacts
+        .read_verified(&proposal.payload_artifact_id)
+        .map_err(artifact_storage_error)?;
+    if usize_to_u64(payload.bytes().len(), "stored proposal payload length")?
+        != proposal.payload_bytes
+        || digest_bytes(payload.bytes()) != proposal.payload_hash
+        || proposal.payload_artifact_id.as_str() != proposal.payload_hash.to_string()
+        || proposal.after_hash != proposal.payload_hash
+    {
+        return Err(storage_invariant(
+            "stored proposal payload object is inconsistent",
+        ));
+    }
+    if candidate_manifest_digest(
+        baseline,
+        &proposal.path,
+        payload.bytes(),
+        proposal.payload_hash,
+    )? != proposal.candidate_manifest_digest
+    {
+        return Err(storage_invariant(
+            "stored proposal candidate manifest digest is inconsistent",
+        ));
+    }
+    let canonical_envelope = canonical_proposal_envelope(
+        baseline.manifest_digest,
+        &proposal.path,
+        proposal.expected_live_hash,
+        proposal.before_hash,
+        proposal.after_hash,
+        proposal.payload_hash,
+        payload.bytes(),
+    )?;
+    if artifact_id_for_bytes(&canonical_envelope)? != proposal.proposal_artifact_id {
+        return Err(storage_invariant(
+            "stored proposal envelope ID is inconsistent",
+        ));
+    }
+    let envelope = artifacts
+        .read_verified(&proposal.proposal_artifact_id)
+        .map_err(artifact_storage_error)?;
+    if envelope.bytes() != canonical_envelope {
+        return Err(storage_invariant(
+            "stored proposal envelope object is inconsistent",
+        ));
+    }
+    Ok(())
+}
+
+fn candidate_manifest_digest(
+    baseline: &SubscriptionRunBaselineRecord,
+    changed_path: &str,
+    payload: &[u8],
+    payload_digest: Sha256Digest,
+) -> Result<Sha256Digest, CarlError> {
+    if digest_bytes(payload) != payload_digest {
+        return Err(artifact_validation_error(
+            "candidate payload digest is inconsistent",
+        ));
+    }
+    let mut found = false;
+    let mut bytes = Vec::new();
+    for entry in &baseline.entries {
+        let path = entry.path.as_bytes();
+        bytes.extend_from_slice(
+            &u32::try_from(path.len())
+                .map_err(|_| artifact_validation_error("candidate path is too long"))?
+                .to_be_bytes(),
+        );
+        bytes.extend_from_slice(path);
+        if entry.path == changed_path {
+            bytes.extend_from_slice(
+                &usize_to_u64(payload.len(), "candidate payload length")?.to_be_bytes(),
+            );
+            bytes.extend_from_slice(payload_digest.as_bytes());
+            found = true;
+        } else {
+            bytes.extend_from_slice(&entry.byte_length.to_be_bytes());
+            bytes.extend_from_slice(entry.content_digest.as_bytes());
+        }
+    }
+    if !found {
+        return Err(artifact_validation_error(
+            "candidate path is absent from the sealed baseline",
+        ));
+    }
+    Ok(digest_bytes(&bytes))
+}
+
+fn canonical_manifest_bytes(
+    entries: &[SubscriptionRunBaselineEntryRecord],
+) -> Result<Vec<u8>, CarlError> {
+    let mut bytes = Vec::new();
+    for entry in entries {
+        let path = entry.path.as_bytes();
+        bytes.extend_from_slice(
+            &u32::try_from(path.len())
+                .map_err(|_| storage_invariant("stored baseline path is too long"))?
+                .to_be_bytes(),
+        );
+        bytes.extend_from_slice(path);
+        bytes.extend_from_slice(&entry.byte_length.to_be_bytes());
+        bytes.extend_from_slice(entry.content_digest.as_bytes());
+    }
+    Ok(bytes)
+}
+
+fn canonical_proposal_envelope(
+    baseline: Sha256Digest,
+    path: &str,
+    expected_live: Sha256Digest,
+    before: Sha256Digest,
+    after: Sha256Digest,
+    payload_hash: Sha256Digest,
+    payload: &[u8],
+) -> Result<Vec<u8>, CarlError> {
+    let path_length = u32::try_from(path.len())
+        .map_err(|_| artifact_validation_error("proposal path is too long"))?;
+    let payload_length = usize_to_u64(payload.len(), "proposal payload length")?;
+    let mut bytes = Vec::with_capacity(
+        EXACT_REPLACEMENT_DOMAIN.len() + 32 + 4 + path.len() + (32 * 4) + 8 + payload.len(),
+    );
+    bytes.extend_from_slice(EXACT_REPLACEMENT_DOMAIN);
+    bytes.extend_from_slice(baseline.as_bytes());
+    bytes.extend_from_slice(&path_length.to_be_bytes());
+    bytes.extend_from_slice(path.as_bytes());
+    bytes.extend_from_slice(expected_live.as_bytes());
+    bytes.extend_from_slice(before.as_bytes());
+    bytes.extend_from_slice(after.as_bytes());
+    bytes.extend_from_slice(payload_hash.as_bytes());
+    bytes.extend_from_slice(&payload_length.to_be_bytes());
+    bytes.extend_from_slice(payload);
+    Ok(bytes)
+}
+
+fn load_subscription_run_baseline(
+    connection: &Connection,
+    run_id: RunId,
+) -> Result<Option<SubscriptionRunBaselineRecord>, CarlError> {
+    let header = connection
+        .query_row(
+            "SELECT baseline.manifest_artifact_id, baseline.manifest_digest,
+                    baseline.source_preconditions_artifact_id,
+                    baseline.source_preconditions_digest,
+                    baseline.entry_count, baseline.total_bytes, baseline.created_at,
+                    manifest_object.byte_length, preconditions_object.byte_length
+             FROM subscription_run_baselines AS baseline
+             JOIN artifact_objects AS manifest_object
+               ON manifest_object.id = baseline.manifest_artifact_id
+             JOIN artifact_objects AS preconditions_object
+               ON preconditions_object.id = baseline.source_preconditions_artifact_id
+             WHERE baseline.run_id = ?1",
+            [run_id.to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, i64>(8)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(storage_error)?;
+    let Some((
+        manifest_artifact_id,
+        manifest_digest,
+        source_preconditions_artifact_id,
+        source_preconditions_digest,
+        entry_count,
+        total_bytes,
+        created_at,
+        manifest_byte_length,
+        source_preconditions_byte_length,
+    )) = header
+    else {
+        if subscription_run_has_baseline(connection, run_id)? {
+            return Err(storage_invariant(
+                "stored baseline has no registered manifest object",
+            ));
+        }
+        return Ok(None);
+    };
+    let manifest_artifact_id = ArtifactId::parse(manifest_artifact_id)
+        .map_err(|_| storage_invariant("stored baseline artifact ID is invalid"))?;
+    let manifest_digest = Sha256Digest::parse(manifest_digest)
+        .map_err(|_| storage_invariant("stored baseline digest is invalid"))?;
+    if manifest_artifact_id.as_str() != manifest_digest.to_string() {
+        return Err(storage_invariant(
+            "stored baseline artifact and digest disagree",
+        ));
+    }
+    let source_preconditions_artifact_id = ArtifactId::parse(source_preconditions_artifact_id)
+        .map_err(|_| storage_invariant("stored source preconditions artifact ID is invalid"))?;
+    let source_preconditions_digest = Sha256Digest::parse(source_preconditions_digest)
+        .map_err(|_| storage_invariant("stored source preconditions digest is invalid"))?;
+    if source_preconditions_artifact_id.as_str() != source_preconditions_digest.to_string() {
+        return Err(storage_invariant(
+            "stored source preconditions artifact and digest disagree",
+        ));
+    }
+    let entry_count = stored_u64(entry_count, "baseline entry count")?;
+    let total_bytes = stored_u64(total_bytes, "baseline total bytes")?;
+    let manifest_byte_length = stored_u64(manifest_byte_length, "baseline manifest length")?;
+    let source_preconditions_byte_length = stored_u64(
+        source_preconditions_byte_length,
+        "source preconditions length",
+    )?;
+
+    let rows = {
+        let mut statement = connection
+            .prepare(
+                "SELECT ordinal, path, byte_length, content_sha256,
+                        content_artifact_id, identity_platform,
+                        identity_a, identity_b, owner_id, owner_mode
+                 FROM subscription_run_baseline_entries
+                 WHERE run_id = ?1
+                 ORDER BY ordinal ASC",
+            )
+            .map_err(storage_error)?;
+        statement
+            .query_map([run_id.to_string()], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, Option<i64>>(9)?,
+                ))
+            })
+            .map_err(storage_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(storage_error)?
+    };
+    let mut entries = Vec::with_capacity(rows.len());
+    let mut measured_total = 0_u64;
+    let mut canonical_manifest = Vec::new();
+    for (
+        index,
+        (
+            ordinal,
+            path,
+            byte_length,
+            content_digest,
+            content_artifact_id,
+            identity_platform,
+            identity_a,
+            identity_b,
+            owner_id,
+            owner_mode,
+        ),
+    ) in rows.into_iter().enumerate()
+    {
+        let ordinal = stored_u64(ordinal, "baseline entry ordinal")?;
+        if usize_to_u64(index, "baseline entry index")? != ordinal {
+            return Err(storage_invariant("stored baseline entry order has a gap"));
+        }
+        let byte_length = stored_u64(byte_length, "baseline entry length")?;
+        let content_digest = Sha256Digest::parse(content_digest)
+            .map_err(|_| storage_invariant("stored baseline content digest is invalid"))?;
+        let content_artifact_id = ArtifactId::parse(content_artifact_id)
+            .map_err(|_| storage_invariant("stored baseline content artifact ID is invalid"))?;
+        if content_artifact_id.as_str() != content_digest.to_string() {
+            return Err(storage_invariant(
+                "stored baseline content artifact and digest disagree",
+            ));
+        }
+        require_registered_artifact_object(connection, &content_artifact_id, byte_length)?;
+        let owner_mode = owner_mode
+            .map(|mode| {
+                u32::try_from(mode)
+                    .map_err(|_| storage_invariant("stored baseline owner mode is invalid"))
+            })
+            .transpose()?;
+        if !matches!(
+            (identity_platform.as_str(), owner_mode),
+            ("unix", Some(0..=0o7777)) | ("windows", None)
+        ) {
+            return Err(storage_invariant(
+                "stored baseline identity platform and mode disagree",
+            ));
+        }
+        let path_bytes = path.as_bytes();
+        canonical_manifest.extend_from_slice(
+            &u32::try_from(path_bytes.len())
+                .map_err(|_| storage_invariant("stored baseline path is too long"))?
+                .to_be_bytes(),
+        );
+        canonical_manifest.extend_from_slice(path_bytes);
+        canonical_manifest.extend_from_slice(&byte_length.to_be_bytes());
+        canonical_manifest.extend_from_slice(content_digest.as_bytes());
+        measured_total = measured_total
+            .checked_add(byte_length)
+            .ok_or_else(|| storage_invariant("stored baseline size overflows"))?;
+        entries.push(SubscriptionRunBaselineEntryRecord {
+            ordinal,
+            path,
+            byte_length,
+            content_digest,
+            content_artifact_id,
+            identity_platform,
+            identity_a,
+            identity_b,
+            owner_id,
+            owner_mode,
+        });
+    }
+    if usize_to_u64(entries.len(), "stored baseline entries")? != entry_count
+        || measured_total != total_bytes
+        || usize_to_u64(canonical_manifest.len(), "stored baseline manifest length")?
+            != manifest_byte_length
+        || digest_bytes(&canonical_manifest) != manifest_digest
+    {
+        return Err(storage_invariant(
+            "stored baseline projection is internally inconsistent",
+        ));
+    }
+    let canonical_preconditions = canonical_source_preconditions(
+        manifest_digest,
+        entries.iter().map(|entry| SourcePreconditionRef {
+            path: &entry.path,
+            bytes: entry.byte_length,
+            content_digest: entry.content_digest,
+            platform: &entry.identity_platform,
+            identity_a: &entry.identity_a,
+            identity_b: &entry.identity_b,
+            owner_id: &entry.owner_id,
+            owner_mode: entry.owner_mode,
+        }),
+    )
+    .map_err(|_| storage_invariant("stored source precondition evidence is invalid"))?;
+    if usize_to_u64(
+        canonical_preconditions.len(),
+        "stored source preconditions length",
+    )? != source_preconditions_byte_length
+        || digest_bytes(&canonical_preconditions) != source_preconditions_digest
+    {
+        return Err(storage_invariant(
+            "stored source precondition evidence is internally inconsistent",
+        ));
+    }
+    Ok(Some(SubscriptionRunBaselineRecord {
+        run_id,
+        manifest_artifact_id,
+        manifest_digest,
+        source_preconditions_artifact_id,
+        source_preconditions_digest,
+        entry_count,
+        total_bytes,
+        entries,
+        created_at: parse_timestamp(&created_at)?,
+    }))
+}
+
+fn load_subscription_run_inspection(
+    connection: &Connection,
+    run_id: RunId,
+) -> Result<Option<SubscriptionRunInspectionRecord>, CarlError> {
+    connection
+        .query_row(
+            "SELECT outcome, stage_manifest_digest, created_at
+             FROM subscription_run_inspections
+             WHERE run_id = ?1",
+            [run_id.to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(storage_error)?
+        .map(|(outcome, stage_manifest_digest, created_at)| {
+            Ok(SubscriptionRunInspectionRecord {
+                run_id,
+                outcome: SubscriptionRunInspectionOutcome::parse(&outcome)?,
+                stage_manifest_digest: Sha256Digest::parse(stage_manifest_digest).map_err(
+                    |_| storage_invariant("stored inspection manifest digest is invalid"),
+                )?,
+                created_at: parse_timestamp(&created_at)?,
+            })
+        })
+        .transpose()
+}
+
+fn load_subscription_run_proposal(
+    connection: &Connection,
+    run_id: RunId,
+) -> Result<Option<SubscriptionRunProposalRecord>, CarlError> {
+    let raw = connection
+        .query_row(
+            "SELECT proposal.proposal_artifact_id,
+                    proposal.baseline_manifest_artifact_id,
+                    proposal.path, proposal.expected_live_sha256,
+                    proposal.before_sha256, proposal.after_sha256,
+                    proposal.payload_sha256, proposal.payload_bytes,
+                    proposal.created_at, inspection.outcome,
+                    inspection.stage_manifest_digest
+             FROM subscription_run_proposals AS proposal
+             JOIN subscription_run_inspections AS inspection
+               ON inspection.run_id = proposal.run_id
+             WHERE proposal.run_id = ?1",
+            [run_id.to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, String>(9)?,
+                    row.get::<_, String>(10)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(storage_error)?;
+    let Some((
+        proposal_artifact_id,
+        baseline_manifest_artifact_id,
+        path,
+        expected_live_hash,
+        before_hash,
+        after_hash,
+        payload_hash,
+        payload_bytes,
+        created_at,
+        outcome,
+        candidate_manifest_digest,
+    )) = raw
+    else {
+        return Ok(None);
+    };
+    if SubscriptionRunInspectionOutcome::parse(&outcome)?
+        != SubscriptionRunInspectionOutcome::ExactReplacement
+    {
+        return Err(storage_invariant(
+            "stored proposal has a non-proposal inspection outcome",
+        ));
+    }
+    let proposal_artifact_id = ArtifactId::parse(proposal_artifact_id)
+        .map_err(|_| storage_invariant("stored proposal artifact ID is invalid"))?;
+    let baseline_manifest_artifact_id = ArtifactId::parse(baseline_manifest_artifact_id)
+        .map_err(|_| storage_invariant("stored proposal baseline artifact ID is invalid"))?;
+    let expected_live_hash = Sha256Digest::parse(expected_live_hash)
+        .map_err(|_| storage_invariant("stored proposal live hash is invalid"))?;
+    let before_hash = Sha256Digest::parse(before_hash)
+        .map_err(|_| storage_invariant("stored proposal before hash is invalid"))?;
+    let after_hash = Sha256Digest::parse(after_hash)
+        .map_err(|_| storage_invariant("stored proposal after hash is invalid"))?;
+    let payload_hash = Sha256Digest::parse(payload_hash)
+        .map_err(|_| storage_invariant("stored proposal payload hash is invalid"))?;
+    let payload_artifact_id = ArtifactId::parse(payload_hash.to_string())
+        .map_err(|_| storage_invariant("stored proposal payload artifact ID is invalid"))?;
+    let candidate_manifest_digest = Sha256Digest::parse(candidate_manifest_digest)
+        .map_err(|_| storage_invariant("stored candidate manifest digest is invalid"))?;
+    let payload_bytes = stored_u64(payload_bytes, "proposal payload length")?;
+    require_registered_artifact_object(connection, &payload_artifact_id, payload_bytes)?;
+    let envelope_bytes = usize_to_u64(
+        EXACT_REPLACEMENT_DOMAIN.len() + 32 + 4 + path.len() + (32 * 4) + 8,
+        "proposal envelope metadata length",
+    )?
+    .checked_add(payload_bytes)
+    .ok_or_else(|| storage_invariant("stored proposal envelope length overflows"))?;
+    require_registered_artifact_object(connection, &proposal_artifact_id, envelope_bytes)?;
+    if expected_live_hash != before_hash || after_hash != payload_hash {
+        return Err(storage_invariant(
+            "stored proposal hash relationships are inconsistent",
+        ));
+    }
+    let baseline = load_subscription_run_baseline(connection, run_id)?
+        .ok_or_else(|| storage_invariant("stored proposal has no sealed baseline"))?;
+    if baseline.manifest_artifact_id != baseline_manifest_artifact_id
+        || !baseline
+            .entries
+            .iter()
+            .any(|entry| entry.path == path && entry.content_digest == before_hash)
+    {
+        return Err(storage_invariant(
+            "stored proposal disagrees with its sealed baseline",
+        ));
+    }
+    Ok(Some(SubscriptionRunProposalRecord {
+        run_id,
+        proposal_artifact_id,
+        payload_artifact_id,
+        baseline_manifest_artifact_id,
+        candidate_manifest_digest,
+        path,
+        expected_live_hash,
+        before_hash,
+        after_hash,
+        payload_hash,
+        payload_bytes,
+        created_at: parse_timestamp(&created_at)?,
+    }))
+}
+
+fn artifact_id_for_bytes(bytes: &[u8]) -> Result<ArtifactId, CarlError> {
+    ArtifactId::parse(format!("{:x}", Sha256::digest(bytes)))
+        .map_err(|_| artifact_validation_error("content-addressed artifact ID is invalid"))
+}
+
+fn digest_bytes(bytes: &[u8]) -> Sha256Digest {
+    Sha256Digest::from_bytes(Sha256::digest(bytes).into())
+}
+
+fn artifact_validation_error(detail: &str) -> CarlError {
+    CarlError::Validation {
+        detail: detail.to_owned(),
+    }
+}
+
+fn artifact_storage_error(error: crate::artifacts::ArtifactError) -> CarlError {
+    CarlError::Storage {
+        detail: error.to_string(),
+    }
+}
+
+fn proposal_storage_error(error: crate::staging::ProposalError) -> CarlError {
+    CarlError::Validation {
+        detail: error.to_string(),
+    }
+}
+
+fn usize_to_u64(value: usize, kind: &str) -> Result<u64, CarlError> {
+    u64::try_from(value)
+        .map_err(|_| storage_invariant(&format!("{kind} cannot be represented durably")))
+}
+
+fn usize_to_sql(value: usize, kind: &str) -> Result<i64, CarlError> {
+    i64::try_from(value)
+        .map_err(|_| storage_invariant(&format!("{kind} cannot be represented durably")))
+}
+
+fn stored_u64(value: i64, kind: &str) -> Result<u64, CarlError> {
+    u64::try_from(value).map_err(|_| storage_invariant(&format!("stored {kind} is invalid")))
 }
 
 fn append_event_in_transaction(

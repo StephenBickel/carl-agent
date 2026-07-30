@@ -3,9 +3,11 @@ use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use carl::artifacts::ArtifactStore;
 use carl::security::{SecretFilter, SecretRule};
 use carl::staging::{
-    SanitizedStageBuilder, StageContainment, StageErrorCode, StageExclusionReason, StageLimits,
+    SanitizedStage, SanitizedStageBuilder, StageContainment, StageErrorCode, StageExclusionReason,
+    StageLimits,
 };
 use uuid::Uuid;
 
@@ -19,6 +21,7 @@ struct StageLayout {
     root: PathBuf,
     source: PathBuf,
     stages: PathBuf,
+    artifacts: PathBuf,
 }
 
 impl StageLayout {
@@ -30,15 +33,19 @@ impl StageLayout {
         let root = temporary_root.join(format!("carl-stage-{}", Uuid::new_v4()));
         let source = root.join("source");
         let stages = root.join("stages");
+        let artifacts = root.join("artifacts");
         fs::create_dir_all(&source)?;
         fs::create_dir_all(&stages)?;
+        fs::create_dir_all(&artifacts)?;
         make_owner_only(&root)?;
         make_owner_only(&source)?;
         make_owner_only(&stages)?;
+        make_owner_only(&artifacts)?;
         Ok(Self {
             root,
             source,
             stages,
+            artifacts,
         })
     }
 
@@ -66,7 +73,7 @@ fn stage_is_owner_only_deterministic_and_disposable() -> TestResult {
     #[cfg(unix)]
     let source_mode = permissions(&first.source.join("README.md"))?;
 
-    let stage = builder(&first, StageLimits::new(10, 1_024, 4_096)?)?.prepare()?;
+    let stage = prepare(&first, StageLimits::new(10, 1_024, 4_096)?)?;
     assert_ne!(stage.path(), first.source);
     assert!(stage.path().starts_with(fs::canonicalize(&first.stages)?));
     assert_eq!(
@@ -119,7 +126,7 @@ fn stage_is_owner_only_deterministic_and_disposable() -> TestResult {
     let second = StageLayout::new()?;
     second.write("README.md", b"hello\n")?;
     second.write("src/lib.rs", b"pub fn answer() -> u32 { 42 }\n")?;
-    let stage = builder(&second, StageLimits::new(10, 1_024, 4_096)?)?.prepare()?;
+    let stage = prepare(&second, StageLimits::new(10, 1_024, 4_096)?)?;
     assert_eq!(
         stage.manifest().digest().to_string(),
         EXPECTED_MANIFEST_DIGEST
@@ -194,7 +201,7 @@ fn protected_and_unsupported_entries_never_reach_the_stage() -> TestResult {
     #[cfg(unix)]
     let _socket = std::os::unix::net::UnixListener::bind(layout.source.join("events.socket"))?;
 
-    let stage = builder(&layout, StageLimits::new(100, 4_096, 64 * 1_024)?)?.prepare()?;
+    let stage = prepare(&layout, StageLimits::new(100, 4_096, 64 * 1_024)?)?;
     assert_eq!(
         stage
             .manifest()
@@ -257,14 +264,52 @@ fn protected_and_unsupported_entries_never_reach_the_stage() -> TestResult {
 }
 
 #[test]
+fn protected_source_roots_and_git_redirect_files_are_rejected_or_excluded() -> TestResult {
+    let layout = StageLayout::new()?;
+    let protected_source = layout.root.join(".codex");
+    fs::create_dir(&protected_source)?;
+    fs::write(
+        protected_source.join("config.toml"),
+        b"private provider config\n",
+    )?;
+    assert_eq!(
+        SanitizedStageBuilder::open(
+            &protected_source,
+            &layout.stages,
+            StageLimits::new(10, 1_024, 4_096)?,
+            SecretFilter,
+        )
+        .expect_err("a protected directory cannot become the traversal root")
+        .code(),
+        StageErrorCode::InvalidRoot
+    );
+
+    layout.write("src/lib.rs", b"pub fn safe() {}\n")?;
+    layout.write(
+        ".git",
+        b"gitdir: /absolute/live/repository/worktrees/private\n",
+    )?;
+    let stage = prepare(&layout, StageLimits::new(10, 1_024, 4_096)?)?;
+    assert!(!stage.path().join(".git").exists());
+    assert_eq!(
+        stage
+            .exclusions()
+            .iter()
+            .find(|entry| entry.path() == ".git")
+            .map(|entry| entry.reason()),
+        Some(StageExclusionReason::ProtectedPath)
+    );
+    Ok(())
+}
+
+#[test]
 fn a_secret_rejects_the_entire_stage_with_path_only_diagnostics() -> TestResult {
     let layout = StageLayout::new()?;
     layout.write(
         "src/config.rs",
         format!("const TOKEN: &str = \"{SECRET_SENTINEL}\";\n").as_bytes(),
     )?;
-    let error = builder(&layout, StageLimits::new(10, 4_096, 16 * 1_024)?)?
-        .prepare()
+    let error = prepare(&layout, StageLimits::new(10, 4_096, 16 * 1_024)?)
         .expect_err("a secret-bearing source file must reject the stage");
 
     assert_eq!(error.code(), StageErrorCode::SecretDetected);
@@ -281,7 +326,7 @@ fn stage_limits_fail_on_the_first_file_or_byte_beyond_the_boundary() -> TestResu
     let exact = StageLayout::new()?;
     exact.write("four.txt", b"1234")?;
     exact.write("two.txt", b"12")?;
-    let exact_stage = builder(&exact, StageLimits::new(2, 4, 6)?)?.prepare()?;
+    let exact_stage = prepare(&exact, StageLimits::new(2, 4, 6)?)?;
     assert_eq!(exact_stage.manifest().entries().len(), 2);
     assert_eq!(exact_stage.manifest().total_bytes(), 6);
 
@@ -289,9 +334,18 @@ fn stage_limits_fail_on_the_first_file_or_byte_beyond_the_boundary() -> TestResu
     file_count.write("one.txt", b"1")?;
     file_count.write("two.txt", b"2")?;
     assert_eq!(
-        builder(&file_count, StageLimits::new(1, 10, 10)?)?
-            .prepare()
+        prepare(&file_count, StageLimits::new(1, 10, 10)?)
             .expect_err("second file exceeds count")
+            .code(),
+        StageErrorCode::LimitExceeded
+    );
+
+    let entry_count = StageLayout::new()?;
+    fs::create_dir(entry_count.source.join("first-directory"))?;
+    fs::create_dir(entry_count.source.join("second-directory"))?;
+    assert_eq!(
+        prepare(&entry_count, StageLimits::new(1, 10, 10)?)
+            .expect_err("directories consume the same bounded entry budget")
             .code(),
         StageErrorCode::LimitExceeded
     );
@@ -299,8 +353,7 @@ fn stage_limits_fail_on_the_first_file_or_byte_beyond_the_boundary() -> TestResu
     let file_bytes = StageLayout::new()?;
     file_bytes.write("six.txt", b"123456")?;
     assert_eq!(
-        builder(&file_bytes, StageLimits::new(1, 5, 10)?)?
-            .prepare()
+        prepare(&file_bytes, StageLimits::new(1, 5, 10)?)
             .expect_err("sixth byte exceeds per-file limit")
             .code(),
         StageErrorCode::LimitExceeded
@@ -310,8 +363,7 @@ fn stage_limits_fail_on_the_first_file_or_byte_beyond_the_boundary() -> TestResu
     total_bytes.write("four.txt", b"1234")?;
     total_bytes.write("three.txt", b"123")?;
     assert_eq!(
-        builder(&total_bytes, StageLimits::new(2, 4, 6)?)?
-            .prepare()
+        prepare(&total_bytes, StageLimits::new(2, 4, 6)?)
             .expect_err("seventh aggregate byte exceeds limit")
             .code(),
         StageErrorCode::LimitExceeded
@@ -469,13 +521,14 @@ fn stage_path_is_anchored_to_the_canonical_held_parent() -> TestResult {
         std::os::unix::fs::symlink(&layout.root, &alias)?;
         let aliased_stages = alias.join("stages");
 
+        let store = ArtifactStore::open(&layout.artifacts)?;
         let stage = SanitizedStageBuilder::open(
             &layout.source,
             &aliased_stages,
             StageLimits::new(10, 1_024, 4_096)?,
             SecretFilter,
         )?
-        .prepare()?;
+        .prepare(&store)?;
         assert!(
             stage.path().starts_with(fs::canonicalize(&layout.stages)?),
             "the execution path must use the canonical held parent"
@@ -490,11 +543,109 @@ fn stage_path_is_anchored_to_the_canonical_held_parent() -> TestResult {
     Ok(())
 }
 
+#[cfg(unix)]
+#[test]
+fn execution_workspace_rejects_a_named_stage_replacement() -> TestResult {
+    let layout = StageLayout::new()?;
+    layout.write("README.md", b"hello\n")?;
+    let stage = prepare(&layout, StageLimits::new(10, 1_024, 4_096)?)?;
+    let original = stage.path().to_path_buf();
+    let moved = layout
+        .stages
+        .join(format!("moved-stage-{}", Uuid::new_v4()));
+    fs::rename(&original, &moved)?;
+    fs::create_dir(&original)?;
+    make_owner_only(&original)?;
+
+    assert!(
+        stage.execution_workspace().is_err(),
+        "the ambient stage name must still identify the held work directory"
+    );
+
+    fs::remove_dir(&original)?;
+    fs::rename(&moved, &original)?;
+    drop(stage);
+    assert!(!original.exists());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn cleanup_removes_a_stage_renamed_within_its_held_parent() -> TestResult {
+    let layout = StageLayout::new()?;
+    layout.write("README.md", b"must be deleted\n")?;
+    let stage = prepare(&layout, StageLimits::new(10, 1_024, 4_096)?)?;
+    let original = stage.path().to_path_buf();
+    let moved = layout
+        .stages
+        .join(format!("moved-stage-{}", Uuid::new_v4()));
+    fs::rename(&original, &moved)?;
+
+    stage.cleanup()?;
+
+    assert!(!original.exists());
+    assert!(!moved.exists());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn cleanup_never_deletes_a_replacement_at_the_original_stage_name() -> TestResult {
+    let layout = StageLayout::new()?;
+    layout.write("README.md", b"held stage\n")?;
+    let stage = prepare(&layout, StageLimits::new(10, 1_024, 4_096)?)?;
+    let original = stage.path().to_path_buf();
+    let moved = layout
+        .stages
+        .join(format!("moved-stage-{}", Uuid::new_v4()));
+    fs::rename(&original, &moved)?;
+    fs::create_dir(&original)?;
+    make_owner_only(&original)?;
+    fs::write(original.join("replacement-sentinel"), b"must survive\n")?;
+
+    stage.cleanup()?;
+
+    assert!(!moved.exists());
+    assert_eq!(
+        fs::read(original.join("replacement-sentinel"))?,
+        b"must survive\n"
+    );
+    Ok(())
+}
+
+#[test]
+fn cleanup_is_iterative_for_agent_created_deep_trees() -> TestResult {
+    let layout = StageLayout::new()?;
+    layout.write("README.md", b"held stage\n")?;
+    let stage = prepare(&layout, StageLimits::new(10, 1_024, 4_096)?)?;
+    let stage_path = stage.path().to_path_buf();
+    let mut nested = stage_path.clone();
+    for depth in 0..96 {
+        nested.push(format!("d{depth}"));
+        fs::create_dir(&nested)?;
+    }
+    fs::write(nested.join("deep-sentinel"), b"must be deleted\n")?;
+
+    stage.cleanup()?;
+
+    assert!(!stage_path.exists());
+    Ok(())
+}
+
 fn builder(
     layout: &StageLayout,
     limits: StageLimits,
 ) -> Result<SanitizedStageBuilder, carl::staging::StageError> {
     SanitizedStageBuilder::open(&layout.source, &layout.stages, limits, SecretFilter)
+}
+
+fn prepare(
+    layout: &StageLayout,
+    limits: StageLimits,
+) -> Result<SanitizedStage, carl::staging::StageError> {
+    let store =
+        ArtifactStore::open(&layout.artifacts).expect("the private artifact fixture must open");
+    builder(layout, limits)?.prepare(&store)
 }
 
 #[cfg(unix)]

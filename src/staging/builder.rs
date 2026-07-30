@@ -15,17 +15,22 @@ use cap_std::fs::{MetadataExt, Permissions, PermissionsExt};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use crate::artifacts::ArtifactStore;
 use crate::policy::Sha256Digest;
 use crate::security::{SecretFilter, SecretRule};
 
 use super::{
-    SanitizedStage, StageContainment, StageError, StageErrorCode, StageExclusion,
-    StageExclusionReason, StageLimits, StageManifest, StageManifestEntry,
+    SanitizedStage, SealedBaseline, SealedBaselineEntry, SourceIdentity, SourcePreconditionRef,
+    StageContainment, StageError, StageErrorCode, StageExclusion, StageExclusionReason,
+    StageLimits, StageManifest, StageManifestEntry, account_path_bytes, canonical_manifest_bytes,
+    canonical_source_preconditions,
 };
 
 const MAX_DEPTH: usize = 64;
+const MAX_RELATIVE_PATH_BYTES: usize = 4_096;
 
 pub struct SanitizedStageBuilder {
+    source_display_path: PathBuf,
     stage_parent_display_path: PathBuf,
     source: Dir,
     stage_parent: Dir,
@@ -65,6 +70,9 @@ impl SanitizedStageBuilder {
             .map_err(|_| StageError::new(StageErrorCode::InvalidRoot))?;
         if source_path.starts_with(&stage_parent_path)
             || stage_parent_path.starts_with(&source_path)
+            || crate::sidecar::directory_paths_overlap(&source_path, &stage_parent_path)
+                .map_err(|_| StageError::new(StageErrorCode::InvalidRoot))?
+            || root_contains_protected_component(&source_path)
             || root_contains_protected_component(&stage_parent_path)
         {
             return Err(StageError::new(StageErrorCode::InvalidRoot));
@@ -74,11 +82,15 @@ impl SanitizedStageBuilder {
             .map_err(|_| StageError::new(StageErrorCode::InvalidRoot))?;
         let stage_parent = Dir::open_ambient_dir(&stage_parent_path, ambient_authority())
             .map_err(|_| StageError::new(StageErrorCode::InvalidRoot))?;
-        if !held_private_directory_is_verified(&stage_parent) {
+        if !named_path_matches_held(&source_path, &source)
+            || !named_path_matches_held(&stage_parent_path, &stage_parent)
+            || !held_private_directory_is_verified(&stage_parent)
+        {
             return Err(StageError::new(StageErrorCode::InvalidRoot));
         }
 
         Ok(Self {
+            source_display_path: source_path,
             stage_parent_display_path: stage_parent_path,
             source,
             stage_parent,
@@ -87,7 +99,24 @@ impl SanitizedStageBuilder {
         })
     }
 
-    pub fn prepare(self) -> Result<SanitizedStage, StageError> {
+    pub fn prepare(self, artifacts: &ArtifactStore) -> Result<SanitizedStage, StageError> {
+        if !named_path_matches_held(&self.source_display_path, &self.source)
+            || !named_path_matches_held(&self.stage_parent_display_path, &self.stage_parent)
+            || crate::sidecar::directory_paths_overlap(
+                &self.source_display_path,
+                &self.stage_parent_display_path,
+            )
+            .map_err(|_| StageError::new(StageErrorCode::InvalidRoot))?
+            || artifacts
+                .overlaps_canonical_path(&self.source_display_path)
+                .map_err(|_| StageError::new(StageErrorCode::InvalidRoot))?
+            || artifacts
+                .overlaps_canonical_path(&self.stage_parent_display_path)
+                .map_err(|_| StageError::new(StageErrorCode::InvalidRoot))?
+        {
+            return Err(StageError::new(StageErrorCode::InvalidRoot));
+        }
+
         let directory_name = format!("stage-{}", Uuid::new_v4());
         let stage_path = self.stage_parent_display_path.join(&directory_name);
         let destination = match create_private_directory(&self.stage_parent, &directory_name) {
@@ -98,35 +127,125 @@ impl SanitizedStageBuilder {
             }
         };
 
-        let mut state = BuildState::new(self.limits, self.secret_filter);
+        let mut state = BuildState::new(self.limits, self.secret_filter, artifacts);
         let walk_result = walk_directory(&self.source, &destination, "", 0, &mut state);
-        drop(destination);
         if let Err(error) = walk_result {
+            drop(destination);
             let _ = self.stage_parent.remove_dir_all(&directory_name);
             return Err(error);
+        }
+        if !named_path_matches_held(&self.source_display_path, &self.source)
+            || !named_path_matches_held(&self.stage_parent_display_path, &self.stage_parent)
+        {
+            drop(destination);
+            let _ = self.stage_parent.remove_dir_all(&directory_name);
+            return Err(StageError::new(StageErrorCode::InvalidRoot));
         }
 
         state
             .entries
             .sort_by(|left, right| left.path().cmp(right.path()));
         state
+            .baseline_entries
+            .sort_by(|left, right| left.path().cmp(right.path()));
+        state.directories.sort();
+        state
             .exclusions
             .sort_by(|left, right| left.path().cmp(right.path()));
         let manifest = match build_manifest(state.total_bytes, state.entries) {
             Ok(manifest) => manifest,
             Err(error) => {
+                drop(destination);
                 let _ = self.stage_parent.remove_dir_all(&directory_name);
                 return Err(error);
             }
         };
-        Ok(SanitizedStage::new(
-            stage_path,
-            self.stage_parent,
+        let manifest_bytes = match manifest.canonical_bytes() {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                drop(destination);
+                let _ = self.stage_parent.remove_dir_all(&directory_name);
+                return Err(error);
+            }
+        };
+        let manifest_artifact = match artifacts.put(&manifest_bytes) {
+            Ok(artifact) => artifact,
+            Err(_) => {
+                drop(destination);
+                let _ = self.stage_parent.remove_dir_all(&directory_name);
+                return Err(StageError::new(StageErrorCode::Artifact));
+            }
+        };
+        if manifest_artifact.id().as_str() != manifest.digest().to_string() {
+            drop(destination);
+            let _ = self.stage_parent.remove_dir_all(&directory_name);
+            return Err(StageError::new(StageErrorCode::Artifact));
+        }
+        let source_preconditions = match canonical_source_preconditions(
+            manifest.digest(),
+            state.baseline_entries.iter().map(|entry| {
+                let identity = entry.source_identity();
+                SourcePreconditionRef {
+                    path: entry.path(),
+                    bytes: entry.bytes(),
+                    content_digest: entry.content_digest(),
+                    platform: identity.platform,
+                    identity_a: &identity.identity_a,
+                    identity_b: &identity.identity_b,
+                    owner_id: &identity.owner_id,
+                    owner_mode: identity.owner_mode,
+                }
+            }),
+        ) {
+            Ok(preconditions) => preconditions,
+            Err(_) => {
+                drop(destination);
+                let _ = self.stage_parent.remove_dir_all(&directory_name);
+                return Err(StageError::new(StageErrorCode::Artifact));
+            }
+        };
+        let source_preconditions_artifact = match artifacts.put(&source_preconditions) {
+            Ok(artifact) => artifact,
+            Err(_) => {
+                drop(destination);
+                let _ = self.stage_parent.remove_dir_all(&directory_name);
+                return Err(StageError::new(StageErrorCode::Artifact));
+            }
+        };
+        let source_preconditions_digest =
+            match Sha256Digest::parse(source_preconditions_artifact.id().as_str()) {
+                Ok(digest) => digest,
+                Err(_) => {
+                    drop(destination);
+                    let _ = self.stage_parent.remove_dir_all(&directory_name);
+                    return Err(StageError::new(StageErrorCode::Artifact));
+                }
+            };
+        let baseline = SealedBaseline::new(
+            manifest.clone(),
+            manifest_artifact.id().clone(),
+            source_preconditions_artifact.id().clone(),
+            source_preconditions_digest,
+            state.baseline_entries,
+            state.directories,
+        );
+        if !named_path_matches_held(&self.source_display_path, &self.source)
+            || !named_path_matches_held(&self.stage_parent_display_path, &self.stage_parent)
+        {
+            drop(destination);
+            let _ = self.stage_parent.remove_dir_all(&directory_name);
+            return Err(StageError::new(StageErrorCode::InvalidRoot));
+        }
+        Ok(SanitizedStage {
+            path: stage_path,
+            parent: self.stage_parent,
+            work_root: Some(destination),
             directory_name,
-            StageContainment::CurrentUserPrivateVerified,
+            containment: StageContainment::CurrentUserPrivateVerified,
             manifest,
-            state.exclusions,
-        ))
+            baseline,
+            exclusions: state.exclusions,
+        })
     }
 }
 
@@ -141,21 +260,31 @@ impl fmt::Debug for SanitizedStageBuilder {
     }
 }
 
-struct BuildState {
+struct BuildState<'a> {
     limits: StageLimits,
     secret_filter: SecretFilter,
+    artifacts: &'a ArtifactStore,
+    entry_count: usize,
+    path_bytes: usize,
     total_bytes: u64,
     entries: Vec<StageManifestEntry>,
+    baseline_entries: Vec<SealedBaselineEntry>,
+    directories: Vec<String>,
     exclusions: Vec<StageExclusion>,
 }
 
-impl BuildState {
-    fn new(limits: StageLimits, secret_filter: SecretFilter) -> Self {
+impl<'a> BuildState<'a> {
+    fn new(limits: StageLimits, secret_filter: SecretFilter, artifacts: &'a ArtifactStore) -> Self {
         Self {
             limits,
             secret_filter,
+            artifacts,
+            entry_count: 0,
+            path_bytes: 0,
             total_bytes: 0,
             entries: Vec::new(),
+            baseline_entries: Vec::new(),
+            directories: Vec::new(),
             exclusions: Vec::new(),
         }
     }
@@ -170,7 +299,7 @@ fn walk_directory(
     destination: &Dir,
     relative_parent: &str,
     depth: usize,
-    state: &mut BuildState,
+    state: &mut BuildState<'_>,
 ) -> Result<(), StageError> {
     if depth > MAX_DEPTH {
         return Err(StageError::at(
@@ -179,11 +308,23 @@ fn walk_directory(
         ));
     }
 
+    let remaining_entries = state.limits.max_files().saturating_sub(state.entry_count);
     let mut entries = source
         .entries()
         .map_err(|_| io_error(relative_parent))?
+        .take(remaining_entries.saturating_add(1))
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| io_error(relative_parent))?;
+    if entries.len() > remaining_entries {
+        return Err(StageError::at(
+            StageErrorCode::LimitExceeded,
+            relative_parent.to_owned(),
+        ));
+    }
+    state.entry_count = state
+        .entry_count
+        .checked_add(entries.len())
+        .ok_or_else(|| StageError::at(StageErrorCode::LimitExceeded, relative_parent.to_owned()))?;
     entries.sort_by_key(cap_std::fs::DirEntry::file_name);
 
     for entry in entries {
@@ -198,21 +339,27 @@ fn walk_directory(
             ));
         }
         let relative = join_relative(relative_parent, name);
+        if relative.len() > MAX_RELATIVE_PATH_BYTES {
+            return Err(StageError::at(StageErrorCode::LimitExceeded, relative));
+        }
+        account_path_bytes(&mut state.path_bytes, &relative)
+            .map_err(|()| StageError::at(StageErrorCode::LimitExceeded, relative.clone()))?;
         let file_type = entry.file_type().map_err(|_| io_error(&relative))?;
 
         if entry_is_link_or_reparse(&entry, &file_type).map_err(|_| io_error(&relative))? {
             state.exclude(relative, StageExclusionReason::Symlink);
             continue;
         }
+        if protected_directory(name) {
+            state.exclude(relative, StageExclusionReason::ProtectedPath);
+            continue;
+        }
         if file_type.is_dir() {
-            if protected_directory(name) {
-                state.exclude(relative, StageExclusionReason::ProtectedPath);
-                continue;
-            }
             let source_child =
                 open_directory_nofollow(source, name).map_err(|_| io_error(&relative))?;
             let destination_child =
                 create_private_directory(destination, name).map_err(|_| io_error(&relative))?;
+            state.directories.push(relative.clone());
             walk_directory(
                 &source_child,
                 &destination_child,
@@ -241,7 +388,7 @@ fn copy_regular_file(
     destination: &Dir,
     name: &str,
     relative: String,
-    state: &mut BuildState,
+    state: &mut BuildState<'_>,
 ) -> Result<(), StageError> {
     let before = entry.metadata().map_err(|_| io_error(&relative))?;
     if matches!(pre_open_link_count(&before), Some(count) if count != 1) {
@@ -317,46 +464,49 @@ fn copy_regular_file(
         return Err(StageError::secret(relative, finding.rule()));
     }
 
+    let baseline_artifact = state
+        .artifacts
+        .put(&contents)
+        .map_err(|_| StageError::at(StageErrorCode::Artifact, relative.clone()))?;
+    let content_digest = Sha256Digest::from_bytes(Sha256::digest(&contents).into());
+    if baseline_artifact.id().as_str() != content_digest.to_string() {
+        return Err(StageError::at(StageErrorCode::Artifact, relative));
+    }
+    let identity = source_identity(&final_metadata)
+        .ok_or_else(|| StageError::at(StageErrorCode::InvalidEntry, relative.clone()))?;
+
     let mut destination_file =
         create_private_file(destination, name).map_err(|_| io_error(&relative))?;
     destination_file
         .write_all(&contents)
         .map_err(|_| io_error(&relative))?;
+    destination_file
+        .sync_all()
+        .map_err(|_| io_error(&relative))?;
     secure_created_file(&destination_file).map_err(|_| io_error(&relative))?;
 
     state.total_bytes = prospective_total;
-    let content_digest = Sha256Digest::from_bytes(Sha256::digest(&contents).into());
     state.entries.push(StageManifestEntry::new(
+        relative.clone(),
+        contents.len() as u64,
+        content_digest,
+    ));
+    state.baseline_entries.push(SealedBaselineEntry::new(
         relative,
         contents.len() as u64,
         content_digest,
+        baseline_artifact.id().clone(),
+        identity,
     ));
     Ok(())
 }
 
-fn build_manifest(
+pub(super) fn build_manifest(
     total_bytes: u64,
     entries: Vec<StageManifestEntry>,
 ) -> Result<StageManifest, StageError> {
-    let mut hasher = Sha256::new();
-    for entry in &entries {
-        let path = entry.path().as_bytes();
-        let path_len =
-            u32::try_from(path.len()).map_err(|_| StageError::new(StageErrorCode::InvalidEntry))?;
-        hasher.update(path_len.to_be_bytes());
-        hasher.update(path);
-        hasher.update(entry.bytes().to_be_bytes());
-        hasher.update(entry.content_digest().as_bytes());
-        let stage_file = Path::new(entry.path());
-        if stage_file.is_absolute()
-            || stage_file
-                .components()
-                .any(|component| !matches!(component, Component::Normal(_)))
-        {
-            return Err(StageError::new(StageErrorCode::InvalidEntry));
-        }
-    }
-    let digest_bytes: [u8; 32] = hasher.finalize().into();
+    let canonical = canonical_manifest_bytes(&entries)?;
+    let digest_bytes: [u8; 32] = Sha256::digest(canonical).into();
     let digest_text = digest_bytes
         .iter()
         .map(|byte| format!("{byte:02x}"))
@@ -366,7 +516,7 @@ fn build_manifest(
     Ok(StageManifest::new(digest, total_bytes, entries))
 }
 
-fn excluded_file(relative: &str, name: &str) -> Option<StageExclusionReason> {
+pub(super) fn excluded_file(relative: &str, name: &str) -> Option<StageExclusionReason> {
     if relative == ".mcp.json" {
         return Some(StageExclusionReason::ProtectedPath);
     }
@@ -392,7 +542,7 @@ fn compatibility_instruction(relative: &str, name: &str) -> bool {
     ) || relative.eq_ignore_ascii_case(".github/copilot-instructions.md")
 }
 
-fn protected_directory(name: &str) -> bool {
+pub(super) fn protected_directory(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
         ".git"
@@ -417,7 +567,11 @@ fn root_contains_protected_component(path: &Path) -> bool {
     })
 }
 
-fn join_relative(parent: &str, name: &str) -> String {
+fn named_path_matches_held(path: &Path, held: &Dir) -> bool {
+    crate::sidecar::directory_path_matches_held(path, held)
+}
+
+pub(super) fn join_relative(parent: &str, name: &str) -> String {
     if parent.is_empty() {
         name.to_owned()
     } else {
@@ -474,7 +628,7 @@ fn private_parent_is_verified(_path: &Path, _metadata: &std::fs::Metadata) -> bo
 }
 
 #[cfg(unix)]
-fn held_private_directory_is_verified(directory: &Dir) -> bool {
+pub(super) fn held_private_directory_is_verified(directory: &Dir) -> bool {
     directory.dir_metadata().is_ok_and(|metadata| {
         metadata.is_dir()
             && metadata.uid() == unsafe { libc::geteuid() }
@@ -483,7 +637,7 @@ fn held_private_directory_is_verified(directory: &Dir) -> bool {
 }
 
 #[cfg(windows)]
-fn held_private_directory_is_verified(directory: &Dir) -> bool {
+pub(super) fn held_private_directory_is_verified(directory: &Dir) -> bool {
     directory.dir_metadata().is_ok_and(|metadata| {
         metadata.is_dir()
             && metadata.file_attributes()
@@ -493,7 +647,7 @@ fn held_private_directory_is_verified(directory: &Dir) -> bool {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn held_private_directory_is_verified(_directory: &Dir) -> bool {
+pub(super) fn held_private_directory_is_verified(_directory: &Dir) -> bool {
     false
 }
 
@@ -538,7 +692,10 @@ fn create_private_directory(_directory: &Dir, _name: &str) -> std::io::Result<Di
 }
 
 #[cfg(unix)]
-fn open_directory_nofollow(directory: &Dir, name: &str) -> std::io::Result<Dir> {
+pub(super) fn open_directory_nofollow(
+    directory: &Dir,
+    name: impl AsRef<Path>,
+) -> std::io::Result<Dir> {
     let mut options = OpenOptions::new();
     options.read(true);
     options.custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW);
@@ -551,9 +708,12 @@ fn open_directory_nofollow(directory: &Dir, name: &str) -> std::io::Result<Dir> 
 }
 
 #[cfg(windows)]
-fn open_directory_nofollow(directory: &Dir, name: &str) -> std::io::Result<Dir> {
+pub(super) fn open_directory_nofollow(
+    directory: &Dir,
+    name: impl AsRef<Path>,
+) -> std::io::Result<Dir> {
     let parent = directory.try_clone()?.into_std_file();
-    let child = cap_primitives::fs::open_dir_nofollow(&parent, Path::new(name))?;
+    let child = cap_primitives::fs::open_dir_nofollow(&parent, name.as_ref())?;
     let child = Dir::from_std_file(child);
     let metadata = child.dir_metadata()?;
     if metadata.is_dir()
@@ -568,7 +728,10 @@ fn open_directory_nofollow(directory: &Dir, name: &str) -> std::io::Result<Dir> 
 }
 
 #[cfg(not(any(unix, windows)))]
-fn open_directory_nofollow(_directory: &Dir, _name: &str) -> std::io::Result<Dir> {
+pub(super) fn open_directory_nofollow(
+    _directory: &Dir,
+    _name: impl AsRef<Path>,
+) -> std::io::Result<Dir> {
     Err(private_containment_error())
 }
 
@@ -633,20 +796,20 @@ fn private_containment_error() -> std::io::Error {
 }
 
 #[cfg(unix)]
-fn set_no_follow(options: &mut OpenOptions) {
+pub(super) fn set_no_follow(options: &mut OpenOptions) {
     options.custom_flags(libc::O_NOFOLLOW);
 }
 
 #[cfg(windows)]
-fn set_no_follow(options: &mut OpenOptions) {
+pub(super) fn set_no_follow(options: &mut OpenOptions) {
     options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
 }
 
 #[cfg(not(any(unix, windows)))]
-fn set_no_follow(_options: &mut OpenOptions) {}
+pub(super) fn set_no_follow(_options: &mut OpenOptions) {}
 
 #[cfg(windows)]
-fn entry_is_link_or_reparse(
+pub(super) fn entry_is_link_or_reparse(
     entry: &cap_std::fs::DirEntry,
     file_type: &cap_std::fs::FileType,
 ) -> std::io::Result<bool> {
@@ -657,7 +820,7 @@ fn entry_is_link_or_reparse(
 }
 
 #[cfg(not(windows))]
-fn entry_is_link_or_reparse(
+pub(super) fn entry_is_link_or_reparse(
     _entry: &cap_std::fs::DirEntry,
     file_type: &cap_std::fs::FileType,
 ) -> std::io::Result<bool> {
@@ -675,22 +838,22 @@ fn pre_open_link_count(_metadata: &Metadata) -> Option<u64> {
 }
 
 #[cfg(unix)]
-fn link_count(metadata: &Metadata) -> Option<u64> {
+pub(super) fn link_count(metadata: &Metadata) -> Option<u64> {
     Some(metadata.nlink())
 }
 
 #[cfg(windows)]
-fn link_count(metadata: &Metadata) -> Option<u64> {
+pub(super) fn link_count(metadata: &Metadata) -> Option<u64> {
     metadata.number_of_links().map(u64::from)
 }
 
 #[cfg(not(any(unix, windows)))]
-fn link_count(_metadata: &Metadata) -> Option<u64> {
+pub(super) fn link_count(_metadata: &Metadata) -> Option<u64> {
     None
 }
 
 #[cfg(windows)]
-fn opened_metadata_is_regular(metadata: &Metadata) -> bool {
+pub(super) fn opened_metadata_is_regular(metadata: &Metadata) -> bool {
     metadata.is_file()
         && metadata.file_attributes()
             & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
@@ -698,7 +861,7 @@ fn opened_metadata_is_regular(metadata: &Metadata) -> bool {
 }
 
 #[cfg(not(windows))]
-fn opened_metadata_is_regular(metadata: &Metadata) -> bool {
+pub(super) fn opened_metadata_is_regular(metadata: &Metadata) -> bool {
     metadata.is_file()
 }
 
@@ -713,12 +876,12 @@ fn pre_open_matches_opened(_before: &Metadata, _opened: &Metadata) -> bool {
 }
 
 #[cfg(unix)]
-fn same_file(left: &Metadata, right: &Metadata) -> bool {
+pub(super) fn same_file(left: &Metadata, right: &Metadata) -> bool {
     left.dev() == right.dev() && left.ino() == right.ino()
 }
 
 #[cfg(windows)]
-fn same_file(left: &Metadata, right: &Metadata) -> bool {
+pub(super) fn same_file(left: &Metadata, right: &Metadata) -> bool {
     left.volume_serial_number() == right.volume_serial_number()
         && left.file_index() == right.file_index()
         && left.volume_serial_number().is_some()
@@ -726,7 +889,7 @@ fn same_file(left: &Metadata, right: &Metadata) -> bool {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn same_file(left: &Metadata, right: &Metadata) -> bool {
+pub(super) fn same_file(left: &Metadata, right: &Metadata) -> bool {
     left.len() == right.len()
 }
 
@@ -741,4 +904,34 @@ fn named_entry_matches(
         && link_count(&validation_metadata) == Some(1)
         && validation_metadata.len() == expected.len()
         && same_file(expected, &validation_metadata))
+}
+
+#[cfg(unix)]
+fn source_identity(metadata: &Metadata) -> Option<SourceIdentity> {
+    Some(SourceIdentity {
+        platform: "unix",
+        identity_a: metadata.dev().to_string(),
+        identity_b: metadata.ino().to_string(),
+        owner_id: metadata.uid().to_string(),
+        owner_mode: Some(metadata.permissions().mode() & 0o7777),
+    })
+}
+
+#[cfg(windows)]
+fn source_identity(metadata: &Metadata) -> Option<SourceIdentity> {
+    Some(SourceIdentity {
+        platform: "windows",
+        identity_a: metadata.volume_serial_number()?.to_string(),
+        identity_b: metadata.file_index()?.to_string(),
+        // The source workspace is not required to have Carl's private DACL.
+        // Promotion revalidates its named identity and content; this marker
+        // explicitly records that no owner SID is asserted here.
+        owner_id: "not_asserted".to_owned(),
+        owner_mode: None,
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn source_identity(_metadata: &Metadata) -> Option<SourceIdentity> {
+    None
 }
