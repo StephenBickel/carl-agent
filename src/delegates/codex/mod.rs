@@ -139,6 +139,7 @@ impl CodexExecAdapter {
                 effort.as_codex_value()
             )));
         }
+        arguments.extend(["--ask-for-approval", "never"].map(OsString::from));
         arguments.extend(
             [
                 "exec",
@@ -146,8 +147,6 @@ impl CodexExecAdapter {
                 "--ephemeral",
                 "--sandbox",
                 "workspace-write",
-                "--ask-for-approval",
-                "never",
                 "--skip-git-repo-check",
                 "-",
             ]
