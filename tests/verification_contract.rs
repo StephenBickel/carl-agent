@@ -261,9 +261,17 @@ fn verification_runs_the_exact_approved_command_in_a_fresh_closed_candidate() ->
             .as_str()
             .ok_or("fixture report has no working directory")?,
     );
-    assert!(candidate.starts_with(fs::canonicalize(&prepared.layout.verifications)?));
-    assert_ne!(candidate, fs::canonicalize(prepared.stage.path())?);
-    assert_ne!(candidate, fs::canonicalize(&prepared.layout.source)?);
+    let candidate_parent = fs::canonicalize(
+        candidate
+            .parent()
+            .ok_or("fixture working directory has no parent")?,
+    )?;
+    assert_eq!(
+        candidate_parent,
+        fs::canonicalize(&prepared.layout.verifications)?
+    );
+    assert_ne!(candidate_parent, fs::canonicalize(prepared.stage.path())?);
+    assert_ne!(candidate_parent, fs::canonicalize(&prepared.layout.source)?);
     assert!(
         !candidate.exists(),
         "the disposable verification candidate must be removed after execution"
