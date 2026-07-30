@@ -37,10 +37,15 @@ All notable changes to Carl will be recorded here. The project is pre-alpha and 
   verified reopen/rehash, sealed source-identity evidence, startup reachability
   cleanup, aggregate storage limits, plus a process-free one-file exact-replacement
   inspector.
+- An inert independent-verification boundary that reconstructs fresh candidates from
+  sealed artifacts, binds the approved native executable and literal argv, runs with
+  a credential-free environment through a bounded process-tree supervisor, rejects
+  candidate mutation and unsafe diagnostics, persists request/result evidence
+  atomically, and mints verified-proposal capabilities only after commit.
 
 ### Not yet available
 
 - Native model execution remains unavailable.
 - Subscription-backed coding is not exposed through the CLI: no subscription coding
-  task is CLI-reachable until independent verification, stale-safe promotion, and
-  run-engine orchestration are implemented.
+  task is CLI-reachable until stale-safe promotion and run-engine orchestration are
+  implemented.

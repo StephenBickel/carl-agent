@@ -19,13 +19,18 @@ use crate::events::{
 use crate::policy::{ActorId, Sha256Digest};
 use crate::runtime::subscription::{
     ProviderReported, RunConfigSnapshot, RunFailureCode, RunId, RunState, RunTransition,
-    RunTrustLabel,
+    RunTrustLabel, VerificationId,
 };
 use crate::security::SecretFilter;
 use crate::sidecar::DataRootLock;
 use crate::staging::{
     ExactReplacementProposal, ProposalLimits, ProposalOutcome, SanitizedStage, SealedBaseline,
     SourcePreconditionRef, canonical_source_preconditions,
+};
+use crate::verification::{
+    VerificationEnvironmentProfile, VerificationExecutableEvidence, VerificationLimits,
+    VerificationOutcome, VerificationRequest, VerificationResult, VerificationSpec,
+    VerificationSpecEvidence, VerifiedProposal,
 };
 
 use super::schema;
@@ -35,6 +40,8 @@ const MAX_BOUND_APPROVAL_LIFETIME: chrono::TimeDelta = chrono::TimeDelta::minute
 const MAX_APPROVAL_SUMMARY_BYTES: usize = 4 * 1_024;
 const RUNTIME_DATABASE_FILENAME: &str = "carl.sqlite3";
 const EXACT_REPLACEMENT_DOMAIN: &[u8] = b"carl.exact-replacement.v1\0";
+const BASELINE_DIRECTORIES_DOMAIN: &[u8] = b"carl.baseline-directories.v1\0";
+const MAX_BASELINE_DIRECTORY_PATH_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionRecord {
@@ -356,7 +363,10 @@ pub struct SubscriptionRunBaselineRecord {
     pub source_preconditions_digest: Sha256Digest,
     pub entry_count: u64,
     pub total_bytes: u64,
+    pub directory_count: u64,
+    pub directory_manifest_digest: Sha256Digest,
     pub entries: Vec<SubscriptionRunBaselineEntryRecord>,
+    pub directories: Vec<String>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -408,6 +418,88 @@ pub struct SubscriptionRunProposalRecord {
     pub payload_hash: Sha256Digest,
     pub payload_bytes: u64,
     pub created_at: DateTime<Utc>,
+}
+
+pub struct VerificationCompletionRecord {
+    run: SubscriptionRunRecord,
+    result: VerificationResult,
+    verified_proposal: Option<VerifiedProposal>,
+}
+
+pub(crate) struct VerificationResultRehydrationAuthority {
+    _repository_loader_only: (),
+}
+
+impl VerificationCompletionRecord {
+    #[must_use]
+    pub const fn run(&self) -> &SubscriptionRunRecord {
+        &self.run
+    }
+
+    #[must_use]
+    pub const fn result(&self) -> &VerificationResult {
+        &self.result
+    }
+
+    #[must_use]
+    pub const fn verified_proposal(&self) -> Option<&VerifiedProposal> {
+        self.verified_proposal.as_ref()
+    }
+}
+
+struct StoredVerificationRequest {
+    verification_id: String,
+    started_run_sequence: i64,
+    inspection_outcome: String,
+    baseline_manifest_artifact_id: String,
+    source_preconditions_artifact_id: String,
+    source_preconditions_digest: String,
+    baseline_directory_manifest_digest: String,
+    proposal_artifact_id: String,
+    payload_artifact_id: String,
+    candidate_manifest_digest: String,
+    executable_path: String,
+    executable_metadata_risk: String,
+    executable_platform_identity: Vec<u8>,
+    executable_byte_length: i64,
+    executable_content_sha256: String,
+    executable_attestation_digest: String,
+    verification_spec_digest: String,
+    request_digest: String,
+    argv_digest: String,
+    environment_profile: String,
+    execution_timeout_nanos: i64,
+    max_output_bytes: i64,
+    graceful_shutdown_timeout_nanos: i64,
+    forced_shutdown_timeout_nanos: i64,
+    poll_interval_nanos: i64,
+    argv_count: i64,
+    argv_bytes: i64,
+    created_at: String,
+}
+
+struct StoredVerificationResult {
+    verification_id: String,
+    completed_run_sequence: i64,
+    request_digest: String,
+    expected_candidate_manifest_digest: String,
+    expected_directory_manifest_digest: String,
+    outcome: String,
+    exit_code: Option<i64>,
+    observed_candidate_manifest_digest: Option<String>,
+    observed_directory_manifest_digest: Option<String>,
+    executable_attestation_evidence: String,
+    executable_attestation_digest: String,
+    stdout_text: String,
+    stdout_bytes: i64,
+    stdout_digest: String,
+    stderr_text: String,
+    stderr_bytes: i64,
+    stderr_digest: String,
+    max_output_bytes: i64,
+    duration_nanos: i64,
+    result_digest: String,
+    completed_at: String,
 }
 
 pub struct Store {
@@ -713,6 +805,8 @@ impl Store {
             });
         }
         let (manifest_bytes, source_preconditions_bytes) = validate_sealed_baseline(baseline)?;
+        let directory_manifest = canonical_baseline_directories(baseline.directories())?;
+        let directory_manifest_digest = digest_bytes(&directory_manifest);
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -747,8 +841,9 @@ impl Store {
                 "INSERT INTO subscription_run_baselines (
                     run_id, manifest_artifact_id, manifest_digest,
                     source_preconditions_artifact_id, source_preconditions_digest,
-                    entry_count, total_bytes, created_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    entry_count, total_bytes,
+                    directory_count, directory_manifest_digest, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
                     run_id.to_string(),
                     baseline.manifest_artifact_id().as_str(),
@@ -757,6 +852,8 @@ impl Store {
                     baseline.source_preconditions_digest().to_string(),
                     usize_to_sql(baseline.entries().len(), "baseline entry count")?,
                     revision_to_sql(baseline.manifest().total_bytes())?,
+                    usize_to_sql(baseline.directories().len(), "baseline directory count")?,
+                    directory_manifest_digest.to_string(),
                     format_timestamp(created_at),
                 ],
             )
@@ -791,6 +888,20 @@ impl Store {
                         identity.identity_b,
                         identity.owner_id,
                         identity.owner_mode.map(i64::from),
+                    ],
+                )
+                .map_err(storage_error)?;
+        }
+        for (ordinal, path) in baseline.directories().iter().enumerate() {
+            transaction
+                .execute(
+                    "INSERT INTO subscription_run_baseline_directories (
+                        run_id, ordinal, path
+                     ) VALUES (?1, ?2, ?3)",
+                    params![
+                        run_id.to_string(),
+                        usize_to_sql(ordinal, "baseline directory ordinal")?,
+                        path,
                     ],
                 )
                 .map_err(storage_error)?;
@@ -958,6 +1069,333 @@ impl Store {
         Ok(proposal)
     }
 
+    fn get_subscription_run_verification_request(
+        &self,
+        run_id: RunId,
+    ) -> Result<Option<VerificationRequest>, CarlError> {
+        load_subscription_run_verification_request(&self.connection, run_id)
+    }
+
+    fn get_subscription_run_verification_result(
+        &self,
+        run_id: RunId,
+    ) -> Result<Option<VerificationResult>, CarlError> {
+        load_subscription_run_verification_result(&self.connection, run_id)
+    }
+
+    fn begin_subscription_run_verification(
+        &mut self,
+        run_id: RunId,
+        expected_revision: u64,
+        specification: &VerificationSpec,
+        created_at: DateTime<Utc>,
+    ) -> Result<Option<VerificationRequest>, CarlError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage_error)?;
+        let Some(mut run) = load_subscription_run(&transaction, run_id)? else {
+            transaction.commit().map_err(storage_error)?;
+            return Ok(None);
+        };
+        if run.state != RunState::Inspecting || run.revision != expected_revision {
+            transaction.commit().map_err(storage_error)?;
+            return Ok(None);
+        }
+        let baseline = load_subscription_run_baseline(&transaction, run_id)?
+            .ok_or_else(|| storage_invariant("subscription run has no sealed baseline"))?;
+        let proposal = load_subscription_run_proposal(&transaction, run_id)?
+            .ok_or_else(|| storage_invariant("subscription run has no exact proposal"))?;
+        let request = VerificationRequest::from_persisted(
+            VerificationId::new(),
+            run_id,
+            &baseline,
+            &proposal,
+            specification,
+        )
+        .map_err(verification_storage_error)?;
+        let next_revision = expected_revision
+            .checked_add(1)
+            .ok_or_else(|| storage_invariant("subscription run revision overflow"))?;
+        let evidence = specification.evidence();
+        let executable = evidence.executable();
+        let limits = specification.limits();
+        transaction
+            .execute(
+                "INSERT INTO subscription_run_verification_requests (
+                    id, run_id, started_run_sequence, inspection_outcome,
+                    baseline_manifest_artifact_id,
+                    source_preconditions_artifact_id,
+                    source_preconditions_digest,
+                    baseline_directory_manifest_digest,
+                    proposal_artifact_id, payload_artifact_id,
+                    candidate_manifest_digest, executable_path,
+                    executable_metadata_risk, executable_platform_identity,
+                    executable_byte_length, executable_content_sha256,
+                    executable_attestation_digest, verification_spec_digest,
+                    request_digest, argv_digest,
+                    environment_profile, execution_timeout_nanos,
+                    max_output_bytes, graceful_shutdown_timeout_nanos,
+                    forced_shutdown_timeout_nanos, poll_interval_nanos,
+                    argv_count, argv_bytes, created_at
+                 ) VALUES (
+                    ?1, ?2, ?3, 'exact_replacement', ?4, ?5, ?6, ?7,
+                    ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
+                    ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27,
+                    ?28
+                 )",
+                params![
+                    request.verification_id().to_string(),
+                    run_id.to_string(),
+                    revision_to_sql(next_revision)?,
+                    request.baseline_manifest_artifact_id().as_str(),
+                    request.source_preconditions_artifact_id().as_str(),
+                    request.source_preconditions_digest().to_string(),
+                    request.baseline_directory_manifest_digest().to_string(),
+                    request.proposal_artifact_id().as_str(),
+                    request.payload_artifact_id().as_str(),
+                    request.candidate_manifest_digest().to_string(),
+                    executable.canonical_path(),
+                    executable.metadata_risk_tag(),
+                    executable.platform_identity_evidence(),
+                    revision_to_sql(executable.byte_len())?,
+                    executable.content_sha256().to_string(),
+                    evidence.executable_attestation_digest().to_string(),
+                    request.specification_digest().to_string(),
+                    request.request_digest().to_string(),
+                    evidence.argument_vector_digest().to_string(),
+                    specification.environment_profile().as_storage_str(),
+                    duration_to_sql_nanos(
+                        limits.execution_timeout(),
+                        "verification execution timeout",
+                    )?,
+                    usize_to_sql(
+                        limits.max_output_bytes(),
+                        "verification maximum output bytes",
+                    )?,
+                    duration_to_sql_nanos(
+                        limits.graceful_shutdown_timeout(),
+                        "verification graceful shutdown timeout",
+                    )?,
+                    duration_to_sql_nanos(
+                        limits.forced_shutdown_timeout(),
+                        "verification forced shutdown timeout",
+                    )?,
+                    duration_to_sql_nanos(limits.poll_interval(), "verification poll interval",)?,
+                    usize_to_sql(
+                        specification.arguments().len(),
+                        "verification argument count",
+                    )?,
+                    usize_to_sql(evidence.argument_bytes(), "verification argument bytes",)?,
+                    format_timestamp(created_at),
+                ],
+            )
+            .map_err(storage_error)?;
+        for (ordinal, argument) in specification.arguments().iter().enumerate() {
+            transaction
+                .execute(
+                    "INSERT INTO subscription_run_verification_argv (
+                        verification_id, ordinal, value
+                     ) VALUES (?1, ?2, ?3)",
+                    params![
+                        request.verification_id().to_string(),
+                        usize_to_sql(ordinal, "verification argument ordinal")?,
+                        argument,
+                    ],
+                )
+                .map_err(storage_error)?;
+        }
+        let transition = RunTransition::new(RunState::Inspecting, RunState::Verifying, None)?;
+        let changed = transaction
+            .execute(
+                "UPDATE subscription_runs
+                 SET state = ?4, revision = ?5, updated_at = ?6
+                 WHERE id = ?1 AND state = ?2 AND revision = ?3",
+                params![
+                    run_id.to_string(),
+                    RunState::Inspecting.as_str(),
+                    revision_to_sql(expected_revision)?,
+                    RunState::Verifying.as_str(),
+                    revision_to_sql(next_revision)?,
+                    format_timestamp(created_at),
+                ],
+            )
+            .map_err(storage_error)?;
+        if changed != 1 {
+            return Err(storage_invariant(
+                "subscription run changed while beginning verification",
+            ));
+        }
+        let envelope = append_event_in_transaction(
+            &transaction,
+            run.session_id,
+            Some(run.turn_id),
+            Event::SubscriptionRunTransitioned {
+                run_id,
+                run_sequence: next_revision,
+                transition,
+                trust_label: RunTrustLabel::TrustedCarlState,
+            },
+            created_at,
+        )?;
+        link_subscription_run_event(&transaction, run_id, next_revision, envelope.id)?;
+        transaction.commit().map_err(storage_error)?;
+
+        run.state = RunState::Verifying;
+        run.revision = next_revision;
+        run.updated_at = created_at;
+        Ok(Some(request))
+    }
+
+    fn complete_subscription_run_verification(
+        &mut self,
+        run_id: RunId,
+        expected_revision: u64,
+        result: &VerificationResult,
+        completed_at: DateTime<Utc>,
+    ) -> Result<Option<VerificationCompletionRecord>, CarlError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage_error)?;
+        let Some(mut run) = load_subscription_run(&transaction, run_id)? else {
+            transaction.commit().map_err(storage_error)?;
+            return Ok(None);
+        };
+        if run.state != RunState::Verifying || run.revision != expected_revision {
+            transaction.commit().map_err(storage_error)?;
+            return Ok(None);
+        }
+        let request = load_subscription_run_verification_request(&transaction, run_id)?
+            .ok_or_else(|| storage_invariant("verifying run has no durable request"))?;
+        result
+            .validate_recomputed(&request)
+            .map_err(verification_storage_error)?;
+        if result.run_id() != run_id {
+            return Err(CarlError::Validation {
+                detail: "verification result belongs to a different subscription run".to_owned(),
+            });
+        }
+        if subscription_run_has_verification_result(&transaction, run_id)? {
+            return Err(CarlError::Validation {
+                detail: "the subscription run verification result is already recorded".to_owned(),
+            });
+        }
+        let next_revision = expected_revision
+            .checked_add(1)
+            .ok_or_else(|| storage_invariant("subscription run revision overflow"))?;
+        let (next_state, failure_code) = match result.outcome() {
+            VerificationOutcome::Passed => (RunState::AwaitingPromotionApproval, None),
+            VerificationOutcome::Cancelled => (RunState::Cancelled, None),
+            _ => (RunState::Failed, Some(RunFailureCode::VerificationFailed)),
+        };
+        let transition = RunTransition::new(RunState::Verifying, next_state, failure_code)?;
+        let maximum_output_bytes = request.specification().limits().max_output_bytes();
+        transaction
+            .execute(
+                "INSERT INTO subscription_run_verification_results (
+                    verification_id, run_id, completed_run_sequence,
+                    request_digest, expected_candidate_manifest_digest,
+                    expected_directory_manifest_digest, outcome, exit_code,
+                    observed_candidate_manifest_digest,
+                    observed_directory_manifest_digest,
+                    executable_attestation_evidence,
+                    executable_attestation_digest,
+                    stdout_text, stdout_bytes, stdout_digest,
+                    stderr_text, stderr_bytes, stderr_digest,
+                    max_output_bytes, duration_nanos, result_digest,
+                    completed_at
+                 ) VALUES (
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                    ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20,
+                    ?21, ?22
+                 )",
+                params![
+                    result.verification_id().to_string(),
+                    run_id.to_string(),
+                    revision_to_sql(next_revision)?,
+                    result.request_digest().to_string(),
+                    result.expected_candidate_manifest_digest().to_string(),
+                    result.expected_directory_manifest_digest().to_string(),
+                    result.outcome().as_storage_str(),
+                    result.exit_code(),
+                    result
+                        .observed_candidate_manifest_digest()
+                        .map(|digest| digest.to_string()),
+                    result
+                        .observed_directory_manifest_digest()
+                        .map(|digest| digest.to_string()),
+                    result.executable_attestation_evidence(),
+                    result.executable_attestation_digest().to_string(),
+                    result.stdout().text(),
+                    revision_to_sql(result.stdout().byte_length())?,
+                    result.stdout().digest().to_string(),
+                    result.stderr().text(),
+                    revision_to_sql(result.stderr().byte_length())?,
+                    result.stderr().digest().to_string(),
+                    usize_to_sql(maximum_output_bytes, "verification maximum output bytes",)?,
+                    duration_to_sql_nanos(result.duration(), "verification result duration")?,
+                    result.result_digest().to_string(),
+                    format_timestamp(completed_at),
+                ],
+            )
+            .map_err(storage_error)?;
+        let changed = transaction
+            .execute(
+                "UPDATE subscription_runs
+                 SET state = ?4, revision = ?5, failure_code = ?6, updated_at = ?7
+                 WHERE id = ?1 AND state = ?2 AND revision = ?3",
+                params![
+                    run_id.to_string(),
+                    RunState::Verifying.as_str(),
+                    revision_to_sql(expected_revision)?,
+                    next_state.as_str(),
+                    revision_to_sql(next_revision)?,
+                    failure_code.map(RunFailureCode::as_str),
+                    format_timestamp(completed_at),
+                ],
+            )
+            .map_err(storage_error)?;
+        if changed != 1 {
+            return Err(storage_invariant(
+                "subscription run changed while completing verification",
+            ));
+        }
+        let envelope = append_event_in_transaction(
+            &transaction,
+            run.session_id,
+            Some(run.turn_id),
+            Event::SubscriptionRunTransitioned {
+                run_id,
+                run_sequence: next_revision,
+                transition,
+                trust_label: RunTrustLabel::TrustedCarlVerification,
+            },
+            completed_at,
+        )?;
+        link_subscription_run_event(&transaction, run_id, next_revision, envelope.id)?;
+        transaction.commit().map_err(storage_error)?;
+
+        run.state = next_state;
+        run.revision = next_revision;
+        run.failure_code = failure_code;
+        run.updated_at = completed_at;
+        let committed_result = result.clone();
+        let verified_proposal = if committed_result.outcome() == VerificationOutcome::Passed {
+            Some(
+                VerifiedProposal::from_committed_result(&request, &committed_result)
+                    .map_err(|_| storage_invariant("committed verification result is invalid"))?,
+            )
+        } else {
+            None
+        };
+        Ok(Some(VerificationCompletionRecord {
+            run,
+            result: committed_result,
+            verified_proposal,
+        }))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn record_subscription_run_provider_configuration(
         &mut self,
@@ -1066,6 +1504,12 @@ impl Store {
         if transition.from() != expected_state {
             return Err(CarlError::Validation {
                 detail: "subscription run transition does not match its precondition".to_owned(),
+            });
+        }
+        if transition.to() == RunState::Verifying || transition.from() == RunState::Verifying {
+            return Err(CarlError::Validation {
+                detail: "the dedicated verification APIs must own verification transitions"
+                    .to_owned(),
             });
         }
         let transaction = self
@@ -1808,6 +2252,80 @@ impl RuntimeStore {
         Ok(Some(proposal))
     }
 
+    pub fn begin_subscription_run_verification(
+        &mut self,
+        run_id: RunId,
+        expected_revision: u64,
+        specification: &VerificationSpec,
+        created_at: DateTime<Utc>,
+    ) -> Result<Option<VerificationRequest>, CarlError> {
+        self.get_subscription_run_baseline(run_id)?
+            .ok_or_else(|| storage_invariant("subscription run has no sealed baseline"))?;
+        self.get_subscription_run_proposal(run_id)?
+            .ok_or_else(|| storage_invariant("subscription run has no exact proposal"))?;
+        self.store.begin_subscription_run_verification(
+            run_id,
+            expected_revision,
+            specification,
+            created_at,
+        )
+    }
+
+    pub fn get_subscription_run_verification_request(
+        &self,
+        run_id: RunId,
+    ) -> Result<Option<VerificationRequest>, CarlError> {
+        let request = self
+            .store
+            .get_subscription_run_verification_request(run_id)?;
+        if request.is_some() {
+            self.get_subscription_run_baseline(run_id)?
+                .ok_or_else(|| storage_invariant("verification request has no sealed baseline"))?;
+            self.get_subscription_run_proposal(run_id)?
+                .ok_or_else(|| storage_invariant("verification request has no exact proposal"))?;
+        }
+        Ok(request)
+    }
+
+    pub fn complete_subscription_run_verification(
+        &mut self,
+        run_id: RunId,
+        expected_revision: u64,
+        result: &VerificationResult,
+        completed_at: DateTime<Utc>,
+    ) -> Result<Option<VerificationCompletionRecord>, CarlError> {
+        let Some(run) = self.store.get_subscription_run(run_id)? else {
+            return Ok(None);
+        };
+        if run.state != RunState::Verifying || run.revision != expected_revision {
+            return Ok(None);
+        }
+        self.get_subscription_run_verification_request(run_id)?
+            .ok_or_else(|| storage_invariant("verifying run has no durable request"))?;
+        self.store.complete_subscription_run_verification(
+            run_id,
+            expected_revision,
+            result,
+            completed_at,
+        )
+    }
+
+    pub fn get_subscription_run_verification_result(
+        &self,
+        run_id: RunId,
+    ) -> Result<Option<VerificationResult>, CarlError> {
+        let result = self
+            .store
+            .get_subscription_run_verification_result(run_id)?;
+        if result.is_some() {
+            self.get_subscription_run_baseline(run_id)?
+                .ok_or_else(|| storage_invariant("verification result has no sealed baseline"))?;
+            self.get_subscription_run_proposal(run_id)?
+                .ok_or_else(|| storage_invariant("verification result has no exact proposal"))?;
+        }
+        Ok(result)
+    }
+
     #[must_use]
     pub fn startup_recoveries(&self) -> &[RunId] {
         &self.startup_recoveries
@@ -1924,6 +2442,21 @@ fn subscription_run_has_proposal(
     connection
         .query_row(
             "SELECT 1 FROM subscription_run_proposals WHERE run_id = ?1",
+            [run_id.to_string()],
+            |_| Ok(()),
+        )
+        .optional()
+        .map(|row| row.is_some())
+        .map_err(storage_error)
+}
+
+fn subscription_run_has_verification_result(
+    connection: &Connection,
+    run_id: RunId,
+) -> Result<bool, CarlError> {
+    connection
+        .query_row(
+            "SELECT 1 FROM subscription_run_verification_results WHERE run_id = ?1",
             [run_id.to_string()],
             |_| Ok(()),
         )
@@ -2083,6 +2616,7 @@ fn validate_sealed_baseline(baseline: &SealedBaseline) -> Result<(Vec<u8>, Vec<u
             "sealed baseline total size is inconsistent",
         ));
     }
+    canonical_baseline_directories(baseline.directories())?;
     let source_preconditions = canonical_source_preconditions(
         manifest.digest(),
         baseline.entries().iter().map(|entry| {
@@ -2151,6 +2685,18 @@ fn verify_loaded_baseline_artifacts(
     artifacts: &ArtifactStore,
     baseline: &SubscriptionRunBaselineRecord,
 ) -> Result<(), CarlError> {
+    let canonical_directories = canonical_baseline_directories(&baseline.directories)
+        .map_err(|_| storage_invariant("stored baseline directory topology is invalid"))?;
+    if usize_to_u64(
+        baseline.directories.len(),
+        "stored baseline directory count",
+    )? != baseline.directory_count
+        || digest_bytes(&canonical_directories) != baseline.directory_manifest_digest
+    {
+        return Err(storage_invariant(
+            "stored baseline directory topology is inconsistent",
+        ));
+    }
     let canonical_manifest = canonical_manifest_bytes(&baseline.entries)?;
     if digest_bytes(&canonical_manifest) != baseline.manifest_digest
         || artifact_id_for_bytes(&canonical_manifest)? != baseline.manifest_artifact_id
@@ -2383,6 +2929,58 @@ fn candidate_manifest_digest(
     Ok(digest_bytes(&bytes))
 }
 
+fn canonical_baseline_directories(directories: &[String]) -> Result<Vec<u8>, CarlError> {
+    let mut bytes = Vec::new();
+    let mut aggregate_path_bytes = 0_usize;
+    let mut previous: Option<&str> = None;
+    bytes.extend_from_slice(BASELINE_DIRECTORIES_DOMAIN);
+    bytes.extend_from_slice(
+        &u32::try_from(directories.len())
+            .map_err(|_| artifact_validation_error("baseline directory count is invalid"))?
+            .to_be_bytes(),
+    );
+    for directory in directories {
+        let path = directory.as_str();
+        if path.is_empty()
+            || path.len() > 4_096
+            || path.starts_with('/')
+            || path.ends_with('/')
+            || path.contains(['\\', '\0'])
+            || path
+                .split('/')
+                .any(|component| component.is_empty() || matches!(component, "." | ".."))
+            || previous.is_some_and(|previous| previous >= path)
+        {
+            return Err(artifact_validation_error(
+                "sealed baseline directory topology is invalid",
+            ));
+        }
+        if let Some((parent, _)) = path.rsplit_once('/')
+            && directories
+                .binary_search_by(|candidate| candidate.as_str().cmp(parent))
+                .is_err()
+        {
+            return Err(artifact_validation_error(
+                "sealed baseline directory parent is missing",
+            ));
+        }
+        aggregate_path_bytes = aggregate_path_bytes
+            .checked_add(path.len())
+            .filter(|total| *total <= MAX_BASELINE_DIRECTORY_PATH_BYTES)
+            .ok_or_else(|| {
+                artifact_validation_error("baseline directory paths exceed the limit")
+            })?;
+        bytes.extend_from_slice(
+            &u32::try_from(path.len())
+                .map_err(|_| artifact_validation_error("baseline directory path is too long"))?
+                .to_be_bytes(),
+        );
+        bytes.extend_from_slice(path.as_bytes());
+        previous = Some(path);
+    }
+    Ok(bytes)
+}
+
 fn canonical_manifest_bytes(
     entries: &[SubscriptionRunBaselineEntryRecord],
 ) -> Result<Vec<u8>, CarlError> {
@@ -2438,7 +3036,9 @@ fn load_subscription_run_baseline(
             "SELECT baseline.manifest_artifact_id, baseline.manifest_digest,
                     baseline.source_preconditions_artifact_id,
                     baseline.source_preconditions_digest,
-                    baseline.entry_count, baseline.total_bytes, baseline.created_at,
+                    baseline.entry_count, baseline.total_bytes,
+                    baseline.directory_count, baseline.directory_manifest_digest,
+                    baseline.created_at,
                     manifest_object.byte_length, preconditions_object.byte_length
              FROM subscription_run_baselines AS baseline
              JOIN artifact_objects AS manifest_object
@@ -2455,9 +3055,11 @@ fn load_subscription_run_baseline(
                     row.get::<_, String>(3)?,
                     row.get::<_, i64>(4)?,
                     row.get::<_, i64>(5)?,
-                    row.get::<_, String>(6)?,
-                    row.get::<_, i64>(7)?,
-                    row.get::<_, i64>(8)?,
+                    row.get::<_, Option<i64>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, i64>(9)?,
+                    row.get::<_, i64>(10)?,
                 ))
             },
         )
@@ -2470,6 +3072,8 @@ fn load_subscription_run_baseline(
         source_preconditions_digest,
         entry_count,
         total_bytes,
+        directory_count,
+        directory_manifest_digest,
         created_at,
         manifest_byte_length,
         source_preconditions_byte_length,
@@ -2502,6 +3106,15 @@ fn load_subscription_run_baseline(
     }
     let entry_count = stored_u64(entry_count, "baseline entry count")?;
     let total_bytes = stored_u64(total_bytes, "baseline total bytes")?;
+    let directory_count = directory_count
+        .ok_or_else(|| storage_invariant("stored baseline directory count is missing"))
+        .and_then(|count| stored_u64(count, "baseline directory count"))?;
+    let directory_manifest_digest = directory_manifest_digest
+        .ok_or_else(|| storage_invariant("stored baseline directory digest is missing"))
+        .and_then(|digest| {
+            Sha256Digest::parse(digest)
+                .map_err(|_| storage_invariant("stored baseline directory digest is invalid"))
+        })?;
     let manifest_byte_length = stored_u64(manifest_byte_length, "baseline manifest length")?;
     let source_preconditions_byte_length = stored_u64(
         source_preconditions_byte_length,
@@ -2621,6 +3234,42 @@ fn load_subscription_run_baseline(
             "stored baseline projection is internally inconsistent",
         ));
     }
+    let directory_rows = {
+        let mut statement = connection
+            .prepare(
+                "SELECT ordinal, path
+                 FROM subscription_run_baseline_directories
+                 WHERE run_id = ?1
+                 ORDER BY ordinal ASC",
+            )
+            .map_err(storage_error)?;
+        statement
+            .query_map([run_id.to_string()], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(storage_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(storage_error)?
+    };
+    let mut directories = Vec::with_capacity(directory_rows.len());
+    for (index, (ordinal, path)) in directory_rows.into_iter().enumerate() {
+        let ordinal = stored_u64(ordinal, "baseline directory ordinal")?;
+        if usize_to_u64(index, "baseline directory index")? != ordinal {
+            return Err(storage_invariant(
+                "stored baseline directory order has a gap",
+            ));
+        }
+        directories.push(path);
+    }
+    let canonical_directories = canonical_baseline_directories(&directories)
+        .map_err(|_| storage_invariant("stored baseline directory topology is invalid"))?;
+    if usize_to_u64(directories.len(), "stored baseline directories")? != directory_count
+        || digest_bytes(&canonical_directories) != directory_manifest_digest
+    {
+        return Err(storage_invariant(
+            "stored baseline directory topology is internally inconsistent",
+        ));
+    }
     let canonical_preconditions = canonical_source_preconditions(
         manifest_digest,
         entries.iter().map(|entry| SourcePreconditionRef {
@@ -2653,7 +3302,10 @@ fn load_subscription_run_baseline(
         source_preconditions_digest,
         entry_count,
         total_bytes,
+        directory_count,
+        directory_manifest_digest,
         entries,
+        directories,
         created_at: parse_timestamp(&created_at)?,
     }))
 }
@@ -2808,6 +3460,415 @@ fn load_subscription_run_proposal(
     }))
 }
 
+fn load_subscription_run_verification_request(
+    connection: &Connection,
+    run_id: RunId,
+) -> Result<Option<VerificationRequest>, CarlError> {
+    let raw = connection
+        .query_row(
+            "SELECT id, started_run_sequence, inspection_outcome,
+                    baseline_manifest_artifact_id,
+                    source_preconditions_artifact_id,
+                    source_preconditions_digest,
+                    baseline_directory_manifest_digest,
+                    proposal_artifact_id, payload_artifact_id,
+                    candidate_manifest_digest, executable_path,
+                    executable_metadata_risk, executable_platform_identity,
+                    executable_byte_length, executable_content_sha256,
+                    executable_attestation_digest,
+                    verification_spec_digest, request_digest, argv_digest,
+                    environment_profile, execution_timeout_nanos,
+                    max_output_bytes, graceful_shutdown_timeout_nanos,
+                    forced_shutdown_timeout_nanos, poll_interval_nanos,
+                    argv_count, argv_bytes, created_at
+             FROM subscription_run_verification_requests
+             WHERE run_id = ?1",
+            [run_id.to_string()],
+            |row| {
+                Ok(StoredVerificationRequest {
+                    verification_id: row.get(0)?,
+                    started_run_sequence: row.get(1)?,
+                    inspection_outcome: row.get(2)?,
+                    baseline_manifest_artifact_id: row.get(3)?,
+                    source_preconditions_artifact_id: row.get(4)?,
+                    source_preconditions_digest: row.get(5)?,
+                    baseline_directory_manifest_digest: row.get(6)?,
+                    proposal_artifact_id: row.get(7)?,
+                    payload_artifact_id: row.get(8)?,
+                    candidate_manifest_digest: row.get(9)?,
+                    executable_path: row.get(10)?,
+                    executable_metadata_risk: row.get(11)?,
+                    executable_platform_identity: row.get(12)?,
+                    executable_byte_length: row.get(13)?,
+                    executable_content_sha256: row.get(14)?,
+                    executable_attestation_digest: row.get(15)?,
+                    verification_spec_digest: row.get(16)?,
+                    request_digest: row.get(17)?,
+                    argv_digest: row.get(18)?,
+                    environment_profile: row.get(19)?,
+                    execution_timeout_nanos: row.get(20)?,
+                    max_output_bytes: row.get(21)?,
+                    graceful_shutdown_timeout_nanos: row.get(22)?,
+                    forced_shutdown_timeout_nanos: row.get(23)?,
+                    poll_interval_nanos: row.get(24)?,
+                    argv_count: row.get(25)?,
+                    argv_bytes: row.get(26)?,
+                    created_at: row.get(27)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(storage_error)?;
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    if raw.inspection_outcome != SubscriptionRunInspectionOutcome::ExactReplacement.as_str() {
+        return Err(storage_invariant(
+            "stored verification request has an invalid inspection outcome",
+        ));
+    }
+
+    let baseline = load_subscription_run_baseline(connection, run_id)?
+        .ok_or_else(|| storage_invariant("stored verification request has no sealed baseline"))?;
+    let proposal = load_subscription_run_proposal(connection, run_id)?
+        .ok_or_else(|| storage_invariant("stored verification request has no exact proposal"))?;
+    let argv_rows = {
+        let mut statement = connection
+            .prepare(
+                "SELECT ordinal, value
+                 FROM subscription_run_verification_argv
+                 WHERE verification_id = ?1
+                 ORDER BY ordinal ASC",
+            )
+            .map_err(storage_error)?;
+        statement
+            .query_map([raw.verification_id.as_str()], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(storage_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(storage_error)?
+    };
+    let mut arguments = Vec::with_capacity(argv_rows.len());
+    let mut argument_bytes = 0_u64;
+    for (index, (ordinal, value)) in argv_rows.into_iter().enumerate() {
+        if stored_u64(ordinal, "verification argument ordinal")?
+            != usize_to_u64(index, "verification argument index")?
+        {
+            return Err(storage_invariant(
+                "stored verification argument order has a gap",
+            ));
+        }
+        argument_bytes = argument_bytes
+            .checked_add(usize_to_u64(
+                value.len(),
+                "stored verification argument length",
+            )?)
+            .ok_or_else(|| storage_invariant("stored verification argument bytes overflow"))?;
+        arguments.push(value);
+    }
+    if usize_to_u64(arguments.len(), "stored verification argument count")?
+        != stored_u64(raw.argv_count, "verification argument count")?
+        || argument_bytes != stored_u64(raw.argv_bytes, "verification argument bytes")?
+    {
+        return Err(storage_invariant(
+            "stored verification argument projection is inconsistent",
+        ));
+    }
+
+    let executable = VerificationExecutableEvidence::rehydrate(
+        raw.executable_path,
+        raw.executable_metadata_risk,
+        raw.executable_platform_identity,
+        stored_u64(
+            raw.executable_byte_length,
+            "verification executable byte length",
+        )?,
+        parse_stored_digest(
+            raw.executable_content_sha256,
+            "verification executable content digest",
+        )?,
+    )
+    .map_err(|_| storage_invariant("stored verification executable evidence is invalid"))?;
+    let limits = VerificationLimits::new(
+        stored_duration_nanos(
+            raw.execution_timeout_nanos,
+            "verification execution timeout",
+        )?,
+        stored_usize(raw.max_output_bytes, "verification maximum output bytes")?,
+        stored_duration_nanos(
+            raw.graceful_shutdown_timeout_nanos,
+            "verification graceful shutdown timeout",
+        )?,
+        stored_duration_nanos(
+            raw.forced_shutdown_timeout_nanos,
+            "verification forced shutdown timeout",
+        )?,
+        stored_duration_nanos(raw.poll_interval_nanos, "verification poll interval")?,
+    )
+    .map_err(|_| storage_invariant("stored verification limits are invalid"))?;
+    let specification = VerificationSpecEvidence::rehydrate(
+        executable,
+        arguments,
+        VerificationEnvironmentProfile::from_storage_str(&raw.environment_profile)
+            .map_err(|_| storage_invariant("stored verification environment is invalid"))?,
+        limits,
+        parse_stored_digest(
+            raw.executable_attestation_digest,
+            "verification executable attestation digest",
+        )?,
+        parse_stored_digest(raw.argv_digest, "verification argument vector digest")?,
+        parse_stored_digest(
+            raw.verification_spec_digest,
+            "verification specification digest",
+        )?,
+    )
+    .map_err(|_| storage_invariant("stored verification specification is inconsistent"))?;
+    let verification_id = parse_id::<VerificationId>("verification ID", &raw.verification_id)?;
+    let baseline_manifest_artifact_id = ArtifactId::parse(raw.baseline_manifest_artifact_id)
+        .map_err(|_| storage_invariant("stored verification baseline artifact ID is invalid"))?;
+    let source_preconditions_artifact_id = ArtifactId::parse(raw.source_preconditions_artifact_id)
+        .map_err(|_| {
+            storage_invariant("stored verification source-preconditions artifact ID is invalid")
+        })?;
+    let proposal_artifact_id = ArtifactId::parse(raw.proposal_artifact_id)
+        .map_err(|_| storage_invariant("stored verification proposal artifact ID is invalid"))?;
+    let payload_artifact_id = ArtifactId::parse(raw.payload_artifact_id)
+        .map_err(|_| storage_invariant("stored verification payload artifact ID is invalid"))?;
+    let request = VerificationRequest::rehydrate(
+        verification_id,
+        run_id,
+        baseline_manifest_artifact_id,
+        baseline.manifest_digest,
+        source_preconditions_artifact_id,
+        parse_stored_digest(
+            raw.source_preconditions_digest,
+            "verification source-preconditions digest",
+        )?,
+        parse_stored_digest(
+            raw.baseline_directory_manifest_digest,
+            "verification directory-manifest digest",
+        )?,
+        proposal_artifact_id,
+        payload_artifact_id,
+        proposal.payload_hash,
+        parse_stored_digest(
+            raw.candidate_manifest_digest,
+            "verification candidate-manifest digest",
+        )?,
+        specification,
+        parse_stored_digest(raw.request_digest, "verification request digest")?,
+    )
+    .map_err(|_| storage_invariant("stored verification request is inconsistent"))?;
+    if request.baseline_manifest_artifact_id() != &baseline.manifest_artifact_id
+        || request.source_preconditions_artifact_id() != &baseline.source_preconditions_artifact_id
+        || request.source_preconditions_digest() != baseline.source_preconditions_digest
+        || request.baseline_directory_manifest_digest() != baseline.directory_manifest_digest
+        || request.proposal_artifact_id() != &proposal.proposal_artifact_id
+        || request.payload_artifact_id() != &proposal.payload_artifact_id
+        || request.candidate_manifest_digest() != proposal.candidate_manifest_digest
+    {
+        return Err(storage_invariant(
+            "stored verification request disagrees with baseline or proposal evidence",
+        ));
+    }
+
+    let started_run_sequence =
+        stored_u64(raw.started_run_sequence, "verification start run sequence")?;
+    let created_at = parse_timestamp(&raw.created_at)?;
+    let run = load_subscription_run(connection, run_id)?
+        .ok_or_else(|| storage_invariant("stored verification request has no subscription run"))?;
+    let events = load_and_validate_subscription_run_events(connection, &run)?;
+    let start_index = usize::try_from(
+        started_run_sequence
+            .checked_sub(1)
+            .ok_or_else(|| storage_invariant("verification start sequence is invalid"))?,
+    )
+    .map_err(|_| storage_invariant("verification start sequence is too large"))?;
+    match events.get(start_index) {
+        Some(EventEnvelope {
+            timestamp,
+            event:
+                Event::SubscriptionRunTransitioned {
+                    transition,
+                    trust_label,
+                    ..
+                },
+            ..
+        }) if *timestamp == created_at
+            && transition.from() == RunState::Inspecting
+            && transition.to() == RunState::Verifying
+            && *trust_label == RunTrustLabel::TrustedCarlState => {}
+        _ => {
+            return Err(storage_invariant(
+                "stored verification request has no matching start transition",
+            ));
+        }
+    }
+    Ok(Some(request))
+}
+
+fn load_subscription_run_verification_result(
+    connection: &Connection,
+    run_id: RunId,
+) -> Result<Option<VerificationResult>, CarlError> {
+    let raw = connection
+        .query_row(
+            "SELECT verification_id, completed_run_sequence,
+                    request_digest,
+                    expected_candidate_manifest_digest,
+                    expected_directory_manifest_digest,
+                    outcome, exit_code,
+                    observed_candidate_manifest_digest,
+                    observed_directory_manifest_digest,
+                    executable_attestation_evidence,
+                    executable_attestation_digest,
+                    stdout_text, stdout_bytes, stdout_digest,
+                    stderr_text, stderr_bytes, stderr_digest,
+                    max_output_bytes, duration_nanos, result_digest,
+                    completed_at
+             FROM subscription_run_verification_results
+             WHERE run_id = ?1",
+            [run_id.to_string()],
+            |row| {
+                Ok(StoredVerificationResult {
+                    verification_id: row.get(0)?,
+                    completed_run_sequence: row.get(1)?,
+                    request_digest: row.get(2)?,
+                    expected_candidate_manifest_digest: row.get(3)?,
+                    expected_directory_manifest_digest: row.get(4)?,
+                    outcome: row.get(5)?,
+                    exit_code: row.get(6)?,
+                    observed_candidate_manifest_digest: row.get(7)?,
+                    observed_directory_manifest_digest: row.get(8)?,
+                    executable_attestation_evidence: row.get(9)?,
+                    executable_attestation_digest: row.get(10)?,
+                    stdout_text: row.get(11)?,
+                    stdout_bytes: row.get(12)?,
+                    stdout_digest: row.get(13)?,
+                    stderr_text: row.get(14)?,
+                    stderr_bytes: row.get(15)?,
+                    stderr_digest: row.get(16)?,
+                    max_output_bytes: row.get(17)?,
+                    duration_nanos: row.get(18)?,
+                    result_digest: row.get(19)?,
+                    completed_at: row.get(20)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(storage_error)?;
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let request = load_subscription_run_verification_request(connection, run_id)?
+        .ok_or_else(|| storage_invariant("stored verification result has no request"))?;
+    let verification_id = parse_id::<VerificationId>("verification ID", &raw.verification_id)?;
+    let request_digest =
+        parse_stored_digest(raw.request_digest, "verification result request digest")?;
+    let expected_candidate_manifest_digest = parse_stored_digest(
+        raw.expected_candidate_manifest_digest,
+        "verification expected candidate-manifest digest",
+    )?;
+    let expected_directory_manifest_digest = parse_stored_digest(
+        raw.expected_directory_manifest_digest,
+        "verification expected directory-manifest digest",
+    )?;
+    if verification_id != request.verification_id()
+        || request_digest != request.request_digest()
+        || expected_candidate_manifest_digest != request.candidate_manifest_digest()
+        || expected_directory_manifest_digest != request.baseline_directory_manifest_digest()
+        || stored_usize(
+            raw.max_output_bytes,
+            "verification result maximum output bytes",
+        )? != request.specification().limits().max_output_bytes()
+    {
+        return Err(storage_invariant(
+            "stored verification result disagrees with its request",
+        ));
+    }
+    let outcome = VerificationOutcome::from_storage_str(&raw.outcome)
+        .map_err(|_| storage_invariant("stored verification outcome is invalid"))?;
+    let rehydration_authority = VerificationResultRehydrationAuthority {
+        _repository_loader_only: (),
+    };
+    let result = VerificationResult::rehydrate(
+        &rehydration_authority,
+        &request,
+        outcome,
+        raw.exit_code
+            .map(|code| {
+                i32::try_from(code)
+                    .map_err(|_| storage_invariant("stored verification exit code is invalid"))
+            })
+            .transpose()?,
+        parse_optional_stored_digest(
+            raw.observed_candidate_manifest_digest,
+            "verification observed candidate-manifest digest",
+        )?,
+        parse_optional_stored_digest(
+            raw.observed_directory_manifest_digest,
+            "verification observed directory-manifest digest",
+        )?,
+        raw.executable_attestation_evidence,
+        parse_stored_digest(
+            raw.executable_attestation_digest,
+            "verification result executable attestation digest",
+        )?,
+        raw.stdout_text,
+        stored_u64(raw.stdout_bytes, "verification stdout bytes")?,
+        parse_stored_digest(raw.stdout_digest, "verification stdout digest")?,
+        raw.stderr_text,
+        stored_u64(raw.stderr_bytes, "verification stderr bytes")?,
+        parse_stored_digest(raw.stderr_digest, "verification stderr digest")?,
+        stored_duration_nanos(raw.duration_nanos, "verification result duration")?,
+        parse_stored_digest(raw.result_digest, "verification result digest")?,
+    )
+    .map_err(|_| storage_invariant("stored verification result is inconsistent"))?;
+
+    let completed_run_sequence = stored_u64(
+        raw.completed_run_sequence,
+        "verification completion run sequence",
+    )?;
+    let completed_at = parse_timestamp(&raw.completed_at)?;
+    let run = load_subscription_run(connection, run_id)?
+        .ok_or_else(|| storage_invariant("stored verification result has no subscription run"))?;
+    let events = load_and_validate_subscription_run_events(connection, &run)?;
+    let completion_index = usize::try_from(
+        completed_run_sequence
+            .checked_sub(1)
+            .ok_or_else(|| storage_invariant("verification completion sequence is invalid"))?,
+    )
+    .map_err(|_| storage_invariant("verification completion sequence is too large"))?;
+    let (expected_state, expected_failure) = match outcome {
+        VerificationOutcome::Passed => (RunState::AwaitingPromotionApproval, None),
+        VerificationOutcome::Cancelled => (RunState::Cancelled, None),
+        _ => (RunState::Failed, Some(RunFailureCode::VerificationFailed)),
+    };
+    match events.get(completion_index) {
+        Some(EventEnvelope {
+            timestamp,
+            event:
+                Event::SubscriptionRunTransitioned {
+                    transition,
+                    trust_label,
+                    ..
+                },
+            ..
+        }) if *timestamp == completed_at
+            && transition.from() == RunState::Verifying
+            && transition.to() == expected_state
+            && transition.failure_code() == expected_failure
+            && *trust_label == RunTrustLabel::TrustedCarlVerification => {}
+        _ => {
+            return Err(storage_invariant(
+                "stored verification result has no matching completion transition",
+            ));
+        }
+    }
+    Ok(Some(result))
+}
+
 fn artifact_id_for_bytes(bytes: &[u8]) -> Result<ArtifactId, CarlError> {
     ArtifactId::parse(format!("{:x}", Sha256::digest(bytes)))
         .map_err(|_| artifact_validation_error("content-addressed artifact ID is invalid"))
@@ -2833,6 +3894,39 @@ fn proposal_storage_error(error: crate::staging::ProposalError) -> CarlError {
     CarlError::Validation {
         detail: error.to_string(),
     }
+}
+
+fn verification_storage_error(error: crate::verification::VerificationError) -> CarlError {
+    CarlError::Validation {
+        detail: error.to_string(),
+    }
+}
+
+fn duration_to_sql_nanos(value: Duration, kind: &str) -> Result<i64, CarlError> {
+    i64::try_from(value.as_nanos())
+        .map_err(|_| storage_invariant(&format!("{kind} cannot be represented durably")))
+}
+
+fn stored_duration_nanos(value: i64, kind: &str) -> Result<Duration, CarlError> {
+    stored_u64(value, kind).map(Duration::from_nanos)
+}
+
+fn stored_usize(value: i64, kind: &str) -> Result<usize, CarlError> {
+    usize::try_from(stored_u64(value, kind)?)
+        .map_err(|_| storage_invariant(&format!("stored {kind} is too large")))
+}
+
+fn parse_stored_digest(value: String, kind: &str) -> Result<Sha256Digest, CarlError> {
+    Sha256Digest::parse(value).map_err(|_| storage_invariant(&format!("stored {kind} is invalid")))
+}
+
+fn parse_optional_stored_digest(
+    value: Option<String>,
+    kind: &str,
+) -> Result<Option<Sha256Digest>, CarlError> {
+    value
+        .map(|value| parse_stored_digest(value, kind))
+        .transpose()
 }
 
 fn usize_to_u64(value: usize, kind: &str) -> Result<u64, CarlError> {
@@ -3707,5 +4801,605 @@ fn storage_invariant(detail: &str) -> CarlError {
 fn storage_error(error: impl std::fmt::Display) -> CarlError {
     CarlError::Storage {
         detail: error.to_string(),
+    }
+}
+
+#[cfg(all(test, unix))]
+mod verification_persistence_tests {
+    use std::error::Error;
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+
+    use chrono::TimeDelta;
+    use semver::VersionReq;
+
+    use super::*;
+    use crate::delegates::DelegateSettingsLayers;
+    use crate::sidecar::{ExecutableTrustDecision, SidecarCommand, VersionOutputFormat};
+    use crate::staging::{ProposalLimits, ProposalOutcome, SanitizedStageBuilder, StageLimits};
+
+    type TestResult<T = ()> = Result<T, Box<dyn Error>>;
+
+    const BEFORE: &[u8] = b"pub fn answer() -> u32 { 41 }\n";
+    const AFTER: &[u8] = b"pub fn answer() -> u32 { 42 }\n";
+
+    struct VerificationLayout {
+        root: PathBuf,
+        source: PathBuf,
+        stages: PathBuf,
+    }
+
+    impl VerificationLayout {
+        fn new() -> TestResult<Self> {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            let root = PathBuf::from("/tmp")
+                .join(format!("carl-verification-storage-unit-{}", Uuid::new_v4()));
+            let source = root.join("source");
+            let stages = root.join("stages");
+            fs::create_dir_all(source.join("src"))?;
+            fs::create_dir_all(&stages)?;
+            for path in [&root, &source, &stages] {
+                fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+            }
+            fs::write(source.join("src/lib.rs"), BEFORE)?;
+            Ok(Self {
+                root,
+                source,
+                stages,
+            })
+        }
+    }
+
+    impl Drop for VerificationLayout {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn completion_matrix_is_atomic_capability_safe_and_durable() -> TestResult {
+        let layout = VerificationLayout::new()?;
+        let mut runtime =
+            RuntimeStore::open(DataRootLock::acquire(&layout.root)?, test_instant(0))?;
+        let specification = verification_specification()?;
+        let matrix = [
+            (
+                VerificationOutcome::Passed,
+                Some(0),
+                RunState::AwaitingPromotionApproval,
+                None,
+                true,
+            ),
+            (
+                VerificationOutcome::Cancelled,
+                None,
+                RunState::Cancelled,
+                None,
+                false,
+            ),
+            (
+                VerificationOutcome::NonZeroExit,
+                Some(2),
+                RunState::Failed,
+                Some(RunFailureCode::VerificationFailed),
+                false,
+            ),
+            (
+                VerificationOutcome::TimedOut,
+                None,
+                RunState::Failed,
+                Some(RunFailureCode::VerificationFailed),
+                false,
+            ),
+            (
+                VerificationOutcome::OutputLimitExceeded,
+                None,
+                RunState::Failed,
+                Some(RunFailureCode::VerificationFailed),
+                false,
+            ),
+            (
+                VerificationOutcome::ProcessFailed,
+                None,
+                RunState::Failed,
+                Some(RunFailureCode::VerificationFailed),
+                false,
+            ),
+            (
+                VerificationOutcome::CandidateMutated,
+                Some(0),
+                RunState::Failed,
+                Some(RunFailureCode::VerificationFailed),
+                false,
+            ),
+            (
+                VerificationOutcome::OutputRejected,
+                None,
+                RunState::Failed,
+                Some(RunFailureCode::VerificationFailed),
+                false,
+            ),
+        ];
+        let mut persisted = Vec::new();
+        for (index, (outcome, exit_code, state, failure_code, should_verify)) in
+            matrix.into_iter().enumerate()
+        {
+            let offset = i64::try_from(index)? * 20;
+            let (run_id, request, verifying_revision) =
+                prepare_verifying_run(&mut runtime, &layout, &specification, offset)?;
+            let observed_candidate = if outcome == VerificationOutcome::CandidateMutated {
+                Some(Sha256Digest::from_bytes([7; 32]))
+            } else {
+                Some(request.candidate_manifest_digest())
+            };
+            let (stdout, stderr) = if outcome == VerificationOutcome::OutputRejected {
+                (
+                    vec![0xff],
+                    b"diagnostic must be redacted as one unit".to_vec(),
+                )
+            } else {
+                (b"bounded stdout\n".to_vec(), b"bounded stderr\n".to_vec())
+            };
+            let result = VerificationResult::from_execution_observation(
+                &request,
+                outcome,
+                exit_code,
+                observed_candidate,
+                Some(request.baseline_directory_manifest_digest()),
+                stdout,
+                stderr,
+                Duration::from_nanos(12_345_678),
+            )?;
+            assert!(
+                runtime
+                    .complete_subscription_run_verification(
+                        run_id,
+                        verifying_revision + 1,
+                        &result,
+                        test_instant(offset + 8),
+                    )?
+                    .is_none(),
+                "a stale completion must not persist a result"
+            );
+            assert!(
+                runtime
+                    .get_subscription_run_verification_result(run_id)?
+                    .is_none()
+            );
+
+            let completion = runtime
+                .complete_subscription_run_verification(
+                    run_id,
+                    verifying_revision,
+                    &result,
+                    test_instant(offset + 8),
+                )?
+                .expect("current verification completion wins");
+            assert_eq!(completion.run().state, state);
+            assert_eq!(completion.run().failure_code, failure_code);
+            assert_eq!(
+                completion.verified_proposal().is_some(),
+                should_verify,
+                "only a committed pass may mint VerifiedProposal"
+            );
+            assert_eq!(completion.result().result_digest(), result.result_digest());
+            let durable = runtime
+                .get_subscription_run_verification_result(run_id)?
+                .expect("committed verification result is loadable");
+            assert_eq!(durable.result_digest(), result.result_digest());
+            persisted.push((run_id, outcome, result.result_digest()));
+        }
+
+        drop(runtime);
+        let reopened = RuntimeStore::open(DataRootLock::acquire(&layout.root)?, test_instant(200))?;
+        for (run_id, outcome, result_digest) in persisted {
+            let durable = reopened
+                .get_subscription_run_verification_result(run_id)?
+                .expect("verification result survives restart and recomputation");
+            assert_eq!(durable.outcome(), outcome);
+            assert_eq!(durable.result_digest(), result_digest);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn completion_failure_rolls_back_result_state_event_and_capability() -> TestResult {
+        let layout = VerificationLayout::new()?;
+        let mut runtime =
+            RuntimeStore::open(DataRootLock::acquire(&layout.root)?, test_instant(0))?;
+        let specification = verification_specification()?;
+        let (run_id, request, verifying_revision) =
+            prepare_verifying_run(&mut runtime, &layout, &specification, 0)?;
+        let result = VerificationResult::from_execution_observation(
+            &request,
+            VerificationOutcome::Passed,
+            Some(0),
+            Some(request.candidate_manifest_digest()),
+            Some(request.baseline_directory_manifest_digest()),
+            Vec::new(),
+            Vec::new(),
+            Duration::from_nanos(9_999_991),
+        )?;
+        runtime.store.connection.execute_batch(
+            "CREATE TRIGGER test_reject_verification_completion
+             BEFORE UPDATE OF state ON subscription_runs
+             WHEN OLD.state = 'verifying'
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected completion failure');
+             END;",
+        )?;
+
+        assert!(
+            runtime
+                .complete_subscription_run_verification(
+                    run_id,
+                    verifying_revision,
+                    &result,
+                    test_instant(8),
+                )
+                .is_err(),
+            "the injected failure must escape without a capability"
+        );
+        runtime
+            .store
+            .connection
+            .execute_batch("DROP TRIGGER test_reject_verification_completion;")?;
+        let run = runtime
+            .get_subscription_run(run_id)?
+            .expect("run remains present");
+        assert_eq!(run.state, RunState::Verifying);
+        assert_eq!(run.revision, verifying_revision);
+        assert!(
+            runtime
+                .get_subscription_run_verification_result(run_id)?
+                .is_none(),
+            "the result insert must roll back with the failed transition"
+        );
+        assert_eq!(
+            runtime.store.connection.query_row(
+                "SELECT COUNT(*)
+                 FROM subscription_run_verification_results
+                 WHERE run_id = ?1",
+                [run_id.to_string()],
+                |row| row.get::<_, u64>(0),
+            )?,
+            0,
+            "the failed transaction must leave no raw result row behind"
+        );
+        assert_eq!(
+            runtime.read_subscription_run_events(run_id)?.len(),
+            usize::try_from(verifying_revision)?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn begin_failure_rolls_back_request_arguments_state_and_event() -> TestResult {
+        let layout = VerificationLayout::new()?;
+        let mut runtime =
+            RuntimeStore::open(DataRootLock::acquire(&layout.root)?, test_instant(0))?;
+        let specification = verification_specification()?;
+        let (run_id, inspecting_revision) = prepare_inspecting_run(&mut runtime, &layout, 0)?;
+        runtime.store.connection.execute_batch(
+            "CREATE TRIGGER test_reject_verification_begin
+             BEFORE UPDATE OF state ON subscription_runs
+             WHEN NEW.state = 'verifying'
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected begin failure');
+             END;",
+        )?;
+
+        assert!(
+            runtime
+                .begin_subscription_run_verification(
+                    run_id,
+                    inspecting_revision,
+                    &specification,
+                    test_instant(7),
+                )
+                .is_err()
+        );
+        runtime
+            .store
+            .connection
+            .execute_batch("DROP TRIGGER test_reject_verification_begin;")?;
+        assert!(
+            runtime
+                .get_subscription_run_verification_request(run_id)?
+                .is_none()
+        );
+        let run = runtime
+            .get_subscription_run(run_id)?
+            .expect("run remains present");
+        assert_eq!(run.state, RunState::Inspecting);
+        assert_eq!(run.revision, inspecting_revision);
+        assert_eq!(
+            runtime.read_subscription_run_events(run_id)?.len(),
+            usize::try_from(inspecting_revision)?
+        );
+        let argv_count = runtime.store.connection.query_row(
+            "SELECT COUNT(*)
+             FROM subscription_run_verification_argv AS argv
+             JOIN subscription_run_verification_requests AS request
+               ON request.id = argv.verification_id
+             WHERE request.run_id = ?1",
+            [run_id.to_string()],
+            |row| row.get::<_, u64>(0),
+        )?;
+        assert_eq!(argv_count, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn verification_loaders_reject_replay_and_digest_corruption() -> TestResult {
+        let layout = VerificationLayout::new()?;
+        let mut runtime =
+            RuntimeStore::open(DataRootLock::acquire(&layout.root)?, test_instant(0))?;
+        let specification = verification_specification()?;
+        let (run_id, request, verifying_revision) =
+            prepare_verifying_run(&mut runtime, &layout, &specification, 0)?;
+        runtime
+            .store
+            .connection
+            .execute_batch("DROP TRIGGER subscription_run_verification_requests_immutable;")?;
+        runtime.store.connection.execute(
+            "UPDATE subscription_run_verification_requests
+             SET started_run_sequence = started_run_sequence - 1
+             WHERE run_id = ?1",
+            [run_id.to_string()],
+        )?;
+        assert!(
+            runtime
+                .get_subscription_run_verification_request(run_id)
+                .is_err(),
+            "a request must point at its exact Inspecting-to-Verifying event"
+        );
+        runtime.store.connection.execute(
+            "UPDATE subscription_run_verification_requests
+             SET started_run_sequence = ?2
+             WHERE run_id = ?1",
+            params![run_id.to_string(), revision_to_sql(verifying_revision)?,],
+        )?;
+        assert!(
+            runtime
+                .get_subscription_run_verification_request(run_id)?
+                .is_some()
+        );
+        runtime.store.connection.execute(
+            "UPDATE subscription_run_verification_requests
+             SET argv_digest = ?2
+             WHERE run_id = ?1",
+            params![run_id.to_string(), "0".repeat(64)],
+        )?;
+        assert!(
+            runtime
+                .get_subscription_run_verification_request(run_id)
+                .is_err(),
+            "argv evidence must be recomputed rather than trusted"
+        );
+
+        let (result_run_id, result_request, result_revision) =
+            prepare_verifying_run(&mut runtime, &layout, &specification, 20)?;
+        let result = VerificationResult::from_execution_observation(
+            &result_request,
+            VerificationOutcome::Passed,
+            Some(0),
+            Some(result_request.candidate_manifest_digest()),
+            Some(result_request.baseline_directory_manifest_digest()),
+            b"ok\n".to_vec(),
+            Vec::new(),
+            Duration::from_nanos(2_000_001),
+        )?;
+        runtime
+            .complete_subscription_run_verification(
+                result_run_id,
+                result_revision,
+                &result,
+                test_instant(28),
+            )?
+            .expect("result persists");
+        runtime
+            .store
+            .connection
+            .execute_batch("DROP TRIGGER subscription_run_verification_results_immutable;")?;
+        runtime.store.connection.execute(
+            "UPDATE subscription_run_verification_results
+             SET completed_run_sequence = completed_run_sequence - 1
+             WHERE run_id = ?1",
+            [result_run_id.to_string()],
+        )?;
+        assert!(
+            runtime
+                .get_subscription_run_verification_result(result_run_id)
+                .is_err(),
+            "a result must point at its exact completion event"
+        );
+        runtime.store.connection.execute(
+            "UPDATE subscription_run_verification_results
+             SET completed_run_sequence = ?2
+             WHERE run_id = ?1",
+            params![
+                result_run_id.to_string(),
+                revision_to_sql(result_revision + 1)?,
+            ],
+        )?;
+        assert!(
+            runtime
+                .get_subscription_run_verification_result(result_run_id)?
+                .is_some()
+        );
+        runtime.store.connection.execute(
+            "UPDATE subscription_run_verification_results
+             SET duration_nanos = duration_nanos + 1
+             WHERE run_id = ?1",
+            [result_run_id.to_string()],
+        )?;
+        assert!(
+            runtime
+                .get_subscription_run_verification_result(result_run_id)
+                .is_err(),
+            "result duration is digest-bound and must be recomputed"
+        );
+        assert_eq!(request.run_id(), run_id);
+        Ok(())
+    }
+
+    fn prepare_verifying_run(
+        runtime: &mut RuntimeStore,
+        layout: &VerificationLayout,
+        specification: &VerificationSpec,
+        offset: i64,
+    ) -> TestResult<(RunId, VerificationRequest, u64)> {
+        let (run_id, inspecting) = prepare_inspecting_run(runtime, layout, offset)?;
+        let request = runtime
+            .begin_subscription_run_verification(
+                run_id,
+                inspecting,
+                specification,
+                test_instant(offset + 7),
+            )?
+            .expect("verification begins");
+        Ok((run_id, request, inspecting + 1))
+    }
+
+    fn prepare_inspecting_run(
+        runtime: &mut RuntimeStore,
+        layout: &VerificationLayout,
+        offset: i64,
+    ) -> TestResult<(RunId, u64)> {
+        fs::write(layout.source.join("src/lib.rs"), BEFORE)?;
+        let stage = SanitizedStageBuilder::open(
+            &layout.source,
+            &layout.stages,
+            StageLimits::new(32, 4_096, 64 * 1_024)?,
+            SecretFilter,
+        )?
+        .prepare(runtime.artifacts())?;
+        let run_id = create_test_run(runtime, test_instant(offset + 1))?;
+        runtime
+            .record_subscription_run_baseline(
+                run_id,
+                RunState::Prepared,
+                1,
+                stage.sealed_baseline(),
+                test_instant(offset + 2),
+            )?
+            .expect("baseline persists");
+        let awaiting = transition_test_run(
+            runtime,
+            run_id,
+            RunState::Prepared,
+            1,
+            RunState::AwaitingDelegateApproval,
+            test_instant(offset + 3),
+        )?;
+        let running = transition_test_run(
+            runtime,
+            run_id,
+            RunState::AwaitingDelegateApproval,
+            awaiting,
+            RunState::Running,
+            test_instant(offset + 4),
+        )?;
+        let inspecting = transition_test_run(
+            runtime,
+            run_id,
+            RunState::Running,
+            running,
+            RunState::Inspecting,
+            test_instant(offset + 5),
+        )?;
+        fs::write(stage.path().join("src/lib.rs"), AFTER)?;
+        let proposal = match stage.inspect_proposal(
+            runtime.artifacts(),
+            ProposalLimits::new(4_096)?,
+            SecretFilter,
+        )? {
+            ProposalOutcome::ExactReplacement(proposal) => proposal,
+            ProposalOutcome::NoChanges => return Err("changed stage produced no proposal".into()),
+        };
+        runtime
+            .record_subscription_run_exact_proposal(
+                run_id,
+                RunState::Inspecting,
+                inspecting,
+                &proposal,
+                test_instant(offset + 6),
+            )?
+            .expect("proposal persists");
+        Ok((run_id, inspecting))
+    }
+
+    fn create_test_run(runtime: &mut RuntimeStore, at: DateTime<Utc>) -> TestResult<RunId> {
+        let session = runtime.create_session()?;
+        let resolved = DelegateSettingsLayers::default().resolve();
+        let run_id = RunId::new();
+        runtime.create_subscription_run(NewSubscriptionRun::new(
+            run_id,
+            session.id,
+            TurnId::new(),
+            DelegateSettings::default(),
+            RunConfigSnapshot::from_resolved(&resolved),
+            at,
+        )?)?;
+        Ok(run_id)
+    }
+
+    fn transition_test_run(
+        runtime: &mut RuntimeStore,
+        run_id: RunId,
+        from: RunState,
+        revision: u64,
+        to: RunState,
+        at: DateTime<Utc>,
+    ) -> TestResult<u64> {
+        Ok(runtime
+            .compare_and_transition_subscription_run(
+                run_id,
+                from,
+                revision,
+                RunTransition::new(from, to, None)?,
+                RunTrustLabel::TrustedCarlState,
+                at,
+            )?
+            .expect("transition succeeds")
+            .revision)
+    }
+
+    fn verification_specification() -> TestResult<VerificationSpec> {
+        let command = SidecarCommand {
+            executable: std::env::current_exe()?,
+            arguments: Vec::new(),
+            version_arguments: vec![OsString::from("--version")],
+            version_output: VersionOutputFormat::SingleSemverToken,
+            isolated_home: PathBuf::from("verification-storage-unit"),
+            supported_versions: VersionReq::parse(">=0.0.0")?,
+        };
+        let resolved = command.resolve_executable()?;
+        let decision = if resolved.metadata_risk().is_some() {
+            ExecutableTrustDecision::TrustCanonicalPathWithMetadataRisk
+        } else {
+            ExecutableTrustDecision::TrustCanonicalPath
+        };
+        Ok(VerificationSpec::new(
+            resolved.trust(decision)?,
+            vec![String::new(), "--check".to_owned()],
+            VerificationEnvironmentProfile::CleanV1,
+            VerificationLimits::new(
+                Duration::from_nanos(123_456_789),
+                64 * 1_024,
+                Duration::from_nanos(20_000_003),
+                Duration::from_nanos(30_000_007),
+                Duration::from_nanos(1_000_009),
+            )?,
+        )?)
+    }
+
+    fn test_instant(offset_seconds: i64) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-07-30T12:00:00Z")
+            .expect("valid test timestamp")
+            .with_timezone(&Utc)
+            + TimeDelta::seconds(offset_seconds)
     }
 }

@@ -6,12 +6,13 @@
 mod builder;
 mod proposal;
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::ffi::OsString;
 use std::fmt;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+use cap_std::ambient_authority;
 #[cfg(unix)]
 use cap_std::fs::PermissionsExt;
 use cap_std::fs::{Dir, Permissions};
@@ -22,9 +23,14 @@ use crate::policy::Sha256Digest;
 use crate::security::SecretRule;
 use crate::sidecar::{ExecutionWorkspace, SidecarError, SidecarErrorCode};
 
-use self::builder::{entry_is_link_or_reparse, link_count, open_directory_nofollow, same_file};
+use self::builder::{
+    create_private_directory, create_private_file, entry_is_link_or_reparse,
+    held_private_directory_is_verified, link_count, named_path_matches_held,
+    open_directory_nofollow, root_is_link_or_reparse, same_file, secure_created_file,
+};
 
 pub use builder::SanitizedStageBuilder;
+pub(crate) use proposal::canonical_proposal_envelope;
 pub use proposal::{
     ExactReplacementProposal, ProposalError, ProposalErrorCode, ProposalLimits, ProposalOutcome,
 };
@@ -307,6 +313,281 @@ pub struct SanitizedStage {
     exclusions: Vec<StageExclusion>,
 }
 
+#[derive(Clone, Eq, PartialEq)]
+pub(crate) struct CandidateFile {
+    pub(crate) path: String,
+    pub(crate) bytes: Vec<u8>,
+}
+
+pub(crate) struct VerificationCandidate {
+    path: PathBuf,
+    parent: Dir,
+    work_root: Option<Dir>,
+    directory_name: String,
+}
+
+impl VerificationCandidate {
+    pub(crate) fn reconstruct(
+        parent_path: &Path,
+        directories: &[String],
+        files: &[CandidateFile],
+    ) -> Result<Self, StageError> {
+        let (parent_path, parent) = open_private_parent(parent_path)?;
+        validate_candidate_topology(directories, files)?;
+
+        let directory_name = format!("verify-{}", Uuid::new_v4());
+        let path = parent_path.join(&directory_name);
+        let work_root = match create_private_directory(&parent, &directory_name) {
+            Ok(work_root) => work_root,
+            Err(_) => {
+                let _ = parent.remove_dir_all(&directory_name);
+                return Err(StageError::new(StageErrorCode::Io));
+            }
+        };
+
+        let reconstruct = || -> Result<(), StageError> {
+            let mut ordered_directories = directories.to_vec();
+            ordered_directories.sort_by(|left, right| {
+                path_depth(left)
+                    .cmp(&path_depth(right))
+                    .then_with(|| left.cmp(right))
+            });
+            for relative in &ordered_directories {
+                let (parent_relative, name) = split_relative_path(relative)?;
+                let held_parent = open_relative_directory(&work_root, parent_relative)?;
+                create_private_directory(&held_parent, name)
+                    .map_err(|_| StageError::at(StageErrorCode::Io, relative.clone()))?;
+            }
+
+            for candidate_file in files {
+                let (parent_relative, name) = split_relative_path(&candidate_file.path)?;
+                let held_parent = open_relative_directory(&work_root, parent_relative)?;
+                let mut file = create_private_file(&held_parent, name)
+                    .map_err(|_| StageError::at(StageErrorCode::Io, candidate_file.path.clone()))?;
+                file.write_all(&candidate_file.bytes)
+                    .map_err(|_| StageError::at(StageErrorCode::Io, candidate_file.path.clone()))?;
+                file.sync_all()
+                    .map_err(|_| StageError::at(StageErrorCode::Io, candidate_file.path.clone()))?;
+                secure_created_file(&file)
+                    .map_err(|_| StageError::at(StageErrorCode::Io, candidate_file.path.clone()))?;
+            }
+            Ok(())
+        };
+
+        if let Err(error) = reconstruct() {
+            let mut candidate = Self {
+                path,
+                parent,
+                work_root: Some(work_root),
+                directory_name,
+            };
+            let _ = candidate.cleanup_inner();
+            return Err(error);
+        }
+
+        if !named_path_matches_held(&path, &work_root)
+            || !held_private_directory_is_verified(&work_root)
+            || !named_path_matches_held(&parent_path, &parent)
+        {
+            let mut candidate = Self {
+                path,
+                parent,
+                work_root: Some(work_root),
+                directory_name,
+            };
+            let _ = candidate.cleanup_inner();
+            return Err(StageError::new(StageErrorCode::InvalidRoot));
+        }
+
+        Ok(Self {
+            path,
+            parent,
+            work_root: Some(work_root),
+            directory_name,
+        })
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(crate) fn execution_workspace(&self) -> Result<ExecutionWorkspace, SidecarError> {
+        let work_root = self
+            .work_root
+            .as_ref()
+            .ok_or_else(|| SidecarError::from_code(SidecarErrorCode::InvalidConfiguration))?;
+        ExecutionWorkspace::open_matching_held(&self.path, work_root)
+    }
+
+    pub(crate) fn held_root(&self) -> Result<&Dir, StageError> {
+        self.work_root
+            .as_ref()
+            .ok_or_else(|| StageError::new(StageErrorCode::InvalidRoot))
+    }
+
+    pub(crate) fn inspect(
+        &self,
+        expected_entries: &[StageManifestEntry],
+        expected_directories: &[String],
+        limits: ProposalLimits,
+        secret_filter: crate::security::SecretFilter,
+    ) -> Result<proposal::CandidateSnapshotSeal, ProposalError> {
+        proposal::inspect_verification_candidate(
+            self.held_root()
+                .map_err(|_| ProposalError::from_stage_io())?,
+            expected_entries,
+            expected_directories,
+            limits,
+            secret_filter,
+        )
+    }
+
+    pub(crate) fn cleanup(mut self) -> Result<(), StageError> {
+        self.cleanup_inner()
+            .map_err(|_| StageError::new(StageErrorCode::Io))
+    }
+
+    fn cleanup_inner(&mut self) -> io::Result<()> {
+        cleanup_disposable_directory(&self.parent, &mut self.work_root, &self.directory_name)
+    }
+}
+
+impl Drop for VerificationCandidate {
+    fn drop(&mut self) {
+        if self.cleanup_inner().is_err() {
+            eprintln!("Carl could not completely remove a verification workspace.");
+        }
+    }
+}
+
+fn open_private_parent(parent_path: &Path) -> Result<(PathBuf, Dir), StageError> {
+    if !parent_path.is_absolute() {
+        return Err(StageError::new(StageErrorCode::InvalidRoot));
+    }
+    let metadata = std::fs::symlink_metadata(parent_path)
+        .map_err(|_| StageError::new(StageErrorCode::InvalidRoot))?;
+    if !metadata.is_dir() || root_is_link_or_reparse(&metadata) {
+        return Err(StageError::new(StageErrorCode::InvalidRoot));
+    }
+    let canonical = std::fs::canonicalize(parent_path)
+        .map_err(|_| StageError::new(StageErrorCode::InvalidRoot))?;
+    let parent = Dir::open_ambient_dir(&canonical, ambient_authority())
+        .map_err(|_| StageError::new(StageErrorCode::InvalidRoot))?;
+    if !named_path_matches_held(&canonical, &parent) || !held_private_directory_is_verified(&parent)
+    {
+        return Err(StageError::new(StageErrorCode::InvalidRoot));
+    }
+    Ok((canonical, parent))
+}
+
+fn validate_candidate_topology(
+    directories: &[String],
+    files: &[CandidateFile],
+) -> Result<(), StageError> {
+    if directories.len().saturating_add(files.len()) > MAX_CLEANUP_ENTRIES {
+        return Err(StageError::new(StageErrorCode::LimitExceeded));
+    }
+
+    let mut path_bytes = 0_usize;
+    let mut directory_set = BTreeSet::new();
+    for directory in directories {
+        validate_relative_path(directory)?;
+        account_path_bytes(&mut path_bytes, directory)
+            .map_err(|()| StageError::new(StageErrorCode::LimitExceeded))?;
+        if !directory_set.insert(directory.as_str()) {
+            return Err(StageError::at(
+                StageErrorCode::InvalidEntry,
+                directory.clone(),
+            ));
+        }
+        let (parent, _) = split_relative_path(directory)?;
+        if !parent.is_empty() && !directory_set.contains(parent) {
+            return Err(StageError::at(
+                StageErrorCode::InvalidEntry,
+                directory.clone(),
+            ));
+        }
+    }
+
+    let mut file_set = BTreeSet::new();
+    let mut total_bytes = 0_u64;
+    for file in files {
+        validate_relative_path(&file.path)?;
+        account_path_bytes(&mut path_bytes, &file.path)
+            .map_err(|()| StageError::new(StageErrorCode::LimitExceeded))?;
+        if !file_set.insert(file.path.as_str()) || directory_set.contains(file.path.as_str()) {
+            return Err(StageError::at(
+                StageErrorCode::InvalidEntry,
+                file.path.clone(),
+            ));
+        }
+        let (parent, _) = split_relative_path(&file.path)?;
+        if !parent.is_empty() && !directory_set.contains(parent) {
+            return Err(StageError::at(
+                StageErrorCode::InvalidEntry,
+                file.path.clone(),
+            ));
+        }
+        let bytes = u64::try_from(file.bytes.len())
+            .map_err(|_| StageError::new(StageErrorCode::LimitExceeded))?;
+        if bytes > 1024 * 1024 {
+            return Err(StageError::at(
+                StageErrorCode::LimitExceeded,
+                file.path.clone(),
+            ));
+        }
+        total_bytes = total_bytes
+            .checked_add(bytes)
+            .ok_or_else(|| StageError::new(StageErrorCode::LimitExceeded))?;
+        if total_bytes > 100 * 1024 * 1024 {
+            return Err(StageError::new(StageErrorCode::LimitExceeded));
+        }
+    }
+    Ok(())
+}
+
+fn validate_relative_path(relative: &str) -> Result<(), StageError> {
+    if relative.is_empty()
+        || relative.len() > 4_096
+        || Path::new(relative).is_absolute()
+        || relative.contains('\\')
+        || relative
+            .split('/')
+            .any(|component| component.is_empty() || component == "." || component == "..")
+    {
+        return Err(StageError::at(
+            StageErrorCode::InvalidEntry,
+            relative.to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn split_relative_path(relative: &str) -> Result<(&str, &str), StageError> {
+    validate_relative_path(relative)?;
+    Ok(relative
+        .rsplit_once('/')
+        .map_or(("", relative), |(parent, name)| (parent, name)))
+}
+
+fn path_depth(relative: &str) -> usize {
+    relative.bytes().filter(|byte| *byte == b'/').count()
+}
+
+fn open_relative_directory(root: &Dir, relative: &str) -> Result<Dir, StageError> {
+    let mut current = root
+        .try_clone()
+        .map_err(|_| StageError::new(StageErrorCode::Io))?;
+    if relative.is_empty() {
+        return Ok(current);
+    }
+    for component in relative.split('/') {
+        current = open_directory_nofollow(&current, component)
+            .map_err(|_| StageError::at(StageErrorCode::InvalidEntry, relative.to_owned()))?;
+    }
+    Ok(current)
+}
+
 impl SanitizedStage {
     #[must_use]
     pub fn path(&self) -> &Path {
@@ -354,52 +635,7 @@ impl SanitizedStage {
     }
 
     fn cleanup_inner(&mut self) -> io::Result<()> {
-        let Some(work_root) = self.work_root.as_ref() else {
-            return Ok(());
-        };
-        let held_metadata = work_root.dir_metadata()?;
-        let held_name = matching_held_directory_name(&self.parent, &self.directory_name, work_root);
-        let mut cleanup_error = held_name.as_ref().err().map(clone_io_error);
-        let held_name = held_name.ok().flatten();
-        let mut quarantine_name = held_name.as_ref().and_then(|held_name| {
-            match quarantine_held_directory(&self.parent, held_name, &held_metadata) {
-                Ok(name) => Some(name),
-                Err(error) => {
-                    if cleanup_error.is_none() {
-                        cleanup_error = Some(error);
-                    }
-                    None
-                }
-            }
-        });
-
-        if let Err(error) = scrub_cleanup_tree(work_root)
-            && cleanup_error.is_none()
-        {
-            cleanup_error = Some(error);
-        }
-        drop(self.work_root.take());
-
-        if quarantine_name.is_none()
-            && let Some(held_name) = held_name.as_ref()
-            && let Ok(name) = quarantine_held_directory(&self.parent, held_name, &held_metadata)
-        {
-            quarantine_name = Some(name);
-        }
-        if let Some(quarantine_name) = quarantine_name {
-            return match self.parent.remove_dir(&quarantine_name) {
-                Ok(()) => Ok(()),
-                Err(remove_error) => Err(cleanup_error.unwrap_or(remove_error)),
-            };
-        }
-        if held_name.is_none() && cleanup_error.is_none() {
-            cleanup_error = Some(io::Error::new(
-                io::ErrorKind::NotFound,
-                "the held disposable stage moved outside its parent",
-            ));
-        }
-        Err(cleanup_error
-            .unwrap_or_else(|| io::Error::other("the disposable stage could not be isolated")))
+        cleanup_disposable_directory(&self.parent, &mut self.work_root, &self.directory_name)
     }
 }
 
@@ -421,6 +657,59 @@ impl Drop for SanitizedStage {
             eprintln!("Carl could not completely remove a disposable agent stage.");
         }
     }
+}
+
+fn cleanup_disposable_directory(
+    parent: &Dir,
+    work_root: &mut Option<Dir>,
+    directory_name: &str,
+) -> io::Result<()> {
+    let Some(held_root) = work_root.as_ref() else {
+        return Ok(());
+    };
+    let held_metadata = held_root.dir_metadata()?;
+    let held_name = matching_held_directory_name(parent, directory_name, held_root);
+    let mut cleanup_error = held_name.as_ref().err().map(clone_io_error);
+    let held_name = held_name.ok().flatten();
+    let mut quarantine_name = held_name.as_ref().and_then(|held_name| {
+        match quarantine_held_directory(parent, held_name, &held_metadata) {
+            Ok(name) => Some(name),
+            Err(error) => {
+                if cleanup_error.is_none() {
+                    cleanup_error = Some(error);
+                }
+                None
+            }
+        }
+    });
+
+    if let Err(error) = scrub_cleanup_tree(held_root)
+        && cleanup_error.is_none()
+    {
+        cleanup_error = Some(error);
+    }
+    drop(work_root.take());
+
+    if quarantine_name.is_none()
+        && let Some(held_name) = held_name.as_ref()
+        && let Ok(name) = quarantine_held_directory(parent, held_name, &held_metadata)
+    {
+        quarantine_name = Some(name);
+    }
+    if let Some(quarantine_name) = quarantine_name {
+        return match parent.remove_dir(&quarantine_name) {
+            Ok(()) => Ok(()),
+            Err(remove_error) => Err(cleanup_error.unwrap_or(remove_error)),
+        };
+    }
+    if held_name.is_none() && cleanup_error.is_none() {
+        cleanup_error = Some(io::Error::new(
+            io::ErrorKind::NotFound,
+            "the held disposable stage moved outside its parent",
+        ));
+    }
+    Err(cleanup_error
+        .unwrap_or_else(|| io::Error::other("the disposable stage could not be isolated")))
 }
 
 fn scrub_cleanup_tree(root: &Dir) -> io::Result<()> {
@@ -825,6 +1114,104 @@ pub(crate) fn canonical_manifest_bytes(
         }
     }
     Ok(bytes)
+}
+
+#[cfg(all(test, unix))]
+mod verification_candidate_tests {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+
+    use sha2::{Digest, Sha256};
+    use uuid::Uuid;
+
+    use super::{CandidateFile, ProposalLimits, StageManifestEntry, VerificationCandidate};
+    use crate::policy::Sha256Digest;
+    use crate::security::SecretFilter;
+
+    #[test]
+    fn fresh_candidate_preserves_sealed_empty_directories() {
+        let root =
+            PathBuf::from("/tmp").join(format!("carl-verification-candidate-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("create fixture root");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).expect("secure fixture root");
+        let directories = vec!["src".to_owned(), "src/empty".to_owned()];
+        let files = vec![CandidateFile {
+            path: "src/file.txt".to_owned(),
+            bytes: b"sealed candidate".to_vec(),
+        }];
+
+        let candidate = VerificationCandidate::reconstruct(&root, &directories, &files)
+            .expect("reconstruct candidate");
+        assert_eq!(
+            fs::read(candidate.path().join("src/file.txt")).expect("read candidate"),
+            b"sealed candidate"
+        );
+        assert!(candidate.path().join("src/empty").is_dir());
+        let candidate_path = candidate.path().to_path_buf();
+        candidate.cleanup().expect("clean candidate");
+        assert!(!candidate_path.exists());
+        fs::remove_dir(root).expect("remove fixture root");
+    }
+
+    #[test]
+    fn candidate_seal_detects_same_content_file_replacement() {
+        let root = PathBuf::from("/tmp").join(format!("carl-verification-seal-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("create fixture root");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).expect("secure fixture root");
+        let contents = b"sealed candidate";
+        let digest = Sha256Digest::from_bytes(Sha256::digest(contents).into());
+        let expected = vec![StageManifestEntry::new(
+            "src/file.txt".to_owned(),
+            contents.len() as u64,
+            digest,
+        )];
+        let expected_manifest_digest =
+            super::builder::build_manifest(contents.len() as u64, expected.clone())
+                .expect("expected manifest")
+                .digest();
+        let directories = vec!["src".to_owned()];
+        let candidate = VerificationCandidate::reconstruct(
+            &root,
+            &directories,
+            &[CandidateFile {
+                path: "src/file.txt".to_owned(),
+                bytes: contents.to_vec(),
+            }],
+        )
+        .expect("reconstruct candidate");
+
+        let before = candidate
+            .inspect(
+                &expected,
+                &directories,
+                ProposalLimits::new(1_024).expect("proposal limits"),
+                SecretFilter,
+            )
+            .expect("seal before execution");
+        let replacement = candidate.path().join("src/replacement.txt");
+        fs::write(&replacement, contents).expect("write replacement");
+        fs::set_permissions(&replacement, fs::Permissions::from_mode(0o600))
+            .expect("secure replacement");
+        fs::rename(&replacement, candidate.path().join("src/file.txt"))
+            .expect("replace candidate file");
+        let after = candidate
+            .inspect(
+                &expected,
+                &directories,
+                ProposalLimits::new(1_024).expect("proposal limits"),
+                SecretFilter,
+            )
+            .expect("seal after replacement");
+
+        assert!(before.matches_expected_manifest(
+            expected_manifest_digest,
+            before.directory_manifest_digest(),
+        ));
+        assert!(!before.same_persistent_snapshot(&after));
+        candidate.cleanup().expect("clean candidate");
+        fs::remove_dir(root).expect("remove fixture root");
+    }
 }
 
 #[cfg(test)]

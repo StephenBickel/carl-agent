@@ -28,6 +28,7 @@ const MAX_RELATIVE_PATH_BYTES: usize = 4_096;
 const MAX_TOTAL_BYTES: u64 = 100 * 1024 * 1024;
 const MAX_FILE_BYTES: u64 = 1024 * 1024;
 const PROPOSAL_DOMAIN: &[u8] = b"carl.exact-replacement.v1\0";
+const DIRECTORY_MANIFEST_DOMAIN: &[u8] = b"carl.baseline-directories.v1\0";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProposalErrorCode {
@@ -78,6 +79,10 @@ impl ProposalError {
             path: Some(path.into()),
             secret_rule: Some(rule),
         }
+    }
+
+    pub(crate) const fn from_stage_io() -> Self {
+        Self::new(ProposalErrorCode::Io)
     }
 
     #[must_use]
@@ -290,6 +295,38 @@ struct StageSnapshot {
 }
 
 #[derive(Clone, Eq, PartialEq)]
+pub(crate) struct CandidateSnapshotSeal {
+    snapshot: StageSnapshot,
+    manifest_digest: Sha256Digest,
+    directory_manifest_digest: Sha256Digest,
+}
+
+impl CandidateSnapshotSeal {
+    pub(crate) const fn manifest_digest(&self) -> Sha256Digest {
+        self.manifest_digest
+    }
+
+    pub(crate) const fn directory_manifest_digest(&self) -> Sha256Digest {
+        self.directory_manifest_digest
+    }
+
+    pub(crate) fn matches_expected_manifest(
+        &self,
+        manifest_digest: Sha256Digest,
+        directory_manifest_digest: Sha256Digest,
+    ) -> bool {
+        self.manifest_digest == manifest_digest
+            && self.directory_manifest_digest == directory_manifest_digest
+    }
+
+    pub(crate) fn same_persistent_snapshot(&self, other: &Self) -> bool {
+        self.snapshot == other.snapshot
+            && self.manifest_digest == other.manifest_digest
+            && self.directory_manifest_digest == other.directory_manifest_digest
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
 struct ScannedFile {
     bytes: Vec<u8>,
     digest: Sha256Digest,
@@ -301,6 +338,147 @@ struct ScannedFile {
 struct ScannedDirectory {
     identity: EntryIdentity,
     metadata_valid: bool,
+}
+
+pub(crate) fn inspect_verification_candidate(
+    root: &Dir,
+    expected_entries: &[StageManifestEntry],
+    expected_directories: &[String],
+    limits: ProposalLimits,
+    secret_filter: SecretFilter,
+) -> Result<CandidateSnapshotSeal, ProposalError> {
+    verify_work_directory(root, "")?;
+    let first = scan_stage(root, limits, secret_filter)?;
+    let second = scan_stage(root, limits, secret_filter)?;
+    ensure_stable_scan(&first, &second)?;
+    seal_expected_snapshot(first, expected_entries, expected_directories)
+}
+
+fn seal_expected_snapshot(
+    snapshot: StageSnapshot,
+    expected_entries: &[StageManifestEntry],
+    expected_directories: &[String],
+) -> Result<CandidateSnapshotSeal, ProposalError> {
+    let mut previous_path: Option<&str> = None;
+    let mut expected_total = 0_u64;
+    for expected in expected_entries {
+        if previous_path.is_some_and(|previous| previous >= expected.path()) {
+            return Err(ProposalError::new(ProposalErrorCode::EntryChanged));
+        }
+        let scanned = snapshot.files.get(expected.path()).ok_or_else(|| {
+            ProposalError::at(ProposalErrorCode::EntryChanged, expected.path().to_owned())
+        })?;
+        if !scanned.metadata_valid
+            || scanned.bytes.len() as u64 != expected.bytes()
+            || scanned.digest != expected.content_digest()
+        {
+            return Err(ProposalError::at(
+                ProposalErrorCode::EntryChanged,
+                expected.path().to_owned(),
+            ));
+        }
+        expected_total = expected_total
+            .checked_add(expected.bytes())
+            .ok_or_else(|| ProposalError::new(ProposalErrorCode::LimitExceeded))?;
+        previous_path = Some(expected.path());
+    }
+    if snapshot.files.len() != expected_entries.len() || snapshot.total_bytes != expected_total {
+        let unexpected = snapshot
+            .files
+            .keys()
+            .find(|path| {
+                expected_entries
+                    .binary_search_by(|entry| entry.path().cmp(path.as_str()))
+                    .is_err()
+            })
+            .cloned()
+            .unwrap_or_default();
+        return Err(ProposalError::at(
+            ProposalErrorCode::EntryChanged,
+            unexpected,
+        ));
+    }
+
+    let expected_directory_set = expected_directories
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    if expected_directory_set.len() != expected_directories.len()
+        || snapshot.directories.len() != expected_directories.len()
+        || snapshot.directories.iter().any(|(path, directory)| {
+            !directory.metadata_valid || !expected_directory_set.contains(path.as_str())
+        })
+    {
+        let unexpected = snapshot
+            .directories
+            .keys()
+            .find(|path| !expected_directory_set.contains(path.as_str()))
+            .cloned()
+            .unwrap_or_default();
+        return Err(ProposalError::at(
+            ProposalErrorCode::EntryChanged,
+            unexpected,
+        ));
+    }
+    let directory_manifest = canonical_directory_manifest(expected_directories)?;
+    let manifest = build_manifest(expected_total, expected_entries.to_vec())
+        .map_err(|_| ProposalError::new(ProposalErrorCode::EntryChanged))?;
+    Ok(CandidateSnapshotSeal {
+        snapshot,
+        manifest_digest: manifest.digest(),
+        directory_manifest_digest: digest(&directory_manifest),
+    })
+}
+
+fn canonical_directory_manifest(directories: &[String]) -> Result<Vec<u8>, ProposalError> {
+    let mut bytes = Vec::new();
+    let mut previous: Option<&str> = None;
+    let mut path_bytes = 0_usize;
+    bytes.extend_from_slice(DIRECTORY_MANIFEST_DOMAIN);
+    bytes.extend_from_slice(
+        &u32::try_from(directories.len())
+            .map_err(|_| ProposalError::new(ProposalErrorCode::LimitExceeded))?
+            .to_be_bytes(),
+    );
+    for directory in directories {
+        if directory.is_empty()
+            || directory.len() > MAX_RELATIVE_PATH_BYTES
+            || directory.contains('\\')
+            || directory.starts_with('/')
+            || directory.ends_with('/')
+            || directory
+                .split('/')
+                .any(|component| component.is_empty() || component == "." || component == "..")
+            || previous.is_some_and(|previous| previous >= directory.as_str())
+        {
+            return Err(ProposalError::at(
+                ProposalErrorCode::EntryChanged,
+                directory.clone(),
+            ));
+        }
+        if let Some((parent, _)) = directory.rsplit_once('/')
+            && directories
+                .binary_search_by(|candidate| candidate.as_str().cmp(parent))
+                .is_err()
+        {
+            return Err(ProposalError::at(
+                ProposalErrorCode::EntryChanged,
+                directory.clone(),
+            ));
+        }
+        account_path_bytes(&mut path_bytes, directory)
+            .map_err(|()| ProposalError::at(ProposalErrorCode::LimitExceeded, directory.clone()))?;
+        bytes.extend_from_slice(
+            &u32::try_from(directory.len())
+                .map_err(|_| {
+                    ProposalError::at(ProposalErrorCode::LimitExceeded, directory.clone())
+                })?
+                .to_be_bytes(),
+        );
+        bytes.extend_from_slice(directory.as_bytes());
+        previous = Some(directory);
+    }
+    Ok(bytes)
 }
 
 fn verify_baseline(
@@ -541,7 +719,7 @@ fn candidate_manifest_digest(
         .map_err(|_| ProposalError::at(ProposalErrorCode::EntryChanged, changed_path.to_owned()))
 }
 
-fn canonical_proposal_envelope(
+pub(crate) fn canonical_proposal_envelope(
     baseline: Sha256Digest,
     path: &str,
     expected_live: Sha256Digest,

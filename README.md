@@ -13,7 +13,7 @@ The intended v1 experience is one continuous session across a local terminal UI 
 ## Status: pre-alpha foundation
 
 > [!WARNING]
-> Carl is currently a **pre-alpha foundation** and is not yet a usable end-user agent. The authentication command surface, an inert library-level Codex exec adapter, sealed staging, and exact proposal inspection are implemented, but the HTTP/OpenAI adapters, runtime tool loop, user-reachable subscription execution, independent verification, stale-safe promotion, built-in tools, TUI interaction, and Telegram gateway are not implemented. Only the four placeholder commands `serve`, `pair`, `doctor`, and `sessions` return not-implemented errors; Clap's built-in `help` command displays help.
+> Carl is currently a **pre-alpha foundation** and is not yet a usable end-user agent. The authentication command surface, an inert library-level Codex exec adapter, sealed staging, exact proposal inspection, and independent bounded verification are implemented, but the HTTP/OpenAI adapters, runtime tool loop, user-reachable subscription execution, stale-safe promotion, built-in tools, TUI interaction, and Telegram gateway are not implemented. Only the four placeholder commands `serve`, `pair`, `doctor`, and `sessions` return not-implemented errors; Clap's built-in `help` command displays help.
 
 Authentication and adapter code do not enable a live coding task. The auth and Codex
 exec boundaries are tested with offline provider fakes; this repository does not
@@ -45,13 +45,16 @@ Implemented and covered by deterministic tests:
 - private, quota-bounded content-addressed baseline/proposal storage with sealed
   source identity, startup reachability cleanup, plus process-free inspection that
   accepts only no changes or one exact existing UTF-8 file replacement;
+- fresh, independently reconstructed verification candidates; approved executable
+  and literal-argv attestation; credential-free bounded process-tree supervision;
+  sanitized durable results; and post-commit-only verified-proposal capabilities;
 - a Clap command/help shell for the remaining planned top-level interface.
 
 The approved v1 design adds a shared runtime loop, OpenAI and OpenAI-compatible HTTP adapters, bounded workspace tools, a TUI, explicit memory, and an owner-only Telegram gateway. These are roadmap items, not current capabilities.
 
 No subscription coding task is CLI-reachable. The implemented safety modules are
-library boundaries only; independent verification, stale-safe promotion, and
-run-engine orchestration remain unavailable.
+library boundaries only; stale-safe promotion and run-engine orchestration remain
+unavailable.
 
 ## Quick start
 
@@ -123,9 +126,9 @@ Telegram (planned) ---+       |
 Today, the event model, storage layer, budget primitives, provider boundary, scripted
 adapter, provider-owned authentication sidecars, an inert Codex exec adapter,
 external-agent policy, exact approvals, secret filtering, sealed staging, and exact
-replacement proposal inspection exist. The subscription run engine, independent
-verification and promotion pipeline, native runtime, production adapters, and
-frontends remain planned. See the [architecture guide](docs/architecture.md), the
+replacement proposal inspection, and independent bounded verification exist. The
+subscription run engine, promotion pipeline, native runtime, production adapters,
+and frontends remain planned. See the [architecture guide](docs/architecture.md), the
 [approved Carl design](docs/superpowers/specs/2026-07-23-carl-top-tier-harness-design.md),
 and the decisions on [event-sourced execution](docs/adr/0001-event-sourced-runtime.md),
 a [single-process v1](docs/adr/0002-single-process-v1.md), and

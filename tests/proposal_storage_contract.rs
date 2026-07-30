@@ -1,6 +1,8 @@
 use std::error::Error;
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use carl::artifacts::ArtifactStore;
 use carl::delegates::{DelegateSettings, DelegateSettingsLayers};
@@ -9,14 +11,18 @@ use carl::runtime::subscription::{
     RunConfigSnapshot, RunId, RunState, RunTransition, RunTrustLabel,
 };
 use carl::security::SecretFilter;
-use carl::sidecar::DataRootLock;
+use carl::sidecar::{
+    DataRootLock, ExecutableTrustDecision, SidecarCommand, TrustedExecutable, VersionOutputFormat,
+};
 use carl::staging::{
     ExactReplacementProposal, ProposalLimits, ProposalOutcome, SanitizedStage,
     SanitizedStageBuilder, StageLimits,
 };
 use carl::storage::{NewSubscriptionRun, RuntimeStore, Store, SubscriptionRunInspectionOutcome};
+use carl::verification::{VerificationEnvironmentProfile, VerificationLimits, VerificationSpec};
 use chrono::{DateTime, Utc};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, ErrorCode as SqliteErrorCode, params};
+use semver::VersionReq;
 use uuid::Uuid;
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -126,6 +132,8 @@ fn sealed_baseline_is_cas_bound_single_assignment_and_durable() -> TestResult {
     );
     assert_eq!(persisted.entry_count, 1);
     assert_eq!(persisted.total_bytes, BEFORE.len() as u64);
+    assert_eq!(persisted.directory_count, 1);
+    assert_eq!(persisted.directories, vec!["src"]);
     assert_eq!(persisted.entries.len(), 1);
     assert_eq!(persisted.entries[0].ordinal, 0);
     assert_eq!(persisted.entries[0].path, "src/lib.rs");
@@ -162,6 +170,45 @@ fn sealed_baseline_is_cas_bound_single_assignment_and_durable() -> TestResult {
             .get_subscription_run_baseline(run_id)?
             .expect("baseline metadata survives stage cleanup and restart"),
         persisted
+    );
+    Ok(())
+}
+
+#[test]
+fn sealed_baseline_persists_its_exact_directory_topology() -> TestResult {
+    let layout = StorageLayout::new()?;
+    layout.write_source("src/nested/lib.rs", BEFORE)?;
+    let mut store = RuntimeStore::open(DataRootLock::acquire(&layout.root)?, instant(0))?;
+    let stage = layout.prepare(store.artifacts())?;
+    let run_id = create_run(&mut store, instant(1))?;
+
+    store
+        .record_subscription_run_baseline(
+            run_id,
+            RunState::Prepared,
+            1,
+            stage.sealed_baseline(),
+            instant(2),
+        )?
+        .expect("baseline CAS succeeds");
+    drop(stage);
+    drop(store);
+
+    let connection = Connection::open(&layout.database)?;
+    let directories = connection
+        .prepare(
+            "SELECT ordinal, path
+             FROM subscription_run_baseline_directories
+             WHERE run_id = ?1
+             ORDER BY ordinal ASC",
+        )?
+        .query_map([run_id.to_string()], |row| {
+            Ok((row.get::<_, u64>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(
+        directories,
+        vec![(0, "src".to_owned()), (1, "src/nested".to_owned())]
     );
     Ok(())
 }
@@ -324,6 +371,315 @@ fn exact_proposal_and_payload_references_survive_stage_cleanup_and_restart() -> 
             .read_verified(&persisted.payload_artifact_id)?
             .bytes(),
         AFTER
+    );
+    Ok(())
+}
+
+#[test]
+fn verification_request_schema_accepts_an_exact_zero_argument_command() -> TestResult {
+    let layout = StorageLayout::new()?;
+    layout.write_source("src/lib.rs", BEFORE)?;
+    let mut store = RuntimeStore::open(DataRootLock::acquire(&layout.root)?, instant(0))?;
+    let stage = layout.prepare(store.artifacts())?;
+    let run_id = create_run(&mut store, instant(1))?;
+    let baseline = store
+        .record_subscription_run_baseline(
+            run_id,
+            RunState::Prepared,
+            1,
+            stage.sealed_baseline(),
+            instant(2),
+        )?
+        .expect("baseline CAS succeeds");
+    let revision = advance_to_inspecting(&mut store, run_id, 1)?;
+    fs::write(stage.path().join("src/lib.rs"), AFTER)?;
+    let proposal = exact_proposal(&stage, store.artifacts())?;
+    let proposal = store
+        .record_subscription_run_exact_proposal(
+            run_id,
+            RunState::Inspecting,
+            revision,
+            &proposal,
+            instant(7),
+        )?
+        .expect("proposal CAS succeeds");
+    drop(stage);
+    drop(store);
+
+    let connection = Connection::open(&layout.database)?;
+    connection.execute_batch("PRAGMA foreign_keys = ON;")?;
+    let inserted = connection.execute(
+        "INSERT INTO subscription_run_verification_requests (
+            id, run_id, started_run_sequence, inspection_outcome,
+            baseline_manifest_artifact_id,
+            source_preconditions_artifact_id, source_preconditions_digest,
+            baseline_directory_manifest_digest,
+            proposal_artifact_id, payload_artifact_id,
+            candidate_manifest_digest, executable_path,
+            executable_metadata_risk, executable_platform_identity,
+            executable_byte_length, executable_content_sha256,
+            executable_attestation_digest,
+            verification_spec_digest,
+            request_digest, argv_digest, environment_profile,
+            execution_timeout_nanos, max_output_bytes,
+            graceful_shutdown_timeout_nanos, forced_shutdown_timeout_nanos,
+            poll_interval_nanos, argv_count, argv_bytes, created_at
+         ) VALUES (
+            ?1, ?2, ?3, 'exact_replacement', ?4, ?5, ?6, ?7,
+            ?8, ?9, ?10, ?11, 'none', ?12, 123, ?13, ?14, ?15, ?16,
+            ?17, 'credential_free_v1', 1000, 4096, 100, 500, 5, 0, 0, ?18
+         )",
+        params![
+            Uuid::new_v4().to_string(),
+            run_id.to_string(),
+            revision + 1,
+            baseline.manifest_artifact_id.as_str(),
+            baseline.source_preconditions_artifact_id.as_str(),
+            baseline.source_preconditions_digest.to_string(),
+            baseline.directory_manifest_digest.to_string(),
+            proposal.proposal_artifact_id.as_str(),
+            proposal.payload_artifact_id.as_str(),
+            proposal.candidate_manifest_digest.to_string(),
+            "/fixture-verifier",
+            vec![0_u8; 16],
+            "a".repeat(64),
+            "b".repeat(64),
+            "c".repeat(64),
+            "d".repeat(64),
+            "e".repeat(64),
+            instant(8).to_rfc3339(),
+        ],
+    );
+    assert!(
+        matches!(inserted, Ok(1)),
+        "a command with no arguments must remain exact and valid: {inserted:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn verification_begin_atomically_persists_exact_evidence_and_enters_verifying() -> TestResult {
+    let layout = StorageLayout::new()?;
+    layout.write_source("src/lib.rs", BEFORE)?;
+    let mut store = RuntimeStore::open(DataRootLock::acquire(&layout.root)?, instant(0))?;
+    let stage = layout.prepare(store.artifacts())?;
+    let run_id = create_run(&mut store, instant(1))?;
+    let baseline = store
+        .record_subscription_run_baseline(
+            run_id,
+            RunState::Prepared,
+            1,
+            stage.sealed_baseline(),
+            instant(2),
+        )?
+        .expect("baseline CAS succeeds");
+    let revision = advance_to_inspecting(&mut store, run_id, 1)?;
+    fs::write(stage.path().join("src/lib.rs"), AFTER)?;
+    let proposal = exact_proposal(&stage, store.artifacts())?;
+    store
+        .record_subscription_run_exact_proposal(
+            run_id,
+            RunState::Inspecting,
+            revision,
+            &proposal,
+            instant(7),
+        )?
+        .expect("proposal persists");
+    let specification = VerificationSpec::new(
+        trusted_fixture()?,
+        vec![String::new(), "--check".to_owned()],
+        VerificationEnvironmentProfile::CleanV1,
+        VerificationLimits::new(
+            Duration::from_nanos(123_456_789),
+            64 * 1_024,
+            Duration::from_nanos(20_000_003),
+            Duration::from_nanos(30_000_007),
+            Duration::from_nanos(1_000_009),
+        )?,
+    )?;
+
+    assert!(
+        store
+            .begin_subscription_run_verification(run_id, revision + 1, &specification, instant(8),)?
+            .is_none(),
+        "a stale revision must not persist a request"
+    );
+    let request = store
+        .begin_subscription_run_verification(run_id, revision, &specification, instant(8))?
+        .expect("current inspection revision begins verification");
+    assert_eq!(request.run_id(), run_id);
+    assert_eq!(
+        request.baseline_directory_manifest_digest(),
+        baseline.directory_manifest_digest
+    );
+
+    let run = store
+        .get_subscription_run(run_id)?
+        .expect("run projection remains present");
+    assert_eq!(run.state, RunState::Verifying);
+    assert_eq!(run.revision, revision + 1);
+
+    let connection = Connection::open(&layout.database)?;
+    let stored_limits = connection.query_row(
+        "SELECT execution_timeout_nanos,
+                graceful_shutdown_timeout_nanos,
+                forced_shutdown_timeout_nanos, poll_interval_nanos,
+                argv_count, argv_bytes
+         FROM subscription_run_verification_requests
+         WHERE run_id = ?1",
+        [run_id.to_string()],
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+            ))
+        },
+    )?;
+    assert_eq!(
+        stored_limits,
+        (123_456_789, 20_000_003, 30_000_007, 1_000_009, 2, 7)
+    );
+    let argv = connection
+        .prepare(
+            "SELECT ordinal, value
+             FROM subscription_run_verification_argv
+             WHERE verification_id = ?1
+             ORDER BY ordinal",
+        )?
+        .query_map([request.verification_id().to_string()], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(argv, vec![(0, String::new()), (1, "--check".to_owned())]);
+    let expected_verification_id = request.verification_id();
+    let expected_request_digest = request.request_digest();
+    drop(connection);
+    drop(stage);
+    drop(store);
+
+    let reopened = RuntimeStore::open(DataRootLock::acquire(&layout.root)?, instant(9))?;
+    let durable = reopened
+        .get_subscription_run_verification_request(run_id)?
+        .expect("verification request survives restart recovery");
+    assert_eq!(durable.verification_id(), expected_verification_id);
+    assert_eq!(durable.request_digest(), expected_request_digest);
+    Ok(())
+}
+
+#[test]
+fn verification_result_duration_schema_accepts_the_full_supervisor_bound() -> TestResult {
+    const MAXIMUM_DURATION_NANOS: i64 = 3_691_000_000_000;
+    const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+    let layout = StorageLayout::new()?;
+    layout.write_source("src/lib.rs", BEFORE)?;
+    let mut store = RuntimeStore::open(DataRootLock::acquire(&layout.root)?, instant(0))?;
+    let stage = layout.prepare(store.artifacts())?;
+    let run_id = create_run(&mut store, instant(1))?;
+    store
+        .record_subscription_run_baseline(
+            run_id,
+            RunState::Prepared,
+            1,
+            stage.sealed_baseline(),
+            instant(2),
+        )?
+        .expect("baseline CAS succeeds");
+    let inspecting_revision = advance_to_inspecting(&mut store, run_id, 1)?;
+    fs::write(stage.path().join("src/lib.rs"), AFTER)?;
+    let proposal = exact_proposal(&stage, store.artifacts())?;
+    store
+        .record_subscription_run_exact_proposal(
+            run_id,
+            RunState::Inspecting,
+            inspecting_revision,
+            &proposal,
+            instant(7),
+        )?
+        .expect("proposal persists");
+    let specification = VerificationSpec::new(
+        trusted_fixture()?,
+        Vec::new(),
+        VerificationEnvironmentProfile::CleanV1,
+        VerificationLimits::new(
+            Duration::from_secs(3_600),
+            64 * 1_024,
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+            Duration::from_secs(1),
+        )?,
+    )?;
+    store
+        .begin_subscription_run_verification(
+            run_id,
+            inspecting_revision,
+            &specification,
+            instant(8),
+        )?
+        .expect("verification begins");
+    let verifying_revision = inspecting_revision + 1;
+
+    let connection = Connection::open(&layout.database)?;
+    connection.execute_batch("PRAGMA foreign_keys = ON;")?;
+    let insert_duration = |duration_nanos: i64, result_digest: &str| {
+        connection.execute(
+            "INSERT INTO subscription_run_verification_results (
+                verification_id, run_id, completed_run_sequence,
+                request_digest, expected_candidate_manifest_digest,
+                expected_directory_manifest_digest, outcome, exit_code,
+                observed_candidate_manifest_digest,
+                observed_directory_manifest_digest,
+                executable_attestation_evidence,
+                executable_attestation_digest,
+                stdout_text, stdout_bytes, stdout_digest,
+                stderr_text, stderr_bytes, stderr_digest,
+                max_output_bytes, duration_nanos, result_digest,
+                completed_at
+             )
+             SELECT
+                id, run_id, ?2, request_digest,
+                candidate_manifest_digest, baseline_directory_manifest_digest,
+                'passed', 0,
+                candidate_manifest_digest, baseline_directory_manifest_digest,
+                '00', executable_attestation_digest,
+                '', 0, ?3, '', 0, ?3, max_output_bytes, ?4, ?5, ?6
+             FROM subscription_run_verification_requests
+             WHERE run_id = ?1",
+            params![
+                run_id.to_string(),
+                verifying_revision + 1,
+                EMPTY_SHA256,
+                duration_nanos,
+                result_digest,
+                instant(9).to_rfc3339(),
+            ],
+        )
+    };
+
+    assert_eq!(
+        insert_duration(MAXIMUM_DURATION_NANOS, &"e".repeat(64))?,
+        1,
+        "the honest maximum includes execution + graceful + 2×forced + poll"
+    );
+    assert_eq!(
+        connection.execute(
+            "DELETE FROM subscription_run_verification_results WHERE run_id = ?1",
+            [run_id.to_string()],
+        )?,
+        1
+    );
+    let rejected = insert_duration(MAXIMUM_DURATION_NANOS + 1, &"f".repeat(64));
+    assert!(
+        matches!(
+            rejected,
+            Err(rusqlite::Error::SqliteFailure(ref error, _))
+                if error.code == SqliteErrorCode::ConstraintViolation
+        ),
+        "the first nanosecond beyond the supervisor bound must be rejected: {rejected:?}"
     );
     Ok(())
 }
@@ -834,6 +1190,24 @@ fn exact_proposal(
         ProposalOutcome::ExactReplacement(proposal) => Ok(*proposal),
         ProposalOutcome::NoChanges => Err("changed stage produced no proposal".into()),
     }
+}
+
+fn trusted_fixture() -> TestResult<TrustedExecutable> {
+    let command = SidecarCommand {
+        executable: std::env::current_exe()?,
+        arguments: Vec::new(),
+        version_arguments: vec![OsString::from("--version")],
+        version_output: VersionOutputFormat::SingleSemverToken,
+        isolated_home: PathBuf::from("verification-storage-contract"),
+        supported_versions: VersionReq::parse(">=0.0.0")?,
+    };
+    let resolved = command.resolve_executable()?;
+    let decision = if resolved.metadata_risk().is_some() {
+        ExecutableTrustDecision::TrustCanonicalPathWithMetadataRisk
+    } else {
+        ExecutableTrustDecision::TrustCanonicalPath
+    };
+    Ok(resolved.trust(decision)?)
 }
 
 fn table_count(connection: &Connection, table: &str) -> Result<u64, rusqlite::Error> {

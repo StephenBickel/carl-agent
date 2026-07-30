@@ -14,9 +14,13 @@
 //! directory identities and rejects ambient path replacement before each provider
 //! invocation or file operation.
 
+mod bounded_process;
 mod exec_jsonl;
 mod jsonl;
 
+pub(crate) use bounded_process::{
+    BoundedProcessLimits, BoundedProcessOutcome, ClosedEnvironment, run_bounded_process,
+};
 pub use exec_jsonl::{ExecutionWorkspace, JsonlEventProcess, JsonlProcessOutcome};
 
 use std::collections::{HashMap, VecDeque, hash_map::Entry};
@@ -25,7 +29,7 @@ use std::ffi::OsString;
 use std::fmt;
 use std::fs::{self, File};
 use std::future::Future;
-use std::io::{IsTerminal, Write};
+use std::io::{IsTerminal, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
 use std::process::Stdio;
@@ -40,6 +44,7 @@ use process_wrap::tokio::CommandWrapper;
 use process_wrap::tokio::ProcessGroup;
 use process_wrap::tokio::{ChildWrapper, CommandWrap};
 use semver::{Version, VersionReq};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStderr, ChildStdin, ChildStdout, Command};
@@ -53,6 +58,7 @@ const STATE_CANCELLING: u8 = 1;
 const STATE_STOPPED: u8 = 2;
 const VERSION_OUTPUT_LIMIT: usize = 4 * 1_024;
 const VERSION_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_VERIFICATION_EXECUTABLE_BYTES: u64 = 512 * 1_024 * 1_024;
 const REDACTED_STDERR: &str = "<redacted sidecar stderr>";
 const MAX_PENDING_REQUESTS: usize = 128;
 const MAX_ABANDONED_REQUEST_IDS: usize = 128;
@@ -332,6 +338,49 @@ pub struct TrustedExecutable {
     file_identity: ExecutableFileIdentity,
 }
 
+#[derive(Clone, Eq, PartialEq)]
+pub(crate) struct TrustedExecutableAttestation {
+    canonical_path: String,
+    metadata_risk_tag: &'static str,
+    platform_identity_evidence: Vec<u8>,
+    byte_len: u64,
+    content_sha256: [u8; 32],
+}
+
+impl TrustedExecutableAttestation {
+    pub(crate) fn canonical_path(&self) -> &str {
+        &self.canonical_path
+    }
+
+    pub(crate) const fn metadata_risk_tag(&self) -> &'static str {
+        self.metadata_risk_tag
+    }
+
+    pub(crate) fn platform_identity_evidence(&self) -> &[u8] {
+        &self.platform_identity_evidence
+    }
+
+    pub(crate) const fn byte_len(&self) -> u64 {
+        self.byte_len
+    }
+
+    pub(crate) const fn content_sha256(&self) -> [u8; 32] {
+        self.content_sha256
+    }
+}
+
+impl fmt::Debug for TrustedExecutableAttestation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TrustedExecutableAttestation")
+            .field("canonical_path", &"<foreground-only>")
+            .field("metadata_risk_tag", &self.metadata_risk_tag)
+            .field("byte_len", &self.byte_len)
+            .field("content_sha256", &"<redacted>")
+            .finish()
+    }
+}
+
 impl fmt::Debug for TrustedExecutable {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -350,6 +399,112 @@ impl TrustedExecutable {
     fn revalidate_for_spawn(&self) -> Result<(), SidecarError> {
         let (metadata_risk, file_identity) = inspect_trusted_executable(&self.canonical_path)?;
         if metadata_risk != self.metadata_risk || file_identity != self.file_identity {
+            return Err(SidecarError::from_code(SidecarErrorCode::UnsafeExecutable));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn verification_attestation(
+        &self,
+    ) -> Result<TrustedExecutableAttestation, SidecarError> {
+        #[cfg(windows)]
+        if self
+            .canonical_path
+            .extension()
+            .and_then(std::ffi::OsStr::to_str)
+            .is_some_and(|extension| {
+                extension.eq_ignore_ascii_case("bat") || extension.eq_ignore_ascii_case("cmd")
+            })
+        {
+            return Err(SidecarError::from_code(SidecarErrorCode::UnsafeExecutable));
+        }
+
+        self.revalidate_for_spawn()?;
+        let canonical_path = self
+            .canonical_path
+            .to_str()
+            .ok_or_else(|| SidecarError::from_code(SidecarErrorCode::UnsafeExecutable))?
+            .to_owned();
+        let mut file = File::open(&self.canonical_path)
+            .map_err(|_| SidecarError::from_code(SidecarErrorCode::UnsafeExecutable))?;
+        let before = file
+            .metadata()
+            .map_err(|_| SidecarError::from_code(SidecarErrorCode::UnsafeExecutable))?;
+        if !before.file_type().is_file() {
+            return Err(SidecarError::from_code(SidecarErrorCode::UnsafeExecutable));
+        }
+        if before.len() == 0 || before.len() > MAX_VERIFICATION_EXECUTABLE_BYTES {
+            return Err(SidecarError::from_code(SidecarErrorCode::UnsafeExecutable));
+        }
+        let before_identity = executable_identity_from_open_file(&file, &before)?;
+        if before_identity != self.file_identity {
+            return Err(SidecarError::from_code(SidecarErrorCode::UnsafeExecutable));
+        }
+
+        let mut digest = Sha256::new();
+        let mut observed_bytes = 0_u64;
+        let mut buffer = [0_u8; 32 * 1_024];
+        #[cfg(unix)]
+        let mut executable_prefix = [0_u8; 2];
+        #[cfg(unix)]
+        let mut executable_prefix_len = 0_usize;
+        loop {
+            let read = file
+                .read(&mut buffer)
+                .map_err(|_| SidecarError::from_code(SidecarErrorCode::UnsafeExecutable))?;
+            if read == 0 {
+                break;
+            }
+            #[cfg(unix)]
+            if executable_prefix_len < executable_prefix.len() {
+                let copied = (executable_prefix.len() - executable_prefix_len).min(read);
+                executable_prefix[executable_prefix_len..executable_prefix_len + copied]
+                    .copy_from_slice(&buffer[..copied]);
+                executable_prefix_len += copied;
+                if executable_prefix == *b"#!" {
+                    return Err(SidecarError::from_code(SidecarErrorCode::UnsafeExecutable));
+                }
+            }
+            observed_bytes = observed_bytes
+                .checked_add(
+                    u64::try_from(read)
+                        .map_err(|_| SidecarError::from_code(SidecarErrorCode::UnsafeExecutable))?,
+                )
+                .ok_or_else(|| SidecarError::from_code(SidecarErrorCode::UnsafeExecutable))?;
+            if observed_bytes > MAX_VERIFICATION_EXECUTABLE_BYTES || observed_bytes > before.len() {
+                return Err(SidecarError::from_code(SidecarErrorCode::UnsafeExecutable));
+            }
+            digest.update(&buffer[..read]);
+        }
+
+        let after = file
+            .metadata()
+            .map_err(|_| SidecarError::from_code(SidecarErrorCode::UnsafeExecutable))?;
+        let after_identity = executable_identity_from_open_file(&file, &after)?;
+        if before_identity != after_identity
+            || before.len() != after.len()
+            || before.modified().ok() != after.modified().ok()
+            || observed_bytes != after.len()
+        {
+            return Err(SidecarError::from_code(SidecarErrorCode::UnsafeExecutable));
+        }
+        self.revalidate_for_spawn()?;
+
+        Ok(TrustedExecutableAttestation {
+            canonical_path,
+            metadata_risk_tag: executable_metadata_risk_tag(self.metadata_risk),
+            platform_identity_evidence: executable_identity_evidence(self.file_identity),
+            byte_len: observed_bytes,
+            content_sha256: digest.finalize().into(),
+        })
+    }
+
+    pub(crate) fn revalidate_verification_attestation(
+        &self,
+        expected: &TrustedExecutableAttestation,
+    ) -> Result<(), SidecarError> {
+        let actual = self.verification_attestation()?;
+        if &actual != expected {
             return Err(SidecarError::from_code(SidecarErrorCode::UnsafeExecutable));
         }
         Ok(())
@@ -806,6 +961,40 @@ impl SidecarLimits {
             ));
         }
         Ok(self)
+    }
+}
+
+trait ProcessTerminationLimits: Copy {
+    fn graceful_shutdown_timeout(self) -> Duration;
+    fn forced_shutdown_timeout(self) -> Duration;
+    fn process_poll_interval(self) -> Duration;
+}
+
+impl ProcessTerminationLimits for SidecarLimits {
+    fn graceful_shutdown_timeout(self) -> Duration {
+        self.graceful_shutdown_timeout
+    }
+
+    fn forced_shutdown_timeout(self) -> Duration {
+        self.forced_shutdown_timeout
+    }
+
+    fn process_poll_interval(self) -> Duration {
+        self.process_poll_interval
+    }
+}
+
+impl ProcessTerminationLimits for BoundedProcessLimits {
+    fn graceful_shutdown_timeout(self) -> Duration {
+        self.graceful_shutdown_timeout()
+    }
+
+    fn forced_shutdown_timeout(self) -> Duration {
+        self.forced_shutdown_timeout()
+    }
+
+    fn process_poll_interval(self) -> Duration {
+        self.poll_interval()
     }
 }
 
@@ -1788,6 +1977,49 @@ struct ExecutableFileIdentity {
 
 #[cfg(windows)]
 type ExecutableFileIdentity = WindowsFileIdentity;
+
+const fn executable_metadata_risk_tag(risk: Option<ExecutableMetadataRisk>) -> &'static str {
+    match risk {
+        None => "none",
+        Some(ExecutableMetadataRisk::GroupWritableInstallDirectory) => {
+            "group_writable_install_directory"
+        }
+    }
+}
+
+#[cfg(unix)]
+fn executable_identity_evidence(identity: ExecutableFileIdentity) -> Vec<u8> {
+    let mut evidence = b"unix-file-v1\0".to_vec();
+    evidence.extend_from_slice(&identity.device.to_be_bytes());
+    evidence.extend_from_slice(&identity.inode.to_be_bytes());
+    evidence
+}
+
+#[cfg(windows)]
+fn executable_identity_evidence(identity: ExecutableFileIdentity) -> Vec<u8> {
+    let mut evidence = b"windows-file-v1\0".to_vec();
+    evidence.extend_from_slice(&identity.volume_serial.to_be_bytes());
+    evidence.extend_from_slice(&identity.file_index.to_be_bytes());
+    evidence.extend_from_slice(&identity.links.to_be_bytes());
+    evidence
+}
+
+#[cfg(unix)]
+fn executable_identity_from_open_file(
+    _file: &File,
+    metadata: &fs::Metadata,
+) -> Result<ExecutableFileIdentity, SidecarError> {
+    executable_file_identity(Path::new(""), metadata)
+}
+
+#[cfg(windows)]
+fn executable_identity_from_open_file(
+    file: &File,
+    _metadata: &fs::Metadata,
+) -> Result<ExecutableFileIdentity, SidecarError> {
+    windows_file_identity(file)
+        .map_err(|()| SidecarError::from_code(SidecarErrorCode::UnsafeExecutable))
+}
 
 fn inspect_trusted_executable(
     path: &Path,
@@ -3092,9 +3324,9 @@ fn deadline_after(duration: Duration) -> Result<Instant, SidecarError> {
         .ok_or_else(|| SidecarError::from_code(SidecarErrorCode::InvalidConfiguration))
 }
 
-async fn terminate_process(
+async fn terminate_process<L: ProcessTerminationLimits>(
     process: &Arc<Mutex<SidecarProcessGuard>>,
-    limits: SidecarLimits,
+    limits: L,
 ) -> Result<(), SidecarError> {
     #[cfg(unix)]
     {
@@ -3104,8 +3336,8 @@ async fn terminate_process(
 
     let graceful_exit = poll_shared_guard_until(
         process,
-        deadline_after(limits.graceful_shutdown_timeout)?,
-        limits.process_poll_interval,
+        deadline_after(limits.graceful_shutdown_timeout())?,
+        limits.process_poll_interval(),
     )
     .await?;
     if !graceful_exit {
@@ -3115,15 +3347,15 @@ async fn terminate_process(
     Ok(())
 }
 
-async fn force_kill_and_reap(
+async fn force_kill_and_reap<L: ProcessTerminationLimits>(
     process: &Arc<Mutex<SidecarProcessGuard>>,
-    limits: SidecarLimits,
+    limits: L,
 ) -> Result<(), SidecarError> {
     lock(process).start_kill();
     let reaped = poll_shared_guard_until(
         process,
-        deadline_after(limits.forced_shutdown_timeout)?,
-        limits.process_poll_interval,
+        deadline_after(limits.forced_shutdown_timeout())?,
+        limits.process_poll_interval(),
     )
     .await?;
     lock(process).start_kill();
