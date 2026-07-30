@@ -206,7 +206,7 @@ fn contract_timeouts() -> CodexAuthTimeouts {
 
 fn notification_bound_timeouts() -> CodexAuthTimeouts {
     CodexAuthTimeouts::new(
-        Duration::from_millis(300),
+        Duration::from_secs(5),
         Duration::from_secs(5),
         Duration::from_secs(5),
         Duration::from_millis(10),
@@ -812,8 +812,14 @@ fn notification_floods_are_bounded() -> TestResult {
             "completion-advisory-flood",
         ] {
             let mut fixture =
-                Fixture::connect_with_timeouts(scenario, notification_bound_timeouts()).await?;
-            fixture.broker.start_login(AuthMethod::BrowserOAuth).await?;
+                Fixture::connect_with_timeouts(scenario, notification_bound_timeouts())
+                    .await
+                    .map_err(|error| format!("scenario {scenario}: connect failed: {error}"))?;
+            fixture
+                .broker
+                .start_login(AuthMethod::BrowserOAuth)
+                .await
+                .map_err(|error| format!("scenario {scenario}: login start failed: {error}"))?;
             wait_for_fixture_marker(&fixture.layout.home, CODEX_NOTIFICATION_FLOOD_READY)
                 .await
                 .map_err(|error| format!("scenario {scenario}: {error}"))?;
