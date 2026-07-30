@@ -178,8 +178,8 @@ fn pre_subscription_run_database_upgrades_without_rewriting_old_migrations()
             (1, 'initial schema', '2026-07-29T12:00:00Z', ?1),
             (2, 'bound approvals', '2026-07-29T12:00:01Z', ?2)",
         params![
-            "82b335d14e7368e3eef97384e97f74cfac926f21e24c78f495ef90134c41c582",
-            "1dfd44f6bb2bc3f0f05f6263c6446eaa9e7974d96b86052d0d9bc74dc43c271d",
+            "e019c38bf699633416f7084691fa3686c3f3170725fe74afed751be50102201a",
+            "157c7feae68f02ab41d598c777981560a123f6d95a26e9a6f13a5adae4e99c28",
         ],
     )?;
     connection.execute(
@@ -234,6 +234,18 @@ fn pre_subscription_run_database_upgrades_without_rewriting_old_migrations()
             row.get::<_, u64>(0)
         })?,
         3
+    );
+    assert_eq!(
+        connection
+            .prepare("SELECT checksum FROM migrations ORDER BY version")?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?,
+        [
+            "e019c38bf699633416f7084691fa3686c3f3170725fe74afed751be50102201a",
+            "157c7feae68f02ab41d598c777981560a123f6d95a26e9a6f13a5adae4e99c28",
+            "bb944b6783aae22313498e4ad388db36c48863182c3abae6e87ba4204bd8a691",
+        ],
+        "legacy CRLF checksums remain accepted without rewriting the ledger"
     );
     assert_eq!(
         connection.query_row(

@@ -86,7 +86,7 @@ pub(crate) fn migrate(connection: &mut Connection) -> Result<(), CarlError> {
         }
         let expected_checksum = migration_checksum(expected);
         match checksum {
-            Some(checksum) if *checksum == expected_checksum => {}
+            Some(checksum) if migration_checksum_matches(expected, checksum) => {}
             Some(checksum) => {
                 return Err(CarlError::Storage {
                     detail: format!(
@@ -125,7 +125,21 @@ pub(crate) fn migrate(connection: &mut Connection) -> Result<(), CarlError> {
 }
 
 fn migration_checksum(migration: &Migration) -> String {
-    format!("{:x}", Sha256::digest(migration.sql.as_bytes()))
+    // Git may materialize checked-out SQL as CRLF on Windows. New ledger
+    // entries use one LF-normalized digest so databases remain portable.
+    checksum_sql(&migration.sql.replace("\r\n", "\n"))
+}
+
+fn migration_checksum_matches(migration: &Migration, applied: &str) -> bool {
+    let normalized = migration.sql.replace("\r\n", "\n");
+    // Accept the equivalent historical CRLF digest without rewriting an
+    // existing ledger created by earlier Windows builds.
+    applied == checksum_sql(&normalized)
+        || applied == checksum_sql(&normalized.replace('\n', "\r\n"))
+}
+
+fn checksum_sql(sql: &str) -> String {
+    format!("{:x}", Sha256::digest(sql.as_bytes()))
 }
 
 fn storage_error(error: rusqlite::Error) -> CarlError {
