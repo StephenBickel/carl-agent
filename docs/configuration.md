@@ -1,9 +1,10 @@
 # Configuration
 
-Carl has no general configuration loader or platform data-directory resolver. The
-authentication CLI accepts exactly three non-secret process variables; profile files,
-model selection, provider endpoints, policy settings, and credential references
-remain unimplemented.
+Carl has no general file-based configuration loader or platform data-directory
+resolver. The command surface accepts exactly three non-secret process
+variables; profile files, model selection, provider endpoints, policy settings, and
+credential references remain unimplemented. Memory settings are a narrow, typed,
+local SQLite projection managed through `carl memory settings`.
 
 ## Implemented authentication configuration
 
@@ -33,6 +34,24 @@ risky metadata.
 These variables are configuration, not credentials, and are not copied into provider
 child environments unless independently included in the closed child-environment
 allowlist.
+
+## Implemented memory settings
+
+Memory is enabled by default. `carl memory settings` reads or atomically updates the
+local owner/Carl partition:
+
+| Setting | Default | Range |
+| --- | ---: | ---: |
+| `enabled` | `true` | boolean |
+| `max_context_items` | `8` | 1–32 |
+| `context_bytes` | `8192` | 256–65536 |
+| `max_memories` | `500` | 1–5000 |
+| `max_storage_bytes` | `1048576` | 64–67108864 |
+| `episode_ttl_days` | `90` | 1–3650 |
+
+These settings contain no credentials and cause no network access. Disabling blocks
+capture and retrieval while leaving export and deletion available. See the
+[memory guide](memory.md).
 
 ## Data-root process lock
 

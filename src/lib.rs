@@ -4,6 +4,7 @@ pub mod cli;
 pub mod delegates;
 pub mod error;
 pub mod events;
+pub mod memory;
 pub mod policy;
 pub mod providers;
 pub mod runtime;

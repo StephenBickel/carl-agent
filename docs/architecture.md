@@ -36,10 +36,15 @@ This layout keeps user interfaces replaceable, provider wire formats contained, 
 - `error`: stable public error codes with sanitized user messages and separate internal detail.
 - `runtime::budget`: hard counters for turn iterations and tool-call limits.
 - `storage`: SQLite WAL, forward migrations verified by checksum, transactional
-  append-only events, durable session and memory lifecycles, and expiring
+  append-only events, durable session lifecycles, and expiring
   actor/session/turn/request-bound approvals that are atomically consumed once.
   Subscription runs, sealed-baseline references, exact-proposal metadata, and
   independent-verification requests/results are durable projections.
+- `memory`: local owner/agent and global/workspace/session partitions; curated profile,
+  preference, fact, goal, and episode records; bounded BM25-style lexical ranking with
+  stable reasons; optional semantic reranking with lexical fallback; proposal
+  approval; conflict replacement; expiration, capacity, versioned export, and secure
+  hard deletion. No external memory provider or embedding dependency is used.
 - `artifacts`: owner-private, read-only, content-addressed baseline and proposal
   objects. Every exact replacement proposal is inert. Every read reopens,
   identity-checks, and re-hashes the named object. Runtime startup reconciles
@@ -70,9 +75,9 @@ This layout keeps user interfaces replaceable, provider wire formats contained, 
   executable and literal-argv attestation, credential-free bounded execution through
   the shared process supervisor, stable pre/post candidate inspection, sanitized
   diagnostics, durable results, and post-commit-only verified-proposal minting.
-- `cli`: composition for the seven `auth` commands, local foreground checks,
-  cross-process data-root locking, and deterministic safe JSON output; the other
-  top-level commands remain placeholders.
+- `cli`: composition for the seven `auth` commands and the local `memory` management
+  tree, local foreground checks, cross-process data-root locking, and deterministic
+  safe JSON output; four top-level commands remain placeholders.
 
 Authentication status performs only provider-owned local handshakes with the pinned
 executables. It does not issue prompts, start sessions, invoke inference, or validate
@@ -81,6 +86,8 @@ state machine, integrated general tool-policy evaluator, tool executor,
 user-reachable subscription run engine, stale-safe promotion path, TUI, general
 configuration loader, diagnostics command, or Telegram transport yet. Independent
 verification exists as an inert library boundary but is not CLI-reachable.
+The memory store and retrieval boundary are implemented and CLI-reachable, but the
+planned turn context assembler does not yet inject memory into live model requests.
 
 ## Authentication composition
 

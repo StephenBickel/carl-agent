@@ -16,6 +16,12 @@ use crate::error::CarlError;
 use crate::events::{
     ApprovalId, EVENT_SCHEMA_VERSION, Event, EventEnvelope, EventId, SessionId, ToolCallId, TurnId,
 };
+use crate::memory::{
+    DEFAULT_PROPOSAL_TTL_DAYS, MemoryContext, MemoryExport, MemoryKind, MemoryPartition,
+    MemoryProposal, MemoryPurgeReport, MemoryQuery, MemoryRecord, MemoryScope, MemorySettings,
+    MemoryWrite, ProposalOrigin, SemanticMemoryRanker, default_expiration, rank_memories,
+    validate_memory_capture_text,
+};
 use crate::policy::{ActorId, Sha256Digest};
 use crate::runtime::subscription::{
     ProviderReported, RunConfigSnapshot, RunFailureCode, RunId, RunState, RunTransition,
@@ -209,40 +215,6 @@ pub struct ConsumedApproval {
     pub id: ApprovalId,
     pub request_digest: Sha256Digest,
     pub consumed_at: DateTime<Utc>,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MemoryState {
-    Active,
-    Forgotten,
-}
-
-impl MemoryState {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Active => "active",
-            Self::Forgotten => "forgotten",
-        }
-    }
-
-    fn parse(value: &str) -> Result<Self, CarlError> {
-        match value {
-            "active" => Ok(Self::Active),
-            "forgotten" => Ok(Self::Forgotten),
-            other => Err(invalid_stored_value("memory state", other)),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MemoryRecord {
-    pub id: Uuid,
-    pub content: String,
-    pub provenance: String,
-    pub state: MemoryState,
-    pub created_at: DateTime<Utc>,
-    pub forgotten_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -515,6 +487,12 @@ impl Store {
         connection
             .pragma_update(None, "foreign_keys", "ON")
             .map_err(storage_error)?;
+        connection
+            .pragma_update(None, "secure_delete", "ON")
+            .map_err(storage_error)?;
+        connection
+            .pragma_update(None, "journal_size_limit", 0_i64)
+            .map_err(storage_error)?;
         let journal_mode = connection
             .query_row("PRAGMA journal_mode = WAL", [], |row| {
                 row.get::<_, String>(0)
@@ -528,8 +506,32 @@ impl Store {
             });
         }
         schema::migrate(&mut connection)?;
+        checkpoint_for_secure_deletion(&connection)?;
 
         Ok(Self { connection })
+    }
+
+    pub(crate) fn open_locked(data_root_lock: &DataRootLock) -> Result<Self, CarlError> {
+        let data_root = data_root_lock.runtime_data_root();
+        if !data_root_lock.guards_data_root(data_root) {
+            return Err(storage_invariant(
+                "runtime data root changed after lock acquisition",
+            ));
+        }
+        let path = data_root.join(RUNTIME_DATABASE_FILENAME);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if !metadata.file_type().is_file() => {
+                return Err(storage_invariant("runtime database is not a regular file"));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => {
+                return Err(storage_invariant(
+                    "runtime database metadata is unavailable",
+                ));
+            }
+        }
+        Self::open(path)
     }
 
     pub fn journal_mode(&self) -> Result<String, CarlError> {
@@ -1931,87 +1933,423 @@ impl Store {
         })
     }
 
-    pub fn remember_explicit(
+    pub fn memory_settings(
         &self,
-        content: impl Into<String>,
-        provenance: impl Into<String>,
-    ) -> Result<MemoryRecord, CarlError> {
-        let memory = MemoryRecord {
-            id: Uuid::new_v4(),
-            content: content.into(),
-            provenance: provenance.into(),
-            state: MemoryState::Active,
-            created_at: Utc::now(),
-            forgotten_at: None,
-        };
+        partition: &MemoryPartition,
+    ) -> Result<MemorySettings, CarlError> {
+        load_memory_settings(&self.connection, partition)
+    }
+
+    pub fn update_memory_settings(
+        &self,
+        partition: &MemoryPartition,
+        settings: &MemorySettings,
+        updated_at: DateTime<Utc>,
+    ) -> Result<(), CarlError> {
+        settings.validate()?;
         self.connection
             .execute(
-                "INSERT INTO memories (
-                    id, content, provenance, kind, state, created_at, forgotten_at
-                 ) VALUES (?1, ?2, ?3, 'explicit', ?4, ?5, NULL)",
+                "INSERT INTO memory_settings (
+                    owner_id, agent_id, enabled, max_context_items, context_bytes,
+                    max_memories, max_storage_bytes, episode_ttl_days, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                 ON CONFLICT (owner_id, agent_id) DO UPDATE SET
+                    enabled = excluded.enabled,
+                    max_context_items = excluded.max_context_items,
+                    context_bytes = excluded.context_bytes,
+                    max_memories = excluded.max_memories,
+                    max_storage_bytes = excluded.max_storage_bytes,
+                    episode_ttl_days = excluded.episode_ttl_days,
+                    updated_at = excluded.updated_at",
                 params![
-                    memory.id.to_string(),
-                    memory.content,
-                    memory.provenance,
-                    memory.state.as_str(),
-                    format_timestamp(memory.created_at),
+                    partition.owner_id(),
+                    partition.agent_id(),
+                    settings.enabled,
+                    settings.max_context_items,
+                    settings.context_bytes,
+                    settings.max_memories,
+                    settings.max_storage_bytes,
+                    settings.episode_ttl_days,
+                    format_timestamp(updated_at),
                 ],
             )
             .map_err(storage_error)?;
-        Ok(memory)
+        Ok(())
     }
 
-    pub fn list_active_memories(&self) -> Result<Vec<MemoryRecord>, CarlError> {
+    pub fn remember_memory(
+        &self,
+        write: MemoryWrite,
+        now: DateTime<Utc>,
+    ) -> Result<MemoryRecord, CarlError> {
+        validate_memory_write(&write)?;
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)
+                .map_err(storage_error)?;
+        let record = remember_memory_in_transaction(&transaction, &write, now)?;
+        transaction.commit().map_err(storage_error)?;
+        checkpoint_for_secure_deletion(&self.connection)?;
+        Ok(record)
+    }
+
+    pub fn retrieve_memories(
+        &self,
+        query: &MemoryQuery,
+        now: DateTime<Utc>,
+        semantic_ranker: Option<&dyn SemanticMemoryRanker>,
+    ) -> Result<MemoryContext, CarlError> {
+        let settings = self.memory_settings(query.partition())?;
+        if !settings.enabled {
+            return Ok(MemoryContext::disabled());
+        }
+        let workspace = query.workspace.as_deref().unwrap_or("");
+        let session = query.session.map(|id| id.to_string()).unwrap_or_default();
         let mut statement = self
             .connection
             .prepare(
-                "SELECT id, content, provenance, state, created_at, forgotten_at
+                "SELECT id, owner_id, agent_id, scope_kind, scope_key, kind, memory_key,
+                        content, provenance, importance, revision, created_at, updated_at,
+                        expires_at
                  FROM memories
-                 WHERE kind = 'explicit' AND state = 'active'
-                 ORDER BY created_at ASC, rowid ASC",
+                 WHERE owner_id = ?1 AND agent_id = ?2
+                   AND (expires_at IS NULL OR expires_at > ?3)
+                   AND (
+                        scope_kind = 'global'
+                        OR (scope_kind = 'workspace' AND scope_key = ?4)
+                        OR (scope_kind = 'session' AND scope_key = ?5)
+                   )
+                 ORDER BY updated_at DESC, id ASC",
             )
             .map_err(storage_error)?;
         let rows = statement
-            .query_map([], raw_memory)
+            .query_map(
+                params![
+                    query.partition.owner_id(),
+                    query.partition.agent_id(),
+                    format_timestamp(now),
+                    workspace,
+                    session,
+                ],
+                raw_memory_record,
+            )
             .map_err(storage_error)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(storage_error)?;
-        rows.into_iter().map(MemoryRecord::try_from).collect()
+        let memories = rows
+            .into_iter()
+            .map(MemoryRecord::try_from)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rank_memories(
+            query,
+            &settings,
+            memories,
+            now,
+            semantic_ranker,
+        ))
     }
 
-    pub fn get_memory(&self, id: Uuid) -> Result<Option<MemoryRecord>, CarlError> {
-        self.connection
-            .query_row(
-                "SELECT id, content, provenance, state, created_at, forgotten_at
+    pub fn export_memories(
+        &self,
+        partition: &MemoryPartition,
+        now: DateTime<Utc>,
+    ) -> Result<MemoryExport, CarlError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT id, owner_id, agent_id, scope_kind, scope_key, kind, memory_key,
+                        content, provenance, importance, revision, created_at, updated_at,
+                        expires_at
                  FROM memories
-                 WHERE id = ?1",
-                [id.to_string()],
-                raw_memory,
+                 WHERE owner_id = ?1 AND agent_id = ?2
+                   AND (expires_at IS NULL OR expires_at > ?3)
+                 ORDER BY created_at ASC, id ASC",
+            )
+            .map_err(storage_error)?;
+        let rows = statement
+            .query_map(
+                params![
+                    partition.owner_id(),
+                    partition.agent_id(),
+                    format_timestamp(now),
+                ],
+                raw_memory_record,
+            )
+            .map_err(storage_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(storage_error)?;
+        Ok(MemoryExport {
+            schema_version: 1,
+            partition: partition.clone(),
+            settings: self.memory_settings(partition)?,
+            memories: rows
+                .into_iter()
+                .map(MemoryRecord::try_from)
+                .collect::<Result<Vec<_>, _>>()?,
+        })
+    }
+
+    pub fn list_memory_proposals(
+        &self,
+        partition: &MemoryPartition,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<MemoryProposal>, CarlError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT id, owner_id, agent_id, scope_kind, scope_key, kind, memory_key,
+                        content, provenance, importance, memory_expires_at, origin,
+                        source_session_id, created_at, expires_at
+                 FROM memory_proposals
+                 WHERE owner_id = ?1 AND agent_id = ?2 AND expires_at > ?3
+                 ORDER BY created_at ASC, id ASC",
+            )
+            .map_err(storage_error)?;
+        statement
+            .query_map(
+                params![
+                    partition.owner_id(),
+                    partition.agent_id(),
+                    format_timestamp(now),
+                ],
+                raw_memory_proposal,
+            )
+            .map_err(storage_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(storage_error)?
+            .into_iter()
+            .map(MemoryProposal::try_from)
+            .collect()
+    }
+
+    pub fn delete_memory(&self, partition: &MemoryPartition, id: Uuid) -> Result<bool, CarlError> {
+        let deleted = self
+            .connection
+            .execute(
+                "DELETE FROM memories
+                 WHERE id = ?1 AND owner_id = ?2 AND agent_id = ?3",
+                params![id.to_string(), partition.owner_id(), partition.agent_id()],
+            )
+            .map_err(storage_error)?;
+        checkpoint_for_secure_deletion(&self.connection)?;
+        Ok(deleted == 1)
+    }
+
+    pub fn clear_memories(&self, partition: &MemoryPartition) -> Result<u64, CarlError> {
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)
+                .map_err(storage_error)?;
+        let memories = transaction
+            .execute(
+                "DELETE FROM memories WHERE owner_id = ?1 AND agent_id = ?2",
+                params![partition.owner_id(), partition.agent_id()],
+            )
+            .map_err(storage_error)?;
+        let proposals = transaction
+            .execute(
+                "DELETE FROM memory_proposals WHERE owner_id = ?1 AND agent_id = ?2",
+                params![partition.owner_id(), partition.agent_id()],
+            )
+            .map_err(storage_error)?;
+        transaction.commit().map_err(storage_error)?;
+        checkpoint_for_secure_deletion(&self.connection)?;
+        let deleted = memories
+            .checked_add(proposals)
+            .ok_or_else(|| storage_invariant("deleted memory count overflowed"))?;
+        usize_to_u64(deleted, "deleted memory and proposal count")
+    }
+
+    pub fn purge_expired_memory(
+        &self,
+        partition: &MemoryPartition,
+        now: DateTime<Utc>,
+    ) -> Result<MemoryPurgeReport, CarlError> {
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)
+                .map_err(storage_error)?;
+        let timestamp = format_timestamp(now);
+        let memories = transaction
+            .execute(
+                "DELETE FROM memories
+                 WHERE owner_id = ?1 AND agent_id = ?2
+                   AND expires_at IS NOT NULL AND expires_at <= ?3",
+                params![partition.owner_id(), partition.agent_id(), timestamp],
+            )
+            .map_err(storage_error)?;
+        let proposals = transaction
+            .execute(
+                "DELETE FROM memory_proposals
+                 WHERE owner_id = ?1 AND agent_id = ?2 AND expires_at <= ?3",
+                params![partition.owner_id(), partition.agent_id(), timestamp],
+            )
+            .map_err(storage_error)?;
+        transaction.commit().map_err(storage_error)?;
+        checkpoint_for_secure_deletion(&self.connection)?;
+        Ok(MemoryPurgeReport {
+            memories_deleted: usize_to_u64(memories, "expired memory count")?,
+            proposals_deleted: usize_to_u64(proposals, "expired proposal count")?,
+        })
+    }
+
+    pub fn propose_memory(
+        &self,
+        write: MemoryWrite,
+        origin: ProposalOrigin,
+        source_session: Option<SessionId>,
+        now: DateTime<Utc>,
+    ) -> Result<MemoryProposal, CarlError> {
+        validate_memory_write(&write)?;
+        if origin == ProposalOrigin::VerifiedEpisode && write.kind != MemoryKind::Episode {
+            return Err(CarlError::Validation {
+                detail: "verified-event proposals must be episodic memories".to_owned(),
+            });
+        }
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)
+                .map_err(storage_error)?;
+        let settings = load_memory_settings(&transaction, &write.partition)?;
+        if !settings.enabled {
+            return Err(CarlError::Policy {
+                detail: "memory capture is disabled".to_owned(),
+            });
+        }
+        let purged = transaction
+            .execute(
+                "DELETE FROM memory_proposals
+                 WHERE owner_id = ?1 AND agent_id = ?2 AND expires_at <= ?3",
+                params![
+                    write.partition.owner_id(),
+                    write.partition.agent_id(),
+                    format_timestamp(now),
+                ],
+            )
+            .map_err(storage_error)?;
+        let pending: u64 = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM memory_proposals
+                 WHERE owner_id = ?1 AND agent_id = ?2 AND expires_at > ?3",
+                params![
+                    write.partition.owner_id(),
+                    write.partition.agent_id(),
+                    format_timestamp(now),
+                ],
+                |row| row.get(0),
+            )
+            .map_err(storage_error)?;
+        if pending >= 50 {
+            return Err(CarlError::BudgetExceeded {
+                resource: crate::error::BudgetResource::MemoryProposals,
+                limit: 50,
+            });
+        }
+        let proposal = MemoryProposal {
+            id: Uuid::new_v4(),
+            write,
+            origin,
+            source_session,
+            created_at: now,
+            expires_at: now + chrono::TimeDelta::days(DEFAULT_PROPOSAL_TTL_DAYS),
+        };
+        transaction
+            .execute(
+                "INSERT INTO memory_proposals (
+                    id, owner_id, agent_id, scope_kind, scope_key, kind, memory_key,
+                    content, provenance, importance, memory_expires_at, origin,
+                    source_session_id, created_at, expires_at
+                 ) VALUES (
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15
+                 )",
+                params![
+                    proposal.id.to_string(),
+                    proposal.write.partition.owner_id(),
+                    proposal.write.partition.agent_id(),
+                    proposal.write.scope.kind().as_str(),
+                    proposal.write.scope.key(),
+                    proposal.write.kind.as_str(),
+                    proposal.write.key,
+                    proposal.write.content,
+                    proposal.write.provenance,
+                    proposal.write.importance,
+                    proposal.write.expires_at.map(format_timestamp),
+                    proposal.origin.as_str(),
+                    proposal.source_session.map(|id| id.to_string()),
+                    format_timestamp(proposal.created_at),
+                    format_timestamp(proposal.expires_at),
+                ],
+            )
+            .map_err(storage_error)?;
+        transaction.commit().map_err(storage_error)?;
+        if purged > 0 {
+            checkpoint_for_secure_deletion(&self.connection)?;
+        }
+        Ok(proposal)
+    }
+
+    pub fn approve_memory_proposal(
+        &self,
+        partition: &MemoryPartition,
+        id: Uuid,
+        now: DateTime<Utc>,
+    ) -> Result<MemoryRecord, CarlError> {
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)
+                .map_err(storage_error)?;
+        let raw = transaction
+            .query_row(
+                "SELECT id, owner_id, agent_id, scope_kind, scope_key, kind, memory_key,
+                        content, provenance, importance, memory_expires_at, origin,
+                        source_session_id, created_at, expires_at
+                 FROM memory_proposals
+                 WHERE id = ?1 AND owner_id = ?2 AND agent_id = ?3",
+                params![id.to_string(), partition.owner_id(), partition.agent_id()],
+                raw_memory_proposal,
             )
             .optional()
             .map_err(storage_error)?
-            .map(MemoryRecord::try_from)
-            .transpose()
-    }
-
-    pub fn forget_memory(&self, id: Uuid) -> Result<MemoryRecord, CarlError> {
-        let updated = self
-            .connection
-            .execute(
-                "UPDATE memories
-                 SET state = 'forgotten', forgotten_at = ?2
-                 WHERE id = ?1 AND kind = 'explicit' AND state = 'active'",
-                params![id.to_string(), format_timestamp(Utc::now())],
-            )
-            .map_err(storage_error)?;
-        if updated != 1 {
-            return Err(CarlError::Storage {
-                detail: format!("memory {id} is missing or already forgotten"),
+            .ok_or_else(|| CarlError::Validation {
+                detail: "memory proposal is unavailable".to_owned(),
+            })?;
+        let proposal = MemoryProposal::try_from(raw)?;
+        if proposal.expires_at <= now {
+            transaction
+                .execute(
+                    "DELETE FROM memory_proposals WHERE id = ?1",
+                    [id.to_string()],
+                )
+                .map_err(storage_error)?;
+            transaction.commit().map_err(storage_error)?;
+            checkpoint_for_secure_deletion(&self.connection)?;
+            return Err(CarlError::Validation {
+                detail: "memory proposal has expired".to_owned(),
             });
         }
-        self.get_memory(id)?.ok_or_else(|| CarlError::Storage {
-            detail: format!("memory {id} disappeared after being forgotten"),
-        })
+        validate_memory_write(&proposal.write)?;
+        let record = remember_memory_in_transaction(&transaction, &proposal.write, now)?;
+        transaction
+            .execute(
+                "DELETE FROM memory_proposals WHERE id = ?1",
+                [id.to_string()],
+            )
+            .map_err(storage_error)?;
+        transaction.commit().map_err(storage_error)?;
+        checkpoint_for_secure_deletion(&self.connection)?;
+        Ok(record)
+    }
+
+    pub fn reject_memory_proposal(
+        &self,
+        partition: &MemoryPartition,
+        id: Uuid,
+    ) -> Result<bool, CarlError> {
+        let deleted = self
+            .connection
+            .execute(
+                "DELETE FROM memory_proposals
+                 WHERE id = ?1 AND owner_id = ?2 AND agent_id = ?3",
+                params![id.to_string(), partition.owner_id(), partition.agent_id()],
+            )
+            .map_err(storage_error)?;
+        checkpoint_for_secure_deletion(&self.connection)?;
+        Ok(deleted == 1)
     }
 }
 
@@ -2051,7 +2389,7 @@ impl RuntimeStore {
                 ));
             }
         }
-        let mut store = Store::open(path)?;
+        let mut store = Store::open_locked(&data_root_lock)?;
         if !data_root_lock.guards_data_root(data_root) {
             return Err(storage_invariant(
                 "runtime data root changed while opening durable state",
@@ -4603,6 +4941,252 @@ fn revision_to_sql(value: u64) -> Result<i64, CarlError> {
     i64::try_from(value).map_err(|_| storage_invariant("subscription run sequence is too large"))
 }
 
+fn load_memory_settings(
+    connection: &Connection,
+    partition: &MemoryPartition,
+) -> Result<MemorySettings, CarlError> {
+    let stored = connection
+        .query_row(
+            "SELECT enabled, max_context_items, context_bytes, max_memories,
+                    max_storage_bytes, episode_ttl_days
+             FROM memory_settings
+             WHERE owner_id = ?1 AND agent_id = ?2",
+            params![partition.owner_id(), partition.agent_id()],
+            |row| {
+                Ok((
+                    row.get::<_, bool>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(storage_error)?;
+    let Some((
+        enabled,
+        max_context_items,
+        context_bytes,
+        max_memories,
+        max_storage_bytes,
+        episode_ttl_days,
+    )) = stored
+    else {
+        return Ok(MemorySettings::default());
+    };
+    let settings = MemorySettings {
+        enabled,
+        max_context_items: u32::try_from(max_context_items)
+            .map_err(|_| storage_invariant("stored memory context-item limit is invalid"))?,
+        context_bytes: u32::try_from(context_bytes)
+            .map_err(|_| storage_invariant("stored memory context-byte limit is invalid"))?,
+        max_memories: u32::try_from(max_memories)
+            .map_err(|_| storage_invariant("stored memory count limit is invalid"))?,
+        max_storage_bytes: u64::try_from(max_storage_bytes)
+            .map_err(|_| storage_invariant("stored memory storage limit is invalid"))?,
+        episode_ttl_days: u32::try_from(episode_ttl_days)
+            .map_err(|_| storage_invariant("stored memory retention is invalid"))?,
+    };
+    settings
+        .validate()
+        .map_err(|_| storage_invariant("stored memory settings are invalid"))?;
+    Ok(settings)
+}
+
+fn validate_memory_write(write: &MemoryWrite) -> Result<(), CarlError> {
+    SecretFilter
+        .inspect(write.content.as_bytes())
+        .map_err(|finding| CarlError::Validation {
+            detail: format!(
+                "memory capture was rejected by secret filter rule {:?}",
+                finding.rule()
+            ),
+        })?;
+    SecretFilter
+        .inspect(write.provenance.as_bytes())
+        .map_err(|finding| CarlError::Validation {
+            detail: format!(
+                "memory provenance was rejected by secret filter rule {:?}",
+                finding.rule()
+            ),
+        })?;
+    validate_memory_capture_text(&write.content)?;
+    validate_memory_capture_text(&write.provenance)
+}
+
+fn remember_memory_in_transaction(
+    connection: &Connection,
+    write: &MemoryWrite,
+    now: DateTime<Utc>,
+) -> Result<MemoryRecord, CarlError> {
+    let settings = load_memory_settings(connection, &write.partition)?;
+    if !settings.enabled {
+        return Err(CarlError::Policy {
+            detail: "memory capture is disabled".to_owned(),
+        });
+    }
+    let expires_at = default_expiration(write.kind, write.expires_at, &settings, now);
+    if expires_at.is_some_and(|expires_at| expires_at <= now) {
+        return Err(CarlError::Validation {
+            detail: "memory expiration must be in the future".to_owned(),
+        });
+    }
+
+    connection
+        .execute(
+            "DELETE FROM memories
+             WHERE owner_id = ?1 AND agent_id = ?2
+               AND expires_at IS NOT NULL AND expires_at <= ?3",
+            params![
+                write.partition.owner_id(),
+                write.partition.agent_id(),
+                format_timestamp(now),
+            ],
+        )
+        .map_err(storage_error)?;
+    let (count, total_bytes): (i64, i64) = connection
+        .query_row(
+            "SELECT COUNT(*), COALESCE(SUM(length(CAST(content AS BLOB))), 0)
+             FROM memories WHERE owner_id = ?1 AND agent_id = ?2",
+            params![write.partition.owner_id(), write.partition.agent_id()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(storage_error)?;
+    let existing = connection
+        .query_row(
+            "SELECT id, length(CAST(content AS BLOB)), revision, created_at
+             FROM memories
+             WHERE owner_id = ?1 AND agent_id = ?2 AND scope_kind = ?3
+               AND scope_key = ?4 AND kind = ?5 AND memory_key = ?6",
+            params![
+                write.partition.owner_id(),
+                write.partition.agent_id(),
+                write.scope.kind().as_str(),
+                write.scope.key(),
+                write.kind.as_str(),
+                write.key,
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(storage_error)?;
+    let content_bytes = i64::try_from(write.content.len())
+        .map_err(|_| storage_invariant("memory content length is invalid"))?;
+    let retained_bytes = existing
+        .as_ref()
+        .map_or(total_bytes, |(_, previous_bytes, _, _)| {
+            total_bytes - previous_bytes
+        });
+    let projected_bytes = retained_bytes
+        .checked_add(content_bytes)
+        .ok_or_else(|| storage_invariant("memory storage accounting overflowed"))?;
+    if u64::try_from(projected_bytes).map_or(true, |bytes| bytes > settings.max_storage_bytes) {
+        return Err(CarlError::BudgetExceeded {
+            resource: crate::error::BudgetResource::MemoryBytes,
+            limit: u32::try_from(settings.max_storage_bytes).unwrap_or(u32::MAX),
+        });
+    }
+
+    let (id, revision, created_at) = match existing {
+        Some((id, _, revision, created_at)) => {
+            let revision = revision
+                .checked_add(1)
+                .ok_or_else(|| storage_invariant("memory revision overflowed"))?;
+            connection
+                .execute(
+                    "UPDATE memories SET
+                        content = ?2, provenance = ?3, importance = ?4,
+                        revision = ?5, updated_at = ?6, expires_at = ?7
+                     WHERE id = ?1",
+                    params![
+                        id,
+                        write.content,
+                        write.provenance,
+                        write.importance,
+                        revision,
+                        format_timestamp(now),
+                        expires_at.map(format_timestamp),
+                    ],
+                )
+                .map_err(storage_error)?;
+            (id, revision, parse_timestamp(&created_at)?)
+        }
+        None => {
+            if u64::try_from(count).map_or(true, |count| count >= u64::from(settings.max_memories))
+            {
+                return Err(CarlError::BudgetExceeded {
+                    resource: crate::error::BudgetResource::MemoryItems,
+                    limit: settings.max_memories,
+                });
+            }
+            let id = Uuid::new_v4().to_string();
+            connection
+                .execute(
+                    "INSERT INTO memories (
+                        id, owner_id, agent_id, scope_kind, scope_key, kind, memory_key,
+                        content, provenance, importance, revision, created_at, updated_at,
+                        expires_at
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11, ?11, ?12)",
+                    params![
+                        id,
+                        write.partition.owner_id(),
+                        write.partition.agent_id(),
+                        write.scope.kind().as_str(),
+                        write.scope.key(),
+                        write.kind.as_str(),
+                        write.key,
+                        write.content,
+                        write.provenance,
+                        write.importance,
+                        format_timestamp(now),
+                        expires_at.map(format_timestamp),
+                    ],
+                )
+                .map_err(storage_error)?;
+            (id, 1_i64, now)
+        }
+    };
+    Ok(MemoryRecord {
+        id: parse_id("memory ID", &id)?,
+        partition: write.partition.clone(),
+        scope: write.scope.clone(),
+        kind: write.kind,
+        key: write.key.clone(),
+        content: write.content.clone(),
+        provenance: write.provenance.clone(),
+        importance: write.importance,
+        revision: u32::try_from(revision)
+            .map_err(|_| storage_invariant("memory revision is invalid"))?,
+        created_at,
+        updated_at: now,
+        expires_at,
+    })
+}
+
+fn checkpoint_for_secure_deletion(connection: &Connection) -> Result<(), CarlError> {
+    let (busy, _, _): (i64, i64, i64) = connection
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .map_err(storage_error)?;
+    if busy != 0 {
+        return Err(CarlError::Storage {
+            detail: "SQLite could not truncate the write-ahead log after a secure deletion"
+                .to_owned(),
+        });
+    }
+    Ok(())
+}
+
 struct RawEvent {
     id: String,
     turn_id: Option<String>,
@@ -4649,27 +5233,43 @@ impl RawEvent {
     }
 }
 
-struct RawMemory {
+struct RawMemoryRecord {
     id: String,
+    owner_id: String,
+    agent_id: String,
+    scope_kind: String,
+    scope_key: String,
+    kind: String,
+    key: String,
     content: String,
     provenance: String,
-    state: String,
+    importance: i64,
+    revision: i64,
     created_at: String,
-    forgotten_at: Option<String>,
+    updated_at: String,
+    expires_at: Option<String>,
 }
 
-impl TryFrom<RawMemory> for MemoryRecord {
+impl TryFrom<RawMemoryRecord> for MemoryRecord {
     type Error = CarlError;
 
-    fn try_from(value: RawMemory) -> Result<Self, Self::Error> {
+    fn try_from(value: RawMemoryRecord) -> Result<Self, Self::Error> {
         Ok(Self {
             id: parse_id("memory ID", &value.id)?,
+            partition: MemoryPartition::new(value.owner_id, value.agent_id)?,
+            scope: MemoryScope::from_stored(&value.scope_kind, value.scope_key)?,
+            kind: MemoryKind::parse(&value.kind)?,
+            key: value.key,
             content: value.content,
             provenance: value.provenance,
-            state: MemoryState::parse(&value.state)?,
+            importance: u8::try_from(value.importance)
+                .map_err(|_| storage_invariant("stored memory importance is invalid"))?,
+            revision: u32::try_from(value.revision)
+                .map_err(|_| storage_invariant("stored memory revision is invalid"))?,
             created_at: parse_timestamp(&value.created_at)?,
-            forgotten_at: value
-                .forgotten_at
+            updated_at: parse_timestamp(&value.updated_at)?,
+            expires_at: value
+                .expires_at
                 .as_deref()
                 .map(parse_timestamp)
                 .transpose()?,
@@ -4677,14 +5277,94 @@ impl TryFrom<RawMemory> for MemoryRecord {
     }
 }
 
-fn raw_memory(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawMemory> {
-    Ok(RawMemory {
+fn raw_memory_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawMemoryRecord> {
+    Ok(RawMemoryRecord {
         id: row.get(0)?,
-        content: row.get(1)?,
-        provenance: row.get(2)?,
-        state: row.get(3)?,
-        created_at: row.get(4)?,
-        forgotten_at: row.get(5)?,
+        owner_id: row.get(1)?,
+        agent_id: row.get(2)?,
+        scope_kind: row.get(3)?,
+        scope_key: row.get(4)?,
+        kind: row.get(5)?,
+        key: row.get(6)?,
+        content: row.get(7)?,
+        provenance: row.get(8)?,
+        importance: row.get(9)?,
+        revision: row.get(10)?,
+        created_at: row.get(11)?,
+        updated_at: row.get(12)?,
+        expires_at: row.get(13)?,
+    })
+}
+
+struct RawMemoryProposal {
+    id: String,
+    owner_id: String,
+    agent_id: String,
+    scope_kind: String,
+    scope_key: String,
+    kind: String,
+    key: String,
+    content: String,
+    provenance: String,
+    importance: i64,
+    memory_expires_at: Option<String>,
+    origin: String,
+    source_session_id: Option<String>,
+    created_at: String,
+    expires_at: String,
+}
+
+impl TryFrom<RawMemoryProposal> for MemoryProposal {
+    type Error = CarlError;
+
+    fn try_from(value: RawMemoryProposal) -> Result<Self, Self::Error> {
+        let importance = u8::try_from(value.importance)
+            .map_err(|_| storage_invariant("stored memory proposal importance is invalid"))?;
+        let write = MemoryWrite::new(
+            MemoryPartition::new(value.owner_id, value.agent_id)?,
+            MemoryScope::from_stored(&value.scope_kind, value.scope_key)?,
+            MemoryKind::parse(&value.kind)?,
+            value.key,
+            value.content,
+            value.provenance,
+        )?
+        .with_importance(importance);
+        let write = match value.memory_expires_at.as_deref() {
+            Some(expires_at) => write.with_expiration(parse_timestamp(expires_at)?),
+            None => write,
+        };
+        Ok(Self {
+            id: parse_id("memory proposal ID", &value.id)?,
+            write,
+            origin: ProposalOrigin::parse(&value.origin)?,
+            source_session: value
+                .source_session_id
+                .as_deref()
+                .map(|id| parse_id("memory proposal session ID", id))
+                .transpose()?,
+            created_at: parse_timestamp(&value.created_at)?,
+            expires_at: parse_timestamp(&value.expires_at)?,
+        })
+    }
+}
+
+fn raw_memory_proposal(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawMemoryProposal> {
+    Ok(RawMemoryProposal {
+        id: row.get(0)?,
+        owner_id: row.get(1)?,
+        agent_id: row.get(2)?,
+        scope_kind: row.get(3)?,
+        scope_key: row.get(4)?,
+        kind: row.get(5)?,
+        key: row.get(6)?,
+        content: row.get(7)?,
+        provenance: row.get(8)?,
+        importance: row.get(9)?,
+        memory_expires_at: row.get(10)?,
+        origin: row.get(11)?,
+        source_session_id: row.get(12)?,
+        created_at: row.get(13)?,
+        expires_at: row.get(14)?,
     })
 }
 

@@ -14,6 +14,15 @@ Carl does not attempt to defend a host account from an attacker who already cont
 - events use stable types and schema versions;
 - SQLite migrations are forward-only and checksum-verified, and the store rejects unknown future schemas;
 - session events are append-only and lifecycle changes are transactional;
+- memory is partitioned by exact owner, agent, workspace, and session scope; only
+  direct owner capture or approved short-lived proposals become retrievable;
+- memory capture applies non-retaining secret and high-confidence prompt-injection
+  filters before persistence, and retrieved content is labeled as untrusted data that
+  cannot override instructions, policy, approvals, or capabilities;
+- memory count, content bytes, per-record bytes, pending proposals, context items, and
+  context bytes are bounded; episodic memory expires by default;
+- memory deletion retains no content-bearing tombstone and requires SQLite secure
+  deletion plus a successful truncating WAL checkpoint before success is reported;
 - the scripted provider supports deterministic tests without a network or live credentials.
 - provider-owned authentication sidecars run with fixed isolated homes, closed child
   environments, canonical executable identity checks, and supervised process trees;
@@ -82,6 +91,12 @@ model-provider access, a general runtime tool-policy system, redaction of all fu
 runtime data, live-workspace promotion, or a complete process sandbox. Verification
 is implemented as a runtime operation, but promotion is not implemented and no
 complete subscription coding task is user-reachable.
+
+The memory store and management CLI are implemented, but the live turn context
+assembler is not. Hard deletion covers Carl's live database and WAL, not independent
+exports, backups, filesystem snapshots, storage-device remanence, or content already
+sent to a model provider. Optional semantic reranking is not configured by default;
+provider failure falls back to local lexical ranking without exposing provider detail.
 
 ## Planned v1 controls
 

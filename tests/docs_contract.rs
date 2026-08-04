@@ -13,11 +13,13 @@ const PUBLIC_DOCS: &[&str] = &[
     "docs/architecture.md",
     "docs/security.md",
     "docs/configuration.md",
+    "docs/memory.md",
     "docs/telegram.md",
     "docs/adr/0001-event-sourced-runtime.md",
     "docs/adr/0002-single-process-v1.md",
     "docs/adr/0003-no-undocumented-oauth.md",
     "docs/adr/0004-subscription-authentication-through-provider-sidecars.md",
+    "docs/adr/0005-local-curated-memory.md",
     "docs/superpowers/specs/2026-07-23-carl-top-tier-harness-design.md",
 ];
 
@@ -41,13 +43,16 @@ const ACTIVE_IDENTITY_SURFACES: &[&str] = &[
     "docs/architecture.md",
     "docs/security.md",
     "docs/configuration.md",
+    "docs/memory.md",
     "docs/telegram.md",
     "docs/adr/0002-single-process-v1.md",
     "docs/adr/0003-no-undocumented-oauth.md",
     "docs/adr/0004-subscription-authentication-through-provider-sidecars.md",
+    "docs/adr/0005-local-curated-memory.md",
     "src/cli.rs",
     "src/error.rs",
     "src/main.rs",
+    "src/memory/mod.rs",
     "src/runtime/budget.rs",
     "src/storage/repository.rs",
     "src/storage/schema.rs",
@@ -55,6 +60,8 @@ const ACTIVE_IDENTITY_SURFACES: &[&str] = &[
     "tests/docs_contract.rs",
     "tests/domain_contract.rs",
     "tests/identity_contract.rs",
+    "tests/memory_cli_contract.rs",
+    "tests/memory_contract.rs",
     "tests/provider_contract.rs",
     "tests/storage_contract.rs",
     "tests/workflow_contract.rs",
@@ -309,6 +316,47 @@ fn architecture_separates_authentication_from_execution() {
             "deliberately not connected to the cli",
             "do not enable a live coding task",
             "one exclusive os lock per canonical data root",
+        ],
+    );
+}
+
+#[test]
+fn memory_docs_state_the_local_curated_boundary_and_controls() {
+    assert_document_contains(
+        "README.md",
+        &[
+            "memory is enabled by default",
+            "without an embedding model, network call, account, or paid service",
+            "capture is explicit rather than ambient",
+            "scope-isolated",
+            "hard-delete live memory content",
+            "live model prompts do not yet consume this memory",
+        ],
+    );
+    assert_document_contains(
+        "docs/memory.md",
+        &[
+            "global, current-workspace, and session-scoped",
+            "secret and high-confidence prompt-injection rejection before persistence",
+            "disabling is not deletion",
+            "stable `semantic_ranker_unavailable` warning",
+            "without keeping content-bearing tombstones",
+            "exports, backups, filesystem snapshots",
+        ],
+    );
+    assert_document_contains(
+        "docs/adr/0005-local-curated-memory.md",
+        &[
+            "working context",
+            "session history",
+            "curated semantic memory",
+            "curated episodic memory",
+            "proposed content is never retrieved before owner approval",
+            "at most eight records and 8 kib of rendered memory-source data",
+            "exact owner/agent partition",
+            "episodes expire after 90 days by default",
+            "migration 0006",
+            "optional semantic failure",
         ],
     );
 }
