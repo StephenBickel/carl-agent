@@ -13,7 +13,7 @@ The intended v1 experience is one continuous session across a local terminal UI 
 ## Status: pre-alpha foundation
 
 > [!WARNING]
-> Carl is currently a **pre-alpha foundation** and is not yet a usable end-user agent. The authentication command surface, an inert library-level Codex exec adapter, sealed staging, exact proposal inspection, and independent bounded verification are implemented, but the HTTP/OpenAI adapters, runtime tool loop, user-reachable subscription execution, stale-safe promotion, built-in tools, TUI interaction, and Telegram gateway are not implemented. Only the four placeholder commands `serve`, `pair`, `doctor`, and `sessions` return not-implemented errors; Clap's built-in `help` command displays help.
+> Carl is currently a **pre-alpha foundation** and is not yet a usable end-user agent. The authentication and local memory command surfaces, an inert library-level Codex exec adapter, sealed staging, exact proposal inspection, and independent bounded verification are implemented, but the HTTP/OpenAI adapters, runtime tool loop, user-reachable subscription execution, stale-safe promotion, built-in workspace tools, TUI interaction, and Telegram gateway are not implemented. Only the four placeholder commands `serve`, `pair`, `doctor`, and `sessions` return not-implemented errors; Clap's built-in `help` command displays help.
 
 Authentication and adapter code do not enable a live coding task. The auth and Codex
 exec boundaries are tested with offline provider fakes; this repository does not
@@ -28,7 +28,11 @@ Implemented and covered by deterministic tests:
 - versioned, provider-neutral events plus stable IDs and typed, sanitized errors;
 - hard turn-budget accounting primitives;
 - SQLite WAL storage with checksum-verified forward migrations;
-- append-only session events and durable session, memory, and approval lifecycles;
+- append-only session events and durable session and approval lifecycles;
+- curated local profile, preference, fact, goal, and expiring episode memory with
+  scoped isolation, bounded explainable lexical retrieval, proposal approval,
+  secret/injection rejection, versioned export, hard deletion, and no external
+  dependency;
 - a provider trait and deterministic scripted provider for offline contract tests;
 - supervised, isolated provider sidecars for provider-owned authentication;
 - a deterministic JSON authentication CLI for status, login, and logout;
@@ -50,7 +54,7 @@ Implemented and covered by deterministic tests:
   sanitized durable results; and post-commit-only verified-proposal capabilities;
 - a Clap command/help shell for the remaining planned top-level interface.
 
-The approved v1 design adds a shared runtime loop, OpenAI and OpenAI-compatible HTTP adapters, bounded workspace tools, a TUI, explicit memory, and an owner-only Telegram gateway. These are roadmap items, not current capabilities.
+The approved v1 design adds a shared runtime loop, OpenAI and OpenAI-compatible HTTP adapters, bounded workspace tools, a TUI, memory-integrated model context, and an owner-only Telegram gateway. These are roadmap items, not current capabilities.
 
 No subscription coding task is CLI-reachable. The implemented safety modules are
 library boundaries only; stale-safe promotion and run-engine orchestration remain
@@ -73,6 +77,30 @@ carl --help
 ```
 
 Do not rely on `serve`, `pair`, `doctor`, or `sessions` yet; they are placeholders.
+
+## Local memory
+
+Memory is enabled by default, stored only in Carl's SQLite database, and usable without
+an embedding model, network call, account, or paid service. Capture is explicit rather
+than ambient: the CLI records direct owner requests, while the library stores agent
+suggestions only as short-lived proposals that cannot be retrieved before approval.
+
+```sh
+carl memory status
+carl memory remember --kind preference --key response-style --content=concise-verified-answers
+carl memory search verification
+carl memory proposals
+carl memory approve 00000000-0000-4000-8000-000000000000
+carl memory export
+carl memory settings --disable
+```
+
+Retrieval is locally ranked, scope-isolated, byte/item bounded, and explains why each
+record was selected. `forget` and confirmed `clear` hard-delete live memory content;
+exports, backups, snapshots, and already-issued provider requests remain separate
+copies. The model turn loop is not implemented, so live model prompts do not yet
+consume this memory. See the [memory guide](docs/memory.md) and
+[memory ADR](docs/adr/0005-local-curated-memory.md).
 
 ## Subscription authentication
 
@@ -131,7 +159,8 @@ subscription run engine, promotion pipeline, native runtime, production adapters
 and frontends remain planned. See the [architecture guide](docs/architecture.md), the
 [approved Carl design](docs/superpowers/specs/2026-07-23-carl-top-tier-harness-design.md),
 and the decisions on [event-sourced execution](docs/adr/0001-event-sourced-runtime.md),
-a [single-process v1](docs/adr/0002-single-process-v1.md), and
+a [single-process v1](docs/adr/0002-single-process-v1.md),
+[local curated memory](docs/adr/0005-local-curated-memory.md), and
 [provider-owned subscription authentication](docs/adr/0004-subscription-authentication-through-provider-sidecars.md).
 
 ## Security model
@@ -184,6 +213,7 @@ Public behavior should be developed test-first with deterministic fixtures; norm
 - [x] Provider interface and deterministic scripted provider
 - [x] Provider-owned subscription authentication CLI and sidecar supervision
 - [x] External-agent policy, exact approval, secret-filter, and staging foundations
+- [x] Local curated-memory storage, retrieval, migration, settings, and CLI controls
 - [ ] Production HTTP/OpenAI-compatible adapters
 - [ ] Subscription-backed delegate execution
 - [ ] Runtime tool/approval loop, policy engine, and bounded built-in tools
