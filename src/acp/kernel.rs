@@ -817,21 +817,16 @@ impl KernelActor {
             CodexEvent::ItemCompleted { item, .. } => {
                 let item_id = item.item_id().to_owned();
                 let completion = match &item {
-                    CodexItem::Command { status, .. } | CodexItem::FileChange { status, .. } => {
-                        let kind = match item {
-                            CodexItem::Command { .. } => CodexApprovalKind::Command,
-                            CodexItem::FileChange { .. } => CodexApprovalKind::FileChange,
-                            CodexItem::ContextCompaction { .. } | CodexItem::Other { .. } => {
-                                unreachable!()
-                            }
-                        };
-                        let tool_status = match status.as_str() {
-                            "completed" => ToolStatus::Completed,
-                            "failed" | "declined" => ToolStatus::Failed,
-                            _ => return Err(provider_error()),
-                        };
-                        Some((kind, status.clone(), tool_status))
-                    }
+                    CodexItem::Command { status, .. } => Some((
+                        CodexApprovalKind::Command,
+                        status.clone(),
+                        terminal_tool_status(status)?,
+                    )),
+                    CodexItem::FileChange { status, .. } => Some((
+                        CodexApprovalKind::FileChange,
+                        status.clone(),
+                        terminal_tool_status(status)?,
+                    )),
                     CodexItem::ContextCompaction { .. } | CodexItem::Other { .. } => None,
                 };
                 let Some((kind, provider_status, status)) = completion else {
@@ -1840,6 +1835,14 @@ const fn invalid_input() -> KernelError {
 
 const fn provider_error() -> KernelError {
     KernelError::from_code(KernelErrorCode::ProviderFailed)
+}
+
+fn terminal_tool_status(status: &str) -> Result<ToolStatus, KernelError> {
+    match status {
+        "completed" => Ok(ToolStatus::Completed),
+        "failed" | "declined" => Ok(ToolStatus::Failed),
+        _ => Err(provider_error()),
+    }
 }
 
 const fn unknown_session() -> KernelError {
