@@ -13,6 +13,7 @@ const PUBLIC_DOCS: &[&str] = &[
     "docs/architecture.md",
     "docs/security.md",
     "docs/configuration.md",
+    "docs/buzz.md",
     "docs/telegram.md",
     "docs/adr/0001-event-sourced-runtime.md",
     "docs/adr/0002-single-process-v1.md",
@@ -29,6 +30,15 @@ const AUTH_COMMANDS: &[&str] = &[
     "carl auth login grok",
     "carl auth login grok --device",
     "carl auth logout grok",
+];
+
+const BUZZ_SETTINGS: &[&str] = &[
+    "export BUZZ_ACP_AGENT_COMMAND=carl",
+    "export BUZZ_ACP_AGENT_ARGS=acp",
+    "export BUZZ_ACP_MCP_COMMAND=carl-buzz-mcp",
+    "export BUZZ_ACP_AGENTS=1",
+    "export BUZZ_ACP_RESPOND_TO=owner-only",
+    "export BUZZ_ACP_PERMISSION_MODE=default",
 ];
 
 const ACTIVE_IDENTITY_SURFACES: &[&str] = &[
@@ -178,6 +188,44 @@ fn readme_includes_all_seven_auth_invocations() {
     }
 }
 
+#[test]
+fn readme_and_buzz_guide_publish_the_safe_operational_settings() {
+    for relative_path in ["README.md", "docs/buzz.md"] {
+        let document = read_document(relative_path);
+        for setting in BUZZ_SETTINGS {
+            assert!(
+                document.lines().any(|line| line == *setting),
+                "{relative_path} is missing exact Buzz setting: `{setting}`"
+            );
+        }
+    }
+
+    assert_document_contains(
+        "docs/buzz.md",
+        &[
+            "`carl auth login openai`",
+            "there is no api-key fallback",
+            "`/approve <code>`",
+            "`/deny <code>`",
+            "local bypass",
+            "remote bypass",
+            "single-process v1",
+            "`44456e200e3ca6a5d2882b58b447b80474041347`",
+            "credential isolation",
+            "steering",
+            "cancellation",
+            "`carl_buzz_executable`",
+            "node scripts/live-codex-acp-smoke.mjs",
+        ],
+    );
+    assert!(
+        repository_root()
+            .join("scripts/live-codex-acp-smoke.mjs")
+            .is_file(),
+        "the documented opt-in live smoke script must exist"
+    );
+}
+
 fn validate_fenced_carl_commands(markdown: &str) -> Result<(), String> {
     let mut command = Cli::command();
     let clap_commands: BTreeSet<_> = command
@@ -233,28 +281,30 @@ fn readme_states_the_current_status_and_security_boundaries() {
         "README.md",
         &[
             "pre-alpha",
-            "not yet a usable end-user agent",
+            "usable acp coding path",
             "api-key access and consumer subscription access are separate products and billing paths",
             "openai platform api key",
             "xai api key",
             "chatgpt, supergrok, or eligible x subscription",
-            "codex cli `0.136.0`",
+            "codex cli `0.146.0`",
             "grok build `0.2.111`",
             "carl never installs or updates provider executables",
             "`carl_data_dir`",
             "`carl_codex_executable`",
             "`carl_grok_executable`",
+            "`carl_buzz_executable`",
             "`$carl_data_dir/providers/codex`",
             "`$carl_data_dir/providers/grok`",
-            "codex owns its credentials in the operating-system keyring",
+            "codex owns `$codex_home/auth.json`",
+            "explicit `file` mode",
+            "never opens or reads the file",
             "grok owns `$grok_home/auth.json`",
             "foreground-only mutations",
-            "authentication and adapter code do not enable a live coding task",
-            "neither proves current subscription/model entitlement nor enables model execution or delegates",
+            "there is no api-key fallback",
             "undocumented oauth",
             "not a complete security sandbox",
-            "http/openai adapters",
-            "runtime tool loop",
+            "native http/openai adapters",
+            "native tool loop",
             "tui interaction",
             "telegram gateway",
             "only the four placeholder commands",
@@ -274,23 +324,24 @@ fn configuration_documents_the_implemented_auth_boundary() {
     assert_document_contains(
         "docs/configuration.md",
         &[
-            "accepts exactly three non-secret process variables",
+            "accepts exactly four non-secret carl process variables",
             "`carl_data_dir`",
             "required absolute path to a pre-existing, trusted carl data directory",
             "`carl_codex_executable`",
             "`carl_grok_executable`",
+            "`carl_buzz_executable`",
             "`$carl_data_dir/providers/codex`",
             "`$carl_data_dir/providers/grok`",
             "there is no arbitrary provider-home override",
-            "codex cli `0.136.0`",
+            "codex cli `0.146.0`",
             "grok build `0.2.111`",
             "version matching is compatibility evidence, not publisher attestation",
             "one operating-system-backed exclusive lock",
             "a crashed owner does not leave a stale logical lock",
             "it is not a cross-process lock",
             "api keys have their own provider access and billing",
-            "authentication does not enable model execution or subscription-backed delegates",
-            "general configuration is accepted today",
+            "`carl acp` is the implemented subscription-backed execution path",
+            "no general profile configuration is accepted today",
         ],
     );
 }
@@ -305,9 +356,10 @@ fn architecture_separates_authentication_from_execution() {
             "composition for the seven `auth` commands",
             "authentication status performs only provider-owned local handshakes",
             "bounded model and reasoning settings",
-            "codex exec --json",
-            "deliberately not connected to the cli",
-            "do not enable a live coding task",
+            "codex app-server",
+            "`carl acp`",
+            "subscription-backed coding path",
+            "buzz acp frontend",
             "one exclusive os lock per canonical data root",
         ],
     );
@@ -319,9 +371,10 @@ fn security_documents_credential_foreground_and_process_boundaries() {
         "docs/security.md",
         &[
             "carl never receives, reads, copies, logs, persists, or forwards subscription bearer or refresh tokens",
-            "codex owns chatgpt subscription tokens in the operating-system keyring",
-            "`codex_home` isolates filesystem-backed state but does not prove keyring isolation",
-            "logging out through carl can therefore affect another codex cli or ide session",
+            "codex owns chatgpt subscription tokens in `$codex_home/auth.json`",
+            "explicit `file` mode instead of `auto`",
+            "regular, non-linked, owner-only file",
+            "logging out through carl removes only carl's isolated codex session",
             "grok owns `$grok_home/auth.json`",
             "it never opens or reads the file",
             "does not suppress trusted root-owned `/etc/grok` policy",
@@ -333,7 +386,7 @@ fn security_documents_credential_foreground_and_process_boundaries() {
             "task 4's provider-home mutex remains in-process only",
             "process groups on unix and job objects on windows",
             "authentication state does not prove current subscription or model entitlement",
-            "authentication does not enable model execution or subscription-backed delegates",
+            "buzz credentials are never forwarded to codex",
         ],
     );
 }
@@ -349,7 +402,7 @@ fn changelog_records_auth_without_claiming_delegate_execution() {
             "seven `carl auth` status/login/logout commands",
             "deterministic safe json status",
             "inert, library-level subscription-backed codex exec adapter",
-            "subscription-backed coding is not exposed through the cli",
+            "subscription-backed codex app-server execution through `carl acp`",
         ],
     );
 }
@@ -365,7 +418,7 @@ fn documents_the_inert_external_agent_safety_foundation() {
             "single-use",
             "capability-relative",
             "secret-filtered",
-            "no subscription coding task is cli-reachable",
+            "the acp path is cli-reachable",
             "stale-safe promotion and run-engine orchestration remain unavailable",
             "independent bounded verification",
         ],
@@ -403,7 +456,7 @@ fn documents_the_inert_external_agent_safety_foundation() {
             "non-retaining secret detection",
             "capability-built sanitized staging",
             "content-addressed baseline and proposal artifacts",
-            "no subscription coding task is cli-reachable",
+            "the acp path is cli-reachable",
         ],
     );
 }

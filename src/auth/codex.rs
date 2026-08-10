@@ -19,7 +19,9 @@ use crate::sidecar::{
 };
 
 const CODEX_VERSION: &str = "=0.146.0";
-const KEYRING_CONFIG: &[u8] = b"cli_auth_credentials_store = \"keyring\"\n";
+const FILE_CREDENTIAL_CONFIG: &[u8] = b"cli_auth_credentials_store = \"file\"\n";
+const CREDENTIAL_FILENAME: &str = "auth.json";
+const MAX_CREDENTIAL_FILE_BYTES: u64 = 1024 * 1024;
 const MAX_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_LOGIN_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const MAX_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(30);
@@ -30,10 +32,9 @@ const CODEX_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const CODEX_OAUTH_SCOPE: &str =
     "openid profile email offline_access api.connectors.read api.connectors.invoke";
 
-/// Logging out can affect another Codex CLI or IDE session for the same OS user because
-/// OpenAI does not document OS-keyring records as isolated by `CODEX_HOME`.
+/// Logging out removes only the Codex session stored in Carl's isolated provider home.
 pub const CODEX_LOGOUT_WARNING: &str =
-    "Logging out can affect another Codex CLI or IDE session for this OS user.";
+    "Logging out removes Carl's isolated Codex subscription session.";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CodexAuthTimeouts {
@@ -194,8 +195,8 @@ enum Notification {
 ///
 /// The caller must explicitly trust the executable and prepare a Codex
 /// [`ProviderHome`] capability. This adapter never reads Codex credentials. The
-/// provider home isolates filesystem configuration, but does not imply OS-keyring
-/// isolation.
+/// provider owns an owner-only credential file inside that isolated home; Carl
+/// validates only its metadata.
 pub struct CodexAuth {
     sidecar: JsonlSidecar,
     home: ProviderHome,
@@ -228,8 +229,10 @@ impl CodexAuth {
     ) -> Result<Self, AuthError> {
         home.require_profile(crate::sidecar::ProviderEnvironmentProfile::Codex)
             .map_err(map_sidecar_error)?;
+        home.inspect_owner_only_file(CREDENTIAL_FILENAME, MAX_CREDENTIAL_FILE_BYTES)
+            .map_err(map_sidecar_error)?;
         let timeouts = timeouts.validate()?;
-        home.write_static_file("config.toml", KEYRING_CONFIG)
+        home.write_static_file("config.toml", FILE_CREDENTIAL_CONFIG)
             .map_err(map_sidecar_error)?;
 
         let specification = SidecarCommand {
@@ -238,7 +241,7 @@ impl CodexAuth {
                 OsString::from("app-server"),
                 OsString::from("--strict-config"),
                 OsString::from("-c"),
-                OsString::from("cli_auth_credentials_store=\"keyring\""),
+                OsString::from("cli_auth_credentials_store=\"file\""),
                 OsString::from("--listen"),
                 OsString::from("stdio://"),
             ],

@@ -1,6 +1,6 @@
 # Carl Buzz ACP Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** Ship a durable `carl acp` coding harness that Buzz can drive over ACP, using the owner's Codex subscription while Carl controls sessions, model and effort selection, permissions, exact remote approvals, cancellation, steering, Buzz delivery, and credential isolation.
 
@@ -20,7 +20,7 @@
 - Remote bypass never activates from an out-of-band config write alone; it requires `/confirm-bypass <code>` in a later admitted slash-command block.
 - Approval display codes are bounded lookup keys. The durable request digest and actor/session/turn/tool binding are authoritative, single-use, and expire within fifteen minutes.
 - `BUZZ_PRIVATE_KEY`, `BUZZ_RELAY_URL`, and `BUZZ_AUTH_TAG` never enter model input, provider request parameters, journal event JSON, diagnostics, or general child environments.
-- Codex subscription credentials remain owned by the official CLI and OS keyring. Carl never reads or accepts OAuth bearer or refresh tokens and never falls back to `OPENAI_API_KEY`.
+- Codex subscription credentials remain owned by the official CLI in Carl's isolated provider home. Carl never reads or accepts OAuth bearer or refresh tokens and never falls back to `OPENAI_API_KEY`.
 - All normal tests are deterministic, offline, and credential-free. Live Codex and live Buzz tests are explicit opt-in commands and never run in public CI.
 - Every Rust behavior change follows red-green-refactor. Before each commit run the focused tests plus `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test --locked`.
 
@@ -40,7 +40,7 @@
 - Consumes: existing `JsonlSidecar`, `SidecarCommand`, `ProviderHome`, `TrustedExecutable`, and `SidecarLimits`.
 - Produces: `JsonlSidecar::next_server_request()`, `JsonlSidecar::try_next_server_request()`, and `JsonlSidecar::respond_to_server_request(JsonRpcResponse)`; every Codex adapter accepts exactly `codex-cli 0.146.0`.
 
-- [ ] **Step 1: Write failing duplex JSON-RPC contracts**
+- [x] **Step 1: Write failing duplex JSON-RPC contracts**
 
 Add a fake sidecar transcript that emits an id-bearing method after initialization and assert it is queued separately from notifications:
 
@@ -60,13 +60,13 @@ assert_eq!(child_line(), json!({
 
 Also assert duplicate server IDs, response objects containing `method`, response objects missing `result`/`error`, a full server-request queue, and an unknown ordinary response ID fail closed and reap the child.
 
-- [ ] **Step 2: Run the focused tests and verify RED**
+- [x] **Step 2: Run the focused tests and verify RED**
 
 Run: `cargo test --locked --test sidecar_contract server_request -- --nocapture`
 
 Expected: FAIL because `JsonlSidecar` has no server-request channel or response API.
 
-- [ ] **Step 3: Implement the minimal duplex supervisor path**
+- [x] **Step 3: Implement the minimal duplex supervisor path**
 
 Add a bounded server-request channel to `JsonlSidecar`. Classify incoming objects in this order: id+method is a server request, id without method is a response, method without id is a notification, everything else is a protocol violation. Validate responses with this closed predicate:
 
@@ -82,11 +82,11 @@ fn is_server_response(value: &Value) -> bool {
 
 Use the existing single writer and process supervisor. No second process or raw stdin handle may escape `JsonlSidecar`.
 
-- [ ] **Step 4: Update the exact Codex version fixtures**
+- [x] **Step 4: Update the exact Codex version fixtures**
 
-Change the production pin and fake version transcripts from `0.136.0` to `0.146.0`. Retain exact version matching, keyring-only auth, strict config, executable revalidation, and all current negative compatibility tests.
+Change the production pin and fake version transcripts from `0.136.0` to `0.146.0`. Retain exact version matching, explicit provider-owned file auth, strict config, executable revalidation, and all current negative compatibility tests.
 
-- [ ] **Step 5: Verify and commit**
+- [x] **Step 5: Verify and commit**
 
 Run the Task 1 focused contracts and the global Rust checks.
 
@@ -107,7 +107,7 @@ Commit: `git commit -m "feat: support duplex provider sidecars"`
 - Consumes: `ModelId` and `ReasoningEffort` from `carl::delegates`.
 - Produces: `JsonRpcId`, `IncomingFrame`, `OutgoingFrame`, `read_frame`, `write_frame`, `PermissionMode`, `ModeActivation`, `SessionConfiguration`, and `config_options`.
 
-- [ ] **Step 1: Write failing framing and message-shape tests**
+- [x] **Step 1: Write failing framing and message-shape tests**
 
 Exercise the wished-for API with partial reads and exact bytes:
 
@@ -124,7 +124,7 @@ assert_eq!(output.last(), Some(&b'\n'));
 
 Test empty lines, EOF without a final newline, negative and floating IDs, malformed JSON, duplicate JSON keys, a frame at the exact byte limit, one byte above the limit, NUL-containing methods, missing `jsonrpc: "2.0"`, and stdout serialization of results, errors, and notifications.
 
-- [ ] **Step 2: Write failing permission/config option tests**
+- [x] **Step 2: Write failing permission/config option tests**
 
 Assert exact parsing and wire values:
 
@@ -146,13 +146,13 @@ assert_eq!(config_options(&catalog)[2]["configId"], "mode");
 
 Reject empty/oversized model IDs, unsupported efforts for the selected model, unknown modes, and a direct `SessionConfiguration::set_mode(BypassPermissions, RemoteUnconfirmed)`.
 
-- [ ] **Step 3: Run focused tests and verify RED**
+- [x] **Step 3: Run focused tests and verify RED**
 
 Run: `cargo test --locked --test acp_protocol_contract -- --nocapture`
 
 Expected: FAIL because `carl::acp` does not exist.
 
-- [ ] **Step 4: Implement the protocol and configuration types**
+- [x] **Step 4: Implement the protocol and configuration types**
 
 Use a bounded `read_until(b'\n')` loop that clears its buffer after every frame and never allocates above `maximum + 1`. `OutgoingFrame` owns a `serde_json::Value` already validated as one JSON-RPC object. `SessionConfiguration` uses provider-reported model catalogs and exposes this mutation result:
 
@@ -172,7 +172,7 @@ pub enum ConfigChange {
 
 Keep all public errors typed with stable codes and static user messages; internal parse detail is diagnostic-only and bounded.
 
-- [ ] **Step 5: Verify and commit**
+- [x] **Step 5: Verify and commit**
 
 Run the Task 2 contract and global Rust checks.
 
@@ -198,7 +198,7 @@ Commit: `git commit -m "feat: define the ACP wire contract"`
 - Consumes: existing `SessionId`, `TurnId`, `ToolCallId`, `ApprovalId`, `BoundApprovalBinding`, and `RuntimeStore`.
 - Produces: `FrontendSessionRecord`, `RemoteCodeKind`, `RemoteCodeRecord`, `DeliveryRecord`, and transactional `Store` methods for bind/configure/create-code/consume-code/record-delivery.
 
-- [ ] **Step 1: Write the migration and replay tests first**
+- [x] **Step 1: Write the migration and replay tests first**
 
 Create tests that open a migration-five fixture, upgrade it, bind one external ACP session, close, reopen, and recover the same record:
 
@@ -220,17 +220,17 @@ assert_eq!(store.get_frontend_session("buzz-session-1")?, Some(bound));
 
 Assert uniqueness for external session IDs and stable `(frontend, channel_id, cwd)` bindings, strict absolute canonical cwd storage, channel rebinding rejection, and migration-seven future-schema rejection.
 
-- [ ] **Step 2: Write exact remote-code and delivery tests**
+- [x] **Step 2: Write exact remote-code and delivery tests**
 
 Assert a random display code is stored only as a SHA-256 digest; consume requires the exact external session, actor, kind, unexpired approval, and provider request digest. Replay and wrong-session attempts fail without changing the provider request record. Delivery transitions accept only `pending -> delivered|failed|uncertain`; uncertain delivery cannot be automatically retried.
 
-- [ ] **Step 3: Run focused tests and verify RED**
+- [x] **Step 3: Run focused tests and verify RED**
 
 Run: `cargo test --locked --test acp_storage_contract -- --nocapture`
 
 Expected: FAIL because migration six and the frontend records do not exist.
 
-- [ ] **Step 4: Implement migration six and additive event schema three**
+- [x] **Step 4: Implement migration six and additive event schema three**
 
 Create these tables with bounded CHECK constraints and foreign keys:
 
@@ -264,7 +264,7 @@ CREATE TABLE remote_codes (
 
 Add `frontend_deliveries` with a unique action digest and closed status vocabulary. Extend the existing policy `Frontend` enum with `Acp` and `Buzz` and retain the stable snake-case wire representation for all five values. Add backward decoding for event schemas one and two; schema-three variants record frontend binding, permission change, and delivery status without storing raw credentials or approval codes.
 
-- [ ] **Step 5: Verify and commit**
+- [x] **Step 5: Verify and commit**
 
 Run migration/reopen contracts, Task 3 contracts, and global Rust checks.
 
@@ -287,7 +287,7 @@ Commit: `git commit -m "feat: persist ACP frontend state"`
 - Consumes: Buzz `session/new.mcpServers` values and prompt text blocks; existing trusted executable and bounded process primitives.
 - Produces: `BuzzContext::parse`, `BuzzPublisherConfig::from_mcp_servers`, `BuzzPublisher::send_message`, `BuzzPublisher::send_diff`, and `buzz_mcp::run_stdio`.
 
-- [ ] **Step 1: Write failing context parser contracts**
+- [x] **Step 1: Write failing context parser contracts**
 
 Use a literal pinned Buzz event block:
 
@@ -306,7 +306,7 @@ assert_eq!(context.reply_to(), "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 
 Reject duplicate conflicting fields, invalid UUID/hex, more than twelve blocks, blocks over 256 KiB aggregate, missing stable channel, and quoted/history-only lookalikes. Verify the first slash block is parsed separately and never inferred from later context.
 
-- [ ] **Step 2: Write failing credential-isolation and publisher tests**
+- [x] **Step 2: Write failing credential-isolation and publisher tests**
 
 Construct the exact `carl-buzz-mcp` descriptor and assert only `BUZZ_RELAY_URL`, `BUZZ_PRIVATE_KEY`, optional `BUZZ_AUTH_TAG`, and optional `BUZZ_ACP_DISPLAY_NAME` are accepted. A general shell command, unknown credential-bearing server, arguments, duplicate env keys, or extra secret key must be rejected before provider launch.
 
@@ -318,17 +318,17 @@ messages send --channel 123e4567-e89b-12d3-a456-426614174000 --content - --reply
 
 Verify the fake child receives the four allowlisted Buzz variables and no Carl, Codex, OpenAI, shell, or parent environment variables. Secret values must be absent from `Debug`, errors, journal events, and captured diagnostics.
 
-- [ ] **Step 3: Run focused tests and verify RED**
+- [x] **Step 3: Run focused tests and verify RED**
 
 Run: `cargo test --locked --test buzz_adapter_contract --test buzz_mcp_contract -- --nocapture`
 
 Expected: FAIL because the Buzz adapter and MCP alias do not exist.
 
-- [ ] **Step 4: Implement the restricted publisher and MCP server**
+- [x] **Step 4: Implement the restricted publisher and MCP server**
 
 Expose only crate-private bounded-process construction needed to run a trusted executable with exact argv, stdin, closed env, 60-second timeout, 256 KiB aggregate output, and process-tree cleanup. The MCP alias supports only JSON-RPC `initialize`, `tools/list`, and `tools/call` for `send_message` and `send_diff`; schemas use `additionalProperties: false`. The `send_message` content enters the Buzz CLI over stdin, never shell interpolation or argv.
 
-- [ ] **Step 5: Verify and commit**
+- [x] **Step 5: Verify and commit**
 
 Run Task 4 contracts, secret-filter contracts, sidecar contracts, and global Rust checks.
 
@@ -348,7 +348,7 @@ Commit: `git commit -m "feat: add the restricted Buzz publisher"`
 - Consumes: duplex `JsonlSidecar`, `ProviderHome`, `TrustedExecutable`, `SessionConfiguration`, and Codex app-server `0.146.0` JSON schema.
 - Produces: `CodexAppServer`, `CodexModel`, `CodexThreadId`, `CodexTurnId`, `StartThread`, `StartTurn`, `CodexEvent`, `CodexApprovalRequest`, and methods `connect`, `models`, `start_thread`, `start_turn`, `steer`, `interrupt`, `next_event`, and `resolve_approval`.
 
-- [ ] **Step 1: Write the handshake/model/thread tests**
+- [x] **Step 1: Write the handshake/model/thread tests**
 
 Drive a fake app-server and assert exact method order and bounded responses:
 
@@ -365,19 +365,19 @@ assert_eq!(thread.as_str(), "thr_123");
 
 Assert `initialize` then `initialized`, paginated `model/list`, provider-owned supported effort options, persistent non-ephemeral `thread/start`, strict cwd echo validation, malformed catalog rejection, unknown required fields rejection, and sanitized authentication failure.
 
-- [ ] **Step 2: Write event, approval, steering, and cancellation tests**
+- [x] **Step 2: Write event, approval, steering, and cancellation tests**
 
 Normalize `thread/started`, `turn/started`, `item/started`, `item/agentMessage/delta`, `item/completed`, `turn/diff/updated`, `turn/completed`, and `error`. Convert command and file approval server requests into `CodexApprovalRequest` with the exact provider request ID, thread/turn/item IDs, normalized command/reason/scope, and SHA-256 digest. Verify `turn/steer` carries `expectedTurnId`; `turn/interrupt` carries the exact active turn; stale IDs fail closed.
 
-- [ ] **Step 3: Run focused tests and verify RED**
+- [x] **Step 3: Run focused tests and verify RED**
 
 Run: `cargo test --locked --test codex_app_server_contract -- --nocapture`
 
 Expected: FAIL because `CodexAppServer` does not exist.
 
-- [ ] **Step 4: Implement the version-pinned app-server adapter**
+- [x] **Step 4: Implement the version-pinned app-server adapter**
 
-Launch with `app-server --strict-config --listen stdio://` and keyring-only configuration. Map modes exactly:
+Launch with `app-server --strict-config --listen stdio://` and explicit provider-owned file credential configuration. Map modes exactly:
 
 | Carl mode | Codex approval policy | Codex sandbox | Carl response behavior |
 |---|---|---|---|
@@ -389,7 +389,7 @@ Launch with `app-server --strict-config --listen stdio://` and keyring-only conf
 
 Do not configure external MCP servers, apps, plugins, hooks, or parent Codex configuration. Preserve model and effort only when the model catalog reports them.
 
-- [ ] **Step 5: Verify and commit**
+- [x] **Step 5: Verify and commit**
 
 Run Task 5 contracts, Codex auth/exec contracts, sidecar contracts, and global Rust checks.
 
@@ -411,7 +411,7 @@ Commit: `git commit -m "feat: add the Codex app-server runtime"`
 - Consumes: `RuntimeStore`, `CodexAppServer`, `BuzzPublisher`, `SessionConfiguration`, and stored remote codes.
 - Produces: `KernelHandle`, `KernelCommand::{NewSession, Prompt, SetConfig, Cancel, Steer, Shutdown}`, `KernelUpdate`, and `PromptStopReason`.
 
-- [ ] **Step 1: Write the deterministic turn lifecycle contract**
+- [x] **Step 1: Write the deterministic turn lifecycle contract**
 
 Use a scripted Codex port and fake publisher:
 
@@ -430,27 +430,27 @@ assert_eq!(publisher.messages()[0].reply_to, event_id());
 
 Assert input is persisted before provider start, every normalized event is persisted before emission, final delivery is persisted before `end_turn`, and provider failures, publisher failures, ambiguous delivery, cancellation, and crash reconciliation have distinct durable outcomes.
 
-- [ ] **Step 2: Write exact approval and bypass tests**
+- [x] **Step 2: Write exact approval and bypass tests**
 
 For `default`, make Codex request a command. Assert Carl persists `ToolProposed`, a bound approval, and one remote code; posts a bounded summary; returns the ACP turn at `waiting_for_approval`; and performs no side effect. Before persistence or publication, high-confidence secret material in a provider request must be rejected by `SecretFilter` rather than copied into the approval summary. Then send `/approve <code>` as the first prompt block and assert Carl atomically resolves/consumes the exact record, revalidates the provider request digest, responds `accept`, and continues the same Codex turn.
 
 Repeat for deny, expiry, replay, wrong actor, wrong session, changed cwd, changed provider request, and a fake approval string in quoted context. Test bypass selection from ACP config and `/permissions bypassPermissions` both create a confirmation code while leaving the current mode unchanged; only `/confirm-bypass <code>` activates it.
 
-- [ ] **Step 3: Write mode, steer, and cancel tests**
+- [x] **Step 3: Write mode, steer, and cancel tests**
 
 Test every row of the Task 5 mode table. While a turn is active, send `Steer` and assert a same-turn provider `turn/steer`; send `Cancel` and assert `turn/interrupt`, descendant cleanup, `stopReason: cancelled`, and no final Buzz success reply. Reject concurrent prompts and steering while approval is pending.
 
-- [ ] **Step 4: Run focused tests and verify RED**
+- [x] **Step 4: Run focused tests and verify RED**
 
 Run: `cargo test --locked --test acp_kernel_contract -- --nocapture`
 
 Expected: FAIL because the kernel actor does not exist.
 
-- [ ] **Step 5: Implement the single-owner kernel actor**
+- [x] **Step 5: Implement the single-owner kernel actor**
 
 The actor owns `RuntimeStore`, `CodexAppServer`, and an in-memory map of session state. During an active provider turn it uses `tokio::select!` over Codex events and the kernel command channel so cancel and steer remain responsive. At an approval boundary it retains the provider turn and request ID but completes the current ACP prompt; a later exact command resumes it. Generate each display code from ten lowercase hexadecimal characters of a fresh UUID v4, retrying on the database uniqueness constraint, and store only `SHA-256("carl.remote-code.v1\0" || code)`. Run final assistant text through the same bounded secret filter before journal persistence or Buzz publication; a rejected result becomes a typed failed turn rather than a partial delivery.
 
-- [ ] **Step 6: Verify and commit**
+- [x] **Step 6: Verify and commit**
 
 Run Task 6, storage, bound-approval, and global Rust checks.
 
@@ -469,7 +469,7 @@ Commit: `git commit -m "feat: add the ACP kernel actor"`
 - Consumes: bounded ACP wire functions and `KernelHandle`.
 - Produces: `AcpServer::serve<R, W>`, honest initialization metadata, request dispatch, and one serialized outbound writer.
 
-- [ ] **Step 1: Write initialize and session contracts**
+- [x] **Step 1: Write initialize and session contracts**
 
 Drive the server through duplex pipes and assert exact responses:
 
@@ -479,25 +479,25 @@ Drive the server through duplex pipes and assert exact responses:
 
 Test protocol 1 and 2 negotiation, initialize exactly once, requests before initialize, `session/new` with canonical cwd and MCP descriptors, config options in the new-session result, `session/set_config_option`, and unknown methods returning `-32601` without stopping other sessions.
 
-- [ ] **Step 2: Write prompt/update/cancel/steer contracts**
+- [x] **Step 2: Write prompt/update/cancel/steer contracts**
 
 Assert `session/prompt` accepts only bounded text blocks and produces `session/update` notifications with exact `sessionUpdate` discriminators: `agent_message_chunk`, `tool_call`, `tool_call_update`, `available_commands_update`, and `session_info_update`. Verify `session/cancel` is an id-less notification, `_session/steering` returns `{"outcome":"injected"}`, and response IDs can complete out of order without interleaved JSON bytes.
 
-- [ ] **Step 3: Write hostile framing and lifecycle contracts**
+- [x] **Step 3: Write hostile framing and lifecycle contracts**
 
 Feed malformed, oversized, empty, unknown-session, duplicate-prompt, stdout-injection, and shutdown-race inputs. Assert bounded errors, no panic text on stdout, kernel shutdown, Codex/Buzz child reaping, and a clean EOF exit.
 
-- [ ] **Step 4: Run focused tests and verify RED**
+- [x] **Step 4: Run focused tests and verify RED**
 
 Run: `cargo test --locked --test acp_server_contract -- --nocapture`
 
 Expected: FAIL because `AcpServer` does not exist.
 
-- [ ] **Step 5: Implement the concurrent dispatcher and single writer**
+- [x] **Step 5: Implement the concurrent dispatcher and single writer**
 
 The read loop validates frames and sends typed kernel commands. Long prompt requests complete on spawned response tasks; the main loop continues accepting cancel/steer frames. Every response/update enters one bounded `mpsc` writer queue. If the writer closes or fills, cancel the kernel and exit nonzero rather than dropping protocol state.
 
-- [ ] **Step 6: Verify and commit**
+- [x] **Step 6: Verify and commit**
 
 Run Task 7, kernel, protocol, and global Rust checks.
 
@@ -517,7 +517,7 @@ Commit: `git commit -m "feat: serve Carl over ACP"`
 - Consumes: `AcpServerConfig`, `DataRootLock`, provider/publisher executable resolution, and `buzz_mcp::run_stdio`.
 - Produces: the public `carl acp` command and `carl-buzz-mcp` argv-zero behavior.
 
-- [ ] **Step 1: Write failing Clap and setup contracts**
+- [x] **Step 1: Write failing Clap and setup contracts**
 
 Assert the exact command parses:
 
@@ -528,21 +528,21 @@ carl acp --dangerously-bypass-permissions
 
 Reject simultaneous dangerous alias plus a conflicting mode, relative `CARL_DATA_DIR`, unsafe data-root permissions, relative explicit executable overrides, a second owner process, `OPENAI_API_KEY` as an authentication substitute, and attempts to pass Buzz secrets as flags.
 
-- [ ] **Step 2: Write argv-zero and stdio contracts**
+- [x] **Step 2: Write argv-zero and stdio contracts**
 
 Create a symlink named `carl-buzz-mcp` to the test-built `carl` binary. Assert it starts MCP mode without parsing `carl` subcommands, exposes only the two Buzz tools, and never writes non-JSON diagnostics to stdout. A normal `carl acp` invocation must not inherit or forward Buzz variables to Codex.
 
-- [ ] **Step 3: Run focused tests and verify RED**
+- [x] **Step 3: Run focused tests and verify RED**
 
 Run: `cargo test --locked --test cli_contract --test acp_cli_contract -- --nocapture`
 
 Expected: FAIL because `acp` is absent from Clap and `main` has no streaming mode.
 
-- [ ] **Step 4: Implement streaming command dispatch**
+- [x] **Step 4: Implement streaming command dispatch**
 
 Parse argv zero before `Cli::parse`. For `carl acp`, create the Tokio runtime, canonicalize and lock `CARL_DATA_DIR`, resolve exact trusted Codex/Buzz executables, open `RuntimeStore`, construct the kernel/server, and stream stdio until EOF or signal. Keep existing buffered auth commands unchanged. Map normal exit, failure, and cancellation to 0, 1, and 130.
 
-- [ ] **Step 5: Verify and commit**
+- [x] **Step 5: Verify and commit**
 
 Run Task 8, auth CLI contracts, and global Rust checks.
 
@@ -567,15 +567,15 @@ Commit: `git commit -m "feat: expose the Carl ACP command"`
 - Consumes: the real `carl` subprocess, a fake Codex app-server executable, a fake Buzz CLI executable, and pinned Buzz request fixtures.
 - Produces: offline conformance evidence for the entire `buzz-acp -> carl acp -> Codex -> Carl policy -> Buzz publisher` path.
 
-- [ ] **Step 1: Add literal pinned Buzz fixtures and provenance**
+- [x] **Step 1: Add literal pinned Buzz fixtures and provenance**
 
 Copy only the minimal JSON shapes from `block/buzz@44456e200e3ca6a5d2882b58b447b80474041347` into fixtures. Include a `source` field in the test harness metadata, not in protocol messages, and assert fixture hashes so accidental edits are review-visible.
 
-- [ ] **Step 2: Write the process-boundary conformance test**
+- [x] **Step 2: Write the process-boundary conformance test**
 
 Spawn the real `carl acp`, send initialize/new/config/prompt/cancel/steer frames, and parse stdout with an independent bounded reader. Assert stderr may contain diagnostics but stdout contains only valid JSON-RPC objects. Exercise multiple sessions, model/effort rejection, unknown methods, partial writes, and process EOF cleanup.
 
-- [ ] **Step 3: Write the end-to-end coding scenario**
+- [x] **Step 3: Write the end-to-end coding scenario**
 
 The fake Codex transcript must inspect a fixture repository, request an exact file approval, request an exact command approval, emit a diff, receive a steer, complete verification, and return a final message. The test approves one request, denies another, repeats in bypass, cancels a fourth turn, restarts Carl, and proves:
 
@@ -587,13 +587,13 @@ assert!(!all_captured_bytes().contains(private_key.as_bytes()));
 assert_eq!(consequential_action_count("approved-command"), 1);
 ```
 
-- [ ] **Step 4: Run focused tests and verify RED, then GREEN**
+- [x] **Step 4: Run focused tests and verify RED, then GREEN**
 
 Run before implementation wiring: `cargo test --locked --test buzz_acp_contract --test buzz_end_to_end -- --nocapture`
 
 Expected first run: FAIL at the first unimplemented process seam. Implement only the fixture/test wiring needed to exercise Tasks 1–8, then rerun until both pass.
 
-- [ ] **Step 5: Verify and commit**
+- [x] **Step 5: Verify and commit**
 
 Run Task 9 tests and global Rust checks.
 
@@ -617,7 +617,7 @@ Commit: `git commit -m "test: prove the Buzz ACP path"`
 - Consumes: the completed CLI and test commands.
 - Produces: public installation/configuration guidance, CI enforcement, and opt-in live smoke scripts documented as exact commands.
 
-- [ ] **Step 1: Write failing documentation contracts**
+- [x] **Step 1: Write failing documentation contracts**
 
 Require the README and `docs/buzz.md` to contain these exact operational settings and warnings:
 
@@ -632,25 +632,25 @@ export BUZZ_ACP_PERMISSION_MODE=default
 
 Assert docs explain local OAuth via `carl auth login openai`, no API-key fallback, local versus remote bypass, exact approval commands, single-process V1, tested Buzz commit/range, credential isolation, cancellation/steering, and `CARL_BUZZ_EXECUTABLE`.
 
-- [ ] **Step 2: Run docs contracts and verify RED**
+- [x] **Step 2: Run docs contracts and verify RED**
 
 Run: `cargo test --locked --test docs_contract -- --nocapture`
 
 Expected: FAIL because Buzz documentation is absent and the README still says Carl is not usable.
 
-- [ ] **Step 3: Update public docs and CI**
+- [x] **Step 3: Update public docs and CI**
 
 Add the ACP/Buzz integration tests to the existing Linux/macOS/Windows test job without secrets or network. Keep live tests excluded. Update the pre-alpha status truthfully: ACP/Buzz is usable on the tested path; TUI, Telegram, Grok execution, native tools, and broader product milestones remain incomplete unless separately implemented.
 
-- [ ] **Step 4: Run the live Codex subscription smoke test**
+- [x] **Step 4: Run the live Codex subscription smoke test**
 
 With `OPENAI_API_KEY`, `CODEX_API_KEY`, and other API-key variables unset, create a disposable fixture repository and drive the real installed `codex-cli 0.146.0` through the real `carl acp`. In `plan` mode ask for a repository assessment; in `default` mode request a one-line edit and test, consume the emitted exact approvals, and verify the diff and final evidence. Run steer and cancel in separate turns. Save only sanitized pass/fail metadata under the test temp directory; do not commit provider output or credentials.
 
-- [ ] **Step 5: Run the optional local Buzz relay smoke when prerequisites are present**
+- [x] **Step 5: Run the optional local Buzz relay smoke when prerequisites are present**
 
 Build `buzz`, `buzz-acp`, and the local relay from pinned commit `44456e2`; generate disposable local-only identities, register Carl, run with the six documented env settings, and send an owner mention that edits and tests the fixture repository. Verify the reply appears in the originating thread and the relay/provider secrets do not appear in Carl logs or SQLite. If Docker/relay prerequisites are absent, record the exact missing executable/service and retain the deterministic Task 9 proof without claiming the live-relay criterion.
 
-- [ ] **Step 6: Run final verification and commit**
+- [x] **Step 6: Run final verification and commit**
 
 Run:
 

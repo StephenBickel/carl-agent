@@ -55,13 +55,15 @@ Carl uses a dedicated, provider-owned Codex sidecar:
   task and reuses provider-owned ChatGPT authentication;
 - every Codex process receives a Carl-specific `CODEX_HOME`, which isolates
   filesystem-backed configuration and state;
-- Codex stores and refreshes its own tokens in the operating-system keyring;
+- Carl selects Codex's explicit `file` credential mode instead of `auto`;
+- Codex stores and refreshes its own tokens in `$CODEX_HOME/auth.json`, while Carl
+  validates only that it is a bounded, regular, non-linked, owner-only file;
 - Carl never reads, receives, copies, logs, or forwards a Codex bearer or refresh token.
 
-OpenAI does not document the OS-keyring entry as namespaced by `CODEX_HOME`; its login
-cache may be shared with other Codex surfaces for the same OS user. Carl therefore
-does not claim keyring isolation, and its logout UI must warn that logging out can
-affect another Codex CLI or IDE session.
+The explicit store choice prevents a host-dependent keyring fallback and keeps the
+subscription session inside Carl's owner-private provider home. Carl does not open
+the provider-owned credential file. Its logout UI states that logout removes Carl's
+isolated Codex session.
 
 The delegated tool runs against a content-scanned staging copy, never the live
 workspace, and returns bounded exact-replacement proposals for existing text files.

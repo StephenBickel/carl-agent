@@ -385,7 +385,7 @@ pub fn dispatch_codex_auth_fixture(arguments: &[OsString]) -> Option<i32> {
         OsString::from("app-server"),
         OsString::from("--strict-config"),
         OsString::from("-c"),
-        OsString::from("cli_auth_credentials_store=\"keyring\""),
+        OsString::from("cli_auth_credentials_store=\"file\""),
         OsString::from("--listen"),
         OsString::from("stdio://"),
     ];

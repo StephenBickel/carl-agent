@@ -1,6 +1,8 @@
 # Security Model
 
-Status: design plus partial foundation. Carl is not currently a usable agent, and the controls described as planned below are not enforcement claims.
+Status: pre-alpha with an implemented ACP/Buzz coding path plus additional inert
+safety foundations. Claims in "Implemented properties" apply to tested code; planned
+controls are not enforcement claims.
 
 ## Trust model
 
@@ -15,6 +17,24 @@ Carl does not attempt to defend a host account from an attacker who already cont
 - SQLite migrations are forward-only and checksum-verified, and the store rejects unknown future schemas;
 - session events are append-only and lifecycle changes are transactional;
 - the scripted provider supports deterministic tests without a network or live credentials.
+- `carl acp` rejects API-key fallback, validates and locks an owner-private absolute
+  data root, starts only the pinned Codex app-server, and keeps JSON protocol output
+  separate from bounded stderr diagnostics;
+- the ACP kernel serializes each session, persists accepted lifecycle transitions,
+  binds exact single-use approvals to actor/session/turn/tool/provider request,
+  supports provider steering and cancellation, and does not automatically repeat
+  ambiguous consequential work;
+- the Buzz frontend accepts only a structurally validated current-event context and
+  one typed restricted publisher descriptor. Buzz credentials are never forwarded to
+  Codex, provider prompts, durable events, general command environments, or error
+  text;
+- the `carl-buzz-mcp` alias exposes only typed `send_message` and `send_diff`
+  operations. It passes an exact credential allowlist to a trusted Buzz CLI through a
+  closed process environment and sends content on stdin rather than shell text;
+- remote approval and bypass-confirmation display codes are random, stored only as
+  SHA-256 digests, expire, bind exact durable context, and are atomically consumed at
+  most once. Remote bypass requires a later explicit confirmation; local bypass is
+  available only through an explicit dangerous launch choice;
 - provider-owned authentication sidecars run with fixed isolated homes, closed child
   environments, canonical executable identity checks, and supervised process trees;
 - the auth CLI emits deterministic safe JSON and keeps provider challenges, warnings,
@@ -77,11 +97,12 @@ Carl does not attempt to defend a host account from an attacker who already cont
   diagnostics are discarded in full; no matching substring is retained in the
   durable result.
 
-These properties improve auditability and failure behavior. They do not implement
-model-provider access, a general runtime tool-policy system, redaction of all future
-runtime data, live-workspace promotion, or a complete process sandbox. Verification
-is implemented as a runtime operation, but promotion is not implemented and no
-complete subscription coding task is user-reachable.
+These properties improve auditability and failure behavior. The ACP path does
+implement model-provider access through provider-owned Codex app-server tools, but it
+does not implement a general native Carl tool-policy system, redaction of every
+future data shape, live-workspace promotion, or a complete process sandbox.
+Independent verification remains a separate inert library boundary and promotion is
+not implemented.
 
 ## Planned v1 controls
 
@@ -116,10 +137,11 @@ Subscription authentication stays inside provider-owned executables. Carl never
 receives, reads, copies, logs, persists, or forwards subscription bearer or refresh
 tokens.
 
-- Codex owns ChatGPT subscription tokens in the operating-system keyring.
-  `CODEX_HOME` isolates filesystem-backed state but does not prove keyring isolation.
-  Logging out through Carl can therefore affect another Codex CLI or IDE session for
-  the same OS user, and Carl displays a local warning before logout.
+- Codex owns ChatGPT subscription tokens in `$CODEX_HOME/auth.json`. Carl selects
+  explicit `file` mode instead of `auto`, prepares an owner-private provider home,
+  and validates the credential as a bounded, regular, non-linked, owner-only file.
+  It never opens or reads the file. Logging out through Carl removes only Carl's
+  isolated Codex session, and Carl displays a local notice before logout.
 - Grok owns `$GROK_HOME/auth.json`. Carl validates only the credential file's metadata
   as a regular, non-linked, owner-only file; it never opens or reads the file.
   Isolating `GROK_HOME` does not suppress trusted root-owned `/etc/grok` policy.
@@ -131,7 +153,9 @@ See [ADR 0003](adr/0003-no-undocumented-oauth.md) and
 [ADR 0004](adr/0004-subscription-authentication-through-provider-sidecars.md).
 
 Authentication state does not prove current subscription or model entitlement.
-Authentication does not enable model execution or subscription-backed delegates.
+Execution is a separate `carl acp` startup path that must successfully validate the
+Codex executable, app-server handshake, and model catalog. API keys cannot substitute
+for that provider-owned subscription path.
 
 ## Foreground and output boundary
 
@@ -142,13 +166,13 @@ spawned. A status-only Grok broker cannot upgrade itself or mutate authenticatio
 provider-owned status handshake.
 
 Stdout is reserved for one deterministic safe JSON value. Validated challenges,
-shared-keyring warnings, and provider-owned terminal output go only to the verified
+isolated-session notices, and provider-owned terminal output go only to the verified
 local stderr terminal. Provider terminal text is not captured, parsed, relayed,
 serialized, persisted, or logged by Carl.
 
 ## Executable and process boundaries
 
-Carl pins Codex CLI `0.136.0` and Grok Build `0.2.111`, validates a canonical
+Carl pins Codex CLI `0.146.0` and Grok Build `0.2.111`, validates a canonical
 executable identity once, and revalidates that exact identity before use. Version
 matching is compatibility evidence, not publisher attestation. Carl neither installs
 nor updates provider executables.
@@ -205,6 +229,17 @@ before applying bytes.
 
 ## Remote channel boundary
 
-The planned Telegram gateway uses outbound long polling and one paired owner. Group, channel, guest, and unpaired updates must be discarded before provider or tool invocation. Duplicate updates and approval callbacks must be persisted and deduplicated so retries cannot duplicate consequential work. See the [Telegram design guide](telegram.md).
+The implemented Buzz integration relies on Buzz for signed identity, membership,
+inbound deduplication, and the `owner-only` author gate. Carl independently binds the
+actor and stable channel found in the accepted ACP event to its durable session and
+exact approval records; that binding is not a substitute for Buzz's admission gate.
+The restricted publisher keeps relay credentials out of the inbound kernel and
+provider paths. See the [Buzz guide](buzz.md).
+
+The planned Telegram gateway uses outbound long polling and one paired owner. Group,
+channel, guest, and unpaired updates must be discarded before provider or tool
+invocation. Duplicate updates and approval callbacks must be persisted and
+deduplicated so retries cannot duplicate consequential work. See the
+[Telegram design guide](telegram.md).
 
 For vulnerability reporting, follow the private process in the repository [security policy](../SECURITY.md).

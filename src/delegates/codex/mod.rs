@@ -27,8 +27,10 @@ pub use events::{
 };
 
 const CODEX_VERSION: &str = "=0.146.0";
+const CREDENTIAL_FILENAME: &str = "auth.json";
+const MAX_CREDENTIAL_FILE_BYTES: u64 = 1024 * 1024;
 const CODEX_CONFIG: &[u8] = concat!(
-    "cli_auth_credentials_store = \"keyring\"\n",
+    "cli_auth_credentials_store = \"file\"\n",
     "approval_policy = \"never\"\n",
     "sandbox_mode = \"workspace-write\"\n",
     "\n",
@@ -119,6 +121,8 @@ impl CodexExecAdapter {
         limits: SidecarLimits,
     ) -> Result<Self, DelegateError> {
         home.require_profile(ProviderEnvironmentProfile::Codex)
+            .map_err(map_sidecar_error)?;
+        home.inspect_owner_only_file(CREDENTIAL_FILENAME, MAX_CREDENTIAL_FILE_BYTES)
             .map_err(map_sidecar_error)?;
         home.write_static_file("config.toml", CODEX_CONFIG)
             .map_err(map_sidecar_error)?;

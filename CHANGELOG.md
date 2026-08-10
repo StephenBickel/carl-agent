@@ -7,6 +7,9 @@ All notable changes to Carl will be recorded here. The project is pre-alpha and 
 ### Changed
 
 - Renamed the pre-alpha ArcWren foundation to Carl, with the package `carl-agent` and executable `carl`.
+- Codex subscription authentication now uses the official CLI's explicit `file`
+  credential store inside Carl's isolated provider home, with metadata-only safety
+  validation and no host-keyring dependency.
 
 ### Added
 
@@ -42,10 +45,32 @@ All notable changes to Carl will be recorded here. The project is pre-alpha and 
   a credential-free environment through a bounded process-tree supervisor, rejects
   candidate mutation and unsafe diagnostics, persists request/result evidence
   atomically, and mints verified-proposal capabilities only after commit.
+- Subscription-backed Codex app-server execution through `carl acp`, pinned to Codex
+  CLI `0.146.0`, with provider-reported model/reasoning choices and no API-key
+  fallback. The ACP path is CLI-reachable and owns durable provider turns.
+- A bounded ACP v1/v2 stdio server with honest capability negotiation, multiple
+  sessions, configuration updates, assistant/tool/diff updates, steering,
+  cancellation, malformed-frame isolation, and JSON-only stdout.
+- Durable ACP/Buzz frontend bindings, stable workspace/channel claims, permission
+  state, hashed remote codes, and monotonic outbound delivery records.
+- Claude/Codex-compatible `plan`, `default`, `acceptEdits`, `dontAsk`, and
+  `bypassPermissions` modes. Remote bypass requires a later one-time confirmation;
+  local dangerous bypass must be explicit.
+- Exact remote command and file approvals bound to actor, frontend session, Carl
+  session, turn, tool/provider request, workspace, request digest, and expiry. Codes
+  are atomically single-use and provider turns resume without replay.
+- Buzz compatibility pinned to commit
+  `44456e200e3ca6a5d2882b58b447b80474041347`, including structural context parsing,
+  an owner-only recommended setup, restricted `carl-buzz-mcp` message/diff
+  publication, credential isolation, restart safety, and deterministic real-process
+  end-to-end tests.
+- Cross-platform public CI coverage for the pinned Buzz ACP fixtures and end-to-end
+  process path without network access or credentials.
 
 ### Not yet available
 
 - Native model execution remains unavailable.
-- Subscription-backed coding is not exposed through the CLI: no subscription coding
-  task is CLI-reachable until stale-safe promotion and run-engine orchestration are
-  implemented.
+- The interactive TUI, Telegram gateway, Grok execution, native Carl tool loop,
+  stale-safe live-workspace promotion, and general native HTTP model adapters remain
+  unavailable. ACP coding uses Codex app-server capabilities under Carl's kernel and
+  exact approval boundary.

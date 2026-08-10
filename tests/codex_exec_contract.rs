@@ -632,7 +632,7 @@ fn adapter_composes_a_private_subscription_backed_codex_run() -> TestResult {
         assert_eq!(
             fs::read_to_string(layout.home.join("config.toml"))?,
             concat!(
-                "cli_auth_credentials_store = \"keyring\"\n",
+                "cli_auth_credentials_store = \"file\"\n",
                 "approval_policy = \"never\"\n",
                 "sandbox_mode = \"workspace-write\"\n",
                 "\n",

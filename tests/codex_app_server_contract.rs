@@ -143,6 +143,10 @@ fn lifecycle_and_approval() -> Result<(), Box<dyn Error + Send + Sync>> {
         server
             .resolve_approval(&approval, CodexApprovalDecision::Allow)
             .await?;
+        assert!(matches!(
+            server.next_event().await?,
+            CodexEvent::ItemCompleted { .. }
+        ));
 
         server.steer(&thread, &turn, "Focus on the parser").await?;
         server.interrupt(&thread, &turn).await?;
@@ -214,7 +218,7 @@ fn dispatch_fixture(arguments: &[OsString]) -> Option<i32> {
         "app-server",
         "--strict-config",
         "-c",
-        "cli_auth_credentials_store=\"keyring\"",
+        "cli_auth_credentials_store=\"file\"",
         "--listen",
         "stdio://",
     ];
@@ -265,7 +269,7 @@ fn app_server_fixture() -> i32 {
                 continue;
             }
             Some("initialize") => json!({
-                "userAgent":"Codex Desktop/0.146.0 (fixture) dumb (carl; 0.1.0)", "codexHome":home,
+                "userAgent":"carl/0.146.0 (fixture; arm64) unknown (carl; 0.1.0)", "codexHome":home,
                 "platformFamily":"unix", "platformOs":"fixture"
             }),
             Some("model/list") if request["params"]["cursor"].is_null() => json!({
@@ -287,6 +291,16 @@ fn app_server_fixture() -> i32 {
                 if write_message(&json!({"id":id,"result":result})).is_err()
                     || write_message(&json!({
                         "method":"thread/started", "params":{"thread":thread},
+                        "emittedAtMs":1
+                    }))
+                    .is_err()
+                    || write_message(&json!({
+                        "method":"mcpServer/startupStatus/updated",
+                        "params":{
+                            "threadId":"thr_123", "name":"fixture-mcp",
+                            "status":"failed", "error":"fixture unavailable",
+                            "failureReason":null
+                        },
                         "emittedAtMs":1
                     }))
                     .is_err()
@@ -312,6 +326,25 @@ fn app_server_fixture() -> i32 {
             None if request.get("id") == Some(&json!("approval-7")) => {
                 if fs::write(home.join("approval-response.json"), line).is_err() {
                     return 73;
+                }
+                if write_message(&json!({
+                    "method":"serverRequest/resolved",
+                    "params":{"threadId":"thr_123","requestId":"approval-7"},
+                    "emittedAtMs":3
+                }))
+                .is_err()
+                    || write_message(&json!({
+                        "method":"item/completed",
+                        "params":{
+                            "threadId":"thr_123","turnId":"turn_123",
+                            "completedAtMs":3,
+                            "item":{"type":"commandExecution","id":"item_123"}
+                        },
+                        "emittedAtMs":3
+                    }))
+                    .is_err()
+                {
+                    return 74;
                 }
                 continue;
             }
@@ -357,15 +390,31 @@ fn workspace_for(home: &Path) -> PathBuf {
 fn turn_notifications() -> Vec<Value> {
     let mut notifications = vec![
         json!({"method":"turn/started","params":{"threadId":"thr_123","turn":{"id":"turn_123","items":[],"status":"inProgress"}}}),
+        json!({"method":"thread/status/changed","params":{"threadId":"thr_123","status":{"type":"active","activeFlags":[]}}}),
+        json!({"method":"warning","params":{"threadId":"thr_123","message":"fixture warning"}}),
+        json!({"method":"thread/tokenUsage/updated","params":{
+            "threadId":"thr_123","turnId":"turn_123","tokenUsage":{
+                "total":{"totalTokens":3,"inputTokens":2,"cachedInputTokens":0,"cacheWriteInputTokens":0,"outputTokens":1,"reasoningOutputTokens":0},
+                "last":{"totalTokens":3,"inputTokens":2,"cachedInputTokens":0,"cacheWriteInputTokens":0,"outputTokens":1,"reasoningOutputTokens":0},
+                "modelContextWindow":258400
+            }
+        }}),
+        json!({"method":"account/rateLimits/updated","params":{"rateLimits":{
+            "limitId":"codex","limitName":null,"primary":null,"secondary":null,
+            "credits":{"hasCredits":false,"unlimited":false,"balance":"0"},
+            "individualLimit":null,"spendControlReached":null,"planType":"pro",
+            "rateLimitReachedType":null
+        }}}),
         json!({"method":"item/started","params":{"threadId":"thr_123","turnId":"turn_123","startedAtMs":1,"item":{"type":"agentMessage","id":"item_123","text":""}}}),
         json!({"method":"item/agentMessage/delta","params":{"threadId":"thr_123","turnId":"turn_123","itemId":"item_123","delta":"Working"}}),
+        json!({"method":"item/commandExecution/outputDelta","params":{"threadId":"thr_123","turnId":"turn_123","itemId":"item_123","delta":"fixture output"}}),
         json!({"method":"turn/diff/updated","params":{"threadId":"thr_123","turnId":"turn_123","diff":"diff --git a/a b/a"}}),
         json!({"id":"approval-7","method":"item/commandExecution/requestApproval","params":{
             "threadId":"thr_123","turnId":"turn_123","itemId":"item_123","startedAtMs":2,
             "command":"cargo test","reason":"Run the test suite","cwd":null
         }}),
     ];
-    for notification in &mut notifications[..4] {
+    for notification in &mut notifications[..9] {
         notification["emittedAtMs"] = json!(2);
     }
     notifications

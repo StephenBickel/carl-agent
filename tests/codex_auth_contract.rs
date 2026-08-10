@@ -61,6 +61,10 @@ fn main() {
             codex_rejects_grok_provider_home_before_launch,
         ),
         test(
+            "Codex rejects unsafe file credentials before launch",
+            codex_rejects_unsafe_file_credentials_before_launch,
+        ),
+        test(
             "only Codex 0.146.0 is accepted",
             only_codex_0146_is_accepted,
         ),
@@ -221,7 +225,7 @@ fn codex_launch_and_handshake_are_exact() -> TestResult {
 
         assert_eq!(
             fs::read_to_string(fixture.layout.home.join("config.toml"))?,
-            "cli_auth_credentials_store = \"keyring\"\n"
+            "cli_auth_credentials_store = \"file\"\n"
         );
         #[cfg(unix)]
         {
@@ -295,6 +299,27 @@ fn codex_launch_and_handshake_are_exact() -> TestResult {
         assert!(!raw.contains("\"jsonrpc\""));
         assert_redacted_broker(&fixture);
         TestResult::Ok(())
+    })
+}
+
+fn codex_rejects_unsafe_file_credentials_before_launch() -> TestResult {
+    run_async(async {
+        let layout = TestLayout::new()?;
+        let trusted = trusted_fixture_executable(&layout)?;
+        let home = ProviderHome::prepare(
+            ProviderEnvironmentProfile::Codex,
+            &layout.data,
+            &layout.workspace,
+            &layout.home,
+        )?;
+        fs::write(layout.home.join("auth.json"), vec![b'x'; 1024 * 1024 + 1])?;
+
+        let error = CodexAuth::connect(&trusted, home, short_limits(), contract_timeouts())
+            .await
+            .expect_err("an oversized credential file must fail closed");
+        assert_eq!(error.code(), AuthErrorCode::UnsafeCredentialStore);
+        assert!(!layout.home.join("codex-launch.json").exists());
+        Ok(())
     })
 }
 

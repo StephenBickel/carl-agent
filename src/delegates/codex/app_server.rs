@@ -20,12 +20,14 @@ use crate::sidecar::{
 };
 
 const CODEX_APP_SERVER_VERSION: &str = "0.146.0";
+const CREDENTIAL_FILENAME: &str = "auth.json";
+const MAX_CREDENTIAL_FILE_BYTES: u64 = 1024 * 1024;
 const MAX_MODELS: usize = 64;
 const MAX_MODEL_PAGES: usize = 16;
 const MAX_TEXT_BYTES: usize = 256 * 1_024;
 const MAX_CURSOR_BYTES: usize = 128;
 const APP_SERVER_CONFIG: &[u8] = concat!(
-    "cli_auth_credentials_store = \"keyring\"\n",
+    "cli_auth_credentials_store = \"file\"\n",
     "approval_policy = \"never\"\n",
     "sandbox_mode = \"read-only\"\n",
     "web_search = \"disabled\"\n",
@@ -142,6 +144,8 @@ impl CodexAppServer {
     ) -> Result<Self, DelegateError> {
         home.require_profile(ProviderEnvironmentProfile::Codex)
             .map_err(map_sidecar_error)?;
+        home.inspect_owner_only_file(CREDENTIAL_FILENAME, MAX_CREDENTIAL_FILE_BYTES)
+            .map_err(map_sidecar_error)?;
         home.write_static_file("config.toml", APP_SERVER_CONFIG)
             .map_err(map_sidecar_error)?;
         let command = SidecarCommand {
@@ -150,7 +154,7 @@ impl CodexAppServer {
                 "app-server",
                 "--strict-config",
                 "-c",
-                "cli_auth_credentials_store=\"keyring\"",
+                "cli_auth_credentials_store=\"file\"",
                 "--listen",
                 "stdio://",
             ]
@@ -757,7 +761,20 @@ fn valid_user_agent(value: &str) -> bool {
     if value.is_empty() || value.len() > 512 || value.as_bytes().contains(&0) {
         return false;
     }
+    let native_suffix = format!(") unknown (carl; {})", env!("CARGO_PKG_VERSION"));
+    let native = value
+        .strip_prefix("carl/0.146.0 (")
+        .and_then(|platform| platform.strip_suffix(&native_suffix))
+        .is_some_and(|platform| {
+            !platform.is_empty()
+                && platform.len() <= 128
+                && platform.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric()
+                        || matches!(byte, b' ' | b'.' | b'_' | b'-' | b';' | b',')
+                })
+        });
     value == "codex_cli_rs/0.146.0"
+        || native
         || (value.starts_with("Codex Desktop/0.146.0 ")
             && value.ends_with(&format!("(carl; {})", env!("CARGO_PKG_VERSION"))))
 }
@@ -771,31 +788,218 @@ fn is_ignorable_notification(value: &Value) -> Result<bool, DelegateError> {
     {
         return Err(protocol_error());
     }
-    if object.get("method").and_then(Value::as_str) != Some("remoteControl/status/changed") {
-        return Ok(false);
-    }
+    let method = object
+        .get("method")
+        .and_then(Value::as_str)
+        .ok_or_else(protocol_error)?;
     let params = object
         .get("params")
         .and_then(Value::as_object)
         .ok_or_else(protocol_error)?;
+    match method {
+        "remoteControl/status/changed" => {
+            require_keys(
+                params,
+                &["status", "serverName", "installationId", "environmentId"],
+                &[],
+            )?;
+            if !params
+                .get("status")
+                .and_then(Value::as_str)
+                .is_some_and(|status| {
+                    matches!(status, "disabled" | "connecting" | "connected" | "errored")
+                })
+                || !params.get("serverName").is_some_and(Value::is_string)
+                || !params.get("installationId").is_some_and(Value::is_string)
+                || !params
+                    .get("environmentId")
+                    .is_some_and(|value| value.is_null() || value.is_string())
+            {
+                return Err(protocol_error());
+            }
+            Ok(true)
+        }
+        "mcpServer/startupStatus/updated" => {
+            require_keys(
+                params,
+                &["threadId", "name", "status", "error", "failureReason"],
+                &[],
+            )?;
+            bounded_string(params.get("threadId"), 128)?;
+            bounded_string(params.get("name"), 128)?;
+            let status = bounded_string(params.get("status"), 32)?;
+            if !matches!(
+                status.as_str(),
+                "starting" | "ready" | "failed" | "cancelled"
+            ) {
+                return Err(protocol_error());
+            }
+            optional_bounded_string(params.get("error"), MAX_TEXT_BYTES)?;
+            optional_bounded_string(params.get("failureReason"), MAX_TEXT_BYTES)?;
+            Ok(true)
+        }
+        "thread/status/changed" => {
+            require_keys(params, &["threadId", "status"], &[])?;
+            bounded_string(params.get("threadId"), 128)?;
+            let status = params
+                .get("status")
+                .and_then(Value::as_object)
+                .ok_or_else(protocol_error)?;
+            require_keys(status, &["type"], &["activeFlags"])?;
+            let status_type = bounded_string(status.get("type"), 32)?;
+            if !matches!(status_type.as_str(), "active" | "idle") {
+                return Err(protocol_error());
+            }
+            if let Some(flags) = status.get("activeFlags") {
+                let flags = flags.as_array().ok_or_else(protocol_error)?;
+                if flags.len() > 16 {
+                    return Err(protocol_error());
+                }
+                for flag in flags {
+                    bounded_string(Some(flag), 64)?;
+                }
+            }
+            Ok(true)
+        }
+        "warning" => {
+            require_keys(params, &["threadId", "message"], &[])?;
+            bounded_string(params.get("threadId"), 128)?;
+            bounded_string(params.get("message"), MAX_TEXT_BYTES)?;
+            Ok(true)
+        }
+        "thread/tokenUsage/updated" => {
+            require_keys(params, &["threadId", "turnId", "tokenUsage"], &[])?;
+            bounded_string(params.get("threadId"), 128)?;
+            bounded_string(params.get("turnId"), 128)?;
+            let usage = params
+                .get("tokenUsage")
+                .and_then(Value::as_object)
+                .ok_or_else(protocol_error)?;
+            require_keys(usage, &["total", "last", "modelContextWindow"], &[])?;
+            validate_token_usage(usage.get("total"))?;
+            validate_token_usage(usage.get("last"))?;
+            if usage
+                .get("modelContextWindow")
+                .and_then(Value::as_u64)
+                .is_none()
+            {
+                return Err(protocol_error());
+            }
+            Ok(true)
+        }
+        "account/rateLimits/updated" => {
+            require_keys(params, &["rateLimits"], &[])?;
+            validate_rate_limits(params.get("rateLimits"))?;
+            Ok(true)
+        }
+        "item/commandExecution/outputDelta" | "item/fileChange/outputDelta" => {
+            require_keys(params, &["threadId", "turnId", "itemId", "delta"], &[])?;
+            bounded_string(params.get("threadId"), 128)?;
+            bounded_string(params.get("turnId"), 128)?;
+            bounded_string(params.get("itemId"), 128)?;
+            bounded_string(params.get("delta"), MAX_TEXT_BYTES)?;
+            Ok(true)
+        }
+        "serverRequest/resolved" => {
+            require_keys(params, &["threadId", "requestId"], &[])?;
+            bounded_string(params.get("threadId"), 128)?;
+            let request_id = params.get("requestId").ok_or_else(protocol_error)?;
+            if request_id.as_u64().is_none() && bounded_string(Some(request_id), 128).is_err() {
+                return Err(protocol_error());
+            }
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+fn validate_token_usage(value: Option<&Value>) -> Result<(), DelegateError> {
+    let usage = value
+        .and_then(Value::as_object)
+        .ok_or_else(protocol_error)?;
     require_keys(
-        params,
-        &["status", "serverName", "installationId", "environmentId"],
+        usage,
+        &[
+            "totalTokens",
+            "inputTokens",
+            "cachedInputTokens",
+            "cacheWriteInputTokens",
+            "outputTokens",
+            "reasoningOutputTokens",
+        ],
         &[],
     )?;
-    if !params
-        .get("status")
-        .and_then(Value::as_str)
-        .is_some_and(|status| matches!(status, "disabled" | "connecting" | "connected" | "errored"))
-        || !params.get("serverName").is_some_and(Value::is_string)
-        || !params.get("installationId").is_some_and(Value::is_string)
-        || !params
-            .get("environmentId")
-            .is_some_and(|value| value.is_null() || value.is_string())
+    if usage.values().any(|value| value.as_u64().is_none()) {
+        return Err(protocol_error());
+    }
+    Ok(())
+}
+
+fn validate_rate_limits(value: Option<&Value>) -> Result<(), DelegateError> {
+    let limits = value
+        .and_then(Value::as_object)
+        .ok_or_else(protocol_error)?;
+    require_keys(
+        limits,
+        &[
+            "limitId",
+            "limitName",
+            "primary",
+            "secondary",
+            "credits",
+            "individualLimit",
+            "spendControlReached",
+            "planType",
+            "rateLimitReachedType",
+        ],
+        &[],
+    )?;
+    bounded_string(limits.get("limitId"), 128)?;
+    optional_bounded_string(limits.get("limitName"), 128)?;
+    validate_rate_limit_window(limits.get("primary"))?;
+    validate_rate_limit_window(limits.get("secondary"))?;
+    let credits = limits
+        .get("credits")
+        .and_then(Value::as_object)
+        .ok_or_else(protocol_error)?;
+    require_keys(credits, &["hasCredits", "unlimited", "balance"], &[])?;
+    if !credits.get("hasCredits").is_some_and(Value::is_boolean)
+        || !credits.get("unlimited").is_some_and(Value::is_boolean)
     {
         return Err(protocol_error());
     }
-    Ok(true)
+    bounded_string(credits.get("balance"), 128)?;
+    if !limits
+        .get("individualLimit")
+        .is_some_and(|value| value.is_null() || value.is_object())
+        || !limits
+            .get("spendControlReached")
+            .is_some_and(|value| value.is_null() || value.is_boolean())
+    {
+        return Err(protocol_error());
+    }
+    optional_bounded_string(limits.get("planType"), 128)?;
+    optional_bounded_string(limits.get("rateLimitReachedType"), 128)?;
+    Ok(())
+}
+
+fn validate_rate_limit_window(value: Option<&Value>) -> Result<(), DelegateError> {
+    let Some(value) = value else {
+        return Err(protocol_error());
+    };
+    if value.is_null() {
+        return Ok(());
+    }
+    let window = value.as_object().ok_or_else(protocol_error)?;
+    require_keys(
+        window,
+        &["usedPercent", "windowDurationMins", "resetsAt"],
+        &[],
+    )?;
+    if window.values().any(|value| value.as_u64().is_none()) {
+        return Err(protocol_error());
+    }
+    Ok(())
 }
 
 fn response_result(response: Value) -> Result<Value, DelegateError> {

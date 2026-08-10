@@ -213,7 +213,7 @@ fn dispatch_fixture(arguments: &[OsString]) -> Option<i32> {
         "app-server",
         "--strict-config",
         "-c",
-        "cli_auth_credentials_store=\"keyring\"",
+        "cli_auth_credentials_store=\"file\"",
         "--listen",
         "stdio://",
     ];

@@ -1,83 +1,71 @@
 # Carl
 
-Carl is Stephen Bickel's personal, local-first Rust coding agent and an open-source agent harness built around a deterministic core, replayable events, explicit policy boundaries, and interchangeable model providers.
+Carl is Stephen Bickel's personal, local-first Rust coding agent and an open-source
+agent harness. It is built around a deterministic kernel, durable and replayable
+events, explicit permission boundaries, and provider-owned subscription login.
+Carl's personality and operating principles are public in the
+[public operating contract](CARL.md). The name is Stephen's middle name and his
+grandfather's name.
 
-Carl's personality and operating principles are part of the repository; see the
-[public operating contract](CARL.md). The name is personal rather than an acronym:
-Carl is Stephen's middle name and his grandfather's name.
+## Status: pre-alpha, usable ACP coding path
 
-## Terminal and Telegram workflow
+Carl now has a usable ACP coding path: `carl acp` runs a real, version-pinned Codex
+app-server through an existing ChatGPT subscription and can serve Buzz or another
+compatible ACP client over stdio. It supports durable sessions, provider-reported
+model and reasoning choices, plan/default/edit/don't-ask/bypass permission modes,
+exact single-use approvals, steering, cancellation, diffs, and final publication.
+The ACP path is CLI-reachable and covered by process-level offline tests.
 
-The intended v1 experience is one continuous session across a local terminal UI and an owner-only Telegram bot: begin a task at the workstation, inspect or approve proposed actions locally, then resume the same persisted session from a paired private chat. This is a **design preview, not captured output or a runnable demo**; neither frontend is implemented yet.
+This remains pre-alpha. TUI interaction, the Telegram gateway, Grok execution,
+native HTTP/OpenAI adapters, Carl's native tool loop, stale-safe live-workspace
+promotion, and broader consumer packaging are incomplete. The four placeholder
+commands `serve`, `pair`, `doctor`, and `sessions` return not-implemented errors;
+Clap's built-in `help` command displays help.
 
-## Status: pre-alpha foundation
+Only the four placeholder commands remain unavailable as inert CLI shells; `auth`
+and `acp` have implemented behavior.
 
-> [!WARNING]
-> Carl is currently a **pre-alpha foundation** and is not yet a usable end-user agent. The authentication command surface, an inert library-level Codex exec adapter, sealed staging, exact proposal inspection, and independent bounded verification are implemented, but the HTTP/OpenAI adapters, runtime tool loop, user-reachable subscription execution, stale-safe promotion, built-in tools, TUI interaction, and Telegram gateway are not implemented. Only the four placeholder commands `serve`, `pair`, `doctor`, and `sessions` return not-implemented errors; Clap's built-in `help` command displays help.
+## Try Carl locally
 
-Authentication and adapter code do not enable a live coding task. The auth and Codex
-exec boundaries are tested with offline provider fakes; this repository does not
-claim that a live OAuth ceremony or subscription-backed coding task has succeeded.
-
-The repository is being developed in public so the storage, event, provider, and policy boundaries can be reviewed before consequential tool execution exists.
-
-## Features
-
-Implemented and covered by deterministic tests:
-
-- versioned, provider-neutral events plus stable IDs and typed, sanitized errors;
-- hard turn-budget accounting primitives;
-- SQLite WAL storage with checksum-verified forward migrations;
-- append-only session events and durable session, memory, and approval lifecycles;
-- a provider trait and deterministic scripted provider for offline contract tests;
-- supervised, isolated provider sidecars for provider-owned authentication;
-- a deterministic JSON authentication CLI for status, login, and logout;
-- layered Codex model/reasoning settings plus an inert, version-pinned
-  `codex exec --json` adapter with bounded normalized events;
-- normalized external-agent policy that makes safe external-agent requests default to
-  exact owner approval and denies writable live-workspace access, environment grants,
-  and provider-network mismatch;
-- expiring actor/session/turn/request-bound approvals that are atomically single-use,
-  plus non-retaining high-confidence secret detection;
-- deterministic, bounded, owner-only, capability-relative, secret-filtered staging
-  copies that exclude credentials, provider configuration, VCS metadata, links,
-  special files, hooks, plugins, skills, and compatibility instructions;
-- private, quota-bounded content-addressed baseline/proposal storage with sealed
-  source identity, startup reachability cleanup, plus process-free inspection that
-  accepts only no changes or one exact existing UTF-8 file replacement;
-- fresh, independently reconstructed verification candidates; approved executable
-  and literal-argv attestation; credential-free bounded process-tree supervision;
-  sanitized durable results; and post-commit-only verified-proposal capabilities;
-- a Clap command/help shell for the remaining planned top-level interface.
-
-The approved v1 design adds a shared runtime loop, OpenAI and OpenAI-compatible HTTP adapters, bounded workspace tools, a TUI, explicit memory, and an owner-only Telegram gateway. These are roadmap items, not current capabilities.
-
-No subscription coding task is CLI-reachable. The implemented safety modules are
-library boundaries only; stale-safe promotion and run-engine orchestration remain
-unavailable.
-
-## Quick start
-
-The project currently requires the Rust toolchain declared in `rust-toolchain.toml`. Build the foundation, run its tests, and inspect the only supported CLI behavior:
+Carl requires the Rust toolchain in `rust-toolchain.toml`, Codex CLI `0.146.0`, an
+absolute pre-existing private data directory, and a local ChatGPT subscription login.
 
 ```sh
-cargo build --locked
-cargo test --all-features --locked
-cargo run --locked -- --help
+cargo build --locked --release
+mkdir -m 700 "$HOME/.carl"
+export CARL_DATA_DIR="$HOME/.carl"
+carl auth login openai
+carl acp --permission-mode default
 ```
 
-If the binary is already on `PATH`, the equivalent help command is:
+Use `--model <id>` and `--effort low|medium|high|xhigh|max|ultra` to select values
+reported by the active provider. A local operator can explicitly launch unrestricted
+execution with `carl acp --dangerously-bypass-permissions`; see the
+[Buzz guide](docs/buzz.md) before enabling bypass remotely.
+
+## Use Carl from Buzz
+
+Install the same Carl binary as both `carl` and the `carl-buzz-mcp` argv-zero alias,
+install the trusted Buzz CLI, authenticate Codex locally, then use Buzz's custom ACP
+harness settings:
 
 ```sh
-carl --help
+export BUZZ_ACP_AGENT_COMMAND=carl
+export BUZZ_ACP_AGENT_ARGS=acp
+export BUZZ_ACP_MCP_COMMAND=carl-buzz-mcp
+export BUZZ_ACP_AGENTS=1
+export BUZZ_ACP_RESPOND_TO=owner-only
+export BUZZ_ACP_PERMISSION_MODE=default
 ```
 
-Do not rely on `serve`, `pair`, `doctor`, or `sessions` yet; they are placeholders.
+The exact setup, tested Buzz revision, approval commands, restart behavior, and
+credential boundary are in [docs/buzz.md](docs/buzz.md).
 
 ## Subscription authentication
 
-Carl can ask separately installed provider executables to authenticate consumer
-subscriptions. The exact supported commands are:
+Carl delegates consumer OAuth ceremonies and credential storage to separately
+installed provider executables. It never implements undocumented OAuth or receives
+subscription bearer or refresh tokens.
 
 ```sh
 carl auth status
@@ -89,109 +77,88 @@ carl auth login grok --device
 carl auth logout grok
 ```
 
-These commands require Codex CLI `0.136.0` and Grok Build `0.2.111`. Carl never
-installs or updates provider executables. `carl auth status` performs only local
-provider-owned authentication handshakes. Login and logout are local,
-foreground-only mutations; safe deterministic JSON goes to stdout while challenges,
-warnings, and provider terminal output stay on the verified local stderr terminal.
+These commands require Codex CLI `0.146.0` and Grok Build `0.2.111`. Carl never
+installs or updates provider executables. Login and logout are local, foreground-only
+mutations. Codex owns `$CODEX_HOME/auth.json` in explicit `file` mode, and Grok owns
+`$GROK_HOME/auth.json`. Carl validates each credential file as a bounded, regular,
+non-linked, owner-only file but never opens or reads the file. Authentication state
+does not itself prove current subscription or model entitlement.
 
-The implemented auth configuration is deliberately narrow:
+The supported non-secret executable and data settings are `CARL_DATA_DIR`,
+`CARL_CODEX_EXECUTABLE`, `CARL_GROK_EXECUTABLE`, and `CARL_BUZZ_EXECUTABLE`.
+Provider homes remain fixed at `$CARL_DATA_DIR/providers/codex` and
+`$CARL_DATA_DIR/providers/grok`. See the
+[configuration guide](docs/configuration.md).
 
-- `CARL_DATA_DIR` is an absolute, pre-existing trusted data directory;
-- `CARL_CODEX_EXECUTABLE` optionally selects an absolute Codex executable instead of
-  the default `codex` command;
-- `CARL_GROK_EXECUTABLE` optionally selects an absolute Grok executable instead of the
-  default `grok` command.
+There is no API-key fallback for `carl acp`: if `OPENAI_API_KEY` is present, startup
+fails instead of silently changing billing or authentication. API-key access and
+consumer subscription access are separate products and billing paths. A future
+native OpenAI adapter would use an OpenAI Platform API key and a future native xAI
+adapter would use an xAI API key; a ChatGPT, SuperGrok, or eligible X subscription
+does not become either API key.
 
-Provider homes are fixed at `$CARL_DATA_DIR/providers/codex` and
-`$CARL_DATA_DIR/providers/grok`; there is no arbitrary home override. Codex owns its
-credentials in the operating-system keyring, while Grok owns
-`$GROK_HOME/auth.json`. Carl supervises the provider processes and inspects only safe
-authentication state, never subscription bearer or refresh tokens. See the
-[configuration guide](docs/configuration.md) for the complete boundary.
-
-## Architecture
-
-Both planned frontends feed one provider-neutral event stream and are forbidden from calling providers or tools directly:
+## Architecture and safety
 
 ```text
-TUI (planned) --------+
-                      +--> runtime --> provider
-Telegram (planned) ---+       |
-                              +--> policy --> tools
-                              |
-                              +--> append-only event log --> projections
+Buzz / ACP client
+       |
+       v
+  Carl ACP  ---> durable Carl kernel ---> Codex app-server ---> subscription
+       |                 |
+       |                 +--> exact approvals and permission state
+       `--> restricted carl-buzz-mcp publisher ---> originating Buzz thread
 ```
 
-Today, the event model, storage layer, budget primitives, provider boundary, scripted
-adapter, provider-owned authentication sidecars, an inert Codex exec adapter,
-external-agent policy, exact approvals, secret filtering, sealed staging, and exact
-replacement proposal inspection, and independent bounded verification exist. The
-subscription run engine, promotion pipeline, native runtime, production adapters,
-and frontends remain planned. See the [architecture guide](docs/architecture.md), the
-[approved Carl design](docs/superpowers/specs/2026-07-23-carl-top-tier-harness-design.md),
-and the decisions on [event-sourced execution](docs/adr/0001-event-sourced-runtime.md),
-a [single-process v1](docs/adr/0002-single-process-v1.md), and
-[provider-owned subscription authentication](docs/adr/0004-subscription-authentication-through-provider-sidecars.md).
+Implemented foundations include provider-neutral events, SQLite WAL persistence,
+versioned migrations, bounded sidecars, actor/session/turn/request-bound approvals
+that are atomically single-use, and external-agent requests default to exact owner
+approval. The closed evaluator denies writable live-workspace access. Capability-relative,
+secret-filtered staging, content-addressed artifacts, and independent bounded
+verification also exist as library boundaries. Stale-safe promotion and run-engine
+orchestration remain unavailable outside the ACP execution path.
 
-## Security model
+The ACP runtime isolates Buzz credentials from Codex and rejects unknown
+credential-bearing MCP descriptors. Model output, repository content, remote input,
+and tool requests remain untrusted. Shell isolation is lifecycle- and policy-based;
+it is not a complete security sandbox. Read the [architecture guide](docs/architecture.md)
+and [security model](docs/security.md) before enabling consequential execution.
 
-Carl treats model output, remote messages, fetched content, and tool arguments as
-untrusted. External-agent requests now have a closed policy, exact durable approvals,
-non-retaining secret checks, and isolated sanitized staging. These controls are not a
-general runtime policy engine or a process sandbox, and they do not make delegate
-execution user-reachable. See the [security model](docs/security.md) and
-[security policy](SECURITY.md).
-
-**Shell isolation is policy- and process-based in the v1 design; it is not a complete security sandbox.** A future `shell.exec` tool must not be treated as containment for hostile code, even after its workspace, timeout, environment-filtering, and cancellation controls are implemented.
-
-## Provider access and billing
-
-API-key access and consumer subscription access are separate products and billing
-paths. Future native OpenAI and xAI model adapters will require an OpenAI Platform API
-key or xAI API key respectively. A ChatGPT, SuperGrok, or eligible X subscription
-login through the auth CLI does not become an API key, fund API usage, or give Carl a
-raw model-sampling interface.
-
-Carl does not read or reuse subscription credentials. It delegates documented login
-to the pinned provider executable and does not call undocumented OAuth endpoints.
-Authentication reports provider-owned local state only: it neither proves current
-subscription/model entitlement nor enables model execution or delegates. See the
-[configuration guide](docs/configuration.md), the
-[documented-authentication ADR](docs/adr/0003-no-undocumented-oauth.md), and the
-[subscription-sidecar ADR](docs/adr/0004-subscription-authentication-through-provider-sidecars.md).
-
-## Telegram pairing
-
-The Telegram gateway is not implemented. The v1 target uses outbound long polling with no public listener and permits exactly one paired owner in one private chat. Pairing will use a short-lived, one-time code; re-pairing invalidates the previous owner. Group, channel, guest, and unpaired updates will be rejected before model invocation. The planned flow and remote approval rules are documented in the [Telegram guide](docs/telegram.md).
+The approved long-term design remains the
+[top-tier harness design](docs/superpowers/specs/2026-07-23-carl-top-tier-harness-design.md).
+The ACP/Buzz extension is documented in the
+[Buzz design](docs/superpowers/specs/2026-08-10-carl-buzz-acp-design.md). The current
+single-process decision is recorded in
+[ADR 0002](docs/adr/0002-single-process-v1.md), and provider-owned authentication in
+[ADR 0004](docs/adr/0004-subscription-authentication-through-provider-sidecars.md).
 
 ## Development
 
-Start with [CONTRIBUTING.md](CONTRIBUTING.md). The local quality gate is:
+Normal tests are deterministic, offline, credential-free, and include the pinned
+Buzz ACP fixtures and real-process end-to-end path. The opt-in subscription smoke is
+documented in the [Buzz guide](docs/buzz.md) and is excluded from public CI.
 
 ```sh
-cargo fmt --check
+cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-features
-cargo test --doc
+cargo test --locked
+cargo build --locked --release
 ```
 
-Public behavior should be developed test-first with deterministic fixtures; normal tests must not require live model or Telegram credentials. Changes follow the [Code of Conduct](CODE_OF_CONDUCT.md), and notable work is recorded in the [changelog](CHANGELOG.md).
+Start with [CONTRIBUTING.md](CONTRIBUTING.md). Security reports follow
+[SECURITY.md](SECURITY.md), and notable changes are in [CHANGELOG.md](CHANGELOG.md).
 
 ## Roadmap
 
-- [x] Provider-neutral domain contracts, budgets, and durable event storage
-- [x] Provider interface and deterministic scripted provider
-- [x] Provider-owned subscription authentication CLI and sidecar supervision
-- [x] External-agent policy, exact approval, secret-filter, and staging foundations
-- [ ] Production HTTP/OpenAI-compatible adapters
-- [ ] Subscription-backed delegate execution
-- [ ] Runtime tool/approval loop, policy engine, and bounded built-in tools
-- [ ] Interactive TUI and session operations
-- [ ] Owner-only Telegram long-polling gateway
-- [ ] Cross-platform CI and checksummed releases
-
-The [approved design](docs/superpowers/specs/2026-07-23-carl-top-tier-harness-design.md) is the source of truth for v1 scope; checkboxes here describe repository state, not release promises.
+- [x] Durable provider-neutral domain, storage, and event contracts
+- [x] Provider-owned OpenAI and Grok subscription authentication
+- [x] Subscription-backed Codex ACP execution
+- [x] Buzz-compatible ACP frontend and restricted publication adapter
+- [x] Exact remote approvals, model/effort modes, steering, and cancellation
+- [ ] Interactive local TUI
+- [ ] Owner-only Telegram gateway
+- [ ] Grok execution adapter
+- [ ] Native tools, broader sandboxing, and stale-safe promotion
+- [ ] Cross-platform release packaging
 
 ## License
 
