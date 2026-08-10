@@ -75,7 +75,7 @@ docs/benchmarks.md
 - Produces stable enums `OutcomeStatus`, `FailureClass`, and `MetricKind` whose serialized wire values are lowercase snake case.
 - Uses `Path` only at process boundaries; report-facing models store repository-relative POSIX strings or digests.
 
-- [ ] **Step 1: Write failing model validation tests**
+- [x] **Step 1: Write failing model validation tests**
 
 Test that valid bounded values round-trip to dictionaries and that empty/oversized IDs, negative durations/costs/tokens, pass rates outside `[0, 1]`, duplicate trial IDs, non-finite numbers, and an infrastructure-invalid result carrying an agent-failure code are rejected.
 
@@ -99,21 +99,21 @@ def test_trial_result_separates_agent_failure_from_invalid_run() -> None:
     assert invalid.failure_class is FailureClass.INFRASTRUCTURE
 ```
 
-- [ ] **Step 2: Run the focused test and verify RED**
+- [x] **Step 2: Run the focused test and verify RED**
 
 Run: `cd benchmarks && uv run --python 3.12 pytest tests/test_models.py -q`
 
 Expected: FAIL because `carl_bench.models` does not exist.
 
-- [ ] **Step 3: Add the locked package configuration**
+- [x] **Step 3: Add the locked package configuration**
 
 Define Python `>=3.12,<3.13`, a `carl-bench` console script, pytest `8.4.1`, Ruff, and Harbor `0.17.1` in the `harbor` dependency group. Generate and commit `benchmarks/uv.lock`. Configure pytest to add `src` to the import path and Ruff for Python 3.12 with a 100-character line length.
 
-- [ ] **Step 4: Implement minimal frozen models and validation**
+- [x] **Step 4: Implement minimal frozen models and validation**
 
 Keep constructors closed over stable failure codes. `TrialResult.to_public_dict()` must omit every optional field rather than serializing unknown content. `Scorecard` must reject summaries whose counts do not equal their included trial population.
 
-- [ ] **Step 5: Ignore only generated benchmark artifacts**
+- [x] **Step 5: Ignore only generated benchmark artifacts**
 
 Add these exact repository-relative ignores without hiding task fixtures or expected files:
 
@@ -125,7 +125,7 @@ benchmarks/results/private/
 benchmarks/results/public/*.json
 ```
 
-- [ ] **Step 6: Verify and commit**
+- [x] **Step 6: Verify and commit**
 
 Run:
 
