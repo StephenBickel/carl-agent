@@ -1,3 +1,5 @@
+mod app_events;
+mod app_server;
 mod events;
 
 use std::ffi::OsString;
@@ -14,6 +16,11 @@ use crate::sidecar::{
     VersionOutputFormat,
 };
 
+pub use app_events::{
+    CodexApprovalDecision, CodexApprovalKind, CodexApprovalRequest, CodexEvent, CodexThreadId,
+    CodexTurnId,
+};
+pub use app_server::{CodexAppServer, CodexModel, StartThread, StartTurn};
 pub use events::{
     CodexEventNormalizer, CodexProtocolError, CodexProtocolErrorCode, DelegateActivityKind,
     DelegateEvent, DelegateItemPhase, DelegateTerminal, DelegateUsage,
