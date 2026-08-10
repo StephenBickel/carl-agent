@@ -432,7 +432,7 @@ Expected: FAIL because `CarlAcpAdapter` does not exist.
 
 Port the protocol shape from `scripts/live-codex-acp-smoke.mjs`, not its task-specific assertions. Cap frames at 1 MiB, stderr at 256 KiB, notifications at 10,000, and pending requests at 16. Terminate the full process group on every error.
 
-- [ ] **Step 4: Reuse the adapter from the existing live smoke**
+- [x] **Step 4: Reuse the adapter from the existing live smoke**
 
 Replace duplicated Node protocol logic only after the Python adapter passes its fake contract. Keep `scripts/live-codex-acp-smoke.mjs` as a thin compatibility launcher or replace it with a documented invocation of `carl-bench run --adapter carl-acp`; preserve the existing boolean-only metadata guarantees.
 
@@ -510,29 +510,29 @@ carl-bench compare --baseline PATH --candidate PATH --public-result PATH
 ```
 
 - `run` refuses attempts outside `1..10`, unknown task selectors, a public result inside a task/workspace tree, live adapters without explicit absolute executables, and Carl/Codex comparisons whose model or effort differ when `--league same-model` is selected.
-- [ ] **Step 1: Write failing CLI tests**
+- [x] **Step 1: Write failing CLI tests**
 
 Test help, validation, scripted run, comparison, invalid arguments, partial result cleanup, SIGINT, task selection order, same-model mismatch, and absence of raw output in the resulting JSON.
 
-- [ ] **Step 2: Run focused tests and verify RED**
+- [x] **Step 2: Run focused tests and verify RED**
 
 Run: `cd benchmarks && uv run pytest tests/test_cli.py -q`
 
 Expected: FAIL because the console entry point is not implemented.
 
-- [ ] **Step 3: Implement CLI orchestration**
+- [x] **Step 3: Implement CLI orchestration**
 
 Use `argparse`, async entry through `asyncio.run`, and exit codes `0` success, `2` usage/configuration error, `3` completed run with agent failures, `4` infrastructure-invalid run, and `130` cancellation. Never print model output; human stdout is a bounded metric summary.
 
-- [ ] **Step 4: Add an offline smoke script**
+- [x] **Step 4: Add an offline smoke script**
 
 `scripts/benchmark-smoke.sh` must run task validation, one scripted attempt across all three tasks, assert a 100% score, and write its result only to a temporary directory. Use `set -euo pipefail`, locate the repository without assuming cwd, and call `uv` with the locked project.
 
-- [ ] **Step 5: Document exact local commands and limits**
+- [x] **Step 5: Document exact local commands and limits**
 
 Explain scripted plumbing tests, live Carl, live Codex, same-model pairing, private diagnostics, public report guarantees, protected holdout paths, and why Carl is not installed inside Harbor yet.
 
-- [ ] **Step 6: Verify and commit**
+- [x] **Step 6: Verify and commit**
 
 Run:
 
