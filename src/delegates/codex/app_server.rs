@@ -473,7 +473,13 @@ impl CodexAppServer {
                 }
                 Incoming::Request(value) => {
                     let approval = parse_approval_request(value)?;
-                    self.require_active_turn(approval.thread_id(), approval.turn_id())?;
+                    if self
+                        .require_active_turn(approval.thread_id(), approval.turn_id())
+                        .is_err()
+                    {
+                        self.send_approval_response(&approval, CodexApprovalDecision::Deny)?;
+                        return Err(protocol_error());
+                    }
                     let mode = self
                         .threads
                         .get(approval.thread_id().as_str())

@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use carl::acp::{PermissionMode, PermissionProfile};
 use carl::delegates::codex::{
-    CodexAppServer, CodexApprovalDecision, CodexEvent, StartThread, StartTurn,
+    CodexAppServer, CodexApprovalDecision, CodexEvent, DelegateErrorCode, StartThread, StartTurn,
 };
 use carl::delegates::{ModelId, ReasoningEffort};
 use carl::sidecar::{
@@ -36,6 +36,10 @@ fn main() {
         test(
             "Codex app-server normalizes events approvals steering and interrupt",
             lifecycle_and_approval,
+        ),
+        test(
+            "Codex app-server denies invalid bypass approvals before protocol failure",
+            invalid_bypass_approval_is_denied_before_protocol_failure,
         ),
     ];
     libtest_mimic::run(&Arguments::from_args(), trials).exit();
@@ -184,6 +188,62 @@ fn lifecycle_and_approval() -> Result<(), Box<dyn Error + Send + Sync>> {
     })
 }
 
+fn invalid_bypass_approval_is_denied_before_protocol_failure()
+-> Result<(), Box<dyn Error + Send + Sync>> {
+    run_async(async {
+        for (scenario, approval_id) in [
+            ("cross-turn", "approval-invalid-cross-turn"),
+            ("cross-thread", "approval-invalid-cross-thread"),
+        ] {
+            let layout = TestLayout::new()?;
+            let mut server = connect(&layout).await?;
+            server.models().await?;
+            let thread = server
+                .start_thread(StartThread {
+                    cwd: layout.workspace.clone(),
+                    model: Some(ModelId::parse("gpt-5.6-codex")?),
+                    mode: PermissionMode::BypassPermissions,
+                })
+                .await?;
+            server
+                .start_turn(StartTurn {
+                    thread_id: thread,
+                    input: format!("invalid bypass approval {scenario}"),
+                    model: Some(ModelId::parse("gpt-5.6-codex")?),
+                    effort: Some(ReasoningEffort::High),
+                    mode: PermissionMode::BypassPermissions,
+                })
+                .await?;
+            assert!(matches!(
+                server.next_event().await?,
+                CodexEvent::ThreadStarted { .. }
+            ));
+            assert!(matches!(
+                server.next_event().await?,
+                CodexEvent::TurnStarted { .. }
+            ));
+            assert!(matches!(
+                server.next_event().await?,
+                CodexEvent::ItemStarted { .. }
+            ));
+
+            let error = server
+                .next_event()
+                .await
+                .expect_err("the invalid approval binding must fail the provider protocol");
+            assert_eq!(error.code(), DelegateErrorCode::ProtocolFailed);
+            let response =
+                wait_for_json(&layout.home.join("invalid-approval-response.json")).await?;
+            assert_eq!(
+                response,
+                json!({"id":approval_id,"result":{"decision":"decline"}})
+            );
+            server.cancel().await?;
+        }
+        Ok(())
+    })
+}
+
 async fn connect(layout: &TestLayout) -> Result<CodexAppServer, Box<dyn Error + Send + Sync>> {
     let specification = SidecarCommand {
         executable: env::current_exe()?,
@@ -325,7 +385,14 @@ fn app_server_fixture() -> i32 {
                 if write_message(&json!({"id":id,"result":result})).is_err() {
                     return 74;
                 }
-                for notification in turn_notifications() {
+                let input = request["params"]["input"][0]["text"]
+                    .as_str()
+                    .unwrap_or_default();
+                let notifications = match input.strip_prefix("invalid bypass approval ") {
+                    Some(scenario) => invalid_approval_notifications(scenario),
+                    None => turn_notifications(),
+                };
+                for notification in notifications {
                     if write_message(&notification).is_err() {
                         return 74;
                     }
@@ -356,6 +423,15 @@ fn app_server_fixture() -> i32 {
                     .is_err()
                 {
                     return 74;
+                }
+                continue;
+            }
+            None if request.get("id").and_then(Value::as_str).is_some_and(|id| {
+                id == "approval-invalid-cross-turn" || id == "approval-invalid-cross-thread"
+            }) =>
+            {
+                if fs::write(home.join("invalid-approval-response.json"), line).is_err() {
+                    return 73;
                 }
                 continue;
             }
@@ -431,6 +507,22 @@ fn turn_notifications() -> Vec<Value> {
     notifications
 }
 
+fn invalid_approval_notifications(scenario: &str) -> Vec<Value> {
+    let (approval_id, thread_id, turn_id) = match scenario {
+        "cross-turn" => ("approval-invalid-cross-turn", "thr_123", "turn_other"),
+        "cross-thread" => ("approval-invalid-cross-thread", "thr_other", "turn_123"),
+        _ => return Vec::new(),
+    };
+    vec![
+        json!({"method":"turn/started","params":{"threadId":"thr_123","turn":{"id":"turn_123","items":[],"status":"inProgress"}},"emittedAtMs":2}),
+        json!({"method":"item/started","params":{"threadId":"thr_123","turnId":"turn_123","startedAtMs":1,"item":{"type":"agentMessage","id":"item_123","text":""}},"emittedAtMs":2}),
+        json!({"id":approval_id,"method":"item/commandExecution/requestApproval","params":{
+            "threadId":thread_id,"turnId":turn_id,"itemId":"item_123","startedAtMs":2,
+            "command":"cargo test","reason":"Run the test suite","cwd":null
+        }}),
+    ]
+}
+
 fn append_request(home: &Path, request: &Value) -> std::io::Result<()> {
     let mut file = fs::OpenOptions::new()
         .create(true)
@@ -461,6 +553,19 @@ fn run_async<T>(future: impl std::future::Future<Output = T>) -> T {
         .build()
         .unwrap()
         .block_on(future)
+}
+
+async fn wait_for_json(path: &Path) -> Result<Value, Box<dyn Error + Send + Sync>> {
+    for _ in 0..100 {
+        match fs::read(path) {
+            Ok(bytes) => return Ok(serde_json::from_slice(&bytes)?),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err("invalid approval response was not received".into())
 }
 
 struct TestLayout {
