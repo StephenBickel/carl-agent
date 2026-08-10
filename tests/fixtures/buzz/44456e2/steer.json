@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","id":5,"method":"_session/steering","params":{"sessionId":"$SESSION","prompt":[{"type":"text","text":"focus on the smallest safe patch"}]}}

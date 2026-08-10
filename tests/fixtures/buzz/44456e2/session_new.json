@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"$WORKSPACE","mcpServers":[{"name":"carl-buzz-mcp","command":"carl-buzz-mcp","args":[],"env":[{"name":"BUZZ_RELAY_URL","value":"ws://127.0.0.1:7777"},{"name":"BUZZ_PRIVATE_KEY","value":"fixture-private-key"}]}]}}

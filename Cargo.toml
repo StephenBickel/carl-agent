@@ -58,6 +58,16 @@ name = "acp_cli_contract"
 path = "tests/acp_cli_contract.rs"
 harness = false
 
+[[test]]
+name = "buzz_acp_contract"
+path = "tests/buzz_acp_contract.rs"
+harness = false
+
+[[test]]
+name = "buzz_end_to_end"
+path = "tests/buzz_end_to_end.rs"
+harness = false
+
 [dependencies]
 # Dependency review: cap-std 3.x supplies the held-directory, relative-path
 # filesystem API used to build disposable delegate stages without handing

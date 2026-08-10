@@ -835,6 +835,8 @@ impl KernelActor {
                         Event::WorkspaceDiffUpdated { diff: diff.clone() },
                     )
                     .map_err(map_storage)?;
+                self.publish(session_id, turn_id, DeliveryKind::Diff, &diff)
+                    .await?;
                 updates.push(KernelUpdate::DiffUpdated(diff));
             }
             CodexEvent::ApprovalRequested(approval) => {
@@ -1215,10 +1217,7 @@ impl KernelActor {
         session_id: SessionId,
         context: BuzzContext,
     ) -> Result<(), KernelError> {
-        let state = self
-            .sessions
-            .get_mut(&session_id)
-            .ok_or_else(unknown_session)?;
+        let state = self.sessions.get(&session_id).ok_or_else(unknown_session)?;
         if state.frontend != Frontend::Buzz
             || state
                 .active
@@ -1230,6 +1229,16 @@ impl KernelActor {
         let actor = ActorId::parse(context.actor_hex()).map_err(|_| invalid_input())?;
         let channel = crate::storage::ChannelId::try_from(context.channel_id().to_string())
             .map_err(map_storage)?;
+        if self.sessions.iter().any(|(other_id, other)| {
+            *other_id != session_id
+                && other.cwd == state.cwd
+                && other
+                    .buzz_context
+                    .as_ref()
+                    .is_some_and(|existing| existing.channel_id() == context.channel_id())
+        }) {
+            return Err(KernelError::from_code(KernelErrorCode::ApprovalUnavailable));
+        }
         if let Some(existing) = state.buzz_context.as_ref()
             && (existing.channel_id() != context.channel_id()
                 || existing.actor_hex() != context.actor_hex())
@@ -1238,8 +1247,12 @@ impl KernelActor {
         }
         self.store
             .store()
-            .attach_frontend_channel(&state.public.external_session_id, &channel, Utc::now())
+            .claim_frontend_channel(&state.public.external_session_id, &channel, Utc::now())
             .map_err(map_storage)?;
+        let state = self
+            .sessions
+            .get_mut(&session_id)
+            .ok_or_else(unknown_session)?;
         state.actor_id = actor;
         state.buzz_context = Some(context);
         Ok(())
