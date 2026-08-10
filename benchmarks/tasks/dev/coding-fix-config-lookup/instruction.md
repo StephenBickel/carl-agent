@@ -1,0 +1,1 @@
+The configuration resolver returns the wrong value when several sources are present. Inspect the project and tests, fix the implementation, and keep the public API and tests intact. Command-line input must win over environment input, which must win over the config file, which must win over the default. Falsy values such as an empty string are explicit values, not missing values.

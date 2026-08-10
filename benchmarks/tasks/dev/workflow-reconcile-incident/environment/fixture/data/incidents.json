@@ -1,0 +1,16 @@
+[
+  {
+    "incident_id": "inc-100",
+    "service": "checkout",
+    "severity": "sev1",
+    "status": "triggered",
+    "owner": null
+  },
+  {
+    "incident_id": "inc-200",
+    "service": "search",
+    "severity": "sev3",
+    "status": "resolved",
+    "owner": "bob"
+  }
+]

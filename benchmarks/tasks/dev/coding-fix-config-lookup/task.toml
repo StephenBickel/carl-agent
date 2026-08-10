@@ -1,0 +1,31 @@
+schema_version = "1.3"
+artifacts = []
+
+[task]
+name = "carl/coding-fix-config-lookup"
+description = "Repair a deterministic configuration precedence bug."
+keywords = ["coding", "python", "debugging"]
+
+[[task.authors]]
+name = "Carl Bench"
+
+[metadata]
+
+[verifier]
+timeout_sec = 60.0
+collect = []
+
+[verifier.env]
+
+[agent]
+timeout_sec = 180.0
+
+[environment]
+network_mode = "none"
+build_timeout_sec = 600.0
+os = "linux"
+mcp_servers = []
+
+[environment.env]
+
+[solution.env]
