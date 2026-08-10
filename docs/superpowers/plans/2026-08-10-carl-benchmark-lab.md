@@ -560,27 +560,27 @@ Commit: `git commit -m "feat: expose the Carl benchmark lab"`
 - It writes Harbor job logs beneath an explicitly supplied temporary/output root, never beneath task source directories.
 - Docker absence/unavailability returns a stable skip exit code `77`; a task/oracle/nop mismatch returns non-zero failure.
 
-- [ ] **Step 1: Write failing static Harbor-contract tests**
+- [x] **Step 1: Write failing static Harbor-contract tests**
 
 Without Docker, assert schema version `1.3`, Dockerfile immutability, `network_mode = "none"`, verifier reward path, executable test/solution scripts, no host mounts, no secrets, and the local/Harbor verifier semantic checks share the same Python implementation.
 
-- [ ] **Step 2: Run focused tests and verify RED**
+- [x] **Step 2: Run focused tests and verify RED**
 
 Run: `cd benchmarks && uv run pytest tests/test_harbor_contract.py -q`
 
 Expected: FAIL until task Dockerfiles and scripts satisfy the exact Harbor contract.
 
-- [ ] **Step 3: Implement the pinned Harbor validator**
+- [x] **Step 3: Implement the pinned Harbor validator**
 
 Invoke `uvx --from harbor==0.17.1 harbor run` with local task paths and `oracle`, then `nop`. Use explicit job directories and one concurrent task by default. Do not pass Carl data, Codex home, API keys, or the ambient environment into Harbor.
 
-- [ ] **Step 4: Run Docker validation**
+- [x] **Step 4: Run Docker validation**
 
 Run: `./scripts/benchmark-harbor-validate.sh`
 
 Expected: every oracle reward is `1`, every nop reward is `0`. If Docker is unavailable, record the skip in the commit message body and leave static tests green; do not weaken the validator.
 
-- [ ] **Step 5: Verify and commit**
+- [x] **Step 5: Verify and commit**
 
 Run all benchmark tests, Ruff, offline smoke, and the Harbor validator.
 

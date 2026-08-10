@@ -87,3 +87,17 @@ trials are surfaced but excluded from pass-rate denominators.
   and `PATH`. Harbor validation deliberately receives neither Carl nor Codex credentials.
 - Public tasks are useful for development and regression detection, but serious promotion decisions
   also need protected holdouts to reduce benchmark overfitting.
+
+## Harbor parity
+
+Harbor is pinned to `0.17.1` and provides a second execution path for the public task contracts. The
+validator runs both the Harbor `oracle` agent (required reward `1`) and `nop` agent (required reward
+`0`) for every task. Harbor receives a closed allowlisted environment and never receives Carl data,
+Codex home, or provider API keys.
+
+```bash
+./scripts/benchmark-harbor-validate.sh /absolute/private/path/to/harbor-results
+```
+
+The validator performs static task validation first. If Docker is missing or unhealthy it exits
+`77`; schema, network, verifier, and image-pin checks remain covered by the normal Python suite.
