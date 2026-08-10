@@ -43,6 +43,11 @@ name = "verification_contract"
 path = "tests/verification_contract.rs"
 harness = false
 
+[[test]]
+name = "buzz_adapter_contract"
+path = "tests/buzz_adapter_contract.rs"
+harness = false
+
 [dependencies]
 # Dependency review: cap-std 3.x supplies the held-directory, relative-path
 # filesystem API used to build disposable delegate stages without handing

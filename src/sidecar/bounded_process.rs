@@ -5,7 +5,7 @@ use std::process::{ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 
@@ -21,6 +21,7 @@ const MAX_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
 const MAX_ENVIRONMENT_ENTRIES: usize = 64;
 const MAX_ENVIRONMENT_BYTES: usize = 64 * 1024;
+const MAX_STDIN_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct BoundedProcessLimits {
@@ -192,6 +193,52 @@ pub(crate) async fn run_bounded_process(
     limits: BoundedProcessLimits,
     cancellation: CancellationToken,
 ) -> Result<BoundedProcessResult, SidecarError> {
+    run_bounded_process_inner(
+        executable,
+        arguments,
+        environment,
+        cwd,
+        limits,
+        cancellation,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn run_bounded_process_with_stdin(
+    executable: &TrustedExecutable,
+    arguments: &[OsString],
+    environment: &ClosedEnvironment,
+    cwd: &ExecutionWorkspace,
+    limits: BoundedProcessLimits,
+    cancellation: CancellationToken,
+    stdin: &[u8],
+) -> Result<BoundedProcessResult, SidecarError> {
+    if stdin.len() > MAX_STDIN_BYTES {
+        return Err(invalid_configuration());
+    }
+    run_bounded_process_inner(
+        executable,
+        arguments,
+        environment,
+        cwd,
+        limits,
+        cancellation,
+        Some(stdin.to_vec()),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_bounded_process_inner(
+    executable: &TrustedExecutable,
+    arguments: &[OsString],
+    environment: &ClosedEnvironment,
+    cwd: &ExecutionWorkspace,
+    limits: BoundedProcessLimits,
+    cancellation: CancellationToken,
+    stdin: Option<Vec<u8>>,
+) -> Result<BoundedProcessResult, SidecarError> {
     if cancellation.is_cancelled() {
         return Ok(BoundedProcessResult {
             outcome: BoundedProcessOutcome::Cancelled,
@@ -206,7 +253,11 @@ pub(crate) async fn run_bounded_process(
     let mut command = Command::new(executable.canonical_path());
     command
         .args(arguments)
-        .stdin(Stdio::null())
+        .stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
@@ -234,6 +285,19 @@ pub(crate) async fn run_bounded_process(
         .stderr()
         .take()
         .ok_or_else(|| SidecarError::from_code(SidecarErrorCode::SpawnFailed))?;
+    let mut stdin_task = match stdin {
+        Some(input) => {
+            let mut pipe = child
+                .stdin()
+                .take()
+                .ok_or_else(|| SidecarError::from_code(SidecarErrorCode::SpawnFailed))?;
+            Some(tokio::spawn(async move {
+                pipe.write_all(&input).await?;
+                pipe.shutdown().await
+            }))
+        }
+        None => None,
+    };
     let process = Arc::new(Mutex::new(SidecarProcessGuard::new(child)));
     let mut cleanup = ProcessCleanupGuard::new(Arc::clone(&process), limits);
     let budget = Arc::new(Mutex::new(OutputBudget {
@@ -308,6 +372,16 @@ pub(crate) async fn run_bounded_process(
         }
     };
     let duration = supervision_started.elapsed();
+
+    let stdin_result = match stdin_task.as_mut() {
+        Some(task) => tokio::time::timeout(limits.forced_shutdown_timeout, task).await,
+        None => Ok(Ok(Ok(()))),
+    };
+    if matches!(&outcome, BoundedProcessOutcome::Exited(status) if status.success())
+        && !matches!(stdin_result, Ok(Ok(Ok(()))))
+    {
+        return Err(SidecarError::from_code(SidecarErrorCode::SpawnFailed));
+    }
 
     if matches!(outcome, BoundedProcessOutcome::Exited(_)) && output_limit.is_cancelled() {
         outcome = BoundedProcessOutcome::OutputLimitExceeded;

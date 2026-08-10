@@ -20,6 +20,7 @@ mod jsonl;
 
 pub(crate) use bounded_process::{
     BoundedProcessLimits, BoundedProcessOutcome, ClosedEnvironment, run_bounded_process,
+    run_bounded_process_with_stdin,
 };
 pub use exec_jsonl::{ExecutionWorkspace, JsonlEventProcess, JsonlProcessOutcome};
 
