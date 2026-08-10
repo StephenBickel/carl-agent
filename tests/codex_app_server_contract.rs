@@ -10,8 +10,8 @@ use std::time::Duration;
 
 use carl::acp::{PermissionMode, PermissionProfile};
 use carl::delegates::codex::{
-    CodexAppServer, CodexApprovalDecision, CodexEvent, CodexItem, DelegateErrorCode, StartThread,
-    StartTurn,
+    CodexAppServer, CodexApprovalDecision, CodexEvent, CodexItem, CodexThreadId, CodexTurnId,
+    DelegateErrorCode, StartThread, StartTurn,
 };
 use carl::delegates::{ModelId, ReasoningEffort};
 use carl::sidecar::{
@@ -50,8 +50,55 @@ fn main() {
             "Codex app-server fails closed on malformed long-horizon evidence",
             malformed_long_horizon_evidence_fails_closed,
         ),
+        test(
+            "Codex normalized item diagnostics redact execution evidence",
+            normalized_item_diagnostics_are_redacted,
+        ),
     ];
     libtest_mimic::run(&Arguments::from_args(), trials).exit();
+}
+
+fn normalized_item_diagnostics_are_redacted() -> Result<(), Box<dyn Error + Send + Sync>> {
+    let item = CodexItem::Command {
+        item_id: "item-secret".into(),
+        command: "command-secret-7f39".into(),
+        cwd: "/cwd-secret-7f39".into(),
+        status: "failed".into(),
+        exit_code: Some(17),
+        aggregated_output: Some("output-secret-7f39".into()),
+        process_id: Some("process-secret-7f39".into()),
+    };
+    let item_debug = format!("{item:?}");
+    let event_debug = format!(
+        "{:?}",
+        CodexEvent::ItemCompleted {
+            thread_id: CodexThreadId::parse("thread-debug")?,
+            turn_id: CodexTurnId::parse("turn-debug")?,
+            item,
+        }
+    );
+    let file_debug = format!(
+        "{:?}",
+        CodexItem::FileChange {
+            item_id: "file-secret".into(),
+            status: "failed".into(),
+            changes: json!([{"diff":"file-payload-secret-7f39"}]),
+        }
+    );
+    for secret in [
+        "command-secret-7f39",
+        "/cwd-secret-7f39",
+        "output-secret-7f39",
+        "process-secret-7f39",
+        "file-payload-secret-7f39",
+    ] {
+        assert!(!item_debug.contains(secret));
+        assert!(!event_debug.contains(secret));
+        assert!(!file_debug.contains(secret));
+    }
+    assert!(item_debug.contains("failed"));
+    assert!(event_debug.contains("ItemCompleted"));
+    Ok(())
 }
 
 fn long_horizon_protocol_contract_is_pinned() -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -340,6 +387,7 @@ fn malformed_long_horizon_evidence_fails_closed() -> Result<(), Box<dyn Error + 
             "overflowing-token-count",
             "oversized-output",
             "malformed-command",
+            "malformed-command-action",
             "unknown-command-field",
         ] {
             let layout = TestLayout::new()?;
@@ -745,6 +793,11 @@ fn malformed_evidence_notifications(scenario: &str) -> Vec<Value> {
             "type":"commandExecution","id":"command_123","command":"cargo test",
             "status":"completed","exitCode":0,"durationMs":1,
             "aggregatedOutput":"ok","processId":null,"commandActions":[]
+        })),
+        "malformed-command-action" => command_notification(json!({
+            "type":"commandExecution","id":"command_123","command":"cargo test",
+            "cwd":"/workspace","status":"completed","exitCode":0,"durationMs":1,
+            "aggregatedOutput":"ok","processId":null,"commandActions":[null]
         })),
         "unknown-command-field" => command_notification(json!({
             "type":"commandExecution","id":"command_123","command":"cargo test",

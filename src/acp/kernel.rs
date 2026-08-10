@@ -401,7 +401,7 @@ struct ActiveTurn {
     provider_turn_id: CodexTurnId,
     pending_approval: Option<PendingApproval>,
     assistant_text: String,
-    item_ids: HashMap<String, ToolCallId>,
+    item_ids: HashMap<String, (ToolCallId, CodexApprovalKind)>,
 }
 
 struct PendingApproval {
@@ -776,14 +776,21 @@ impl KernelActor {
             }
             CodexEvent::ItemStarted { item, .. } => {
                 let item_id = item.item_id().to_owned();
-                if matches!(
-                    item,
-                    CodexItem::Command { .. } | CodexItem::FileChange { .. }
-                ) {
+                let kind = match item {
+                    CodexItem::Command { .. } => Some(CodexApprovalKind::Command),
+                    CodexItem::FileChange { .. } => Some(CodexApprovalKind::FileChange),
+                    CodexItem::ContextCompaction { .. } | CodexItem::Other { .. } => None,
+                };
+                if let Some(kind) = kind {
                     let tool_call_id = ToolCallId::new();
-                    self.active_turn_mut(session_id)?
+                    if self
+                        .active_turn_mut(session_id)?
                         .item_ids
-                        .insert(item_id.clone(), tool_call_id);
+                        .insert(item_id.clone(), (tool_call_id, kind))
+                        .is_some()
+                    {
+                        return Err(provider_error());
+                    }
                 }
                 self.persist_lifecycle(session_id, Some(turn_id), "item_started", &item_id)?;
             }
@@ -809,25 +816,36 @@ impl KernelActor {
             }
             CodexEvent::ItemCompleted { item, .. } => {
                 let item_id = item.item_id().to_owned();
-                let status = match &item {
+                let completion = match &item {
                     CodexItem::Command { status, .. } | CodexItem::FileChange { status, .. } => {
-                        if status == "completed" {
-                            Some(ToolStatus::Completed)
-                        } else {
-                            Some(ToolStatus::Failed)
-                        }
+                        let kind = match item {
+                            CodexItem::Command { .. } => CodexApprovalKind::Command,
+                            CodexItem::FileChange { .. } => CodexApprovalKind::FileChange,
+                            CodexItem::ContextCompaction { .. } | CodexItem::Other { .. } => {
+                                unreachable!()
+                            }
+                        };
+                        let tool_status = match status.as_str() {
+                            "completed" => ToolStatus::Completed,
+                            "failed" | "declined" => ToolStatus::Failed,
+                            _ => return Err(provider_error()),
+                        };
+                        Some((kind, status.clone(), tool_status))
                     }
                     CodexItem::ContextCompaction { .. } | CodexItem::Other { .. } => None,
                 };
-                let Some(status) = status else {
+                let Some((kind, provider_status, status)) = completion else {
                     self.persist_lifecycle(session_id, Some(turn_id), "item_completed", &item_id)?;
                     return Ok(None);
                 };
-                let tool_call_id = self
+                let (tool_call_id, started_kind) = self
                     .active_turn_mut(session_id)?
                     .item_ids
                     .remove(&item_id)
-                    .unwrap_or_else(ToolCallId::new);
+                    .ok_or_else(provider_error)?;
+                if started_kind != kind {
+                    return Err(provider_error());
+                }
                 self.store
                     .store_mut()
                     .append(
@@ -835,7 +853,7 @@ impl KernelActor {
                         Some(turn_id),
                         Event::ToolCompleted {
                             tool_call_id,
-                            output: json!({"status":"completed"}),
+                            output: json!({"status":provider_status}),
                         },
                     )
                     .map_err(map_storage)?;
@@ -944,7 +962,12 @@ impl KernelActor {
             (
                 approval.thread_id() == &state.provider_thread,
                 approval.turn_id() == &active.provider_turn_id && turn_id == active.local_turn_id,
-                active.item_ids.get(approval.item_id()).copied(),
+                active
+                    .item_ids
+                    .get(approval.item_id())
+                    .copied()
+                    .filter(|(_, kind)| *kind == approval.kind())
+                    .map(|(tool_call_id, _)| tool_call_id),
             )
         };
         let Some(tool_call_id) = tool_call_id.filter(|_| thread_matches && turn_matches) else {
@@ -1064,7 +1087,14 @@ impl KernelActor {
             .item_ids
             .get(approval.item_id())
             .copied()
-            .unwrap_or_else(ToolCallId::new);
+            .filter(|(_, kind)| *kind == approval.kind())
+            .map(|(tool_call_id, _)| tool_call_id);
+        let Some(tool_call_id) = tool_call_id else {
+            self.codex
+                .resolve_approval(&approval, CodexApprovalDecision::Deny)
+                .await?;
+            return Err(provider_error());
+        };
         let approval_id = ApprovalId::new();
         let now = Utc::now();
         let binding = BoundApprovalBinding::new(

@@ -168,7 +168,7 @@ pub struct CodexTokenUsage {
     pub model_context_window: Option<u64>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub enum CodexItem {
     Command {
         item_id: String,
@@ -191,6 +191,49 @@ pub enum CodexItem {
         item_id: String,
         item_type: String,
     },
+}
+
+impl fmt::Debug for CodexItem {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Command {
+                status,
+                exit_code,
+                aggregated_output,
+                process_id,
+                ..
+            } => formatter
+                .debug_struct("CodexItem::Command")
+                .field("item_id", &"<redacted>")
+                .field("command", &"<redacted>")
+                .field("cwd", &"<redacted>")
+                .field("status", status)
+                .field("exit_code", exit_code)
+                .field("has_aggregated_output", &aggregated_output.is_some())
+                .field("has_process_id", &process_id.is_some())
+                .finish(),
+            Self::FileChange {
+                status, changes, ..
+            } => formatter
+                .debug_struct("CodexItem::FileChange")
+                .field("item_id", &"<redacted>")
+                .field("status", status)
+                .field(
+                    "change_count",
+                    &changes.as_array().map_or(0, std::vec::Vec::len),
+                )
+                .finish(),
+            Self::ContextCompaction { .. } => formatter
+                .debug_struct("CodexItem::ContextCompaction")
+                .field("item_id", &"<redacted>")
+                .finish(),
+            Self::Other { .. } => formatter
+                .debug_struct("CodexItem::Other")
+                .field("item_id", &"<redacted>")
+                .field("item_type", &"<redacted>")
+                .finish(),
+        }
+    }
 }
 
 impl CodexItem {
@@ -437,6 +480,9 @@ fn parse_item(value: &Value) -> Result<CodexItem, DelegateError> {
             if actions.len() > 256 || serialized_len(actions)? > MAX_ITEM_PAYLOAD_BYTES {
                 return Err(protocol_error());
             }
+            for action in actions {
+                validate_command_action(action)?;
+            }
             let exit_code = optional_i32(item.get("exitCode"))?;
             let aggregated_output =
                 optional_string(item.get("aggregatedOutput"), MAX_AGGREGATED_OUTPUT_BYTES)?;
@@ -481,6 +527,57 @@ fn parse_item(value: &Value) -> Result<CodexItem, DelegateError> {
             Ok(CodexItem::Other { item_id, item_type })
         }
     }
+}
+
+fn validate_command_action(value: &Value) -> Result<(), DelegateError> {
+    let action = value.as_object().ok_or_else(protocol_error)?;
+    let action_type = parse_bounded_string(
+        action.get("type").ok_or_else(protocol_error)?,
+        MAX_PROVIDER_ID_BYTES,
+    )?;
+    match action_type.as_str() {
+        "read" => {
+            require_keys(action, &["type", "command", "name", "path"], &[])?;
+            parse_bounded_string(
+                action.get("command").ok_or_else(protocol_error)?,
+                MAX_COMMAND_BYTES,
+            )?;
+            parse_bounded_string(
+                action.get("name").ok_or_else(protocol_error)?,
+                MAX_PROVIDER_ID_BYTES,
+            )?;
+            parse_bounded_string(
+                action.get("path").ok_or_else(protocol_error)?,
+                MAX_COMMAND_BYTES,
+            )?;
+        }
+        "listFiles" => {
+            require_keys(action, &["type", "command"], &["path"])?;
+            parse_bounded_string(
+                action.get("command").ok_or_else(protocol_error)?,
+                MAX_COMMAND_BYTES,
+            )?;
+            optional_string(action.get("path"), MAX_COMMAND_BYTES)?;
+        }
+        "search" => {
+            require_keys(action, &["type", "command"], &["path", "query"])?;
+            parse_bounded_string(
+                action.get("command").ok_or_else(protocol_error)?,
+                MAX_COMMAND_BYTES,
+            )?;
+            optional_string(action.get("path"), MAX_COMMAND_BYTES)?;
+            optional_string(action.get("query"), MAX_COMMAND_BYTES)?;
+        }
+        "unknown" => {
+            require_keys(action, &["type", "command"], &[])?;
+            parse_bounded_string(
+                action.get("command").ok_or_else(protocol_error)?,
+                MAX_COMMAND_BYTES,
+            )?;
+        }
+        _ => return Err(protocol_error()),
+    }
+    Ok(())
 }
 
 fn parse_token_usage(value: &Value) -> Result<CodexTokenUsage, DelegateError> {

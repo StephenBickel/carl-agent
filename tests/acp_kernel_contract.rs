@@ -129,6 +129,172 @@ async fn unknown_codex_items_are_not_reported_as_successful_tools() -> TestResul
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn orphaned_known_tool_completion_fails_without_a_completion_journal() -> TestResult {
+    let layout = Layout::new()?;
+    let port = ScriptedPort::with_events([
+        CodexEvent::ItemCompleted {
+            thread_id: thread()?,
+            turn_id: turn()?,
+            item: command_item("orphan-command", "completed"),
+        },
+        CodexEvent::TurnCompleted {
+            thread_id: thread()?,
+            turn_id: turn()?,
+            status: "completed".into(),
+        },
+    ]);
+    let kernel = Kernel::start_with_ports(layout.runtime()?, Box::new(port), None).await?;
+    let session = kernel
+        .new_session(new_session(&layout, Frontend::Acp, None)?)
+        .await?;
+    let error = kernel
+        .prompt(session.id(), Prompt::new(vec!["inspect this repo".into()])?)
+        .await
+        .expect_err("a known completion must bind to a started item");
+    assert_eq!(error.code(), carl::acp::KernelErrorCode::ProviderFailed);
+    let events = Store::open(&layout.database)?.read_events(session.id())?;
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event.event, Event::ToolCompleted { .. }))
+    );
+    kernel.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn known_tool_completion_kind_mismatch_fails_without_a_completion_journal() -> TestResult {
+    let layout = Layout::new()?;
+    let port = ScriptedPort::with_events([
+        CodexEvent::ItemStarted {
+            thread_id: thread()?,
+            turn_id: turn()?,
+            item: command_item("changed-kind", "inProgress"),
+        },
+        CodexEvent::ItemCompleted {
+            thread_id: thread()?,
+            turn_id: turn()?,
+            item: file_change_item("changed-kind", "completed"),
+        },
+        CodexEvent::TurnCompleted {
+            thread_id: thread()?,
+            turn_id: turn()?,
+            status: "completed".into(),
+        },
+    ]);
+    let kernel = Kernel::start_with_ports(layout.runtime()?, Box::new(port), None).await?;
+    let session = kernel
+        .new_session(new_session(&layout, Frontend::Acp, None)?)
+        .await?;
+    let error = kernel
+        .prompt(session.id(), Prompt::new(vec!["inspect this repo".into()])?)
+        .await
+        .expect_err("a completion cannot change the started item kind");
+    assert_eq!(error.code(), carl::acp::KernelErrorCode::ProviderFailed);
+    let events = Store::open(&layout.database)?.read_events(session.id())?;
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event.event, Event::ToolCompleted { .. }))
+    );
+    kernel.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn duplicate_known_tool_completion_fails_without_a_second_completion_journal() -> TestResult {
+    let layout = Layout::new()?;
+    let port = ScriptedPort::with_events([
+        CodexEvent::ItemStarted {
+            thread_id: thread()?,
+            turn_id: turn()?,
+            item: command_item("duplicate-command", "inProgress"),
+        },
+        CodexEvent::ItemCompleted {
+            thread_id: thread()?,
+            turn_id: turn()?,
+            item: command_item("duplicate-command", "completed"),
+        },
+        CodexEvent::ItemCompleted {
+            thread_id: thread()?,
+            turn_id: turn()?,
+            item: command_item("duplicate-command", "completed"),
+        },
+        CodexEvent::TurnCompleted {
+            thread_id: thread()?,
+            turn_id: turn()?,
+            status: "completed".into(),
+        },
+    ]);
+    let kernel = Kernel::start_with_ports(layout.runtime()?, Box::new(port), None).await?;
+    let session = kernel
+        .new_session(new_session(&layout, Frontend::Acp, None)?)
+        .await?;
+    let error = kernel
+        .prompt(session.id(), Prompt::new(vec!["inspect this repo".into()])?)
+        .await
+        .expect_err("a completed item cannot complete a second time");
+    assert_eq!(error.code(), carl::acp::KernelErrorCode::ProviderFailed);
+    let events = Store::open(&layout.database)?.read_events(session.id())?;
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event.event, Event::ToolCompleted { .. }))
+            .count(),
+        1
+    );
+    kernel.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn failed_and_declined_tool_statuses_are_durable() -> TestResult {
+    for terminal_status in ["failed", "declined"] {
+        let layout = Layout::new()?;
+        let item_id = format!("command-{terminal_status}");
+        let port = ScriptedPort::with_events([
+            CodexEvent::ItemStarted {
+                thread_id: thread()?,
+                turn_id: turn()?,
+                item: command_item(&item_id, "inProgress"),
+            },
+            CodexEvent::ItemCompleted {
+                thread_id: thread()?,
+                turn_id: turn()?,
+                item: command_item(&item_id, terminal_status),
+            },
+            CodexEvent::TurnCompleted {
+                thread_id: thread()?,
+                turn_id: turn()?,
+                status: "completed".into(),
+            },
+        ]);
+        let kernel = Kernel::start_with_ports(layout.runtime()?, Box::new(port), None).await?;
+        let session = kernel
+            .new_session(new_session(&layout, Frontend::Acp, None)?)
+            .await?;
+        let outcome = kernel
+            .prompt(session.id(), Prompt::new(vec!["inspect this repo".into()])?)
+            .await?;
+        assert!(outcome.updates.iter().any(|update| matches!(
+            update,
+            carl::acp::KernelUpdate::ToolCompleted {
+                status: carl::acp::ToolStatus::Failed,
+                ..
+            }
+        )));
+        let events = Store::open(&layout.database)?.read_events(session.id())?;
+        let output = events.iter().find_map(|event| match &event.event {
+            Event::ToolCompleted { output, .. } => Some(output),
+            _ => None,
+        });
+        assert_eq!(output, Some(&json!({"status":terminal_status})));
+        kernel.shutdown().await?;
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn remote_approval_is_exact_single_use_and_resumes_the_same_turn() -> TestResult {
     let layout = Layout::new()?;
     let port = ScriptedPort::approval()?;
@@ -743,6 +909,14 @@ fn command_item(item_id: &str, status: &str) -> CodexItem {
         exit_code: (status == "completed").then_some(0),
         aggregated_output: None,
         process_id: None,
+    }
+}
+
+fn file_change_item(item_id: &str, status: &str) -> CodexItem {
+    CodexItem::FileChange {
+        item_id: item_id.into(),
+        status: status.into(),
+        changes: json!([]),
     }
 }
 
