@@ -54,6 +54,15 @@ for raw_line in sys.stdin:
             continue
         if mode == "early-exit":
             raise SystemExit(7)
+        if mode == "early-exit-child":
+            child = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(60)"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            (workspace / "acp-child.pid").write_text(str(child.pid), encoding="utf-8")
+            raise SystemExit(7)
         if mode in {"timeout", "cancel"}:
             child = subprocess.Popen(
                 [sys.executable, "-c", "import time; time.sleep(60)"],

@@ -155,15 +155,19 @@ def _valid_trial_map(scorecard: Scorecard) -> dict[tuple[str, str, int, int], Tr
     return result
 
 
-def _bootstrap_interval(differences: tuple[int, ...], seed: int) -> tuple[float, float]:
-    if not differences:
+def _bootstrap_interval(clusters: tuple[tuple[int, ...], ...], seed: int) -> tuple[float, float]:
+    if not clusters:
         return 0.0, 0.0
     generator = random.Random(seed)
-    count = len(differences)
-    samples = sorted(
-        sum(generator.choice(differences) for _ in range(count)) / count
-        for _ in range(BOOTSTRAP_RESAMPLES)
-    )
+    cluster_count = len(clusters)
+    samples: list[float] = []
+    for _ in range(BOOTSTRAP_RESAMPLES):
+        selected = tuple(generator.choice(clusters) for _ in range(cluster_count))
+        samples.append(
+            sum(sum(cluster) for cluster in selected)
+            / sum(len(cluster) for cluster in selected)
+        )
+    samples.sort()
     return samples[499], samples[9_499]
 
 
@@ -198,12 +202,16 @@ def compare_runs(baseline: Scorecard, candidate: Scorecard, *, comparison_seed: 
     )
     baseline_rate = _rate(baseline_passed, len(pairs))
     candidate_rate = _rate(candidate_passed, len(pairs))
-    differences = tuple(
-        int(candidate_trial.status is OutcomeStatus.PASSED)
-        - int(baseline_trial.status is OutcomeStatus.PASSED)
-        for baseline_trial, candidate_trial in pairs
+    clustered_differences: dict[tuple[str, str], list[int]] = defaultdict(list)
+    for baseline_trial, candidate_trial in pairs:
+        clustered_differences[(baseline_trial.task_id, baseline_trial.task_digest)].append(
+            int(candidate_trial.status is OutcomeStatus.PASSED)
+            - int(baseline_trial.status is OutcomeStatus.PASSED)
+        )
+    confidence_lower, confidence_upper = _bootstrap_interval(
+        tuple(tuple(clustered_differences[key]) for key in sorted(clustered_differences)),
+        comparison_seed,
     )
-    confidence_lower, confidence_upper = _bootstrap_interval(differences, comparison_seed)
 
     task_counts = Counter((trial.task_id, trial.task_digest) for trial, _ in pairs)
     tracks: dict[str, list[tuple[TrialResult, TrialResult]]] = defaultdict(list)
@@ -256,6 +264,6 @@ def compare_runs(baseline: Scorecard, candidate: Scorecard, *, comparison_seed: 
         track_deltas=track_deltas,
         decision=decision,
         gate_reasons=reasons,
-        algorithm=f"paired-bootstrap-v1-{BOOTSTRAP_RESAMPLES}",
+        algorithm=f"task-clustered-paired-bootstrap-v1-{BOOTSTRAP_RESAMPLES}",
         comparison_seed=comparison_seed,
     )

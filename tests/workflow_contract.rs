@@ -4,6 +4,8 @@ use serde_yaml_ng::{Mapping, Value};
 
 const CHECKOUT_ACTION: &str = "actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683";
 const CHECKOUT_TAG: &str = "v4.2.2";
+const SETUP_UV_ACTION: &str = "astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990";
+const SETUP_UV_TAG: &str = "v8.3.2";
 
 fn repository_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -66,7 +68,11 @@ fn run_commands<'a>(job: &'a Mapping, context: &str) -> Result<Vec<&'a str>, Str
         .collect()
 }
 
-fn validate_common(root: &Mapping, workflow: &str) -> Result<(), String> {
+fn validate_common(
+    root: &Mapping,
+    workflow: &str,
+    allowed_actions: &[(&str, &str)],
+) -> Result<(), String> {
     reject_keys(root, "workflow", &["defaults", "env"])?;
 
     let permissions = value_map(
@@ -131,7 +137,10 @@ fn validate_common(root: &Mapping, workflow: &str) -> Result<(), String> {
                     .ok_or_else(|| format!("{context} step `uses` must be a string"))?
                     .trim();
                 validate_action_pin(action)?;
-                if action != CHECKOUT_ACTION {
+                if !allowed_actions
+                    .iter()
+                    .any(|(allowed, _)| action == *allowed)
+                {
                     return Err(format!("unapproved workflow action: {action}"));
                 }
                 *discovered_actions.entry(action.to_owned()).or_default() += 1;
@@ -143,12 +152,23 @@ fn validate_common(root: &Mapping, workflow: &str) -> Result<(), String> {
         return Err("workflow must contain at least one structurally valid action step".to_owned());
     }
     for (action, occurrence_count) in discovered_actions {
+        let expected_tag = allowed_actions
+            .iter()
+            .find_map(|(allowed, tag)| (*allowed == action).then_some(*tag))
+            .ok_or_else(|| format!("unapproved workflow action: {action}"))?;
         let tagged_line_count = workflow
             .lines()
-            .filter(|line| action_line_has_expected_tag_comment(line, &action))
+            .filter(|line| action_line_has_expected_tag_comment(line, &action, expected_tag))
             .count();
         if tagged_line_count != occurrence_count {
-            return Err("checkout action uses must have the exact `# v4.2.2` comment".to_owned());
+            let action_name = if action == CHECKOUT_ACTION {
+                "checkout action"
+            } else {
+                "action"
+            };
+            return Err(format!(
+                "{action_name} uses must have the exact `# {expected_tag}` comment"
+            ));
         }
     }
 
@@ -181,7 +201,7 @@ fn validate_action_pin(action: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn action_line_has_expected_tag_comment(line: &str, action: &str) -> bool {
+fn action_line_has_expected_tag_comment(line: &str, action: &str, expected_tag: &str) -> bool {
     let line = line.trim_start();
     let Some(after_uses) = line
         .strip_prefix("- uses:")
@@ -192,7 +212,7 @@ fn action_line_has_expected_tag_comment(line: &str, action: &str) -> bool {
     let Some((raw_action, comment)) = after_uses.split_once('#') else {
         return false;
     };
-    raw_action.trim() == action && comment.trim() == CHECKOUT_TAG
+    raw_action.trim() == action && comment.trim() == expected_tag
 }
 
 fn value_contains_secrets_context(value: &Value) -> bool {
@@ -335,7 +355,7 @@ fn trigger_is_unrestricted(trigger: &Value) -> bool {
 fn validate_ci_workflow(workflow: &str) -> Result<(), String> {
     let document = parse_workflow(workflow)?;
     let root = value_map(&document, "workflow")?;
-    validate_common(root, workflow)?;
+    validate_common(root, workflow, &[(CHECKOUT_ACTION, CHECKOUT_TAG)])?;
 
     let triggers = triggers(root)?;
     validate_exact_trigger_keys(
@@ -454,7 +474,7 @@ fn validate_ci_workflow(workflow: &str) -> Result<(), String> {
 fn validate_security_workflow(workflow: &str) -> Result<(), String> {
     let document = parse_workflow(workflow)?;
     let root = value_map(&document, "workflow")?;
-    validate_common(root, workflow)?;
+    validate_common(root, workflow, &[(CHECKOUT_ACTION, CHECKOUT_TAG)])?;
 
     let triggers = triggers(root)?;
     validate_exact_trigger_keys(
@@ -507,8 +527,99 @@ fn validate_security_workflow(workflow: &str) -> Result<(), String> {
     validate_required_job_steps(security, "jobs.security")
 }
 
+fn validate_benchmark_workflow(workflow: &str) -> Result<(), String> {
+    let document = parse_workflow(workflow)?;
+    let root = value_map(&document, "workflow")?;
+    validate_common(
+        root,
+        workflow,
+        &[
+            (CHECKOUT_ACTION, CHECKOUT_TAG),
+            (SETUP_UV_ACTION, SETUP_UV_TAG),
+        ],
+    )?;
+
+    let triggers = triggers(root)?;
+    validate_exact_trigger_keys(
+        triggers,
+        &["push", "pull_request"],
+        "`push` and `pull_request`",
+    )?;
+    let push = value_map(field(triggers, "push", "workflow.on")?, "workflow.on.push")?;
+    let branches = field(push, "branches", "workflow.on.push")?
+        .as_sequence()
+        .ok_or_else(|| "workflow.on.push.branches must be a sequence".to_owned())?;
+    if push.len() != 1 || branches.as_slice() != [Value::String("main".to_owned())] {
+        return Err("workflow.on.push must contain only branches: [main]".to_owned());
+    }
+    if !trigger_is_unrestricted(field(triggers, "pull_request", "workflow.on")?) {
+        return Err("workflow.on.pull_request must be unrestricted".to_owned());
+    }
+
+    let jobs = value_map(field(root, "jobs", "workflow")?, "workflow.jobs")?;
+    if jobs.len() != 1 {
+        return Err("benchmark workflow must contain exactly one job".to_owned());
+    }
+    let benchmark = job(jobs, "benchmark-contracts")?;
+    validate_required_job(benchmark, "jobs.benchmark-contracts")?;
+    if string_field(benchmark, "name", "jobs.benchmark-contracts")? != "Benchmark contracts" {
+        return Err("benchmark job must retain its stable name".to_owned());
+    }
+    if string_field(benchmark, "runs-on", "jobs.benchmark-contracts")? != "ubuntu-latest" {
+        return Err("benchmark job must run on ubuntu-latest".to_owned());
+    }
+    require_commands(
+        benchmark,
+        "jobs.benchmark-contracts",
+        &[
+            "uv sync --project benchmarks --python 3.12 --locked",
+            "uv run --offline --project benchmarks --locked pytest -q benchmarks/tests",
+            "uv run --offline --project benchmarks --locked ruff check benchmarks",
+            "./scripts/benchmark-smoke.sh",
+        ],
+    )?;
+    validate_required_job_steps(benchmark, "jobs.benchmark-contracts")?;
+
+    let setup_steps: Vec<_> = steps(benchmark, "jobs.benchmark-contracts")?
+        .into_iter()
+        .filter(|step| {
+            step.get(Value::String("uses".to_owned()))
+                .and_then(Value::as_str)
+                == Some(SETUP_UV_ACTION)
+        })
+        .collect();
+    if setup_steps.len() != 1 {
+        return Err("benchmark workflow must install uv exactly once".to_owned());
+    }
+    let setup = setup_steps[0];
+    let inputs = value_map(
+        field(setup, "with", "benchmark setup-uv step")?,
+        "benchmark setup-uv step.with",
+    )?;
+    if string_field(inputs, "version", "benchmark setup-uv step.with")? != "0.10.4"
+        || string_field(inputs, "python-version", "benchmark setup-uv step.with")? != "3.12"
+        || field(inputs, "enable-cache", "benchmark setup-uv step.with")?.as_bool() != Some(true)
+        || string_field(
+            inputs,
+            "cache-dependency-glob",
+            "benchmark setup-uv step.with",
+        )? != "benchmarks/uv.lock"
+        || string_field(inputs, "cache-local-path", "benchmark setup-uv step.with")?
+            != "~/.cache/uv"
+        || field(inputs, "cache-python", "benchmark setup-uv step.with")?.as_bool() != Some(false)
+    {
+        return Err("benchmark setup-uv inputs must remain pinned and cache-only".to_owned());
+    }
+
+    Ok(())
+}
+
 fn assert_ci_workflow(workflow: &str) {
     validate_ci_workflow(workflow).unwrap_or_else(|error| panic!("{error}"));
+}
+
+fn assert_benchmark_workflow(workflow: &str) {
+    validate_benchmark_workflow(workflow).unwrap_or_else(|error| panic!("{error}"));
 }
 
 fn replace_in_workflow(name: &str, from: &str, to: &str) -> String {
@@ -560,6 +671,11 @@ fn ci_workflow_enforces_required_cross_platform_checks() {
 }
 
 #[test]
+fn benchmark_workflow_enforces_pinned_offline_contract_checks() {
+    assert_benchmark_workflow(&read_workflow("benchmark-contracts.yml"));
+}
+
+#[test]
 fn checker_rejects_multiline_unpinned_uses() {
     let workflow = r#"
 name: Adversarial
@@ -587,7 +703,7 @@ jobs:
 
     let document = parse_workflow(workflow).unwrap();
     let root = value_map(&document, "workflow").unwrap();
-    let error = validate_common(root, workflow)
+    let error = validate_common(root, workflow, &[(CHECKOUT_ACTION, CHECKOUT_TAG)])
         .expect_err("checker must reject a multiline unpinned action");
     assert!(
         error.contains("exactly 40 lowercase hexadecimal characters"),

@@ -9,6 +9,7 @@ import re
 import signal
 import stat
 import time
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
@@ -74,24 +75,23 @@ async def _drain_stderr(stream: asyncio.StreamReader) -> None:
 
 
 async def _terminate(process: asyncio.subprocess.Process) -> None:
+    if os.name != "nt":
+        with suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGTERM)
+        if process.returncode is None:
+            try:
+                await asyncio.wait_for(process.wait(), timeout=2)
+            except TimeoutError:
+                with suppress(ProcessLookupError):
+                    os.killpg(process.pid, signal.SIGKILL)
+        await process.wait()
+        return
     if process.returncode is None:
-        try:
-            if os.name == "nt":
-                process.terminate()
-            else:
-                os.killpg(process.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
+        process.terminate()
         try:
             await asyncio.wait_for(process.wait(), timeout=2)
         except TimeoutError:
-            try:
-                if os.name == "nt":
-                    process.kill()
-                else:
-                    os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+            process.kill()
     await process.wait()
 
 
@@ -295,6 +295,7 @@ class CarlAcpAdapter:
                 await asyncio.wait_for(exit_task, timeout=3)
                 if process.returncode != 0:
                     raise _AgentExited(process.returncode)
+                await _terminate(process)
         except _OutputOverflow:
             await asyncio.shield(_terminate(process))
             return AgentOutcome.failed(

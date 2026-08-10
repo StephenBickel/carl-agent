@@ -95,6 +95,15 @@ def test_run_rejects_invalid_attempts_and_results_inside_task_tree(tmp_path: Pat
         inside.unlink(missing_ok=True)
 
 
+def test_run_rejects_a_symlinked_public_result(tmp_path: Path) -> None:
+    target = tmp_path / "target.json"
+    target.write_text("preserve me", encoding="utf-8")
+    destination = tmp_path / "result-link.json"
+    destination.symlink_to(target)
+    assert run_scripted(destination) == 2
+    assert target.read_text(encoding="utf-8") == "preserve me"
+
+
 def test_live_adapters_require_explicit_paths_model_and_effort(tmp_path: Path) -> None:
     destination = tmp_path / "live.json"
     common = [
@@ -165,6 +174,31 @@ def test_compare_reads_public_scorecards_and_rejects_same_model_mismatch(
     compared = json.loads(comparison.read_text(encoding="utf-8"))
     assert compared["paired_trials"] == 3
     assert compared["decision"] == "insufficient_evidence"
+
+
+def test_compare_rejects_wrong_json_types_without_a_traceback(tmp_path: Path) -> None:
+    baseline = tmp_path / "baseline.json"
+    malformed = tmp_path / "malformed.json"
+    result = tmp_path / "comparison.json"
+    assert run_scripted(baseline) == 0
+    value = json.loads(baseline.read_text(encoding="utf-8"))
+    value["trials"][0]["track"] = []
+    malformed.write_text(json.dumps(value), encoding="utf-8")
+    assert (
+        cli.main(
+            [
+                "compare",
+                "--baseline",
+                os.fspath(baseline),
+                "--candidate",
+                os.fspath(malformed),
+                "--public-result",
+                os.fspath(result),
+            ]
+        )
+        == 2
+    )
+    assert not result.exists()
 
 
 def test_cancellation_returns_130_without_a_partial_result(

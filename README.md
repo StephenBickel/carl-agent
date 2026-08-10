@@ -177,6 +177,14 @@ cargo build --locked --release
 Start with [CONTRIBUTING.md](CONTRIBUTING.md). Security reports follow
 [SECURITY.md](SECURITY.md), and notable changes are in [CHANGELOG.md](CHANGELOG.md).
 
+## Benchmark lab
+
+The [benchmark lab](docs/benchmarks.md) now provides reproducible coding,
+workflow-automation, and safety tasks plus same-model Carl/Codex comparisons. It is the first layer
+of the approved [improvement-factory design](docs/superpowers/specs/2026-08-10-codex-carl-improvement-factory-design.md),
+but it does not autonomously promote or merge changes; its scorecards are advisory until the
+experiment graph, protected validation, and deterministic promotion controller are implemented.
+
 ## Roadmap
 
 - [x] Durable provider-neutral domain, storage, and event contracts

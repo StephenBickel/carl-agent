@@ -600,23 +600,23 @@ Commit: `git commit -m "test: validate benchmark tasks with Harbor"`
 - CI installs `uv`, syncs Python 3.12 from `benchmarks/uv.lock`, runs pytest/Ruff, and runs the offline benchmark smoke. It does not run Docker, live Carl, live Codex, or protected holdouts.
 - Operator docs define the first manual loop: validate tasks, build Carl, run paired Carl/Codex trials, compare, inspect private evidence, and create an experiment proposal. It must state that comparison output is advisory until the later promotion-controller plan is implemented.
 
-- [ ] **Step 1: Add CI and documentation assertions**
+- [x] **Step 1: Add CI and documentation assertions**
 
 Extend tests to parse the workflow and assert it uses the lockfile, has no credential-bearing environment keys, runs no live adapter, and invokes the offline smoke. Add a docs link checker for local repository paths referenced by `docs/benchmarks.md`.
 
-- [ ] **Step 2: Implement the CI workflow**
+- [x] **Step 2: Implement the CI workflow**
 
 Pin actions by full commit SHA, use least-privilege `contents: read`, set a job timeout, and upload no private logs. Cache only the `uv` package cache keyed by `benchmarks/uv.lock`.
 
-- [ ] **Step 3: Write operator documentation**
+- [x] **Step 3: Write operator documentation**
 
 Include the exact same-model command sequence and explain task digests, attempt seeds, invalid infrastructure runs, public/private evidence, confidence limits, protected holdouts, budget limits from the design spec, and the credential-safe Harbor boundary.
 
-- [ ] **Step 4: Link the benchmark lab from the root README**
+- [x] **Step 4: Link the benchmark lab from the root README**
 
 Add one concise section pointing to `docs/benchmarks.md` and the factory design spec. Do not market the autonomous promoter as shipped.
 
-- [ ] **Step 5: Run the full completion gate**
+- [x] **Step 5: Run the full completion gate**
 
 Run:
 
@@ -636,11 +636,11 @@ git status --short
 
 Run the Harbor validator if Docker is healthy. Run one live Carl/Codex coding comparison only if the existing owner-authenticated executables and data directories are already configured; never create or copy credentials to make the smoke pass.
 
-- [ ] **Step 6: Self-review against the design and update the checklist**
+- [x] **Step 6: Self-review against the design and update the checklist**
 
 Read the complete diff and verify: three task tracks exist; task sources are immutable during runs; public evidence is sanitized; agent and infrastructure failures are disjoint; model/effort equality is enforced in the same-model league; Harbor is pinned; normal CI is offline; no secrets or raw model output are persisted; and the autonomous promotion system is not falsely represented as implemented. Mark completed plan checkboxes in this file.
 
-- [ ] **Step 7: Commit the integration**
+- [x] **Step 7: Commit the integration**
 
 Commit: `git commit -m "ci: verify the benchmark lab"`
 
@@ -648,15 +648,19 @@ Commit: `git commit -m "ci: verify the benchmark lab"`
 
 ## Exit criteria for this plan
 
-- [ ] `./scripts/benchmark-smoke.sh` passes from a clean checkout without credentials or network access after dependencies are installed.
-- [ ] All three public tasks fail before their oracle solution and pass after it.
-- [ ] The same task digests and verifier semantics are used by the trusted local runner and Harbor.
-- [ ] A fake Carl ACP process and fake Codex CLI exercise every live-adapter error path offline.
-- [ ] When owner authentication already exists, Carl and Codex can be run with the same model/effort on fresh task copies and produce comparable sanitized scorecards.
-- [ ] Public result JSON is provably free of prompts, model output, stderr, credentials, absolute owner paths, and repository contents.
-- [ ] Infrastructure-invalid trials are excluded from benchmark pass-rate denominators and surfaced separately.
-- [ ] Harbor 0.17.1 oracle/nop validation passes, or Docker absence is reported as exit `77` without weakening static validation.
-- [ ] The root Rust suite and benchmark Python suite are green.
+- [x] `./scripts/benchmark-smoke.sh` passes from a clean checkout without credentials or network access after dependencies are installed.
+- [x] All three public tasks fail before their oracle solution and pass after it.
+- [x] The same task digests and verifier semantics are used by the trusted local runner and Harbor.
+- [x] A fake Carl ACP process and fake Codex CLI exercise every live-adapter error path offline.
+- [x] When owner authentication already exists, Carl and Codex can be run with the same model/effort on fresh task copies and produce comparable sanitized scorecards.
+- [x] Public result JSON is provably free of prompts, model output, stderr, credentials, absolute owner paths, and repository contents.
+- [x] Infrastructure-invalid trials are excluded from benchmark pass-rate denominators and surfaced separately.
+- [x] Harbor 0.17.1 oracle/nop validation passes, or Docker absence is reported as exit `77` without weakening static validation.
+- [x] The root Rust suite and benchmark Python suite are green.
+
+Live Carl/Codex execution was not attempted on 2026-08-10 because the owner-authenticated Carl
+data directory, explicit Codex executable, and release Carl binary were not all present. The full
+offline process contracts passed; Docker was unavailable and the Harbor validator returned `77`.
 
 ## Plans unlocked by this milestone
 

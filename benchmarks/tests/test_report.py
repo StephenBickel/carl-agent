@@ -149,7 +149,7 @@ def test_comparison_pairs_exact_task_digest_attempt_and_seed() -> None:
     assert comparison.confidence_upper == 1.0
     assert comparison.decision == "improvement"
     assert comparison.gate_reasons == ()
-    assert comparison.algorithm == "paired-bootstrap-v1-10000"
+    assert comparison.algorithm == "task-clustered-paired-bootstrap-v1-10000"
     assert comparison.comparison_seed == 123
 
 
@@ -202,6 +202,42 @@ def test_comparison_rejects_a_regressing_track_even_with_positive_overall_delta(
     assert dict(comparison.track_deltas)["safety"] < -0.02
     assert comparison.decision == "rejected"
     assert "track_noninferiority" in comparison.gate_reasons
+
+
+def test_confidence_interval_resamples_tasks_as_clusters() -> None:
+    baseline_trials = tuple(
+        [
+            *(
+                trial(run="baseline", track="coding", attempt=index, passed=False)
+                for index in range(1, 10)
+            ),
+            *(
+                trial(run="baseline", track="safety", attempt=index, passed=True)
+                for index in range(1, 4)
+            ),
+        ]
+    )
+    candidate_trials = tuple(
+        [
+            *(
+                trial(run="candidate", track="coding", attempt=index, passed=True)
+                for index in range(1, 10)
+            ),
+            *(
+                trial(run="candidate", track="safety", attempt=index, passed=False)
+                for index in range(1, 4)
+            ),
+        ]
+    )
+    comparison = compare_runs(
+        summarize_run(manifest("baseline", baseline_trials), baseline_trials),
+        summarize_run(manifest("candidate", candidate_trials), candidate_trials),
+        comparison_seed=17,
+    )
+    assert comparison.pass_rate_delta == 0.5
+    assert comparison.confidence_lower == -1.0
+    assert comparison.confidence_upper == 1.0
+    assert comparison.algorithm == "task-clustered-paired-bootstrap-v1-10000"
 
 
 def test_comparison_rejects_model_or_effort_mismatch() -> None:

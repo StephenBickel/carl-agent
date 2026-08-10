@@ -36,6 +36,15 @@ if mode == "environment" and not environment_safe:
     raise SystemExit(8)
 if mode == "nonzero":
     raise SystemExit(7)
+if mode == "nonzero-child":
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    (workspace / "codex-child.pid").write_text(str(child.pid), encoding="utf-8")
+    raise SystemExit(7)
 if mode == "signal":
     os.kill(os.getpid(), signal.SIGTERM)
 if mode == "malformed":

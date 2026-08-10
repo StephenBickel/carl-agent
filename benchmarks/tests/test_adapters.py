@@ -138,6 +138,21 @@ async def test_scripted_adapter_rejects_missing_symlinked_and_non_executable_sol
 
 
 @pytest.mark.asyncio
+async def test_scripted_adapter_reaps_descendant_after_leader_exit(tmp_path: Path) -> None:
+    if os.name == "nt":
+        pytest.skip("process-group descendant assertion is Unix-only")
+    workspace = tmp_path / "workspace-orphan"
+    workspace.mkdir()
+    solution = executable_script(
+        tmp_path / "orphan.sh",
+        "#!/bin/sh\nset -eu\nsleep 60 >/dev/null 2>&1 &\nprintf '%s' \"$!\" > child.pid\nexit 7\n",
+    )
+    outcome = await ScriptedAdapter().run(request(workspace, solution))
+    assert outcome.failure_code == "agent_exit_nonzero"
+    await assert_pid_gone(int((workspace / "child.pid").read_text(encoding="utf-8")))
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["normal", "partial", "environment"])
 async def test_carl_acp_completes_v2_without_retaining_provider_text(
     tmp_path: Path, mode: str, monkeypatch: pytest.MonkeyPatch
@@ -209,6 +224,17 @@ async def test_carl_acp_cancellation_reaps_descendants(tmp_path: Path) -> None:
     with pytest.raises(asyncio.CancelledError):
         await running
     await assert_pid_gone(int((workspace / "acp-leader.pid").read_text(encoding="utf-8")))
+    await assert_pid_gone(int((workspace / "acp-child.pid").read_text(encoding="utf-8")))
+
+
+@pytest.mark.asyncio
+async def test_carl_acp_reaps_descendant_after_leader_exit(tmp_path: Path) -> None:
+    if os.name == "nt":
+        pytest.skip("process-group descendant assertion is Unix-only")
+    adapter, agent_request = carl_request(tmp_path, "early-exit-child")
+    outcome = await adapter.run(agent_request)
+    assert outcome.failure_code == "agent_exit_nonzero"
+    workspace = Path(agent_request.workspace)
     await assert_pid_gone(int((workspace / "acp-child.pid").read_text(encoding="utf-8")))
 
 
@@ -336,6 +362,17 @@ async def test_codex_cli_cancellation_reaps_descendants(tmp_path: Path) -> None:
     with pytest.raises(asyncio.CancelledError):
         await running
     await assert_pid_gone(int((workspace / "codex-leader.pid").read_text(encoding="utf-8")))
+    await assert_pid_gone(int((workspace / "codex-child.pid").read_text(encoding="utf-8")))
+
+
+@pytest.mark.asyncio
+async def test_codex_cli_reaps_descendant_after_leader_exit(tmp_path: Path) -> None:
+    if os.name == "nt":
+        pytest.skip("process-group descendant assertion is Unix-only")
+    adapter, agent_request = codex_request(tmp_path, "nonzero-child")
+    outcome = await adapter.run(agent_request)
+    assert outcome.failure_code == "agent_exit_nonzero"
+    workspace = Path(agent_request.workspace)
     await assert_pid_gone(int((workspace / "codex-child.pid").read_text(encoding="utf-8")))
 
 

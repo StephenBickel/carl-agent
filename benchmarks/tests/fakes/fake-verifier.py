@@ -45,6 +45,15 @@ elif mode == "oversized-output":
     time.sleep(30)
 elif mode == "nonzero":
     raise SystemExit(7)
+elif mode == "nonzero-child":
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    (arguments.workspace / "child.pid").write_text(str(child.pid), encoding="utf-8")
+    raise SystemExit(7)
 elif mode == "environment":
     safe = "SHOULD_NOT_LEAK" not in os.environ and "PATH" in os.environ and "HOME" not in os.environ
     arguments.result.write_text(

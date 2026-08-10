@@ -34,24 +34,23 @@ async def _read_bounded(stream: asyncio.StreamReader, maximum: int) -> None:
 
 
 async def _terminate(process: asyncio.subprocess.Process) -> None:
+    if os.name != "nt":
+        with suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGTERM)
+        if process.returncode is None:
+            try:
+                await asyncio.wait_for(process.wait(), timeout=2)
+            except TimeoutError:
+                with suppress(ProcessLookupError):
+                    os.killpg(process.pid, signal.SIGKILL)
+        await process.wait()
+        return
     if process.returncode is None:
-        try:
-            if os.name == "nt":
-                process.terminate()
-            else:
-                os.killpg(process.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
+        process.terminate()
         try:
             await asyncio.wait_for(process.wait(), timeout=2)
         except TimeoutError:
-            try:
-                if os.name == "nt":
-                    process.kill()
-                else:
-                    os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+            process.kill()
     await process.wait()
 
 
@@ -134,6 +133,7 @@ class ScriptedAdapter:
             with suppress(FileNotFoundError):
                 copied.unlink()
 
+        await _terminate(process)
         if process.returncode != 0:
             return AgentOutcome.failed(code="agent_exit_nonzero", elapsed_ms=_elapsed_ms(started))
         return AgentOutcome.succeeded(elapsed_ms=_elapsed_ms(started), tool_calls=0)

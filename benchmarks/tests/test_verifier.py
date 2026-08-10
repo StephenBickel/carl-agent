@@ -114,6 +114,18 @@ async def test_cancellation_terminates_leader_and_descendant(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
+async def test_nonzero_verifier_reaps_descendant_after_leader_exit(tmp_path: Path) -> None:
+    if os.name == "nt":
+        pytest.skip("process-group descendant assertion is Unix-only")
+    task = fake_task(tmp_path)
+    workspace, private = workspace_and_private(tmp_path, "nonzero-child")
+    outcome = await Verifier().run(task, workspace, private)
+    assert outcome.infrastructure_code == "verifier_exit_nonzero"
+    child = int((workspace / "child.pid").read_text(encoding="utf-8"))
+    await assert_process_gone(child)
+
+
+@pytest.mark.asyncio
 async def test_private_directory_must_be_absolute_private_and_not_symlinked(tmp_path: Path) -> None:
     task = fake_task(tmp_path)
     workspace, private = workspace_and_private(tmp_path, "pass")

@@ -74,8 +74,9 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _resolved(path: Path) -> Path:
-    return path.expanduser().resolve(strict=False)
+def _anchored(path: Path) -> Path:
+    absolute = path.expanduser().absolute()
+    return absolute.parent.resolve(strict=False) / absolute.name
 
 
 def _inside(path: Path, parent: Path) -> bool:
@@ -87,15 +88,15 @@ def _inside(path: Path, parent: Path) -> bool:
 
 
 def _safe_result_path(destination: Path, forbidden_roots: Sequence[Path]) -> Path:
-    result = _resolved(destination)
+    result = _anchored(destination)
     for root in forbidden_roots:
-        if _inside(result, _resolved(root)):
+        if _inside(result, _anchored(root)):
             raise ValueError("public result cannot be written inside benchmark task sources")
     return result
 
 
 def _select_tasks(root: Path, selectors: Sequence[str]) -> tuple[BenchmarkTask, ...]:
-    tasks = discover_tasks(_resolved(root))
+    tasks = discover_tasks(_anchored(root))
     if not selectors:
         return tasks
     if len(selectors) != len(set(selectors)):
@@ -147,7 +148,7 @@ async def _run_command(args: argparse.Namespace) -> int:
         raise ValueError("seed must be a non-negative 63-bit integer")
     if args.seed + args.attempts - 1 >= (1 << 63):
         raise ValueError("attempt seeds exceed the supported range")
-    task_root = _resolved(args.tasks)
+    task_root = _anchored(args.tasks)
     destination = _safe_result_path(args.public_result, (task_root,))
     tasks = _select_tasks(task_root, args.task)
     if not tasks:
@@ -198,7 +199,7 @@ def _object_without_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 
 
 def _read_public_object(path: Path) -> dict[str, Any]:
-    source = _resolved(path)
+    source = _anchored(path)
     try:
         metadata = source.lstat()
         if (
@@ -334,8 +335,8 @@ def _scorecard_from_public(value: dict[str, Any]) -> Scorecard:
 
 def _compare_command(args: argparse.Namespace) -> int:
     destination = _safe_result_path(args.public_result, ())
-    baseline_path = _resolved(args.baseline)
-    candidate_path = _resolved(args.candidate)
+    baseline_path = _anchored(args.baseline)
+    candidate_path = _anchored(args.candidate)
     if destination in {baseline_path, candidate_path}:
         raise ValueError("comparison output cannot overwrite an input scorecard")
     baseline = _scorecard_from_public(_read_public_object(baseline_path))
@@ -350,7 +351,7 @@ def _compare_command(args: argparse.Namespace) -> int:
 
 
 def _validate_command(args: argparse.Namespace) -> int:
-    tasks = discover_tasks(_resolved(args.root))
+    tasks = discover_tasks(_anchored(args.root))
     tracks = ", ".join(sorted({task.identity.track for task in tasks}))
     print(f"{len(tasks)} valid tasks ({tracks})")
     return 0
@@ -366,7 +367,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return asyncio.run(_run_command(args))
     except (KeyboardInterrupt, asyncio.CancelledError):
         return 130
-    except (TaskContractError, PublicSafetyError, ValueError, OSError):
+    except (TaskContractError, PublicSafetyError, TypeError, ValueError, OSError):
         print("carl-bench: configuration or contract error", file=sys.stderr)
         return 2
 
