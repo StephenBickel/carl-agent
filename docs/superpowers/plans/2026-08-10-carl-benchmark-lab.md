@@ -153,29 +153,29 @@ Commit: `git commit -m "feat: define benchmark result contracts"`
 - Produces `assert_public_safe(value, repository_root)` and `write_public_json(path, value, repository_root)`.
 - Canonical JSON is UTF-8, sorted keys, compact separators, no NaN/Infinity, and ends with one newline only when written to disk.
 
-- [ ] **Step 1: Write failing deterministic hash tests**
+- [x] **Step 1: Write failing deterministic hash tests**
 
 Assert dictionary key order and filesystem enumeration order do not change a digest; file bytes, executable mode, relative path, and symlink presence do. Reject symlinks, sockets, devices, escaping paths, case-folded duplicate paths, files above 1 MiB, and trees above 16 MiB.
 
-- [ ] **Step 2: Write failing public-safety tests**
+- [x] **Step 2: Write failing public-safety tests**
 
 Reject keys named `prompt`, `instruction`, `response`, `output`, `stdout`, `stderr`, `environment`, `secret`, or `token` at any nesting depth; strings containing the repository root, the current home directory, PEM headers, bearer/API-key patterns, or more than 512 characters; and collections deeper than 12 levels or wider than 256 entries.
 
-- [ ] **Step 3: Run focused tests and verify RED**
+- [x] **Step 3: Run focused tests and verify RED**
 
 Run: `cd benchmarks && uv run pytest tests/test_canonical.py tests/test_sanitize.py -q`
 
 Expected: FAIL because canonicalization and sanitization modules do not exist.
 
-- [ ] **Step 4: Implement bounded canonical hashing**
+- [x] **Step 4: Implement bounded canonical hashing**
 
 Hash a length-prefixed sequence of `(relative_path, kind, mode, content_digest)` records. Do not follow symlinks. Normalize directory separators to `/` but never normalize case or Unicode in a way that aliases two inputs.
 
-- [ ] **Step 5: Implement fail-closed public serialization**
+- [x] **Step 5: Implement fail-closed public serialization**
 
 Walk the complete object before opening the destination. Create the parent with mode `0700`, write a sibling temporary file with mode `0600`, `fsync`, then atomically replace the public JSON. Sanitize errors to a stable code plus a JSON pointer; do not echo the rejected value.
 
-- [ ] **Step 6: Verify and commit**
+- [x] **Step 6: Verify and commit**
 
 Run focused tests and `uv run ruff check .`.
 
