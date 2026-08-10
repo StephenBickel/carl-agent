@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::ops::{Deref, DerefMut};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use std::{fs, io};
 
@@ -10,13 +10,14 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use crate::acp::PermissionMode;
 use crate::artifacts::{ArtifactId, ArtifactStore};
 use crate::delegates::{DelegateSettings, ModelId, ReasoningEffort, SettingSource};
 use crate::error::CarlError;
 use crate::events::{
     ApprovalId, EVENT_SCHEMA_VERSION, Event, EventEnvelope, EventId, SessionId, ToolCallId, TurnId,
 };
-use crate::policy::{ActorId, Sha256Digest};
+use crate::policy::{ActorId, Frontend, Sha256Digest};
 use crate::runtime::subscription::{
     ProviderReported, RunConfigSnapshot, RunFailureCode, RunId, RunState, RunTransition,
     RunTrustLabel, VerificationId,
@@ -42,6 +43,220 @@ const RUNTIME_DATABASE_FILENAME: &str = "carl.sqlite3";
 const EXACT_REPLACEMENT_DOMAIN: &[u8] = b"carl.exact-replacement.v1\0";
 const BASELINE_DIRECTORIES_DOMAIN: &[u8] = b"carl.baseline-directories.v1\0";
 const MAX_BASELINE_DIRECTORY_PATH_BYTES: usize = 8 * 1024 * 1024;
+const MAX_FRONTEND_VALUE_BYTES: usize = 128;
+const MAX_FRONTEND_CWD_BYTES: usize = 32 * 1024;
+const REMOTE_CODE_DOMAIN: &[u8] = b"carl.remote-code.v1\0";
+
+macro_rules! bounded_frontend_value {
+    ($name:ident, $label:literal) => {
+        #[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
+        pub struct $name(String);
+
+        impl $name {
+            #[must_use]
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
+        }
+
+        impl TryFrom<&str> for $name {
+            type Error = CarlError;
+
+            fn try_from(value: &str) -> Result<Self, Self::Error> {
+                Self::try_from(value.to_owned())
+            }
+        }
+
+        impl TryFrom<String> for $name {
+            type Error = CarlError;
+
+            fn try_from(value: String) -> Result<Self, Self::Error> {
+                let valid = !value.is_empty()
+                    && value.len() <= MAX_FRONTEND_VALUE_BYTES
+                    && !value.as_bytes().contains(&0)
+                    && !value.chars().any(char::is_control);
+                if !valid {
+                    return Err(CarlError::Validation {
+                        detail: concat!($label, " is invalid").to_owned(),
+                    });
+                }
+                Ok(Self(value))
+            }
+        }
+
+        impl std::fmt::Debug for $name {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str(concat!(stringify!($name), "(<redacted>)"))
+            }
+        }
+    };
+}
+
+bounded_frontend_value!(ExternalSessionId, "external session ID");
+bounded_frontend_value!(ClientName, "ACP client name");
+bounded_frontend_value!(ChannelId, "frontend channel ID");
+bounded_frontend_value!(ProviderThreadId, "provider thread ID");
+bounded_frontend_value!(ProviderRequestId, "provider request ID");
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NewFrontendSession {
+    pub frontend: Frontend,
+    pub external_session_id: ExternalSessionId,
+    pub session_id: SessionId,
+    pub cwd: PathBuf,
+    pub protocol_version: u32,
+    pub client_name: ClientName,
+    pub permission_mode: PermissionMode,
+    pub channel_id: Option<ChannelId>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FrontendSessionRecord {
+    pub frontend: Frontend,
+    pub external_session_id: ExternalSessionId,
+    pub session_id: SessionId,
+    pub cwd: PathBuf,
+    pub protocol_version: u32,
+    pub client_name: ClientName,
+    pub permission_mode: PermissionMode,
+    pub channel_id: Option<ChannelId>,
+    pub provider_thread_id: Option<ProviderThreadId>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RemoteCodeKind {
+    Approval,
+    BypassConfirmation,
+}
+
+impl RemoteCodeKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Approval => "approval",
+            Self::BypassConfirmation => "bypass_confirmation",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, CarlError> {
+        match value {
+            "approval" => Ok(Self::Approval),
+            "bypass_confirmation" => Ok(Self::BypassConfirmation),
+            other => Err(invalid_stored_value("remote code kind", other)),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NewRemoteCode<'a> {
+    pub display_code: &'a str,
+    pub kind: RemoteCodeKind,
+    pub external_session_id: ExternalSessionId,
+    pub approval_id: Option<ApprovalId>,
+    pub provider_request_id: Option<ProviderRequestId>,
+    pub request_digest: Sha256Digest,
+    pub actor_id: ActorId,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RemoteCodeClaim<'a> {
+    pub display_code: &'a str,
+    pub kind: RemoteCodeKind,
+    pub external_session_id: ExternalSessionId,
+    pub approval_id: Option<ApprovalId>,
+    pub provider_request_id: Option<ProviderRequestId>,
+    pub request_digest: Sha256Digest,
+    pub actor_id: ActorId,
+    pub now: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RemoteCodeRecord {
+    pub code_digest: Sha256Digest,
+    pub kind: RemoteCodeKind,
+    pub external_session_id: ExternalSessionId,
+    pub approval_id: Option<ApprovalId>,
+    pub provider_request_id: Option<ProviderRequestId>,
+    pub request_digest: Sha256Digest,
+    pub actor_id: ActorId,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub consumed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DeliveryKind {
+    Message,
+    Diff,
+}
+
+impl DeliveryKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Message => "message",
+            Self::Diff => "diff",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, CarlError> {
+        match value {
+            "message" => Ok(Self::Message),
+            "diff" => Ok(Self::Diff),
+            other => Err(invalid_stored_value("delivery kind", other)),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DeliveryStatus {
+    Pending,
+    Delivered,
+    Failed,
+    Uncertain,
+}
+
+impl DeliveryStatus {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Delivered => "delivered",
+            Self::Failed => "failed",
+            Self::Uncertain => "uncertain",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, CarlError> {
+        match value {
+            "pending" => Ok(Self::Pending),
+            "delivered" => Ok(Self::Delivered),
+            "failed" => Ok(Self::Failed),
+            "uncertain" => Ok(Self::Uncertain),
+            other => Err(invalid_stored_value("delivery status", other)),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NewDelivery {
+    pub action_digest: Sha256Digest,
+    pub external_session_id: ExternalSessionId,
+    pub kind: DeliveryKind,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeliveryRecord {
+    pub action_digest: Sha256Digest,
+    pub external_session_id: ExternalSessionId,
+    pub kind: DeliveryKind,
+    pub status: DeliveryStatus,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionRecord {
@@ -601,6 +816,405 @@ impl Store {
                 })
             })
             .collect()
+    }
+
+    pub fn bind_frontend_session(
+        &self,
+        input: NewFrontendSession,
+    ) -> Result<FrontendSessionRecord, CarlError> {
+        if !matches!(input.frontend, Frontend::Acp | Frontend::Buzz)
+            || !matches!(input.protocol_version, 1 | 2)
+        {
+            return Err(CarlError::Validation {
+                detail: "frontend session protocol is invalid".to_owned(),
+            });
+        }
+        validate_canonical_frontend_cwd(&input.cwd)?;
+        let record = FrontendSessionRecord {
+            frontend: input.frontend,
+            external_session_id: input.external_session_id,
+            session_id: input.session_id,
+            cwd: input.cwd,
+            protocol_version: input.protocol_version,
+            client_name: input.client_name,
+            permission_mode: input.permission_mode,
+            channel_id: input.channel_id,
+            provider_thread_id: None,
+            created_at: input.created_at,
+            updated_at: input.created_at,
+        };
+        if let Some(existing) = self.get_frontend_session(record.external_session_id.as_str())? {
+            if existing == record {
+                return Ok(existing);
+            }
+            return Err(policy_error(
+                "frontend session binding conflicts with durable state",
+            ));
+        }
+        self.connection
+            .execute(
+                "INSERT INTO frontend_sessions (
+                    external_session_id, frontend, session_id, client_name, protocol_version,
+                    cwd, channel_id, provider_thread_id, permission_mode, created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8, ?9, ?9)",
+                params![
+                    record.external_session_id.as_str(),
+                    record.frontend.as_str(),
+                    record.session_id.to_string(),
+                    record.client_name.as_str(),
+                    i64::from(record.protocol_version),
+                    record.cwd.to_str(),
+                    record.channel_id.as_ref().map(ChannelId::as_str),
+                    record.permission_mode.as_wire_str(),
+                    format_timestamp(record.created_at),
+                ],
+            )
+            .map_err(storage_error)?;
+        Ok(record)
+    }
+
+    pub fn get_frontend_session(
+        &self,
+        external_session_id: &str,
+    ) -> Result<Option<FrontendSessionRecord>, CarlError> {
+        let raw = self
+            .connection
+            .query_row(
+                "SELECT frontend, session_id, client_name, protocol_version, cwd, channel_id,
+                        provider_thread_id, permission_mode, created_at, updated_at
+                 FROM frontend_sessions
+                 WHERE external_session_id = ?1",
+                [external_session_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, String>(8)?,
+                        row.get::<_, String>(9)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(storage_error)?;
+        raw.map(
+            |(
+                frontend,
+                session_id,
+                client_name,
+                protocol_version,
+                cwd,
+                channel_id,
+                provider_thread_id,
+                permission_mode,
+                created_at,
+                updated_at,
+            )| {
+                let protocol_version = u32::try_from(protocol_version)
+                    .map_err(|_| invalid_stored_value("protocol version", "out of range"))?;
+                let permission_mode = permission_mode
+                    .parse()
+                    .map_err(|_| invalid_stored_value("permission mode", &permission_mode))?;
+                Ok(FrontendSessionRecord {
+                    frontend: Frontend::parse(&frontend)?,
+                    external_session_id: ExternalSessionId::try_from(external_session_id)?,
+                    session_id: parse_id("session ID", &session_id)?,
+                    cwd: PathBuf::from(cwd),
+                    protocol_version,
+                    client_name: ClientName::try_from(client_name)?,
+                    permission_mode,
+                    channel_id: channel_id.map(ChannelId::try_from).transpose()?,
+                    provider_thread_id: provider_thread_id
+                        .map(ProviderThreadId::try_from)
+                        .transpose()?,
+                    created_at: parse_timestamp(&created_at)?,
+                    updated_at: parse_timestamp(&updated_at)?,
+                })
+            },
+        )
+        .transpose()
+    }
+
+    pub fn configure_frontend_session(
+        &self,
+        external_session_id: &ExternalSessionId,
+        provider_thread_id: Option<&ProviderThreadId>,
+        permission_mode: PermissionMode,
+        updated_at: DateTime<Utc>,
+    ) -> Result<FrontendSessionRecord, CarlError> {
+        let changed = self
+            .connection
+            .execute(
+                "UPDATE frontend_sessions
+                 SET provider_thread_id = ?2, permission_mode = ?3, updated_at = ?4
+                 WHERE external_session_id = ?1 AND updated_at <= ?4",
+                params![
+                    external_session_id.as_str(),
+                    provider_thread_id.map(ProviderThreadId::as_str),
+                    permission_mode.as_wire_str(),
+                    format_timestamp(updated_at),
+                ],
+            )
+            .map_err(storage_error)?;
+        if changed != 1 {
+            return Err(policy_error("frontend session is unavailable"));
+        }
+        self.get_frontend_session(external_session_id.as_str())?
+            .ok_or_else(|| storage_invariant("configured frontend session disappeared"))
+    }
+
+    pub fn create_remote_code(
+        &self,
+        input: NewRemoteCode<'_>,
+    ) -> Result<RemoteCodeRecord, CarlError> {
+        validate_remote_display_code(input.display_code)?;
+        validate_remote_code_shape(
+            input.kind,
+            input.approval_id,
+            input.provider_request_id.as_ref(),
+        )?;
+        let lifetime = input.expires_at.signed_duration_since(input.created_at);
+        if lifetime <= chrono::TimeDelta::zero() || lifetime > MAX_BOUND_APPROVAL_LIFETIME {
+            return Err(CarlError::Validation {
+                detail: "remote code lifetime is invalid".to_owned(),
+            });
+        }
+        let record = RemoteCodeRecord {
+            code_digest: remote_code_digest(input.display_code),
+            kind: input.kind,
+            external_session_id: input.external_session_id,
+            approval_id: input.approval_id,
+            provider_request_id: input.provider_request_id,
+            request_digest: input.request_digest,
+            actor_id: input.actor_id,
+            created_at: input.created_at,
+            expires_at: input.expires_at,
+            consumed_at: None,
+        };
+        self.connection
+            .execute(
+                "INSERT INTO remote_codes (
+                    code_digest, kind, external_session_id, approval_id, provider_request_id,
+                    request_digest, actor_id, created_at, expires_at, consumed_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL)",
+                params![
+                    record.code_digest.to_string(),
+                    record.kind.as_str(),
+                    record.external_session_id.as_str(),
+                    record.approval_id.map(|id| id.to_string()),
+                    record
+                        .provider_request_id
+                        .as_ref()
+                        .map(ProviderRequestId::as_str),
+                    record.request_digest.to_string(),
+                    record.actor_id.as_str(),
+                    format_timestamp(record.created_at),
+                    format_timestamp(record.expires_at),
+                ],
+            )
+            .map_err(storage_error)?;
+        Ok(record)
+    }
+
+    pub fn get_remote_code(
+        &self,
+        code_digest: Sha256Digest,
+    ) -> Result<Option<RemoteCodeRecord>, CarlError> {
+        let raw = self
+            .connection
+            .query_row(
+                "SELECT kind, external_session_id, approval_id, provider_request_id,
+                        request_digest, actor_id, created_at, expires_at, consumed_at
+                 FROM remote_codes WHERE code_digest = ?1",
+                [code_digest.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, Option<String>>(8)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(storage_error)?;
+        raw.map(
+            |(
+                kind,
+                external_session_id,
+                approval_id,
+                provider_request_id,
+                request_digest,
+                actor_id,
+                created_at,
+                expires_at,
+                consumed_at,
+            )| {
+                Ok(RemoteCodeRecord {
+                    code_digest,
+                    kind: RemoteCodeKind::parse(&kind)?,
+                    external_session_id: ExternalSessionId::try_from(external_session_id)?,
+                    approval_id: approval_id
+                        .as_deref()
+                        .map(|value| parse_id("approval ID", value))
+                        .transpose()?,
+                    provider_request_id: provider_request_id
+                        .map(ProviderRequestId::try_from)
+                        .transpose()?,
+                    request_digest: Sha256Digest::parse(request_digest)?,
+                    actor_id: ActorId::parse(actor_id)?,
+                    created_at: parse_timestamp(&created_at)?,
+                    expires_at: parse_timestamp(&expires_at)?,
+                    consumed_at: consumed_at.as_deref().map(parse_timestamp).transpose()?,
+                })
+            },
+        )
+        .transpose()
+    }
+
+    pub fn consume_remote_code(
+        &mut self,
+        claim: RemoteCodeClaim<'_>,
+    ) -> Result<RemoteCodeRecord, CarlError> {
+        validate_remote_display_code(claim.display_code)?;
+        validate_remote_code_shape(
+            claim.kind,
+            claim.approval_id,
+            claim.provider_request_id.as_ref(),
+        )?;
+        let code_digest = remote_code_digest(claim.display_code);
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage_error)?;
+        let existing = load_remote_code(&transaction, code_digest)?
+            .ok_or_else(|| policy_error("remote code is unavailable"))?;
+        if existing.kind != claim.kind
+            || existing.external_session_id != claim.external_session_id
+            || existing.approval_id != claim.approval_id
+            || existing.provider_request_id != claim.provider_request_id
+            || existing.request_digest != claim.request_digest
+            || existing.actor_id != claim.actor_id
+            || existing.consumed_at.is_some()
+            || claim.now >= existing.expires_at
+        {
+            return Err(policy_error("remote code does not match the request"));
+        }
+        let changed = transaction
+            .execute(
+                "UPDATE remote_codes SET consumed_at = ?2
+                 WHERE code_digest = ?1 AND consumed_at IS NULL AND expires_at > ?2",
+                params![code_digest.to_string(), format_timestamp(claim.now)],
+            )
+            .map_err(storage_error)?;
+        if changed != 1 {
+            return Err(policy_error("remote code is unavailable"));
+        }
+        transaction.commit().map_err(storage_error)?;
+        self.get_remote_code(code_digest)?
+            .ok_or_else(|| storage_invariant("consumed remote code disappeared"))
+    }
+
+    pub fn create_delivery(&self, input: NewDelivery) -> Result<DeliveryRecord, CarlError> {
+        let record = DeliveryRecord {
+            action_digest: input.action_digest,
+            external_session_id: input.external_session_id,
+            kind: input.kind,
+            status: DeliveryStatus::Pending,
+            created_at: input.created_at,
+            updated_at: input.created_at,
+        };
+        self.connection
+            .execute(
+                "INSERT INTO frontend_deliveries (
+                    action_digest, external_session_id, kind, status, created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, 'pending', ?4, ?4)",
+                params![
+                    record.action_digest.to_string(),
+                    record.external_session_id.as_str(),
+                    record.kind.as_str(),
+                    format_timestamp(record.created_at),
+                ],
+            )
+            .map_err(storage_error)?;
+        Ok(record)
+    }
+
+    pub fn get_delivery(
+        &self,
+        action_digest: Sha256Digest,
+    ) -> Result<Option<DeliveryRecord>, CarlError> {
+        let raw = self
+            .connection
+            .query_row(
+                "SELECT external_session_id, kind, status, created_at, updated_at
+                 FROM frontend_deliveries WHERE action_digest = ?1",
+                [action_digest.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(storage_error)?;
+        raw.map(
+            |(external_session_id, kind, status, created_at, updated_at)| {
+                Ok(DeliveryRecord {
+                    action_digest,
+                    external_session_id: ExternalSessionId::try_from(external_session_id)?,
+                    kind: DeliveryKind::parse(&kind)?,
+                    status: DeliveryStatus::parse(&status)?,
+                    created_at: parse_timestamp(&created_at)?,
+                    updated_at: parse_timestamp(&updated_at)?,
+                })
+            },
+        )
+        .transpose()
+    }
+
+    pub fn transition_delivery(
+        &self,
+        action_digest: Sha256Digest,
+        status: DeliveryStatus,
+        updated_at: DateTime<Utc>,
+    ) -> Result<DeliveryRecord, CarlError> {
+        if status == DeliveryStatus::Pending {
+            return Err(CarlError::Validation {
+                detail: "delivery must transition to a terminal status".to_owned(),
+            });
+        }
+        let changed = self
+            .connection
+            .execute(
+                "UPDATE frontend_deliveries SET status = ?2, updated_at = ?3
+                 WHERE action_digest = ?1 AND status = 'pending' AND created_at <= ?3",
+                params![
+                    action_digest.to_string(),
+                    status.as_str(),
+                    format_timestamp(updated_at),
+                ],
+            )
+            .map_err(storage_error)?;
+        if changed != 1 {
+            return Err(policy_error("delivery is unavailable or already terminal"));
+        }
+        self.get_delivery(action_digest)?
+            .ok_or_else(|| storage_invariant("transitioned delivery disappeared"))
     }
 
     pub fn append(
@@ -4758,6 +5372,129 @@ fn bound_record_from_raw(
         resolved_at: resolved_at.as_deref().map(parse_timestamp).transpose()?,
         consumed_at: consumed_at.as_deref().map(parse_timestamp).transpose()?,
     })
+}
+
+fn validate_canonical_frontend_cwd(cwd: &Path) -> Result<(), CarlError> {
+    let encoded = cwd.to_str().ok_or_else(|| CarlError::Validation {
+        detail: "frontend working directory is not UTF-8".to_owned(),
+    })?;
+    if !cwd.is_absolute()
+        || encoded.is_empty()
+        || encoded.len() > MAX_FRONTEND_CWD_BYTES
+        || encoded.as_bytes().contains(&0)
+    {
+        return Err(CarlError::Validation {
+            detail: "frontend working directory is invalid".to_owned(),
+        });
+    }
+    let canonical = fs::canonicalize(cwd).map_err(|_| CarlError::Validation {
+        detail: "frontend working directory is unavailable".to_owned(),
+    })?;
+    if canonical != cwd || !canonical.is_dir() {
+        return Err(CarlError::Validation {
+            detail: "frontend working directory is not canonical".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_remote_display_code(display_code: &str) -> Result<(), CarlError> {
+    if display_code.len() != 10
+        || !display_code
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(CarlError::Validation {
+            detail: "remote display code is invalid".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_remote_code_shape(
+    kind: RemoteCodeKind,
+    approval_id: Option<ApprovalId>,
+    provider_request_id: Option<&ProviderRequestId>,
+) -> Result<(), CarlError> {
+    let valid = match kind {
+        RemoteCodeKind::Approval => approval_id.is_some() && provider_request_id.is_some(),
+        RemoteCodeKind::BypassConfirmation => {
+            approval_id.is_none() && provider_request_id.is_none()
+        }
+    };
+    if !valid {
+        return Err(CarlError::Validation {
+            detail: "remote code binding is invalid".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn remote_code_digest(display_code: &str) -> Sha256Digest {
+    let mut digest = Sha256::new();
+    digest.update(REMOTE_CODE_DOMAIN);
+    digest.update(display_code.as_bytes());
+    Sha256Digest::from_bytes(digest.finalize().into())
+}
+
+fn load_remote_code(
+    transaction: &Transaction<'_>,
+    code_digest: Sha256Digest,
+) -> Result<Option<RemoteCodeRecord>, CarlError> {
+    let raw = transaction
+        .query_row(
+            "SELECT kind, external_session_id, approval_id, provider_request_id,
+                    request_digest, actor_id, created_at, expires_at, consumed_at
+             FROM remote_codes WHERE code_digest = ?1",
+            [code_digest.to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(storage_error)?;
+    raw.map(
+        |(
+            kind,
+            external_session_id,
+            approval_id,
+            provider_request_id,
+            request_digest,
+            actor_id,
+            created_at,
+            expires_at,
+            consumed_at,
+        )| {
+            Ok(RemoteCodeRecord {
+                code_digest,
+                kind: RemoteCodeKind::parse(&kind)?,
+                external_session_id: ExternalSessionId::try_from(external_session_id)?,
+                approval_id: approval_id
+                    .as_deref()
+                    .map(|value| parse_id("approval ID", value))
+                    .transpose()?,
+                provider_request_id: provider_request_id
+                    .map(ProviderRequestId::try_from)
+                    .transpose()?,
+                request_digest: Sha256Digest::parse(request_digest)?,
+                actor_id: ActorId::parse(actor_id)?,
+                created_at: parse_timestamp(&created_at)?,
+                expires_at: parse_timestamp(&expires_at)?,
+                consumed_at: consumed_at.as_deref().map(parse_timestamp).transpose()?,
+            })
+        },
+    )
+    .transpose()
 }
 
 fn format_timestamp(timestamp: DateTime<Utc>) -> String {

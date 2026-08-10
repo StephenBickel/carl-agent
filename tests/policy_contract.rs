@@ -59,6 +59,24 @@ fn delegate_approval_digest_binds_the_exact_verification_specification() -> Test
 }
 
 #[test]
+fn every_frontend_has_a_stable_snake_case_wire_value() -> TestResult {
+    for (frontend, wire) in [
+        (Frontend::Cli, "cli"),
+        (Frontend::Tui, "tui"),
+        (Frontend::Telegram, "telegram"),
+        (Frontend::Acp, "acp"),
+        (Frontend::Buzz, "buzz"),
+    ] {
+        assert_eq!(serde_json::to_string(&frontend)?, format!("\"{wire}\""));
+        assert_eq!(
+            serde_json::from_str::<Frontend>(&format!("\"{wire}\""))?,
+            frontend
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn normalized_request_digest_covers_every_security_relevant_field() -> TestResult {
     let request = safe_request(Frontend::Cli)?;
     assert_eq!(

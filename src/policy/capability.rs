@@ -121,6 +121,32 @@ pub enum Frontend {
     Cli,
     Tui,
     Telegram,
+    Acp,
+    Buzz,
+}
+
+impl Frontend {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Cli => "cli",
+            Self::Tui => "tui",
+            Self::Telegram => "telegram",
+            Self::Acp => "acp",
+            Self::Buzz => "buzz",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, CarlError> {
+        match value {
+            "cli" => Ok(Self::Cli),
+            "tui" => Ok(Self::Tui),
+            "telegram" => Ok(Self::Telegram),
+            "acp" => Ok(Self::Acp),
+            "buzz" => Ok(Self::Buzz),
+            _ => Err(validation_error("frontend is invalid")),
+        }
+    }
 }
 
 #[derive(Clone, Eq, PartialEq, Serialize)]

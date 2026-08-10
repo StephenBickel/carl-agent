@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::fmt;
 use std::str::FromStr;
 
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
 use uuid::Uuid;
@@ -40,7 +41,8 @@ impl ConfigError {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub enum PermissionMode {
     Plan,
     Default,

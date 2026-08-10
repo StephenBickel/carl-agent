@@ -1,7 +1,10 @@
+use carl::acp::PermissionMode;
 use carl::error::{BudgetResource, CarlError, ErrorCode};
 use carl::events::{
-    ApprovalId, EVENT_SCHEMA_VERSION, Event, EventEnvelope, EventId, SessionId, ToolCallId, TurnId,
+    ApprovalId, EVENT_SCHEMA_VERSION, Event, EventEnvelope, EventId, FrontendDeliveryStatus,
+    SessionId, ToolCallId, TurnId,
 };
+use carl::policy::Frontend;
 use carl::runtime::budget::{BudgetTracker, TurnBudget};
 use chrono::{TimeZone, Utc};
 use serde_json::{Value, json};
@@ -20,7 +23,7 @@ fn every_event_has_a_stable_type_and_schema_version() -> Result<(), Box<dyn std:
                 text: "hello".into(),
             },
             json!({
-                "schema_version": 2,
+                "schema_version": 3,
                 "type": "user_input",
                 "text": "hello",
             }),
@@ -30,7 +33,7 @@ fn every_event_has_a_stable_type_and_schema_version() -> Result<(), Box<dyn std:
                 text: "world".into(),
             },
             json!({
-                "schema_version": 2,
+                "schema_version": 3,
                 "type": "assistant_text_delta",
                 "text": "world",
             }),
@@ -42,7 +45,7 @@ fn every_event_has_a_stable_type_and_schema_version() -> Result<(), Box<dyn std:
                 arguments: json!({"path": "notes.txt"}),
             },
             json!({
-                "schema_version": 2,
+                "schema_version": 3,
                 "type": "tool_proposed",
                 "tool_call_id": "11111111-1111-4111-8111-111111111111",
                 "tool_name": "fs.read",
@@ -56,7 +59,7 @@ fn every_event_has_a_stable_type_and_schema_version() -> Result<(), Box<dyn std:
                 summary: "Read notes.txt".into(),
             },
             json!({
-                "schema_version": 2,
+                "schema_version": 3,
                 "type": "approval_requested",
                 "approval_id": "22222222-2222-4222-8222-222222222222",
                 "tool_call_id": "11111111-1111-4111-8111-111111111111",
@@ -69,7 +72,7 @@ fn every_event_has_a_stable_type_and_schema_version() -> Result<(), Box<dyn std:
                 output: json!({"text": "contents"}),
             },
             json!({
-                "schema_version": 2,
+                "schema_version": 3,
                 "type": "tool_completed",
                 "tool_call_id": "11111111-1111-4111-8111-111111111111",
                 "output": {"text": "contents"},
@@ -78,7 +81,7 @@ fn every_event_has_a_stable_type_and_schema_version() -> Result<(), Box<dyn std:
         (
             Event::TurnCompleted,
             json!({
-                "schema_version": 2,
+                "schema_version": 3,
                 "type": "turn_completed",
             }),
         ),
@@ -87,7 +90,7 @@ fn every_event_has_a_stable_type_and_schema_version() -> Result<(), Box<dyn std:
                 reason: "cancelled".into(),
             },
             json!({
-                "schema_version": 2,
+                "schema_version": 3,
                 "type": "turn_interrupted",
                 "reason": "cancelled",
             }),
@@ -104,7 +107,7 @@ fn every_event_has_a_stable_type_and_schema_version() -> Result<(), Box<dyn std:
 }
 
 #[test]
-fn schema_v1_literal_fixture_remains_readable_and_reencodes_as_v2()
+fn schema_v1_literal_fixture_remains_readable_and_reencodes_as_current()
 -> Result<(), Box<dyn std::error::Error>> {
     const V1_FIXTURE: &str = r#"{
         "schema_version": 1,
@@ -129,15 +132,54 @@ fn schema_v1_literal_fixture_remains_readable_and_reencodes_as_v2()
         serde_json::to_value(decoded)?["schema_version"],
         EVENT_SCHEMA_VERSION
     );
-    assert_eq!(EVENT_SCHEMA_VERSION, 2);
+    assert_eq!(EVENT_SCHEMA_VERSION, 3);
 
+    Ok(())
+}
+
+#[test]
+fn schema_v2_literal_remains_readable_and_frontend_events_use_schema_v3()
+-> Result<(), Box<dyn std::error::Error>> {
+    let v2 = r#"{
+        "schema_version": 2,
+        "type": "turn_interrupted",
+        "reason": "legacy"
+    }"#;
+    assert_eq!(
+        serde_json::from_str::<Event>(v2)?,
+        Event::TurnInterrupted {
+            reason: "legacy".into(),
+        }
+    );
+
+    let cases = [
+        Event::FrontendSessionBound {
+            frontend: Frontend::Buzz,
+            external_session_id: "buzz-session-1".into(),
+            protocol_version: 2,
+        },
+        Event::FrontendPermissionChanged {
+            external_session_id: "buzz-session-1".into(),
+            permission_mode: PermissionMode::Default,
+        },
+        Event::FrontendDeliveryTransitioned {
+            action_digest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .into(),
+            status: FrontendDeliveryStatus::Delivered,
+        },
+    ];
+    for event in cases {
+        let encoded = serde_json::to_value(&event)?;
+        assert_eq!(encoded["schema_version"], 3);
+        assert_eq!(serde_json::from_value::<Event>(encoded)?, event);
+    }
     Ok(())
 }
 
 #[test]
 fn event_rejects_an_unknown_future_schema_version() {
     let error = serde_json::from_value::<Event>(json!({
-        "schema_version": 3,
+        "schema_version": 4,
         "type": "user_input",
         "text": "hello",
     }))
@@ -146,7 +188,7 @@ fn event_rejects_an_unknown_future_schema_version() {
     assert!(
         error
             .to_string()
-            .contains("unsupported event schema version 3")
+            .contains("unsupported event schema version 4")
     );
 }
 
@@ -173,12 +215,12 @@ fn event_envelope_serializes_metadata_and_a_flattened_payload()
     assert_eq!(encoded["session_id"], session_id.to_string());
     assert_eq!(encoded["turn_id"], turn_id.to_string());
     assert_eq!(encoded["sequence"], 7);
-    assert_eq!(encoded["schema_version"], 2);
+    assert_eq!(encoded["schema_version"], 3);
     assert_eq!(encoded["timestamp"], "2026-07-13T12:34:56Z");
     assert_eq!(encoded["type"], "user_input");
     assert_eq!(encoded["text"], "hello");
     assert!(encoded.get("event").is_none());
-    assert_eq!(envelope.schema_version(), 2);
+    assert_eq!(envelope.schema_version(), 3);
     assert_eq!(serde_json::from_value::<EventEnvelope>(encoded)?, envelope);
 
     Ok(())

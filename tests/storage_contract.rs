@@ -56,10 +56,13 @@ fn fresh_database_is_migrated_and_configured_for_durable_use() -> Result<(), Box
         "approvals".to_owned(),
         "artifact_objects".to_owned(),
         "events".to_owned(),
+        "frontend_deliveries".to_owned(),
+        "frontend_sessions".to_owned(),
         "memories".to_owned(),
         "messages".to_owned(),
         "migrations".to_owned(),
         "processed_telegram_updates".to_owned(),
+        "remote_codes".to_owned(),
         "sessions".to_owned(),
         "session_delegate_settings".to_owned(),
         "subscription_run_baseline_entries".to_owned(),
@@ -83,12 +86,12 @@ fn fresh_database_is_migrated_and_configured_for_durable_use() -> Result<(), Box
     let migrations = connection.query_row("SELECT COUNT(*) FROM migrations", [], |row| {
         row.get::<_, u64>(0)
     })?;
-    assert_eq!(migrations, 5);
+    assert_eq!(migrations, 6);
     let checksums = connection
         .prepare("SELECT checksum FROM migrations ORDER BY version")?
         .query_map([], |row| row.get::<_, String>(0))?
         .collect::<Result<Vec<_>, _>>()?;
-    assert_eq!(checksums.len(), 5);
+    assert_eq!(checksums.len(), 6);
     assert_eq!(
         &checksums[..3],
         [
@@ -105,6 +108,10 @@ fn fresh_database_is_migrated_and_configured_for_durable_use() -> Result<(), Box
         checksums[4],
         "b16563bec8020c47e4b8aa81fdf0ec28a1b6aa0841959c4a15455be1cca5f391"
     );
+    assert_eq!(
+        checksums[5],
+        "67f18d5ed69b66f7fc0d40a578c59c0f61ea923ec172df919960ad4fe1f90158"
+    );
     assert!(checksums.iter().all(|checksum| {
         checksum.len() == 64
             && checksum
@@ -120,7 +127,7 @@ fn fresh_database_is_migrated_and_configured_for_durable_use() -> Result<(), Box
     let migrations = connection.query_row("SELECT COUNT(*) FROM migrations", [], |row| {
         row.get::<_, u64>(0)
     })?;
-    assert_eq!(migrations, 5);
+    assert_eq!(migrations, 6);
 
     Ok(())
 }
@@ -168,7 +175,7 @@ fn store_open_rejects_a_future_database_migration() -> Result<(), Box<dyn Error>
     ensure_checksum_column(&connection)?;
     connection.execute(
         "INSERT INTO migrations (version, name, applied_at, checksum)
-         VALUES (6, 'future migration', '2026-07-13T12:00:00Z', ?1)",
+         VALUES (7, 'future migration', '2026-07-13T12:00:00Z', ?1)",
         ["ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"],
     )?;
     drop(connection);
@@ -177,7 +184,7 @@ fn store_open_rejects_a_future_database_migration() -> Result<(), Box<dyn Error>
     assert!(matches!(
         error,
         CarlError::Storage { ref detail }
-            if detail.contains("unsupported database migration version 6")
+            if detail.contains("unsupported database migration version 7")
     ));
     Ok(())
 }
@@ -274,13 +281,13 @@ fn pre_subscription_run_database_upgrades_without_rewriting_old_migrations()
         connection.query_row("SELECT COUNT(*) FROM migrations", [], |row| {
             row.get::<_, u64>(0)
         })?,
-        5
+        6
     );
     let checksums = connection
         .prepare("SELECT checksum FROM migrations ORDER BY version")?
         .query_map([], |row| row.get::<_, String>(0))?
         .collect::<Result<Vec<_>, _>>()?;
-    assert_eq!(checksums.len(), 5);
+    assert_eq!(checksums.len(), 6);
     assert_eq!(
         &checksums[..3],
         [
@@ -354,7 +361,7 @@ fn pre_proposal_artifact_database_upgrades_through_migration_five_and_reopens()
         connection.query_row("SELECT COUNT(*) FROM migrations", [], |row| {
             row.get::<_, u64>(0)
         })?,
-        5
+        6
     );
     let tables = connection
         .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")?
@@ -383,7 +390,7 @@ fn pre_proposal_artifact_database_upgrades_through_migration_five_and_reopens()
         connection.query_row("SELECT COUNT(*) FROM migrations", [], |row| {
             row.get::<_, u64>(0)
         })?,
-        5
+        6
     );
 
     Ok(())
@@ -419,7 +426,7 @@ fn pre_verification_database_applies_migration_five_and_reopens() -> Result<(), 
         connection.query_row("SELECT COUNT(*) FROM migrations", [], |row| {
             row.get::<_, u64>(0)
         })?,
-        5
+        6
     );
     assert_eq!(
         connection.query_row(
@@ -784,7 +791,7 @@ fn reading_rejects_a_future_event_schema_as_a_typed_storage_error() -> Result<()
     assert!(matches!(
         error,
         CarlError::Storage { ref detail }
-            if detail.contains("unsupported event schema version 3")
+            if detail.contains("unsupported event schema version 4")
     ));
 
     Ok(())
@@ -822,12 +829,12 @@ fn inject_future_event(path: &Path, session_id: SessionId) -> Result<(), Box<dyn
     connection.execute(
         "INSERT INTO events (
             id, session_id, turn_id, sequence, timestamp, schema_version, event_json
-         ) VALUES (?1, ?2, NULL, 1, ?3, 3, ?4)",
+         ) VALUES (?1, ?2, NULL, 1, ?3, 4, ?4)",
         params![
             EventId::new().to_string(),
             session_id.to_string(),
             "2026-07-13T12:00:00Z",
-            r#"{"schema_version":3,"type":"user_input","text":"future"}"#,
+            r#"{"schema_version":4,"type":"user_input","text":"future"}"#,
         ],
     )?;
     Ok(())

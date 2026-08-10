@@ -431,7 +431,7 @@ fn schema_v2_prepared_event_carries_replay_sequence_and_configuration()
     assert_eq!(
         encoded,
         serde_json::json!({
-            "schema_version": 2,
+            "schema_version": 3,
             "type": "subscription_run_prepared",
             "run_id": "11111111-1111-4111-8111-111111111111",
             "run_sequence": 1,
@@ -474,7 +474,7 @@ fn schema_v2_provider_observation_is_explicitly_untrusted() -> Result<(), Box<dy
     assert_eq!(
         encoded,
         serde_json::json!({
-            "schema_version": 2,
+            "schema_version": 3,
             "type": "subscription_run_configuration_observed",
             "run_id": "11111111-1111-4111-8111-111111111111",
             "run_sequence": 4,
@@ -515,7 +515,7 @@ fn schema_v2_transition_event_carries_validated_transition_and_replay_sequence()
     assert_eq!(
         encoded,
         serde_json::json!({
-            "schema_version": 2,
+            "schema_version": 3,
             "type": "subscription_run_transitioned",
             "run_id": "11111111-1111-4111-8111-111111111111",
             "run_sequence": 2,
