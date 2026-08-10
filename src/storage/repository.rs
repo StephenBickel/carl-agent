@@ -1125,6 +1125,97 @@ impl Store {
             .ok_or_else(|| storage_invariant("consumed remote code disappeared"))
     }
 
+    /// Atomically consume an approval display code and resolve its exact bound
+    /// approval. This prevents a crash between code consumption and approval
+    /// resolution from making a provider request appear reusable.
+    pub fn consume_remote_bound_approval(
+        &mut self,
+        claim: RemoteCodeClaim<'_>,
+        binding: &BoundApprovalBinding,
+        status: ApprovalStatus,
+    ) -> Result<RemoteCodeRecord, CarlError> {
+        validate_remote_display_code(claim.display_code)?;
+        validate_remote_code_shape(
+            claim.kind,
+            claim.approval_id,
+            claim.provider_request_id.as_ref(),
+        )?;
+        if claim.kind != RemoteCodeKind::Approval
+            || !matches!(status, ApprovalStatus::Allowed | ApprovalStatus::Denied)
+            || claim.request_digest != binding.request_digest()
+            || claim.actor_id != *binding.actor_id()
+            || claim.now >= binding.expires_at()
+        {
+            return Err(policy_error("remote approval claim is invalid"));
+        }
+        let approval_id = claim
+            .approval_id
+            .ok_or_else(|| policy_error("remote approval has no bound approval"))?;
+        let code_digest = remote_code_digest(claim.display_code);
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage_error)?;
+        let existing = load_remote_code(&transaction, code_digest)?
+            .ok_or_else(|| policy_error("remote code is unavailable"))?;
+        if existing.kind != claim.kind
+            || existing.external_session_id != claim.external_session_id
+            || existing.approval_id != claim.approval_id
+            || existing.provider_request_id != claim.provider_request_id
+            || existing.request_digest != claim.request_digest
+            || existing.actor_id != claim.actor_id
+            || existing.consumed_at.is_some()
+            || claim.now >= existing.expires_at
+        {
+            return Err(policy_error("remote code does not match the request"));
+        }
+        let raw = transaction
+            .query_row(
+                "SELECT session_id, turn_id, tool_call_id, actor_id, request_digest,
+                        summary, status, created_at, expires_at, resolved_at, consumed_at
+                 FROM bound_approvals WHERE id = ?1",
+                [approval_id.to_string()],
+                raw_bound_approval,
+            )
+            .optional()
+            .map_err(storage_error)?
+            .ok_or_else(|| policy_error("bound approval is unavailable"))?;
+        let approval = bound_record_from_raw(approval_id, raw)?;
+        if approval.binding != *binding
+            || approval.status != ApprovalStatus::Pending
+            || approval.consumed_at.is_some()
+            || claim.now >= approval.binding.expires_at()
+        {
+            return Err(policy_error("bound approval does not match the request"));
+        }
+        let timestamp = format_timestamp(claim.now);
+        let code_changed = transaction
+            .execute(
+                "UPDATE remote_codes SET consumed_at = ?2
+                 WHERE code_digest = ?1 AND consumed_at IS NULL AND expires_at > ?2",
+                params![code_digest.to_string(), timestamp],
+            )
+            .map_err(storage_error)?;
+        let approval_changed = transaction
+            .execute(
+                "UPDATE bound_approvals
+                 SET status = ?2, resolved_at = ?3,
+                     consumed_at = CASE WHEN ?2 = 'allowed' THEN ?3 ELSE NULL END
+                 WHERE id = ?1 AND status = 'pending' AND consumed_at IS NULL
+                   AND expires_at > ?3",
+                params![approval_id.to_string(), status.as_str(), timestamp],
+            )
+            .map_err(storage_error)?;
+        if code_changed != 1 || approval_changed != 1 {
+            return Err(policy_error("remote approval is unavailable"));
+        }
+        transaction.commit().map_err(storage_error)?;
+        Ok(RemoteCodeRecord {
+            consumed_at: Some(claim.now),
+            ..existing
+        })
+    }
+
     pub fn create_delivery(&self, input: NewDelivery) -> Result<DeliveryRecord, CarlError> {
         let record = DeliveryRecord {
             action_digest: input.action_digest,

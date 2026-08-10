@@ -14,8 +14,13 @@ const MAX_EVENT_TEXT_BYTES: usize = 1_048_576;
 pub struct CodexThreadId(String);
 
 impl CodexThreadId {
-    pub(crate) fn parse(value: &Value) -> Result<Self, DelegateError> {
-        Ok(Self(parse_bounded_string(value, MAX_PROVIDER_ID_BYTES)?))
+    pub fn parse(value: impl Into<String>) -> Result<Self, DelegateError> {
+        let value = value.into();
+        Ok(Self(validate_bounded(&value, MAX_PROVIDER_ID_BYTES)?))
+    }
+
+    pub(crate) fn from_value(value: &Value) -> Result<Self, DelegateError> {
+        Self::parse(parse_bounded_string(value, MAX_PROVIDER_ID_BYTES)?)
     }
 
     #[must_use]
@@ -34,8 +39,13 @@ impl fmt::Debug for CodexThreadId {
 pub struct CodexTurnId(String);
 
 impl CodexTurnId {
-    pub(crate) fn parse(value: &Value) -> Result<Self, DelegateError> {
-        Ok(Self(parse_bounded_string(value, MAX_PROVIDER_ID_BYTES)?))
+    pub fn parse(value: impl Into<String>) -> Result<Self, DelegateError> {
+        let value = value.into();
+        Ok(Self(validate_bounded(&value, MAX_PROVIDER_ID_BYTES)?))
+    }
+
+    pub(crate) fn from_value(value: &Value) -> Result<Self, DelegateError> {
+        Self::parse(parse_bounded_string(value, MAX_PROVIDER_ID_BYTES)?)
     }
 
     #[must_use]
@@ -85,6 +95,10 @@ pub struct CodexApprovalRequest {
 }
 
 impl CodexApprovalRequest {
+    pub fn from_provider_request(value: Value) -> Result<Self, DelegateError> {
+        parse_approval_request(value)
+    }
+
     #[must_use]
     pub fn provider_request_id(&self) -> &str {
         &self.provider_request_id
@@ -204,17 +218,17 @@ pub(crate) fn parse_notification(value: Value) -> Result<CodexEvent, DelegateErr
                 .get("thread")
                 .and_then(Value::as_object)
                 .ok_or_else(protocol_error)?;
-            let thread_id = parse_id_field(thread, "id", CodexThreadId::parse)?;
+            let thread_id = parse_id_field(thread, "id", CodexThreadId::from_value)?;
             Ok(CodexEvent::ThreadStarted { thread_id })
         }
         "turn/started" => {
             require_keys(params, &["threadId", "turn"], &[])?;
-            let thread_id = parse_id_field(params, "threadId", CodexThreadId::parse)?;
+            let thread_id = parse_id_field(params, "threadId", CodexThreadId::from_value)?;
             let turn = params
                 .get("turn")
                 .and_then(Value::as_object)
                 .ok_or_else(protocol_error)?;
-            let turn_id = parse_id_field(turn, "id", CodexTurnId::parse)?;
+            let turn_id = parse_id_field(turn, "id", CodexTurnId::from_value)?;
             Ok(CodexEvent::TurnStarted { thread_id, turn_id })
         }
         "item/started" => {
@@ -298,12 +312,12 @@ pub(crate) fn parse_notification(value: Value) -> Result<CodexEvent, DelegateErr
         }
         "turn/completed" => {
             require_keys(params, &["threadId", "turn"], &[])?;
-            let thread_id = parse_id_field(params, "threadId", CodexThreadId::parse)?;
+            let thread_id = parse_id_field(params, "threadId", CodexThreadId::from_value)?;
             let turn = params
                 .get("turn")
                 .and_then(Value::as_object)
                 .ok_or_else(protocol_error)?;
-            let turn_id = parse_id_field(turn, "id", CodexTurnId::parse)?;
+            let turn_id = parse_id_field(turn, "id", CodexTurnId::from_value)?;
             let status = parse_bounded_string(
                 turn.get("status").ok_or_else(protocol_error)?,
                 MAX_PROVIDER_ID_BYTES,
@@ -322,8 +336,12 @@ pub(crate) fn parse_notification(value: Value) -> Result<CodexEvent, DelegateErr
                 return Err(protocol_error());
             }
             Ok(CodexEvent::ProviderError {
-                thread_id: Some(parse_id_field(params, "threadId", CodexThreadId::parse)?),
-                turn_id: Some(parse_id_field(params, "turnId", CodexTurnId::parse)?),
+                thread_id: Some(parse_id_field(
+                    params,
+                    "threadId",
+                    CodexThreadId::from_value,
+                )?),
+                turn_id: Some(parse_id_field(params, "turnId", CodexTurnId::from_value)?),
             })
         }
         _ => Err(protocol_error()),
@@ -405,8 +423,8 @@ fn parse_turn_binding(
     params: &serde_json::Map<String, Value>,
 ) -> Result<(CodexThreadId, CodexTurnId), DelegateError> {
     Ok((
-        parse_id_field(params, "threadId", CodexThreadId::parse)?,
-        parse_id_field(params, "turnId", CodexTurnId::parse)?,
+        parse_id_field(params, "threadId", CodexThreadId::from_value)?,
+        parse_id_field(params, "turnId", CodexTurnId::from_value)?,
     ))
 }
 

@@ -41,6 +41,35 @@ pub struct CodexModel {
 }
 
 impl CodexModel {
+    pub fn new(
+        id: ModelId,
+        display_name: impl Into<String>,
+        supported_efforts: Vec<ReasoningEffort>,
+        default_effort: ReasoningEffort,
+    ) -> Result<Self, DelegateError> {
+        let display_name = display_name.into();
+        if display_name.is_empty()
+            || display_name.len() > 128
+            || supported_efforts.is_empty()
+            || supported_efforts.len() > 6
+            || supported_efforts
+                .iter()
+                .copied()
+                .collect::<HashSet<_>>()
+                .len()
+                != supported_efforts.len()
+            || !supported_efforts.contains(&default_effort)
+        {
+            return Err(protocol_error());
+        }
+        Ok(Self {
+            id,
+            display_name,
+            supported_efforts,
+            default_effort,
+        })
+    }
+
     #[must_use]
     pub const fn id(&self) -> &ModelId {
         &self.id
@@ -280,7 +309,7 @@ impl CodexAppServer {
         {
             return Err(protocol_error());
         }
-        let thread_id = CodexThreadId::parse(thread.get("id").ok_or_else(protocol_error)?)?;
+        let thread_id = CodexThreadId::from_value(thread.get("id").ok_or_else(protocol_error)?)?;
         if self.threads.contains_key(thread_id.as_str()) {
             return Err(protocol_error());
         }
@@ -329,7 +358,7 @@ impl CodexAppServer {
             .get("turn")
             .and_then(Value::as_object)
             .ok_or_else(protocol_error)?;
-        let turn_id = CodexTurnId::parse(turn.get("id").ok_or_else(protocol_error)?)?;
+        let turn_id = CodexTurnId::from_value(turn.get("id").ok_or_else(protocol_error)?)?;
         let state = self
             .threads
             .get_mut(request.thread_id.as_str())

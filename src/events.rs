@@ -94,6 +94,13 @@ pub enum Event {
     AssistantTextDelta {
         text: String,
     },
+    ProviderLifecycle {
+        phase: String,
+        provider_id: Option<String>,
+    },
+    WorkspaceDiffUpdated {
+        diff: String,
+    },
     ToolProposed {
         tool_call_id: ToolCallId,
         tool_name: String,
@@ -169,6 +176,13 @@ enum EventRef<'a> {
     AssistantTextDelta {
         text: &'a str,
     },
+    ProviderLifecycle {
+        phase: &'a str,
+        provider_id: Option<&'a str>,
+    },
+    WorkspaceDiffUpdated {
+        diff: &'a str,
+    },
     ToolProposed {
         tool_call_id: ToolCallId,
         tool_name: &'a str,
@@ -226,6 +240,11 @@ impl<'a> From<&'a Event> for EventRef<'a> {
         match event {
             Event::UserInput { text } => Self::UserInput { text },
             Event::AssistantTextDelta { text } => Self::AssistantTextDelta { text },
+            Event::ProviderLifecycle { phase, provider_id } => Self::ProviderLifecycle {
+                phase,
+                provider_id: provider_id.as_deref(),
+            },
+            Event::WorkspaceDiffUpdated { diff } => Self::WorkspaceDiffUpdated { diff },
             Event::ToolProposed {
                 tool_call_id,
                 tool_name,
@@ -550,6 +569,13 @@ enum EventPayloadV3 {
     AssistantTextDelta {
         text: String,
     },
+    ProviderLifecycle {
+        phase: String,
+        provider_id: Option<String>,
+    },
+    WorkspaceDiffUpdated {
+        diff: String,
+    },
     ToolProposed {
         tool_call_id: ToolCallId,
         tool_name: String,
@@ -607,6 +633,10 @@ impl From<EventPayloadV3> for Event {
         match payload {
             EventPayloadV3::UserInput { text } => Self::UserInput { text },
             EventPayloadV3::AssistantTextDelta { text } => Self::AssistantTextDelta { text },
+            EventPayloadV3::ProviderLifecycle { phase, provider_id } => {
+                Self::ProviderLifecycle { phase, provider_id }
+            }
+            EventPayloadV3::WorkspaceDiffUpdated { diff } => Self::WorkspaceDiffUpdated { diff },
             EventPayloadV3::ToolProposed {
                 tool_call_id,
                 tool_name,
