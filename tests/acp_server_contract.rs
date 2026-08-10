@@ -4,13 +4,14 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use carl::acp::{AcpServer, CodexPort, IncomingFrame, JsonRpcId, Kernel, PortFuture, read_frame};
-use carl::delegates::codex::{
-    CodexApprovalDecision, CodexApprovalRequest, CodexEvent, CodexModel, CodexThreadId,
-    CodexTurnId, StartThread, StartTurn,
-};
+use carl::acp::{AcpServer, IncomingFrame, JsonRpcId, Kernel, read_frame};
 use carl::delegates::{ModelId, ReasoningEffort};
 use carl::policy::Frontend;
+use carl::runtime::agent_port::{
+    AgentCapabilities, AgentContextId, AgentEpochId, AgentEvent, AgentFuture, AgentModel,
+    AgentPort, AgentPortError, AgentPortErrorCode, AgentProcess, AgentRequestId, EffectDecision,
+    ResumeAgentContext, StartAgentContext, StartAgentEpoch,
+};
 use carl::sidecar::DataRootLock;
 use carl::storage::RuntimeStore;
 use chrono::Utc;
@@ -236,7 +237,7 @@ struct FakePort {
 }
 
 struct PortState {
-    events: VecDeque<CodexEvent>,
+    events: VecDeque<AgentEvent>,
     starts: usize,
     steers: Vec<String>,
     interrupts: usize,
@@ -245,25 +246,20 @@ struct PortState {
 impl FakePort {
     fn lifecycle() -> TestResult<Self> {
         Ok(Self::with_events([
-            CodexEvent::TurnStarted {
-                thread_id: thread()?,
-                turn_id: turn()?,
+            AgentEvent::EpochStarted {
+                context_id: context()?,
+                epoch_id: epoch()?,
             },
-            CodexEvent::AgentMessageDelta {
-                thread_id: thread()?,
-                turn_id: turn()?,
-                item_id: "message".into(),
+            AgentEvent::AssistantDelta {
+                epoch_id: epoch()?,
                 text: "Working".into(),
             },
-            CodexEvent::AgentMessageDelta {
-                thread_id: thread()?,
-                turn_id: turn()?,
-                item_id: "message".into(),
+            AgentEvent::AssistantDelta {
+                epoch_id: epoch()?,
                 text: "Done".into(),
             },
-            CodexEvent::TurnCompleted {
-                thread_id: thread()?,
-                turn_id: turn()?,
+            AgentEvent::EpochCompleted {
+                epoch_id: epoch()?,
                 status: "completed".into(),
             },
         ]))
@@ -273,7 +269,7 @@ impl FakePort {
         Ok(Self::with_events([]))
     }
 
-    fn with_events<const N: usize>(events: [CodexEvent; N]) -> Self {
+    fn with_events<const N: usize>(events: [AgentEvent; N]) -> Self {
         Self {
             state: Arc::new(Mutex::new(PortState {
                 events: events.into(),
@@ -285,36 +281,50 @@ impl FakePort {
     }
 }
 
-impl CodexPort for FakePort {
-    fn models(&mut self) -> PortFuture<'_, Vec<CodexModel>> {
+impl AgentPort for FakePort {
+    fn capabilities(&self) -> AgentCapabilities {
+        AgentCapabilities {
+            resume: true,
+            compact: true,
+            token_usage: true,
+            pre_dispatch_effects: true,
+            history_paging: false,
+            background_processes: false,
+        }
+    }
+
+    fn models(&mut self) -> AgentFuture<'_, Vec<AgentModel>> {
         Box::pin(async {
-            Ok(vec![
-                CodexModel::new(
-                    ModelId::parse("gpt-5.6-codex").map_err(|_| invalid())?,
-                    "GPT-5.6 Codex",
-                    vec![ReasoningEffort::Medium, ReasoningEffort::High],
-                    ReasoningEffort::Medium,
-                )
-                .map_err(|_| invalid())?,
-            ])
+            Ok(vec![AgentModel {
+                id: ModelId::parse("gpt-5.6-codex").map_err(|_| invalid())?,
+                display_name: "GPT-5.6 Codex".into(),
+                supported_efforts: vec![ReasoningEffort::Medium, ReasoningEffort::High],
+                default_effort: ReasoningEffort::Medium,
+            }])
         })
     }
-    fn start_thread(&mut self, _request: StartThread) -> PortFuture<'_, CodexThreadId> {
-        Box::pin(async { thread().map_err(|_| invalid()) })
+    fn start_context(&mut self, _request: StartAgentContext) -> AgentFuture<'_, AgentContextId> {
+        Box::pin(async { context() })
     }
-    fn start_turn(&mut self, _request: StartTurn) -> PortFuture<'_, CodexTurnId> {
+    fn resume_context(&mut self, request: ResumeAgentContext) -> AgentFuture<'_, AgentContextId> {
+        Box::pin(async move { Ok(request.context_id) })
+    }
+    fn compact_context(&mut self, _context_id: &AgentContextId) -> AgentFuture<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
+    fn start_epoch(&mut self, _request: StartAgentEpoch) -> AgentFuture<'_, AgentEpochId> {
         let state = Arc::clone(&self.state);
         Box::pin(async move {
             state.lock().unwrap().starts += 1;
-            turn().map_err(|_| invalid())
+            epoch()
         })
     }
     fn steer(
         &mut self,
-        _thread_id: &CodexThreadId,
-        _turn_id: &CodexTurnId,
+        _context_id: &AgentContextId,
+        _epoch_id: &AgentEpochId,
         input: String,
-    ) -> PortFuture<'_, ()> {
+    ) -> AgentFuture<'_, ()> {
         let state = Arc::clone(&self.state);
         Box::pin(async move {
             state.lock().unwrap().steers.push(input);
@@ -323,16 +333,16 @@ impl CodexPort for FakePort {
     }
     fn interrupt(
         &mut self,
-        _thread_id: &CodexThreadId,
-        _turn_id: &CodexTurnId,
-    ) -> PortFuture<'_, ()> {
+        _context_id: &AgentContextId,
+        _epoch_id: &AgentEpochId,
+    ) -> AgentFuture<'_, ()> {
         let state = Arc::clone(&self.state);
         Box::pin(async move {
             state.lock().unwrap().interrupts += 1;
             Ok(())
         })
     }
-    fn next_event(&mut self) -> PortFuture<'_, CodexEvent> {
+    fn next_event(&mut self) -> AgentFuture<'_, AgentEvent> {
         let event = self.state.lock().unwrap().events.pop_front();
         Box::pin(async move {
             match event {
@@ -341,26 +351,39 @@ impl CodexPort for FakePort {
             }
         })
     }
-    fn resolve_approval(
+    fn resolve_effect(
         &mut self,
-        _approval: &CodexApprovalRequest,
-        _decision: CodexApprovalDecision,
-    ) -> PortFuture<'_, ()> {
+        _request_id: &AgentRequestId,
+        _decision: EffectDecision,
+    ) -> AgentFuture<'_, ()> {
         Box::pin(async { Ok(()) })
     }
-    fn cancel(&mut self) -> PortFuture<'_, ()> {
+    fn list_background_processes(
+        &mut self,
+        _context_id: &AgentContextId,
+    ) -> AgentFuture<'_, Vec<AgentProcess>> {
+        Box::pin(async { Err(invalid()) })
+    }
+    fn terminate_background_process(
+        &mut self,
+        _context_id: &AgentContextId,
+        _process_id: &str,
+    ) -> AgentFuture<'_, bool> {
+        Box::pin(async { Err(invalid()) })
+    }
+    fn shutdown(&mut self) -> AgentFuture<'_, ()> {
         Box::pin(async { Ok(()) })
     }
 }
 
-fn thread() -> Result<CodexThreadId, carl::delegates::codex::DelegateError> {
-    CodexThreadId::parse("thr_123")
+fn context() -> Result<AgentContextId, AgentPortError> {
+    AgentContextId::parse("thr_123")
 }
-fn turn() -> Result<CodexTurnId, carl::delegates::codex::DelegateError> {
-    CodexTurnId::parse("turn_123")
+fn epoch() -> Result<AgentEpochId, AgentPortError> {
+    AgentEpochId::parse("turn_123")
 }
-fn invalid() -> carl::acp::KernelError {
-    carl::acp::KernelError::from_code(carl::acp::KernelErrorCode::ProviderFailed)
+fn invalid() -> AgentPortError {
+    AgentPortError::from_code(AgentPortErrorCode::InvalidResponse)
 }
 
 struct Layout {

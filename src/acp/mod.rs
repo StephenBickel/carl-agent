@@ -15,9 +15,7 @@ pub use config::{
     ConfigChange, ConfigError, ConfigErrorCode, ModeActivation, ModelCatalog, ModelDescriptor,
     PermissionMode, PermissionProfile, SessionConfiguration, config_options,
 };
-pub use kernel::{
-    CodexPort, Kernel, KernelCommand, KernelHandle, KernelPublisher, PortFuture, PublicationFailure,
-};
+pub use kernel::{Kernel, KernelCommand, KernelHandle, KernelPublisher, PublicationFailure};
 pub use protocol::{
     AcpError, AcpErrorCode, BoundedJsonRpcString, IncomingFrame, JsonRpcId, OutgoingFrame,
     read_frame, write_frame,

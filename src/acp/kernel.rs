@@ -19,12 +19,12 @@ use super::{
     ModelDescriptor, PermissionMode, PermissionProfile, SessionConfiguration,
 };
 use crate::delegates::DelegateSettings;
-use crate::delegates::codex::{
-    CodexAppServer, CodexApprovalDecision, CodexApprovalKind, CodexApprovalRequest, CodexEvent,
-    CodexItem, CodexModel, CodexThreadId, CodexTurnId, StartThread, StartTurn,
-};
 use crate::events::{ApprovalId, Event, SessionId, ToolCallId, TurnId};
 use crate::policy::{ActorId, Frontend, Sha256Digest};
+use crate::runtime::agent_port::{
+    AgentContextId, AgentEffectKind, AgentEffectRequest, AgentEpochId, AgentEvent, AgentItem,
+    AgentModel, AgentPort, AgentPortError, EffectDecision, StartAgentContext, StartAgentEpoch,
+};
 use crate::security::SecretFilter;
 use crate::storage::{
     ApprovalStatus, BoundApprovalBinding, DeliveryKind, DeliveryStatus, ExternalSessionId,
@@ -35,113 +35,6 @@ use crate::storage::{
 const COMMAND_CAPACITY: usize = 64;
 const APPROVAL_LIFETIME: TimeDelta = TimeDelta::minutes(15);
 const MAX_FINAL_MESSAGE_BYTES: usize = 256 * 1_024;
-
-pub type PortFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, KernelError>> + Send + 'a>>;
-
-pub trait CodexPort: Send {
-    fn models(&mut self) -> PortFuture<'_, Vec<CodexModel>>;
-    fn start_thread(&mut self, request: StartThread) -> PortFuture<'_, CodexThreadId>;
-    fn start_turn(&mut self, request: StartTurn) -> PortFuture<'_, CodexTurnId>;
-    fn steer(
-        &mut self,
-        thread_id: &CodexThreadId,
-        turn_id: &CodexTurnId,
-        input: String,
-    ) -> PortFuture<'_, ()>;
-    fn interrupt(&mut self, thread_id: &CodexThreadId, turn_id: &CodexTurnId)
-    -> PortFuture<'_, ()>;
-    fn next_event(&mut self) -> PortFuture<'_, CodexEvent>;
-    fn resolve_approval(
-        &mut self,
-        approval: &CodexApprovalRequest,
-        decision: CodexApprovalDecision,
-    ) -> PortFuture<'_, ()>;
-    fn cancel(&mut self) -> PortFuture<'_, ()>;
-}
-
-impl CodexPort for CodexAppServer {
-    fn models(&mut self) -> PortFuture<'_, Vec<CodexModel>> {
-        Box::pin(async move {
-            CodexAppServer::models(self)
-                .await
-                .map_err(|_| provider_error())
-        })
-    }
-
-    fn start_thread(&mut self, request: StartThread) -> PortFuture<'_, CodexThreadId> {
-        Box::pin(async move {
-            CodexAppServer::start_thread(self, request)
-                .await
-                .map_err(|_| provider_error())
-        })
-    }
-
-    fn start_turn(&mut self, request: StartTurn) -> PortFuture<'_, CodexTurnId> {
-        Box::pin(async move {
-            CodexAppServer::start_turn(self, request)
-                .await
-                .map_err(|_| provider_error())
-        })
-    }
-
-    fn steer(
-        &mut self,
-        thread_id: &CodexThreadId,
-        turn_id: &CodexTurnId,
-        input: String,
-    ) -> PortFuture<'_, ()> {
-        let thread_id = thread_id.clone();
-        let turn_id = turn_id.clone();
-        Box::pin(async move {
-            CodexAppServer::steer(self, &thread_id, &turn_id, input)
-                .await
-                .map_err(|_| provider_error())
-        })
-    }
-
-    fn interrupt(
-        &mut self,
-        thread_id: &CodexThreadId,
-        turn_id: &CodexTurnId,
-    ) -> PortFuture<'_, ()> {
-        let thread_id = thread_id.clone();
-        let turn_id = turn_id.clone();
-        Box::pin(async move {
-            CodexAppServer::interrupt(self, &thread_id, &turn_id)
-                .await
-                .map_err(|_| provider_error())
-        })
-    }
-
-    fn next_event(&mut self) -> PortFuture<'_, CodexEvent> {
-        Box::pin(async move {
-            CodexAppServer::next_event(self)
-                .await
-                .map_err(|_| provider_error())
-        })
-    }
-
-    fn resolve_approval(
-        &mut self,
-        approval: &CodexApprovalRequest,
-        decision: CodexApprovalDecision,
-    ) -> PortFuture<'_, ()> {
-        let approval = approval.clone();
-        Box::pin(async move {
-            CodexAppServer::resolve_approval(self, &approval, decision)
-                .await
-                .map_err(|_| provider_error())
-        })
-    }
-
-    fn cancel(&mut self) -> PortFuture<'_, ()> {
-        Box::pin(async move {
-            CodexAppServer::cancel(self)
-                .await
-                .map_err(|_| provider_error())
-        })
-    }
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PublicationFailure {
@@ -345,14 +238,14 @@ impl KernelHandle {
 pub struct Kernel;
 
 impl Kernel {
-    pub async fn start(
+    pub async fn start<A: AgentPort + 'static>(
         store: RuntimeStore,
-        codex: CodexAppServer,
+        agent: A,
         publisher: Option<BuzzPublisher>,
     ) -> Result<KernelHandle, KernelError> {
         Self::start_with_ports(
             store,
-            Box::new(codex),
+            Box::new(agent),
             publisher.map(|publisher| Box::new(publisher) as Box<dyn KernelPublisher>),
         )
         .await
@@ -360,10 +253,10 @@ impl Kernel {
 
     pub async fn start_with_ports(
         store: RuntimeStore,
-        mut codex: Box<dyn CodexPort>,
+        mut agent: Box<dyn AgentPort>,
         publisher: Option<Box<dyn KernelPublisher>>,
     ) -> Result<KernelHandle, KernelError> {
-        let provider_models = codex.models().await?;
+        let provider_models = agent.models().await.map_err(map_agent_port)?;
         let catalog = Arc::new(catalog_from_provider(&provider_models)?);
         let (commands, receiver) = mpsc::channel(COMMAND_CAPACITY);
         let handle = KernelHandle {
@@ -373,7 +266,7 @@ impl Kernel {
         tokio::spawn(
             KernelActor {
                 store,
-                codex,
+                agent,
                 publisher,
                 catalog,
                 sessions: HashMap::new(),
@@ -391,21 +284,21 @@ struct SessionState {
     actor_id: ActorId,
     frontend: Frontend,
     buzz_context: Option<BuzzContext>,
-    provider_thread: CodexThreadId,
+    provider_context: AgentContextId,
     active: Option<ActiveTurn>,
     pending_bypass: Option<PendingBypass>,
 }
 
 struct ActiveTurn {
     local_turn_id: TurnId,
-    provider_turn_id: CodexTurnId,
+    provider_epoch_id: AgentEpochId,
     pending_approval: Option<PendingApproval>,
     assistant_text: String,
-    item_ids: HashMap<String, (ToolCallId, CodexApprovalKind)>,
+    item_ids: HashMap<String, (ToolCallId, AgentEffectKind)>,
 }
 
 struct PendingApproval {
-    request: CodexApprovalRequest,
+    request: AgentEffectRequest,
     approval_id: ApprovalId,
     binding: BoundApprovalBinding,
 }
@@ -416,7 +309,7 @@ struct PendingBypass {
 
 struct KernelActor {
     store: RuntimeStore,
-    codex: Box<dyn CodexPort>,
+    agent: Box<dyn AgentPort>,
     publisher: Option<Box<dyn KernelPublisher>>,
     catalog: Arc<ModelCatalog>,
     sessions: HashMap<SessionId, SessionState>,
@@ -483,7 +376,7 @@ impl KernelActor {
                     false
                 }
                 KernelCommand::Shutdown { reply } => {
-                    let result = self.codex.cancel().await;
+                    let result = self.agent.shutdown().await.map_err(map_agent_port);
                     let _ = reply.send(result);
                     true
                 }
@@ -492,7 +385,7 @@ impl KernelActor {
                 break;
             }
         }
-        let _ = self.codex.cancel().await;
+        let _ = self.agent.shutdown().await;
     }
 
     async fn new_session(
@@ -548,16 +441,17 @@ impl KernelActor {
                 },
             )
             .map_err(map_storage)?;
-        let provider_thread = self
-            .codex
-            .start_thread(StartThread {
+        let provider_context = self
+            .agent
+            .start_context(StartAgentContext {
                 cwd: request.cwd.clone(),
-                model: Some(model),
-                mode: request.mode,
+                model,
+                permission_mode: request.mode,
             })
-            .await?;
+            .await
+            .map_err(map_agent_port)?;
         let provider_thread_id =
-            ProviderThreadId::try_from(provider_thread.as_str()).map_err(|_| provider_error())?;
+            ProviderThreadId::try_from(provider_context.as_str()).map_err(|_| provider_error())?;
         self.store
             .store()
             .configure_frontend_session(
@@ -577,7 +471,7 @@ impl KernelActor {
                 actor_id: request.actor_id,
                 frontend: request.frontend,
                 buzz_context: request.buzz_context,
-                provider_thread,
+                provider_context,
                 active: None,
                 pending_bypass: None,
             },
@@ -659,22 +553,23 @@ impl KernelActor {
             )
             .map_err(map_storage)?;
         let state = self.sessions.get(&session_id).ok_or_else(unknown_session)?;
-        let provider_turn_id = self
-            .codex
-            .start_turn(StartTurn {
-                thread_id: state.provider_thread.clone(),
+        let provider_epoch_id = self
+            .agent
+            .start_epoch(StartAgentEpoch {
+                context_id: state.provider_context.clone(),
                 input,
-                model: Some(state.public.configuration().model().clone()),
-                effort: Some(state.public.configuration().effort()),
-                mode: state.public.configuration().mode(),
+                model: state.public.configuration().model().clone(),
+                effort: state.public.configuration().effort(),
+                permission_mode: state.public.configuration().mode(),
             })
-            .await?;
+            .await
+            .map_err(map_agent_port)?;
         self.sessions
             .get_mut(&session_id)
             .ok_or_else(unknown_session)?
             .active = Some(ActiveTurn {
             local_turn_id,
-            provider_turn_id,
+            provider_epoch_id,
             pending_approval: None,
             assistant_text: String::new(),
             item_ids: HashMap::new(),
@@ -686,11 +581,11 @@ impl KernelActor {
         let mut updates = Vec::new();
         loop {
             enum Next {
-                Provider(Result<CodexEvent, KernelError>),
+                Provider(Result<AgentEvent, AgentPortError>),
                 Command(Option<KernelCommand>),
             }
             let next = tokio::select! {
-                event = self.codex.next_event() => Next::Provider(event),
+                event = self.agent.next_event() => Next::Provider(event),
                 command = self.receiver.recv() => Next::Command(command),
             };
             match next {
@@ -699,7 +594,7 @@ impl KernelActor {
                         Ok(event) => event,
                         Err(error) => {
                             self.fail_active_turn(session_id, "provider_failed");
-                            return Err(error);
+                            return Err(map_agent_port(error));
                         }
                     };
                     match self
@@ -756,30 +651,30 @@ impl KernelActor {
     async fn process_provider_event(
         &mut self,
         session_id: SessionId,
-        event: CodexEvent,
+        event: AgentEvent,
         updates: &mut Vec<KernelUpdate>,
     ) -> Result<Option<PromptOutcome>, KernelError> {
         let turn_id = self.active_turn(session_id)?.local_turn_id;
         match event {
-            CodexEvent::ThreadStarted { thread_id } => {
-                self.persist_lifecycle(session_id, None, "thread_started", thread_id.as_str())?;
+            AgentEvent::ContextStarted { context_id } => {
+                self.persist_lifecycle(session_id, None, "context_started", context_id.as_str())?;
             }
-            CodexEvent::TurnStarted {
-                turn_id: provider, ..
+            AgentEvent::EpochStarted {
+                epoch_id: provider, ..
             } => {
                 self.persist_lifecycle(
                     session_id,
                     Some(turn_id),
-                    "turn_started",
+                    "epoch_started",
                     provider.as_str(),
                 )?;
             }
-            CodexEvent::ItemStarted { item, .. } => {
+            AgentEvent::ItemStarted { item, .. } => {
                 let item_id = item.item_id().to_owned();
                 let kind = match item {
-                    CodexItem::Command { .. } => Some(CodexApprovalKind::Command),
-                    CodexItem::FileChange { .. } => Some(CodexApprovalKind::FileChange),
-                    CodexItem::ContextCompaction { .. } | CodexItem::Other { .. } => None,
+                    AgentItem::Command { .. } => Some(AgentEffectKind::Command),
+                    AgentItem::FileChange { .. } => Some(AgentEffectKind::FileChange),
+                    AgentItem::ContextCompaction { .. } | AgentItem::Other { .. } => None,
                 };
                 if let Some(kind) = kind {
                     let tool_call_id = ToolCallId::new();
@@ -794,7 +689,7 @@ impl KernelActor {
                 }
                 self.persist_lifecycle(session_id, Some(turn_id), "item_started", &item_id)?;
             }
-            CodexEvent::AgentMessageDelta { text, .. } => {
+            AgentEvent::AssistantDelta { text, .. } => {
                 SecretFilter
                     .inspect(text.as_bytes())
                     .map_err(|_| invalid_input())?;
@@ -814,20 +709,20 @@ impl KernelActor {
                     .map_err(map_storage)?;
                 updates.push(KernelUpdate::AgentMessageChunk(text));
             }
-            CodexEvent::ItemCompleted { item, .. } => {
+            AgentEvent::ItemCompleted { item, .. } => {
                 let item_id = item.item_id().to_owned();
                 let completion = match &item {
-                    CodexItem::Command { status, .. } => Some((
-                        CodexApprovalKind::Command,
+                    AgentItem::Command { status, .. } => Some((
+                        AgentEffectKind::Command,
                         status.clone(),
                         terminal_tool_status(status)?,
                     )),
-                    CodexItem::FileChange { status, .. } => Some((
-                        CodexApprovalKind::FileChange,
+                    AgentItem::FileChange { status, .. } => Some((
+                        AgentEffectKind::FileChange,
                         status.clone(),
                         terminal_tool_status(status)?,
                     )),
-                    CodexItem::ContextCompaction { .. } | CodexItem::Other { .. } => None,
+                    AgentItem::ContextCompaction { .. } | AgentItem::Other { .. } => None,
                 };
                 let Some((kind, provider_status, status)) = completion else {
                     self.persist_lifecycle(session_id, Some(turn_id), "item_completed", &item_id)?;
@@ -857,8 +752,8 @@ impl KernelActor {
                     status,
                 });
             }
-            CodexEvent::TokenUsageUpdated { .. } => {}
-            CodexEvent::DiffUpdated { diff, .. } => {
+            AgentEvent::UsageUpdated { .. } => {}
+            AgentEvent::DiffUpdated { diff, .. } => {
                 SecretFilter
                     .inspect(diff.as_bytes())
                     .map_err(|_| invalid_input())?;
@@ -874,7 +769,7 @@ impl KernelActor {
                     .await?;
                 updates.push(KernelUpdate::DiffUpdated(diff));
             }
-            CodexEvent::ApprovalRequested(approval) => {
+            AgentEvent::EffectRequested(approval) => {
                 if self
                     .sessions
                     .get(&session_id)
@@ -894,7 +789,42 @@ impl KernelActor {
                     .await
                     .map(Some);
             }
-            CodexEvent::TurnCompleted { .. } => {
+            AgentEvent::CompactionStarted {
+                context_id,
+                item_id,
+            } => {
+                if context_id
+                    != self
+                        .sessions
+                        .get(&session_id)
+                        .ok_or_else(unknown_session)?
+                        .provider_context
+                {
+                    return Err(provider_error());
+                }
+                self.persist_lifecycle(session_id, Some(turn_id), "compaction_started", &item_id)?;
+            }
+            AgentEvent::CompactionCompleted {
+                context_id,
+                item_id,
+            } => {
+                if context_id
+                    != self
+                        .sessions
+                        .get(&session_id)
+                        .ok_or_else(unknown_session)?
+                        .provider_context
+                {
+                    return Err(provider_error());
+                }
+                self.persist_lifecycle(
+                    session_id,
+                    Some(turn_id),
+                    "compaction_completed",
+                    &item_id,
+                )?;
+            }
+            AgentEvent::EpochCompleted { .. } => {
                 let final_text = self.active_turn(session_id)?.assistant_text.clone();
                 SecretFilter
                     .inspect(final_text.as_bytes())
@@ -920,7 +850,7 @@ impl KernelActor {
                     updates: std::mem::take(updates),
                 }));
             }
-            CodexEvent::ProviderError { .. } => {
+            AgentEvent::ProviderFailed { .. } => {
                 self.store
                     .store_mut()
                     .append(
@@ -948,44 +878,38 @@ impl KernelActor {
         &mut self,
         session_id: SessionId,
         turn_id: TurnId,
-        approval: CodexApprovalRequest,
+        approval: AgentEffectRequest,
         updates: &mut Vec<KernelUpdate>,
     ) -> Result<(), KernelError> {
-        let (thread_matches, turn_matches, tool_call_id) = {
+        let tool_call_id = {
             let state = self.sessions.get(&session_id).ok_or_else(unknown_session)?;
             let active = state.active.as_ref().ok_or_else(session_busy)?;
-            (
-                approval.thread_id() == &state.provider_thread,
-                approval.turn_id() == &active.provider_turn_id && turn_id == active.local_turn_id,
-                active
-                    .item_ids
-                    .get(approval.item_id())
-                    .copied()
-                    .filter(|(_, kind)| *kind == approval.kind())
-                    .map(|(tool_call_id, _)| tool_call_id),
-            )
+            (turn_id == active.local_turn_id)
+                .then(|| {
+                    active
+                        .item_ids
+                        .get(&approval.item_id)
+                        .copied()
+                        .filter(|(_, kind)| *kind == approval.kind)
+                        .map(|(tool_call_id, _)| tool_call_id)
+                })
+                .flatten()
         };
-        let Some(tool_call_id) = tool_call_id.filter(|_| thread_matches && turn_matches) else {
-            self.codex
-                .resolve_approval(&approval, CodexApprovalDecision::Deny)
-                .await?;
+        let Some(tool_call_id) = tool_call_id else {
+            self.agent
+                .resolve_effect(&approval.request_id, EffectDecision::Deny)
+                .await
+                .map_err(map_agent_port)?;
             return Err(provider_error());
         };
-        let title = approval
-            .command()
-            .unwrap_or_else(|| match approval.kind() {
-                CodexApprovalKind::Command => "command",
-                CodexApprovalKind::FileChange => "file changes",
-            })
-            .to_owned();
-        let summary = match approval.reason() {
-            Some(reason) => format!("{title}\nReason: {reason}"),
-            None => title.clone(),
-        };
+        let (tool_name, tool_kind) = effect_metadata(approval.kind)?;
+        let summary = approval.summary.clone();
+        let title = effect_title(&approval);
         if SecretFilter.inspect(summary.as_bytes()).is_err() {
-            self.codex
-                .resolve_approval(&approval, CodexApprovalDecision::Deny)
-                .await?;
+            self.agent
+                .resolve_effect(&approval.request_id, EffectDecision::Deny)
+                .await
+                .map_err(map_agent_port)?;
             return Err(provider_error());
         }
         self.store
@@ -995,10 +919,7 @@ impl KernelActor {
                 Some(turn_id),
                 Event::ToolProposed {
                     tool_call_id,
-                    tool_name: match approval.kind() {
-                        CodexApprovalKind::Command => "command".to_owned(),
-                        CodexApprovalKind::FileChange => "file_change".to_owned(),
-                    },
+                    tool_name: tool_name.to_owned(),
                     arguments: json!({"summary":summary}),
                 },
             )
@@ -1010,20 +931,18 @@ impl KernelActor {
                 Some(turn_id),
                 Event::ToolDispatchAuthorized {
                     tool_call_id,
-                    request_digest: approval.request_digest().to_string(),
+                    request_digest: approval.request_digest.to_string(),
                     automatic: true,
                 },
             )
             .map_err(map_storage)?;
-        self.codex
-            .resolve_approval(&approval, CodexApprovalDecision::Allow)
-            .await?;
+        self.agent
+            .resolve_effect(&approval.request_id, EffectDecision::Allow)
+            .await
+            .map_err(map_agent_port)?;
         updates.push(KernelUpdate::ToolStarted {
             title,
-            kind: match approval.kind() {
-                CodexApprovalKind::Command => ToolKind::Execute,
-                CodexApprovalKind::FileChange => ToolKind::Edit,
-            },
+            kind: tool_kind,
         });
         Ok(())
     }
@@ -1032,7 +951,7 @@ impl KernelActor {
         &mut self,
         session_id: SessionId,
         turn_id: TurnId,
-        approval: CodexApprovalRequest,
+        approval: AgentEffectRequest,
         updates: &mut Vec<KernelUpdate>,
     ) -> Result<PromptOutcome, KernelError> {
         let (actor_id, external_session_id, frontend) = {
@@ -1043,21 +962,14 @@ impl KernelActor {
                 state.frontend,
             )
         };
-        let title = approval
-            .command()
-            .unwrap_or_else(|| match approval.kind() {
-                CodexApprovalKind::Command => "command",
-                CodexApprovalKind::FileChange => "file changes",
-            })
-            .to_owned();
-        let summary = match approval.reason() {
-            Some(reason) => format!("{title}\nReason: {reason}"),
-            None => title.clone(),
-        };
+        let (tool_name, tool_kind) = effect_metadata(approval.kind)?;
+        let title = effect_title(&approval);
+        let summary = approval.summary.clone();
         if SecretFilter.inspect(summary.as_bytes()).is_err() {
-            self.codex
-                .resolve_approval(&approval, CodexApprovalDecision::Deny)
-                .await?;
+            self.agent
+                .resolve_effect(&approval.request_id, EffectDecision::Deny)
+                .await
+                .map_err(map_agent_port)?;
             self.store
                 .store_mut()
                 .append(
@@ -1080,14 +992,15 @@ impl KernelActor {
         let tool_call_id = self
             .active_turn_mut(session_id)?
             .item_ids
-            .get(approval.item_id())
+            .get(&approval.item_id)
             .copied()
-            .filter(|(_, kind)| *kind == approval.kind())
+            .filter(|(_, kind)| *kind == approval.kind)
             .map(|(tool_call_id, _)| tool_call_id);
         let Some(tool_call_id) = tool_call_id else {
-            self.codex
-                .resolve_approval(&approval, CodexApprovalDecision::Deny)
-                .await?;
+            self.agent
+                .resolve_effect(&approval.request_id, EffectDecision::Deny)
+                .await
+                .map_err(map_agent_port)?;
             return Err(provider_error());
         };
         let approval_id = ApprovalId::new();
@@ -1097,7 +1010,7 @@ impl KernelActor {
             turn_id,
             tool_call_id,
             actor_id.clone(),
-            approval.request_digest(),
+            approval.request_digest,
             now,
             now + APPROVAL_LIFETIME,
         )
@@ -1109,10 +1022,7 @@ impl KernelActor {
                 Some(turn_id),
                 Event::ToolProposed {
                     tool_call_id,
-                    tool_name: match approval.kind() {
-                        CodexApprovalKind::Command => "command".to_owned(),
-                        CodexApprovalKind::FileChange => "file_change".to_owned(),
-                    },
+                    tool_name: tool_name.to_owned(),
                     arguments: json!({"summary":summary}),
                 },
             )
@@ -1160,8 +1070,8 @@ impl KernelActor {
                 .request
                 .clone();
             let _ = self
-                .codex
-                .resolve_approval(&request, CodexApprovalDecision::Deny)
+                .agent
+                .resolve_effect(&request.request_id, EffectDecision::Deny)
                 .await;
             self.fail_active_turn(session_id, "approval_publication_failed");
             return Err(error);
@@ -1171,17 +1081,7 @@ impl KernelActor {
         }
         updates.push(KernelUpdate::ToolStarted {
             title,
-            kind: match self
-                .active_turn(session_id)?
-                .pending_approval
-                .as_ref()
-                .expect("approval was stored")
-                .request
-                .kind()
-            {
-                CodexApprovalKind::Command => ToolKind::Execute,
-                CodexApprovalKind::FileChange => ToolKind::Edit,
-            },
+            kind: tool_kind,
         });
         Ok(PromptOutcome {
             stop_reason: PromptStopReason::WaitingForApproval,
@@ -1198,9 +1098,9 @@ impl KernelActor {
             .leading_slash_command()
             .ok_or_else(|| KernelError::from_code(KernelErrorCode::ApprovalUnavailable))?;
         let (decision, code) = if let Some(code) = command.strip_prefix("/approve ") {
-            (CodexApprovalDecision::Allow, code)
+            (EffectDecision::Allow, code)
         } else if let Some(code) = command.strip_prefix("/deny ") {
-            (CodexApprovalDecision::Deny, code)
+            (EffectDecision::Deny, code)
         } else {
             return Err(KernelError::from_code(KernelErrorCode::ApprovalUnavailable));
         };
@@ -1210,9 +1110,8 @@ impl KernelActor {
             .pending_approval
             .as_ref()
             .ok_or_else(|| KernelError::from_code(KernelErrorCode::ApprovalUnavailable))?;
-        let provider_request_id =
-            ProviderRequestId::try_from(pending.request.provider_request_id())
-                .map_err(|_| provider_error())?;
+        let provider_request_id = ProviderRequestId::try_from(pending.request.request_id.as_str())
+            .map_err(|_| provider_error())?;
         let durable = self
             .store
             .store()
@@ -1225,13 +1124,13 @@ impl KernelActor {
                 .provider_thread_id
                 .as_ref()
                 .map(ProviderThreadId::as_str)
-                != Some(state.provider_thread.as_str())
+                != Some(state.provider_context.as_str())
         {
             return Err(KernelError::from_code(KernelErrorCode::ApprovalUnavailable));
         }
         let status = match decision {
-            CodexApprovalDecision::Allow => ApprovalStatus::Allowed,
-            CodexApprovalDecision::Deny => ApprovalStatus::Denied,
+            EffectDecision::Allow => ApprovalStatus::Allowed,
+            EffectDecision::Deny => ApprovalStatus::Denied,
         };
         let now = Utc::now();
         self.store
@@ -1243,7 +1142,7 @@ impl KernelActor {
                     external_session_id: state.public.external_session_id.clone(),
                     approval_id: Some(pending.approval_id),
                     provider_request_id: Some(provider_request_id),
-                    request_digest: pending.request.request_digest(),
+                    request_digest: pending.request.request_digest,
                     actor_id: state.actor_id.clone(),
                     now,
                 },
@@ -1252,9 +1151,12 @@ impl KernelActor {
             )
             .map_err(|_| KernelError::from_code(KernelErrorCode::ApprovalUnavailable))?;
         let approval = pending.request.clone();
-        let tool_title = approval.command().unwrap_or(approval.item_id()).to_owned();
+        let tool_title = effect_title(&approval);
         let turn_id = active.local_turn_id;
-        self.codex.resolve_approval(&approval, decision).await?;
+        self.agent
+            .resolve_effect(&approval.request_id, decision)
+            .await
+            .map_err(map_agent_port)?;
         self.store
             .store_mut()
             .append(
@@ -1262,8 +1164,8 @@ impl KernelActor {
                 Some(turn_id),
                 Event::UserInput {
                     text: match decision {
-                        CodexApprovalDecision::Allow => "/approve <redacted>",
-                        CodexApprovalDecision::Deny => "/deny <redacted>",
+                        EffectDecision::Allow => "/approve <redacted>",
+                        EffectDecision::Deny => "/deny <redacted>",
                     }
                     .to_owned(),
                 },
@@ -1275,7 +1177,7 @@ impl KernelActor {
             0,
             KernelUpdate::ToolCompleted {
                 title: tool_title,
-                status: if decision == CodexApprovalDecision::Allow {
+                status: if decision == EffectDecision::Allow {
                     ToolStatus::Completed
                 } else {
                     ToolStatus::Failed
@@ -1456,7 +1358,7 @@ impl KernelActor {
             .configure_frontend_session(
                 &state.public.external_session_id,
                 Some(
-                    &ProviderThreadId::try_from(state.provider_thread.as_str())
+                    &ProviderThreadId::try_from(state.provider_context.as_str())
                         .map_err(map_storage)?,
                 ),
                 state.public.configuration.mode(),
@@ -1491,9 +1393,10 @@ impl KernelActor {
     async fn cancel_session(&mut self, session_id: SessionId) -> Result<(), KernelError> {
         let state = self.sessions.get(&session_id).ok_or_else(unknown_session)?;
         let active = state.active.as_ref().ok_or_else(session_busy)?;
-        self.codex
-            .interrupt(&state.provider_thread, &active.provider_turn_id)
-            .await?;
+        self.agent
+            .interrupt(&state.provider_context, &active.provider_epoch_id)
+            .await
+            .map_err(map_agent_port)?;
         self.store
             .store_mut()
             .append(
@@ -1537,9 +1440,10 @@ impl KernelActor {
                 },
             )
             .map_err(map_storage)?;
-        self.codex
-            .steer(&state.provider_thread, &active.provider_turn_id, input)
+        self.agent
+            .steer(&state.provider_context, &active.provider_epoch_id, input)
             .await
+            .map_err(map_agent_port)
     }
 
     async fn publish(
@@ -1616,19 +1520,19 @@ impl KernelActor {
         &self,
         external_session_id: &ExternalSessionId,
         approval_id: ApprovalId,
-        approval: &CodexApprovalRequest,
+        approval: &AgentEffectRequest,
         actor_id: &ActorId,
         now: chrono::DateTime<Utc>,
     ) -> Result<String, KernelError> {
         let provider_request_id =
-            ProviderRequestId::try_from(approval.provider_request_id()).map_err(map_storage)?;
+            ProviderRequestId::try_from(approval.request_id.as_str()).map_err(map_storage)?;
         create_remote_code(
             self.store.store(),
             RemoteCodeKind::Approval,
             external_session_id,
             Some(approval_id),
             Some(provider_request_id),
-            approval.request_digest(),
+            approval.request_digest,
             actor_id,
             now,
         )
@@ -1716,14 +1620,14 @@ fn reject_busy_command(command: KernelCommand) {
     }
 }
 
-fn catalog_from_provider(models: &[CodexModel]) -> Result<ModelCatalog, KernelError> {
+fn catalog_from_provider(models: &[AgentModel]) -> Result<ModelCatalog, KernelError> {
     let descriptors = models
         .iter()
         .map(|model| {
             ModelDescriptor::new(
-                model.id().clone(),
-                model.display_name(),
-                model.supported_efforts().to_vec(),
+                model.id.clone(),
+                model.display_name.clone(),
+                model.supported_efforts.clone(),
             )
             .map_err(|_| provider_error())
         })
@@ -1827,6 +1731,33 @@ fn map_publication_error(error: crate::acp::BuzzError) -> PublicationFailure {
 
 fn map_storage(_error: crate::error::CarlError) -> KernelError {
     KernelError::from_code(KernelErrorCode::StorageFailed)
+}
+
+fn map_agent_port(_error: AgentPortError) -> KernelError {
+    provider_error()
+}
+
+fn effect_metadata(kind: AgentEffectKind) -> Result<(&'static str, ToolKind), KernelError> {
+    match kind {
+        AgentEffectKind::Command => Ok(("command", ToolKind::Execute)),
+        AgentEffectKind::FileChange => Ok(("file_change", ToolKind::Edit)),
+        AgentEffectKind::Network | AgentEffectKind::External => Err(provider_error()),
+    }
+}
+
+fn effect_title(request: &AgentEffectRequest) -> String {
+    request
+        .summary
+        .lines()
+        .next()
+        .filter(|line| !line.is_empty())
+        .unwrap_or(match request.kind {
+            AgentEffectKind::Command => "command",
+            AgentEffectKind::FileChange => "file changes",
+            AgentEffectKind::Network => "network access",
+            AgentEffectKind::External => "external effect",
+        })
+        .to_owned()
 }
 
 const fn invalid_input() -> KernelError {

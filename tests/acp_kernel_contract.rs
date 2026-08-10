@@ -5,17 +5,19 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use carl::acp::{
-    BuzzContext, CodexPort, ConfigOutcome, ConfigSelection, Kernel, KernelPublisher,
-    NewSessionRequest, PermissionMode, PermissionProfile, PortFuture, Prompt, PromptStopReason,
-    PublicationFailure,
+    BuzzContext, ConfigOutcome, ConfigSelection, Kernel, KernelPublisher, NewSessionRequest,
+    PermissionMode, PermissionProfile, Prompt, PromptStopReason, PublicationFailure,
 };
-use carl::delegates::codex::{
-    CodexAppServer, CodexApprovalDecision, CodexApprovalRequest, CodexEvent, CodexItem, CodexModel,
-    CodexThreadId, CodexTurnId, StartThread, StartTurn,
-};
+use carl::delegates::codex::CodexAppServer;
 use carl::delegates::{ModelId, ReasoningEffort};
 use carl::events::Event;
-use carl::policy::{ActorId, Frontend};
+use carl::policy::{ActorId, Frontend, Sha256Digest};
+use carl::runtime::agent_port::{
+    AgentCapabilities, AgentContextId, AgentEffectKind, AgentEffectRequest, AgentEpochId,
+    AgentEvent, AgentFuture, AgentItem, AgentModel, AgentPort, AgentPortError, AgentPortErrorCode,
+    AgentProcess, AgentRequestId, EffectDecision, ResumeAgentContext, StartAgentContext,
+    StartAgentEpoch,
+};
 use carl::sidecar::DataRootLock;
 use carl::storage::{ChannelId, ClientName, ExternalSessionId, RuntimeStore, Store};
 use chrono::Utc;
@@ -87,28 +89,25 @@ async fn kernel_persists_provider_events_before_returning_updates() -> TestResul
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn unknown_codex_items_are_not_reported_as_successful_tools() -> TestResult {
+async fn unknown_agent_items_are_not_reported_as_successful_tools() -> TestResult {
     let layout = Layout::new()?;
     let port = ScriptedPort::with_events([
-        CodexEvent::ItemStarted {
-            thread_id: thread()?,
-            turn_id: turn()?,
-            item: CodexItem::Other {
+        AgentEvent::ItemStarted {
+            epoch_id: epoch()?,
+            item: AgentItem::Other {
                 item_id: "future-item".into(),
                 item_type: "futureTool".into(),
             },
         },
-        CodexEvent::ItemCompleted {
-            thread_id: thread()?,
-            turn_id: turn()?,
-            item: CodexItem::Other {
+        AgentEvent::ItemCompleted {
+            epoch_id: epoch()?,
+            item: AgentItem::Other {
                 item_id: "future-item".into(),
                 item_type: "futureTool".into(),
             },
         },
-        CodexEvent::TurnCompleted {
-            thread_id: thread()?,
-            turn_id: turn()?,
+        AgentEvent::EpochCompleted {
+            epoch_id: epoch()?,
             status: "completed".into(),
         },
     ]);
@@ -132,14 +131,12 @@ async fn unknown_codex_items_are_not_reported_as_successful_tools() -> TestResul
 async fn orphaned_known_tool_completion_fails_without_a_completion_journal() -> TestResult {
     let layout = Layout::new()?;
     let port = ScriptedPort::with_events([
-        CodexEvent::ItemCompleted {
-            thread_id: thread()?,
-            turn_id: turn()?,
+        AgentEvent::ItemCompleted {
+            epoch_id: epoch()?,
             item: command_item("orphan-command", "completed"),
         },
-        CodexEvent::TurnCompleted {
-            thread_id: thread()?,
-            turn_id: turn()?,
+        AgentEvent::EpochCompleted {
+            epoch_id: epoch()?,
             status: "completed".into(),
         },
     ]);
@@ -166,19 +163,16 @@ async fn orphaned_known_tool_completion_fails_without_a_completion_journal() -> 
 async fn known_tool_completion_kind_mismatch_fails_without_a_completion_journal() -> TestResult {
     let layout = Layout::new()?;
     let port = ScriptedPort::with_events([
-        CodexEvent::ItemStarted {
-            thread_id: thread()?,
-            turn_id: turn()?,
+        AgentEvent::ItemStarted {
+            epoch_id: epoch()?,
             item: command_item("changed-kind", "inProgress"),
         },
-        CodexEvent::ItemCompleted {
-            thread_id: thread()?,
-            turn_id: turn()?,
+        AgentEvent::ItemCompleted {
+            epoch_id: epoch()?,
             item: file_change_item("changed-kind", "completed"),
         },
-        CodexEvent::TurnCompleted {
-            thread_id: thread()?,
-            turn_id: turn()?,
+        AgentEvent::EpochCompleted {
+            epoch_id: epoch()?,
             status: "completed".into(),
         },
     ]);
@@ -205,24 +199,20 @@ async fn known_tool_completion_kind_mismatch_fails_without_a_completion_journal(
 async fn duplicate_known_tool_completion_fails_without_a_second_completion_journal() -> TestResult {
     let layout = Layout::new()?;
     let port = ScriptedPort::with_events([
-        CodexEvent::ItemStarted {
-            thread_id: thread()?,
-            turn_id: turn()?,
+        AgentEvent::ItemStarted {
+            epoch_id: epoch()?,
             item: command_item("duplicate-command", "inProgress"),
         },
-        CodexEvent::ItemCompleted {
-            thread_id: thread()?,
-            turn_id: turn()?,
+        AgentEvent::ItemCompleted {
+            epoch_id: epoch()?,
             item: command_item("duplicate-command", "completed"),
         },
-        CodexEvent::ItemCompleted {
-            thread_id: thread()?,
-            turn_id: turn()?,
+        AgentEvent::ItemCompleted {
+            epoch_id: epoch()?,
             item: command_item("duplicate-command", "completed"),
         },
-        CodexEvent::TurnCompleted {
-            thread_id: thread()?,
-            turn_id: turn()?,
+        AgentEvent::EpochCompleted {
+            epoch_id: epoch()?,
             status: "completed".into(),
         },
     ]);
@@ -253,19 +243,16 @@ async fn failed_and_declined_tool_statuses_are_durable() -> TestResult {
         let layout = Layout::new()?;
         let item_id = format!("command-{terminal_status}");
         let port = ScriptedPort::with_events([
-            CodexEvent::ItemStarted {
-                thread_id: thread()?,
-                turn_id: turn()?,
+            AgentEvent::ItemStarted {
+                epoch_id: epoch()?,
                 item: command_item(&item_id, "inProgress"),
             },
-            CodexEvent::ItemCompleted {
-                thread_id: thread()?,
-                turn_id: turn()?,
+            AgentEvent::ItemCompleted {
+                epoch_id: epoch()?,
                 item: command_item(&item_id, terminal_status),
             },
-            CodexEvent::TurnCompleted {
-                thread_id: thread()?,
-                turn_id: turn()?,
+            AgentEvent::EpochCompleted {
+                epoch_id: epoch()?,
                 status: "completed".into(),
             },
         ]);
@@ -346,10 +333,7 @@ async fn remote_approval_is_exact_single_use_and_resumes_the_same_turn() -> Test
         .prompt(session.id(), Prompt::new(vec![format!("/approve {code}")])?)
         .await?;
     assert_eq!(finished.stop_reason, PromptStopReason::EndTurn);
-    assert_eq!(
-        shared.lock().unwrap().resolved,
-        [CodexApprovalDecision::Allow]
-    );
+    assert_eq!(shared.lock().unwrap().resolved, [EffectDecision::Allow]);
     let replay = kernel
         .prompt(session.id(), Prompt::new(vec![format!("/approve {code}")])?)
         .await
@@ -543,12 +527,8 @@ async fn failed_authorization_append_prevents_the_full_access_effect() -> TestRe
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn full_access_denies_unknown_completed_and_cross_turn_approval_items() -> TestResult {
-    for case in [
-        InvalidApprovalCase::Unknown,
-        InvalidApprovalCase::Completed,
-        InvalidApprovalCase::CrossTurn,
-    ] {
+async fn full_access_denies_unknown_and_completed_approval_items() -> TestResult {
+    for case in [InvalidApprovalCase::Unknown, InvalidApprovalCase::Completed] {
         let layout = Layout::new()?;
         let port = ScriptedPort::invalid_automatic_approval(case)?;
         let shared = Arc::clone(&port.shared);
@@ -566,7 +546,7 @@ async fn full_access_denies_unknown_completed_and_cross_turn_approval_items() ->
         {
             let state = shared.lock().unwrap();
             assert_eq!(state.allowed_effects, 0);
-            assert_eq!(state.resolved, [CodexApprovalDecision::Deny]);
+            assert_eq!(state.resolved, [EffectDecision::Deny]);
         }
         let events = Store::open(&layout.database)?.read_events(session.id())?;
         assert!(
@@ -632,10 +612,7 @@ async fn secret_bearing_approval_is_declined_before_persistence_or_publication()
         .prompt(session.id(), Prompt::new(vec!["do the thing".into()])?)
         .await?;
     assert_eq!(outcome.stop_reason, PromptStopReason::Failed);
-    assert_eq!(
-        shared.lock().unwrap().resolved,
-        [CodexApprovalDecision::Deny]
-    );
+    assert_eq!(shared.lock().unwrap().resolved, [EffectDecision::Deny]);
     let events = Store::open(&layout.database)?.read_events(session.id())?;
     assert!(!events.iter().any(|event| {
         matches!(
@@ -694,9 +671,9 @@ struct ScriptedPort {
 }
 
 struct PortState {
-    events: VecDeque<CodexEvent>,
-    continuation: VecDeque<CodexEvent>,
-    resolved: Vec<CodexApprovalDecision>,
+    events: VecDeque<AgentEvent>,
+    continuation: VecDeque<AgentEvent>,
+    resolved: Vec<EffectDecision>,
     allowed_effects: usize,
     starts: usize,
     steers: Vec<String>,
@@ -707,64 +684,50 @@ struct PortState {
 enum InvalidApprovalCase {
     Unknown,
     Completed,
-    CrossTurn,
 }
 
 impl ScriptedPort {
     fn lifecycle() -> TestResult<Self> {
         Ok(Self::with_events([
-            CodexEvent::TurnStarted {
-                thread_id: thread()?,
-                turn_id: turn()?,
+            AgentEvent::EpochStarted {
+                context_id: context()?,
+                epoch_id: epoch()?,
             },
-            CodexEvent::AgentMessageDelta {
-                thread_id: thread()?,
-                turn_id: turn()?,
-                item_id: "message-1".into(),
+            AgentEvent::AssistantDelta {
+                epoch_id: epoch()?,
                 text: "Working".into(),
             },
-            CodexEvent::AgentMessageDelta {
-                thread_id: thread()?,
-                turn_id: turn()?,
-                item_id: "message-1".into(),
+            AgentEvent::AssistantDelta {
+                epoch_id: epoch()?,
                 text: "Fixed and verified.".into(),
             },
-            CodexEvent::TurnCompleted {
-                thread_id: thread()?,
-                turn_id: turn()?,
+            AgentEvent::EpochCompleted {
+                epoch_id: epoch()?,
                 status: "completed".into(),
             },
         ]))
     }
 
     fn approval() -> TestResult<Self> {
-        let approval = CodexApprovalRequest::from_provider_request(json!({
-            "id":"approval-7",
-            "method":"item/commandExecution/requestApproval",
-            "params":{
-                "threadId":"thr_123", "turnId":"turn_123", "itemId":"item_123",
-                "startedAtMs":2, "command":"cargo test", "reason":"Run the test suite",
-                "cwd":null
-            }
-        }))?;
+        let approval = effect_request(
+            "approval-7",
+            "item_123",
+            "Command: cargo test\nReason: Run the test suite",
+        )?;
         let port = Self::with_events([
-            CodexEvent::ItemStarted {
-                thread_id: thread()?,
-                turn_id: turn()?,
+            AgentEvent::ItemStarted {
+                epoch_id: epoch()?,
                 item: command_item("item_123", "inProgress"),
             },
-            CodexEvent::ApprovalRequested(approval),
+            AgentEvent::EffectRequested(approval),
         ]);
         port.shared.lock().unwrap().continuation = VecDeque::from([
-            CodexEvent::AgentMessageDelta {
-                thread_id: thread()?,
-                turn_id: turn()?,
-                item_id: "message-2".into(),
+            AgentEvent::AssistantDelta {
+                epoch_id: epoch()?,
                 text: "Tests passed.".into(),
             },
-            CodexEvent::TurnCompleted {
-                thread_id: thread()?,
-                turn_id: turn()?,
+            AgentEvent::EpochCompleted {
+                epoch_id: epoch()?,
                 status: "completed".into(),
             },
         ]);
@@ -772,33 +735,26 @@ impl ScriptedPort {
     }
 
     fn automatic_approval() -> TestResult<(Self, String)> {
-        let approval = CodexApprovalRequest::from_provider_request(json!({
-            "id":"approval-auto",
-            "method":"item/commandExecution/requestApproval",
-            "params":{
-                "threadId":"thr_123", "turnId":"turn_123", "itemId":"item_auto",
-                "startedAtMs":2, "command":"cargo test", "reason":"Run the test suite",
-                "cwd":null
-            }
-        }))?;
-        let request_digest = approval.request_digest().to_string();
+        let approval = effect_request(
+            "approval-auto",
+            "item_auto",
+            "Command: cargo test\nReason: Run the test suite",
+        )?;
+        let request_digest = approval.request_digest.to_string();
         let port = Self::with_events([
-            CodexEvent::ItemStarted {
-                thread_id: thread()?,
-                turn_id: turn()?,
+            AgentEvent::ItemStarted {
+                epoch_id: epoch()?,
                 item: command_item("item_auto", "inProgress"),
             },
-            CodexEvent::ApprovalRequested(approval),
+            AgentEvent::EffectRequested(approval),
         ]);
         port.shared.lock().unwrap().continuation = VecDeque::from([
-            CodexEvent::ItemCompleted {
-                thread_id: thread()?,
-                turn_id: turn()?,
+            AgentEvent::ItemCompleted {
+                epoch_id: epoch()?,
                 item: command_item("item_auto", "completed"),
             },
-            CodexEvent::TurnCompleted {
-                thread_id: thread()?,
-                turn_id: turn()?,
+            AgentEvent::EpochCompleted {
+                epoch_id: epoch()?,
                 status: "completed".into(),
             },
         ]);
@@ -806,46 +762,28 @@ impl ScriptedPort {
     }
 
     fn invalid_automatic_approval(case: InvalidApprovalCase) -> TestResult<Self> {
-        let approval_turn = match case {
-            InvalidApprovalCase::CrossTurn => "turn_other",
-            InvalidApprovalCase::Unknown | InvalidApprovalCase::Completed => "turn_123",
-        };
-        let approval = CodexApprovalRequest::from_provider_request(json!({
-            "id":"approval-invalid",
-            "method":"item/commandExecution/requestApproval",
-            "params":{
-                "threadId":"thr_123", "turnId":approval_turn, "itemId":"item_invalid",
-                "startedAtMs":2, "command":"cargo test", "reason":"Run the test suite",
-                "cwd":null
-            }
-        }))?;
+        let approval = effect_request(
+            "approval-invalid",
+            "item_invalid",
+            "Command: cargo test\nReason: Run the test suite",
+        )?;
         let events = match case {
             InvalidApprovalCase::Unknown => {
-                vec![CodexEvent::ApprovalRequested(approval)]
+                vec![AgentEvent::EffectRequested(approval)]
             }
             InvalidApprovalCase::Completed => vec![
-                CodexEvent::ItemStarted {
-                    thread_id: thread()?,
-                    turn_id: turn()?,
+                AgentEvent::ItemStarted {
+                    epoch_id: epoch()?,
                     item: command_item("item_invalid", "inProgress"),
                 },
-                CodexEvent::ItemCompleted {
-                    thread_id: thread()?,
-                    turn_id: turn()?,
+                AgentEvent::ItemCompleted {
+                    epoch_id: epoch()?,
                     item: command_item("item_invalid", "completed"),
                 },
-                CodexEvent::ApprovalRequested(approval),
-            ],
-            InvalidApprovalCase::CrossTurn => vec![
-                CodexEvent::ItemStarted {
-                    thread_id: thread()?,
-                    turn_id: turn()?,
-                    item: command_item("item_invalid", "inProgress"),
-                },
-                CodexEvent::ApprovalRequested(approval),
+                AgentEvent::EffectRequested(approval),
             ],
         };
-        let port = Self {
+        Ok(Self {
             shared: Arc::new(Mutex::new(PortState {
                 events: events.into(),
                 continuation: VecDeque::new(),
@@ -855,37 +793,23 @@ impl ScriptedPort {
                 steers: Vec::new(),
                 interrupts: 0,
             })),
-        };
-        if matches!(case, InvalidApprovalCase::CrossTurn) {
-            port.shared.lock().unwrap().continuation =
-                VecDeque::from([CodexEvent::TurnCompleted {
-                    thread_id: thread()?,
-                    turn_id: turn()?,
-                    status: "completed".into(),
-                }]);
-        }
-        Ok(port)
+        })
     }
 
     fn secret_approval() -> TestResult<Self> {
-        let approval = CodexApprovalRequest::from_provider_request(json!({
-            "id":"approval-secret",
-            "method":"item/commandExecution/requestApproval",
-            "params":{
-                "threadId":"thr_123", "turnId":"turn_123", "itemId":"item_secret",
-                "startedAtMs":2,
-                "command":"curl -H 'Authorization: Bearer sk-123456789012345678901234'",
-                "reason":"Run a command", "cwd":null
-            }
-        }))?;
-        Ok(Self::with_events([CodexEvent::ApprovalRequested(approval)]))
+        let approval = effect_request(
+            "approval-secret",
+            "item_secret",
+            "Command: curl -H 'Authorization: Bearer sk-123456789012345678901234'\nReason: Run a command",
+        )?;
+        Ok(Self::with_events([AgentEvent::EffectRequested(approval)]))
     }
 
     fn idle() -> TestResult<Self> {
         Ok(Self::with_events([]))
     }
 
-    fn with_events<const N: usize>(events: [CodexEvent; N]) -> Self {
+    fn with_events<const N: usize>(events: [AgentEvent; N]) -> Self {
         Self {
             shared: Arc::new(Mutex::new(PortState {
                 events: events.into(),
@@ -900,11 +824,11 @@ impl ScriptedPort {
     }
 }
 
-fn command_item(item_id: &str, status: &str) -> CodexItem {
-    CodexItem::Command {
+fn command_item(item_id: &str, status: &str) -> AgentItem {
+    AgentItem::Command {
         item_id: item_id.into(),
         command: "cargo test".into(),
-        cwd: "/workspace".into(),
+        cwd: PathBuf::from("/workspace"),
         status: status.into(),
         exit_code: (status == "completed").then_some(0),
         aggregated_output: None,
@@ -912,47 +836,63 @@ fn command_item(item_id: &str, status: &str) -> CodexItem {
     }
 }
 
-fn file_change_item(item_id: &str, status: &str) -> CodexItem {
-    CodexItem::FileChange {
+fn file_change_item(item_id: &str, status: &str) -> AgentItem {
+    AgentItem::FileChange {
         item_id: item_id.into(),
         status: status.into(),
         changes: json!([]),
     }
 }
 
-impl CodexPort for ScriptedPort {
-    fn models(&mut self) -> PortFuture<'_, Vec<CodexModel>> {
+impl AgentPort for ScriptedPort {
+    fn capabilities(&self) -> AgentCapabilities {
+        AgentCapabilities {
+            resume: true,
+            compact: true,
+            token_usage: true,
+            pre_dispatch_effects: true,
+            history_paging: false,
+            background_processes: false,
+        }
+    }
+
+    fn models(&mut self) -> AgentFuture<'_, Vec<AgentModel>> {
         Box::pin(async {
-            Ok(vec![
-                CodexModel::new(
-                    ModelId::parse("gpt-5.6-codex").map_err(|_| invalid())?,
-                    "GPT-5.6 Codex",
-                    vec![ReasoningEffort::Medium, ReasoningEffort::High],
-                    ReasoningEffort::Medium,
-                )
-                .map_err(|_| invalid())?,
-            ])
+            Ok(vec![AgentModel {
+                id: ModelId::parse("gpt-5.6-codex").map_err(|_| invalid())?,
+                display_name: "GPT-5.6 Codex".into(),
+                supported_efforts: vec![ReasoningEffort::Medium, ReasoningEffort::High],
+                default_effort: ReasoningEffort::Medium,
+            }])
         })
     }
 
-    fn start_thread(&mut self, _request: StartThread) -> PortFuture<'_, CodexThreadId> {
-        Box::pin(async { thread().map_err(|_| invalid()) })
+    fn start_context(&mut self, _request: StartAgentContext) -> AgentFuture<'_, AgentContextId> {
+        Box::pin(async { context() })
     }
 
-    fn start_turn(&mut self, _request: StartTurn) -> PortFuture<'_, CodexTurnId> {
+    fn resume_context(&mut self, request: ResumeAgentContext) -> AgentFuture<'_, AgentContextId> {
+        Box::pin(async move { Ok(request.context_id) })
+    }
+
+    fn compact_context(&mut self, _context_id: &AgentContextId) -> AgentFuture<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn start_epoch(&mut self, _request: StartAgentEpoch) -> AgentFuture<'_, AgentEpochId> {
         let shared = Arc::clone(&self.shared);
         Box::pin(async move {
             shared.lock().unwrap().starts += 1;
-            turn().map_err(|_| invalid())
+            epoch()
         })
     }
 
     fn steer(
         &mut self,
-        _thread_id: &CodexThreadId,
-        _turn_id: &CodexTurnId,
+        _context_id: &AgentContextId,
+        _epoch_id: &AgentEpochId,
         input: String,
-    ) -> PortFuture<'_, ()> {
+    ) -> AgentFuture<'_, ()> {
         let shared = Arc::clone(&self.shared);
         Box::pin(async move {
             shared.lock().unwrap().steers.push(input);
@@ -962,9 +902,9 @@ impl CodexPort for ScriptedPort {
 
     fn interrupt(
         &mut self,
-        _thread_id: &CodexThreadId,
-        _turn_id: &CodexTurnId,
-    ) -> PortFuture<'_, ()> {
+        _context_id: &AgentContextId,
+        _epoch_id: &AgentEpochId,
+    ) -> AgentFuture<'_, ()> {
         let shared = Arc::clone(&self.shared);
         Box::pin(async move {
             shared.lock().unwrap().interrupts += 1;
@@ -972,7 +912,7 @@ impl CodexPort for ScriptedPort {
         })
     }
 
-    fn next_event(&mut self) -> PortFuture<'_, CodexEvent> {
+    fn next_event(&mut self) -> AgentFuture<'_, AgentEvent> {
         let event = self.shared.lock().unwrap().events.pop_front();
         Box::pin(async move {
             match event {
@@ -982,16 +922,16 @@ impl CodexPort for ScriptedPort {
         })
     }
 
-    fn resolve_approval(
+    fn resolve_effect(
         &mut self,
-        _approval: &CodexApprovalRequest,
-        decision: CodexApprovalDecision,
-    ) -> PortFuture<'_, ()> {
+        _request_id: &AgentRequestId,
+        decision: EffectDecision,
+    ) -> AgentFuture<'_, ()> {
         let shared = Arc::clone(&self.shared);
         Box::pin(async move {
             let mut state = shared.lock().unwrap();
             state.resolved.push(decision);
-            if decision == CodexApprovalDecision::Allow {
+            if decision == EffectDecision::Allow {
                 state.allowed_effects += 1;
             }
             let continuation = std::mem::take(&mut state.continuation);
@@ -1000,7 +940,22 @@ impl CodexPort for ScriptedPort {
         })
     }
 
-    fn cancel(&mut self) -> PortFuture<'_, ()> {
+    fn list_background_processes(
+        &mut self,
+        _context_id: &AgentContextId,
+    ) -> AgentFuture<'_, Vec<AgentProcess>> {
+        Box::pin(async { Err(invalid()) })
+    }
+
+    fn terminate_background_process(
+        &mut self,
+        _context_id: &AgentContextId,
+        _process_id: &str,
+    ) -> AgentFuture<'_, bool> {
+        Box::pin(async { Err(invalid()) })
+    }
+
+    fn shutdown(&mut self) -> AgentFuture<'_, ()> {
         Box::pin(async { Ok(()) })
     }
 }
@@ -1086,16 +1041,30 @@ fn new_session(
     })
 }
 
-fn thread() -> Result<CodexThreadId, carl::delegates::codex::DelegateError> {
-    CodexThreadId::parse("thr_123")
+fn context() -> Result<AgentContextId, AgentPortError> {
+    AgentContextId::parse("thr_123")
 }
 
-fn turn() -> Result<CodexTurnId, carl::delegates::codex::DelegateError> {
-    CodexTurnId::parse("turn_123")
+fn epoch() -> Result<AgentEpochId, AgentPortError> {
+    AgentEpochId::parse("turn_123")
 }
 
-fn invalid() -> carl::acp::KernelError {
-    carl::acp::KernelError::from_code(carl::acp::KernelErrorCode::ProviderFailed)
+fn effect_request(
+    request_id: &str,
+    item_id: &str,
+    summary: &str,
+) -> TestResult<AgentEffectRequest> {
+    Ok(AgentEffectRequest {
+        request_id: AgentRequestId::parse(request_id)?,
+        item_id: item_id.into(),
+        kind: AgentEffectKind::Command,
+        summary: summary.into(),
+        request_digest: Sha256Digest::parse("11".repeat(32))?,
+    })
+}
+
+fn invalid() -> AgentPortError {
+    AgentPortError::from_code(AgentPortErrorCode::InvalidResponse)
 }
 
 struct Layout {

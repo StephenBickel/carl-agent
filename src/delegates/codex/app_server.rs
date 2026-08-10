@@ -9,11 +9,17 @@ use serde_json::{Map, Value, json};
 
 use super::app_events::{parse_approval_request, parse_notification};
 use super::{
-    CodexApprovalDecision, CodexApprovalKind, CodexApprovalRequest, CodexEvent, CodexThreadId,
-    CodexTurnId, DelegateError, DelegateErrorCode, map_sidecar_error,
+    CodexApprovalDecision, CodexApprovalKind, CodexApprovalRequest, CodexEvent, CodexItem,
+    CodexThreadId, CodexTurnId, DelegateError, DelegateErrorCode, map_sidecar_error,
 };
 use crate::acp::PermissionMode;
 use crate::delegates::{ModelId, ReasoningEffort};
+use crate::runtime::agent_port::{
+    AgentCapabilities, AgentContextId, AgentEffectKind, AgentEffectRequest, AgentEpochId,
+    AgentEvent, AgentFuture, AgentItem, AgentModel, AgentPort, AgentPortError, AgentPortErrorCode,
+    AgentProcess, AgentRequestId, AgentUsage, EffectDecision, ResumeAgentContext,
+    StartAgentContext, StartAgentEpoch,
+};
 use crate::sidecar::{
     JsonlSidecar, NotificationPolicy, ProviderEnvironmentProfile, ProviderHome, SidecarCommand,
     SidecarLimits, TrustedExecutable, VersionOutputFormat,
@@ -26,6 +32,7 @@ const MAX_MODELS: usize = 64;
 const MAX_MODEL_PAGES: usize = 16;
 const MAX_TEXT_BYTES: usize = 256 * 1_024;
 const MAX_CURSOR_BYTES: usize = 128;
+const MAX_EFFECT_SUMMARY_BYTES: usize = 32 * 1_024;
 const APP_SERVER_CONFIG: &[u8] = concat!(
     "cli_auth_credentials_store = \"file\"\n",
     "approval_policy = \"never\"\n",
@@ -116,12 +123,18 @@ struct ThreadState {
     active_turn: Option<CodexTurnId>,
 }
 
+#[derive(Clone)]
+struct OutstandingApproval {
+    request: CodexApprovalRequest,
+    request_digest: crate::policy::Sha256Digest,
+}
+
 pub struct CodexAppServer {
     sidecar: JsonlSidecar,
     next_request_id: u64,
     models: Vec<CodexModel>,
     threads: HashMap<String, ThreadState>,
-    outstanding_approvals: HashMap<String, crate::policy::Sha256Digest>,
+    outstanding_approvals: HashMap<String, OutstandingApproval>,
 }
 
 impl fmt::Debug for CodexAppServer {
@@ -348,6 +361,57 @@ impl CodexAppServer {
         Ok(thread_id)
     }
 
+    async fn resume_thread(
+        &mut self,
+        request: ResumeAgentContext,
+    ) -> Result<CodexThreadId, DelegateError> {
+        let cwd = canonical_directory(request.cwd)?;
+        self.require_model(&request.model, None)?;
+        let codex_id = CodexThreadId::parse(request.context_id.as_str())?;
+        let result = self
+            .request("thread/resume", json!({"threadId":codex_id.as_str()}))
+            .await?;
+        let object = result.as_object().ok_or_else(protocol_error)?;
+        require_keys(object, &["thread"], &[])?;
+        let thread = object
+            .get("thread")
+            .and_then(Value::as_object)
+            .ok_or_else(protocol_error)?;
+        let resumed = CodexThreadId::from_value(thread.get("id").ok_or_else(protocol_error)?)?;
+        if resumed != codex_id {
+            return Err(protocol_error());
+        }
+        self.threads.insert(
+            resumed.as_str().to_owned(),
+            ThreadState {
+                _cwd: cwd,
+                mode: request.permission_mode,
+                active_turn: None,
+            },
+        );
+        Ok(resumed)
+    }
+
+    async fn compact_thread(&mut self, context_id: &AgentContextId) -> Result<(), DelegateError> {
+        let thread_id = CodexThreadId::parse(context_id.as_str())?;
+        let state = self
+            .threads
+            .get(thread_id.as_str())
+            .ok_or_else(protocol_error)?;
+        if state.active_turn.is_some() {
+            return Err(protocol_error());
+        }
+        let result = self
+            .request(
+                "thread/compact/start",
+                json!({"threadId":thread_id.as_str()}),
+            )
+            .await?;
+        let object = result.as_object().ok_or_else(protocol_error)?;
+        require_keys(object, &[], &[])?;
+        Ok(())
+    }
+
     pub async fn start_turn(&mut self, request: StartTurn) -> Result<CodexTurnId, DelegateError> {
         validate_text(&request.input)?;
         let state = self
@@ -518,7 +582,10 @@ impl CodexAppServer {
                             .outstanding_approvals
                             .insert(
                                 approval.provider_request_id().to_owned(),
-                                approval.request_digest(),
+                                OutstandingApproval {
+                                    request: approval.clone(),
+                                    request_digest: approval.request_digest(),
+                                },
                             )
                             .is_some()
                         {
@@ -547,7 +614,9 @@ impl CodexAppServer {
             .outstanding_approvals
             .remove(approval.provider_request_id())
             .ok_or_else(protocol_error)?;
-        if stored != approval.request_digest() {
+        if stored.request.provider_id() != approval.provider_id()
+            || stored.request_digest != approval.request_digest()
+        {
             return Err(protocol_error());
         }
         self.send_approval_response(approval, decision)
@@ -654,6 +723,351 @@ impl CodexAppServer {
             }))
             .map_err(map_sidecar_error)
     }
+}
+
+impl AgentPort for CodexAppServer {
+    fn capabilities(&self) -> AgentCapabilities {
+        AgentCapabilities {
+            resume: true,
+            compact: true,
+            token_usage: true,
+            pre_dispatch_effects: true,
+            history_paging: false,
+            background_processes: false,
+        }
+    }
+
+    fn models(&mut self) -> AgentFuture<'_, Vec<AgentModel>> {
+        Box::pin(async move {
+            CodexAppServer::models(self)
+                .await
+                .map(|models| {
+                    models
+                        .into_iter()
+                        .map(|model| AgentModel {
+                            id: model.id,
+                            display_name: model.display_name,
+                            supported_efforts: model.supported_efforts,
+                            default_effort: model.default_effort,
+                        })
+                        .collect()
+                })
+                .map_err(map_agent_error)
+        })
+    }
+
+    fn start_context(&mut self, request: StartAgentContext) -> AgentFuture<'_, AgentContextId> {
+        Box::pin(async move {
+            let thread_id = CodexAppServer::start_thread(
+                self,
+                StartThread {
+                    cwd: request.cwd,
+                    model: Some(request.model),
+                    mode: request.permission_mode,
+                },
+            )
+            .await
+            .map_err(map_agent_error)?;
+            AgentContextId::parse(thread_id.as_str())
+        })
+    }
+
+    fn resume_context(&mut self, request: ResumeAgentContext) -> AgentFuture<'_, AgentContextId> {
+        Box::pin(async move {
+            let thread_id = self.resume_thread(request).await.map_err(map_agent_error)?;
+            AgentContextId::parse(thread_id.as_str())
+        })
+    }
+
+    fn compact_context(&mut self, context_id: &AgentContextId) -> AgentFuture<'_, ()> {
+        let context_id = context_id.clone();
+        Box::pin(async move {
+            self.compact_thread(&context_id)
+                .await
+                .map_err(map_agent_error)
+        })
+    }
+
+    fn start_epoch(&mut self, request: StartAgentEpoch) -> AgentFuture<'_, AgentEpochId> {
+        Box::pin(async move {
+            let turn_id = CodexAppServer::start_turn(
+                self,
+                StartTurn {
+                    thread_id: CodexThreadId::parse(request.context_id.as_str())
+                        .map_err(map_agent_error)?,
+                    input: request.input,
+                    model: Some(request.model),
+                    effort: Some(request.effort),
+                    mode: request.permission_mode,
+                },
+            )
+            .await
+            .map_err(map_agent_error)?;
+            AgentEpochId::parse(turn_id.as_str())
+        })
+    }
+
+    fn steer(
+        &mut self,
+        context_id: &AgentContextId,
+        epoch_id: &AgentEpochId,
+        text: String,
+    ) -> AgentFuture<'_, ()> {
+        let context_id = context_id.clone();
+        let epoch_id = epoch_id.clone();
+        Box::pin(async move {
+            let thread_id = CodexThreadId::parse(context_id.as_str()).map_err(map_agent_error)?;
+            let turn_id = CodexTurnId::parse(epoch_id.as_str()).map_err(map_agent_error)?;
+            CodexAppServer::steer(self, &thread_id, &turn_id, text)
+                .await
+                .map_err(map_agent_error)
+        })
+    }
+
+    fn interrupt(
+        &mut self,
+        context_id: &AgentContextId,
+        epoch_id: &AgentEpochId,
+    ) -> AgentFuture<'_, ()> {
+        let context_id = context_id.clone();
+        let epoch_id = epoch_id.clone();
+        Box::pin(async move {
+            let thread_id = CodexThreadId::parse(context_id.as_str()).map_err(map_agent_error)?;
+            let turn_id = CodexTurnId::parse(epoch_id.as_str()).map_err(map_agent_error)?;
+            CodexAppServer::interrupt(self, &thread_id, &turn_id)
+                .await
+                .map_err(map_agent_error)
+        })
+    }
+
+    fn next_event(&mut self) -> AgentFuture<'_, AgentEvent> {
+        Box::pin(async move {
+            let event = CodexAppServer::next_event(self)
+                .await
+                .map_err(map_agent_error)?;
+            translate_codex_event(event)
+        })
+    }
+
+    fn resolve_effect(
+        &mut self,
+        request_id: &AgentRequestId,
+        decision: EffectDecision,
+    ) -> AgentFuture<'_, ()> {
+        let request_id = request_id.clone();
+        Box::pin(async move {
+            let stored = self
+                .outstanding_approvals
+                .get(request_id.as_str())
+                .cloned()
+                .ok_or_else(|| AgentPortError::from_code(AgentPortErrorCode::InvalidRequest))?;
+            if stored.request.provider_request_id() != request_id.as_str()
+                || stored.request.request_digest() != stored.request_digest
+            {
+                return Err(AgentPortError::from_code(
+                    AgentPortErrorCode::InvalidResponse,
+                ));
+            }
+            CodexAppServer::resolve_approval(
+                self,
+                &stored.request,
+                match decision {
+                    EffectDecision::Allow => CodexApprovalDecision::Allow,
+                    EffectDecision::Deny => CodexApprovalDecision::Deny,
+                },
+            )
+            .await
+            .map_err(map_agent_error)
+        })
+    }
+
+    fn list_background_processes(
+        &mut self,
+        _context_id: &AgentContextId,
+    ) -> AgentFuture<'_, Vec<AgentProcess>> {
+        Box::pin(async { Err(AgentPortError::from_code(AgentPortErrorCode::Unsupported)) })
+    }
+
+    fn terminate_background_process(
+        &mut self,
+        _context_id: &AgentContextId,
+        _process_id: &str,
+    ) -> AgentFuture<'_, bool> {
+        Box::pin(async { Err(AgentPortError::from_code(AgentPortErrorCode::Unsupported)) })
+    }
+
+    fn shutdown(&mut self) -> AgentFuture<'_, ()> {
+        Box::pin(async move { CodexAppServer::cancel(self).await.map_err(map_agent_error) })
+    }
+}
+
+fn translate_codex_event(event: CodexEvent) -> Result<AgentEvent, AgentPortError> {
+    match event {
+        CodexEvent::ThreadStarted { thread_id } => Ok(AgentEvent::ContextStarted {
+            context_id: AgentContextId::parse(thread_id.as_str())?,
+        }),
+        CodexEvent::TurnStarted { thread_id, turn_id } => Ok(AgentEvent::EpochStarted {
+            context_id: AgentContextId::parse(thread_id.as_str())?,
+            epoch_id: AgentEpochId::parse(turn_id.as_str())?,
+        }),
+        CodexEvent::ItemStarted {
+            thread_id,
+            turn_id,
+            item,
+        } => translate_item_event(thread_id, turn_id, item, false),
+        CodexEvent::AgentMessageDelta { turn_id, text, .. } => Ok(AgentEvent::AssistantDelta {
+            epoch_id: AgentEpochId::parse(turn_id.as_str())?,
+            text,
+        }),
+        CodexEvent::ItemCompleted {
+            thread_id,
+            turn_id,
+            item,
+        } => translate_item_event(thread_id, turn_id, item, true),
+        CodexEvent::TokenUsageUpdated { turn_id, usage, .. } => Ok(AgentEvent::UsageUpdated {
+            epoch_id: AgentEpochId::parse(turn_id.as_str())?,
+            usage: AgentUsage {
+                last_total_tokens: usage.last_total_tokens,
+                total_tokens: usage.total_tokens,
+                model_context_window: usage.model_context_window,
+            },
+        }),
+        CodexEvent::DiffUpdated { turn_id, diff, .. } => Ok(AgentEvent::DiffUpdated {
+            epoch_id: AgentEpochId::parse(turn_id.as_str())?,
+            diff,
+        }),
+        CodexEvent::TurnCompleted {
+            turn_id, status, ..
+        } => Ok(AgentEvent::EpochCompleted {
+            epoch_id: AgentEpochId::parse(turn_id.as_str())?,
+            status,
+        }),
+        CodexEvent::ProviderError { thread_id, turn_id } => Ok(AgentEvent::ProviderFailed {
+            context_id: thread_id
+                .map(|thread_id| AgentContextId::parse(thread_id.as_str()))
+                .transpose()?,
+            epoch_id: turn_id
+                .map(|turn_id| AgentEpochId::parse(turn_id.as_str()))
+                .transpose()?,
+        }),
+        CodexEvent::ApprovalRequested(approval) => {
+            let kind = match approval.kind() {
+                CodexApprovalKind::Command => AgentEffectKind::Command,
+                CodexApprovalKind::FileChange => AgentEffectKind::FileChange,
+            };
+            let summary = effect_summary(&approval, kind)?;
+            Ok(AgentEvent::EffectRequested(AgentEffectRequest {
+                request_id: AgentRequestId::parse(approval.provider_request_id())?,
+                item_id: approval.item_id().to_owned(),
+                kind,
+                summary,
+                request_digest: approval.request_digest(),
+            }))
+        }
+    }
+}
+
+fn translate_item_event(
+    thread_id: CodexThreadId,
+    turn_id: CodexTurnId,
+    item: CodexItem,
+    completed: bool,
+) -> Result<AgentEvent, AgentPortError> {
+    if let CodexItem::ContextCompaction { item_id } = item {
+        let context_id = AgentContextId::parse(thread_id.as_str())?;
+        return Ok(if completed {
+            AgentEvent::CompactionCompleted {
+                context_id,
+                item_id,
+            }
+        } else {
+            AgentEvent::CompactionStarted {
+                context_id,
+                item_id,
+            }
+        });
+    }
+    let epoch_id = AgentEpochId::parse(turn_id.as_str())?;
+    let item = translate_codex_item(item);
+    Ok(if completed {
+        AgentEvent::ItemCompleted { epoch_id, item }
+    } else {
+        AgentEvent::ItemStarted { epoch_id, item }
+    })
+}
+
+fn translate_codex_item(item: CodexItem) -> AgentItem {
+    match item {
+        CodexItem::Command {
+            item_id,
+            command,
+            cwd,
+            status,
+            exit_code,
+            aggregated_output,
+            process_id,
+        } => AgentItem::Command {
+            item_id,
+            command,
+            cwd: PathBuf::from(cwd),
+            status,
+            exit_code,
+            aggregated_output,
+            process_id,
+        },
+        CodexItem::FileChange {
+            item_id,
+            status,
+            changes,
+        } => AgentItem::FileChange {
+            item_id,
+            status,
+            changes,
+        },
+        CodexItem::ContextCompaction { item_id } => AgentItem::ContextCompaction { item_id },
+        CodexItem::Other { item_id, item_type } => AgentItem::Other { item_id, item_type },
+    }
+}
+
+fn effect_summary(
+    approval: &CodexApprovalRequest,
+    kind: AgentEffectKind,
+) -> Result<String, AgentPortError> {
+    let kind = match kind {
+        AgentEffectKind::Command => "Command",
+        AgentEffectKind::FileChange => "File changes",
+        AgentEffectKind::Network => "Network access",
+        AgentEffectKind::External => "External effect",
+    };
+    let mut summary = kind.to_owned();
+    if let Some(command) = approval.command() {
+        summary.push_str(": ");
+        summary.push_str(command);
+    }
+    if let Some(reason) = approval.reason() {
+        summary.push_str("\nReason: ");
+        summary.push_str(reason);
+    }
+    if summary.len() > MAX_EFFECT_SUMMARY_BYTES || summary.as_bytes().contains(&0) {
+        return Err(AgentPortError::from_code(
+            AgentPortErrorCode::InvalidResponse,
+        ));
+    }
+    Ok(summary)
+}
+
+fn map_agent_error(error: DelegateError) -> AgentPortError {
+    let code = match error.code() {
+        DelegateErrorCode::Configuration => AgentPortErrorCode::InvalidRequest,
+        DelegateErrorCode::ProtocolFailed => AgentPortErrorCode::InvalidResponse,
+        DelegateErrorCode::Cancelled => AgentPortErrorCode::Cancelled,
+        DelegateErrorCode::AuthenticationRequired
+        | DelegateErrorCode::Incompatible
+        | DelegateErrorCode::StartFailed
+        | DelegateErrorCode::BudgetExhausted
+        | DelegateErrorCode::ProviderFailed => AgentPortErrorCode::Transport,
+    };
+    AgentPortError::from_code(code)
 }
 
 enum Incoming {
