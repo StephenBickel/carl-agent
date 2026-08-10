@@ -21,7 +21,7 @@ use super::{
 use crate::delegates::DelegateSettings;
 use crate::delegates::codex::{
     CodexAppServer, CodexApprovalDecision, CodexApprovalKind, CodexApprovalRequest, CodexEvent,
-    CodexModel, CodexThreadId, CodexTurnId, StartThread, StartTurn,
+    CodexItem, CodexModel, CodexThreadId, CodexTurnId, StartThread, StartTurn,
 };
 use crate::events::{ApprovalId, Event, SessionId, ToolCallId, TurnId};
 use crate::policy::{ActorId, Frontend, Sha256Digest};
@@ -774,11 +774,17 @@ impl KernelActor {
                     provider.as_str(),
                 )?;
             }
-            CodexEvent::ItemStarted { item_id, .. } => {
-                let tool_call_id = ToolCallId::new();
-                self.active_turn_mut(session_id)?
-                    .item_ids
-                    .insert(item_id.clone(), tool_call_id);
+            CodexEvent::ItemStarted { item, .. } => {
+                let item_id = item.item_id().to_owned();
+                if matches!(
+                    item,
+                    CodexItem::Command { .. } | CodexItem::FileChange { .. }
+                ) {
+                    let tool_call_id = ToolCallId::new();
+                    self.active_turn_mut(session_id)?
+                        .item_ids
+                        .insert(item_id.clone(), tool_call_id);
+                }
                 self.persist_lifecycle(session_id, Some(turn_id), "item_started", &item_id)?;
             }
             CodexEvent::AgentMessageDelta { text, .. } => {
@@ -801,7 +807,22 @@ impl KernelActor {
                     .map_err(map_storage)?;
                 updates.push(KernelUpdate::AgentMessageChunk(text));
             }
-            CodexEvent::ItemCompleted { item_id, .. } => {
+            CodexEvent::ItemCompleted { item, .. } => {
+                let item_id = item.item_id().to_owned();
+                let status = match &item {
+                    CodexItem::Command { status, .. } | CodexItem::FileChange { status, .. } => {
+                        if status == "completed" {
+                            Some(ToolStatus::Completed)
+                        } else {
+                            Some(ToolStatus::Failed)
+                        }
+                    }
+                    CodexItem::ContextCompaction { .. } | CodexItem::Other { .. } => None,
+                };
+                let Some(status) = status else {
+                    self.persist_lifecycle(session_id, Some(turn_id), "item_completed", &item_id)?;
+                    return Ok(None);
+                };
                 let tool_call_id = self
                     .active_turn_mut(session_id)?
                     .item_ids
@@ -820,9 +841,10 @@ impl KernelActor {
                     .map_err(map_storage)?;
                 updates.push(KernelUpdate::ToolCompleted {
                     title: item_id,
-                    status: ToolStatus::Completed,
+                    status,
                 });
             }
+            CodexEvent::TokenUsageUpdated { .. } => {}
             CodexEvent::DiffUpdated { diff, .. } => {
                 SecretFilter
                     .inspect(diff.as_bytes())

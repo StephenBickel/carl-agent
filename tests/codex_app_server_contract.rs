@@ -10,7 +10,8 @@ use std::time::Duration;
 
 use carl::acp::{PermissionMode, PermissionProfile};
 use carl::delegates::codex::{
-    CodexAppServer, CodexApprovalDecision, CodexEvent, DelegateErrorCode, StartThread, StartTurn,
+    CodexAppServer, CodexApprovalDecision, CodexEvent, CodexItem, DelegateErrorCode, StartThread,
+    StartTurn,
 };
 use carl::delegates::{ModelId, ReasoningEffort};
 use carl::sidecar::{
@@ -30,6 +31,10 @@ fn main() {
     }
     let trials = vec![
         test(
+            "Codex long-horizon protocol contract is pinned to 0.146.0",
+            long_horizon_protocol_contract_is_pinned,
+        ),
+        test(
             "Codex app-server handshake catalog and thread start are exact",
             handshake_and_thread,
         ),
@@ -41,8 +46,26 @@ fn main() {
             "Codex app-server denies invalid bypass approvals before protocol failure",
             invalid_bypass_approval_is_denied_before_protocol_failure,
         ),
+        test(
+            "Codex app-server fails closed on malformed long-horizon evidence",
+            malformed_long_horizon_evidence_fails_closed,
+        ),
     ];
     libtest_mimic::run(&Arguments::from_args(), trials).exit();
+}
+
+fn long_horizon_protocol_contract_is_pinned() -> Result<(), Box<dyn Error + Send + Sync>> {
+    let fixture: Value = serde_json::from_str(include_str!(
+        "fixtures/codex/0.146.0/long_horizon_contract.json"
+    ))?;
+    assert_eq!(
+        CodexAppServer::long_horizon_protocol_contract("0.146.0")?,
+        fixture
+    );
+    let error = CodexAppServer::long_horizon_protocol_contract("0.145.0")
+        .expect_err("a different Codex version must be rejected");
+    assert_eq!(error.code(), DelegateErrorCode::Incompatible);
+    Ok(())
 }
 
 fn test(name: &'static str, body: fn() -> Result<(), Box<dyn Error + Send + Sync>>) -> Trial {
@@ -131,9 +154,19 @@ fn lifecycle_and_approval() -> Result<(), Box<dyn Error + Send + Sync>> {
             server.next_event().await?,
             CodexEvent::TurnStarted { .. }
         ));
+        let CodexEvent::TokenUsageUpdated { usage, .. } = server.next_event().await? else {
+            return Err("missing normalized token usage".into());
+        };
+        assert_eq!(usage.last_total_tokens, 3);
+        assert_eq!(usage.total_tokens, 3);
+        assert_eq!(usage.model_context_window, Some(258_400));
+        let CodexEvent::ItemStarted { item, .. } = server.next_event().await? else {
+            return Err("missing started item".into());
+        };
         assert!(matches!(
-            server.next_event().await?,
-            CodexEvent::ItemStarted { .. }
+            item,
+            CodexItem::Other { item_id, item_type }
+                if item_id == "item_123" && item_type == "agentMessage"
         ));
         let CodexEvent::AgentMessageDelta { text, .. } = server.next_event().await? else {
             return Err("missing agent delta".into());
@@ -156,10 +189,66 @@ fn lifecycle_and_approval() -> Result<(), Box<dyn Error + Send + Sync>> {
         server
             .resolve_approval(&approval, CodexApprovalDecision::Allow)
             .await?;
+        let CodexEvent::ItemCompleted { item, .. } = server.next_event().await? else {
+            return Err("missing completed item".into());
+        };
         assert!(matches!(
-            server.next_event().await?,
-            CodexEvent::ItemCompleted { .. }
+            item,
+            CodexItem::Command {
+                item_id,
+                command,
+                cwd,
+                status,
+                exit_code: Some(0),
+                aggregated_output: Some(output),
+                process_id: Some(process_id),
+            } if item_id == "item_123"
+                && command == "cargo test"
+                && cwd == layout.workspace.to_string_lossy()
+                && status == "completed"
+                && output == "test result: ok"
+                && process_id == "proc_123"
         ));
+
+        let CodexEvent::ItemStarted { item, .. } = server.next_event().await? else {
+            return Err("missing file-change start".into());
+        };
+        assert_eq!(
+            item,
+            CodexItem::FileChange {
+                item_id: "file_123".into(),
+                status: "inProgress".into(),
+                changes: json!([{
+                    "path":"src/lib.rs","kind":{"type":"update"},"diff":"@@ -1 +1 @@"
+                }]),
+            }
+        );
+        let CodexEvent::ItemCompleted { item, .. } = server.next_event().await? else {
+            return Err("missing file-change completion".into());
+        };
+        assert!(matches!(
+            item,
+            CodexItem::FileChange { item_id, status, .. }
+                if item_id == "file_123" && status == "completed"
+        ));
+        let CodexEvent::ItemStarted { item, .. } = server.next_event().await? else {
+            return Err("missing compaction start".into());
+        };
+        assert_eq!(
+            item,
+            CodexItem::ContextCompaction {
+                item_id: "compact_123".into()
+            }
+        );
+        let CodexEvent::ItemCompleted { item, .. } = server.next_event().await? else {
+            return Err("missing compaction completion".into());
+        };
+        assert_eq!(
+            item,
+            CodexItem::ContextCompaction {
+                item_id: "compact_123".into()
+            }
+        );
 
         server.steer(&thread, &turn, "Focus on the parser").await?;
         server.interrupt(&thread, &turn).await?;
@@ -244,6 +333,53 @@ fn invalid_bypass_approval_is_denied_before_protocol_failure()
     })
 }
 
+fn malformed_long_horizon_evidence_fails_closed() -> Result<(), Box<dyn Error + Send + Sync>> {
+    run_async(async {
+        for scenario in [
+            "signed-token-count",
+            "overflowing-token-count",
+            "oversized-output",
+            "malformed-command",
+            "unknown-command-field",
+        ] {
+            let layout = TestLayout::new()?;
+            let mut server = connect(&layout).await?;
+            server.models().await?;
+            let thread = server
+                .start_thread(StartThread {
+                    cwd: layout.workspace.clone(),
+                    model: Some(ModelId::parse("gpt-5.6-codex")?),
+                    mode: PermissionMode::Default,
+                })
+                .await?;
+            server
+                .start_turn(StartTurn {
+                    thread_id: thread,
+                    input: format!("malformed evidence {scenario}"),
+                    model: Some(ModelId::parse("gpt-5.6-codex")?),
+                    effort: Some(ReasoningEffort::High),
+                    mode: PermissionMode::Default,
+                })
+                .await?;
+            assert!(matches!(
+                server.next_event().await?,
+                CodexEvent::ThreadStarted { .. }
+            ));
+            assert!(matches!(
+                server.next_event().await?,
+                CodexEvent::TurnStarted { .. }
+            ));
+            let error = server
+                .next_event()
+                .await
+                .expect_err("malformed normalized evidence must fail the protocol");
+            assert_eq!(error.code(), DelegateErrorCode::ProtocolFailed);
+            server.cancel().await?;
+        }
+        Ok(())
+    })
+}
+
 async fn connect(layout: &TestLayout) -> Result<CodexAppServer, Box<dyn Error + Send + Sync>> {
     let specification = SidecarCommand {
         executable: env::current_exe()?,
@@ -270,7 +406,7 @@ async fn connect(layout: &TestLayout) -> Result<CodexAppServer, Box<dyn Error + 
 
 fn limits() -> SidecarLimits {
     SidecarLimits {
-        max_stdout_line_bytes: 128 * 1024,
+        max_stdout_line_bytes: 1024 * 1024,
         max_stderr_bytes: 128,
         graceful_shutdown_timeout: Duration::from_millis(150),
         forced_shutdown_timeout: Duration::from_secs(2),
@@ -390,7 +526,10 @@ fn app_server_fixture() -> i32 {
                     .unwrap_or_default();
                 let notifications = match input.strip_prefix("invalid bypass approval ") {
                     Some(scenario) => invalid_approval_notifications(scenario),
-                    None => turn_notifications(),
+                    None => match input.strip_prefix("malformed evidence ") {
+                        Some(scenario) => malformed_evidence_notifications(scenario),
+                        None => turn_notifications(),
+                    },
                 };
                 for notification in notifications {
                     if write_message(&notification).is_err() {
@@ -416,9 +555,63 @@ fn app_server_fixture() -> i32 {
                         "params":{
                             "threadId":"thr_123","turnId":"turn_123",
                             "completedAtMs":3,
-                            "item":{"type":"commandExecution","id":"item_123"}
+                            "item":{
+                                "type":"commandExecution","id":"item_123",
+                                "command":"cargo test","cwd":workspace_for(&home),
+                                "status":"completed","exitCode":0,"durationMs":17,
+                                "aggregatedOutput":"test result: ok","processId":"proc_123",
+                                "commandActions":[]
+                            }
                         },
                         "emittedAtMs":3
+                    }))
+                    .is_err()
+                    || write_message(&json!({
+                        "method":"item/started",
+                        "params":{
+                            "threadId":"thr_123","turnId":"turn_123","startedAtMs":4,
+                            "item":{
+                                "type":"fileChange","id":"file_123","status":"inProgress",
+                                "changes":[{
+                                    "path":"src/lib.rs","kind":{"type":"update"},
+                                    "diff":"@@ -1 +1 @@"
+                                }]
+                            }
+                        },
+                        "emittedAtMs":4
+                    }))
+                    .is_err()
+                    || write_message(&json!({
+                        "method":"item/completed",
+                        "params":{
+                            "threadId":"thr_123","turnId":"turn_123","completedAtMs":5,
+                            "item":{
+                                "type":"fileChange","id":"file_123","status":"completed",
+                                "changes":[{
+                                    "path":"src/lib.rs","kind":{"type":"update"},
+                                    "diff":"@@ -1 +1 @@"
+                                }]
+                            }
+                        },
+                        "emittedAtMs":5
+                    }))
+                    .is_err()
+                    || write_message(&json!({
+                        "method":"item/started",
+                        "params":{
+                            "threadId":"thr_123","turnId":"turn_123","startedAtMs":6,
+                            "item":{"type":"contextCompaction","id":"compact_123"}
+                        },
+                        "emittedAtMs":6
+                    }))
+                    .is_err()
+                    || write_message(&json!({
+                        "method":"item/completed",
+                        "params":{
+                            "threadId":"thr_123","turnId":"turn_123","completedAtMs":7,
+                            "item":{"type":"contextCompaction","id":"compact_123"}
+                        },
+                        "emittedAtMs":7
                     }))
                     .is_err()
                 {
@@ -521,6 +714,60 @@ fn invalid_approval_notifications(scenario: &str) -> Vec<Value> {
             "command":"cargo test","reason":"Run the test suite","cwd":null
         }}),
     ]
+}
+
+fn malformed_evidence_notifications(scenario: &str) -> Vec<Value> {
+    let malformed = match scenario {
+        "signed-token-count" | "overflowing-token-count" => {
+            let total_tokens = if scenario == "signed-token-count" {
+                json!(-1)
+            } else {
+                serde_json::from_str("18446744073709551616").unwrap()
+            };
+            let breakdown = json!({
+                "totalTokens":total_tokens,"inputTokens":0,"cachedInputTokens":0,
+                "cacheWriteInputTokens":0,"outputTokens":0,"reasoningOutputTokens":0
+            });
+            json!({"method":"thread/tokenUsage/updated","params":{
+                "threadId":"thr_123","turnId":"turn_123",
+                "tokenUsage":{"total":breakdown,"last":{
+                    "totalTokens":0,"inputTokens":0,"cachedInputTokens":0,
+                    "cacheWriteInputTokens":0,"outputTokens":0,"reasoningOutputTokens":0
+                },"modelContextWindow":null}
+            }})
+        }
+        "oversized-output" => command_notification(json!({
+            "type":"commandExecution","id":"command_123","command":"cargo test",
+            "cwd":"/workspace","status":"completed","exitCode":0,"durationMs":1,
+            "aggregatedOutput":"x".repeat(512 * 1_024 + 1),"processId":null,"commandActions":[]
+        })),
+        "malformed-command" => command_notification(json!({
+            "type":"commandExecution","id":"command_123","command":"cargo test",
+            "status":"completed","exitCode":0,"durationMs":1,
+            "aggregatedOutput":"ok","processId":null,"commandActions":[]
+        })),
+        "unknown-command-field" => command_notification(json!({
+            "type":"commandExecution","id":"command_123","command":"cargo test",
+            "cwd":"/workspace","status":"completed","exitCode":0,"durationMs":1,
+            "aggregatedOutput":"ok","processId":null,"commandActions":[],
+            "providerPayload":"must not be accepted"
+        })),
+        _ => return Vec::new(),
+    };
+    vec![
+        json!({"method":"turn/started","params":{"threadId":"thr_123","turn":{"id":"turn_123","items":[],"status":"inProgress"}},"emittedAtMs":2}),
+        malformed,
+    ]
+}
+
+fn command_notification(item: Value) -> Value {
+    json!({
+        "method":"item/completed",
+        "params":{
+            "threadId":"thr_123","turnId":"turn_123","completedAtMs":3,"item":item
+        },
+        "emittedAtMs":3
+    })
 }
 
 fn append_request(home: &Path, request: &Value) -> std::io::Result<()> {

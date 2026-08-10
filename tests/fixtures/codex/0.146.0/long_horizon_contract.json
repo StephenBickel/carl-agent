@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "codex_version": "0.146.0",
+  "methods": {
+    "thread/resume": ["threadId"],
+    "thread/compact/start": ["threadId"]
+  },
+  "notifications": {
+    "thread/tokenUsage/updated": ["threadId", "turnId", "tokenUsage"],
+    "item/started": ["threadId", "turnId", "item", "startedAtMs"],
+    "item/completed": ["threadId", "turnId", "item", "completedAtMs"]
+  },
+  "item_types": ["commandExecution", "fileChange", "contextCompaction"]
+}

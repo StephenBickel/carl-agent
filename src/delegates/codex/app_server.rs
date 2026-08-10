@@ -137,6 +137,26 @@ impl fmt::Debug for CodexAppServer {
 }
 
 impl CodexAppServer {
+    pub fn long_horizon_protocol_contract(codex_version: &str) -> Result<Value, DelegateError> {
+        if codex_version != CODEX_APP_SERVER_VERSION {
+            return Err(DelegateError::new(DelegateErrorCode::Incompatible));
+        }
+        Ok(json!({
+            "schema_version": 1,
+            "codex_version": CODEX_APP_SERVER_VERSION,
+            "methods": {
+                "thread/resume": ["threadId"],
+                "thread/compact/start": ["threadId"]
+            },
+            "notifications": {
+                "thread/tokenUsage/updated": ["threadId", "turnId", "tokenUsage"],
+                "item/started": ["threadId", "turnId", "item", "startedAtMs"],
+                "item/completed": ["threadId", "turnId", "item", "completedAtMs"]
+            },
+            "item_types": ["commandExecution", "fileChange", "contextCompaction"]
+        }))
+    }
+
     pub async fn connect(
         executable: &TrustedExecutable,
         home: ProviderHome,
@@ -601,6 +621,9 @@ impl CodexAppServer {
             | CodexEvent::ItemCompleted {
                 thread_id, turn_id, ..
             }
+            | CodexEvent::TokenUsageUpdated {
+                thread_id, turn_id, ..
+            }
             | CodexEvent::DiffUpdated {
                 thread_id, turn_id, ..
             }
@@ -872,26 +895,6 @@ fn is_ignorable_notification(value: &Value) -> Result<bool, DelegateError> {
             bounded_string(params.get("message"), MAX_TEXT_BYTES)?;
             Ok(true)
         }
-        "thread/tokenUsage/updated" => {
-            require_keys(params, &["threadId", "turnId", "tokenUsage"], &[])?;
-            bounded_string(params.get("threadId"), 128)?;
-            bounded_string(params.get("turnId"), 128)?;
-            let usage = params
-                .get("tokenUsage")
-                .and_then(Value::as_object)
-                .ok_or_else(protocol_error)?;
-            require_keys(usage, &["total", "last", "modelContextWindow"], &[])?;
-            validate_token_usage(usage.get("total"))?;
-            validate_token_usage(usage.get("last"))?;
-            if usage
-                .get("modelContextWindow")
-                .and_then(Value::as_u64)
-                .is_none()
-            {
-                return Err(protocol_error());
-            }
-            Ok(true)
-        }
         "account/rateLimits/updated" => {
             require_keys(params, &["rateLimits"], &[])?;
             validate_rate_limits(params.get("rateLimits"))?;
@@ -916,28 +919,6 @@ fn is_ignorable_notification(value: &Value) -> Result<bool, DelegateError> {
         }
         _ => Ok(false),
     }
-}
-
-fn validate_token_usage(value: Option<&Value>) -> Result<(), DelegateError> {
-    let usage = value
-        .and_then(Value::as_object)
-        .ok_or_else(protocol_error)?;
-    require_keys(
-        usage,
-        &[
-            "totalTokens",
-            "inputTokens",
-            "cachedInputTokens",
-            "cacheWriteInputTokens",
-            "outputTokens",
-            "reasoningOutputTokens",
-        ],
-        &[],
-    )?;
-    if usage.values().any(|value| value.as_u64().is_none()) {
-        return Err(protocol_error());
-    }
-    Ok(())
 }
 
 fn validate_rate_limits(value: Option<&Value>) -> Result<(), DelegateError> {

@@ -17,8 +17,8 @@ use crate::sidecar::{
 };
 
 pub use app_events::{
-    CodexApprovalDecision, CodexApprovalKind, CodexApprovalRequest, CodexEvent, CodexThreadId,
-    CodexTurnId,
+    CodexApprovalDecision, CodexApprovalKind, CodexApprovalRequest, CodexEvent, CodexItem,
+    CodexThreadId, CodexTokenUsage, CodexTurnId,
 };
 pub use app_server::{CodexAppServer, CodexModel, StartThread, StartTurn};
 pub use events::{

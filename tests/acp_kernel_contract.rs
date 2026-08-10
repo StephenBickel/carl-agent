@@ -10,7 +10,7 @@ use carl::acp::{
     PublicationFailure,
 };
 use carl::delegates::codex::{
-    CodexAppServer, CodexApprovalDecision, CodexApprovalRequest, CodexEvent, CodexModel,
+    CodexAppServer, CodexApprovalDecision, CodexApprovalRequest, CodexEvent, CodexItem, CodexModel,
     CodexThreadId, CodexTurnId, StartThread, StartTurn,
 };
 use carl::delegates::{ModelId, ReasoningEffort};
@@ -83,6 +83,48 @@ async fn kernel_persists_provider_events_before_returning_updates() -> TestResul
     ));
     assert_eq!(shared.lock().unwrap().starts, 1);
     kernel.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn unknown_codex_items_are_not_reported_as_successful_tools() -> TestResult {
+    let layout = Layout::new()?;
+    let port = ScriptedPort::with_events([
+        CodexEvent::ItemStarted {
+            thread_id: thread()?,
+            turn_id: turn()?,
+            item: CodexItem::Other {
+                item_id: "future-item".into(),
+                item_type: "futureTool".into(),
+            },
+        },
+        CodexEvent::ItemCompleted {
+            thread_id: thread()?,
+            turn_id: turn()?,
+            item: CodexItem::Other {
+                item_id: "future-item".into(),
+                item_type: "futureTool".into(),
+            },
+        },
+        CodexEvent::TurnCompleted {
+            thread_id: thread()?,
+            turn_id: turn()?,
+            status: "completed".into(),
+        },
+    ]);
+    let kernel = Kernel::start_with_ports(layout.runtime()?, Box::new(port), None).await?;
+    let session = kernel
+        .new_session(new_session(&layout, Frontend::Acp, None)?)
+        .await?;
+    let outcome = kernel
+        .prompt(session.id(), Prompt::new(vec!["inspect this repo".into()])?)
+        .await?;
+    assert!(
+        outcome
+            .updates
+            .iter()
+            .all(|update| !matches!(update, carl::acp::KernelUpdate::ToolCompleted { .. }))
+    );
     Ok(())
 }
 
@@ -543,7 +585,7 @@ impl ScriptedPort {
             CodexEvent::ItemStarted {
                 thread_id: thread()?,
                 turn_id: turn()?,
-                item_id: "item_123".into(),
+                item: command_item("item_123", "inProgress"),
             },
             CodexEvent::ApprovalRequested(approval),
         ]);
@@ -578,7 +620,7 @@ impl ScriptedPort {
             CodexEvent::ItemStarted {
                 thread_id: thread()?,
                 turn_id: turn()?,
-                item_id: "item_auto".into(),
+                item: command_item("item_auto", "inProgress"),
             },
             CodexEvent::ApprovalRequested(approval),
         ]);
@@ -586,7 +628,7 @@ impl ScriptedPort {
             CodexEvent::ItemCompleted {
                 thread_id: thread()?,
                 turn_id: turn()?,
-                item_id: "item_auto".into(),
+                item: command_item("item_auto", "completed"),
             },
             CodexEvent::TurnCompleted {
                 thread_id: thread()?,
@@ -619,12 +661,12 @@ impl ScriptedPort {
                 CodexEvent::ItemStarted {
                     thread_id: thread()?,
                     turn_id: turn()?,
-                    item_id: "item_invalid".into(),
+                    item: command_item("item_invalid", "inProgress"),
                 },
                 CodexEvent::ItemCompleted {
                     thread_id: thread()?,
                     turn_id: turn()?,
-                    item_id: "item_invalid".into(),
+                    item: command_item("item_invalid", "completed"),
                 },
                 CodexEvent::ApprovalRequested(approval),
             ],
@@ -632,7 +674,7 @@ impl ScriptedPort {
                 CodexEvent::ItemStarted {
                     thread_id: thread()?,
                     turn_id: turn()?,
-                    item_id: "item_invalid".into(),
+                    item: command_item("item_invalid", "inProgress"),
                 },
                 CodexEvent::ApprovalRequested(approval),
             ],
@@ -689,6 +731,18 @@ impl ScriptedPort {
                 interrupts: 0,
             })),
         }
+    }
+}
+
+fn command_item(item_id: &str, status: &str) -> CodexItem {
+    CodexItem::Command {
+        item_id: item_id.into(),
+        command: "cargo test".into(),
+        cwd: "/workspace".into(),
+        status: status.into(),
+        exit_code: (status == "completed").then_some(0),
+        aggregated_output: None,
+        process_id: None,
     }
 }
 

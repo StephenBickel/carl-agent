@@ -446,7 +446,7 @@ fn app_server_fixture() -> i32 {
                     continue;
                 }
                 if input.contains("approval scenario") {
-                    if item_started(thread_id, &turn_id, "file-item")
+                    if item_started(thread_id, &turn_id, "file-item", "fileChange")
                         .and_then(|()| agent_delta(thread_id, &turn_id, "Preparing fix. "))
                         .and_then(|()| {
                             approval_request(
@@ -470,7 +470,7 @@ fn app_server_fixture() -> i32 {
                     continue;
                 }
                 if input.contains("bypass scenario") {
-                    if item_started(thread_id, &turn_id, "bypass-item")
+                    if item_started(thread_id, &turn_id, "bypass-item", "commandExecution")
                         .and_then(|()| {
                             approval_request(
                                 "approval-bypass",
@@ -524,7 +524,12 @@ fn app_server_fixture() -> i32 {
                         }
                         if diff_update(&approval.thread_id, &approval.turn_id)
                             .and_then(|()| {
-                                item_started(&approval.thread_id, &approval.turn_id, "command-item")
+                                item_started(
+                                    &approval.thread_id,
+                                    &approval.turn_id,
+                                    "command-item",
+                                    "commandExecution",
+                                )
                             })
                             .and_then(|()| {
                                 approval_request(
@@ -669,11 +674,26 @@ fn turn_started(thread_id: &str, turn_id: &str) -> std::io::Result<()> {
     }))
 }
 
-fn item_started(thread_id: &str, turn_id: &str, item_id: &str) -> std::io::Result<()> {
+fn item_started(
+    thread_id: &str,
+    turn_id: &str,
+    item_id: &str,
+    item_type: &str,
+) -> std::io::Result<()> {
+    let item = match item_type {
+        "commandExecution" => json!({
+            "type":"commandExecution","id":item_id,"command":"cargo test",
+            "cwd":"/workspace","status":"inProgress","commandActions":[]
+        }),
+        "fileChange" => json!({
+            "type":"fileChange","id":item_id,"status":"inProgress","changes":[]
+        }),
+        _ => return Err(std::io::Error::other("unsupported fixture item type")),
+    };
     notify(json!({
         "method":"item/started", "params":{
             "threadId":thread_id,"turnId":turn_id,"startedAtMs":1,
-            "item":{"type":"agentMessage","id":item_id,"text":""}
+            "item":item
         }
     }))
 }
