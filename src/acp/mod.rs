@@ -4,6 +4,7 @@ mod buzz;
 mod config;
 mod kernel;
 mod protocol;
+mod server;
 mod session;
 
 pub use buzz::{
@@ -21,6 +22,7 @@ pub use protocol::{
     AcpError, AcpErrorCode, BoundedJsonRpcString, IncomingFrame, JsonRpcId, OutgoingFrame,
     read_frame, write_frame,
 };
+pub use server::{AcpServer, AcpServerError, AcpServerErrorCode};
 pub use session::{
     ConfigOutcome, ConfigSelection, KernelError, KernelErrorCode, KernelSession, KernelUpdate,
     NewSessionRequest, Prompt, PromptOutcome, PromptStopReason, ToolKind, ToolStatus,

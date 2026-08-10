@@ -204,6 +204,11 @@ pub enum KernelCommand {
         selection: ConfigSelection,
         reply: oneshot::Sender<Result<ConfigOutcome, KernelError>>,
     },
+    AttachBuzzContext {
+        session_id: SessionId,
+        context: BuzzContext,
+        reply: oneshot::Sender<Result<(), KernelError>>,
+    },
     Cancel {
         session_id: SessionId,
         reply: oneshot::Sender<Result<(), KernelError>>,
@@ -270,6 +275,21 @@ impl KernelHandle {
         self.send(KernelCommand::SetConfig {
             session_id,
             selection,
+            reply,
+        })
+        .await?;
+        result.await.map_err(|_| stopped_error())?
+    }
+
+    pub async fn attach_buzz_context(
+        &self,
+        session_id: SessionId,
+        context: BuzzContext,
+    ) -> Result<(), KernelError> {
+        let (reply, result) = oneshot::channel();
+        self.send(KernelCommand::AttachBuzzContext {
+            session_id,
+            context,
             reply,
         })
         .await?;
@@ -355,6 +375,7 @@ struct SessionState {
     public: KernelSession,
     cwd: std::path::PathBuf,
     actor_id: ActorId,
+    frontend: Frontend,
     buzz_context: Option<BuzzContext>,
     provider_thread: CodexThreadId,
     active: Option<ActiveTurn>,
@@ -414,6 +435,15 @@ impl KernelActor {
                     let _ = reply.send(result);
                     false
                 }
+                KernelCommand::AttachBuzzContext {
+                    session_id,
+                    context,
+                    reply,
+                } => {
+                    let result = self.attach_buzz_context(session_id, context);
+                    let _ = reply.send(result);
+                    false
+                }
                 KernelCommand::Cancel { session_id, reply } => {
                     let result = self.cancel_session(session_id).await;
                     let _ = reply.send(result);
@@ -445,19 +475,14 @@ impl KernelActor {
         &mut self,
         request: NewSessionRequest,
     ) -> Result<KernelSession, KernelError> {
-        if !matches!(request.protocol_version, 1 | 2)
-            || (request.frontend == Frontend::Buzz && request.buzz_context.is_none())
-            || (request.frontend == Frontend::Buzz
-                && request
-                    .channel_id
-                    .as_ref()
-                    .map(crate::storage::ChannelId::as_str)
-                    != request
-                        .buzz_context
-                        .as_ref()
-                        .map(|context| context.channel_id().to_string())
-                        .as_deref())
-        {
+        let buzz_binding_valid = match (&request.buzz_context, &request.channel_id) {
+            (Some(context), Some(channel)) if request.frontend == Frontend::Buzz => {
+                channel.as_str() == context.channel_id().to_string()
+            }
+            (None, None) => true,
+            _ => false,
+        };
+        if !matches!(request.protocol_version, 1 | 2) || !buzz_binding_valid {
             return Err(invalid_input());
         }
         let model = request
@@ -526,6 +551,7 @@ impl KernelActor {
                 public: public.clone(),
                 cwd: request.cwd,
                 actor_id: request.actor_id,
+                frontend: request.frontend,
                 buzz_context: request.buzz_context,
                 provider_thread,
                 active: None,
@@ -1160,6 +1186,41 @@ impl KernelActor {
         Ok(ConfigOutcome::Applied(configuration))
     }
 
+    fn attach_buzz_context(
+        &mut self,
+        session_id: SessionId,
+        context: BuzzContext,
+    ) -> Result<(), KernelError> {
+        let state = self
+            .sessions
+            .get_mut(&session_id)
+            .ok_or_else(unknown_session)?;
+        if state.frontend != Frontend::Buzz
+            || state
+                .active
+                .as_ref()
+                .is_some_and(|active| active.pending_approval.is_none())
+        {
+            return Err(session_busy());
+        }
+        let actor = ActorId::parse(context.actor_hex()).map_err(|_| invalid_input())?;
+        let channel = crate::storage::ChannelId::try_from(context.channel_id().to_string())
+            .map_err(map_storage)?;
+        if let Some(existing) = state.buzz_context.as_ref()
+            && (existing.channel_id() != context.channel_id()
+                || existing.actor_hex() != context.actor_hex())
+        {
+            return Err(KernelError::from_code(KernelErrorCode::ApprovalUnavailable));
+        }
+        self.store
+            .store()
+            .attach_frontend_channel(&state.public.external_session_id, &channel, Utc::now())
+            .map_err(map_storage)?;
+        state.actor_id = actor;
+        state.buzz_context = Some(context);
+        Ok(())
+    }
+
     fn confirm_bypass(
         &mut self,
         session_id: SessionId,
@@ -1457,6 +1518,9 @@ fn reject_busy_command(command: KernelCommand) {
             let _ = reply.send(Err(session_busy()));
         }
         KernelCommand::SetConfig { reply, .. } => {
+            let _ = reply.send(Err(session_busy()));
+        }
+        KernelCommand::AttachBuzzContext { reply, .. } => {
             let _ = reply.send(Err(session_busy()));
         }
         KernelCommand::Cancel { reply, .. } | KernelCommand::Steer { reply, .. } => {

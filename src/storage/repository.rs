@@ -968,6 +968,36 @@ impl Store {
             .ok_or_else(|| storage_invariant("configured frontend session disappeared"))
     }
 
+    pub fn attach_frontend_channel(
+        &self,
+        external_session_id: &ExternalSessionId,
+        channel_id: &ChannelId,
+        updated_at: DateTime<Utc>,
+    ) -> Result<FrontendSessionRecord, CarlError> {
+        let changed = self
+            .connection
+            .execute(
+                "UPDATE frontend_sessions
+                 SET channel_id = COALESCE(channel_id, ?2), updated_at = ?3
+                 WHERE external_session_id = ?1
+                   AND (channel_id IS NULL OR channel_id = ?2)
+                   AND updated_at <= ?3",
+                params![
+                    external_session_id.as_str(),
+                    channel_id.as_str(),
+                    format_timestamp(updated_at),
+                ],
+            )
+            .map_err(storage_error)?;
+        if changed != 1 {
+            return Err(policy_error(
+                "frontend channel binding conflicts with durable state",
+            ));
+        }
+        self.get_frontend_session(external_session_id.as_str())?
+            .ok_or_else(|| storage_invariant("attached frontend session disappeared"))
+    }
+
     pub fn create_remote_code(
         &self,
         input: NewRemoteCode<'_>,
