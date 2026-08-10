@@ -23,7 +23,7 @@ pub(crate) use bounded_process::{
 };
 pub use exec_jsonl::{ExecutionWorkspace, JsonlEventProcess, JsonlProcessOutcome};
 
-use std::collections::{HashMap, VecDeque, hash_map::Entry};
+use std::collections::{HashMap, HashSet, VecDeque, hash_map::Entry};
 use std::env;
 use std::ffi::OsString;
 use std::fmt;
@@ -65,6 +65,7 @@ const MAX_ABANDONED_REQUEST_IDS: usize = 128;
 const SUPERVISOR_CHANNEL_CAPACITY: usize = 256;
 const WRITER_CHANNEL_CAPACITY: usize = 128;
 const NOTIFICATION_CHANNEL_CAPACITY: usize = 64;
+const SERVER_REQUEST_CHANNEL_CAPACITY: usize = 64;
 const MAX_STDOUT_LINE_BYTES: usize = 1024 * 1024;
 const MAX_STDERR_BYTES: usize = 64 * 1024;
 const MAX_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
@@ -2259,6 +2260,7 @@ pub struct JsonlSidecar {
     supervisor: mpsc::Sender<SupervisorEvent>,
     writer: mpsc::Sender<WriterMessage>,
     notifications: AsyncMutex<mpsc::Receiver<serde_json::Value>>,
+    server_requests: AsyncMutex<mpsc::Receiver<serde_json::Value>>,
     request_slots: Arc<Semaphore>,
     abandonments: Arc<Abandonments>,
     pipe_task_aborts: Vec<AbortHandle>,
@@ -2384,6 +2386,7 @@ impl JsonlSidecar {
         let (supervisor_tx, supervisor_rx) = mpsc::channel(SUPERVISOR_CHANNEL_CAPACITY);
         let (writer_tx, writer_rx) = mpsc::channel(WRITER_CHANNEL_CAPACITY);
         let (notification_tx, notification_rx) = mpsc::channel(NOTIFICATION_CHANNEL_CAPACITY);
+        let (server_request_tx, server_request_rx) = mpsc::channel(SERVER_REQUEST_CHANNEL_CAPACITY);
 
         let writer_task = tokio::spawn(writer_worker(stdin, writer_rx, supervisor_tx.clone()));
         let stdout_task = tokio::spawn(stdout_worker(
@@ -2406,6 +2409,7 @@ impl JsonlSidecar {
             events: supervisor_rx,
             writer: writer_tx.clone(),
             notifications: notification_tx,
+            server_requests: server_request_tx,
             abandonments: Arc::clone(&abandonments),
             state: Arc::clone(&state),
             writer_task,
@@ -2420,6 +2424,7 @@ impl JsonlSidecar {
             supervisor: supervisor_tx,
             writer: writer_tx,
             notifications: AsyncMutex::new(notification_rx),
+            server_requests: AsyncMutex::new(server_request_rx),
             request_slots: Arc::new(Semaphore::new(MAX_PENDING_REQUESTS)),
             abandonments,
             pipe_task_aborts,
@@ -2501,6 +2506,46 @@ impl JsonlSidecar {
             Err(mpsc::error::TryRecvError::Empty) => Ok(None),
             Err(mpsc::error::TryRecvError::Disconnected) => Err(stopped_error(&self.state)),
         }
+    }
+
+    /// Receive the next bounded JSON-RPC request initiated by the sidecar.
+    pub async fn next_server_request(&self) -> Result<serde_json::Value, SidecarError> {
+        let mut requests = self.server_requests.lock().await;
+        requests
+            .recv()
+            .await
+            .ok_or_else(|| stopped_error(&self.state))
+    }
+
+    /// Receive one already-buffered sidecar-initiated request without waiting.
+    pub async fn try_next_server_request(&self) -> Result<Option<serde_json::Value>, SidecarError> {
+        let mut requests = self.server_requests.lock().await;
+        match requests.try_recv() {
+            Ok(request) => Ok(Some(request)),
+            Err(mpsc::error::TryRecvError::Empty) => Ok(None),
+            Err(mpsc::error::TryRecvError::Disconnected) => Err(stopped_error(&self.state)),
+        }
+    }
+
+    /// Send one bounded JSON-RPC result or error for a sidecar-initiated request.
+    pub fn respond_to_server_request(
+        &self,
+        response: serde_json::Value,
+    ) -> Result<(), SidecarError> {
+        if !is_server_response(&response) {
+            return Err(SidecarError::from_code(SidecarErrorCode::ProtocolViolation));
+        }
+        let key = correlation_key(&response)?;
+        let line = encode_line(&response, self.limits.max_stdout_line_bytes)
+            .map_err(|()| SidecarError::from_code(SidecarErrorCode::ProtocolViolation))?;
+        self.supervisor
+            .try_send(SupervisorEvent::ServerResponse { key, line })
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => {
+                    SidecarError::from_code(SidecarErrorCode::TimedOut)
+                }
+                mpsc::error::TrySendError::Closed(_) => stopped_error(&self.state),
+            })
     }
 
     /// Send one bounded ID-less JSONL notification.
@@ -2680,6 +2725,10 @@ enum SupervisorEvent {
     },
     Written(String),
     Incoming(serde_json::Value),
+    ServerResponse {
+        key: String,
+        line: Vec<u8>,
+    },
     Failure(SidecarErrorCode),
     Cancel {
         complete: oneshot::Sender<Result<(), SidecarError>>,
@@ -2794,6 +2843,7 @@ struct SupervisorContext {
     events: mpsc::Receiver<SupervisorEvent>,
     writer: mpsc::Sender<WriterMessage>,
     notifications: mpsc::Sender<serde_json::Value>,
+    server_requests: mpsc::Sender<serde_json::Value>,
     abandonments: Arc<Abandonments>,
     state: Arc<AtomicU8>,
     writer_task: JoinHandle<()>,
@@ -2809,6 +2859,7 @@ async fn supervisor_worker(context: SupervisorContext) {
         mut events,
         writer,
         notifications,
+        server_requests,
         abandonments,
         state,
         mut writer_task,
@@ -2818,6 +2869,7 @@ async fn supervisor_worker(context: SupervisorContext) {
         notification_policy,
     } = context;
     let mut pending = PendingRequests::new();
+    let mut active_server_requests = HashSet::new();
     let mut abandoned_count = 0_usize;
     loop {
         pending.retain(|_, request| {
@@ -2913,9 +2965,27 @@ async fn supervisor_worker(context: SupervisorContext) {
                     &mut pending,
                     &mut abandoned_count,
                     &notifications,
+                    &server_requests,
+                    &mut active_server_requests,
                     notification_policy,
                 )
                 .is_err()
+                {
+                    shutdown_supervisor(
+                        &process,
+                        &mut pending,
+                        &state,
+                        [&mut writer_task, &mut stdout_task, &mut stderr_task],
+                        limits,
+                        SidecarErrorCode::ProtocolViolation,
+                    )
+                    .await;
+                    return;
+                }
+            }
+            Ok(Some(SupervisorEvent::ServerResponse { key, line })) => {
+                if !active_server_requests.remove(&key)
+                    || writer.try_send(WriterMessage::Notification(line)).is_err()
                 {
                     shutdown_supervisor(
                         &process,
@@ -2992,6 +3062,8 @@ async fn supervisor_worker(context: SupervisorContext) {
                 &mut abandoned_count,
                 &abandonments,
                 &notifications,
+                &server_requests,
+                &mut active_server_requests,
                 &state,
                 [&mut writer_task, &mut stdout_task, &mut stderr_task],
                 limits,
@@ -3047,9 +3119,18 @@ fn handle_incoming(
     pending: &mut PendingRequests,
     abandoned_count: &mut usize,
     notifications: &mpsc::Sender<serde_json::Value>,
+    server_requests: &mpsc::Sender<serde_json::Value>,
+    active_server_requests: &mut HashSet<String>,
     notification_policy: NotificationPolicy,
 ) -> Result<(), ()> {
-    if let Ok(key) = correlation_key(&message) {
+    if is_server_request(&message) {
+        let key = correlation_key(&message).map_err(|_| ())?;
+        if !active_server_requests.insert(key) {
+            return Err(());
+        }
+        server_requests.try_send(message).map_err(|_| ())
+    } else if is_server_response(&message) {
+        let key = correlation_key(&message).map_err(|_| ())?;
         let Some(request) = pending.remove(&key) else {
             return Err(());
         };
@@ -3074,6 +3155,8 @@ async fn drain_after_leader_exit(
     abandoned_count: &mut usize,
     abandonments: &Abandonments,
     notifications: &mpsc::Sender<serde_json::Value>,
+    server_requests: &mpsc::Sender<serde_json::Value>,
+    active_server_requests: &mut HashSet<String>,
     state: &Arc<AtomicU8>,
     tasks: [&mut JoinHandle<()>; 3],
     limits: SidecarLimits,
@@ -3107,6 +3190,8 @@ async fn drain_after_leader_exit(
                         pending,
                         abandoned_count,
                         notifications,
+                        server_requests,
+                        active_server_requests,
                         notification_policy,
                     )
                     .is_err()
@@ -3118,6 +3203,9 @@ async fn drain_after_leader_exit(
                     if let Some(request) = pending.get_mut(&key) {
                         request.enqueued = true;
                     }
+                }
+                SupervisorEvent::ServerResponse { .. } => {
+                    failure_code = SidecarErrorCode::SidecarExited;
                 }
                 SupervisorEvent::Register { acknowledge, .. }
                 | SupervisorEvent::Enqueue { acknowledge, .. } => {
@@ -3177,6 +3265,27 @@ fn is_notification(value: &serde_json::Value) -> bool {
             && object
                 .get("method")
                 .is_some_and(serde_json::Value::is_string)
+    })
+}
+
+fn is_server_request(value: &serde_json::Value) -> bool {
+    value.as_object().is_some_and(|object| {
+        object.contains_key("id")
+            && object
+                .get("method")
+                .is_some_and(serde_json::Value::is_string)
+            && !object.contains_key("result")
+            && !object.contains_key("error")
+            && correlation_key(value).is_ok()
+    })
+}
+
+fn is_server_response(value: &serde_json::Value) -> bool {
+    value.as_object().is_some_and(|object| {
+        object.contains_key("id")
+            && !object.contains_key("method")
+            && (object.contains_key("result") ^ object.contains_key("error"))
+            && correlation_key(value).is_ok()
     })
 }
 

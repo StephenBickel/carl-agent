@@ -18,7 +18,7 @@ use crate::sidecar::{
     SidecarLimits, TrustedExecutable, VersionOutputFormat,
 };
 
-const CODEX_VERSION: &str = "=0.136.0";
+const CODEX_VERSION: &str = "=0.146.0";
 const KEYRING_CONFIG: &[u8] = b"cli_auth_credentials_store = \"keyring\"\n";
 const MAX_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_LOGIN_TIMEOUT: Duration = Duration::from_secs(15 * 60);
@@ -245,7 +245,7 @@ impl CodexAuth {
             version_arguments: vec![OsString::from("--version")],
             version_output: VersionOutputFormat::ExactPrefixedVersion {
                 prefix: "codex-cli",
-                version: "0.136.0",
+                version: "0.146.0",
             },
             // `spawn_in_home` uses the held capability instead of reopening this path.
             isolated_home: PathBuf::new(),

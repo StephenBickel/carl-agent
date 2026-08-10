@@ -171,6 +171,22 @@ fn main() {
             notifications_are_bounded_and_delivered,
         ),
         test(
+            "server requests are routed and answered separately",
+            server_requests_are_routed_and_answered_separately,
+        ),
+        test(
+            "duplicate server request IDs fail closed",
+            duplicate_server_request_ids_fail_closed,
+        ),
+        test(
+            "server request response confusion fails closed",
+            server_request_response_confusion_fails_closed,
+        ),
+        test(
+            "server request queue overflow fails closed",
+            server_request_queue_overflow_fails_closed,
+        ),
+        test(
             "outbound notifications and nonblocking receive are bounded",
             outbound_notifications_and_nonblocking_receive_are_bounded,
         ),
@@ -1977,6 +1993,76 @@ fn notifications_are_bounded_and_delivered() -> TestResult {
         assert_eq!(notification?["method"], "auth/progress");
         sidecar.cancel().await?;
         TestResult::Ok(())
+    })
+}
+
+fn server_requests_are_routed_and_answered_separately() -> TestResult {
+    run_async(async {
+        let layout = TestLayout::new()?;
+        let command = fixture_command(&layout, "server-request-round-trip", "1.2.3");
+        let sidecar = std::sync::Arc::new(spawn_fixture(command, &layout, short_limits()).await?);
+        assert_eq!(sidecar.try_next_server_request().await?, None);
+
+        let request_sidecar = std::sync::Arc::clone(&sidecar);
+        let request = tokio::spawn(async move {
+            request_sidecar
+                .request(json!({"id": "turn-1", "method": "turn/start"}))
+                .await
+        });
+        let server_request = sidecar.next_server_request().await?;
+        assert_eq!(server_request["id"], "approval-7");
+        assert_eq!(
+            server_request["method"],
+            "item/commandExecution/requestApproval"
+        );
+        assert_eq!(sidecar.try_next_notification().await?, None);
+
+        sidecar.respond_to_server_request(json!({
+            "id": "approval-7",
+            "result": {"decision": "accept"},
+        }))?;
+        assert_eq!(request.await??["result"], "complete");
+        let child_line = wait_for_fixture_json(&layout.home.join("server-response.json")).await?;
+        assert_eq!(
+            child_line,
+            json!({
+                "id": "approval-7",
+                "result": {"decision": "accept"},
+            })
+        );
+        sidecar.cancel().await?;
+        TestResult::Ok(())
+    })
+}
+
+fn duplicate_server_request_ids_fail_closed() -> TestResult {
+    assert_server_request_protocol_failure("duplicate-server-request")
+}
+
+fn server_request_response_confusion_fails_closed() -> TestResult {
+    for scenario in ["response-with-method", "response-without-result-or-error"] {
+        assert_server_request_protocol_failure(scenario)?;
+    }
+    Ok(())
+}
+
+fn server_request_queue_overflow_fails_closed() -> TestResult {
+    assert_server_request_protocol_failure("server-request-flood")
+}
+
+fn assert_server_request_protocol_failure(scenario: &str) -> TestResult {
+    run_async(async {
+        let layout = TestLayout::new()?;
+        let command = fixture_command(&layout, scenario, "1.2.3");
+        let sidecar = spawn_fixture(command, &layout, short_limits()).await?;
+        let pid = sidecar.process_id().ok_or("fixture PID was unavailable")?;
+        let error = sidecar
+            .request(json!({"id": "turn-1", "method": "turn/start"}))
+            .await
+            .expect_err("invalid server-request traffic must fail closed");
+        assert_eq!(error.code(), SidecarErrorCode::ProtocolViolation);
+        wait_until_processes_reaped(&[pid]).await?;
+        Ok(())
     })
 }
 

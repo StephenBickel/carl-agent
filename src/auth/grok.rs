@@ -358,10 +358,18 @@ impl GrokAuth {
     }
 
     async fn request(&self, sidecar: &JsonlSidecar, request: Value) -> Result<Value, AuthError> {
-        tokio::time::timeout(self.timeouts.request, sidecar.request(request))
-            .await
-            .map_err(|_| timed_out())?
-            .map_err(map_sidecar_error)
+        tokio::time::timeout(self.timeouts.request, async {
+            tokio::select! {
+                biased;
+                response = sidecar.request(request) => response.map_err(map_sidecar_error),
+                server_request = sidecar.next_server_request() => match server_request {
+                    Ok(_) => Err(protocol_mismatch()),
+                    Err(error) => Err(map_sidecar_error(error)),
+                },
+            }
+        })
+        .await
+        .map_err(|_| timed_out())?
     }
 
     fn prepare_foreground(&self, arguments: &[OsString]) -> Result<ForegroundProcess, AuthError> {

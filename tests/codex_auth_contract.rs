@@ -53,7 +53,7 @@ fn main() {
 
     let trials = vec![
         test(
-            "Codex 0.136.0 launch and handshake are exact",
+            "Codex 0.146.0 launch and handshake are exact",
             codex_launch_and_handshake_are_exact,
         ),
         test(
@@ -61,8 +61,8 @@ fn main() {
             codex_rejects_grok_provider_home_before_launch,
         ),
         test(
-            "only Codex 0.136.0 is accepted",
-            only_codex_0136_is_accepted,
+            "only Codex 0.146.0 is accepted",
+            only_codex_0146_is_accepted,
         ),
         test(
             "browser and device ceremonies complete through correlated notifications",
@@ -73,7 +73,7 @@ fn main() {
             codex_authorization_urls_fail_closed,
         ),
         test(
-            "account plans use the exact 0.136.0 closed mapping",
+            "account plans use the exact 0.146.0 closed mapping",
             account_plans_use_exact_mapping,
         ),
         test(
@@ -328,7 +328,7 @@ fn codex_rejects_grok_provider_home_before_launch() -> TestResult {
     })
 }
 
-fn only_codex_0136_is_accepted() -> TestResult {
+fn only_codex_0146_is_accepted() -> TestResult {
     run_async(async {
         for (scenario, expected) in [
             ("unsupported-version", AuthErrorCode::UnsupportedVersion),
@@ -348,7 +348,7 @@ fn only_codex_0136_is_accepted() -> TestResult {
             home.write_static_file("fixture-scenario", scenario.as_bytes())?;
             let error = CodexAuth::connect(&trusted, home, short_limits(), contract_timeouts())
                 .await
-                .expect_err("only exact codex-cli 0.136.0 must be accepted");
+                .expect_err("only exact codex-cli 0.146.0 must be accepted");
             assert_eq!(error.code(), expected);
             assert_contains_no_secret(&format!("{error:?}"));
             assert!(

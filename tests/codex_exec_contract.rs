@@ -685,7 +685,7 @@ fn adapter_rejects_a_non_codex_provider_home() -> TestResult {
         version_arguments: Vec::new(),
         version_output: VersionOutputFormat::SingleSemverToken,
         isolated_home: layout.home.clone(),
-        supported_versions: VersionReq::parse("=0.136.0")?,
+        supported_versions: VersionReq::parse("=0.146.0")?,
     };
     let trusted = specification
         .resolve_executable()?
@@ -844,7 +844,7 @@ fn codex_adapter_fixture(
         version_arguments: Vec::new(),
         version_output: VersionOutputFormat::SingleSemverToken,
         isolated_home: layout.home.clone(),
-        supported_versions: VersionReq::parse("=0.136.0")?,
+        supported_versions: VersionReq::parse("=0.146.0")?,
     };
     let trusted = specification
         .resolve_executable()?
@@ -920,7 +920,7 @@ fn dispatch_exec_fixture(arguments: &[OsString]) -> Option<i32> {
                     })
                     .flatten()
             })
-            .unwrap_or_else(|| "0.136.0".to_owned());
+            .unwrap_or_else(|| "0.146.0".to_owned());
         println!("codex-cli {}", version.trim());
         return Some(0);
     }

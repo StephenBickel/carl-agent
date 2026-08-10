@@ -340,6 +340,11 @@ pub fn dispatch_fixture(arguments: &[OsString]) -> Option<i32> {
         #[cfg(unix)]
         "replacement-execution-marker" => replacement_execution_marker(),
         "strict-jsonl" => strict_jsonl(false, false),
+        "server-request-round-trip" => server_request_round_trip(),
+        "duplicate-server-request" => duplicate_server_request(),
+        "response-with-method" => confused_response(true),
+        "response-without-result-or-error" => confused_response(false),
+        "server-request-flood" => server_request_flood(),
         "stderr" => strict_jsonl(true, false),
         "malformed" => malformed_response(false),
         "oversized" => malformed_response(true),
@@ -366,12 +371,12 @@ pub fn dispatch_codex_auth_fixture(arguments: &[OsString]) -> Option<i32> {
     if arguments == [OsString::from("--version")] {
         match scenario {
             "status-hold" => return Some(hold_status_version(&home)),
-            "unsupported-version" => println!("codex-cli 0.135.0"),
-            "version-build-metadata" => println!("codex-cli 0.136.0+modified"),
-            "version-wrong-prefix" => println!("codex 0.136.0"),
-            "version-extra-token" => println!("codex-cli 0.136.0 stable"),
+            "unsupported-version" => println!("codex-cli 0.145.0"),
+            "version-build-metadata" => println!("codex-cli 0.146.0+modified"),
+            "version-wrong-prefix" => println!("codex 0.146.0"),
+            "version-extra-token" => println!("codex-cli 0.146.0 stable"),
             "version-malformed" => println!("codex-cli release"),
-            _ => println!("codex-cli 0.136.0"),
+            _ => println!("codex-cli 0.146.0"),
         }
         return Some(0);
     }
@@ -958,7 +963,7 @@ fn codex_auth_jsonl_fixture(home: &Path, scenario: &str) -> i32 {
                     home.to_path_buf()
                 };
                 let mut result = serde_json::json!({
-                    "userAgent": "codex_cli_rs/0.136.0",
+                    "userAgent": "codex_cli_rs/0.146.0",
                     "codexHome": codex_home,
                     "platformFamily": "unix",
                     "platformOs": "fixture",
@@ -1809,6 +1814,117 @@ fn strict_jsonl(write_stderr: bool, ignore_term: bool) -> i32 {
         });
     }
     0
+}
+
+fn server_request_round_trip() -> i32 {
+    let Some(trigger) = read_fixture_json_line() else {
+        return 74;
+    };
+    let Some(trigger_id) = trigger.get("id").cloned() else {
+        return 65;
+    };
+    if write_fixture_json_line(&serde_json::json!({
+        "id": "approval-7",
+        "method": "item/commandExecution/requestApproval",
+        "params": {"command": "cargo test"},
+    }))
+    .is_err()
+    {
+        return 74;
+    }
+    let Some(response) = read_fixture_json_line() else {
+        return 74;
+    };
+    let home = match fixture_home() {
+        Ok(home) => home,
+        Err(_) => return 73,
+    };
+    if fs::write(
+        home.join("server-response.json"),
+        serde_json::to_vec(&response).expect("fixture response serializes"),
+    )
+    .is_err()
+    {
+        return 73;
+    }
+    if write_fixture_json_line(&serde_json::json!({
+        "id": trigger_id,
+        "result": "complete",
+    }))
+    .is_err()
+    {
+        return 74;
+    }
+    thread::sleep(Duration::from_secs(30));
+    0
+}
+
+fn duplicate_server_request() -> i32 {
+    if read_fixture_json_line().is_none() {
+        return 74;
+    }
+    let request = serde_json::json!({
+        "id": "duplicate-approval",
+        "method": "item/commandExecution/requestApproval",
+        "params": {},
+    });
+    if write_fixture_json_line(&request).is_err() || write_fixture_json_line(&request).is_err() {
+        return 74;
+    }
+    thread::sleep(Duration::from_secs(30));
+    0
+}
+
+fn confused_response(with_method: bool) -> i32 {
+    let Some(trigger) = read_fixture_json_line() else {
+        return 74;
+    };
+    let Some(id) = trigger.get("id").cloned() else {
+        return 65;
+    };
+    let response = if with_method {
+        serde_json::json!({"id": id, "method": "not/a/request", "result": null})
+    } else {
+        serde_json::json!({"id": id})
+    };
+    if write_fixture_json_line(&response).is_err() {
+        return 74;
+    }
+    thread::sleep(Duration::from_secs(30));
+    0
+}
+
+fn server_request_flood() -> i32 {
+    if read_fixture_json_line().is_none() {
+        return 74;
+    }
+    for id in 0..=64_u64 {
+        if write_fixture_json_line(&serde_json::json!({
+            "id": format!("approval-{id}"),
+            "method": "item/commandExecution/requestApproval",
+            "params": {},
+        }))
+        .is_err()
+        {
+            return 74;
+        }
+    }
+    thread::sleep(Duration::from_secs(30));
+    0
+}
+
+fn read_fixture_json_line() -> Option<serde_json::Value> {
+    let mut input = String::new();
+    io::stdin().read_line(&mut input).ok()?;
+    serde_json::from_str(&input).ok()
+}
+
+fn write_fixture_json_line(value: &serde_json::Value) -> io::Result<()> {
+    let stdout = io::stdout();
+    let mut stdout = stdout.lock();
+    serde_json::to_writer(&mut stdout, value)?;
+    writeln!(stdout)?;
+    stdout.flush()
 }
 
 fn record_received_request() -> io::Result<()> {

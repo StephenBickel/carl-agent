@@ -19,7 +19,7 @@ pub use events::{
     DelegateEvent, DelegateItemPhase, DelegateTerminal, DelegateUsage,
 };
 
-const CODEX_VERSION: &str = "=0.136.0";
+const CODEX_VERSION: &str = "=0.146.0";
 const CODEX_CONFIG: &[u8] = concat!(
     "cli_auth_credentials_store = \"keyring\"\n",
     "approval_policy = \"never\"\n",
@@ -159,7 +159,7 @@ impl CodexExecAdapter {
             version_arguments: vec![OsString::from("--version")],
             version_output: VersionOutputFormat::ExactPrefixedVersion {
                 prefix: "codex-cli",
-                version: "0.136.0",
+                version: "0.146.0",
             },
             isolated_home: PathBuf::new(),
             supported_versions: VersionReq::parse(CODEX_VERSION)
