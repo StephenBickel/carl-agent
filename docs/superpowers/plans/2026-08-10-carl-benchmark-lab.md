@@ -418,17 +418,17 @@ Commit: `git commit -m "feat: compare benchmark scorecards"`
 - Live environment allowlist is `PATH`, locale variables, `CARL_DATA_DIR`, and `CARL_CODEX_EXECUTABLE`. All API-key variables and every `BUZZ_*`/`XAI_*` variable are removed.
 - Metrics returned are elapsed milliseconds, stop reason, bounded notification/tool-call counts, and exit classification only; model text and diffs stay private and are never returned in `AgentOutcome`.
 
-- [ ] **Step 1: Write failing fake ACP contracts**
+- [x] **Step 1: Write failing fake ACP contracts**
 
 Test partial lines, out-of-order response IDs, notifications, successful end turn, JSON-RPC error, malformed/oversized frame, stderr flood, unexpected server request, early exit, timeout, cancellation, wrong negotiated version, and attempted environment leakage.
 
-- [ ] **Step 2: Run focused tests and verify RED**
+- [x] **Step 2: Run focused tests and verify RED**
 
 Run: `cd benchmarks && uv run pytest tests/test_adapters.py -q -k carl_acp`
 
 Expected: FAIL because `CarlAcpAdapter` does not exist.
 
-- [ ] **Step 3: Implement the bounded ACP client**
+- [x] **Step 3: Implement the bounded ACP client**
 
 Port the protocol shape from `scripts/live-codex-acp-smoke.mjs`, not its task-specific assertions. Cap frames at 1 MiB, stderr at 256 KiB, notifications at 10,000, and pending requests at 16. Terminate the full process group on every error.
 
@@ -436,7 +436,7 @@ Port the protocol shape from `scripts/live-codex-acp-smoke.mjs`, not its task-sp
 
 Replace duplicated Node protocol logic only after the Python adapter passes its fake contract. Keep `scripts/live-codex-acp-smoke.mjs` as a thin compatibility launcher or replace it with a documented invocation of `carl-bench run --adapter carl-acp`; preserve the existing boolean-only metadata guarantees.
 
-- [ ] **Step 5: Verify offline and optionally live**
+- [x] **Step 5: Verify offline and optionally live**
 
 Run:
 
@@ -448,7 +448,7 @@ uv run ruff check .
 
 If `CARL_DATA_DIR`, `CARL_CODEX_EXECUTABLE`, and a built `CARL_BIN` are already available, also run one coding task with `--adapter carl-acp --attempts 1`. Absence of live credentials is not a test failure.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 Commit: `git commit -m "feat: benchmark Carl over ACP"`
 
@@ -466,25 +466,25 @@ Commit: `git commit -m "feat: benchmark Carl over ACP"`
 - It removes API-key variables and relies on provider-owned CLI authentication exactly as the local operator configured it.
 - It returns bounded process metrics and a stable outcome code only. Raw JSONL events, stdout, stderr, and final answer are private diagnostics.
 
-- [ ] **Step 1: Inspect the pinned CLI's local help and freeze the argv contract**
+- [x] **Step 1: Inspect the pinned CLI's local help and freeze the argv contract**
 
 Run the configured executable or `codex exec --help`. Record only flags supported by pinned Codex `0.146.0`. Do not infer flags from online examples.
 
-- [ ] **Step 2: Write failing fake CLI tests**
+- [x] **Step 2: Write failing fake CLI tests**
 
 Cover correct cwd/model/effort, successful zero exit, non-zero exit, signal exit, timeout with descendants, stderr/output bounds, malformed JSONL if JSON output is enabled, environment scrubbing, and cancellation.
 
-- [ ] **Step 3: Run focused tests and verify RED**
+- [x] **Step 3: Run focused tests and verify RED**
 
 Run: `cd benchmarks && uv run pytest tests/test_adapters.py -q -k codex_cli`
 
 Expected: FAIL because `CodexCliAdapter` does not exist.
 
-- [ ] **Step 4: Implement the minimal pinned adapter**
+- [x] **Step 4: Implement the minimal pinned adapter**
 
 Use argv arrays, no shell, closed stdin after the instruction is delivered, the task timeout, and the same process-group cleanup as Carl ACP. If exact token/cost fields are unavailable, record them as absent rather than estimating them.
 
-- [ ] **Step 5: Verify and commit**
+- [x] **Step 5: Verify and commit**
 
 Run all adapter tests and `uv run ruff check .`.
 
