@@ -902,11 +902,12 @@ impl KernelActor {
         approval: CodexApprovalRequest,
         updates: &mut Vec<KernelUpdate>,
     ) -> Result<PromptOutcome, KernelError> {
-        let (actor_id, external_session_id) = {
+        let (actor_id, external_session_id, frontend) = {
             let state = self.sessions.get(&session_id).ok_or_else(unknown_session)?;
             (
                 state.actor_id.clone(),
                 state.public.external_session_id.clone(),
+                state.frontend,
             )
         };
         let title = approval
@@ -1024,6 +1025,9 @@ impl KernelActor {
                 .await;
             self.fail_active_turn(session_id, "approval_publication_failed");
             return Err(error);
+        }
+        if frontend != Frontend::Buzz {
+            updates.push(KernelUpdate::AgentMessageChunk(publication));
         }
         updates.push(KernelUpdate::ToolStarted {
             title,

@@ -112,6 +112,10 @@ fn lifecycle_and_approval() -> Result<(), Box<dyn Error + Send + Sync>> {
 
         assert!(matches!(
             server.next_event().await?,
+            CodexEvent::ThreadStarted { .. }
+        ));
+        assert!(matches!(
+            server.next_event().await?,
             CodexEvent::TurnStarted { .. }
         ));
         assert!(matches!(
@@ -244,9 +248,24 @@ fn app_server_fixture() -> i32 {
         let method = request.get("method").and_then(Value::as_str);
         let id = request.get("id").cloned();
         let result = match method {
-            Some("initialized") => continue,
+            Some("initialized") => {
+                if write_message(&json!({
+                    "method":"remoteControl/status/changed",
+                    "params":{
+                        "status":"disabled", "serverName":"fixture",
+                        "installationId":"00000000-0000-4000-8000-000000000000",
+                        "environmentId":null
+                    },
+                    "emittedAtMs":1
+                }))
+                .is_err()
+                {
+                    return 74;
+                }
+                continue;
+            }
             Some("initialize") => json!({
-                "userAgent":"codex_cli_rs/0.146.0", "codexHome":home,
+                "userAgent":"Codex Desktop/0.146.0 (fixture) dumb (carl; 0.1.0)", "codexHome":home,
                 "platformFamily":"unix", "platformOs":"fixture"
             }),
             Some("model/list") if request["params"]["cursor"].is_null() => json!({
@@ -257,12 +276,25 @@ fn app_server_fixture() -> i32 {
                 "data":[model("gpt-5.6-mini", "GPT-5.6 Mini", ["low", "medium"])],
                 "nextCursor":null
             }),
-            Some("thread/start") => json!({
-                "thread": thread(&home), "model":"gpt-5.6-codex", "modelProvider":"openai",
-                "cwd":workspace_for(&home),
-                "approvalPolicy":"on-request", "approvalsReviewer":"user",
-                "sandbox":"workspace-write"
-            }),
+            Some("thread/start") => {
+                let thread = thread(&home);
+                let result = json!({
+                    "thread":thread, "model":"gpt-5.6-codex", "modelProvider":"openai",
+                    "cwd":workspace_for(&home),
+                    "approvalPolicy":"on-request", "approvalsReviewer":"user",
+                    "sandbox":"workspace-write"
+                });
+                if write_message(&json!({"id":id,"result":result})).is_err()
+                    || write_message(&json!({
+                        "method":"thread/started", "params":{"thread":thread},
+                        "emittedAtMs":1
+                    }))
+                    .is_err()
+                {
+                    return 74;
+                }
+                continue;
+            }
             Some("turn/start") => {
                 let result = json!({"turn":{"id":"turn_123","items":[],"status":"inProgress"}});
                 if write_message(&json!({"id":id,"result":result})).is_err() {
@@ -323,7 +355,7 @@ fn workspace_for(home: &Path) -> PathBuf {
 }
 
 fn turn_notifications() -> Vec<Value> {
-    vec![
+    let mut notifications = vec![
         json!({"method":"turn/started","params":{"threadId":"thr_123","turn":{"id":"turn_123","items":[],"status":"inProgress"}}}),
         json!({"method":"item/started","params":{"threadId":"thr_123","turnId":"turn_123","startedAtMs":1,"item":{"type":"agentMessage","id":"item_123","text":""}}}),
         json!({"method":"item/agentMessage/delta","params":{"threadId":"thr_123","turnId":"turn_123","itemId":"item_123","delta":"Working"}}),
@@ -332,7 +364,11 @@ fn turn_notifications() -> Vec<Value> {
             "threadId":"thr_123","turnId":"turn_123","itemId":"item_123","startedAtMs":2,
             "command":"cargo test","reason":"Run the test suite","cwd":null
         }}),
-    ]
+    ];
+    for notification in &mut notifications[..4] {
+        notification["emittedAtMs"] = json!(2);
+    }
+    notifications
 }
 
 fn append_request(home: &Path, request: &Value) -> std::io::Result<()> {

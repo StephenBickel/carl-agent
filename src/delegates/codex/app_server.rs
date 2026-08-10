@@ -447,6 +447,9 @@ impl CodexAppServer {
 
             match incoming {
                 Incoming::Notification(value) => {
+                    if is_ignorable_notification(&value)? {
+                        continue;
+                    }
                     let event = parse_notification(value)?;
                     self.validate_event_binding(&event)?;
                     if let CodexEvent::TurnCompleted {
@@ -728,7 +731,10 @@ fn validate_initialize_result(result: &Value, home: &ProviderHome) -> Result<(),
         &["userAgent", "codexHome", "platformFamily", "platformOs"],
         &[],
     )?;
-    if object.get("userAgent").and_then(Value::as_str) != Some("codex_cli_rs/0.146.0")
+    if !object
+        .get("userAgent")
+        .and_then(Value::as_str)
+        .is_some_and(valid_user_agent)
         || !object
             .get("codexHome")
             .and_then(Value::as_str)
@@ -745,6 +751,51 @@ fn validate_initialize_result(result: &Value, home: &ProviderHome) -> Result<(),
         return Err(protocol_error());
     }
     Ok(())
+}
+
+fn valid_user_agent(value: &str) -> bool {
+    if value.is_empty() || value.len() > 512 || value.as_bytes().contains(&0) {
+        return false;
+    }
+    value == "codex_cli_rs/0.146.0"
+        || (value.starts_with("Codex Desktop/0.146.0 ")
+            && value.ends_with(&format!("(carl; {})", env!("CARGO_PKG_VERSION"))))
+}
+
+fn is_ignorable_notification(value: &Value) -> Result<bool, DelegateError> {
+    let object = value.as_object().ok_or_else(protocol_error)?;
+    require_keys(object, &["method", "params"], &["emittedAtMs"])?;
+    if object
+        .get("emittedAtMs")
+        .is_some_and(|timestamp| timestamp.as_u64().is_none())
+    {
+        return Err(protocol_error());
+    }
+    if object.get("method").and_then(Value::as_str) != Some("remoteControl/status/changed") {
+        return Ok(false);
+    }
+    let params = object
+        .get("params")
+        .and_then(Value::as_object)
+        .ok_or_else(protocol_error)?;
+    require_keys(
+        params,
+        &["status", "serverName", "installationId", "environmentId"],
+        &[],
+    )?;
+    if !params
+        .get("status")
+        .and_then(Value::as_str)
+        .is_some_and(|status| matches!(status, "disabled" | "connecting" | "connected" | "errored"))
+        || !params.get("serverName").is_some_and(Value::is_string)
+        || !params.get("installationId").is_some_and(Value::is_string)
+        || !params
+            .get("environmentId")
+            .is_some_and(|value| value.is_null() || value.is_string())
+    {
+        return Err(protocol_error());
+    }
+    Ok(true)
 }
 
 fn response_result(response: Value) -> Result<Value, DelegateError> {

@@ -944,6 +944,7 @@ fn codex_auth_jsonl_fixture(home: &Path, scenario: &str) -> i32 {
                         "status": "disabled",
                         "environmentId": null,
                     },
+                    "emittedAtMs": 1,
                 })
             };
             if write_codex_message(&remote_status).is_err() {
@@ -1231,6 +1232,7 @@ fn codex_auth_jsonl_fixture(home: &Path, scenario: &str) -> i32 {
                                 "status": "connected",
                                 "environmentId": "fixture-environment",
                             },
+                            "emittedAtMs": 2,
                         }))
                         .is_err()
                             || write_login_completion(CODEX_LOGIN_ID, true).is_err()

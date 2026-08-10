@@ -948,6 +948,11 @@ fn parse_cancel_status(result: Value) -> Result<String, AuthError> {
 
 fn parse_notification(notification: Value) -> Result<Notification, AuthError> {
     let mut notification = into_object(notification)?;
+    if let Some(emitted_at) = notification.remove("emittedAtMs")
+        && emitted_at.as_u64().is_none()
+    {
+        return Err(protocol_mismatch());
+    }
     if !has_exact_keys(&notification, &["method", "params"]) {
         return Err(protocol_mismatch());
     }

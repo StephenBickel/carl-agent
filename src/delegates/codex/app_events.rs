@@ -441,7 +441,16 @@ fn exact_object<'a>(
     keys: &[&str],
 ) -> Result<&'a serde_json::Map<String, Value>, DelegateError> {
     let object = value.as_object().ok_or_else(protocol_error)?;
-    if object.len() != keys.len() || keys.iter().any(|key| !object.contains_key(*key)) {
+    let has_emitted_at = object.contains_key("emittedAtMs");
+    if object.len() != keys.len() + usize::from(has_emitted_at)
+        || keys.iter().any(|key| !object.contains_key(*key))
+        || object
+            .keys()
+            .any(|key| !keys.contains(&key.as_str()) && key.as_str() != "emittedAtMs")
+        || object
+            .get("emittedAtMs")
+            .is_some_and(|value| value.as_u64().is_none())
+    {
         return Err(protocol_error());
     }
     Ok(object)

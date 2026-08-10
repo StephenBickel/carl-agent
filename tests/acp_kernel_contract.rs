@@ -140,6 +140,33 @@ async fn remote_approval_is_exact_single_use_and_resumes_the_same_turn() -> Test
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn local_acp_approval_surfaces_the_exact_resume_commands() -> TestResult {
+    let layout = Layout::new()?;
+    let kernel =
+        Kernel::start_with_ports(layout.runtime()?, Box::new(ScriptedPort::approval()?), None)
+            .await?;
+    let session = kernel
+        .new_session(new_session(&layout, Frontend::Acp, None)?)
+        .await?;
+    let waiting = kernel
+        .prompt(session.id(), Prompt::new(vec!["run the tests".into()])?)
+        .await?;
+    assert_eq!(waiting.stop_reason, PromptStopReason::WaitingForApproval);
+    let message = waiting
+        .updates
+        .iter()
+        .find_map(|update| match update {
+            carl::acp::KernelUpdate::AgentMessageChunk(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .ok_or("local approval command was not surfaced")?;
+    assert!(message.contains("Approve with /approve "));
+    assert!(message.contains(" or deny with /deny "));
+    kernel.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn remote_bypass_requires_a_later_exact_confirmation() -> TestResult {
     let layout = Layout::new()?;
     let kernel =
