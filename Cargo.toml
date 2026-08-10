@@ -53,6 +53,11 @@ name = "codex_app_server_contract"
 path = "tests/codex_app_server_contract.rs"
 harness = false
 
+[[test]]
+name = "acp_cli_contract"
+path = "tests/acp_cli_contract.rs"
+harness = false
+
 [dependencies]
 # Dependency review: cap-std 3.x supplies the held-directory, relative-path
 # filesystem API used to build disposable delegate stages without handing
@@ -80,6 +85,7 @@ thiserror = "2.0"
 tokio = { version = "1.47", features = [
     "process",
     "io-util",
+    "io-std",
     "sync",
     "time",
     "rt",

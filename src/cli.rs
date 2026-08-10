@@ -5,20 +5,31 @@ use std::future::{Future, pending};
 use std::path::PathBuf;
 use std::pin::Pin;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use chrono::Utc;
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
+use tokio::io::BufReader;
+use tokio_util::sync::CancellationToken;
 
+use crate::acp::{
+    AcpServer, AcpServerConfig, AcpServerErrorCode, BuzzPublisher, BuzzPublisherBootstrap,
+    BuzzPublisherConfig, Kernel, PermissionMode,
+};
 use crate::auth::codex::{CODEX_LOGOUT_WARNING, CodexAuth, CodexAuthTimeouts};
 use crate::auth::grok::{GrokAuth, GrokAuthTimeouts};
 use crate::auth::{
     AuthError, AuthErrorCode, AuthMethod, AuthState, AuthUnavailableCode, LoginChallenge,
     SubscriptionAuthBroker, SubscriptionPlan, SubscriptionService,
 };
+use crate::buzz_mcp;
+use crate::delegates::codex::CodexAppServer;
+use crate::delegates::{ModelId, ReasoningEffort};
+use crate::policy::Frontend;
 use crate::sidecar::{
-    DataRootLock, DataRootLockErrorCode, ExecutableTrustDecision, ProviderEnvironmentProfile,
-    ProviderHome, ResolvedExecutable, SidecarError, SidecarErrorCode, SidecarLimits,
-    TrustedExecutable, authorize_local_foreground, local_foreground_terminal_available,
-    write_local_foreground_stderr,
+    DataRootLock, DataRootLockErrorCode, ExecutableTrustDecision, ExecutionWorkspace,
+    ProviderEnvironmentProfile, ProviderHome, ResolvedExecutable, SidecarError, SidecarErrorCode,
+    SidecarLimits, TrustedExecutable, authorize_local_foreground,
+    local_foreground_terminal_available, write_local_foreground_stderr,
 };
 
 #[derive(Debug, Parser)]
@@ -31,6 +42,7 @@ pub struct Cli {
 #[derive(Debug, Subcommand)]
 pub enum Command {
     Serve,
+    Acp(AcpArgs),
     Auth {
         #[command(subcommand)]
         command: AuthCommand,
@@ -38,6 +50,65 @@ pub enum Command {
     Pair,
     Doctor,
     Sessions,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct AcpArgs {
+    #[arg(long)]
+    pub model: Option<String>,
+    #[arg(long, value_enum)]
+    pub effort: Option<AcpEffort>,
+    #[arg(long, value_enum, conflicts_with = "dangerously_bypass_permissions")]
+    pub permission_mode: Option<AcpPermissionMode>,
+    #[arg(long, conflicts_with = "permission_mode")]
+    pub dangerously_bypass_permissions: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum AcpEffort {
+    Low,
+    Medium,
+    High,
+    Xhigh,
+    Max,
+    Ultra,
+}
+
+impl From<AcpEffort> for ReasoningEffort {
+    fn from(value: AcpEffort) -> Self {
+        match value {
+            AcpEffort::Low => Self::Low,
+            AcpEffort::Medium => Self::Medium,
+            AcpEffort::High => Self::High,
+            AcpEffort::Xhigh => Self::XHigh,
+            AcpEffort::Max => Self::Max,
+            AcpEffort::Ultra => Self::Ultra,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum AcpPermissionMode {
+    Plan,
+    Default,
+    #[value(name = "acceptEdits")]
+    AcceptEdits,
+    #[value(name = "dontAsk")]
+    DontAsk,
+    #[value(name = "bypassPermissions")]
+    BypassPermissions,
+}
+
+impl From<AcpPermissionMode> for PermissionMode {
+    fn from(value: AcpPermissionMode) -> Self {
+        match value {
+            AcpPermissionMode::Plan => Self::Plan,
+            AcpPermissionMode::Default => Self::Default,
+            AcpPermissionMode::AcceptEdits => Self::AcceptEdits,
+            AcpPermissionMode::DontAsk => Self::DontAsk,
+            AcpPermissionMode::BypassPermissions => Self::BypassPermissions,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Subcommand)]
@@ -297,11 +368,141 @@ where
     let mut cancellation = Box::pin(cancellation);
     match command {
         Command::Auth { command } => run_auth(command, cancellation.as_mut()).await,
+        Command::Acp(_) => CliRunResult::not_implemented("acp streaming dispatch"),
         Command::Serve => CliRunResult::not_implemented("serve"),
         Command::Pair => CliRunResult::not_implemented("pair"),
         Command::Doctor => CliRunResult::not_implemented("doctor"),
         Command::Sessions => CliRunResult::not_implemented("sessions"),
     }
+}
+
+/// Run Carl's ACP frontend on process stdio until EOF or Ctrl-C.
+pub async fn run_acp_stdio(args: AcpArgs) -> ExitClassification {
+    if env::var_os("OPENAI_API_KEY").is_some() {
+        return acp_failure("carl acp: API-key authentication is not supported");
+    }
+    let Ok(configuration) = load_common_configuration() else {
+        return acp_failure("carl acp: invalid Carl data directory or workspace");
+    };
+    let Ok(data_root_lock) = acquire_data_root_lock(&configuration) else {
+        return acp_failure("carl acp: Carl data directory is unsafe or already in use");
+    };
+    let Ok((codex_executable, codex_home)) = prepare_provider(AuthService::Openai, &configuration)
+    else {
+        return acp_failure("carl acp: Codex executable or provider home is invalid");
+    };
+    let frontend = if env::var_os("BUZZ_ACP_AGENTS").as_deref() == Some(std::ffi::OsStr::new("1")) {
+        Frontend::Buzz
+    } else {
+        Frontend::Acp
+    };
+    let buzz_publisher = if frontend == Frontend::Buzz {
+        let Ok(executable) = prepare_buzz_executable() else {
+            return acp_failure("carl acp: Buzz executable is unavailable or untrusted");
+        };
+        let Ok(workspace) = ExecutionWorkspace::open(&configuration.workspace) else {
+            return acp_failure("carl acp: workspace is invalid");
+        };
+        Some(BuzzPublisherBootstrap::new(executable, workspace))
+    } else {
+        None
+    };
+    let Ok(runtime_store) = crate::storage::RuntimeStore::open(data_root_lock, Utc::now()) else {
+        return acp_failure("carl acp: durable state failed to open");
+    };
+    let Ok(codex) =
+        CodexAppServer::connect(&codex_executable, codex_home, SidecarLimits::default()).await
+    else {
+        return acp_failure("carl acp: Codex app-server startup failed");
+    };
+    let Ok(kernel) = Kernel::start(runtime_store, codex, None).await else {
+        return acp_failure("carl acp: Codex model discovery failed");
+    };
+    let model = match args.model {
+        Some(model) => match ModelId::parse(model) {
+            Ok(model) => Some(model),
+            Err(_) => return shutdown_failure(kernel, "carl acp: model ID is invalid").await,
+        },
+        None => None,
+    };
+    let permission_mode = if args.dangerously_bypass_permissions {
+        PermissionMode::BypassPermissions
+    } else {
+        args.permission_mode
+            .map(Into::into)
+            .unwrap_or(PermissionMode::Default)
+    };
+    let server = AcpServer::configured(
+        kernel.clone(),
+        AcpServerConfig {
+            frontend,
+            model,
+            effort: args.effort.map(Into::into),
+            permission_mode,
+            buzz_publisher,
+        },
+    );
+    let cancellation = CancellationToken::new();
+    let signal = cancellation.clone();
+    tokio::spawn(async move {
+        registered_ctrl_c().await;
+        signal.cancel();
+    });
+    let input = BufReader::new(tokio::io::stdin());
+    match server
+        .serve_with_cancellation(input, tokio::io::stdout(), cancellation)
+        .await
+    {
+        Ok(()) => ExitClassification::Success,
+        Err(error) if error.code() == AcpServerErrorCode::Cancelled => {
+            ExitClassification::Cancelled
+        }
+        Err(_) => acp_failure("carl acp: ACP transport failed"),
+    }
+}
+
+async fn shutdown_failure(
+    kernel: crate::acp::KernelHandle,
+    message: &'static str,
+) -> ExitClassification {
+    let _ = kernel.shutdown().await;
+    acp_failure(message)
+}
+
+fn acp_failure(message: &'static str) -> ExitClassification {
+    eprintln!("{message}");
+    ExitClassification::Failure
+}
+
+/// Run the restricted Buzz publisher MCP surface selected by the executable name.
+pub async fn run_buzz_mcp_stdio() -> ExitClassification {
+    let Ok(configuration) = load_common_configuration() else {
+        return mcp_failure("carl-buzz-mcp: invalid Carl data directory");
+    };
+    let Ok(executable) = prepare_buzz_executable() else {
+        return mcp_failure("carl-buzz-mcp: Buzz executable is unavailable or untrusted");
+    };
+    let Ok(workspace) = ExecutionWorkspace::open(&configuration.workspace) else {
+        return mcp_failure("carl-buzz-mcp: workspace is invalid");
+    };
+    let Ok(publisher_config) = BuzzPublisherConfig::from_process_environment() else {
+        return mcp_failure("carl-buzz-mcp: Buzz environment is invalid");
+    };
+    let Ok(publisher) = BuzzPublisher::connect(executable, workspace, publisher_config).await
+    else {
+        return mcp_failure("carl-buzz-mcp: Buzz publisher startup failed");
+    };
+    let mut input = BufReader::new(tokio::io::stdin());
+    let mut output = tokio::io::stdout();
+    match buzz_mcp::run_stdio(&mut input, &mut output, &publisher).await {
+        Ok(()) => ExitClassification::Success,
+        Err(_) => mcp_failure("carl-buzz-mcp: MCP transport failed"),
+    }
+}
+
+fn mcp_failure(message: &'static str) -> ExitClassification {
+    eprintln!("{message}");
+    ExitClassification::Failure
 }
 
 async fn run_auth<C>(command: AuthCommand, cancellation: Pin<&mut C>) -> CliRunResult
@@ -724,6 +925,28 @@ fn configured_executable(service: AuthService) -> Result<(PathBuf, bool), AuthEr
             false,
         )),
     }
+}
+
+fn prepare_buzz_executable() -> Result<TrustedExecutable, AuthError> {
+    let (candidate, explicit_override) = match env::var_os("CARL_BUZZ_EXECUTABLE") {
+        Some(value) => {
+            let path = PathBuf::from(value);
+            if !path.is_absolute() {
+                return Err(AuthError::from_code(AuthErrorCode::ProviderRejected));
+            }
+            (path, true)
+        }
+        None => (PathBuf::from("buzz"), false),
+    };
+    let resolved = ResolvedExecutable::resolve(&candidate).map_err(map_sidecar_error)?;
+    let decision = if resolved.metadata_risk().is_none() {
+        ExecutableTrustDecision::TrustCanonicalPath
+    } else if explicit_override && candidate == resolved.canonical_path() {
+        ExecutableTrustDecision::TrustCanonicalPathWithMetadataRisk
+    } else {
+        ExecutableTrustDecision::TrustCanonicalPath
+    };
+    resolved.trust(decision).map_err(map_sidecar_error)
 }
 
 fn load_common_configuration() -> Result<CommonConfiguration, AuthError> {

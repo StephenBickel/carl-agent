@@ -10,14 +10,15 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::{
-    BuzzContext, BuzzPublisherConfig, ConfigOutcome, ConfigSelection, IncomingFrame, JsonRpcId,
-    KernelError, KernelHandle, KernelUpdate, OutgoingFrame, PermissionMode, Prompt,
+    BuzzContext, BuzzPublisher, BuzzPublisherConfig, ConfigOutcome, ConfigSelection, IncomingFrame,
+    JsonRpcId, KernelError, KernelHandle, KernelUpdate, OutgoingFrame, PermissionMode, Prompt,
     PromptStopReason, SessionConfiguration, ToolKind, ToolStatus, config_options, read_frame,
     write_frame,
 };
 use crate::delegates::{ModelId, ReasoningEffort};
 use crate::events::SessionId;
 use crate::policy::{ActorId, Frontend};
+use crate::sidecar::{ExecutionWorkspace, TrustedExecutable};
 use crate::storage::{ClientName, ExternalSessionId};
 
 const MAX_FRAME_BYTES: usize = 1_048_576;
@@ -33,6 +34,8 @@ pub enum AcpServerErrorCode {
     KernelFailed,
     #[error("ACP server output queue is unavailable")]
     OutputUnavailable,
+    #[error("ACP server was cancelled")]
+    Cancelled,
 }
 
 #[derive(Debug, Error)]
@@ -60,16 +63,60 @@ struct SessionBinding {
 
 pub struct AcpServer {
     kernel: KernelHandle,
-    frontend: Frontend,
+    config: AcpServerConfig,
+    buzz_bootstrap: Option<BuzzPublisherBootstrap>,
     initialized: Option<InitializedClient>,
     sessions: HashMap<String, SessionBinding>,
+}
+
+pub struct BuzzPublisherBootstrap {
+    executable: TrustedExecutable,
+    workspace: ExecutionWorkspace,
+}
+
+impl BuzzPublisherBootstrap {
+    #[must_use]
+    pub const fn new(executable: TrustedExecutable, workspace: ExecutionWorkspace) -> Self {
+        Self {
+            executable,
+            workspace,
+        }
+    }
+}
+
+impl fmt::Debug for BuzzPublisherBootstrap {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("BuzzPublisherBootstrap(<redacted>)")
+    }
+}
+
+#[derive(Debug)]
+pub struct AcpServerConfig {
+    pub frontend: Frontend,
+    pub model: Option<ModelId>,
+    pub effort: Option<ReasoningEffort>,
+    pub permission_mode: PermissionMode,
+    pub buzz_publisher: Option<BuzzPublisherBootstrap>,
+}
+
+impl AcpServerConfig {
+    #[must_use]
+    pub const fn new(frontend: Frontend) -> Self {
+        Self {
+            frontend,
+            model: None,
+            effort: None,
+            permission_mode: PermissionMode::Default,
+            buzz_publisher: None,
+        }
+    }
 }
 
 impl fmt::Debug for AcpServer {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("AcpServer")
-            .field("frontend", &self.frontend)
+            .field("frontend", &self.config.frontend)
             .field("initialized", &self.initialized.is_some())
             .field("sessions", &self.sessions.len())
             .finish()
@@ -85,29 +132,54 @@ struct InitializedClient {
 impl AcpServer {
     #[must_use]
     pub fn new(kernel: KernelHandle, frontend: Frontend) -> Self {
+        Self::configured(kernel, AcpServerConfig::new(frontend))
+    }
+
+    #[must_use]
+    pub fn configured(kernel: KernelHandle, mut config: AcpServerConfig) -> Self {
+        let buzz_bootstrap = config.buzz_publisher.take();
         Self {
             kernel,
-            frontend,
+            config,
+            buzz_bootstrap,
             initialized: None,
             sessions: HashMap::new(),
         }
     }
 
-    pub async fn serve<R, W>(mut self, mut reader: R, writer: W) -> Result<(), AcpServerError>
+    pub async fn serve<R, W>(self, reader: R, writer: W) -> Result<(), AcpServerError>
+    where
+        R: AsyncBufRead + Unpin + Send + 'static,
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
+        self.serve_with_cancellation(reader, writer, CancellationToken::new())
+            .await
+    }
+
+    pub async fn serve_with_cancellation<R, W>(
+        mut self,
+        mut reader: R,
+        writer: W,
+        cancellation: CancellationToken,
+    ) -> Result<(), AcpServerError>
     where
         R: AsyncBufRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
     {
         let (outbound, receiver) = mpsc::channel(WRITER_CAPACITY);
-        let cancelled = CancellationToken::new();
-        let writer_cancel = cancelled.clone();
+        let output_failed = CancellationToken::new();
+        let writer_cancel = output_failed.clone();
         let writer_task =
             tokio::spawn(async move { writer_loop(writer, receiver, writer_cancel).await });
         let mut read_result = Ok(());
         loop {
             let frame = tokio::select! {
-                () = cancelled.cancelled() => {
+                () = output_failed.cancelled() => {
                     read_result = Err(server_error(AcpServerErrorCode::OutputUnavailable));
+                    break;
+                }
+                () = cancellation.cancelled() => {
+                    read_result = Err(server_error(AcpServerErrorCode::Cancelled));
                     break;
                 }
                 frame = read_frame(&mut reader, MAX_FRAME_BYTES) => frame,
@@ -120,7 +192,7 @@ impl AcpServer {
                     break;
                 }
             };
-            if let Err(error) = self.dispatch(frame, &outbound, &cancelled).await {
+            if let Err(error) = self.dispatch(frame, &outbound, &output_failed).await {
                 read_result = Err(error);
                 break;
             }
@@ -259,12 +331,25 @@ impl AcpServer {
             .as_array()
             .map(Vec::len)
             .ok_or_else(invalid_input)?;
-        match self.frontend {
-            Frontend::Buzz => {
-                BuzzPublisherConfig::from_mcp_servers(mcp_servers).map_err(|_| invalid_input())?;
-            }
-            Frontend::Acp if mcp_count == 0 => {}
+        let publisher_config = match self.config.frontend {
+            Frontend::Buzz => Some(
+                BuzzPublisherConfig::from_mcp_servers(mcp_servers).map_err(|_| invalid_input())?,
+            ),
+            Frontend::Acp if mcp_count == 0 => None,
             _ => return Err(invalid_input()),
+        };
+        if let Some(bootstrap) = self.buzz_bootstrap.take() {
+            let publisher = BuzzPublisher::connect(
+                bootstrap.executable,
+                bootstrap.workspace,
+                publisher_config.ok_or_else(invalid_input)?,
+            )
+            .await
+            .map_err(|_| invalid_input())?;
+            self.kernel
+                .install_publisher(Box::new(publisher))
+                .await
+                .map_err(map_kernel)?;
         }
         let external =
             ExternalSessionId::try_from(Uuid::new_v4().to_string()).map_err(|_| invalid_input())?;
@@ -272,11 +357,11 @@ impl AcpServer {
             .kernel
             .new_session(super::NewSessionRequest {
                 external_session_id: external.clone(),
-                frontend: self.frontend,
+                frontend: self.config.frontend,
                 client_name: client.name,
                 protocol_version: client.protocol_version,
                 cwd,
-                actor_id: ActorId::parse(if self.frontend == Frontend::Buzz {
+                actor_id: ActorId::parse(if self.config.frontend == Frontend::Buzz {
                     "buzz-pending"
                 } else {
                     "local-owner"
@@ -284,9 +369,9 @@ impl AcpServer {
                 .map_err(|_| invalid_input())?,
                 channel_id: None,
                 buzz_context: None,
-                model: None,
-                effort: None,
-                mode: PermissionMode::Default,
+                model: self.config.model.clone(),
+                effort: self.config.effort,
+                mode: self.config.permission_mode,
             })
             .await
             .map_err(map_kernel)?;
@@ -320,7 +405,7 @@ impl AcpServer {
             "thought_level" => ConfigSelection::Effort(parse_effort(&value)?),
             "mode" => ConfigSelection::Mode {
                 mode: value.parse().map_err(|_| invalid_input())?,
-                remote: self.frontend == Frontend::Buzz,
+                remote: self.config.frontend == Frontend::Buzz,
             },
             _ => return Err(invalid_input()),
         };
@@ -372,7 +457,7 @@ impl AcpServer {
             .local_id;
         let blocks = parse_prompt_blocks(params.get("prompt"))?;
         let mut prompt = Prompt::new(blocks.clone()).map_err(map_kernel)?;
-        if self.frontend == Frontend::Buzz {
+        if self.config.frontend == Frontend::Buzz {
             let refs = blocks.iter().map(String::as_str).collect::<Vec<_>>();
             let context = BuzzContext::parse(&refs).map_err(|_| invalid_input())?;
             self.kernel

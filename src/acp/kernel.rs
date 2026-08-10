@@ -209,6 +209,10 @@ pub enum KernelCommand {
         context: BuzzContext,
         reply: oneshot::Sender<Result<(), KernelError>>,
     },
+    InstallPublisher {
+        publisher: Box<dyn KernelPublisher>,
+        reply: oneshot::Sender<Result<(), KernelError>>,
+    },
     Cancel {
         session_id: SessionId,
         reply: oneshot::Sender<Result<(), KernelError>>,
@@ -293,6 +297,16 @@ impl KernelHandle {
             reply,
         })
         .await?;
+        result.await.map_err(|_| stopped_error())?
+    }
+
+    pub async fn install_publisher(
+        &self,
+        publisher: Box<dyn KernelPublisher>,
+    ) -> Result<(), KernelError> {
+        let (reply, result) = oneshot::channel();
+        self.send(KernelCommand::InstallPublisher { publisher, reply })
+            .await?;
         result.await.map_err(|_| stopped_error())?
     }
 
@@ -441,6 +455,16 @@ impl KernelActor {
                     reply,
                 } => {
                     let result = self.attach_buzz_context(session_id, context);
+                    let _ = reply.send(result);
+                    false
+                }
+                KernelCommand::InstallPublisher { publisher, reply } => {
+                    let result = if self.publisher.is_none() && self.sessions.is_empty() {
+                        self.publisher = Some(publisher);
+                        Ok(())
+                    } else {
+                        Err(KernelError::from_code(KernelErrorCode::InvalidInput))
+                    };
                     let _ = reply.send(result);
                     false
                 }
@@ -1521,6 +1545,9 @@ fn reject_busy_command(command: KernelCommand) {
             let _ = reply.send(Err(session_busy()));
         }
         KernelCommand::AttachBuzzContext { reply, .. } => {
+            let _ = reply.send(Err(session_busy()));
+        }
+        KernelCommand::InstallPublisher { reply, .. } => {
             let _ = reply.send(Err(session_busy()));
         }
         KernelCommand::Cancel { reply, .. } | KernelCommand::Steer { reply, .. } => {

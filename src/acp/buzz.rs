@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashSet};
+use std::env;
 use std::ffi::OsString;
 use std::fmt;
 use std::path::Path;
@@ -169,6 +170,22 @@ impl fmt::Debug for BuzzPublisherConfig {
 }
 
 impl BuzzPublisherConfig {
+    pub fn from_process_environment() -> Result<Self, BuzzError> {
+        let mut values = BTreeMap::new();
+        for name in [
+            "BUZZ_RELAY_URL",
+            "BUZZ_PRIVATE_KEY",
+            "BUZZ_AUTH_TAG",
+            "BUZZ_ACP_DISPLAY_NAME",
+        ] {
+            if let Some(value) = env::var_os(name) {
+                let value = value.into_string().map_err(|_| invalid_configuration())?;
+                values.insert(name, value);
+            }
+        }
+        Self::from_values(values)
+    }
+
     pub fn from_mcp_servers(servers: &Value) -> Result<Self, BuzzError> {
         let servers = servers.as_array().ok_or_else(invalid_configuration)?;
         if servers.len() != 1 {
@@ -234,14 +251,24 @@ impl BuzzPublisherConfig {
             {
                 return Err(invalid_configuration());
             }
-            values.insert(name, value);
+            values.insert(name, value.to_owned());
         }
-        for required in ["BUZZ_RELAY_URL", "BUZZ_PRIVATE_KEY"] {
-            if !values.contains_key(required) {
-                return Err(invalid_configuration());
-            }
+        Self::from_values(values)
+    }
+
+    fn from_values(values: BTreeMap<&str, String>) -> Result<Self, BuzzError> {
+        if !(2..=4).contains(&values.len())
+            || values.values().any(|value| {
+                value.is_empty() || value.len() > 8 * 1024 || value.as_bytes().contains(&0)
+            })
+            || ["BUZZ_RELAY_URL", "BUZZ_PRIVATE_KEY"]
+                .iter()
+                .any(|required| !values.contains_key(required))
+        {
+            return Err(invalid_configuration());
         }
-        let relay = Url::parse(values["BUZZ_RELAY_URL"]).map_err(|_| invalid_configuration())?;
+        let relay =
+            Url::parse(values["BUZZ_RELAY_URL"].as_str()).map_err(|_| invalid_configuration())?;
         if !matches!(relay.scheme(), "ws" | "wss")
             || relay.host_str().is_none()
             || !relay.username().is_empty()
@@ -249,11 +276,12 @@ impl BuzzPublisherConfig {
         {
             return Err(invalid_configuration());
         }
-        let environment = values
-            .into_iter()
-            .map(|(name, value)| (OsString::from(name), OsString::from(value)))
-            .collect();
-        Ok(Self { environment })
+        Ok(Self {
+            environment: values
+                .into_iter()
+                .map(|(name, value)| (OsString::from(name), OsString::from(value)))
+                .collect(),
+        })
     }
 }
 
