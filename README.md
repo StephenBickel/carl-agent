@@ -16,14 +16,19 @@ model and reasoning choices, plan/default/edit/don't-ask/bypass permission modes
 exact single-use approvals, steering, cancellation, diffs, and final publication.
 The ACP path is CLI-reachable and covered by process-level offline tests.
 
+Carl also includes curated local profile, preference, fact, goal, and expiring
+episode memory with scoped isolation, bounded lexical retrieval, proposal approval,
+versioned export, hard deletion, and no external service dependency. Memory is
+managed through the implemented `carl memory` command tree.
+
 This remains pre-alpha. TUI interaction, the Telegram gateway, Grok execution,
 native HTTP/OpenAI adapters, Carl's native tool loop, stale-safe live-workspace
 promotion, and broader consumer packaging are incomplete. The four placeholder
 commands `serve`, `pair`, `doctor`, and `sessions` return not-implemented errors;
 Clap's built-in `help` command displays help.
 
-Only the four placeholder commands remain unavailable as inert CLI shells; `auth`
-and `acp` have implemented behavior.
+Only the four placeholder commands remain unavailable as inert CLI shells; `auth`,
+`memory`, and `acp` have implemented behavior.
 
 ## Try Carl locally
 
@@ -60,6 +65,30 @@ export BUZZ_ACP_PERMISSION_MODE=default
 
 The exact setup, tested Buzz revision, approval commands, restart behavior, and
 credential boundary are in [docs/buzz.md](docs/buzz.md).
+
+## Local memory
+
+Memory is enabled by default, stored only in Carl's SQLite database, and usable without
+an embedding model, network call, account, or paid service. Capture is explicit rather
+than ambient: the CLI records direct owner requests, while the library stores agent
+suggestions only as short-lived proposals that cannot be retrieved before approval.
+
+```sh
+carl memory status
+carl memory remember --kind preference --key response-style --content=concise-verified-answers
+carl memory search verification
+carl memory proposals
+carl memory approve 00000000-0000-4000-8000-000000000000
+carl memory export
+carl memory settings --disable
+```
+
+Retrieval is locally ranked, scope-isolated, byte/item bounded, and explains why each
+record was selected. `forget` and confirmed `clear` hard-delete live memory content;
+exports, backups, snapshots, and already-issued provider requests remain separate
+copies. The model turn loop is not implemented, so live model prompts do not yet
+consume this memory. See the [memory guide](docs/memory.md) and
+[memory ADR](docs/adr/0005-local-curated-memory.md).
 
 ## Subscription authentication
 
@@ -110,12 +139,13 @@ Buzz / ACP client
 ```
 
 Implemented foundations include provider-neutral events, SQLite WAL persistence,
-versioned migrations, bounded sidecars, actor/session/turn/request-bound approvals
-that are atomically single-use, and external-agent requests default to exact owner
-approval. The closed evaluator denies writable live-workspace access. Capability-relative,
-secret-filtered staging, content-addressed artifacts, and independent bounded
-verification also exist as library boundaries. Stale-safe promotion and run-engine
-orchestration remain unavailable outside the ACP execution path.
+versioned migrations, curated local memory, bounded sidecars, and
+actor/session/turn/request-bound approvals that are atomically single-use.
+External-agent requests default to exact owner approval, and the closed evaluator
+denies writable live-workspace access. Capability-relative secret-filtered staging,
+content-addressed artifacts, and independent bounded verification also exist as
+library boundaries. Stale-safe promotion and run-engine orchestration remain
+unavailable outside the ACP execution path. See the [memory ADR](docs/adr/0005-local-curated-memory.md).
 
 The ACP runtime isolates Buzz credentials from Codex and rejects unknown
 credential-bearing MCP descriptors. Model output, repository content, remote input,
@@ -154,6 +184,7 @@ Start with [CONTRIBUTING.md](CONTRIBUTING.md). Security reports follow
 - [x] Subscription-backed Codex ACP execution
 - [x] Buzz-compatible ACP frontend and restricted publication adapter
 - [x] Exact remote approvals, model/effort modes, steering, and cancellation
+- [x] Local curated-memory storage, retrieval, settings, and CLI controls
 - [ ] Interactive local TUI
 - [ ] Owner-only Telegram gateway
 - [ ] Grok execution adapter

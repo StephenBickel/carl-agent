@@ -18,6 +18,14 @@ All notable changes to Carl will be recorded here. The project is pre-alpha and 
 - A documentation contract covering required public files, local README links, CLI command names, and critical status/security statements.
 - A provider-neutral event, identifier, error, and budget foundation.
 - SQLite WAL persistence with append-only events and checksum-verified migrations.
+- A local curated-memory system with owner/agent and global/workspace/session
+  isolation; profile, preference, fact, goal, and expiring episode kinds; bounded
+  explainable BM25-style retrieval; conflict replacement; approval-gated proposals;
+  secret and prompt-injection rejection; configurable limits; versioned JSON export;
+  secure hard deletion; legacy migration; and a complete `carl memory` CLI. The
+  default requires no network, embedding model, account, or paid dependency.
+- Persistent memory-proposal review, approval, and rejection commands keep agent
+  suggestions transparent and controllable across restarts.
 - A provider interface and deterministic scripted provider for offline tests.
 - Isolated provider sidecar supervision with fixed Codex and Grok homes, pinned
   executable compatibility, and cross-process data-root exclusivity.

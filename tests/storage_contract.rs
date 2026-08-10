@@ -2,7 +2,7 @@ use carl::delegates::{DelegateSettings, DelegateSettingsLayers};
 use carl::error::CarlError;
 use carl::events::{ApprovalId, Event, EventId, SessionId, ToolCallId};
 use carl::runtime::subscription::{RunConfigSnapshot, RunId};
-use carl::storage::{ApprovalStatus, MemoryState, NewSubscriptionRun, Store};
+use carl::storage::{ApprovalStatus, NewSubscriptionRun, Store};
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, ErrorCode as SqliteErrorCode, params};
 use std::collections::BTreeSet;
@@ -59,6 +59,8 @@ fn fresh_database_is_migrated_and_configured_for_durable_use() -> Result<(), Box
         "frontend_deliveries".to_owned(),
         "frontend_sessions".to_owned(),
         "memories".to_owned(),
+        "memory_proposals".to_owned(),
+        "memory_settings".to_owned(),
         "messages".to_owned(),
         "migrations".to_owned(),
         "processed_telegram_updates".to_owned(),
@@ -86,12 +88,12 @@ fn fresh_database_is_migrated_and_configured_for_durable_use() -> Result<(), Box
     let migrations = connection.query_row("SELECT COUNT(*) FROM migrations", [], |row| {
         row.get::<_, u64>(0)
     })?;
-    assert_eq!(migrations, 6);
+    assert_eq!(migrations, 7);
     let checksums = connection
         .prepare("SELECT checksum FROM migrations ORDER BY version")?
         .query_map([], |row| row.get::<_, String>(0))?
         .collect::<Result<Vec<_>, _>>()?;
-    assert_eq!(checksums.len(), 6);
+    assert_eq!(checksums.len(), 7);
     assert_eq!(
         &checksums[..3],
         [
@@ -110,6 +112,10 @@ fn fresh_database_is_migrated_and_configured_for_durable_use() -> Result<(), Box
     );
     assert_eq!(
         checksums[5],
+        "8df8be30bb866a214021a89107ac6248c9ba9970789f04918c8b56f5a593b092"
+    );
+    assert_eq!(
+        checksums[6],
         "67f18d5ed69b66f7fc0d40a578c59c0f61ea923ec172df919960ad4fe1f90158"
     );
     assert!(checksums.iter().all(|checksum| {
@@ -127,7 +133,7 @@ fn fresh_database_is_migrated_and_configured_for_durable_use() -> Result<(), Box
     let migrations = connection.query_row("SELECT COUNT(*) FROM migrations", [], |row| {
         row.get::<_, u64>(0)
     })?;
-    assert_eq!(migrations, 6);
+    assert_eq!(migrations, 7);
 
     Ok(())
 }
@@ -175,7 +181,7 @@ fn store_open_rejects_a_future_database_migration() -> Result<(), Box<dyn Error>
     ensure_checksum_column(&connection)?;
     connection.execute(
         "INSERT INTO migrations (version, name, applied_at, checksum)
-         VALUES (7, 'future migration', '2026-07-13T12:00:00Z', ?1)",
+         VALUES (8, 'future migration', '2026-07-13T12:00:00Z', ?1)",
         ["ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"],
     )?;
     drop(connection);
@@ -184,7 +190,7 @@ fn store_open_rejects_a_future_database_migration() -> Result<(), Box<dyn Error>
     assert!(matches!(
         error,
         CarlError::Storage { ref detail }
-            if detail.contains("unsupported database migration version 7")
+            if detail.contains("unsupported database migration version 8")
     ));
     Ok(())
 }
@@ -281,13 +287,13 @@ fn pre_subscription_run_database_upgrades_without_rewriting_old_migrations()
         connection.query_row("SELECT COUNT(*) FROM migrations", [], |row| {
             row.get::<_, u64>(0)
         })?,
-        6
+        7
     );
     let checksums = connection
         .prepare("SELECT checksum FROM migrations ORDER BY version")?
         .query_map([], |row| row.get::<_, String>(0))?
         .collect::<Result<Vec<_>, _>>()?;
-    assert_eq!(checksums.len(), 6);
+    assert_eq!(checksums.len(), 7);
     assert_eq!(
         &checksums[..3],
         [
@@ -334,7 +340,7 @@ fn pre_subscription_run_database_upgrades_without_rewriting_old_migrations()
 }
 
 #[test]
-fn pre_proposal_artifact_database_upgrades_through_migration_five_and_reopens()
+fn pre_proposal_artifact_database_upgrades_through_migration_seven_and_reopens()
 -> Result<(), Box<dyn Error>> {
     let database = TemporaryDatabase::new();
     let connection = Connection::open(database.path())?;
@@ -361,7 +367,7 @@ fn pre_proposal_artifact_database_upgrades_through_migration_five_and_reopens()
         connection.query_row("SELECT COUNT(*) FROM migrations", [], |row| {
             row.get::<_, u64>(0)
         })?,
-        6
+        7
     );
     let tables = connection
         .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")?
@@ -380,7 +386,7 @@ fn pre_proposal_artifact_database_upgrades_through_migration_five_and_reopens()
     ]);
     assert!(
         artifact_tables.is_subset(&tables),
-        "missing migration-4/5 tables: {artifact_tables:?} vs {tables:?}"
+        "missing migration-4/5/6/7 tables: {artifact_tables:?} vs {tables:?}"
     );
     drop(connection);
 
@@ -390,14 +396,15 @@ fn pre_proposal_artifact_database_upgrades_through_migration_five_and_reopens()
         connection.query_row("SELECT COUNT(*) FROM migrations", [], |row| {
             row.get::<_, u64>(0)
         })?,
-        6
+        7
     );
 
     Ok(())
 }
 
 #[test]
-fn pre_verification_database_applies_migration_five_and_reopens() -> Result<(), Box<dyn Error>> {
+fn pre_verification_database_applies_migrations_five_through_seven_and_reopens()
+-> Result<(), Box<dyn Error>> {
     let database = TemporaryDatabase::new();
     let connection = Connection::open(database.path())?;
     connection.execute_batch(include_str!("../migrations/0001_init.sql"))?;
@@ -426,7 +433,7 @@ fn pre_verification_database_applies_migration_five_and_reopens() -> Result<(), 
         connection.query_row("SELECT COUNT(*) FROM migrations", [], |row| {
             row.get::<_, u64>(0)
         })?,
-        6
+        7
     );
     assert_eq!(
         connection.query_row(
@@ -713,30 +720,6 @@ fn approvals_persist_pending_and_resolved_state() -> Result<(), Box<dyn Error>> 
 
     let store = Store::open(database.path())?;
     assert_eq!(store.get_approval(approval_id)?, Some(allowed));
-
-    Ok(())
-}
-
-#[test]
-fn explicit_memories_are_retained_when_forgotten() -> Result<(), Box<dyn Error>> {
-    let database = TemporaryDatabase::new();
-    let store = Store::open(database.path())?;
-
-    let active = store.remember_explicit("The owner prefers terse output", "user request")?;
-    assert_eq!(active.state, MemoryState::Active);
-    drop(store);
-
-    let store = Store::open(database.path())?;
-    assert_eq!(store.list_active_memories()?, vec![active.clone()]);
-
-    let forgotten = store.forget_memory(active.id)?;
-    assert_eq!(forgotten.state, MemoryState::Forgotten);
-    assert!(forgotten.forgotten_at.is_some());
-    drop(store);
-
-    let store = Store::open(database.path())?;
-    assert!(store.list_active_memories()?.is_empty());
-    assert_eq!(store.get_memory(active.id)?, Some(forgotten));
 
     Ok(())
 }

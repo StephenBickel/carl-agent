@@ -2,7 +2,8 @@
 
 Carl currently accepts exactly four non-secret Carl process variables plus explicit
 `carl acp` flags. It has no general profile loader, endpoint override, arbitrary
-provider-home setting, or credential-reference schema.
+provider-home setting, or credential-reference schema. Memory settings are a narrow,
+typed local SQLite projection managed through `carl memory settings`.
 
 ## Carl process variables
 
@@ -66,6 +67,24 @@ When `BUZZ_ACP_AGENTS=1` selects the Buzz frontend, Carl accepts only the typed
 `BUZZ_ACP_DISPLAY_NAME`. These values are credentials or transport metadata, not
 general Carl configuration, and are isolated to the restricted publisher. See
 [buzz.md](buzz.md).
+
+## Implemented memory settings
+
+Memory is enabled by default. `carl memory settings` reads or atomically updates the
+local owner/Carl partition:
+
+| Setting | Default | Range |
+| --- | ---: | ---: |
+| `enabled` | `true` | boolean |
+| `max_context_items` | `8` | 1–32 |
+| `context_bytes` | `8192` | 256–65536 |
+| `max_memories` | `500` | 1–5000 |
+| `max_storage_bytes` | `1048576` | 64–67108864 |
+| `episode_ttl_days` | `90` | 1–3650 |
+
+These settings contain no credentials and cause no network access. Disabling blocks
+capture and retrieval while leaving export and deletion available. See the
+[memory guide](memory.md).
 
 ## Data-root process lock
 

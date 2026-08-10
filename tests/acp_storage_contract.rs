@@ -49,7 +49,7 @@ fn migration_six_binds_and_recovers_frontend_sessions() -> Result<(), Box<dyn Er
     assert_eq!(
         connection.query_row("SELECT COUNT(*) FROM migrations", [], |row| row
             .get::<_, u64>(0))?,
-        6
+        7
     );
     for table in ["frontend_sessions", "remote_codes", "frontend_deliveries"] {
         assert_eq!(
@@ -66,7 +66,7 @@ fn migration_six_binds_and_recovers_frontend_sessions() -> Result<(), Box<dyn Er
 }
 
 #[test]
-fn migration_five_database_upgrades_to_six_and_reopens() -> Result<(), Box<dyn Error>> {
+fn migration_six_database_upgrades_to_seven_and_reopens() -> Result<(), Box<dyn Error>> {
     let layout = TestLayout::new()?;
     drop(Store::open(&layout.database)?);
     let connection = Connection::open(&layout.database)?;
@@ -74,7 +74,7 @@ fn migration_five_database_upgrades_to_six_and_reopens() -> Result<(), Box<dyn E
         "DROP TABLE frontend_deliveries;
          DROP TABLE remote_codes;
          DROP TABLE frontend_sessions;
-         DELETE FROM migrations WHERE version = 6;",
+         DELETE FROM migrations WHERE version = 7;",
     )?;
     drop(connection);
 

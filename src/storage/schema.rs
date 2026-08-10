@@ -3,6 +3,10 @@ use rusqlite::{Connection, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 
 use crate::error::CarlError;
+use crate::memory::{
+    MAX_MEMORY_CONTENT_BYTES, MAX_MEMORY_PROVENANCE_BYTES, validate_memory_capture_text,
+};
+use crate::security::SecretFilter;
 
 struct Migration {
     version: i64,
@@ -38,8 +42,13 @@ const MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 6,
+        name: "memory system",
+        sql: include_str!("../../migrations/0006_memory_system.sql"),
+    },
+    Migration {
+        version: 7,
         name: "ACP frontends",
-        sql: include_str!("../../migrations/0006_acp_frontends.sql"),
+        sql: include_str!("../../migrations/0007_acp_frontends.sql"),
     },
 ];
 
@@ -122,6 +131,9 @@ pub(crate) fn migrate(connection: &mut Connection) -> Result<(), CarlError> {
         transaction
             .execute_batch(migration.sql)
             .map_err(storage_error)?;
+        if migration.version == 6 {
+            scrub_unsafe_migrated_memories(&transaction)?;
+        }
         transaction
             .execute(
                 "INSERT INTO migrations (version, name, applied_at, checksum)
@@ -137,6 +149,66 @@ pub(crate) fn migrate(connection: &mut Connection) -> Result<(), CarlError> {
     }
 
     transaction.commit().map_err(storage_error)
+}
+
+fn scrub_unsafe_migrated_memories(
+    transaction: &rusqlite::Transaction<'_>,
+) -> Result<(), CarlError> {
+    transaction
+        .execute(
+            "DELETE FROM memories
+             WHERE length(CAST(content AS BLOB)) > ?1
+                OR length(CAST(provenance AS BLOB)) > ?2
+                OR length(trim(content)) = 0
+                OR length(trim(provenance)) = 0",
+            params![MAX_MEMORY_CONTENT_BYTES, MAX_MEMORY_PROVENANCE_BYTES],
+        )
+        .map_err(storage_error)?;
+
+    let unsafe_ids = {
+        let mut statement = transaction
+            .prepare("SELECT id, content, provenance FROM memories")
+            .map_err(storage_error)?;
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(storage_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(storage_error)?
+            .into_iter()
+            .filter_map(|(id, content, provenance)| {
+                (!migration_memory_is_safe(&content, &provenance)).then_some(id)
+            })
+            .collect::<Vec<_>>()
+    };
+    for id in unsafe_ids {
+        transaction
+            .execute("DELETE FROM memories WHERE id = ?1", [id])
+            .map_err(storage_error)?;
+    }
+    Ok(())
+}
+
+fn migration_memory_is_safe(content: &str, provenance: &str) -> bool {
+    let valid_controls = |value: &str| {
+        !value.contains('\0')
+            && !value
+                .chars()
+                .any(|character| character.is_control() && !matches!(character, '\n' | '\r' | '\t'))
+    };
+    !content.trim().is_empty()
+        && !provenance.trim().is_empty()
+        && valid_controls(content)
+        && valid_controls(provenance)
+        && SecretFilter.inspect(content.as_bytes()).is_ok()
+        && SecretFilter.inspect(provenance.as_bytes()).is_ok()
+        && validate_memory_capture_text(content).is_ok()
+        && validate_memory_capture_text(provenance).is_ok()
 }
 
 fn migration_checksum(migration: &Migration) -> String {

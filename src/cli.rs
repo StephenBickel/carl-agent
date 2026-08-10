@@ -5,11 +5,12 @@ use std::future::{Future, pending};
 use std::path::PathBuf;
 use std::pin::Pin;
 
-use chrono::Utc;
+use chrono::{TimeDelta, Utc};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use tokio::io::BufReader;
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 use crate::acp::{
     AcpServer, AcpServerConfig, AcpServerErrorCode, BuzzPublisher, BuzzPublisherBootstrap,
@@ -24,6 +25,11 @@ use crate::auth::{
 use crate::buzz_mcp;
 use crate::delegates::codex::CodexAppServer;
 use crate::delegates::{ModelId, ReasoningEffort};
+use crate::error::{CarlError, ErrorCode};
+use crate::events::SessionId;
+use crate::memory::{
+    MemoryKind, MemoryPartition, MemoryQuery, MemoryScope, MemorySettings, MemoryWrite,
+};
 use crate::policy::Frontend;
 use crate::sidecar::{
     DataRootLock, DataRootLockErrorCode, ExecutableTrustDecision, ExecutionWorkspace,
@@ -31,6 +37,7 @@ use crate::sidecar::{
     SidecarLimits, TrustedExecutable, authorize_local_foreground,
     local_foreground_terminal_available, write_local_foreground_stderr,
 };
+use crate::storage::Store;
 
 #[derive(Debug, Parser)]
 #[command(name = "carl")]
@@ -46,6 +53,10 @@ pub enum Command {
     Auth {
         #[command(subcommand)]
         command: AuthCommand,
+    },
+    Memory {
+        #[command(subcommand)]
+        command: MemoryCommand,
     },
     Pair,
     Doctor,
@@ -87,6 +98,86 @@ impl From<AcpEffort> for ReasoningEffort {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Subcommand)]
+pub enum MemoryCommand {
+    Status,
+    Remember {
+        #[arg(long, value_enum, default_value = "fact")]
+        kind: MemoryKindArgument,
+        #[arg(long)]
+        key: String,
+        #[arg(long)]
+        content: String,
+        #[arg(long, value_enum, default_value = "global")]
+        scope: MemoryScopeArgument,
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long, default_value_t = 50)]
+        importance: u8,
+        #[arg(long)]
+        expires_in_days: Option<u32>,
+    },
+    Search {
+        query: String,
+        #[arg(long)]
+        session: Option<String>,
+    },
+    List,
+    Export,
+    Purge,
+    Proposals,
+    Approve {
+        id: Uuid,
+    },
+    Reject {
+        id: Uuid,
+    },
+    Forget {
+        id: Uuid,
+    },
+    Clear {
+        #[arg(long, value_enum)]
+        confirm: MemoryClearConfirmation,
+    },
+    Settings {
+        #[arg(long, conflicts_with = "disable")]
+        enable: bool,
+        #[arg(long, conflicts_with = "enable")]
+        disable: bool,
+        #[arg(long)]
+        max_context_items: Option<u32>,
+        #[arg(long)]
+        context_bytes: Option<u32>,
+        #[arg(long)]
+        max_memories: Option<u32>,
+        #[arg(long)]
+        max_storage_bytes: Option<u64>,
+        #[arg(long)]
+        episode_ttl_days: Option<u32>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum MemoryKindArgument {
+    Profile,
+    Preference,
+    Fact,
+    Goal,
+    Episode,
+}
+
+impl From<MemoryKindArgument> for MemoryKind {
+    fn from(value: MemoryKindArgument) -> Self {
+        match value {
+            MemoryKindArgument::Profile => Self::Profile,
+            MemoryKindArgument::Preference => Self::Preference,
+            MemoryKindArgument::Fact => Self::Fact,
+            MemoryKindArgument::Goal => Self::Goal,
+            MemoryKindArgument::Episode => Self::Episode,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub enum AcpPermissionMode {
     Plan,
@@ -109,6 +200,18 @@ impl From<AcpPermissionMode> for PermissionMode {
             AcpPermissionMode::BypassPermissions => Self::BypassPermissions,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum MemoryScopeArgument {
+    Global,
+    Workspace,
+    Session,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum MemoryClearConfirmation {
+    DeleteAll,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Subcommand)]
@@ -230,6 +333,54 @@ impl CliRunResult {
             exit: ExitClassification::Failure,
         }
     }
+
+    fn json_success<T: Serialize>(value: &T) -> Self {
+        let mut stdout =
+            serde_json::to_string(value).expect("closed CLI output should always serialize");
+        stdout.push('\n');
+        Self {
+            stdout,
+            stderr: String::new(),
+            exit: ExitClassification::Success,
+        }
+    }
+
+    fn memory_error(error: &CarlError) -> Self {
+        let mut stderr = serde_json::to_string(&CliErrorOutput {
+            error_code: error.code(),
+            message: error.user_message(),
+        })
+        .expect("closed CLI error output should always serialize");
+        stderr.push('\n');
+        Self {
+            stdout: String::new(),
+            stderr,
+            exit: ExitClassification::Failure,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+struct CliErrorOutput {
+    error_code: ErrorCode,
+    message: &'static str,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct MemoryStatusOutput {
+    settings: MemorySettings,
+    active_memories: usize,
+    pending_proposals: usize,
+    content_bytes: usize,
+    storage: &'static str,
+    retrieval: &'static str,
+    external_dependency_required: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+struct MemoryMutationOutput {
+    changed: bool,
+    deleted: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -369,6 +520,7 @@ where
     match command {
         Command::Auth { command } => run_auth(command, cancellation.as_mut()).await,
         Command::Acp(_) => CliRunResult::not_implemented("acp streaming dispatch"),
+        Command::Memory { command } => run_memory(command),
         Command::Serve => CliRunResult::not_implemented("serve"),
         Command::Pair => CliRunResult::not_implemented("pair"),
         Command::Doctor => CliRunResult::not_implemented("doctor"),
@@ -503,6 +655,227 @@ pub async fn run_buzz_mcp_stdio() -> ExitClassification {
 fn mcp_failure(message: &'static str) -> ExitClassification {
     eprintln!("{message}");
     ExitClassification::Failure
+}
+
+fn run_memory(command: MemoryCommand) -> CliRunResult {
+    let configuration = match load_common_configuration() {
+        Ok(configuration) => configuration,
+        Err(_) => {
+            return CliRunResult::memory_error(&CarlError::Configuration {
+                detail: "memory commands require a trusted CARL_DATA_DIR".to_owned(),
+            });
+        }
+    };
+    let data_root_lock = match DataRootLock::acquire(&configuration.data_root) {
+        Ok(lock) => lock,
+        Err(_) => {
+            return CliRunResult::memory_error(&CarlError::Storage {
+                detail: "the Carl data directory is unavailable".to_owned(),
+            });
+        }
+    };
+    let store = match Store::open_locked(&data_root_lock) {
+        Ok(store) => store,
+        Err(error) => return CliRunResult::memory_error(&error),
+    };
+    match execute_memory_command(&store, command, &configuration.workspace) {
+        Ok(result) => result,
+        Err(error) => CliRunResult::memory_error(&error),
+    }
+}
+
+fn execute_memory_command(
+    store: &Store,
+    command: MemoryCommand,
+    workspace: &std::path::Path,
+) -> Result<CliRunResult, CarlError> {
+    let partition = MemoryPartition::local_carl();
+    let now = Utc::now();
+    match command {
+        MemoryCommand::Status => {
+            let export = store.export_memories(&partition, now)?;
+            let content_bytes = export
+                .memories
+                .iter()
+                .map(|memory| memory.content.len())
+                .sum();
+            Ok(CliRunResult::json_success(&MemoryStatusOutput {
+                settings: export.settings,
+                active_memories: export.memories.len(),
+                pending_proposals: store.list_memory_proposals(&partition, now)?.len(),
+                content_bytes,
+                storage: "local_sqlite",
+                retrieval: "local_lexical",
+                external_dependency_required: false,
+            }))
+        }
+        MemoryCommand::Remember {
+            kind,
+            key,
+            content,
+            scope,
+            session,
+            importance,
+            expires_in_days,
+        } => {
+            let session = parse_optional_session(session.as_deref())?;
+            let scope = memory_scope(scope, workspace, session)?;
+            let mut write = MemoryWrite::new(
+                partition,
+                scope,
+                kind.into(),
+                key,
+                content,
+                "owner explicit CLI request",
+            )?
+            .with_importance(importance);
+            if let Some(days) = expires_in_days {
+                if !(1..=3_650).contains(&days) {
+                    return Err(CarlError::Validation {
+                        detail: "memory expiration is outside supported bounds".to_owned(),
+                    });
+                }
+                write = write.with_expiration(now + TimeDelta::days(i64::from(days)));
+            }
+            Ok(CliRunResult::json_success(
+                &store.remember_memory(write, now)?,
+            ))
+        }
+        MemoryCommand::Search { query, session } => {
+            let session = parse_optional_session(session.as_deref())?;
+            let workspace = workspace.to_str().ok_or_else(|| CarlError::Configuration {
+                detail: "the current workspace path is not valid UTF-8".to_owned(),
+            })?;
+            let query = MemoryQuery::new(partition, query, Some(workspace), session)?;
+            Ok(CliRunResult::json_success(
+                &store.retrieve_memories(&query, now, None)?,
+            ))
+        }
+        MemoryCommand::List => {
+            let export = store.export_memories(&partition, now)?;
+            Ok(CliRunResult::json_success(&export.memories))
+        }
+        MemoryCommand::Export => Ok(CliRunResult::json_success(
+            &store.export_memories(&partition, now)?,
+        )),
+        MemoryCommand::Purge => Ok(CliRunResult::json_success(
+            &store.purge_expired_memory(&partition, now)?,
+        )),
+        MemoryCommand::Proposals => Ok(CliRunResult::json_success(
+            &store.list_memory_proposals(&partition, now)?,
+        )),
+        MemoryCommand::Approve { id } => Ok(CliRunResult::json_success(
+            &store.approve_memory_proposal(&partition, id, now)?,
+        )),
+        MemoryCommand::Reject { id } => {
+            let changed = store.reject_memory_proposal(&partition, id)?;
+            Ok(CliRunResult::json_success(&MemoryMutationOutput {
+                changed,
+                deleted: u64::from(changed),
+            }))
+        }
+        MemoryCommand::Forget { id } => {
+            let changed = store.delete_memory(&partition, id)?;
+            Ok(CliRunResult::json_success(&MemoryMutationOutput {
+                changed,
+                deleted: u64::from(changed),
+            }))
+        }
+        MemoryCommand::Clear { confirm: _ } => {
+            let deleted = store.clear_memories(&partition)?;
+            Ok(CliRunResult::json_success(&MemoryMutationOutput {
+                changed: deleted > 0,
+                deleted,
+            }))
+        }
+        MemoryCommand::Settings {
+            enable,
+            disable,
+            max_context_items,
+            context_bytes,
+            max_memories,
+            max_storage_bytes,
+            episode_ttl_days,
+        } => {
+            let mut settings = store.memory_settings(&partition)?;
+            let changed = enable
+                || disable
+                || max_context_items.is_some()
+                || context_bytes.is_some()
+                || max_memories.is_some()
+                || max_storage_bytes.is_some()
+                || episode_ttl_days.is_some();
+            if enable {
+                settings.enabled = true;
+            } else if disable {
+                settings.enabled = false;
+            }
+            if let Some(value) = max_context_items {
+                settings.max_context_items = value;
+            }
+            if let Some(value) = context_bytes {
+                settings.context_bytes = value;
+            }
+            if let Some(value) = max_memories {
+                settings.max_memories = value;
+            }
+            if let Some(value) = max_storage_bytes {
+                settings.max_storage_bytes = value;
+            }
+            if let Some(value) = episode_ttl_days {
+                settings.episode_ttl_days = value;
+            }
+            if changed {
+                store.update_memory_settings(&partition, &settings, now)?;
+            }
+            Ok(CliRunResult::json_success(&settings))
+        }
+    }
+}
+
+fn parse_optional_session(value: Option<&str>) -> Result<Option<SessionId>, CarlError> {
+    value
+        .map(|value| {
+            value.parse().map_err(|_| CarlError::Validation {
+                detail: "memory session ID is invalid".to_owned(),
+            })
+        })
+        .transpose()
+}
+
+fn memory_scope(
+    scope: MemoryScopeArgument,
+    workspace: &std::path::Path,
+    session: Option<SessionId>,
+) -> Result<MemoryScope, CarlError> {
+    match scope {
+        MemoryScopeArgument::Global => {
+            if session.is_some() {
+                return Err(CarlError::Validation {
+                    detail: "a global memory cannot include a session scope".to_owned(),
+                });
+            }
+            Ok(MemoryScope::global())
+        }
+        MemoryScopeArgument::Workspace => {
+            if session.is_some() {
+                return Err(CarlError::Validation {
+                    detail: "a workspace memory cannot include a session scope".to_owned(),
+                });
+            }
+            let workspace = workspace.to_str().ok_or_else(|| CarlError::Configuration {
+                detail: "the current workspace path is not valid UTF-8".to_owned(),
+            })?;
+            MemoryScope::workspace(workspace)
+        }
+        MemoryScopeArgument::Session => {
+            session
+                .map(MemoryScope::session)
+                .ok_or_else(|| CarlError::Validation {
+                    detail: "a session-scoped memory requires --session".to_owned(),
+                })
+        }
+    }
 }
 
 async fn run_auth<C>(command: AuthCommand, cancellation: Pin<&mut C>) -> CliRunResult

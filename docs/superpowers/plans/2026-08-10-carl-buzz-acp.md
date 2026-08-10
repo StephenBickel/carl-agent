@@ -183,7 +183,7 @@ Commit: `git commit -m "feat: define the ACP wire contract"`
 ### Task 3: Persist ACP session bindings, remote codes, and delivery state
 
 **Files:**
-- Create: `migrations/0006_acp_frontends.sql`
+- Create: `migrations/0007_acp_frontends.sql`
 - Modify: `src/storage/schema.rs`
 - Modify: `src/storage/repository.rs`
 - Modify: `src/storage/mod.rs`

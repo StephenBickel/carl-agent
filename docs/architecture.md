@@ -57,7 +57,8 @@ Provider children receive no Buzz variables.
 
 ## Durable model
 
-SQLite WAL is the audit and replay source. Forward migrations are checksum-verified.
+SQLite WAL is the audit, replay, and local-memory source. Forward migrations are
+checksum-verified.
 ACP bindings persist external session, client, protocol, canonical cwd, stable
 channel, provider thread, and permission mode without storing relay credentials or
 raw remote codes. Delivery transitions are monotonic; uncertain delivery is durable
@@ -76,6 +77,10 @@ is intentionally not a multi-daemon coordination protocol.
 - `storage`: SQLite migrations and projections for sessions, append-only events,
   remote codes, ACP frontends, channel claims, provider turns, and at-most-once
   delivery actions.
+- `memory`: local owner/agent and global/workspace/session partitions; curated
+  profile, preference, fact, goal, and episode records; bounded lexical ranking;
+  proposal approval; expiration, capacity, versioned export, and hard deletion.
+  No external memory provider or embedding dependency is required.
 - `sidecar`: exact executable identity/version checks, duplex bounded JSONL,
   closed child environments, process-tree supervision, cancellation, deadlines, and
   aggregate output limits.
@@ -99,8 +104,8 @@ is intentionally not a multi-daemon coordination protocol.
 - `artifacts` and `verification`: content-addressed evidence, fresh independent
   verification candidates, approved executable/argv attestation, bounded execution,
   and post-commit verified-proposal capabilities.
-- `cli`: safe authentication JSON plus the streaming `carl acp` entry point and
-  argv-zero restricted publisher alias.
+- `cli`: safe authentication JSON, local `carl memory` management, the streaming
+  `carl acp` entry point, and the argv-zero restricted publisher alias.
 
 ## Authentication and execution separation
 

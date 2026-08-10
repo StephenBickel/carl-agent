@@ -62,6 +62,9 @@ impl fmt::Display for ErrorCode {
 pub enum BudgetResource {
     Iterations,
     ToolCalls,
+    MemoryItems,
+    MemoryBytes,
+    MemoryProposals,
 }
 
 impl fmt::Display for BudgetResource {
@@ -69,6 +72,9 @@ impl fmt::Display for BudgetResource {
         match self {
             Self::Iterations => formatter.write_str("iterations"),
             Self::ToolCalls => formatter.write_str("tool calls"),
+            Self::MemoryItems => formatter.write_str("memory items"),
+            Self::MemoryBytes => formatter.write_str("memory bytes"),
+            Self::MemoryProposals => formatter.write_str("memory proposals"),
         }
     }
 }
