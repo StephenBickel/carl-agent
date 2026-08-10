@@ -300,21 +300,21 @@ Commit: `git commit -m "test: add coding workflow and safety benchmarks"`
 - Runs argv arrays without a shell, with a minimal environment, closed stdin, bounded stdout/stderr capture, process-group cancellation, and a hard timeout.
 - Accepts verifier result JSON only as `{"passed": bool, "checks_passed": int, "checks_total": int}` with non-negative bounded integers and consistent totals.
 
-- [ ] **Step 1: Write failing verifier-process tests**
+- [x] **Step 1: Write failing verifier-process tests**
 
 Cover pass, semantic fail, malformed JSON, oversized output, non-zero exit, missing executable, timeout with a grandchild process, output path escape, environment probing, and cancellation. Assert semantic fail is an agent result while every verifier machinery fault is infrastructure-invalid.
 
-- [ ] **Step 2: Run focused tests and verify RED**
+- [x] **Step 2: Run focused tests and verify RED**
 
 Run: `cd benchmarks && uv run pytest tests/test_verifier.py -q`
 
 Expected: FAIL because `carl_bench.verifier` does not exist.
 
-- [ ] **Step 3: Implement the minimal verifier supervisor**
+- [x] **Step 3: Implement the minimal verifier supervisor**
 
 Use `asyncio.create_subprocess_exec(..., start_new_session=True)`. On timeout send `SIGTERM` to the process group, wait two seconds, then `SIGKILL`. On Windows use a new process group and terminate the child; document that full descendant cleanup is validated only on Unix in this milestone.
 
-- [ ] **Step 4: Verify and commit**
+- [x] **Step 4: Verify and commit**
 
 Run focused tests and `uv run ruff check .`.
 
