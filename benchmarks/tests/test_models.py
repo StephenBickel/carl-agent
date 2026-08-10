@@ -90,6 +90,7 @@ def test_public_trial_dictionary_is_closed_and_omits_absent_metrics() -> None:
         "status": "failed",
         "task_digest": TASK_DIGEST,
         "task_id": "carl/coding-fix-config-lookup",
+        "track": "coding",
         "trial_id": "trial-01",
     }
     assert "tool_calls" not in public

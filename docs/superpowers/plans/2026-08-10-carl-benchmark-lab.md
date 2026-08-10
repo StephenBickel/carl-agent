@@ -379,25 +379,25 @@ Commit: `git commit -m "feat: run isolated benchmark trials"`
 - Reports pass rate, valid/invalid counts, agent failure counts by stable code, median elapsed milliseconds, median tool-call count when available, and paired pass-rate delta.
 - Promotion evidence in this milestone is advisory only and uses the design thresholds: at least 3 paired attempts per task, candidate delta `>= +0.03`, one-sided paired bootstrap lower confidence bound `> 0`, and no track regression worse than `-0.02`. The function must return `insufficient_evidence` rather than promote when sample size is too small.
 
-- [ ] **Step 1: Write failing aggregation tests**
+- [x] **Step 1: Write failing aggregation tests**
 
 Use fixed synthetic trials to assert denominators, medians, per-track metrics, invalid-run exclusion, paired alignment, bootstrap determinism from a recorded seed, noninferiority rejection, and insufficient-evidence behavior.
 
-- [ ] **Step 2: Write failing sanitization integration tests**
+- [x] **Step 2: Write failing sanitization integration tests**
 
 Attempt to insert raw output, absolute paths, NaN, and secret-like data into reports and assert the write fails before a destination exists.
 
-- [ ] **Step 3: Run focused tests and verify RED**
+- [x] **Step 3: Run focused tests and verify RED**
 
 Run: `cd benchmarks && uv run pytest tests/test_report.py -q`
 
 Expected: FAIL because `carl_bench.report` does not exist.
 
-- [ ] **Step 4: Implement deterministic aggregation and comparison**
+- [x] **Step 4: Implement deterministic aggregation and comparison**
 
 Use integer counts for all hypothesis inputs and `statistics.median` for public duration summaries. Implement the paired bootstrap locally with `random.Random(comparison_seed)` and 10,000 resamples; record the algorithm ID and seed in the comparison.
 
-- [ ] **Step 5: Verify and commit**
+- [x] **Step 5: Verify and commit**
 
 Run focused tests and `uv run ruff check .`.
 

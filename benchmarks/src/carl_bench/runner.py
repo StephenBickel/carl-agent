@@ -97,6 +97,7 @@ class BenchmarkRunner:
                     seed=seed,
                     code="runner_internal_error",
                     elapsed_ms=_elapsed_ms(started),
+                    track=task.identity.track,
                 )
 
             try:
@@ -114,6 +115,7 @@ class BenchmarkRunner:
                     seed=seed,
                     code="runner_task_source_changed",
                     elapsed_ms=_elapsed_ms(started),
+                    track=task.identity.track,
                 )
             if outcome.status is OutcomeStatus.FAILED:
                 assert outcome.failure_code is not None
@@ -128,6 +130,7 @@ class BenchmarkRunner:
                     code=outcome.failure_code,
                     elapsed_ms=_elapsed_ms(started),
                     tool_calls=outcome.tool_calls,
+                    track=task.identity.track,
                 )
 
             verification = await self._verifier.run(
@@ -144,6 +147,7 @@ class BenchmarkRunner:
                     seed=seed,
                     code=verification.infrastructure_code,
                     elapsed_ms=_elapsed_ms(started),
+                    track=task.identity.track,
                 )
             if not verification.passed:
                 return TrialResult.agent_failure(
@@ -159,6 +163,7 @@ class BenchmarkRunner:
                     tool_calls=outcome.tool_calls,
                     checks_passed=verification.checks_passed,
                     checks_total=verification.checks_total,
+                    track=task.identity.track,
                 )
             return TrialResult.passed(
                 trial_id=trial_id,
@@ -172,4 +177,5 @@ class BenchmarkRunner:
                 checks_passed=verification.checks_passed,
                 checks_total=verification.checks_total,
                 tool_calls=outcome.tool_calls,
+                track=task.identity.track,
             )

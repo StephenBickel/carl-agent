@@ -148,6 +148,7 @@ class TrialResult:
     checks_passed: int | None = None
     checks_total: int | None = None
     tool_calls: int | None = None
+    track: str = "coding"
 
     INFRASTRUCTURE_FAILURE_CODES: ClassVar[frozenset[str]] = frozenset(
         {
@@ -170,6 +171,8 @@ class TrialResult:
         _digest("task_digest", self.task_digest)
         _bounded_string("adapter_id", self.adapter_id, 64)
         _bounded_string("adapter_version", self.adapter_version, 64)
+        if self.track not in _TRACKS:
+            raise ValueError("track must be coding, workflow, or safety")
         if not 1 <= self.attempt <= 10:
             raise ValueError("attempt must be between 1 and 10")
         _non_negative("seed", self.seed, (1 << 63) - 1)
@@ -215,6 +218,7 @@ class TrialResult:
         checks_passed: int,
         checks_total: int,
         tool_calls: int | None = None,
+        track: str = "coding",
     ) -> TrialResult:
         return cls(
             trial_id=trial_id,
@@ -229,6 +233,7 @@ class TrialResult:
             checks_passed=checks_passed,
             checks_total=checks_total,
             tool_calls=tool_calls,
+            track=track,
         )
 
     @classmethod
@@ -247,6 +252,7 @@ class TrialResult:
         tool_calls: int | None = None,
         checks_passed: int | None = None,
         checks_total: int | None = None,
+        track: str = "coding",
     ) -> TrialResult:
         return cls(
             trial_id=trial_id,
@@ -263,6 +269,7 @@ class TrialResult:
             tool_calls=tool_calls,
             checks_passed=checks_passed,
             checks_total=checks_total,
+            track=track,
         )
 
     @classmethod
@@ -278,6 +285,7 @@ class TrialResult:
         seed: int,
         code: str,
         elapsed_ms: int,
+        track: str = "coding",
     ) -> TrialResult:
         return cls(
             trial_id=trial_id,
@@ -291,6 +299,7 @@ class TrialResult:
             elapsed_ms=elapsed_ms,
             failure_class=FailureClass.INFRASTRUCTURE,
             failure_code=code,
+            track=track,
         )
 
     def to_public_dict(self) -> dict[str, Any]:
@@ -303,6 +312,7 @@ class TrialResult:
             "status": self.status.value,
             "task_digest": self.task_digest,
             "task_id": self.task_id,
+            "track": self.track,
             "trial_id": self.trial_id,
         }
         if self.failure_class is not None:
@@ -345,6 +355,51 @@ class RunManifest:
         if len(trial_ids) != len(set(trial_ids)):
             raise ValueError("duplicate trial_id")
 
+    def to_public_dict(self) -> dict[str, Any]:
+        return {
+            "effort": self.effort,
+            "league": self.league,
+            "model": self.model,
+            "run_id": self.run_id,
+            "schema_version": self.schema_version,
+            "seed": self.seed,
+            "started_at": self.started_at,
+            "trials": [trial.to_public_dict() for trial in self.trials],
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class TrackScorecard:
+    track: str
+    valid_trials: int
+    invalid_trials: int
+    passed_trials: int
+    failed_trials: int
+    pass_rate: float
+
+    def __post_init__(self) -> None:
+        if self.track not in _TRACKS:
+            raise ValueError("track must be coding, workflow, or safety")
+        for name in ("valid_trials", "invalid_trials", "passed_trials", "failed_trials"):
+            _non_negative(name, getattr(self, name), 1_000_000)
+        if self.passed_trials + self.failed_trials != self.valid_trials:
+            raise ValueError("track valid trial counts are inconsistent")
+        expected_rate = self.passed_trials / self.valid_trials if self.valid_trials else 0.0
+        if not math.isfinite(self.pass_rate) or not math.isclose(
+            self.pass_rate, expected_rate, rel_tol=0.0, abs_tol=1e-12
+        ):
+            raise ValueError("track pass_rate does not match trial counts")
+
+    def to_public_dict(self) -> dict[str, Any]:
+        return {
+            "failed_trials": self.failed_trials,
+            "invalid_trials": self.invalid_trials,
+            "pass_rate": self.pass_rate,
+            "passed_trials": self.passed_trials,
+            "track": self.track,
+            "valid_trials": self.valid_trials,
+        }
+
 
 @dataclass(frozen=True, slots=True)
 class Scorecard:
@@ -358,6 +413,12 @@ class Scorecard:
     pass_rate: float
     median_elapsed_ms: int | float | None
     trials: tuple[TrialResult, ...]
+    median_tool_calls: int | float | None = None
+    failure_counts: tuple[tuple[str, int], ...] = ()
+    tracks: tuple[TrackScorecard, ...] = ()
+    league: str = "plumbing"
+    model: str | None = None
+    effort: str | None = None
 
     def __post_init__(self) -> None:
         if self.schema_version != 1:
@@ -375,6 +436,13 @@ class Scorecard:
             or self.median_elapsed_ms < 0
         ):
             raise ValueError("median_elapsed_ms must be finite and non-negative")
+        if self.median_tool_calls is not None and (
+            not isinstance(self.median_tool_calls, int | float)
+            or isinstance(self.median_tool_calls, bool)
+            or not math.isfinite(self.median_tool_calls)
+            or self.median_tool_calls < 0
+        ):
+            raise ValueError("median_tool_calls must be finite and non-negative")
         if self.valid_trials + self.invalid_trials != len(self.trials):
             raise ValueError("trial counts do not equal the included trial population")
         if self.passed_trials + self.failed_trials != self.valid_trials:
@@ -382,3 +450,42 @@ class Scorecard:
         expected_rate = self.passed_trials / self.valid_trials if self.valid_trials else 0.0
         if not math.isclose(self.pass_rate, expected_rate, rel_tol=0.0, abs_tol=1e-12):
             raise ValueError("pass_rate does not match trial counts")
+        if tuple(sorted(self.failure_counts)) != self.failure_counts:
+            raise ValueError("failure_counts must be sorted")
+        for code, count in self.failure_counts:
+            if not _CODE_RE.fullmatch(code):
+                raise ValueError("failure_counts contains an invalid code")
+            _non_negative("failure_count", count, 1_000_000)
+        if tuple(sorted(track.track for track in self.tracks)) != tuple(
+            track.track for track in self.tracks
+        ):
+            raise ValueError("tracks must be sorted")
+        if self.league not in {"plumbing", "same-model", "native-product"}:
+            raise ValueError("league is unsupported")
+        if self.model is not None:
+            _bounded_string("model", self.model, 128)
+        if self.effort is not None:
+            _bounded_string("effort", self.effort, 32)
+
+    def to_public_dict(self) -> dict[str, Any]:
+        value: dict[str, Any] = {
+            "effort": self.effort,
+            "failed_trials": self.failed_trials,
+            "failure_counts": [
+                {"code": code, "count": count} for code, count in self.failure_counts
+            ],
+            "invalid_trials": self.invalid_trials,
+            "league": self.league,
+            "median_elapsed_ms": self.median_elapsed_ms,
+            "median_tool_calls": self.median_tool_calls,
+            "model": self.model,
+            "pass_rate": self.pass_rate,
+            "passed_trials": self.passed_trials,
+            "run_digest": self.run_digest,
+            "run_id": self.run_id,
+            "schema_version": self.schema_version,
+            "tracks": [track.to_public_dict() for track in self.tracks],
+            "trials": [trial.to_public_dict() for trial in self.trials],
+            "valid_trials": self.valid_trials,
+        }
+        return value
