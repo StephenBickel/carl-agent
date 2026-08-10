@@ -1,6 +1,6 @@
 # Carl Long-Horizon Runtime Design
 
-Status: approved in conversation; written-spec review pending
+Status: approved
 Date: 2026-08-10
 Decision owner: Stephen Bickel
 
