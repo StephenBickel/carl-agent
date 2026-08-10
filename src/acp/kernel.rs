@@ -16,7 +16,7 @@ use super::session::{
 };
 use super::{
     BuzzContext, BuzzErrorCode, BuzzPublisher, ConfigChange, ModeActivation, ModelCatalog,
-    ModelDescriptor, PermissionMode, SessionConfiguration,
+    ModelDescriptor, PermissionMode, PermissionProfile, SessionConfiguration,
 };
 use crate::delegates::DelegateSettings;
 use crate::delegates::codex::{
@@ -840,6 +840,20 @@ impl KernelActor {
                 updates.push(KernelUpdate::DiffUpdated(diff));
             }
             CodexEvent::ApprovalRequested(approval) => {
+                if self
+                    .sessions
+                    .get(&session_id)
+                    .ok_or_else(unknown_session)?
+                    .public
+                    .configuration()
+                    .mode()
+                    .profile()
+                    == PermissionProfile::FullAccess
+                {
+                    self.authorize_full_access_effect(session_id, turn_id, approval, updates)
+                        .await?;
+                    return Ok(None);
+                }
                 return self
                     .pause_for_approval(session_id, turn_id, approval, updates)
                     .await
@@ -893,6 +907,85 @@ impl KernelActor {
             }
         }
         Ok(None)
+    }
+
+    async fn authorize_full_access_effect(
+        &mut self,
+        session_id: SessionId,
+        turn_id: TurnId,
+        approval: CodexApprovalRequest,
+        updates: &mut Vec<KernelUpdate>,
+    ) -> Result<(), KernelError> {
+        let (thread_matches, turn_matches, tool_call_id) = {
+            let state = self.sessions.get(&session_id).ok_or_else(unknown_session)?;
+            let active = state.active.as_ref().ok_or_else(session_busy)?;
+            (
+                approval.thread_id() == &state.provider_thread,
+                approval.turn_id() == &active.provider_turn_id && turn_id == active.local_turn_id,
+                active.item_ids.get(approval.item_id()).copied(),
+            )
+        };
+        let Some(tool_call_id) = tool_call_id.filter(|_| thread_matches && turn_matches) else {
+            self.codex
+                .resolve_approval(&approval, CodexApprovalDecision::Deny)
+                .await?;
+            return Err(provider_error());
+        };
+        let title = approval
+            .command()
+            .unwrap_or_else(|| match approval.kind() {
+                CodexApprovalKind::Command => "command",
+                CodexApprovalKind::FileChange => "file changes",
+            })
+            .to_owned();
+        let summary = match approval.reason() {
+            Some(reason) => format!("{title}\nReason: {reason}"),
+            None => title.clone(),
+        };
+        if SecretFilter.inspect(summary.as_bytes()).is_err() {
+            self.codex
+                .resolve_approval(&approval, CodexApprovalDecision::Deny)
+                .await?;
+            return Err(provider_error());
+        }
+        self.store
+            .store_mut()
+            .append(
+                session_id,
+                Some(turn_id),
+                Event::ToolProposed {
+                    tool_call_id,
+                    tool_name: match approval.kind() {
+                        CodexApprovalKind::Command => "command".to_owned(),
+                        CodexApprovalKind::FileChange => "file_change".to_owned(),
+                    },
+                    arguments: json!({"summary":summary}),
+                },
+            )
+            .map_err(map_storage)?;
+        self.store
+            .store_mut()
+            .append(
+                session_id,
+                Some(turn_id),
+                Event::ToolDispatchAuthorized {
+                    tool_call_id,
+                    request_digest: approval.request_digest().to_string(),
+                    automatic: true,
+                },
+            )
+            .map_err(map_storage)?;
+        self.codex
+            .resolve_approval(&approval, CodexApprovalDecision::Allow)
+            .await?;
+        updates.push(KernelUpdate::ToolStarted {
+            title,
+            kind: match approval.kind() {
+                CodexApprovalKind::Command => ToolKind::Execute,
+                CodexApprovalKind::FileChange => ToolKind::Edit,
+            },
+        });
+        Ok(())
     }
 
     async fn pause_for_approval(

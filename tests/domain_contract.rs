@@ -23,7 +23,7 @@ fn every_event_has_a_stable_type_and_schema_version() -> Result<(), Box<dyn std:
                 text: "hello".into(),
             },
             json!({
-                "schema_version": 3,
+                "schema_version": 4,
                 "type": "user_input",
                 "text": "hello",
             }),
@@ -33,7 +33,7 @@ fn every_event_has_a_stable_type_and_schema_version() -> Result<(), Box<dyn std:
                 text: "world".into(),
             },
             json!({
-                "schema_version": 3,
+                "schema_version": 4,
                 "type": "assistant_text_delta",
                 "text": "world",
             }),
@@ -45,11 +45,26 @@ fn every_event_has_a_stable_type_and_schema_version() -> Result<(), Box<dyn std:
                 arguments: json!({"path": "notes.txt"}),
             },
             json!({
-                "schema_version": 3,
+                "schema_version": 4,
                 "type": "tool_proposed",
                 "tool_call_id": "11111111-1111-4111-8111-111111111111",
                 "tool_name": "fs.read",
                 "arguments": {"path": "notes.txt"},
+            }),
+        ),
+        (
+            Event::ToolDispatchAuthorized {
+                tool_call_id,
+                request_digest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    .into(),
+                automatic: true,
+            },
+            json!({
+                "schema_version": 4,
+                "type": "tool_dispatch_authorized",
+                "tool_call_id": "11111111-1111-4111-8111-111111111111",
+                "request_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "automatic": true,
             }),
         ),
         (
@@ -59,7 +74,7 @@ fn every_event_has_a_stable_type_and_schema_version() -> Result<(), Box<dyn std:
                 summary: "Read notes.txt".into(),
             },
             json!({
-                "schema_version": 3,
+                "schema_version": 4,
                 "type": "approval_requested",
                 "approval_id": "22222222-2222-4222-8222-222222222222",
                 "tool_call_id": "11111111-1111-4111-8111-111111111111",
@@ -72,7 +87,7 @@ fn every_event_has_a_stable_type_and_schema_version() -> Result<(), Box<dyn std:
                 output: json!({"text": "contents"}),
             },
             json!({
-                "schema_version": 3,
+                "schema_version": 4,
                 "type": "tool_completed",
                 "tool_call_id": "11111111-1111-4111-8111-111111111111",
                 "output": {"text": "contents"},
@@ -81,7 +96,7 @@ fn every_event_has_a_stable_type_and_schema_version() -> Result<(), Box<dyn std:
         (
             Event::TurnCompleted,
             json!({
-                "schema_version": 3,
+                "schema_version": 4,
                 "type": "turn_completed",
             }),
         ),
@@ -90,7 +105,7 @@ fn every_event_has_a_stable_type_and_schema_version() -> Result<(), Box<dyn std:
                 reason: "cancelled".into(),
             },
             json!({
-                "schema_version": 3,
+                "schema_version": 4,
                 "type": "turn_interrupted",
                 "reason": "cancelled",
             }),
@@ -132,13 +147,13 @@ fn schema_v1_literal_fixture_remains_readable_and_reencodes_as_current()
         serde_json::to_value(decoded)?["schema_version"],
         EVENT_SCHEMA_VERSION
     );
-    assert_eq!(EVENT_SCHEMA_VERSION, 3);
+    assert_eq!(EVENT_SCHEMA_VERSION, 4);
 
     Ok(())
 }
 
 #[test]
-fn schema_v2_literal_remains_readable_and_frontend_events_use_schema_v3()
+fn schema_v2_and_v3_literals_remain_readable_and_frontend_events_use_schema_v4()
 -> Result<(), Box<dyn std::error::Error>> {
     let v2 = r#"{
         "schema_version": 2,
@@ -149,6 +164,21 @@ fn schema_v2_literal_remains_readable_and_frontend_events_use_schema_v3()
         serde_json::from_str::<Event>(v2)?,
         Event::TurnInterrupted {
             reason: "legacy".into(),
+        }
+    );
+    let v3 = r#"{
+        "schema_version": 3,
+        "type": "frontend_session_bound",
+        "frontend": "buzz",
+        "external_session_id": "legacy-buzz-session",
+        "protocol_version": 2
+    }"#;
+    assert_eq!(
+        serde_json::from_str::<Event>(v3)?,
+        Event::FrontendSessionBound {
+            frontend: Frontend::Buzz,
+            external_session_id: "legacy-buzz-session".into(),
+            protocol_version: 2,
         }
     );
 
@@ -170,7 +200,7 @@ fn schema_v2_literal_remains_readable_and_frontend_events_use_schema_v3()
     ];
     for event in cases {
         let encoded = serde_json::to_value(&event)?;
-        assert_eq!(encoded["schema_version"], 3);
+        assert_eq!(encoded["schema_version"], 4);
         assert_eq!(serde_json::from_value::<Event>(encoded)?, event);
     }
     Ok(())
@@ -179,7 +209,7 @@ fn schema_v2_literal_remains_readable_and_frontend_events_use_schema_v3()
 #[test]
 fn event_rejects_an_unknown_future_schema_version() {
     let error = serde_json::from_value::<Event>(json!({
-        "schema_version": 4,
+        "schema_version": 5,
         "type": "user_input",
         "text": "hello",
     }))
@@ -188,7 +218,7 @@ fn event_rejects_an_unknown_future_schema_version() {
     assert!(
         error
             .to_string()
-            .contains("unsupported event schema version 4")
+            .contains("unsupported event schema version 5")
     );
 }
 
@@ -215,12 +245,12 @@ fn event_envelope_serializes_metadata_and_a_flattened_payload()
     assert_eq!(encoded["session_id"], session_id.to_string());
     assert_eq!(encoded["turn_id"], turn_id.to_string());
     assert_eq!(encoded["sequence"], 7);
-    assert_eq!(encoded["schema_version"], 3);
+    assert_eq!(encoded["schema_version"], 4);
     assert_eq!(encoded["timestamp"], "2026-07-13T12:34:56Z");
     assert_eq!(encoded["type"], "user_input");
     assert_eq!(encoded["text"], "hello");
     assert!(encoded.get("event").is_none());
-    assert_eq!(envelope.schema_version(), 3);
+    assert_eq!(envelope.schema_version(), 4);
     assert_eq!(serde_json::from_value::<EventEnvelope>(encoded)?, envelope);
 
     Ok(())

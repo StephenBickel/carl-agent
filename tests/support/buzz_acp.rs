@@ -470,19 +470,29 @@ fn app_server_fixture() -> i32 {
                     continue;
                 }
                 if input.contains("bypass scenario") {
-                    if fs::write(workspace.join("target.txt"), "fixed\n")
+                    if item_started(thread_id, &turn_id, "bypass-item")
                         .and_then(|()| {
-                            append_line(&workspace.join(".fixture-actions"), "approved-command")
+                            approval_request(
+                                "approval-bypass",
+                                "item/commandExecution/requestApproval",
+                                thread_id,
+                                &turn_id,
+                                "bypass-item",
+                                json!({
+                                    "command":"cargo test", "reason":"Verify the patch",
+                                    "cwd":null
+                                }),
+                            )
                         })
-                        .and_then(|()| diff_update(thread_id, &turn_id))
-                        .and_then(|()| {
-                            agent_delta(thread_id, &turn_id, "Bypass verification completed.")
-                        })
-                        .and_then(|()| turn_completed(thread_id, &turn_id))
                         .is_err()
                     {
                         return 74;
                     }
+                    pending = Some(PendingApproval {
+                        stage: ApprovalStage::Bypass,
+                        thread_id: thread_id.to_owned(),
+                        turn_id,
+                    });
                     continue;
                 }
                 if agent_delta(thread_id, &turn_id, "Repository verification complete.")
@@ -513,6 +523,9 @@ fn app_server_fixture() -> i32 {
                             return 73;
                         }
                         if diff_update(&approval.thread_id, &approval.turn_id)
+                            .and_then(|()| {
+                                item_started(&approval.thread_id, &approval.turn_id, "command-item")
+                            })
                             .and_then(|()| {
                                 approval_request(
                                     "approval-command",
@@ -552,6 +565,28 @@ fn app_server_fixture() -> i32 {
                             return 74;
                         }
                     }
+                    ApprovalStage::Bypass => {
+                        if !accepted {
+                            return 65;
+                        }
+                        if fs::write(workspace.join("target.txt"), "fixed\n")
+                            .and_then(|()| {
+                                append_line(&workspace.join(".fixture-actions"), "approved-command")
+                            })
+                            .and_then(|()| diff_update(&approval.thread_id, &approval.turn_id))
+                            .and_then(|()| {
+                                agent_delta(
+                                    &approval.thread_id,
+                                    &approval.turn_id,
+                                    "Bypass verification completed.",
+                                )
+                            })
+                            .and_then(|()| turn_completed(&approval.thread_id, &approval.turn_id))
+                            .is_err()
+                        {
+                            return 74;
+                        }
+                    }
                 }
             }
             _ => return 65,
@@ -564,6 +599,7 @@ fn app_server_fixture() -> i32 {
 enum ApprovalStage {
     File,
     Command,
+    Bypass,
 }
 
 struct PendingApproval {

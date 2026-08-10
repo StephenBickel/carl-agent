@@ -774,7 +774,7 @@ fn reading_rejects_a_future_event_schema_as_a_typed_storage_error() -> Result<()
     assert!(matches!(
         error,
         CarlError::Storage { ref detail }
-            if detail.contains("unsupported event schema version 4")
+            if detail.contains("unsupported event schema version 5")
     ));
 
     Ok(())
@@ -812,12 +812,12 @@ fn inject_future_event(path: &Path, session_id: SessionId) -> Result<(), Box<dyn
     connection.execute(
         "INSERT INTO events (
             id, session_id, turn_id, sequence, timestamp, schema_version, event_json
-         ) VALUES (?1, ?2, NULL, 1, ?3, 4, ?4)",
+         ) VALUES (?1, ?2, NULL, 1, ?3, 5, ?4)",
         params![
             EventId::new().to_string(),
             session_id.to_string(),
             "2026-07-13T12:00:00Z",
-            r#"{"schema_version":4,"type":"user_input","text":"future"}"#,
+            r#"{"schema_version":5,"type":"user_input","text":"future"}"#,
         ],
     )?;
     Ok(())

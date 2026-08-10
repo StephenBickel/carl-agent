@@ -103,6 +103,19 @@ fn end_to_end() -> TestResult {
         "fixed\n"
     );
     assert_eq!(layout.action_count("approved-command")?, 1);
+    let provider_requests = fs::read_to_string(layout.workspace.join(".provider-requests.jsonl"))?
+        .lines()
+        .map(serde_json::from_str)
+        .collect::<Result<Vec<serde_json::Value>, _>>()?;
+    let bypass_start = provider_requests
+        .iter()
+        .rfind(|request| request["method"] == "thread/start")
+        .ok_or("bypass thread/start request missing")?;
+    assert_eq!(bypass_start["params"]["approvalPolicy"], "on-request");
+    assert_eq!(bypass_start["params"]["sandbox"], "read-only");
+    assert!(provider_requests.iter().any(|request| {
+        request["id"] == "approval-bypass" && request["result"]["decision"] == "accept"
+    }));
 
     let mut captured = Vec::new();
     captured.extend(first.stdout);

@@ -6,7 +6,8 @@ use std::sync::{Arc, Mutex};
 
 use carl::acp::{
     BuzzContext, CodexPort, ConfigOutcome, ConfigSelection, Kernel, KernelPublisher,
-    NewSessionRequest, PermissionMode, PortFuture, Prompt, PromptStopReason, PublicationFailure,
+    NewSessionRequest, PermissionMode, PermissionProfile, PortFuture, Prompt, PromptStopReason,
+    PublicationFailure,
 };
 use carl::delegates::codex::{
     CodexAppServer, CodexApprovalDecision, CodexApprovalRequest, CodexEvent, CodexModel,
@@ -18,10 +19,24 @@ use carl::policy::{ActorId, Frontend};
 use carl::sidecar::DataRootLock;
 use carl::storage::{ChannelId, ClientName, ExternalSessionId, RuntimeStore, Store};
 use chrono::Utc;
+use rusqlite::Connection;
 use serde_json::json;
 use uuid::Uuid;
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
+
+#[test]
+fn permission_modes_have_canonical_product_authority_profiles() {
+    assert_eq!(PermissionMode::Plan.profile(), PermissionProfile::ReadOnly);
+    assert_eq!(
+        PermissionMode::Default.profile(),
+        PermissionProfile::Approval
+    );
+    assert_eq!(
+        PermissionMode::BypassPermissions.profile(),
+        PermissionProfile::FullAccess,
+    );
+}
 
 #[tokio::test(flavor = "current_thread")]
 async fn kernel_persists_provider_events_before_returning_updates() -> TestResult {
@@ -203,6 +218,160 @@ async fn remote_bypass_requires_a_later_exact_confirmation() -> TestResult {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn full_access_authorization_is_durable_before_the_automatic_effect() -> TestResult {
+    let layout = Layout::new()?;
+    let (port, expected_request_digest) = ScriptedPort::automatic_approval()?;
+    let shared = Arc::clone(&port.shared);
+    let kernel = Kernel::start_with_ports(layout.runtime()?, Box::new(port), None).await?;
+    let mut request = new_session(&layout, Frontend::Acp, None)?;
+    request.mode = PermissionMode::BypassPermissions;
+    let session = kernel.new_session(request).await?;
+
+    let outcome = kernel
+        .prompt(session.id(), Prompt::new(vec!["run the tests".into()])?)
+        .await?;
+
+    assert_eq!(outcome.stop_reason, PromptStopReason::EndTurn);
+    assert_eq!(shared.lock().unwrap().allowed_effects, 1);
+    assert!(!outcome.updates.iter().any(|update| matches!(
+        update,
+        carl::acp::KernelUpdate::AgentMessageChunk(message)
+            if message.contains("Approval required")
+    )));
+    assert_eq!(
+        outcome
+            .updates
+            .iter()
+            .filter(|update| matches!(update, carl::acp::KernelUpdate::ToolCompleted { .. }))
+            .count(),
+        1
+    );
+
+    let events = Store::open(&layout.database)?.read_events(session.id())?;
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event.event, Event::ToolDispatchAuthorized { .. }))
+            .count(),
+        1
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event.event, Event::ApprovalRequested { .. }))
+    );
+    let proposed = events
+        .iter()
+        .find(|event| matches!(event.event, Event::ToolProposed { .. }))
+        .ok_or("tool proposal was not persisted")?;
+    let authorized = events
+        .iter()
+        .find(|event| matches!(event.event, Event::ToolDispatchAuthorized { .. }))
+        .ok_or("tool authorization was not persisted")?;
+    let completed = events
+        .iter()
+        .find(|event| matches!(event.event, Event::ToolCompleted { .. }))
+        .ok_or("tool completion was not persisted")?;
+    assert!(proposed.sequence < authorized.sequence);
+    assert!(authorized.sequence < completed.sequence);
+    let Event::ToolDispatchAuthorized {
+        tool_call_id,
+        request_digest,
+        automatic,
+    } = &authorized.event
+    else {
+        unreachable!();
+    };
+    assert_eq!(request_digest, &expected_request_digest);
+    assert!(*automatic);
+    assert!(matches!(
+        proposed.event,
+        Event::ToolProposed {
+            tool_call_id: proposed_id,
+            ..
+        } if proposed_id == *tool_call_id
+    ));
+    assert!(matches!(
+        completed.event,
+        Event::ToolCompleted {
+            tool_call_id: completed_id,
+            ..
+        } if completed_id == *tool_call_id
+    ));
+    kernel.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn failed_authorization_append_prevents_the_full_access_effect() -> TestResult {
+    let layout = Layout::new()?;
+    let (port, _expected_request_digest) = ScriptedPort::automatic_approval()?;
+    let shared = Arc::clone(&port.shared);
+    let kernel = Kernel::start_with_ports(layout.runtime()?, Box::new(port), None).await?;
+    let mut request = new_session(&layout, Frontend::Acp, None)?;
+    request.mode = PermissionMode::BypassPermissions;
+    let session = kernel.new_session(request).await?;
+    let connection = Connection::open(&layout.database)?;
+    connection.execute_batch(
+        "CREATE TRIGGER reject_tool_authorization
+         BEFORE INSERT ON events
+         WHEN json_extract(NEW.event_json, '$.type') = 'tool_dispatch_authorized'
+         BEGIN
+             SELECT RAISE(ABORT, 'injected authorization append failure');
+         END;",
+    )?;
+
+    let outcome = kernel
+        .prompt(session.id(), Prompt::new(vec!["run the tests".into()])?)
+        .await;
+
+    assert_eq!(shared.lock().unwrap().allowed_effects, 0);
+    assert_eq!(
+        outcome.unwrap_err().code(),
+        carl::acp::KernelErrorCode::StorageFailed
+    );
+    kernel.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn full_access_denies_unknown_completed_and_cross_turn_approval_items() -> TestResult {
+    for case in [
+        InvalidApprovalCase::Unknown,
+        InvalidApprovalCase::Completed,
+        InvalidApprovalCase::CrossTurn,
+    ] {
+        let layout = Layout::new()?;
+        let port = ScriptedPort::invalid_automatic_approval(case)?;
+        let shared = Arc::clone(&port.shared);
+        let kernel = Kernel::start_with_ports(layout.runtime()?, Box::new(port), None).await?;
+        let mut request = new_session(&layout, Frontend::Acp, None)?;
+        request.mode = PermissionMode::BypassPermissions;
+        let session = kernel.new_session(request).await?;
+
+        let error = kernel
+            .prompt(session.id(), Prompt::new(vec!["run the tests".into()])?)
+            .await
+            .expect_err("an approval must bind to an active item in the current turn");
+
+        assert_eq!(error.code(), carl::acp::KernelErrorCode::ProviderFailed);
+        {
+            let state = shared.lock().unwrap();
+            assert_eq!(state.allowed_effects, 0);
+            assert_eq!(state.resolved, [CodexApprovalDecision::Deny]);
+        }
+        let events = Store::open(&layout.database)?.read_events(session.id())?;
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event.event, Event::ToolDispatchAuthorized { .. }))
+        );
+        kernel.shutdown().await?;
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn active_turn_accepts_steering_rejects_concurrency_and_cancels() -> TestResult {
     let layout = Layout::new()?;
     let port = ScriptedPort::idle()?;
@@ -320,9 +489,17 @@ struct PortState {
     events: VecDeque<CodexEvent>,
     continuation: VecDeque<CodexEvent>,
     resolved: Vec<CodexApprovalDecision>,
+    allowed_effects: usize,
     starts: usize,
     steers: Vec<String>,
     interrupts: usize,
+}
+
+#[derive(Clone, Copy)]
+enum InvalidApprovalCase {
+    Unknown,
+    Completed,
+    CrossTurn,
 }
 
 impl ScriptedPort {
@@ -386,6 +563,102 @@ impl ScriptedPort {
         Ok(port)
     }
 
+    fn automatic_approval() -> TestResult<(Self, String)> {
+        let approval = CodexApprovalRequest::from_provider_request(json!({
+            "id":"approval-auto",
+            "method":"item/commandExecution/requestApproval",
+            "params":{
+                "threadId":"thr_123", "turnId":"turn_123", "itemId":"item_auto",
+                "startedAtMs":2, "command":"cargo test", "reason":"Run the test suite",
+                "cwd":null
+            }
+        }))?;
+        let request_digest = approval.request_digest().to_string();
+        let port = Self::with_events([
+            CodexEvent::ItemStarted {
+                thread_id: thread()?,
+                turn_id: turn()?,
+                item_id: "item_auto".into(),
+            },
+            CodexEvent::ApprovalRequested(approval),
+        ]);
+        port.shared.lock().unwrap().continuation = VecDeque::from([
+            CodexEvent::ItemCompleted {
+                thread_id: thread()?,
+                turn_id: turn()?,
+                item_id: "item_auto".into(),
+            },
+            CodexEvent::TurnCompleted {
+                thread_id: thread()?,
+                turn_id: turn()?,
+                status: "completed".into(),
+            },
+        ]);
+        Ok((port, request_digest))
+    }
+
+    fn invalid_automatic_approval(case: InvalidApprovalCase) -> TestResult<Self> {
+        let approval_turn = match case {
+            InvalidApprovalCase::CrossTurn => "turn_other",
+            InvalidApprovalCase::Unknown | InvalidApprovalCase::Completed => "turn_123",
+        };
+        let approval = CodexApprovalRequest::from_provider_request(json!({
+            "id":"approval-invalid",
+            "method":"item/commandExecution/requestApproval",
+            "params":{
+                "threadId":"thr_123", "turnId":approval_turn, "itemId":"item_invalid",
+                "startedAtMs":2, "command":"cargo test", "reason":"Run the test suite",
+                "cwd":null
+            }
+        }))?;
+        let events = match case {
+            InvalidApprovalCase::Unknown => {
+                vec![CodexEvent::ApprovalRequested(approval)]
+            }
+            InvalidApprovalCase::Completed => vec![
+                CodexEvent::ItemStarted {
+                    thread_id: thread()?,
+                    turn_id: turn()?,
+                    item_id: "item_invalid".into(),
+                },
+                CodexEvent::ItemCompleted {
+                    thread_id: thread()?,
+                    turn_id: turn()?,
+                    item_id: "item_invalid".into(),
+                },
+                CodexEvent::ApprovalRequested(approval),
+            ],
+            InvalidApprovalCase::CrossTurn => vec![
+                CodexEvent::ItemStarted {
+                    thread_id: thread()?,
+                    turn_id: turn()?,
+                    item_id: "item_invalid".into(),
+                },
+                CodexEvent::ApprovalRequested(approval),
+            ],
+        };
+        let port = Self {
+            shared: Arc::new(Mutex::new(PortState {
+                events: events.into(),
+                continuation: VecDeque::new(),
+                resolved: Vec::new(),
+                allowed_effects: 0,
+                starts: 0,
+                steers: Vec::new(),
+                interrupts: 0,
+            })),
+        };
+        if matches!(case, InvalidApprovalCase::CrossTurn) {
+            port.shared.lock().unwrap().continuation =
+                VecDeque::from([CodexEvent::TurnCompleted {
+                    thread_id: thread()?,
+                    turn_id: turn()?,
+                    status: "completed".into(),
+                }]);
+        }
+        Ok(port)
+    }
+
     fn secret_approval() -> TestResult<Self> {
         let approval = CodexApprovalRequest::from_provider_request(json!({
             "id":"approval-secret",
@@ -410,6 +683,7 @@ impl ScriptedPort {
                 events: events.into(),
                 continuation: VecDeque::new(),
                 resolved: Vec::new(),
+                allowed_effects: 0,
                 starts: 0,
                 steers: Vec::new(),
                 interrupts: 0,
@@ -489,6 +763,9 @@ impl CodexPort for ScriptedPort {
         Box::pin(async move {
             let mut state = shared.lock().unwrap();
             state.resolved.push(decision);
+            if decision == CodexApprovalDecision::Allow {
+                state.allowed_effects += 1;
+            }
             let continuation = std::mem::take(&mut state.continuation);
             state.events.extend(continuation);
             Ok(())

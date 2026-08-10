@@ -51,6 +51,13 @@ pub enum PermissionMode {
     BypassPermissions,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PermissionProfile {
+    ReadOnly,
+    Approval,
+    FullAccess,
+}
+
 impl PermissionMode {
     pub const ALL: [Self; 5] = [
         Self::Plan,
@@ -68,6 +75,16 @@ impl PermissionMode {
             Self::AcceptEdits => "acceptEdits",
             Self::DontAsk => "dontAsk",
             Self::BypassPermissions => "bypassPermissions",
+        }
+    }
+
+    #[must_use]
+    pub const fn profile(self) -> PermissionProfile {
+        match self {
+            Self::Plan => PermissionProfile::ReadOnly,
+            Self::Default | Self::AcceptEdits => PermissionProfile::Approval,
+            Self::DontAsk => PermissionProfile::ReadOnly,
+            Self::BypassPermissions => PermissionProfile::FullAccess,
         }
     }
 }

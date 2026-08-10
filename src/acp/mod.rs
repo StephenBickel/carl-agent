@@ -13,7 +13,7 @@ pub use buzz::{
 };
 pub use config::{
     ConfigChange, ConfigError, ConfigErrorCode, ModeActivation, ModelCatalog, ModelDescriptor,
-    PermissionMode, SessionConfiguration, config_options,
+    PermissionMode, PermissionProfile, SessionConfiguration, config_options,
 };
 pub use kernel::{
     CodexPort, Kernel, KernelCommand, KernelHandle, KernelPublisher, PortFuture, PublicationFailure,

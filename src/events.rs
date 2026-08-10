@@ -12,7 +12,7 @@ use crate::runtime::subscription::{
     RunConfigSnapshot, RunId, RunState, RunTransition, RunTrustLabel,
 };
 
-pub const EVENT_SCHEMA_VERSION: u32 = 3;
+pub const EVENT_SCHEMA_VERSION: u32 = 4;
 
 macro_rules! define_id {
     ($name:ident) => {
@@ -106,6 +106,11 @@ pub enum Event {
         tool_name: String,
         arguments: Value,
     },
+    ToolDispatchAuthorized {
+        tool_call_id: ToolCallId,
+        request_digest: String,
+        automatic: bool,
+    },
     ApprovalRequested {
         approval_id: ApprovalId,
         tool_call_id: ToolCallId,
@@ -188,6 +193,11 @@ enum EventRef<'a> {
         tool_name: &'a str,
         arguments: &'a Value,
     },
+    ToolDispatchAuthorized {
+        tool_call_id: ToolCallId,
+        request_digest: &'a str,
+        automatic: bool,
+    },
     ApprovalRequested {
         approval_id: ApprovalId,
         tool_call_id: ToolCallId,
@@ -253,6 +263,15 @@ impl<'a> From<&'a Event> for EventRef<'a> {
                 tool_call_id: *tool_call_id,
                 tool_name,
                 arguments,
+            },
+            Event::ToolDispatchAuthorized {
+                tool_call_id,
+                request_digest,
+                automatic,
+            } => Self::ToolDispatchAuthorized {
+                tool_call_id: *tool_call_id,
+                request_digest,
+                automatic: *automatic,
             },
             Event::ApprovalRequested {
                 approval_id,
@@ -374,6 +393,14 @@ struct VersionedEventV3 {
     _schema_version: u32,
     #[serde(flatten)]
     payload: EventPayloadV3,
+}
+
+#[derive(Deserialize)]
+struct VersionedEventV4 {
+    #[serde(rename = "schema_version")]
+    _schema_version: u32,
+    #[serde(flatten)]
+    payload: EventPayloadV4,
 }
 
 #[derive(Deserialize)]
@@ -726,6 +753,186 @@ impl From<EventPayloadV3> for Event {
     }
 }
 
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum EventPayloadV4 {
+    UserInput {
+        text: String,
+    },
+    AssistantTextDelta {
+        text: String,
+    },
+    ProviderLifecycle {
+        phase: String,
+        provider_id: Option<String>,
+    },
+    WorkspaceDiffUpdated {
+        diff: String,
+    },
+    ToolProposed {
+        tool_call_id: ToolCallId,
+        tool_name: String,
+        arguments: Value,
+    },
+    ToolDispatchAuthorized {
+        tool_call_id: ToolCallId,
+        request_digest: String,
+        automatic: bool,
+    },
+    ApprovalRequested {
+        approval_id: ApprovalId,
+        tool_call_id: ToolCallId,
+        summary: String,
+    },
+    ToolCompleted {
+        tool_call_id: ToolCallId,
+        output: Value,
+    },
+    TurnCompleted,
+    TurnInterrupted {
+        reason: String,
+    },
+    FrontendSessionBound {
+        frontend: Frontend,
+        external_session_id: String,
+        protocol_version: u32,
+    },
+    FrontendPermissionChanged {
+        external_session_id: String,
+        permission_mode: PermissionMode,
+    },
+    FrontendDeliveryTransitioned {
+        action_digest: String,
+        status: FrontendDeliveryStatus,
+    },
+    SubscriptionRunPrepared {
+        run_id: RunId,
+        run_sequence: u64,
+        configuration: RunConfigSnapshot,
+        state: RunState,
+        trust_label: RunTrustLabel,
+    },
+    SubscriptionRunConfigurationObserved {
+        run_id: RunId,
+        run_sequence: u64,
+        configuration: RunConfigSnapshot,
+        trust_label: RunTrustLabel,
+    },
+    SubscriptionRunTransitioned {
+        run_id: RunId,
+        run_sequence: u64,
+        transition: RunTransition,
+        trust_label: RunTrustLabel,
+    },
+}
+
+impl From<EventPayloadV4> for Event {
+    fn from(payload: EventPayloadV4) -> Self {
+        match payload {
+            EventPayloadV4::UserInput { text } => Self::UserInput { text },
+            EventPayloadV4::AssistantTextDelta { text } => Self::AssistantTextDelta { text },
+            EventPayloadV4::ProviderLifecycle { phase, provider_id } => {
+                Self::ProviderLifecycle { phase, provider_id }
+            }
+            EventPayloadV4::WorkspaceDiffUpdated { diff } => Self::WorkspaceDiffUpdated { diff },
+            EventPayloadV4::ToolProposed {
+                tool_call_id,
+                tool_name,
+                arguments,
+            } => Self::ToolProposed {
+                tool_call_id,
+                tool_name,
+                arguments,
+            },
+            EventPayloadV4::ToolDispatchAuthorized {
+                tool_call_id,
+                request_digest,
+                automatic,
+            } => Self::ToolDispatchAuthorized {
+                tool_call_id,
+                request_digest,
+                automatic,
+            },
+            EventPayloadV4::ApprovalRequested {
+                approval_id,
+                tool_call_id,
+                summary,
+            } => Self::ApprovalRequested {
+                approval_id,
+                tool_call_id,
+                summary,
+            },
+            EventPayloadV4::ToolCompleted {
+                tool_call_id,
+                output,
+            } => Self::ToolCompleted {
+                tool_call_id,
+                output,
+            },
+            EventPayloadV4::TurnCompleted => Self::TurnCompleted,
+            EventPayloadV4::TurnInterrupted { reason } => Self::TurnInterrupted { reason },
+            EventPayloadV4::FrontendSessionBound {
+                frontend,
+                external_session_id,
+                protocol_version,
+            } => Self::FrontendSessionBound {
+                frontend,
+                external_session_id,
+                protocol_version,
+            },
+            EventPayloadV4::FrontendPermissionChanged {
+                external_session_id,
+                permission_mode,
+            } => Self::FrontendPermissionChanged {
+                external_session_id,
+                permission_mode,
+            },
+            EventPayloadV4::FrontendDeliveryTransitioned {
+                action_digest,
+                status,
+            } => Self::FrontendDeliveryTransitioned {
+                action_digest,
+                status,
+            },
+            EventPayloadV4::SubscriptionRunPrepared {
+                run_id,
+                run_sequence,
+                configuration,
+                state,
+                trust_label,
+            } => Self::SubscriptionRunPrepared {
+                run_id,
+                run_sequence,
+                configuration,
+                state,
+                trust_label,
+            },
+            EventPayloadV4::SubscriptionRunConfigurationObserved {
+                run_id,
+                run_sequence,
+                configuration,
+                trust_label,
+            } => Self::SubscriptionRunConfigurationObserved {
+                run_id,
+                run_sequence,
+                configuration,
+                trust_label,
+            },
+            EventPayloadV4::SubscriptionRunTransitioned {
+                run_id,
+                run_sequence,
+                transition,
+                trust_label,
+            } => Self::SubscriptionRunTransitioned {
+                run_id,
+                run_sequence,
+                transition,
+                trust_label,
+            },
+        }
+    }
+}
+
 impl<'de> Deserialize<'de> for Event {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -742,6 +949,9 @@ impl<'de> Deserialize<'de> for Event {
                 .map(|event| event.payload.into())
                 .map_err(|error| D::Error::custom(error.to_string())),
             3 => serde_json::from_value::<VersionedEventV3>(value)
+                .map(|event| event.payload.into())
+                .map_err(|error| D::Error::custom(error.to_string())),
+            4 => serde_json::from_value::<VersionedEventV4>(value)
                 .map(|event| event.payload.into())
                 .map_err(|error| D::Error::custom(error.to_string())),
             unsupported => Err(D::Error::custom(format_args!(

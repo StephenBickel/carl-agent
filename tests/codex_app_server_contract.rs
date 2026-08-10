@@ -8,7 +8,7 @@ use std::process;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use carl::acp::PermissionMode;
+use carl::acp::{PermissionMode, PermissionProfile};
 use carl::delegates::codex::{
     CodexAppServer, CodexApprovalDecision, CodexEvent, StartThread, StartTurn,
 };
@@ -49,6 +49,15 @@ fn test(name: &'static str, body: fn() -> Result<(), Box<dyn Error + Send + Sync
 
 fn handshake_and_thread() -> Result<(), Box<dyn Error + Send + Sync>> {
     run_async(async {
+        assert_eq!(PermissionMode::Plan.profile(), PermissionProfile::ReadOnly);
+        assert_eq!(
+            PermissionMode::Default.profile(),
+            PermissionProfile::Approval
+        );
+        assert_eq!(
+            PermissionMode::BypassPermissions.profile(),
+            PermissionProfile::FullAccess,
+        );
         let layout = TestLayout::new()?;
         let mut server = connect(&layout).await?;
         let models = server.models().await?;
@@ -62,7 +71,7 @@ fn handshake_and_thread() -> Result<(), Box<dyn Error + Send + Sync>> {
             .start_thread(StartThread {
                 cwd: layout.workspace.clone(),
                 model: Some(ModelId::parse("gpt-5.6-codex")?),
-                mode: PermissionMode::Default,
+                mode: PermissionMode::BypassPermissions,
             })
             .await?;
         assert_eq!(thread.as_str(), "thr_123");
@@ -79,7 +88,7 @@ fn handshake_and_thread() -> Result<(), Box<dyn Error + Send + Sync>> {
         );
         assert_eq!(requests[4]["params"]["model"], "gpt-5.6-codex");
         assert_eq!(requests[4]["params"]["approvalPolicy"], "on-request");
-        assert_eq!(requests[4]["params"]["sandbox"], "workspace-write");
+        assert_eq!(requests[4]["params"]["sandbox"], "read-only");
         assert_eq!(requests[4]["params"]["ephemeral"], false);
         assert!(requests[4]["params"].get("mcpServers").is_none());
         server.cancel().await?;
@@ -282,11 +291,13 @@ fn app_server_fixture() -> i32 {
             }),
             Some("thread/start") => {
                 let thread = thread(&home);
+                let approval_policy = request["params"]["approvalPolicy"].clone();
+                let sandbox = request["params"]["sandbox"].clone();
                 let result = json!({
                     "thread":thread, "model":"gpt-5.6-codex", "modelProvider":"openai",
                     "cwd":workspace_for(&home),
-                    "approvalPolicy":"on-request", "approvalsReviewer":"user",
-                    "sandbox":"workspace-write"
+                    "approvalPolicy":approval_policy, "approvalsReviewer":"user",
+                    "sandbox":sandbox
                 });
                 if write_message(&json!({"id":id,"result":result})).is_err()
                     || write_message(&json!({
