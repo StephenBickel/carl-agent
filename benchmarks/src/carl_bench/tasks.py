@@ -53,6 +53,7 @@ class BenchmarkTask:
     workspace_dir: str
     verifier_command: tuple[str, ...]
     verifier_source: Path
+    protected_dir: Path | None
     agent_timeout_sec: int
     verifier_timeout_sec: int
     capabilities: frozenset[str]
@@ -266,6 +267,12 @@ def load_task(path: Path) -> BenchmarkTask:
     _validate_executable(task_dir / "tests" / "test.sh")
     _validate_executable(verifier_source)
 
+    protected_dir = task_dir / "environment" / "protected"
+    if not protected_dir.exists():
+        protected_dir = None
+    elif not protected_dir.is_dir() or protected_dir.is_symlink():
+        raise TaskContractError("task_source_entry_unsupported")
+
     try:
         instruction = _read_required(task_dir / "instruction.md", maximum=65_536).decode("utf-8")
     except UnicodeError as error:
@@ -290,6 +297,7 @@ def load_task(path: Path) -> BenchmarkTask:
         workspace_dir=workspace_dir,
         verifier_command=tuple(command),
         verifier_source=verifier_source,
+        protected_dir=protected_dir,
         agent_timeout_sec=agent_timeout,
         verifier_timeout_sec=verifier_timeout,
         capabilities=capabilities,

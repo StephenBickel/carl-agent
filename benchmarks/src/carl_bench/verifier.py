@@ -153,7 +153,11 @@ class Verifier:
         self._output_limit_bytes = output_limit_bytes
 
     async def run(
-        self, task: BenchmarkTask, workspace: Path, private_dir: Path
+        self,
+        task: BenchmarkTask,
+        workspace: Path,
+        private_dir: Path,
+        protected_dir: Path | None = None,
     ) -> VerificationOutcome:
         started = time.monotonic()
         if not _private_directory_safe(private_dir):
@@ -177,14 +181,25 @@ class Verifier:
             "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
             "PYTHONIOENCODING": "utf-8",
         }
-        command = (
+        command = [
             sys.executable,
             os.fspath(task.verifier_source),
             "--workspace",
             os.fspath(workspace),
             "--result",
             os.fspath(result_path),
-        )
+        ]
+        if task.protected_dir is not None:
+            if (
+                protected_dir is None
+                or not protected_dir.is_absolute()
+                or not protected_dir.is_dir()
+                or protected_dir.is_symlink()
+            ):
+                return VerificationOutcome.invalid(
+                    "verifier_workspace_unsafe", _elapsed_ms(started)
+                )
+            command.extend(["--protected", os.fspath(protected_dir)])
         try:
             process = await asyncio.create_subprocess_exec(
                 *command,

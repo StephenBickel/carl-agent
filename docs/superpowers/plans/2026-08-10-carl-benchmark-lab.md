@@ -337,29 +337,29 @@ Commit: `git commit -m "feat: supervise benchmark verifiers"`
 - `BenchmarkRunner.run(task, adapter, attempt, seed) -> TrialResult` copies task fixture into a fresh `0700` temporary root, records its pre-run digest, invokes one adapter, invokes the verifier, records its post-run digest, and removes the disposable directory unless private debugging was explicitly enabled.
 - The scripted adapter accepts only a repository-relative solution script from the immutable task source and exists for offline plumbing tests, not leaderboard scores.
 
-- [ ] **Step 1: Write failing adapter and isolation tests**
+- [x] **Step 1: Write failing adapter and isolation tests**
 
 Assert adapter identity/version bounds, unique attempt IDs, deterministic seeds, fresh copies between attempts, no mutation of the source fixture, source read-only enforcement, path containment, timeout propagation, cancellation cleanup, and one verifier call after every completed agent attempt.
 
-- [ ] **Step 2: Write failing result-classification tests**
+- [x] **Step 2: Write failing result-classification tests**
 
 Cover adapter pass + verifier pass, adapter pass + verifier fail, agent timeout, agent crash, adapter protocol error, verifier infrastructure error, and cancellation. Assert only valid trials enter numerator/denominator metrics.
 
-- [ ] **Step 3: Run focused tests and verify RED**
+- [x] **Step 3: Run focused tests and verify RED**
 
 Run: `cd benchmarks && uv run pytest tests/test_adapters.py tests/test_runner.py -q`
 
 Expected: FAIL because adapter and runner modules do not exist.
 
-- [ ] **Step 4: Implement the adapter protocol and scripted adapter**
+- [x] **Step 4: Implement the adapter protocol and scripted adapter**
 
 The scripted adapter copies `solution/solve.sh` into the disposable root and executes it there. It inherits only `PATH`, `LANG`, and `LC_ALL`; it never receives a provider key or Carl data path.
 
-- [ ] **Step 5: Implement isolated runner execution**
+- [x] **Step 5: Implement isolated runner execution**
 
 Use `tempfile.TemporaryDirectory(prefix="carl-bench-")`, canonical containment checks, bounded private logs, and stable codes. Save private diagnostics only beneath an explicitly supplied owner-private `--private-results` directory; default behavior discards them.
 
-- [ ] **Step 6: Verify and commit**
+- [x] **Step 6: Verify and commit**
 
 Run focused tests and `uv run ruff check .`.
 

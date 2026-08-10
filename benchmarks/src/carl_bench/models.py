@@ -70,6 +70,7 @@ class AgentRequest:
     workspace: str
     timeout_sec: int
     seed: int
+    scripted_solution: str | None = None
 
     def __post_init__(self) -> None:
         _bounded_string("trial_id", self.trial_id, 128)
@@ -81,6 +82,10 @@ class AgentRequest:
         if not 1 <= self.timeout_sec <= 3_600:
             raise ValueError("timeout_sec must be between 1 and 3600")
         _non_negative("seed", self.seed, (1 << 63) - 1)
+        if self.scripted_solution is not None and (
+            not self.scripted_solution or len(self.scripted_solution.encode("utf-8")) > 4_096
+        ):
+            raise ValueError("scripted_solution must be between 1 and 4096 bytes")
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,8 +99,10 @@ class AgentOutcome:
         {
             "agent_cancelled",
             "agent_exit_nonzero",
+            "agent_output_overflow",
             "agent_protocol_error",
             "agent_timeout",
+            "verifier_failed",
         }
     )
 
@@ -146,9 +153,14 @@ class TrialResult:
         {
             "runner_cancelled",
             "runner_internal_error",
+            "runner_task_source_changed",
+            "verifier_exit_nonzero",
             "verifier_invalid_output",
+            "verifier_output_overflow",
+            "verifier_private_dir_unsafe",
             "verifier_timeout",
             "verifier_unavailable",
+            "verifier_workspace_unsafe",
         }
     )
 
@@ -233,6 +245,8 @@ class TrialResult:
         code: str,
         elapsed_ms: int,
         tool_calls: int | None = None,
+        checks_passed: int | None = None,
+        checks_total: int | None = None,
     ) -> TrialResult:
         return cls(
             trial_id=trial_id,
@@ -247,6 +261,8 @@ class TrialResult:
             failure_class=FailureClass.AGENT,
             failure_code=code,
             tool_calls=tool_calls,
+            checks_passed=checks_passed,
+            checks_total=checks_total,
         )
 
     @classmethod

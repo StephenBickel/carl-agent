@@ -39,42 +39,46 @@ def canonical_json_bytes(value: Any) -> bytes:
 
 def sha256_file(path: Path) -> str:
     """Hash one regular file without following symbolic links."""
-    try:
-        before = path.lstat()
-    except OSError as error:
-        raise CanonicalizationError("file_unavailable") from error
-    if not stat.S_ISREG(before.st_mode) or stat.S_ISLNK(before.st_mode):
-        raise CanonicalizationError("file_not_regular")
+    for retry in range(3):
+        try:
+            before = path.lstat()
+        except OSError as error:
+            raise CanonicalizationError("file_unavailable") from error
+        if not stat.S_ISREG(before.st_mode) or stat.S_ISLNK(before.st_mode):
+            raise CanonicalizationError("file_not_regular")
 
-    digest = hashlib.sha256()
-    total = 0
-    try:
-        with path.open("rb") as source:
-            while chunk := source.read(64 * 1024):
-                total += len(chunk)
-                if total > MAX_FILE_BYTES:
-                    raise CanonicalizationError("file_too_large")
-                digest.update(chunk)
-        after = path.lstat()
-    except CanonicalizationError:
-        raise
-    except OSError as error:
-        raise CanonicalizationError("file_unavailable") from error
-    if (
-        before.st_dev,
-        before.st_ino,
-        before.st_size,
-        before.st_mtime_ns,
-        before.st_mode,
-    ) != (
-        after.st_dev,
-        after.st_ino,
-        after.st_size,
-        after.st_mtime_ns,
-        after.st_mode,
-    ):
-        raise CanonicalizationError("file_changed_during_hash")
-    return digest.hexdigest()
+        digest = hashlib.sha256()
+        total = 0
+        try:
+            with path.open("rb") as source:
+                while chunk := source.read(64 * 1024):
+                    total += len(chunk)
+                    if total > MAX_FILE_BYTES:
+                        raise CanonicalizationError("file_too_large")
+                    digest.update(chunk)
+            after = path.lstat()
+        except CanonicalizationError:
+            raise
+        except OSError as error:
+            raise CanonicalizationError("file_unavailable") from error
+        stable_identity = (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mode,
+        ) == (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mode,
+        )
+        if not stable_identity:
+            raise CanonicalizationError("file_changed_during_hash")
+        if before.st_mtime_ns == after.st_mtime_ns:
+            return digest.hexdigest()
+        if retry == 2:
+            raise CanonicalizationError("file_changed_during_hash")
+    raise AssertionError("unreachable")
 
 
 def _update_field(digest: Any, value: bytes) -> None:
