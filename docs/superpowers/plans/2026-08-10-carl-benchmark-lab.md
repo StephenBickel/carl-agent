@@ -209,25 +209,25 @@ Commit: `git commit -m "feat: hash and sanitize benchmark evidence"`
 }
 ```
 
-- [ ] **Step 1: Write failing task-contract tests**
+- [x] **Step 1: Write failing task-contract tests**
 
 Assert a valid fixture loads with a stable digest. Build each invalid variant from that fixture in pytest's `tmp_path`, then reject unknown JSON keys, unsupported schema/track/capability, missing Harbor files, absolute or traversal fixture paths, shell-string commands, duplicate task names, public tasks without solutions, `network_mode != "none"`, Harbor and Carl timeout disagreement, writable source task paths, symlinks, and executable verifier files missing from the tree.
 
-- [ ] **Step 2: Run focused tests and verify RED**
+- [x] **Step 2: Run focused tests and verify RED**
 
 Run: `cd benchmarks && uv run pytest tests/test_tasks.py -q`
 
 Expected: FAIL because `carl_bench.tasks` does not exist.
 
-- [ ] **Step 3: Implement strict task loading**
+- [x] **Step 3: Implement strict task loading**
 
 Use `tomllib` and standard JSON. Permit only `coding`, `workflow`, and `safety` tracks in this milestone. Require Harbor `[environment].network_mode = "none"`. Compute identity only after all path and size checks pass.
 
-- [ ] **Step 4: Implement deterministic task discovery**
+- [x] **Step 4: Implement deterministic task discovery**
 
 Return tasks sorted by UTF-8 task ID. Reject duplicates before returning any task. Discovery errors identify only the repository-relative task directory and stable code.
 
-- [ ] **Step 5: Verify and commit**
+- [x] **Step 5: Verify and commit**
 
 Run focused tests and `uv run ruff check .`.
 
