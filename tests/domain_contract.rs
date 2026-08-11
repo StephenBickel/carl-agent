@@ -1,4 +1,5 @@
 use carl::acp::PermissionMode;
+use carl::delegates::{ModelId, ReasoningEffort};
 use carl::error::{BudgetResource, CarlError, ErrorCode};
 use carl::events::{
     ApprovalId, EVENT_SCHEMA_VERSION, Event, EventEnvelope, EventId, FrontendDeliveryStatus,
@@ -6,8 +7,10 @@ use carl::events::{
 };
 use carl::policy::Frontend;
 use carl::runtime::budget::{BudgetTracker, TurnBudget};
+use carl::runtime::task::{CompletionContract, TaskBudget, TaskEvent, TaskId};
 use chrono::{TimeZone, Utc};
 use serde_json::{Value, json};
+use std::path::PathBuf;
 
 #[test]
 fn every_event_has_a_stable_type_and_schema_version() -> Result<(), Box<dyn std::error::Error>> {
@@ -16,6 +19,9 @@ fn every_event_has_a_stable_type_and_schema_version() -> Result<(), Box<dyn std:
     )?);
     let approval_id = ApprovalId::from_uuid(uuid::Uuid::parse_str(
         "22222222-2222-4222-8222-222222222222",
+    )?);
+    let task_id = TaskId::from_uuid(uuid::Uuid::parse_str(
+        "33333333-3333-4333-8333-333333333333",
     )?);
     let cases = [
         (
@@ -108,6 +114,53 @@ fn every_event_has_a_stable_type_and_schema_version() -> Result<(), Box<dyn std:
                 "schema_version": 4,
                 "type": "turn_interrupted",
                 "reason": "cancelled",
+            }),
+        ),
+        (
+            Event::TaskLifecycle {
+                task_id,
+                event: TaskEvent::Created {
+                    session_id: SessionId::from_uuid(uuid::Uuid::parse_str(
+                        "44444444-4444-4444-8444-444444444444",
+                    )?),
+                    workspace: PathBuf::from("/workspace"),
+                    contract: CompletionContract {
+                        version: 1,
+                        goal: "finish".into(),
+                        constraints: vec![],
+                        clauses: vec![],
+                    },
+                    budget: TaskBudget::default(),
+                    model: ModelId::parse("gpt-5.6-sol")?,
+                    effort: ReasoningEffort::High,
+                    permission_mode: PermissionMode::BypassPermissions,
+                },
+            },
+            json!({
+                "schema_version": 4,
+                "type": "task_lifecycle",
+                "task_id": "33333333-3333-4333-8333-333333333333",
+                "event": {
+                    "task_event": "created",
+                    "session_id": "44444444-4444-4444-8444-444444444444",
+                    "workspace": "/workspace",
+                    "contract": {
+                        "version": 1,
+                        "goal": "finish",
+                        "constraints": [],
+                        "clauses": [],
+                    },
+                    "budget": {
+                        "max_wall_time_seconds": null,
+                        "max_provider_requests": null,
+                        "max_tool_calls": null,
+                        "soft_epoch_seconds": 900,
+                        "soft_epoch_tool_calls": 40,
+                    },
+                    "model": "gpt-5.6-sol",
+                    "effort": "high",
+                    "permission_mode": "bypassPermissions",
+                },
             }),
         ),
     ];

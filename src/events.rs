@@ -11,6 +11,7 @@ use crate::policy::Frontend;
 use crate::runtime::subscription::{
     RunConfigSnapshot, RunId, RunState, RunTransition, RunTrustLabel,
 };
+use crate::runtime::task::{TaskEvent, TaskId};
 
 pub const EVENT_SCHEMA_VERSION: u32 = 4;
 
@@ -156,6 +157,10 @@ pub enum Event {
         transition: RunTransition,
         trust_label: RunTrustLabel,
     },
+    TaskLifecycle {
+        task_id: TaskId,
+        event: TaskEvent,
+    },
 }
 
 impl Event {
@@ -242,6 +247,10 @@ enum EventRef<'a> {
         run_sequence: u64,
         transition: &'a RunTransition,
         trust_label: RunTrustLabel,
+    },
+    TaskLifecycle {
+        task_id: TaskId,
+        event: &'a TaskEvent,
     },
 }
 
@@ -348,6 +357,10 @@ impl<'a> From<&'a Event> for EventRef<'a> {
                 run_sequence: *run_sequence,
                 transition,
                 trust_label: *trust_label,
+            },
+            Event::TaskLifecycle { task_id, event } => Self::TaskLifecycle {
+                task_id: *task_id,
+                event,
             },
         }
     }
@@ -824,6 +837,10 @@ enum EventPayloadV4 {
         transition: RunTransition,
         trust_label: RunTrustLabel,
     },
+    TaskLifecycle {
+        task_id: TaskId,
+        event: TaskEvent,
+    },
 }
 
 impl From<EventPayloadV4> for Event {
@@ -929,6 +946,9 @@ impl From<EventPayloadV4> for Event {
                 transition,
                 trust_label,
             },
+            EventPayloadV4::TaskLifecycle { task_id, event } => {
+                Self::TaskLifecycle { task_id, event }
+            }
         }
     }
 }
