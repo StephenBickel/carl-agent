@@ -99,14 +99,20 @@ fn oversized_frames_and_control_identifiers_are_rejected() {
 
 #[test]
 fn request_ids_are_unique_and_idempotency_keys_bind_one_command_digest() -> TestResult {
-    let first = status_request("request-1", "key-1");
+    let task_id = TaskId::new();
+    let first = ServiceRequest {
+        protocol_version: SERVICE_PROTOCOL_VERSION,
+        request_id: "request-1".to_owned(),
+        idempotency_key: "key-1".to_owned(),
+        command: ServiceCommand::Cancel { task_id },
+    };
     let same = ServiceRequest {
         request_id: "request-2".to_owned(),
         ..first.clone()
     };
     let different = ServiceRequest {
         request_id: "request-3".to_owned(),
-        command: ServiceCommand::List,
+        command: ServiceCommand::Resume { task_id },
         ..first.clone()
     };
     let mut ledger = RequestLedger::default();
@@ -186,6 +192,57 @@ fn service_info_is_a_versioned_bounded_negotiation_command() -> TestResult {
     assert_eq!(
         decode_request_line(&encoded, &mut RequestLedger::default())?,
         request
+    );
+    Ok(())
+}
+
+#[test]
+fn read_polling_outlives_the_bounded_request_id_replay_window() -> TestResult {
+    let task_id = TaskId::new();
+    let mut ledger = RequestLedger::default();
+    for index in 0..8_200_u32 {
+        let request = ServiceRequest {
+            protocol_version: SERVICE_PROTOCOL_VERSION,
+            request_id: format!("poll-{index}"),
+            idempotency_key: format!("read-{index}"),
+            command: if index % 2 == 0 {
+                ServiceCommand::Status { task_id }
+            } else {
+                ServiceCommand::Events {
+                    task_id,
+                    after_sequence: Some(u64::from(index)),
+                    limit: 128,
+                }
+            },
+        };
+        assert_eq!(
+            decode_request_line(&encode_request(&request)?, &mut ledger)?,
+            request,
+            "read request {index} must not permanently fill the connection ledger"
+        );
+    }
+
+    let recent = ServiceRequest {
+        protocol_version: SERVICE_PROTOCOL_VERSION,
+        request_id: "poll-8199".to_owned(),
+        idempotency_key: "another-read-key".to_owned(),
+        command: ServiceCommand::List,
+    };
+    assert_eq!(
+        decode_request_line(&encode_request(&recent)?, &mut ledger)
+            .expect_err("a recent request ID remains replay-protected")
+            .code(),
+        ProtocolErrorCode::DuplicateRequestId
+    );
+
+    let evicted = ServiceRequest {
+        request_id: "poll-0".to_owned(),
+        ..recent
+    };
+    assert_eq!(
+        decode_request_line(&encode_request(&evicted)?, &mut ledger)?,
+        evicted,
+        "an evicted read request ID must not fail forever"
     );
     Ok(())
 }

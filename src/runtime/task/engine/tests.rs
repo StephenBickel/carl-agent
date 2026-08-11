@@ -13,9 +13,49 @@ use crate::policy::{Frontend, Sha256Digest};
 use crate::runtime::agent_port::{
     AgentCapabilities, AgentEffectKind, AgentFuture, AgentModel, AgentProcess, AgentRequestId,
 };
-use crate::storage::{ClientName, ExternalSessionId, NewFrontendSession};
+use crate::storage::{
+    ClientName, ExternalSessionId, NewFrontendSession, TrustedFrontendOwnerInput,
+};
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
+
+#[test]
+fn trusted_taskless_session_configuration_persists_the_explicit_ceiling() -> TestResult {
+    let fixture = Fixture::new()?;
+    let store = Store::open(&fixture.database)?;
+    let actor_id = ActorId::parse("b".repeat(64))?;
+    store.trust_frontend_owner(TrustedFrontendOwnerInput {
+        frontend: Frontend::Buzz,
+        actor_id: actor_id.clone(),
+        workspace: fixture.workspace.clone(),
+        permission_mode: PermissionMode::FullAccess,
+        trusted_at: Utc::now(),
+    })?;
+    let engine = TaskEngine::new(store, ApprovalPort::approval());
+    engine.configure_owner_session(OwnerConfigureSession {
+        external_session_id: "taskless-session".to_owned(),
+        workspace: fixture.workspace.clone(),
+        permission_mode: PermissionMode::Plan,
+        admission: OwnerTrustedAdmission {
+            frontend: Frontend::Buzz,
+            actor_id,
+            channel_id: "11111111-1111-4111-8111-111111111111".to_owned(),
+            event_id: "a".repeat(64),
+            recover_existing: false,
+        },
+    })?;
+
+    let binding = engine
+        .store()
+        .get_frontend_session("taskless-session")?
+        .ok_or("taskless binding missing")?;
+    assert_eq!(binding.permission_mode, PermissionMode::Plan);
+    assert_eq!(
+        binding.channel_id.as_ref().map(ChannelId::as_str),
+        Some("11111111-1111-4111-8111-111111111111")
+    );
+    Ok(())
+}
 
 struct ApprovalPort {
     events: VecDeque<AgentEvent>,

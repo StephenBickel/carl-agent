@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -7,9 +7,11 @@ use thiserror::Error;
 
 use crate::acp::PermissionMode;
 use crate::delegates::{ModelId, ReasoningEffort};
-use crate::events::{EventEnvelope, SessionId};
+use crate::events::{EventEnvelope, SessionId, TurnId};
 use crate::policy::{ActorId, Frontend};
-use crate::runtime::task::{CheckpointId, CompletionClause, TaskId, TaskSnapshot, TaskStatus};
+use crate::runtime::task::{
+    CheckpointId, CompletionClause, OperationId, TaskId, TaskSnapshot, TaskStatus,
+};
 
 pub const SERVICE_PROTOCOL_VERSION: u16 = 1;
 pub const MAX_SERVICE_FRAME_BYTES: usize = 256 * 1024;
@@ -41,6 +43,28 @@ pub enum ServiceCommand {
     },
     StartTask(StartTaskCommand),
     StartTrustedTask(TrustedStartTaskCommand),
+    ConfigureTrustedSession {
+        external_session_id: String,
+        workspace: PathBuf,
+        frontend: Frontend,
+        actor_id: ActorId,
+        channel_id: String,
+        event_id: String,
+        permission_mode: PermissionMode,
+    },
+    ResolveApproval {
+        task_id: TaskId,
+        external_session_id: String,
+        workspace: PathBuf,
+        frontend: Frontend,
+        actor_id: ActorId,
+        channel_id: Option<String>,
+        event_id: Option<String>,
+        display_code: String,
+        session_id: SessionId,
+        turn_id: TurnId,
+        decision: ServiceApprovalDecision,
+    },
     Status {
         task_id: TaskId,
     },
@@ -76,6 +100,11 @@ pub enum ServiceCommand {
         after_sequence: Option<u64>,
         limit: u16,
     },
+    LiveUpdates {
+        task_id: TaskId,
+        after_cursor: Option<u64>,
+        limit: u16,
+    },
     Shutdown,
 }
 
@@ -98,6 +127,13 @@ pub struct TrustedStartTaskCommand {
     pub actor_id: ActorId,
     pub channel_id: String,
     pub event_id: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceApprovalDecision {
+    Approve,
+    Deny,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -173,7 +209,23 @@ pub enum ServiceResult {
     Snapshot(TaskSnapshot),
     TaskList(Vec<TaskSnapshot>),
     Events(Vec<EventEnvelope>),
+    LiveUpdates(LiveUpdatePage),
     Applied,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LiveUpdatePage {
+    pub updates: Vec<LiveUpdateEnvelope>,
+    pub cursor: Option<u64>,
+    pub snapshot: Option<TaskSnapshot>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LiveUpdateEnvelope {
+    pub cursor: u64,
+    pub update: TaskUpdate,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -190,9 +242,24 @@ pub enum TaskUpdate {
     ToolCompleted(String),
     AssistantDelta(String),
     Diff(String),
+    ApprovalRequired {
+        task_id: TaskId,
+        operation_id: OperationId,
+        display_code: String,
+        summary: String,
+        request_id: String,
+        session_id: SessionId,
+        turn_id: TurnId,
+        external_session_id: String,
+    },
     Checkpoint(CheckpointId),
-    ContextUsage { used: u64, window: u64 },
-    Compaction { generation: u32 },
+    ContextUsage {
+        used: u64,
+        window: u64,
+    },
+    Compaction {
+        generation: u32,
+    },
     CompletionClauses(Vec<CompletionClause>),
 }
 
@@ -238,7 +305,9 @@ impl ProtocolError {
 #[derive(Debug, Default)]
 pub struct RequestLedger {
     request_ids: BTreeSet<String>,
+    request_order: VecDeque<String>,
     idempotency_digests: BTreeMap<String, [u8; 32]>,
+    idempotency_order: VecDeque<String>,
 }
 
 pub fn decode_request_line(
@@ -283,26 +352,61 @@ impl RequestLedger {
         if self.request_ids.contains(&request.request_id) {
             return Err(protocol_error(ProtocolErrorCode::DuplicateRequestId));
         }
-        let digest = command_digest(&request.command)?;
-        if let Some(existing) = self.idempotency_digests.get(&request.idempotency_key)
-            && existing != &digest
-        {
-            return Err(protocol_error(ProtocolErrorCode::IdempotencyConflict));
-        }
+        let mutation_digest = if is_mutation(&request.command) {
+            let digest = command_digest(&request.command)?;
+            if self
+                .idempotency_digests
+                .get(&request.idempotency_key)
+                .is_some_and(|existing| existing != &digest)
+            {
+                return Err(protocol_error(ProtocolErrorCode::IdempotencyConflict));
+            }
+            Some(digest)
+        } else {
+            None
+        };
         if self.request_ids.len() >= MAX_REQUESTS_PER_CONNECTION
-            || (self.idempotency_digests.len() >= MAX_REQUESTS_PER_CONNECTION
-                && !self
-                    .idempotency_digests
-                    .contains_key(&request.idempotency_key))
+            && let Some(evicted) = self.request_order.pop_front()
         {
-            return Err(protocol_error(ProtocolErrorCode::LedgerFull));
+            self.request_ids.remove(&evicted);
         }
         self.request_ids.insert(request.request_id.clone());
-        self.idempotency_digests
-            .entry(request.idempotency_key.clone())
-            .or_insert(digest);
+        self.request_order.push_back(request.request_id.clone());
+
+        if let Some(digest) = mutation_digest
+            && !self
+                .idempotency_digests
+                .contains_key(&request.idempotency_key)
+        {
+            if self.idempotency_digests.len() >= MAX_REQUESTS_PER_CONNECTION
+                && let Some(evicted) = self.idempotency_order.pop_front()
+            {
+                self.idempotency_digests.remove(&evicted);
+            }
+            self.idempotency_digests
+                .insert(request.idempotency_key.clone(), digest);
+            self.idempotency_order
+                .push_back(request.idempotency_key.clone());
+        }
         Ok(())
     }
+}
+
+#[must_use]
+pub const fn is_mutation(command: &ServiceCommand) -> bool {
+    matches!(
+        command,
+        ServiceCommand::StartTask(_)
+            | ServiceCommand::StartTrustedTask(_)
+            | ServiceCommand::ConfigureTrustedSession { .. }
+            | ServiceCommand::ResolveApproval { .. }
+            | ServiceCommand::Resume { .. }
+            | ServiceCommand::Steer { .. }
+            | ServiceCommand::SteerTrusted { .. }
+            | ServiceCommand::Cancel { .. }
+            | ServiceCommand::Configure { .. }
+            | ServiceCommand::Shutdown
+    )
 }
 
 fn validate_request(request: &ServiceRequest) -> Result<(), ProtocolError> {
@@ -321,8 +425,53 @@ fn validate_request(request: &ServiceRequest) -> Result<(), ProtocolError> {
             validate_bounded_text(&command.channel_id, MAX_IDENTIFIER_BYTES, false)?;
             validate_hex_digest(&command.event_id)?;
         }
+        ServiceCommand::ConfigureTrustedSession {
+            external_session_id,
+            workspace: _,
+            frontend,
+            actor_id: _,
+            channel_id,
+            event_id,
+            permission_mode: _,
+        } => {
+            if *frontend != Frontend::Buzz {
+                return Err(protocol_error(ProtocolErrorCode::InvalidRequest));
+            }
+            validate_bounded_text(external_session_id, MAX_EXTERNAL_SESSION_BYTES, false)?;
+            validate_bounded_text(channel_id, MAX_IDENTIFIER_BYTES, false)?;
+            validate_hex_digest(event_id)?;
+        }
         ServiceCommand::Steer { text, .. } => {
             validate_bounded_text(text, MAX_TASK_TEXT_BYTES, true)?;
+        }
+        ServiceCommand::ResolveApproval {
+            external_session_id,
+            frontend,
+            channel_id,
+            event_id,
+            display_code,
+            ..
+        } => {
+            validate_bounded_text(external_session_id, MAX_EXTERNAL_SESSION_BYTES, false)?;
+            validate_bounded_text(display_code, MAX_IDENTIFIER_BYTES, false)?;
+            match frontend {
+                Frontend::Buzz => {
+                    validate_bounded_text(
+                        channel_id
+                            .as_deref()
+                            .ok_or_else(|| protocol_error(ProtocolErrorCode::InvalidRequest))?,
+                        MAX_IDENTIFIER_BYTES,
+                        false,
+                    )?;
+                    validate_hex_digest(
+                        event_id
+                            .as_deref()
+                            .ok_or_else(|| protocol_error(ProtocolErrorCode::InvalidRequest))?,
+                    )?;
+                }
+                Frontend::Acp if channel_id.is_none() && event_id.is_none() => {}
+                _ => return Err(protocol_error(ProtocolErrorCode::InvalidRequest)),
+            }
         }
         ServiceCommand::Session {
             external_session_id,
@@ -343,7 +492,9 @@ fn validate_request(request: &ServiceRequest) -> Result<(), ProtocolError> {
             validate_bounded_text(channel_id, MAX_IDENTIFIER_BYTES, false)?;
             validate_hex_digest(event_id)?;
         }
-        ServiceCommand::Events { limit, .. } if !(1..=512).contains(limit) => {
+        ServiceCommand::Events { limit, .. } | ServiceCommand::LiveUpdates { limit, .. }
+            if !(1..=512).contains(limit) =>
+        {
             return Err(protocol_error(ProtocolErrorCode::InvalidEventLimit));
         }
         ServiceCommand::Info
@@ -353,6 +504,7 @@ fn validate_request(request: &ServiceRequest) -> Result<(), ProtocolError> {
         | ServiceCommand::Cancel { .. }
         | ServiceCommand::Configure { .. }
         | ServiceCommand::Events { .. }
+        | ServiceCommand::LiveUpdates { .. }
         | ServiceCommand::Shutdown => {}
     }
     Ok(())

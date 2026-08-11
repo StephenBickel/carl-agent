@@ -2,6 +2,8 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use chrono::{TimeDelta, Utc};
@@ -179,6 +181,10 @@ pub(crate) enum TaskEngineControl {
         input: OwnerTrustedMessage,
         reply: oneshot::Sender<Result<(), TaskEngineError>>,
     },
+    ConfigureOwnerSession {
+        input: OwnerConfigureSession,
+        reply: oneshot::Sender<Result<(), TaskEngineError>>,
+    },
     Steer {
         task_id: TaskId,
         text: String,
@@ -228,10 +234,18 @@ pub(crate) struct OwnerTrustedAdmission {
     pub actor_id: ActorId,
     pub channel_id: String,
     pub event_id: String,
+    pub recover_existing: bool,
 }
 
 pub(crate) struct OwnerTrustedMessage {
     pub workspace: PathBuf,
+    pub admission: OwnerTrustedAdmission,
+}
+
+pub(crate) struct OwnerConfigureSession {
+    pub external_session_id: String,
+    pub workspace: PathBuf,
+    pub permission_mode: PermissionMode,
     pub admission: OwnerTrustedAdmission,
 }
 
@@ -246,9 +260,14 @@ pub(crate) struct TaskEngineFrontendContext {
 }
 
 pub(crate) struct TaskEnginePermissionNotice {
+    pub task_id: TaskId,
+    pub operation_id: OperationId,
     pub display_code: String,
     pub summary: String,
     pub request_id: String,
+    pub session_id: SessionId,
+    pub turn_id: crate::events::TurnId,
+    pub external_session_id: ExternalSessionId,
 }
 
 struct RuntimeTask {
@@ -337,11 +356,77 @@ pub struct TaskEngine<P: AgentPort, S: TaskEngineStore = Store> {
     store: S,
     port: P,
     tasks: HashMap<TaskId, RuntimeTask>,
-    updates: Vec<TaskEngineUpdate>,
+    updates: TaskEngineUpdates,
     controls: Option<mpsc::Receiver<TaskEngineControl>>,
     acknowledgements: Option<mpsc::Sender<TaskEngineAcknowledgement>>,
     frontend_context: Option<TaskEngineFrontendContext>,
     permission_notices: Option<mpsc::Sender<TaskEnginePermissionNotice>>,
+}
+
+#[derive(Default)]
+struct TaskEngineUpdates {
+    pending: Vec<TaskEngineUpdate>,
+    sink: Option<TaskEngineUpdateSink>,
+    emitted_count: usize,
+    emitted_bytes: usize,
+}
+
+struct TaskEngineUpdateSink {
+    sender: mpsc::Sender<(TaskId, TaskEngineUpdate)>,
+    overflow: Arc<AtomicU64>,
+}
+
+impl TaskEngineUpdates {
+    fn push(&mut self, update: TaskEngineUpdate) {
+        if self.sink.is_some() {
+            self.account(&update);
+        } else {
+            self.pending.push(update);
+        }
+    }
+
+    fn push_live(&mut self, task_id: TaskId, update: TaskEngineUpdate) {
+        let Some(sink) = &self.sink else {
+            self.pending.push(update);
+            return;
+        };
+        self.emitted_count = self.emitted_count.saturating_add(1);
+        self.emitted_bytes = self
+            .emitted_bytes
+            .saturating_add(engine_update_size(&update));
+        if matches!(
+            sink.sender.try_send((task_id, update)),
+            Err(mpsc::error::TrySendError::Full(_))
+        ) {
+            sink.overflow.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.sink
+            .as_ref()
+            .map_or(self.pending.len(), |_| self.emitted_count)
+    }
+
+    fn bytes(&self) -> usize {
+        self.sink.as_ref().map_or_else(
+            || self.pending.iter().map(engine_update_size).sum(),
+            |_| self.emitted_bytes,
+        )
+    }
+
+    fn account(&mut self, update: &TaskEngineUpdate) {
+        self.emitted_count = self.emitted_count.saturating_add(1);
+        self.emitted_bytes = self
+            .emitted_bytes
+            .saturating_add(engine_update_size(update));
+    }
+
+    fn take(&mut self) -> Vec<TaskEngineUpdate> {
+        self.emitted_count = 0;
+        self.emitted_bytes = 0;
+        std::mem::take(&mut self.pending)
+    }
 }
 
 impl<P: AgentPort, S: TaskEngineStore> fmt::Debug for TaskEngine<P, S> {
@@ -361,7 +446,7 @@ impl<P: AgentPort> TaskEngine<P, Store> {
             store,
             port,
             tasks: HashMap::new(),
-            updates: Vec::new(),
+            updates: TaskEngineUpdates::default(),
             controls: None,
             acknowledgements: None,
             frontend_context: None,
@@ -377,7 +462,7 @@ impl<P: AgentPort> TaskEngine<P, RuntimeStore> {
             store,
             port,
             tasks: HashMap::new(),
-            updates: Vec::new(),
+            updates: TaskEngineUpdates::default(),
             controls: None,
             acknowledgements: None,
             frontend_context: None,
@@ -414,16 +499,14 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
 
     #[must_use]
     pub fn take_updates(&mut self) -> Vec<TaskEngineUpdate> {
-        std::mem::take(&mut self.updates)
+        self.updates.take()
     }
 
     fn can_accumulate_update(&self, additional_bytes: usize) -> bool {
         self.updates.len() < MAX_ENGINE_UPDATES.saturating_sub(1)
             && self
                 .updates
-                .iter()
-                .map(engine_update_size)
-                .sum::<usize>()
+                .bytes()
                 .saturating_add(additional_bytes)
                 .saturating_add(RESERVED_STATUS_UPDATE_BYTES)
                 <= MAX_ENGINE_UPDATE_BYTES
@@ -440,8 +523,60 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
         self.permission_notices = Some(permission_notices);
     }
 
+    pub(crate) fn install_update_sink(
+        &mut self,
+        sender: mpsc::Sender<(TaskId, TaskEngineUpdate)>,
+        overflow: Arc<AtomicU64>,
+    ) {
+        self.updates.sink = Some(TaskEngineUpdateSink { sender, overflow });
+    }
+
     pub(crate) fn install_frontend_context(&mut self, context: TaskEngineFrontendContext) {
         self.frontend_context = Some(context);
+    }
+
+    pub(crate) fn install_owner_frontend_context(
+        &mut self,
+        task_id: TaskId,
+    ) -> Result<(), TaskEngineError> {
+        let record = self
+            .store()
+            .get_task(task_id)
+            .map_err(storage_error)?
+            .ok_or_else(invalid_task)?;
+        let binding = self
+            .store()
+            .get_frontend_session_for_session(record.snapshot.session_id)
+            .map_err(storage_error)?
+            .ok_or_else(invalid_task)?;
+        let actor_id = match binding.frontend {
+            Frontend::Buzz => {
+                self.store()
+                    .get_trusted_frontend_owner_for_workspace(binding.frontend, &binding.cwd)
+                    .map_err(storage_error)?
+                    .ok_or_else(invalid_task)?
+                    .actor_id
+            }
+            Frontend::Acp => ActorId::parse("local-owner").map_err(|_| invalid_task())?,
+            _ => return Err(invalid_task()),
+        };
+        let turn_id = TurnId::new();
+        self.store_mut()
+            .append(
+                record.snapshot.session_id,
+                Some(turn_id),
+                crate::events::Event::UserInput {
+                    text: "persistent task execution".to_owned(),
+                },
+            )
+            .map_err(storage_error)?;
+        self.install_frontend_context(TaskEngineFrontendContext {
+            session_id: record.snapshot.session_id,
+            turn_id,
+            external_session_id: binding.external_session_id,
+            actor_id,
+        });
+        Ok(())
     }
 
     pub async fn reconcile_startup(&mut self) -> Result<Vec<TaskId>, TaskEngineError> {
@@ -601,6 +736,10 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                 let _ = reply.send(self.admit_owner_message(input));
                 None
             }
+            TaskEngineControl::ConfigureOwnerSession { input, reply } => {
+                let _ = reply.send(self.configure_owner_session(input));
+                None
+            }
             control => Some(control),
         }
     }
@@ -614,8 +753,9 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
             return Err(invalid_task());
         }
         let channel_id = ChannelId::try_from(input.admission.channel_id).map_err(storage_error)?;
-        self.store()
-            .admit_trusted_frontend_message(
+        let store = self.store();
+        let result = if input.admission.recover_existing {
+            store.recover_or_admit_trusted_frontend_message(
                 input.admission.frontend,
                 &input.admission.actor_id,
                 &channel_id,
@@ -623,7 +763,96 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                 &input.admission.event_id,
                 Utc::now(),
             )
-            .map_err(|_| invalid_task())?;
+        } else {
+            store.admit_trusted_frontend_message(
+                input.admission.frontend,
+                &input.admission.actor_id,
+                &channel_id,
+                &workspace,
+                &input.admission.event_id,
+                Utc::now(),
+            )
+        };
+        result.map_err(|_| invalid_task())?;
+        Ok(())
+    }
+
+    fn configure_owner_session(&self, input: OwnerConfigureSession) -> Result<(), TaskEngineError> {
+        let workspace = std::fs::canonicalize(&input.workspace).map_err(|_| invalid_task())?;
+        if workspace != input.workspace
+            || !workspace.is_dir()
+            || input.admission.frontend != Frontend::Buzz
+        {
+            return Err(invalid_task());
+        }
+        let external_session_id =
+            ExternalSessionId::try_from(input.external_session_id).map_err(|_| invalid_task())?;
+        let channel_id = ChannelId::try_from(input.admission.channel_id).map_err(storage_error)?;
+        let now = Utc::now();
+        let store = self.store();
+        let owner = if input.admission.recover_existing {
+            store.recover_or_admit_trusted_frontend_message(
+                input.admission.frontend,
+                &input.admission.actor_id,
+                &channel_id,
+                &workspace,
+                &input.admission.event_id,
+                now,
+            )
+        } else {
+            store.admit_trusted_frontend_message(
+                input.admission.frontend,
+                &input.admission.actor_id,
+                &channel_id,
+                &workspace,
+                &input.admission.event_id,
+                now,
+            )
+        }
+        .map_err(|_| invalid_task())?;
+        let permission_mode =
+            restrict_permission_mode(input.permission_mode, owner.permission_mode);
+        let binding = match store
+            .get_frontend_session(external_session_id.as_str())
+            .map_err(storage_error)?
+        {
+            Some(binding) => {
+                if binding.frontend != input.admission.frontend || binding.cwd != workspace {
+                    return Err(invalid_task());
+                }
+                match binding.channel_id.as_ref() {
+                    None => store
+                        .claim_frontend_channel(&external_session_id, &channel_id, now)
+                        .map_err(storage_error)?,
+                    Some(bound) if bound == &channel_id => binding,
+                    Some(_) => return Err(invalid_task()),
+                }
+            }
+            None => {
+                let session = store.create_session().map_err(storage_error)?;
+                store
+                    .bind_frontend_session(NewFrontendSession {
+                        frontend: input.admission.frontend,
+                        external_session_id: external_session_id.clone(),
+                        session_id: session.id,
+                        cwd: workspace,
+                        protocol_version: 1,
+                        client_name: ClientName::try_from("carl-service").map_err(storage_error)?,
+                        permission_mode,
+                        channel_id: Some(channel_id),
+                        created_at: now,
+                    })
+                    .map_err(storage_error)?
+            }
+        };
+        store
+            .configure_frontend_session(
+                &external_session_id,
+                binding.provider_thread_id.as_ref(),
+                permission_mode,
+                Utc::now(),
+            )
+            .map_err(storage_error)?;
         Ok(())
     }
 
@@ -646,9 +875,9 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                 }
                 let channel_id =
                     ChannelId::try_from(admission.channel_id.clone()).map_err(storage_error)?;
-                let owner = self
-                    .store()
-                    .admit_trusted_frontend_message(
+                let store = self.store();
+                let owner = if admission.recover_existing {
+                    store.recover_or_admit_trusted_frontend_message(
                         admission.frontend,
                         &admission.actor_id,
                         &channel_id,
@@ -656,7 +885,17 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                         &admission.event_id,
                         Utc::now(),
                     )
-                    .map_err(|_| invalid_task())?;
+                } else {
+                    store.admit_trusted_frontend_message(
+                        admission.frontend,
+                        &admission.actor_id,
+                        &channel_id,
+                        &workspace,
+                        &admission.event_id,
+                        Utc::now(),
+                    )
+                }
+                .map_err(|_| invalid_task())?;
                 Ok((admission.frontend, channel_id, owner.permission_mode))
             })
             .transpose()?;
@@ -669,37 +908,58 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
             .map_err(storage_error)?
         {
             Some(binding) => {
-                if binding.frontend != expected_frontend
-                    || binding.cwd != workspace
-                    || admitted
-                        .as_ref()
-                        .is_some_and(|(_, channel, _)| binding.channel_id.as_ref() != Some(channel))
-                {
+                if binding.frontend != expected_frontend || binding.cwd != workspace {
                     return Err(invalid_task());
                 }
+                let binding = match admitted.as_ref() {
+                    Some((_, channel, _)) if binding.channel_id.is_none() => self
+                        .store()
+                        .claim_frontend_channel(&external_session_id, channel, Utc::now())
+                        .map_err(storage_error)?,
+                    Some((_, channel, _)) if binding.channel_id.as_ref() != Some(channel) => {
+                        return Err(invalid_task());
+                    }
+                    _ => binding,
+                };
                 let permission_mode = admitted
                     .as_ref()
-                    .map_or(binding.permission_mode, |(_, _, mode)| *mode);
+                    .map_or(binding.permission_mode, |(_, _, ceiling)| {
+                        restrict_permission_mode(binding.permission_mode, *ceiling)
+                    });
                 (binding.session_id, permission_mode)
             }
             None => {
                 let session = self.store().create_session().map_err(storage_error)?;
-                let binding = self
+                let permission_mode =
+                    admitted
+                        .as_ref()
+                        .map_or(input.permission_mode, |(_, _, ceiling)| {
+                            if input.permission_mode == PermissionMode::Default {
+                                *ceiling
+                            } else {
+                                restrict_permission_mode(input.permission_mode, *ceiling)
+                            }
+                        });
+                let mut binding = self
                     .store()
                     .bind_frontend_session(NewFrontendSession {
                         frontend: expected_frontend,
-                        external_session_id,
+                        external_session_id: external_session_id.clone(),
                         session_id: session.id,
                         cwd: workspace.clone(),
                         protocol_version: 1,
                         client_name: ClientName::try_from("carl-service").map_err(storage_error)?,
-                        permission_mode: admitted
-                            .as_ref()
-                            .map_or(input.permission_mode, |(_, _, mode)| *mode),
-                        channel_id: admitted.as_ref().map(|(_, channel, _)| channel.clone()),
+                        permission_mode,
+                        channel_id: None,
                         created_at: Utc::now(),
                     })
                     .map_err(storage_error)?;
+                if let Some((_, channel, _)) = admitted.as_ref() {
+                    binding = self
+                        .store()
+                        .claim_frontend_channel(&external_session_id, channel, Utc::now())
+                        .map_err(storage_error)?;
+                }
                 (session.id, binding.permission_mode)
             }
         };
@@ -1589,6 +1849,13 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
         effort: ReasoningEffort,
         permission_mode: PermissionMode,
     ) -> Result<(), TaskEngineError> {
+        let has_control = self
+            .store()
+            .task_has_configuration_control(task_id, &control_id)
+            .map_err(storage_error)?;
+        if has_control {
+            return Ok(());
+        }
         let record = self
             .store()
             .get_task(task_id)
@@ -2121,8 +2388,16 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                 report_next_objective(&report, runtime),
             )?;
             let preliminary_decision =
-                decide_completion(&report, &tentative, &runtime.operation_evidence)
-                    .map_err(|_| error(TaskEngineErrorCode::Verification))?;
+                match decide_completion(&report, &tentative, &runtime.operation_evidence) {
+                    Ok(decision) => decision,
+                    Err(_) => {
+                        self.block_task(
+                            task_id,
+                            "provider completion evidence failed deterministic verification",
+                        )?;
+                        return Err(error(TaskEngineErrorCode::Verification));
+                    }
+                };
             self.apply_clause_evidence(task_id, &report, &tentative)?;
             let checkpointing = self.append(
                 task_id,
@@ -2505,6 +2780,26 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
         Ok(())
     }
 
+    fn fail_task(&mut self, task_id: TaskId, reason: &str) -> Result<(), TaskEngineError> {
+        let snapshot = self.snapshot(task_id)?;
+        if snapshot.status == TaskStatus::Failed {
+            return Ok(());
+        }
+        let failed = self.append(
+            task_id,
+            TaskEvent::StateTransitioned {
+                from: snapshot.status,
+                to: TaskStatus::Failed,
+                reason: reason.to_owned(),
+            },
+        )?;
+        self.updates.push(TaskEngineUpdate::TaskStatus {
+            task_id,
+            status: failed.snapshot.status,
+        });
+        Ok(())
+    }
+
     fn assemble_epoch_context(
         &mut self,
         task_id: TaskId,
@@ -2872,7 +3167,8 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                             acknowledgement, ..
                         } => *acknowledgement,
                         TaskEngineControl::Enqueue { .. }
-                        | TaskEngineControl::AdmitTrusted { .. } => {
+                        | TaskEngineControl::AdmitTrusted { .. }
+                        | TaskEngineControl::ConfigureOwnerSession { .. } => {
                             unreachable!("owner control was processed before work dispatch")
                         }
                     };
@@ -2889,9 +3185,10 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                             control,
                         )
                         .await;
-                    self.acknowledge(acknowledgement, result.clone()).await;
                     if let Err(control_error) = result {
                         if control_error.code() == TaskEngineErrorCode::Cancelled {
+                            self.acknowledge(acknowledgement, Err(control_error.clone()))
+                                .await;
                             return Err(control_error);
                         }
                         self.interrupt_and_block_epoch(
@@ -2903,8 +3200,12 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                             "provider work control failed",
                         )
                         .await?;
-                        return Err(error(TaskEngineErrorCode::Blocked));
+                        self.fail_task(task_id, "provider work control failed")?;
+                        self.acknowledge(acknowledgement, Err(control_error.clone()))
+                            .await;
+                        return Err(control_error);
                     }
+                    self.acknowledge(acknowledgement, Ok(())).await;
                     if tightening_configuration && operations.is_empty() {
                         return Ok(WorkEpochOutput {
                             transcript: String::new(),
@@ -3102,6 +3403,13 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                 if control_task_id != task_id {
                     return Err(invalid_task());
                 }
+                if self
+                    .store()
+                    .task_has_configuration_control(task_id, &control_id)
+                    .map_err(storage_error)?
+                {
+                    return Ok(());
+                }
                 let tightening = permission_strength(permission_mode)
                     < permission_strength(runtime.effective_permission_mode);
                 self.queue_configuration(
@@ -3121,7 +3429,9 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                 Ok(())
             }
             TaskEngineControl::Approval { .. } => Err(error(TaskEngineErrorCode::Blocked)),
-            TaskEngineControl::Enqueue { .. } | TaskEngineControl::AdmitTrusted { .. } => {
+            TaskEngineControl::Enqueue { .. }
+            | TaskEngineControl::AdmitTrusted { .. }
+            | TaskEngineControl::ConfigureOwnerSession { .. } => {
                 unreachable!("owner control was processed before task control dispatch")
             }
         }
@@ -3544,7 +3854,8 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
             } if context_id == runtime.context_id && epoch_id == *provider_epoch_id => {
                 self.account_estimated_tokens(runtime, text.len())?;
                 output.push_str(&text);
-                self.updates.push(TaskEngineUpdate::AgentMessageChunk(text));
+                self.updates
+                    .push_live(task_id, TaskEngineUpdate::AgentMessageChunk(text));
             }
             AgentEvent::DiffUpdated {
                 context_id,
@@ -3552,7 +3863,8 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                 diff,
             } if context_id == runtime.context_id && epoch_id == *provider_epoch_id => {
                 self.account_estimated_tokens(runtime, diff.len())?;
-                self.updates.push(TaskEngineUpdate::DiffUpdated(diff));
+                self.updates
+                    .push_live(task_id, TaskEngineUpdate::DiffUpdated(diff));
             }
             AgentEvent::UsageUpdated {
                 context_id,
@@ -3828,9 +4140,14 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
         });
         if let Some(sender) = self.permission_notices.clone() {
             let notice = TaskEnginePermissionNotice {
+                task_id,
+                operation_id,
                 display_code,
                 summary: request.summary.clone(),
                 request_id: request.request_id.as_str().to_owned(),
+                session_id: context.session_id,
+                turn_id: context.turn_id,
+                external_session_id: context.external_session_id.clone(),
             };
             let record = self
                 .store()
@@ -3917,7 +4234,9 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                 | TaskEngineControl::Configure {
                     acknowledgement, ..
                 } => *acknowledgement,
-                TaskEngineControl::Enqueue { .. } | TaskEngineControl::AdmitTrusted { .. } => {
+                TaskEngineControl::Enqueue { .. }
+                | TaskEngineControl::AdmitTrusted { .. }
+                | TaskEngineControl::ConfigureOwnerSession { .. } => {
                     unreachable!("owner controls are handled before approval dispatch")
                 }
             };
@@ -4052,7 +4371,9 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                     self.acknowledge(acknowledgement, configured.clone()).await;
                     configured?;
                 }
-                TaskEngineControl::Enqueue { .. } | TaskEngineControl::AdmitTrusted { .. } => {
+                TaskEngineControl::Enqueue { .. }
+                | TaskEngineControl::AdmitTrusted { .. }
+                | TaskEngineControl::ConfigureOwnerSession { .. } => {
                     unreachable!("owner control was processed before approval dispatch")
                 }
             }
@@ -4655,6 +4976,17 @@ const fn permission_strength(mode: PermissionMode) -> u8 {
     }
 }
 
+const fn restrict_permission_mode(
+    requested: PermissionMode,
+    ceiling: PermissionMode,
+) -> PermissionMode {
+    if permission_strength(requested) <= permission_strength(ceiling) {
+        requested
+    } else {
+        ceiling
+    }
+}
+
 fn configuration_tightens(
     control: &TaskEngineControl,
     effective_permission_mode: PermissionMode,
@@ -4691,7 +5023,9 @@ fn control_acknowledgement(control: &TaskEngineControl) -> u64 {
         | TaskEngineControl::Configure {
             acknowledgement, ..
         } => *acknowledgement,
-        TaskEngineControl::Enqueue { .. } | TaskEngineControl::AdmitTrusted { .. } => {
+        TaskEngineControl::Enqueue { .. }
+        | TaskEngineControl::AdmitTrusted { .. }
+        | TaskEngineControl::ConfigureOwnerSession { .. } => {
             unreachable!("owner controls do not use task acknowledgements")
         }
     }

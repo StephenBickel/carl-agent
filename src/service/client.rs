@@ -238,6 +238,7 @@ async fn connect_verified(
 async fn connect_verified(
     data_root: &Path,
 ) -> Result<(LocalReader, LocalWriter), ServiceClientError> {
+    use std::os::windows::io::AsRawHandle as _;
     use tokio::net::windows::named_pipe::ClientOptions;
     use windows_sys::Win32::Foundation::ERROR_PIPE_BUSY;
 
@@ -253,8 +254,161 @@ async fn connect_verified(
             Err(_) => return Err(client_error(ServiceClientErrorCode::Unavailable)),
         }
     };
+    verify_windows_pipe_server(client.as_raw_handle().cast())?;
     let (reader, writer) = tokio::io::split(client);
     Ok((Box::pin(reader), Box::pin(writer)))
+}
+
+#[cfg(windows)]
+fn verify_windows_pipe_server(
+    pipe: windows_sys::Win32::Foundation::HANDLE,
+) -> Result<(), ServiceClientError> {
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_SUCCESS, LocalFree};
+    use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_KERNEL_OBJECT};
+    use windows_sys::Win32::Security::{
+        ACCESS_ALLOWED_ACE, ACCESS_ALLOWED_ACE_TYPE, ACE_HEADER, ACL, DACL_SECURITY_INFORMATION,
+        EqualSid, GetAce, GetSecurityDescriptorControl, OWNER_SECURITY_INFORMATION,
+        PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED,
+    };
+    use windows_sys::Win32::System::Pipes::GetNamedPipeServerProcessId;
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+
+    let current = current_process_user_sid()?;
+    let mut server_pid = 0_u32;
+    // SAFETY: pipe is a connected named-pipe client handle and server_pid is writable.
+    if unsafe { GetNamedPipeServerProcessId(pipe, &mut server_pid) } == 0 {
+        return Err(client_error(ServiceClientErrorCode::InvalidEndpoint));
+    }
+    // SAFETY: the requested access is query-only and server_pid came from the pipe kernel object.
+    let server_process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, server_pid) };
+    if server_process.is_null() {
+        return Err(client_error(ServiceClientErrorCode::InvalidEndpoint));
+    }
+    let server = process_user_sid(server_process);
+    // SAFETY: server_process is an owned process handle from OpenProcess.
+    unsafe { CloseHandle(server_process) };
+    let server = server?;
+    // SAFETY: both token buffers remain live and contain validated TOKEN_USER SIDs.
+    if unsafe { EqualSid(current.sid(), server.sid()) } == 0 {
+        return Err(client_error(ServiceClientErrorCode::InvalidEndpoint));
+    }
+
+    let mut owner: PSID = std::ptr::null_mut();
+    let mut dacl = std::ptr::null_mut::<ACL>();
+    let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    // SAFETY: all requested output pointers are writable and descriptor is freed below.
+    let security = unsafe {
+        GetSecurityInfo(
+            pipe,
+            SE_KERNEL_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &mut owner,
+            std::ptr::null_mut(),
+            &mut dacl,
+            std::ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    if security != ERROR_SUCCESS || descriptor.is_null() || owner.is_null() || dacl.is_null() {
+        if !descriptor.is_null() {
+            // SAFETY: descriptor was allocated by GetSecurityInfo.
+            unsafe { LocalFree(descriptor) };
+        }
+        return Err(client_error(ServiceClientErrorCode::InvalidEndpoint));
+    }
+    let mut control = 0_u16;
+    let mut revision = 0_u32;
+    // SAFETY: descriptor is live and both outputs are writable.
+    let protected = unsafe {
+        GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) != 0
+            && u32::from(control) & SE_DACL_PROTECTED != 0
+    };
+    // SAFETY: owner and current SID remain live.
+    let owner_matches = unsafe { EqualSid(owner, current.sid()) != 0 };
+    // Exactly one current-user allow ACE prevents a permissive or foreign pre-created pipe.
+    // SAFETY: dacl is non-null and remains owned by descriptor until LocalFree below.
+    let ace_count = unsafe { (*dacl).AceCount };
+    let private_dacl = if protected && ace_count == 1 {
+        let mut ace = std::ptr::null_mut();
+        // SAFETY: dacl is live and advertises exactly one ACE.
+        (unsafe { GetAce(dacl, 0, &mut ace) }) != 0
+            && !ace.is_null()
+            // SAFETY: GetAce returned a live ACE_HEADER.
+            && unsafe { (*(ace.cast::<ACE_HEADER>())).AceType == ACCESS_ALLOWED_ACE_TYPE }
+            && {
+                // SAFETY: the ACE type is ACCESS_ALLOWED_ACE and SidStart begins its SID.
+                let allowed = unsafe { &*(ace.cast::<ACCESS_ALLOWED_ACE>()) };
+                let sid = std::ptr::addr_of!(allowed.SidStart).cast_mut().cast();
+                // SAFETY: both SIDs remain live for the comparison.
+                unsafe { EqualSid(sid, current.sid()) != 0 }
+            }
+    } else {
+        false
+    };
+    // SAFETY: descriptor was allocated by GetSecurityInfo and is no longer used.
+    unsafe { LocalFree(descriptor) };
+    if owner_matches && private_dacl {
+        Ok(())
+    } else {
+        Err(client_error(ServiceClientErrorCode::InvalidEndpoint))
+    }
+}
+
+#[cfg(windows)]
+struct TokenUserBuffer(Vec<usize>);
+
+#[cfg(windows)]
+impl TokenUserBuffer {
+    fn sid(&self) -> windows_sys::Win32::Security::PSID {
+        use windows_sys::Win32::Security::TOKEN_USER;
+        // SAFETY: process_user_sid filled this aligned buffer with TOKEN_USER.
+        unsafe { (*(self.0.as_ptr().cast::<TOKEN_USER>())).User.Sid }
+    }
+}
+
+#[cfg(windows)]
+fn current_process_user_sid() -> Result<TokenUserBuffer, ServiceClientError> {
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    // SAFETY: GetCurrentProcess returns a process pseudo-handle valid in this process.
+    process_user_sid(unsafe { GetCurrentProcess() })
+}
+
+#[cfg(windows)]
+fn process_user_sid(
+    process: windows_sys::Win32::Foundation::HANDLE,
+) -> Result<TokenUserBuffer, ServiceClientError> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
+    use windows_sys::Win32::System::Threading::OpenProcessToken;
+
+    let mut token = std::ptr::null_mut();
+    // SAFETY: process is queryable and token is a writable output pointer.
+    if unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) } == 0 {
+        return Err(client_error(ServiceClientErrorCode::InvalidEndpoint));
+    }
+    let mut bytes = 0_u32;
+    // SAFETY: the first call intentionally queries the required buffer size.
+    unsafe { GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut bytes) };
+    let words = usize::try_from(bytes)
+        .map_err(|_| client_error(ServiceClientErrorCode::InvalidEndpoint))?
+        .div_ceil(std::mem::size_of::<usize>());
+    let mut buffer = vec![0_usize; words];
+    // SAFETY: buffer is aligned and at least bytes long; token and output remain live.
+    let loaded = unsafe {
+        GetTokenInformation(
+            token,
+            TokenUser,
+            buffer.as_mut_ptr().cast(),
+            bytes,
+            &mut bytes,
+        )
+    };
+    // SAFETY: token is owned by this function and no longer used.
+    unsafe { CloseHandle(token) };
+    if loaded == 0 || bytes < u32::try_from(std::mem::size_of::<TOKEN_USER>()).unwrap_or(u32::MAX) {
+        return Err(client_error(ServiceClientErrorCode::InvalidEndpoint));
+    }
+    Ok(TokenUserBuffer(buffer))
 }
 
 async fn read_bounded_line<R: tokio::io::AsyncBufRead + Unpin>(

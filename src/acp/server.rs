@@ -23,8 +23,8 @@ use crate::policy::{ActorId, Frontend, Sha256Digest};
 use crate::runtime::task::{TaskEvent, TaskId, TaskStatus};
 use crate::service::client::TaskServiceClient;
 use crate::service::protocol::{
-    SERVICE_PROTOCOL_VERSION, ServiceCommand, ServiceRequest, ServiceResult, StartTaskCommand,
-    TrustedStartTaskCommand,
+    SERVICE_PROTOCOL_VERSION, ServiceApprovalDecision, ServiceCommand, ServiceRequest,
+    ServiceResult, StartTaskCommand, TaskUpdate, TrustedStartTaskCommand,
 };
 use crate::sidecar::{ExecutionWorkspace, TrustedExecutable};
 use crate::storage::{
@@ -770,8 +770,19 @@ struct ServiceSessionBinding {
     permission_mode: PermissionMode,
     task_id: Option<TaskId>,
     last_event_cursor: Option<u64>,
+    last_live_cursor: Option<u64>,
+    stream_generation: u64,
     prompt_active: bool,
     buzz_context: Option<BuzzContext>,
+    pending_approval: Option<ServicePendingApproval>,
+}
+
+#[derive(Clone)]
+struct ServicePendingApproval {
+    task_id: TaskId,
+    display_code: String,
+    session_id: SessionId,
+    turn_id: crate::events::TurnId,
 }
 
 /// ACP transport adapter backed by Carl's persistent owner service. Dropping
@@ -1020,8 +1031,11 @@ impl ServiceAcpServer {
                 permission_mode: self.config.permission_mode,
                 task_id: None,
                 last_event_cursor: None,
+                last_live_cursor: None,
+                stream_generation: 0,
                 prompt_active: false,
                 buzz_context: None,
+                pending_approval: None,
             },
         );
         Ok(json!({
@@ -1038,7 +1052,7 @@ impl ServiceAcpServer {
         require_keys(
             params,
             &["sessionId", "cwd", "mcpServers"],
-            &["lastEventCursor", "taskId"],
+            &["lastEventCursor", "lastLiveCursor", "taskId"],
         )?;
         self.prepare_service_publisher(params.get("mcpServers"))
             .await?;
@@ -1049,6 +1063,9 @@ impl ServiceAcpServer {
             return Err(invalid_input());
         }
         let last_event_cursor = params.get("lastEventCursor").map_or(Ok(None), |value| {
+            value.as_u64().map(Some).ok_or_else(invalid_input)
+        })?;
+        let last_live_cursor = params.get("lastLiveCursor").map_or(Ok(None), |value| {
             value.as_u64().map(Some).ok_or_else(invalid_input)
         })?;
         let requested_task = params
@@ -1086,14 +1103,17 @@ impl ServiceAcpServer {
                 permission_mode: service_session.permission_mode,
                 task_id,
                 last_event_cursor,
+                last_live_cursor,
+                stream_generation: 0,
                 prompt_active: false,
                 buzz_context: None,
+                pending_approval: None,
             },
         );
         Ok(json!({
             "sessionId":external,
             "configOptions":service_config_options(&self.info, &model, effort, service_session.permission_mode),
-            "_meta":{"lastEventCursor":last_event_cursor,"taskId":task_id}
+            "_meta":{"lastEventCursor":last_event_cursor,"lastLiveCursor":last_live_cursor,"taskId":task_id}
         }))
     }
 
@@ -1105,13 +1125,12 @@ impl ServiceAcpServer {
     ) -> Result<(), AcpServerError> {
         let params = params.as_object().ok_or_else(invalid_input)?;
         let external = bounded_string(params.get("sessionId"), 128)?;
-        let session = self
-            .sessions
-            .lock()
-            .await
-            .get(&external)
-            .cloned()
-            .ok_or_else(invalid_input)?;
+        let session = {
+            let mut sessions = self.sessions.lock().await;
+            let session = sessions.get_mut(&external).ok_or_else(invalid_input)?;
+            session.stream_generation = session.stream_generation.saturating_add(1);
+            session.clone()
+        };
         let Some(task_id) = session.task_id else {
             return Ok(());
         };
@@ -1124,6 +1143,8 @@ impl ServiceAcpServer {
                 external,
                 task_id,
                 session.last_event_cursor,
+                session.last_live_cursor,
+                session.stream_generation,
                 outbound,
                 cancelled,
             )
@@ -1205,7 +1226,105 @@ impl ServiceAcpServer {
         } else {
             None
         };
-        let reusable_task = if let Some(task_id) = session.task_id {
+        let resolved_approval = if let Some(pending) = session.pending_approval.clone() {
+            let (decision, display_code) = service_approval_slash(&blocks)?;
+            if display_code != pending.display_code {
+                return Err(invalid_input());
+            }
+            let (actor_id, channel_id, event_id) = match buzz_context.as_ref() {
+                Some(context) => (
+                    ActorId::parse(context.actor_hex()).map_err(|_| invalid_input())?,
+                    Some(context.channel_id().to_string()),
+                    Some(context.reply_to().to_owned()),
+                ),
+                None if self.config.frontend == Frontend::Acp => (
+                    ActorId::parse("local-owner").map_err(|_| invalid_input())?,
+                    None,
+                    None,
+                ),
+                None => return Err(invalid_input()),
+            };
+            let result = self
+                .service_request(ServiceCommand::ResolveApproval {
+                    task_id: pending.task_id,
+                    external_session_id: external.clone(),
+                    workspace: session.cwd.clone(),
+                    frontend: self.config.frontend,
+                    actor_id,
+                    channel_id,
+                    event_id,
+                    display_code,
+                    session_id: pending.session_id,
+                    turn_id: pending.turn_id,
+                    decision,
+                })
+                .await?;
+            session.pending_approval = None;
+            Some(result)
+        } else {
+            None
+        };
+        if session.pending_approval.is_none()
+            && resolved_approval.is_none()
+            && service_approval_shaped(&blocks)
+        {
+            return Err(invalid_input());
+        }
+        if resolved_approval.is_none()
+            && let Some(permission_mode) = service_permission_slash(&blocks)
+        {
+            if let Some(context) = buzz_context.as_ref() {
+                match self
+                    .service_request(ServiceCommand::ConfigureTrustedSession {
+                        external_session_id: external.clone(),
+                        workspace: session.cwd.clone(),
+                        frontend: self.config.frontend,
+                        actor_id: ActorId::parse(context.actor_hex())
+                            .map_err(|_| invalid_input())?,
+                        channel_id: context.channel_id().to_string(),
+                        event_id: context.reply_to().to_owned(),
+                        permission_mode,
+                    })
+                    .await?
+                {
+                    ServiceResult::Applied => {}
+                    _ => return Err(server_error(AcpServerErrorCode::KernelFailed)),
+                }
+            }
+            session.permission_mode = permission_mode;
+            self.sessions
+                .lock()
+                .await
+                .insert(external.clone(), session.clone());
+            enqueue(
+                &outbound,
+                OutgoingFrame::notification(
+                    "session/update",
+                    json!({
+                        "sessionId":external,
+                        "update":{
+                            "sessionUpdate":"session_info_update",
+                            "_meta":{
+                                "model":session.model.as_str(),
+                                "thoughtLevel":session.effort.as_codex_value(),
+                                "mode":permission_mode.as_wire_str()
+                            }
+                        }
+                    }),
+                )
+                .map_err(|_| server_error(AcpServerErrorCode::OutputUnavailable))?,
+                &cancelled,
+            )?;
+            enqueue(
+                &outbound,
+                OutgoingFrame::result(id, json!({"stopReason":"end_turn"})),
+                &cancelled,
+            )?;
+            return Ok(());
+        }
+        let reusable_task = if resolved_approval.is_none()
+            && let Some(task_id) = session.task_id
+        {
             match self
                 .service_request(ServiceCommand::Status { task_id })
                 .await?
@@ -1220,7 +1339,9 @@ impl ServiceAcpServer {
             None
         };
         let request_id = Uuid::new_v4().to_string();
-        let result = if let Some(task_id) = reusable_task {
+        let result = if let Some(result) = resolved_approval {
+            Ok(result)
+        } else if let Some(task_id) = reusable_task {
             self.client
                 .request(ServiceRequest {
                     protocol_version: SERVICE_PROTOCOL_VERSION,
@@ -1257,6 +1378,7 @@ impl ServiceAcpServer {
             ServiceResult::Accepted { task_id } => {
                 session.task_id = Some(task_id);
                 session.last_event_cursor = None;
+                session.last_live_cursor = None;
                 task_id
             }
             ServiceResult::Applied => session.task_id.ok_or_else(invalid_input)?,
@@ -1264,13 +1386,38 @@ impl ServiceAcpServer {
         };
         session.prompt_active = true;
         session.buzz_context = buzz_context;
-        let cursor = session.last_event_cursor;
-        self.sessions.lock().await.insert(external.clone(), session);
+        let buzz_publisher = self.buzz_publisher.clone();
+        let buzz_context = session.buzz_context.clone();
+        let (cursor, live_cursor, stream_generation) = {
+            let mut sessions = self.sessions.lock().await;
+            let current = sessions.get(&external).ok_or_else(invalid_input)?;
+            session.last_event_cursor = current.last_event_cursor;
+            session.last_live_cursor = current.last_live_cursor;
+            session.stream_generation = current.stream_generation.saturating_add(1);
+            let state = (
+                session.last_event_cursor,
+                session.last_live_cursor,
+                session.stream_generation,
+            );
+            sessions.insert(external.clone(), session);
+            state
+        };
         let data_root = self.data_root.clone();
         let sessions = std::sync::Arc::clone(&self.sessions);
         tokio::spawn(async move {
             poll_service_prompt(
-                data_root, sessions, external, task_id, cursor, id, outbound, cancelled,
+                data_root,
+                sessions,
+                external,
+                task_id,
+                cursor,
+                live_cursor,
+                stream_generation,
+                buzz_publisher,
+                buzz_context,
+                id,
+                outbound,
+                cancelled,
             )
             .await;
         });
@@ -1291,23 +1438,23 @@ impl ServiceAcpServer {
             .cloned()
             .ok_or_else(invalid_input)?;
         let task_id = session.task_id.ok_or_else(invalid_input)?;
-        let buzz_context = if self.config.frontend == Frontend::Buzz {
+        let command = if self.config.frontend == Frontend::Buzz {
             let refs = blocks.iter().map(String::as_str).collect::<Vec<_>>();
-            Some(BuzzContext::parse(&refs).map_err(|_| invalid_input())?)
+            match BuzzContext::parse(&refs) {
+                Ok(context) => service_steer_command(
+                    &session,
+                    &external,
+                    task_id,
+                    text,
+                    Some(&context),
+                    self.config.frontend,
+                )?,
+                Err(_) => ServiceCommand::Steer { task_id, text },
+            }
         } else {
-            None
+            ServiceCommand::Steer { task_id, text }
         };
-        match self
-            .service_request(service_steer_command(
-                &session,
-                &external,
-                task_id,
-                text,
-                buzz_context.as_ref(),
-                self.config.frontend,
-            )?)
-            .await?
-        {
+        match self.service_request(command).await? {
             ServiceResult::Applied => Ok(json!({"outcome":"injected","taskId":task_id})),
             _ => Err(server_error(AcpServerErrorCode::KernelFailed)),
         }
@@ -1605,6 +1752,10 @@ async fn poll_service_prompt(
     external_session_id: String,
     task_id: TaskId,
     mut cursor: Option<u64>,
+    mut live_cursor: Option<u64>,
+    stream_generation: u64,
+    buzz_publisher: Option<std::sync::Arc<BuzzPublisher>>,
+    buzz_context: Option<BuzzContext>,
     response_id: JsonRpcId,
     outbound: mpsc::Sender<OutgoingFrame>,
     cancelled: CancellationToken,
@@ -1618,7 +1769,9 @@ async fn poll_service_prompt(
         return;
     };
     loop {
-        if cancelled.is_cancelled() {
+        if cancelled.is_cancelled()
+            || !owns_service_stream(&sessions, &external_session_id, stream_generation).await
+        {
             return;
         }
         let event_key = Uuid::new_v4().to_string();
@@ -1646,7 +1799,13 @@ async fn poll_service_prompt(
             if cursor.is_some_and(|sequence| event.sequence <= sequence) {
                 continue;
             }
-            cursor = Some(event.sequence);
+            let mut bindings = sessions.lock().await;
+            let Some(binding) = bindings
+                .get_mut(&external_session_id)
+                .filter(|binding| binding.stream_generation == stream_generation)
+            else {
+                return;
+            };
             for params in render_service_event(&external_session_id, task_id, &event) {
                 let Ok(frame) = OutgoingFrame::notification("session/update", params) else {
                     return;
@@ -1655,7 +1814,54 @@ async fn poll_service_prompt(
                     return;
                 }
             }
+            cursor = Some(event.sequence);
+            binding.last_event_cursor = cursor;
         }
+        let Ok((next_live_cursor, live_frames, pending_approval)) = poll_live_service_updates(
+            &mut client,
+            &external_session_id,
+            task_id,
+            live_cursor,
+            buzz_publisher.as_deref(),
+            buzz_context.as_ref(),
+            &cancelled,
+        )
+        .await
+        else {
+            return;
+        };
+        let mut bindings = sessions.lock().await;
+        let Some(binding) = bindings
+            .get_mut(&external_session_id)
+            .filter(|binding| binding.stream_generation == stream_generation)
+        else {
+            return;
+        };
+        for frame in live_frames {
+            if enqueue(&outbound, frame, &cancelled).is_err() {
+                return;
+            }
+        }
+        live_cursor = next_live_cursor;
+        binding.last_live_cursor = live_cursor;
+        if let Some(pending) = pending_approval {
+            binding.pending_approval = Some(pending);
+            binding.prompt_active = false;
+            drop(bindings);
+            let _ = enqueue(
+                &outbound,
+                OutgoingFrame::result(
+                    response_id,
+                    json!({
+                        "stopReason":"waiting_for_approval",
+                        "_meta":{"taskId":task_id,"lastEventCursor":cursor,"lastLiveCursor":live_cursor}
+                    }),
+                ),
+                &cancelled,
+            );
+            return;
+        }
+        drop(bindings);
         let status_key = Uuid::new_v4().to_string();
         let status = client
             .request(ServiceRequest {
@@ -1676,8 +1882,14 @@ async fn poll_service_prompt(
         if snapshot.status.is_terminal()
             || matches!(snapshot.status, TaskStatus::Blocked | TaskStatus::Paused)
         {
-            if let Some(session) = sessions.lock().await.get_mut(&external_session_id) {
+            if let Some(session) = sessions
+                .lock()
+                .await
+                .get_mut(&external_session_id)
+                .filter(|session| session.stream_generation == stream_generation)
+            {
                 session.last_event_cursor = cursor;
+                session.last_live_cursor = live_cursor;
                 session.prompt_active = false;
             }
             let stop_reason = match snapshot.status {
@@ -1693,7 +1905,7 @@ async fn poll_service_prompt(
                     response_id,
                     json!({
                         "stopReason":stop_reason,
-                        "_meta":{"taskId":task_id,"lastEventCursor":cursor}
+                        "_meta":{"taskId":task_id,"lastEventCursor":cursor,"lastLiveCursor":live_cursor}
                     }),
                 ),
                 &cancelled,
@@ -1707,12 +1919,15 @@ async fn poll_service_prompt(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn replay_service_events(
     data_root: PathBuf,
     sessions: std::sync::Arc<tokio::sync::Mutex<HashMap<String, ServiceSessionBinding>>>,
     external_session_id: String,
     task_id: TaskId,
     mut cursor: Option<u64>,
+    mut live_cursor: Option<u64>,
+    stream_generation: u64,
     outbound: mpsc::Sender<OutgoingFrame>,
     cancelled: CancellationToken,
 ) {
@@ -1720,7 +1935,9 @@ async fn replay_service_events(
         return;
     };
     loop {
-        if cancelled.is_cancelled() {
+        if cancelled.is_cancelled()
+            || !owns_service_stream(&sessions, &external_session_id, stream_generation).await
+        {
             return;
         }
         let key = Uuid::new_v4().to_string();
@@ -1745,7 +1962,13 @@ async fn replay_service_events(
             {
                 return;
             }
-            cursor = Some(event.sequence);
+            let mut bindings = sessions.lock().await;
+            let Some(binding) = bindings
+                .get_mut(&external_session_id)
+                .filter(|binding| binding.stream_generation == stream_generation)
+            else {
+                return;
+            };
             for params in render_service_event(&external_session_id, task_id, &event) {
                 let Ok(frame) = OutgoingFrame::notification("session/update", params) else {
                     return;
@@ -1754,9 +1977,44 @@ async fn replay_service_events(
                     return;
                 }
             }
+            cursor = Some(event.sequence);
+            binding.last_event_cursor = cursor;
         }
-        if let Some(session) = sessions.lock().await.get_mut(&external_session_id) {
-            session.last_event_cursor = cursor;
+        let Ok((next_live_cursor, live_frames, pending_approval)) = poll_live_service_updates(
+            &mut client,
+            &external_session_id,
+            task_id,
+            live_cursor,
+            None,
+            None,
+            &cancelled,
+        )
+        .await
+        else {
+            return;
+        };
+        let mut bindings = sessions.lock().await;
+        let Some(binding) = bindings
+            .get_mut(&external_session_id)
+            .filter(|binding| binding.stream_generation == stream_generation)
+        else {
+            return;
+        };
+        for frame in live_frames {
+            if enqueue(&outbound, frame, &cancelled).is_err() {
+                return;
+            }
+        }
+        live_cursor = next_live_cursor;
+        binding.last_event_cursor = cursor;
+        binding.last_live_cursor = live_cursor;
+        let approval_pending = pending_approval.is_some();
+        if let Some(pending) = pending_approval {
+            binding.pending_approval = Some(pending);
+        }
+        drop(bindings);
+        if approval_pending {
+            return;
         }
 
         let status_key = Uuid::new_v4().to_string();
@@ -1783,6 +2041,158 @@ async fn replay_service_events(
             }
         }
     }
+}
+
+async fn owns_service_stream(
+    sessions: &std::sync::Arc<tokio::sync::Mutex<HashMap<String, ServiceSessionBinding>>>,
+    external_session_id: &str,
+    generation: u64,
+) -> bool {
+    sessions
+        .lock()
+        .await
+        .get(external_session_id)
+        .is_some_and(|session| session.stream_generation == generation)
+}
+
+async fn poll_live_service_updates(
+    client: &mut TaskServiceClient,
+    external_session_id: &str,
+    task_id: TaskId,
+    live_cursor: Option<u64>,
+    buzz_publisher: Option<&BuzzPublisher>,
+    buzz_context: Option<&BuzzContext>,
+    cancelled: &CancellationToken,
+) -> Result<
+    (
+        Option<u64>,
+        Vec<OutgoingFrame>,
+        Option<ServicePendingApproval>,
+    ),
+    AcpServerError,
+> {
+    let result = client
+        .request(ServiceRequest {
+            protocol_version: SERVICE_PROTOCOL_VERSION,
+            request_id: Uuid::new_v4().to_string(),
+            idempotency_key: Uuid::new_v4().to_string(),
+            command: ServiceCommand::LiveUpdates {
+                task_id,
+                after_cursor: live_cursor,
+                limit: 128,
+            },
+        })
+        .await
+        .map_err(|_| server_error(AcpServerErrorCode::KernelFailed))?;
+    let ServiceResult::LiveUpdates(page) = result else {
+        return Err(server_error(AcpServerErrorCode::KernelFailed));
+    };
+    let mut frames = Vec::new();
+    let mut pending_approval = None;
+    if let Some(snapshot) = page.snapshot {
+        frames.push(OutgoingFrame::notification(
+            "session/update",
+            json!({
+                "sessionId":external_session_id,
+                "update":{"sessionUpdate":"task_status","taskId":task_id,"status":snapshot.status},
+                "_meta":{"liveCursor":page.cursor,"snapshotFallback":true}
+            }),
+        )
+        .map_err(|_| server_error(AcpServerErrorCode::KernelFailed))?);
+    }
+    for envelope in page.updates {
+        let update = match envelope.update {
+            TaskUpdate::AssistantDelta(text) => {
+                if let (Some(publisher), Some(context)) = (buzz_publisher, buzz_context) {
+                    publisher
+                        .send_message(context, &text, cancelled.clone())
+                        .await
+                        .map_err(|_| server_error(AcpServerErrorCode::KernelFailed))?;
+                }
+                json!({
+                    "sessionUpdate":"agent_message_chunk",
+                    "content":{"type":"text","text":text}
+                })
+            }
+            TaskUpdate::Diff(diff) => {
+                if let (Some(publisher), Some(context)) = (buzz_publisher, buzz_context) {
+                    publisher
+                        .send_diff(context, &diff, cancelled.clone())
+                        .await
+                        .map_err(|_| server_error(AcpServerErrorCode::KernelFailed))?;
+                }
+                json!({
+                    "sessionUpdate":"tool_call",
+                    "toolCallId":format!("live-diff-{}", envelope.cursor),
+                    "title":"Workspace diff","kind":"edit","status":"completed",
+                    "content":[{"type":"diff","diff":diff}]
+                })
+            }
+            TaskUpdate::ApprovalRequired {
+                task_id: approval_task,
+                operation_id,
+                display_code,
+                summary,
+                request_id,
+                session_id,
+                turn_id,
+                external_session_id: approval_session,
+            } => {
+                if approval_task != task_id || approval_session != external_session_id {
+                    return Err(server_error(AcpServerErrorCode::KernelFailed));
+                }
+                let publication = format!(
+                    "Approval required: {summary}\nApprove with /approve {display_code} or deny with /deny {display_code}"
+                );
+                if let (Some(publisher), Some(context)) = (buzz_publisher, buzz_context) {
+                    publisher
+                        .send_message(context, &publication, cancelled.clone())
+                        .await
+                        .map_err(|_| server_error(AcpServerErrorCode::KernelFailed))?;
+                }
+                frames.push(
+                    OutgoingFrame::notification(
+                        "session/update",
+                        json!({
+                            "sessionId":external_session_id,
+                            "update":{
+                                "sessionUpdate":"tool_call",
+                                "toolCallId":operation_id,
+                                "title":request_id,
+                                "kind":"execute",
+                                "status":"pending"
+                            },
+                            "_meta":{"liveCursor":envelope.cursor}
+                        }),
+                    )
+                    .map_err(|_| server_error(AcpServerErrorCode::KernelFailed))?,
+                );
+                pending_approval = Some(ServicePendingApproval {
+                    task_id,
+                    display_code,
+                    session_id,
+                    turn_id,
+                });
+                json!({
+                    "sessionUpdate":"agent_message_chunk",
+                    "content":{"type":"text","text":publication}
+                })
+            }
+            _ => continue,
+        };
+        frames.push(
+            OutgoingFrame::notification(
+                "session/update",
+                json!({
+                    "sessionId":external_session_id,
+                    "update":update,
+                    "_meta":{"liveCursor":envelope.cursor}
+                }),
+            )
+            .map_err(|_| server_error(AcpServerErrorCode::KernelFailed))?,
+        );
+    }
+    Ok((page.cursor, frames, pending_approval))
 }
 
 fn render_service_event(session_id: &str, task_id: TaskId, envelope: &EventEnvelope) -> Vec<Value> {
@@ -2173,6 +2583,45 @@ fn parse_effort(value: &str) -> Result<ReasoningEffort, AcpServerError> {
     }
 }
 
+fn service_permission_slash(blocks: &[String]) -> Option<PermissionMode> {
+    match blocks.first()?.trim() {
+        "/permissions fullAccess" => Some(PermissionMode::FullAccess),
+        "/permissions approval" => Some(PermissionMode::Default),
+        "/permissions readOnly" => Some(PermissionMode::Plan),
+        _ => None,
+    }
+}
+
+fn service_approval_slash(
+    blocks: &[String],
+) -> Result<(ServiceApprovalDecision, String), AcpServerError> {
+    let command = blocks
+        .first()
+        .map(|block| block.trim())
+        .ok_or_else(invalid_input)?;
+    let (decision, display_code) = if let Some(code) = command.strip_prefix("/approve ") {
+        (ServiceApprovalDecision::Approve, code)
+    } else if let Some(code) = command.strip_prefix("/deny ") {
+        (ServiceApprovalDecision::Deny, code)
+    } else {
+        return Err(invalid_input());
+    };
+    if display_code.is_empty()
+        || display_code.len() > 128
+        || display_code.chars().any(char::is_whitespace)
+    {
+        return Err(invalid_input());
+    }
+    Ok((decision, display_code.to_owned()))
+}
+
+fn service_approval_shaped(blocks: &[String]) -> bool {
+    blocks.first().is_some_and(|block| {
+        let command = block.trim();
+        command.starts_with("/approve ") || command.starts_with("/deny ")
+    })
+}
+
 fn task_control_digest(method: &str, task_id: TaskId, text: Option<&str>) -> Sha256Digest {
     let mut hasher = Sha256::new();
     hasher.update(b"carl.task-control.v1\0");
@@ -2223,4 +2672,35 @@ const fn invalid_input() -> AcpServerError {
 
 const fn server_error(code: AcpServerErrorCode) -> AcpServerError {
     AcpServerError::from_code(code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PermissionMode, service_permission_slash};
+
+    #[test]
+    fn persistent_permission_slashes_require_an_exact_leading_block() {
+        for (command, expected) in [
+            ("/permissions fullAccess", PermissionMode::FullAccess),
+            ("/permissions approval", PermissionMode::Default),
+            ("/permissions readOnly", PermissionMode::Plan),
+        ] {
+            assert_eq!(
+                service_permission_slash(&[command.to_owned(), "Buzz metadata".to_owned()]),
+                Some(expected)
+            );
+        }
+
+        for blocks in [
+            vec!["please use /permissions readOnly".to_owned()],
+            vec!["quoted:\n/permissions readOnly".to_owned()],
+            vec!["/permissions readOnly now".to_owned()],
+            vec![
+                "ordinary input".to_owned(),
+                "/permissions readOnly".to_owned(),
+            ],
+        ] {
+            assert_eq!(service_permission_slash(&blocks), None);
+        }
+    }
 }

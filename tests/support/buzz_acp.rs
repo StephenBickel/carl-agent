@@ -303,6 +303,26 @@ pub struct Client {
     stderr_worker: Option<JoinHandle<()>>,
 }
 
+impl Drop for Client {
+    fn drop(&mut self) {
+        self.stdin.take();
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = self.child.kill();
+        }
+        let _ = self.child.wait();
+        if let Some(worker) = self.stdout_worker.take() {
+            let _ = worker.join();
+        }
+        if let Some(worker) = self.stderr_worker.take() {
+            let _ = worker.join();
+        }
+        if self.service.try_wait().ok().flatten().is_none() {
+            let _ = self.service.kill();
+        }
+        let _ = self.service.wait();
+    }
+}
+
 impl Client {
     pub fn spawn(layout: &Layout, bypass: bool) -> TestResult<Self> {
         let binary = assert_cmd::cargo::cargo_bin!("carl");
@@ -739,16 +759,29 @@ fn app_server_fixture() -> i32 {
                     });
                     continue;
                 }
-                if agent_delta(
-                    thread_id,
-                    &turn_id,
-                    "Repository verification complete. <carl-epoch-report>{\"schema_version\":1,\"disposition\":\"complete\",\"summary\":\"Repository verification complete.\",\"clause_evidence\":[],\"exact_identifiers\":[]}</carl-epoch-report>",
-                )
-                    .and_then(|()| turn_completed(thread_id, &turn_id))
+                if item_started(thread_id, &turn_id, "observation-item", "commandExecution")
+                    .and_then(|()| {
+                        approval_request(
+                            "approval-observation",
+                            "item/commandExecution/requestApproval",
+                            thread_id,
+                            &turn_id,
+                            "observation-item",
+                            json!({
+                                "command":"cargo test", "reason":"Verify the repository",
+                                "cwd":null
+                            }),
+                        )
+                    })
                     .is_err()
                 {
                     return 74;
                 }
+                pending = Some(PendingApproval {
+                    stage: ApprovalStage::Observation,
+                    thread_id: thread_id.to_owned(),
+                    turn_id,
+                });
             }
             Some("turn/steer") => {
                 let steering = request
@@ -846,13 +879,25 @@ fn app_server_fixture() -> i32 {
                             return 73;
                         }
                         let message = if accepted {
-                            "Verification completed successfully."
+                            let Some(operation_id) = operation_ids.get(&approval.turn_id) else {
+                                return 65;
+                            };
+                            completion_report("Verification completed successfully.", operation_id)
                         } else {
-                            "Verification denied safely."
+                            "Verification denied safely.".to_owned()
                         };
-                        if agent_delta(&approval.thread_id, &approval.turn_id, message)
-                            .and_then(|()| turn_completed(&approval.thread_id, &approval.turn_id))
-                            .is_err()
+                        if item_completed(
+                            &approval.thread_id,
+                            &approval.turn_id,
+                            "command-item",
+                            "commandExecution",
+                            accepted,
+                        )
+                        .and_then(|()| {
+                            agent_delta(&approval.thread_id, &approval.turn_id, &message)
+                        })
+                        .and_then(|()| turn_completed(&approval.thread_id, &approval.turn_id))
+                        .is_err()
                         {
                             return 74;
                         }
@@ -889,6 +934,29 @@ fn app_server_fixture() -> i32 {
                             return 74;
                         }
                     }
+                    ApprovalStage::Observation => {
+                        if !accepted {
+                            return 65;
+                        }
+                        let Some(operation_id) = operation_ids.get(&approval.turn_id) else {
+                            return 65;
+                        };
+                        let report =
+                            completion_report("Repository verification complete.", operation_id);
+                        if item_completed(
+                            &approval.thread_id,
+                            &approval.turn_id,
+                            "observation-item",
+                            "commandExecution",
+                            true,
+                        )
+                        .and_then(|()| agent_delta(&approval.thread_id, &approval.turn_id, &report))
+                        .and_then(|()| turn_completed(&approval.thread_id, &approval.turn_id))
+                        .is_err()
+                        {
+                            return 74;
+                        }
+                    }
                 }
             }
             _ => return 65,
@@ -918,6 +986,7 @@ enum ApprovalStage {
     File,
     Command,
     Bypass,
+    Observation,
 }
 
 struct PendingApproval {

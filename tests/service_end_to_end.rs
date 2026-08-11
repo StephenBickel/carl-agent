@@ -14,13 +14,16 @@ use carl::runtime::agent_port::{
     AgentEvent, AgentFuture, AgentItem, AgentModel, AgentPort, AgentPortError, AgentProcess,
     AgentRequestId, EffectDecision, ResumeAgentContext, StartAgentContext, StartAgentEpoch,
 };
-use carl::runtime::task::TaskStatus;
+use carl::runtime::task::{TaskControlKind, TaskEvent, TaskId, TaskStatus};
 use carl::service::client::TaskServiceClient;
 use carl::service::protocol::{
     ServiceCommand, ServiceRequest, ServiceResult, StartTaskCommand, TrustedStartTaskCommand,
+    command_digest,
 };
 use carl::service::server::{EndpointErrorCode, OwnedLocalEndpoint, TaskService};
-use carl::storage::{Store, TrustedFrontendOwnerInput};
+use carl::storage::{
+    ServiceCommandReceiptClaim, ServiceCommandReceiptInput, Store, TrustedFrontendOwnerInput,
+};
 use chrono::Utc;
 use serde_json::json;
 use tokio::io::{AsyncWriteExt, BufReader};
@@ -100,6 +103,58 @@ async fn windows_named_pipe_is_hashed_owner_private_and_exclusive_before_sqlite(
     );
     drop(client);
     drop(endpoint);
+    Ok(())
+}
+
+#[cfg(windows)]
+#[tokio::test(flavor = "current_thread")]
+async fn windows_client_rejects_a_permissive_precreated_pipe_before_info() -> TestResult {
+    use sha2::{Digest as _, Sha256};
+    use std::os::windows::ffi::OsStrExt as _;
+
+    let layout = Layout::new()?;
+    let mut hasher = Sha256::new();
+    for unit in layout.data.as_os_str().encode_wide() {
+        hasher.update(unit.to_le_bytes());
+    }
+    let pipe_name = format!(r"\\.\pipe\carl-{:x}", hasher.finalize());
+    let server = tokio::net::windows::named_pipe::ServerOptions::new()
+        .first_pipe_instance(true)
+        .create(&pipe_name)?;
+    let accepting = tokio::spawn(async move { server.connect().await });
+    let error = match TaskServiceClient::connect(&layout.data).await {
+        Ok(_) => return Err("a default permissive pipe passed identity verification".into()),
+        Err(error) => error,
+    };
+    assert_eq!(
+        error.code(),
+        carl::service::client::ServiceClientErrorCode::InvalidEndpoint
+    );
+    accepting.await??;
+    assert!(!layout.data.join("carl.sqlite3").exists());
+    Ok(())
+}
+
+#[cfg(windows)]
+#[tokio::test(flavor = "current_thread")]
+async fn windows_client_accepts_the_current_user_private_service_pipe() -> TestResult {
+    let layout = Layout::new()?;
+    let service = TaskService::bind(&layout.data, PendingPort::new()).await?;
+    let running = tokio::spawn(service.serve(CancellationToken::new()));
+    let mut client = TaskServiceClient::connect(&layout.data).await?;
+    assert_eq!(client.protocol_version(), 1);
+    assert_eq!(
+        client
+            .request(ServiceRequest {
+                protocol_version: 1,
+                request_id: "windows-shutdown".to_owned(),
+                idempotency_key: "windows-shutdown-key".to_owned(),
+                command: ServiceCommand::Shutdown,
+            })
+            .await?,
+        ServiceResult::Applied
+    );
+    running.await??;
     Ok(())
 }
 
@@ -189,6 +244,82 @@ async fn client_eof_does_not_cancel_owner_task_and_controls_are_idempotent() -> 
     );
     service_task.await??;
     assert!(state.lock().unwrap().shutdowns >= 1);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+async fn read_polling_does_not_exhaust_process_or_connection_mutation_capacity() -> TestResult {
+    let layout = Layout::new()?;
+    let port = PendingPort::new();
+    let state = Arc::clone(&port.state);
+    let service = TaskService::bind(&layout.data, port).await?;
+    let running = tokio::spawn(service.serve(CancellationToken::new()));
+    let mut client = TaskServiceClient::connect(&layout.data).await?;
+    let ServiceResult::Accepted { task_id } = client
+        .request(ServiceRequest {
+            protocol_version: 1,
+            request_id: "ledger-start".to_owned(),
+            idempotency_key: "ledger-start-key".to_owned(),
+            command: ServiceCommand::StartTask(StartTaskCommand {
+                external_session_id: "ledger-session".to_owned(),
+                workspace: layout.workspace.clone(),
+                request: "remain controllable after sustained polling".to_owned(),
+                model: ModelId::parse("gpt-test")?,
+                effort: ReasoningEffort::High,
+                permission_mode: PermissionMode::FullAccess,
+            }),
+        })
+        .await?
+    else {
+        return Err("ledger task was not accepted".into());
+    };
+
+    for index in 0..8_200_u32 {
+        let command = if index % 2 == 0 {
+            ServiceCommand::Status { task_id }
+        } else {
+            ServiceCommand::Events {
+                task_id,
+                after_sequence: Some(0),
+                limit: 1,
+            }
+        };
+        client
+            .request(ServiceRequest {
+                protocol_version: 1,
+                request_id: format!("ledger-read-{index}"),
+                idempotency_key: format!("ledger-read-key-{index}"),
+                command,
+            })
+            .await
+            .map_err(|error| format!("read request {index} failed: {error:?}"))?;
+    }
+
+    assert_eq!(
+        client
+            .request(ServiceRequest {
+                protocol_version: 1,
+                request_id: "ledger-cancel".to_owned(),
+                idempotency_key: "ledger-cancel-key".to_owned(),
+                command: ServiceCommand::Cancel { task_id },
+            })
+            .await?,
+        ServiceResult::Applied
+    );
+    assert_eq!(state.lock().unwrap().interrupts, 1);
+    assert_eq!(
+        client
+            .request(ServiceRequest {
+                protocol_version: 1,
+                request_id: "ledger-shutdown".to_owned(),
+                idempotency_key: "ledger-shutdown-key".to_owned(),
+                command: ServiceCommand::Shutdown,
+            })
+            .await?,
+        ServiceResult::Applied
+    );
+    running.await??;
     Ok(())
 }
 
@@ -343,6 +474,457 @@ async fn start_idempotency_survives_owner_restart_without_a_second_task() -> Tes
         })
         .await?;
     running.await??;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+async fn every_service_mutation_replays_durably_and_keys_never_rebind() -> TestResult {
+    let layout = Layout::new()?;
+    let service = TaskService::bind(&layout.data, PendingPort::new()).await?;
+    let running = tokio::spawn(service.serve(CancellationToken::new()));
+    let mut client = TaskServiceClient::connect(&layout.data).await?;
+    let start = ServiceCommand::StartTask(StartTaskCommand {
+        external_session_id: "global-receipt-session".to_owned(),
+        workspace: layout.workspace.clone(),
+        request: "exercise every durable service mutation".to_owned(),
+        model: ModelId::parse("gpt-test")?,
+        effort: ReasoningEffort::High,
+        permission_mode: PermissionMode::FullAccess,
+    });
+    let ServiceResult::Accepted { task_id } = client
+        .request(ServiceRequest {
+            protocol_version: 1,
+            request_id: "global-start".to_owned(),
+            idempotency_key: "global-start-key".to_owned(),
+            command: start.clone(),
+        })
+        .await?
+    else {
+        return Err("global receipt task was not accepted".into());
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let ServiceResult::Snapshot(snapshot) = client
+                .request(ServiceRequest {
+                    protocol_version: 1,
+                    request_id: format!("global-status-{}", Uuid::new_v4()),
+                    idempotency_key: format!("global-status-key-{}", Uuid::new_v4()),
+                    command: ServiceCommand::Status { task_id },
+                })
+                .await
+                .expect("global status succeeds")
+            else {
+                continue;
+            };
+            if snapshot.status == TaskStatus::Active && snapshot.active_epoch.is_some() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+
+    let mutations = [
+        ("global-resume-key", ServiceCommand::Resume { task_id }),
+        (
+            "global-steer-key",
+            ServiceCommand::Steer {
+                task_id,
+                text: "preserve this exact owner steering".to_owned(),
+            },
+        ),
+        (
+            "global-configure-key",
+            ServiceCommand::Configure {
+                task_id,
+                model: ModelId::parse("gpt-test")?,
+                effort: ReasoningEffort::High,
+                permission_mode: PermissionMode::FullAccess,
+            },
+        ),
+        ("global-cancel-key", ServiceCommand::Cancel { task_id }),
+    ];
+    for (index, (key, command)) in mutations.iter().enumerate() {
+        assert_eq!(
+            client
+                .request(ServiceRequest {
+                    protocol_version: 1,
+                    request_id: format!("global-mutation-{index}"),
+                    idempotency_key: (*key).to_owned(),
+                    command: command.clone(),
+                })
+                .await?,
+            ServiceResult::Applied
+        );
+    }
+    assert_eq!(
+        client
+            .request(ServiceRequest {
+                protocol_version: 1,
+                request_id: "global-shutdown".to_owned(),
+                idempotency_key: "global-shutdown-key".to_owned(),
+                command: ServiceCommand::Shutdown,
+            })
+            .await?,
+        ServiceResult::Applied
+    );
+    running.await??;
+
+    let replacement_port = PendingPort::new();
+    let replacement_state = Arc::clone(&replacement_port.state);
+    let replacement = TaskService::bind(&layout.data, replacement_port).await?;
+    let replacement_running = tokio::spawn(replacement.serve(CancellationToken::new()));
+    let mut replay = TaskServiceClient::connect(&layout.data).await?;
+    assert_eq!(
+        replay
+            .request(ServiceRequest {
+                protocol_version: 1,
+                request_id: "global-start-replay".to_owned(),
+                idempotency_key: "global-start-key".to_owned(),
+                command: start,
+            })
+            .await?,
+        ServiceResult::Accepted { task_id }
+    );
+    for (index, (key, command)) in mutations.iter().enumerate() {
+        assert_eq!(
+            replay
+                .request(ServiceRequest {
+                    protocol_version: 1,
+                    request_id: format!("global-replay-{index}"),
+                    idempotency_key: (*key).to_owned(),
+                    command: command.clone(),
+                })
+                .await?,
+            ServiceResult::Applied
+        );
+    }
+    drop(replay);
+
+    for (key, _) in
+        std::iter::once(&("global-start-key", ServiceCommand::List)).chain(mutations.iter())
+    {
+        let mut conflict = TaskServiceClient::connect(&layout.data).await?;
+        assert!(
+            conflict
+                .request(ServiceRequest {
+                    protocol_version: 1,
+                    request_id: format!("global-conflict-{key}"),
+                    idempotency_key: (*key).to_owned(),
+                    command: ServiceCommand::Cancel {
+                        task_id: TaskId::new(),
+                    },
+                })
+                .await
+                .is_err(),
+            "global key {key} must reject method/task/payload rebinding"
+        );
+    }
+    {
+        let state = replacement_state.lock().unwrap();
+        assert_eq!(state.started_contexts, 0);
+        assert_eq!(state.resumed_contexts, 0);
+        assert_eq!(state.interrupts, 0);
+    }
+    let mut shutdown = TaskServiceClient::connect(&layout.data).await?;
+    assert_eq!(
+        shutdown
+            .request(ServiceRequest {
+                protocol_version: 1,
+                request_id: "global-shutdown-replay".to_owned(),
+                idempotency_key: "global-shutdown-key".to_owned(),
+                command: ServiceCommand::Shutdown,
+            })
+            .await?,
+        ServiceResult::Applied
+    );
+    replacement_running.await??;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+async fn pending_service_receipts_reconcile_control_crash_windows_without_duplicate_work()
+-> TestResult {
+    for method in ["resume", "steer", "configure", "cancel"] {
+        let layout = Layout::new()?;
+        let service = TaskService::bind(&layout.data, PendingPort::new()).await?;
+        let running = tokio::spawn(service.serve(CancellationToken::new()));
+        let mut client = TaskServiceClient::connect(&layout.data).await?;
+        let ServiceResult::Accepted { task_id } = client
+            .request(ServiceRequest {
+                protocol_version: 1,
+                request_id: format!("pending-{method}-start"),
+                idempotency_key: format!("pending-{method}-start-key"),
+                command: ServiceCommand::StartTask(StartTaskCommand {
+                    external_session_id: format!("pending-{method}-session"),
+                    workspace: layout.workspace.clone(),
+                    request: format!("exercise the {method} receipt crash window"),
+                    model: ModelId::parse("gpt-test")?,
+                    effort: ReasoningEffort::High,
+                    permission_mode: PermissionMode::FullAccess,
+                }),
+            })
+            .await?
+        else {
+            return Err(format!("pending {method} task was not accepted").into());
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let ServiceResult::Snapshot(snapshot) = client
+                    .request(ServiceRequest {
+                        protocol_version: 1,
+                        request_id: format!("pending-{method}-status-{}", Uuid::new_v4()),
+                        idempotency_key: format!("pending-{method}-status-key-{}", Uuid::new_v4()),
+                        command: ServiceCommand::Status { task_id },
+                    })
+                    .await
+                    .expect("pending status succeeds")
+                else {
+                    continue;
+                };
+                if snapshot.status == TaskStatus::Active && snapshot.active_epoch.is_some() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        let key = format!("pending-{method}-key");
+        let command = match method {
+            "resume" => ServiceCommand::Resume { task_id },
+            "steer" => ServiceCommand::Steer {
+                task_id,
+                text: "one crash-window steering intent".to_owned(),
+            },
+            "configure" => ServiceCommand::Configure {
+                task_id,
+                model: ModelId::parse("gpt-test")?,
+                effort: ReasoningEffort::High,
+                permission_mode: PermissionMode::FullAccess,
+            },
+            "cancel" => ServiceCommand::Cancel { task_id },
+            _ => unreachable!(),
+        };
+        rusqlite::Connection::open(layout.data.join("carl.sqlite3"))?.execute_batch(&format!(
+            "CREATE TRIGGER fail_{method}_service_receipt
+             BEFORE UPDATE OF state ON service_command_receipts
+             WHEN OLD.idempotency_key = '{key}' AND NEW.state = 'completed'
+             BEGIN SELECT RAISE(FAIL, 'forced service receipt completion failure'); END;"
+        ))?;
+        assert!(
+            client
+                .request(ServiceRequest {
+                    protocol_version: 1,
+                    request_id: format!("pending-{method}-first"),
+                    idempotency_key: key.clone(),
+                    command: command.clone(),
+                })
+                .await
+                .is_err(),
+            "{method} must expose the forced post-action receipt failure"
+        );
+        assert_eq!(
+            rusqlite::Connection::open(layout.data.join("carl.sqlite3"))?.query_row(
+                "SELECT state FROM service_command_receipts WHERE idempotency_key = ?1",
+                [&key],
+                |row| row.get::<_, String>(0),
+            )?,
+            "pending"
+        );
+        running.abort();
+        let _ = running.await;
+        drop(client);
+        rusqlite::Connection::open(layout.data.join("carl.sqlite3"))?
+            .execute_batch(&format!("DROP TRIGGER fail_{method}_service_receipt"))?;
+
+        let replacement_port = PendingPort::new();
+        let replacement_state = Arc::clone(&replacement_port.state);
+        let replacement = TaskService::bind(&layout.data, replacement_port).await?;
+        let baseline = {
+            let state = replacement_state.lock().unwrap();
+            (
+                state.started_contexts,
+                state.resumed_contexts,
+                state.interrupts,
+            )
+        };
+        let replacement_running = tokio::spawn(replacement.serve(CancellationToken::new()));
+        let mut retry = TaskServiceClient::connect(&layout.data).await?;
+        let retried = retry
+            .request(ServiceRequest {
+                protocol_version: 1,
+                request_id: format!("pending-{method}-retry"),
+                idempotency_key: key,
+                command,
+            })
+            .await
+            .map_err(|error| format!("{method} pending retry failed: {error:?}"))?;
+        assert_eq!(
+            retried,
+            ServiceResult::Applied,
+            "{method} pending receipt must reconcile canonically"
+        );
+        {
+            let state = replacement_state.lock().unwrap();
+            assert_eq!(
+                (
+                    state.started_contexts,
+                    state.resumed_contexts,
+                    state.interrupts
+                ),
+                baseline,
+                "{method} retry duplicated provider work"
+            );
+        }
+        retry
+            .request(ServiceRequest {
+                protocol_version: 1,
+                request_id: format!("pending-{method}-shutdown"),
+                idempotency_key: format!("pending-{method}-shutdown-key"),
+                command: ServiceCommand::Shutdown,
+            })
+            .await?;
+        replacement_running.await??;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+async fn pending_cancel_marker_without_terminal_state_resumes_the_same_control() -> TestResult {
+    use sha2::{Digest as _, Sha256};
+
+    let layout = Layout::new()?;
+    let service = TaskService::bind(&layout.data, PendingPort::new()).await?;
+    let running = tokio::spawn(service.serve(CancellationToken::new()));
+    let mut client = TaskServiceClient::connect(&layout.data).await?;
+    let ServiceResult::Accepted { task_id } = client
+        .request(ServiceRequest {
+            protocol_version: 1,
+            request_id: "marker-only-start".to_owned(),
+            idempotency_key: "marker-only-start-key".to_owned(),
+            command: ServiceCommand::StartTask(StartTaskCommand {
+                external_session_id: "marker-only-session".to_owned(),
+                workspace: layout.workspace.clone(),
+                request: "cancel from a marker-only crash cut".to_owned(),
+                model: ModelId::parse("gpt-test")?,
+                effort: ReasoningEffort::High,
+                permission_mode: PermissionMode::FullAccess,
+            }),
+        })
+        .await?
+    else {
+        return Err("marker-only task was not accepted".into());
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let ServiceResult::Snapshot(snapshot) = client
+                .request(ServiceRequest {
+                    protocol_version: 1,
+                    request_id: format!("marker-status-{}", Uuid::new_v4()),
+                    idempotency_key: format!("marker-status-key-{}", Uuid::new_v4()),
+                    command: ServiceCommand::Status { task_id },
+                })
+                .await
+                .expect("marker status succeeds")
+            else {
+                continue;
+            };
+            if snapshot.status == TaskStatus::Active && snapshot.active_epoch.is_some() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    running.abort();
+    let _ = running.await;
+    drop(client);
+
+    let key = "marker-only-cancel-key";
+    let command = ServiceCommand::Cancel { task_id };
+    let digest = command_digest(&command)?;
+    let receipt = ServiceCommandReceiptInput {
+        idempotency_key: key.to_owned(),
+        command_digest: Sha256Digest::parse(
+            digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>(),
+        )?,
+        command_kind: "cancel".to_owned(),
+        created_at: Utc::now(),
+    };
+    let mut store = Store::open(layout.data.join("carl.sqlite3"))?;
+    assert_eq!(
+        store.claim_service_command(receipt)?,
+        ServiceCommandReceiptClaim::Fresh
+    );
+    let control_id = format!(
+        "{:x}",
+        Sha256::digest(format!("carl-service-v1:{task_id}:cancel:{key}").as_bytes())
+    );
+    let current = store.get_task(task_id)?.ok_or("marker task missing")?;
+    assert!(!current.snapshot.status.is_terminal());
+    store
+        .append_task_event(
+            task_id,
+            current.revision,
+            TaskEvent::ControlRequested {
+                control_id: control_id.clone(),
+                kind: TaskControlKind::Cancel,
+            },
+            Utc::now(),
+        )?
+        .ok_or("cancel marker was not appended")?;
+    drop(store);
+
+    let replacement_port = PendingPort::new();
+    let replacement_state = Arc::clone(&replacement_port.state);
+    let replacement = TaskService::bind(&layout.data, replacement_port).await?;
+    let replacement_running = tokio::spawn(replacement.serve(CancellationToken::new()));
+    let mut retry = TaskServiceClient::connect(&layout.data).await?;
+    assert_eq!(
+        retry
+            .request(ServiceRequest {
+                protocol_version: 1,
+                request_id: "marker-only-cancel-retry".to_owned(),
+                idempotency_key: key.to_owned(),
+                command,
+            })
+            .await?,
+        ServiceResult::Applied
+    );
+    assert_eq!(
+        rusqlite::Connection::open(layout.data.join("carl.sqlite3"))?.query_row(
+            "SELECT COUNT(*) FROM task_control_markers
+             WHERE task_id = ?1 AND control_id = ?2 AND kind = 'cancel'",
+            rusqlite::params![task_id.to_string(), control_id],
+            |row| row.get::<_, i64>(0),
+        )?,
+        1,
+        "retry must not append a second cancel marker"
+    );
+    assert!(replacement_state.lock().unwrap().interrupts <= 1);
+    assert_eq!(
+        Store::open(layout.data.join("carl.sqlite3"))?
+            .get_task(task_id)?
+            .ok_or("cancelled marker task missing")?
+            .snapshot
+            .status,
+        TaskStatus::Cancelled
+    );
+    retry
+        .request(ServiceRequest {
+            protocol_version: 1,
+            request_id: "marker-only-shutdown".to_owned(),
+            idempotency_key: "marker-only-shutdown-key".to_owned(),
+            command: ServiceCommand::Shutdown,
+        })
+        .await?;
+    replacement_running.await??;
     Ok(())
 }
 
@@ -875,7 +1457,7 @@ async fn buzz_start_is_admitted_by_the_owner_writer_before_task_creation() -> Te
         .get_frontend_session("buzz-service-session")?
         .ok_or("Buzz binding missing")?;
     assert_eq!(binding.frontend, Frontend::Buzz);
-    assert_eq!(binding.permission_mode, PermissionMode::FullAccess);
+    assert_eq!(binding.permission_mode, PermissionMode::Plan);
     let expected_channel = Uuid::nil().to_string();
     assert_eq!(
         binding.channel_id.as_ref().map(|channel| channel.as_str()),
@@ -1061,6 +1643,7 @@ async fn acp_reconnect_during_three_epoch_task_replays_once_and_completes() -> T
     let layout = Layout::new()?;
     let shared = Arc::new(Mutex::new(ThreeEpochState {
         workspace: layout.workspace.clone(),
+        emit_live: true,
         ..ThreeEpochState::default()
     }));
     let service = TaskService::bind(&layout.data, ThreeEpochPort::new(Arc::clone(&shared))).await?;
@@ -1202,9 +1785,23 @@ async fn acp_reconnect_during_three_epoch_task_replays_once_and_completes() -> T
                 .ok_or("three-epoch load response missing")?;
         loaded = frame.value()["id"] == 11;
     }
+    client_write
+        .write_all(
+            format!(
+                "{}\n",
+                json!({"jsonrpc":"2.0","id":12,"method":"session/prompt","params":{"sessionId":session_id,"prompt":[{"type":"text","text":"continue from the loaded durable cursor"}]}})
+            )
+            .as_bytes(),
+        )
+        .await?;
+    client_write.flush().await?;
     shared.lock().unwrap().release_epoch_two = true;
 
     let mut replayed = Vec::new();
+    let mut visible_assistant = 0_u64;
+    let mut visible_diff = 0_u64;
+    let mut prompt_completed = false;
+    let mut durable_completed = false;
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let frame = read_frame(&mut reader, 1024 * 1024)
@@ -1214,15 +1811,34 @@ async fn acp_reconnect_during_three_epoch_task_replays_once_and_completes() -> T
             if let Some(sequence) = frame.value()["params"]["_meta"]["eventSequence"].as_u64() {
                 replayed.push(sequence);
                 if frame.value()["params"]["update"]["status"] == "completed" {
-                    break;
+                    durable_completed = true;
                 }
+            }
+            visible_assistant += u64::from(
+                frame.value()["params"]["update"]["content"]["text"] == "visible assistant update",
+            );
+            visible_diff += u64::from(
+                frame.value()["params"]["update"]["content"][0]["diff"]
+                    == "diff --git a/live b/live",
+            );
+            prompt_completed |= frame.value()["id"] == 12;
+            if durable_completed && prompt_completed {
+                break;
             }
         }
     })
     .await?;
     assert!(!replayed.is_empty());
     assert!(replayed.iter().all(|sequence| *sequence > cursor));
-    assert!(replayed.windows(2).all(|pair| pair[0] < pair[1]));
+    assert!(
+        replayed.windows(2).all(|pair| pair[0] < pair[1]),
+        "durable replay duplicated or reordered: {replayed:?}"
+    );
+    assert_eq!(
+        visible_assistant, 1,
+        "live assistant output is delivered once"
+    );
+    assert_eq!(visible_diff, 1, "live diff output is delivered once");
 
     let ServiceResult::Snapshot(snapshot) = owner
         .request(ServiceRequest {
@@ -1467,6 +2083,7 @@ struct ThreeEpochState {
     epoch_two_finished: bool,
     completion_reports: u64,
     interrupts: u64,
+    emit_live: bool,
 }
 
 impl ThreeEpochPort {
@@ -1542,6 +2159,18 @@ impl AgentPort for ThreeEpochPort {
             state.work_epochs += 1;
             match state.work_epochs {
                 1 => {
+                    if state.emit_live {
+                        state.events.push_back(AgentEvent::AssistantDelta {
+                            context_id: request.context_id.clone(),
+                            epoch_id: epoch_id.clone(),
+                            text: "visible assistant update".to_owned(),
+                        });
+                        state.events.push_back(AgentEvent::DiffUpdated {
+                            context_id: request.context_id.clone(),
+                            epoch_id: epoch_id.clone(),
+                            diff: "diff --git a/live b/live".to_owned(),
+                        });
+                    }
                     let item = AgentItem::Command {
                         item_id: "three-effect".to_owned(),
                         command: "apply-once".to_owned(),

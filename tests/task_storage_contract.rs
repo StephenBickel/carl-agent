@@ -13,8 +13,9 @@ use carl::runtime::task::{
 };
 use carl::sidecar::DataRootLock;
 use carl::storage::{
-    ClientName, ExternalSessionId, NewFrontendSession, NewTask, RuntimeStore, Store,
-    TaskControlMutationClaim, TaskControlMutationInput,
+    ClientName, ExternalSessionId, NewFrontendSession, NewTask, RuntimeStore,
+    ServiceCommandReceiptClaim, ServiceCommandReceiptInput, Store, TaskControlMutationClaim,
+    TaskControlMutationInput,
 };
 use chrono::{DateTime, Utc};
 use rusqlite::Connection;
@@ -365,6 +366,55 @@ fn task_control_receipts_survive_both_crash_windows_without_key_rebinding()
             })
             .is_err(),
         "method or payload reuse must never rebind an idempotency key"
+    );
+    Ok(())
+}
+
+#[test]
+fn service_command_receipts_are_global_durable_and_canonical() -> Result<(), Box<dyn Error>> {
+    let fixture = TemporaryTaskDatabase::new()?;
+    let store = Store::open(&fixture.database)?;
+    let input = ServiceCommandReceiptInput {
+        idempotency_key: "global-command-key".to_owned(),
+        command_digest: Sha256Digest::parse(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )?,
+        command_kind: "configure".to_owned(),
+        created_at: timestamp(0),
+    };
+    assert_eq!(
+        store.claim_service_command(input.clone())?,
+        ServiceCommandReceiptClaim::Fresh
+    );
+    drop(store);
+
+    let store = Store::open(&fixture.database)?;
+    assert_eq!(
+        store.claim_service_command(input.clone())?,
+        ServiceCommandReceiptClaim::Pending
+    );
+    let result = r#"{"type":"applied"}"#;
+    store.complete_service_command(&input, result, timestamp(1))?;
+    drop(store);
+
+    let store = Store::open(&fixture.database)?;
+    assert_eq!(
+        store.claim_service_command(input.clone())?,
+        ServiceCommandReceiptClaim::Replay {
+            result_json: result.to_owned()
+        }
+    );
+    assert!(
+        store
+            .claim_service_command(ServiceCommandReceiptInput {
+                command_digest: Sha256Digest::parse(
+                    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                )?,
+                command_kind: "cancel".to_owned(),
+                ..input
+            })
+            .is_err(),
+        "one global key cannot be rebound to another method or digest"
     );
     Ok(())
 }

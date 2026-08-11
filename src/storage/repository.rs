@@ -178,6 +178,21 @@ pub enum TaskControlMutationClaim {
     },
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServiceCommandReceiptInput {
+    pub idempotency_key: String,
+    pub command_digest: Sha256Digest,
+    pub command_kind: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ServiceCommandReceiptClaim {
+    Fresh,
+    Pending,
+    Replay { result_json: String },
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RemoteCodeKind {
     Approval,
@@ -1052,6 +1067,34 @@ impl Store {
         .transpose()
     }
 
+    pub fn get_frontend_session_for_session(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<FrontendSessionRecord>, CarlError> {
+        let external_session_id = self
+            .connection
+            .query_row(
+                "SELECT external_session_id FROM frontend_sessions WHERE session_id = ?1",
+                [session_id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(storage_error)?;
+        external_session_id
+            .map(|external| self.get_frontend_session(&external))
+            .transpose()
+            .map(Option::flatten)
+    }
+
+    pub fn get_trusted_frontend_owner_for_workspace(
+        &self,
+        frontend: Frontend,
+        workspace: &Path,
+    ) -> Result<Option<TrustedFrontendOwnerRecord>, CarlError> {
+        validate_canonical_frontend_cwd(workspace)?;
+        self.get_trusted_frontend_owner(frontend, frontend_workspace_digest(workspace))
+    }
+
     pub fn configure_frontend_session(
         &self,
         external_session_id: &ExternalSessionId,
@@ -1421,6 +1464,56 @@ impl Store {
             .ok_or_else(|| storage_invariant("admitted trusted frontend owner disappeared"))
     }
 
+    pub fn recover_or_admit_trusted_frontend_message(
+        &self,
+        frontend: Frontend,
+        actor_id: &ActorId,
+        channel_id: &ChannelId,
+        workspace: &Path,
+        event_id: &str,
+        admitted_at: DateTime<Utc>,
+    ) -> Result<TrustedFrontendOwnerRecord, CarlError> {
+        validate_canonical_frontend_cwd(workspace)?;
+        let workspace_digest = frontend_workspace_digest(workspace);
+        let existing = self
+            .connection
+            .query_row(
+                "SELECT frontend, workspace_digest, actor_id, channel_id
+                 FROM trusted_frontend_events WHERE event_id = ?1",
+                [event_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(storage_error)?;
+        if let Some((stored_frontend, stored_workspace, stored_actor, stored_channel)) = existing {
+            if stored_frontend != frontend.as_str()
+                || stored_workspace != workspace_digest.to_string()
+                || stored_actor != actor_id.as_str()
+                || stored_channel != channel_id.as_str()
+            {
+                return Err(policy_error("trusted frontend event binding is invalid"));
+            }
+            return self
+                .get_trusted_frontend_owner(frontend, workspace_digest)?
+                .ok_or_else(|| storage_invariant("trusted frontend event lost its owner"));
+        }
+        self.admit_trusted_frontend_message(
+            frontend,
+            actor_id,
+            channel_id,
+            workspace,
+            event_id,
+            admitted_at,
+        )
+    }
+
     pub fn claim_task_control_mutation(
         &self,
         input: TaskControlMutationInput,
@@ -1527,6 +1620,104 @@ impl Store {
             .map_err(storage_error)?;
         transaction.commit().map_err(storage_error)?;
         Ok(TaskControlMutationClaim::Fresh)
+    }
+
+    pub fn claim_service_command(
+        &self,
+        input: ServiceCommandReceiptInput,
+    ) -> Result<ServiceCommandReceiptClaim, CarlError> {
+        validate_service_command_receipt(&input)?;
+        let transaction = self
+            .connection
+            .unchecked_transaction()
+            .map_err(storage_error)?;
+        let existing = transaction
+            .query_row(
+                "SELECT command_digest, state, result_json
+                 FROM service_command_receipts WHERE idempotency_key = ?1",
+                [input.idempotency_key.as_str()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(storage_error)?;
+        if let Some((digest, state, result_json)) = existing {
+            if digest != input.command_digest.to_string() {
+                return Err(policy_error("service command idempotency key was rebound"));
+            }
+            return match (state.as_str(), result_json) {
+                ("pending", None) => Ok(ServiceCommandReceiptClaim::Pending),
+                ("completed", Some(result_json)) => {
+                    Ok(ServiceCommandReceiptClaim::Replay { result_json })
+                }
+                _ => Err(storage_invariant(
+                    "service command receipt state is invalid",
+                )),
+            };
+        }
+        transaction
+            .execute(
+                "INSERT INTO service_command_receipts (
+                    idempotency_key, command_digest, command_kind, state, created_at
+                 ) VALUES (?1, ?2, ?3, 'pending', ?4)",
+                params![
+                    input.idempotency_key,
+                    input.command_digest.to_string(),
+                    input.command_kind,
+                    format_timestamp(input.created_at),
+                ],
+            )
+            .map_err(storage_error)?;
+        transaction.commit().map_err(storage_error)?;
+        Ok(ServiceCommandReceiptClaim::Fresh)
+    }
+
+    pub fn complete_service_command(
+        &self,
+        input: &ServiceCommandReceiptInput,
+        result_json: &str,
+        completed_at: DateTime<Utc>,
+    ) -> Result<String, CarlError> {
+        validate_service_command_receipt(input)?;
+        if result_json.is_empty()
+            || result_json.len() > 262_144
+            || !serde_json::from_str::<serde_json::Value>(result_json)
+                .is_ok_and(|value| value.is_object())
+        {
+            return Err(policy_error("service command result is invalid"));
+        }
+        let changed = self
+            .connection
+            .execute(
+                "UPDATE service_command_receipts
+                 SET state = 'completed', result_json = ?3, completed_at = ?4
+                 WHERE idempotency_key = ?1 AND command_digest = ?2 AND state = 'pending'",
+                params![
+                    input.idempotency_key,
+                    input.command_digest.to_string(),
+                    result_json,
+                    format_timestamp(completed_at),
+                ],
+            )
+            .map_err(storage_error)?;
+        if changed == 1 {
+            return Ok(result_json.to_owned());
+        }
+        self.connection
+            .query_row(
+                "SELECT result_json FROM service_command_receipts
+                 WHERE idempotency_key = ?1 AND command_digest = ?2 AND state = 'completed'",
+                params![input.idempotency_key, input.command_digest.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(storage_error)?
+            .ok_or_else(|| policy_error("service command was not durably completed"))
     }
 
     pub fn complete_task_control_mutation(
@@ -2325,6 +2516,33 @@ impl Store {
         load_task_record(&self.connection, task_id)
     }
 
+    pub fn get_service_task_receipt(
+        &self,
+        idempotency_key: &str,
+        command_digest: Sha256Digest,
+    ) -> Result<Option<TaskId>, CarlError> {
+        let existing = self
+            .connection
+            .query_row(
+                "SELECT command_digest, task_id FROM service_task_receipts
+                 WHERE idempotency_key = ?1",
+                [idempotency_key],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(storage_error)?;
+        let Some((digest, task_id)) = existing else {
+            return Ok(None);
+        };
+        if digest != command_digest.to_string() {
+            return Err(policy_error("service task idempotency key was rebound"));
+        }
+        task_id
+            .parse()
+            .map(Some)
+            .map_err(|_| storage_invariant("service task receipt is corrupt"))
+    }
+
     pub fn get_task_configuration(
         &self,
         task_id: TaskId,
@@ -2346,6 +2564,24 @@ impl Store {
                     WHERE task_id = ?1 AND control_id = ?2 AND kind = ?3
                  )",
                 params![task_id.to_string(), control_id, task_control_kind_str(kind)],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(storage_error)
+    }
+
+    pub fn task_has_configuration_control(
+        &self,
+        task_id: TaskId,
+        control_id: &str,
+    ) -> Result<bool, CarlError> {
+        validate_task_control_id(control_id)?;
+        self.connection
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM service_configuration_controls
+                    WHERE task_id = ?1 AND control_id = ?2
+                 )",
+                params![task_id.to_string(), control_id],
                 |row| row.get::<_, bool>(0),
             )
             .map_err(storage_error)
@@ -6978,6 +7214,14 @@ fn apply_task_child_projection(
                 )
                 .map_err(storage_error)?;
             require_projection_change(changed, "task configuration projection is missing")?;
+            transaction
+                .execute(
+                    "INSERT INTO service_configuration_controls (
+                        task_id, control_id, event_sequence
+                     ) VALUES (?1, ?2, ?3)",
+                    params![task_id, control_id, event_sequence],
+                )
+                .map_err(storage_error)?;
         }
         TaskEvent::ConfigurationApplied { control_id } => {
             let changed = transaction
@@ -7760,6 +8004,30 @@ fn validate_task_control_id(control_id: &str) -> Result<(), CarlError> {
     } else {
         Err(policy_error("task control ID is invalid"))
     }
+}
+
+fn validate_service_command_receipt(input: &ServiceCommandReceiptInput) -> Result<(), CarlError> {
+    let kind_valid = matches!(
+        input.command_kind.as_str(),
+        "start_task"
+            | "start_trusted_task"
+            | "configure_trusted_session"
+            | "resolve_approval"
+            | "resume"
+            | "steer"
+            | "steer_trusted"
+            | "cancel"
+            | "configure"
+            | "shutdown"
+    );
+    if input.idempotency_key.is_empty()
+        || input.idempotency_key.len() > 128
+        || input.idempotency_key.chars().any(char::is_control)
+        || !kind_valid
+    {
+        return Err(policy_error("service command receipt binding is invalid"));
+    }
+    Ok(())
 }
 
 const fn permission_strength(mode: PermissionMode) -> u8 {

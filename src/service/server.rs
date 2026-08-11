@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -18,20 +18,21 @@ use tokio_util::sync::CancellationToken;
 
 use crate::acp::PermissionMode;
 use crate::events::TurnId;
-use crate::policy::Frontend;
-use crate::runtime::agent_port::AgentPort;
+use crate::policy::{Frontend, Sha256Digest};
+use crate::runtime::agent_port::{AgentPort, EffectDecision};
 use crate::runtime::task::{
-    OwnerStartTask, OwnerTrustedAdmission, OwnerTrustedMessage, TaskControlKind, TaskEngine,
-    TaskEngineAcknowledgement, TaskEngineControl, TaskEngineError, TaskEngineErrorCode, TaskId,
-    TaskStatus,
+    OwnerConfigureSession, OwnerStartTask, OwnerTrustedAdmission, OwnerTrustedMessage,
+    TaskControlKind, TaskEngine, TaskEngineAcknowledgement, TaskEngineControl, TaskEngineError,
+    TaskEngineErrorCode, TaskEngineUpdate, TaskId, TaskStatus,
 };
 use crate::sidecar::{DataRootLock, DataRootLockErrorCode};
-use crate::storage::{RuntimeStore, Store};
+use crate::storage::{RuntimeStore, ServiceCommandReceiptClaim, ServiceCommandReceiptInput, Store};
 
 use super::protocol::{
-    MAX_SERVICE_FRAME_BYTES, ProtocolErrorCode, RequestLedger, ServiceCapabilities, ServiceCommand,
-    ServiceFrame, ServiceInfo, ServiceModel, ServiceRequest, ServiceResult, ServiceSessionInfo,
-    command_digest, decode_request_line, encode_frame,
+    LiveUpdateEnvelope, LiveUpdatePage, MAX_SERVICE_FRAME_BYTES, ProtocolErrorCode, RequestLedger,
+    ServiceCapabilities, ServiceCommand, ServiceFrame, ServiceInfo, ServiceModel, ServiceRequest,
+    ServiceResult, ServiceSessionInfo, TaskUpdate, command_digest, decode_request_line,
+    encode_frame, is_mutation,
 };
 
 #[cfg(unix)]
@@ -296,7 +297,7 @@ const fn endpoint_error(code: EndpointErrorCode) -> EndpointError {
 
 const SERVICE_COMMAND_CAPACITY: usize = 64;
 const SERVICE_CONTROL_CAPACITY: usize = 64;
-const MAX_COMPLETED_IDEMPOTENCY: usize = 8_192;
+const LIVE_UPDATE_CAPACITY: usize = 128;
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum TaskServiceErrorCode {
@@ -336,7 +337,10 @@ pub struct TaskService<P: AgentPort + 'static> {
     initial_tasks: Vec<TaskId>,
     controls: mpsc::Sender<TaskEngineControl>,
     acknowledgements: Arc<tokio::sync::Mutex<mpsc::Receiver<TaskEngineAcknowledgement>>>,
-    completed_idempotency: Arc<tokio::sync::Mutex<CompletedIdempotency>>,
+    mutation_gate: Arc<tokio::sync::Mutex<()>>,
+    live_updates: Arc<LiveUpdateHub>,
+    live_update_receiver: mpsc::Receiver<(TaskId, TaskEngineUpdate)>,
+    permission_receiver: mpsc::Receiver<crate::runtime::task::TaskEnginePermissionNotice>,
     next_acknowledgement: Arc<AtomicU64>,
     active_task: Arc<tokio::sync::Mutex<Option<TaskId>>>,
     info: ServiceInfo,
@@ -373,10 +377,13 @@ impl<P: AgentPort + 'static> TaskService<P> {
         )?;
         let mut engine = TaskEngine::new_runtime(runtime_store, port);
         let initial_tasks = engine.reconcile_startup().await.map_err(map_engine)?;
+        let (live_update_sender, live_update_receiver) = mpsc::channel(LIVE_UPDATE_CAPACITY);
+        let live_update_overflow = Arc::new(AtomicU64::new(0));
+        engine.install_update_sink(live_update_sender, Arc::clone(&live_update_overflow));
         let (controls, control_receiver) = mpsc::channel(SERVICE_CONTROL_CAPACITY);
         let (acknowledgement_sender, acknowledgement_receiver) =
             mpsc::channel(SERVICE_CONTROL_CAPACITY);
-        let (permission_sender, _permission_receiver) = mpsc::channel(1);
+        let (permission_sender, permission_receiver) = mpsc::channel(1);
         engine.install_controls(control_receiver, acknowledgement_sender, permission_sender);
         Ok(Self {
             endpoint,
@@ -385,9 +392,10 @@ impl<P: AgentPort + 'static> TaskService<P> {
             initial_tasks,
             controls,
             acknowledgements: Arc::new(tokio::sync::Mutex::new(acknowledgement_receiver)),
-            completed_idempotency: Arc::new(tokio::sync::Mutex::new(
-                CompletedIdempotency::default(),
-            )),
+            mutation_gate: Arc::new(tokio::sync::Mutex::new(())),
+            live_updates: Arc::new(LiveUpdateHub::new(live_update_overflow)),
+            live_update_receiver,
+            permission_receiver,
             next_acknowledgement: Arc::new(AtomicU64::new(1)),
             active_task: Arc::new(tokio::sync::Mutex::new(None)),
             info,
@@ -402,7 +410,10 @@ impl<P: AgentPort + 'static> TaskService<P> {
             initial_tasks,
             controls,
             acknowledgements,
-            completed_idempotency,
+            mutation_gate,
+            live_updates,
+            mut live_update_receiver,
+            mut permission_receiver,
             next_acknowledgement,
             active_task,
             info,
@@ -419,11 +430,40 @@ impl<P: AgentPort + 'static> TaskService<P> {
             read_store,
             controls,
             acknowledgements,
-            completed_idempotency,
+            mutation_gate,
+            live_updates: Arc::clone(&live_updates),
             next_acknowledgement,
             active_task,
             actor_sender,
             info,
+        });
+        let live_task = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    update = live_update_receiver.recv() => {
+                        let Some(update) = update else { break };
+                        if let Some((task_id, update)) = map_live_update(update) {
+                            live_updates.publish(task_id, update);
+                        }
+                    }
+                    notice = permission_receiver.recv() => {
+                        let Some(notice) = notice else { break };
+                        live_updates.publish(
+                            notice.task_id,
+                            TaskUpdate::ApprovalRequired {
+                                task_id: notice.task_id,
+                                operation_id: notice.operation_id,
+                                display_code: notice.display_code,
+                                summary: notice.summary,
+                                request_id: notice.request_id,
+                                session_id: notice.session_id,
+                                turn_id: notice.turn_id,
+                                external_session_id: notice.external_session_id.as_str().to_owned(),
+                            },
+                        );
+                    }
+                }
+            }
         });
         let stop = CancellationToken::new();
         let mut connections = JoinSet::new();
@@ -448,6 +488,8 @@ impl<P: AgentPort + 'static> TaskService<P> {
         connections.abort_all();
         while connections.join_next().await.is_some() {}
         drop(shared);
+        live_task.abort();
+        let _ = live_task.await;
         actor_task
             .join()
             .await
@@ -483,16 +525,196 @@ struct ServiceShared {
     read_store: Arc<Mutex<Store>>,
     controls: mpsc::Sender<TaskEngineControl>,
     acknowledgements: Arc<tokio::sync::Mutex<mpsc::Receiver<TaskEngineAcknowledgement>>>,
-    completed_idempotency: Arc<tokio::sync::Mutex<CompletedIdempotency>>,
+    mutation_gate: Arc<tokio::sync::Mutex<()>>,
+    live_updates: Arc<LiveUpdateHub>,
     next_acknowledgement: Arc<AtomicU64>,
     active_task: Arc<tokio::sync::Mutex<Option<TaskId>>>,
     actor_sender: mpsc::Sender<ActorCommand>,
     info: ServiceInfo,
 }
 
-#[derive(Default)]
-struct CompletedIdempotency {
-    entries: BTreeMap<String, ([u8; 32], ServiceResult)>,
+struct LiveUpdateHub {
+    tasks: Mutex<HashMap<TaskId, LiveTaskUpdates>>,
+    source_overflow: Arc<AtomicU64>,
+}
+
+struct LiveTaskUpdates {
+    next_cursor: u64,
+    ring: VecDeque<LiveUpdateEnvelope>,
+    subscribers: Vec<mpsc::Sender<LiveUpdateEnvelope>>,
+    observed_source_overflow: u64,
+    pending_approval: Option<LiveUpdateEnvelope>,
+}
+
+impl Default for LiveTaskUpdates {
+    fn default() -> Self {
+        Self {
+            next_cursor: 1,
+            ring: VecDeque::new(),
+            subscribers: Vec::new(),
+            observed_source_overflow: 0,
+            pending_approval: None,
+        }
+    }
+}
+
+impl LiveUpdateHub {
+    fn new(source_overflow: Arc<AtomicU64>) -> Self {
+        Self {
+            tasks: Mutex::new(HashMap::new()),
+            source_overflow,
+        }
+    }
+
+    fn publish(&self, task_id: TaskId, update: TaskUpdate) {
+        let Ok(mut tasks) = self.tasks.lock() else {
+            return;
+        };
+        let task = tasks.entry(task_id).or_default();
+        let envelope = LiveUpdateEnvelope {
+            cursor: task.next_cursor,
+            update,
+        };
+        if matches!(&envelope.update, TaskUpdate::ApprovalRequired { .. }) {
+            task.pending_approval = Some(envelope.clone());
+        }
+        task.next_cursor = task.next_cursor.saturating_add(1);
+        if task.ring.len() == LIVE_UPDATE_CAPACITY {
+            task.ring.pop_front();
+        }
+        task.ring.push_back(envelope.clone());
+        task.subscribers
+            .retain(|subscriber| subscriber.try_send(envelope.clone()).is_ok());
+    }
+
+    fn clear_pending_approval(&self, task_id: TaskId) {
+        if let Ok(mut tasks) = self.tasks.lock()
+            && let Some(task) = tasks.get_mut(&task_id)
+        {
+            task.pending_approval = None;
+        }
+    }
+
+    async fn page(
+        &self,
+        task_id: TaskId,
+        after_cursor: Option<u64>,
+        limit: u16,
+    ) -> Result<(Vec<LiveUpdateEnvelope>, Option<u64>, bool), TaskServiceError> {
+        let (initial, receiver) = {
+            let mut tasks = self
+                .tasks
+                .lock()
+                .map_err(|_| service_error(TaskServiceErrorCode::Stopped))?;
+            let task = tasks.entry(task_id).or_default();
+            let initial = task.page(
+                after_cursor,
+                limit,
+                self.source_overflow.load(Ordering::Relaxed),
+            );
+            if !initial.0.is_empty() || initial.2 {
+                (initial, None)
+            } else {
+                let (sender, receiver) = mpsc::channel(1);
+                task.subscribers.push(sender);
+                (initial, Some(receiver))
+            }
+        };
+        let Some(mut receiver) = receiver else {
+            return Ok(initial);
+        };
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(25), receiver.recv()).await;
+        let mut tasks = self
+            .tasks
+            .lock()
+            .map_err(|_| service_error(TaskServiceErrorCode::Stopped))?;
+        let Some(task) = tasks.get_mut(&task_id) else {
+            return Ok((Vec::new(), after_cursor, false));
+        };
+        Ok(task.page(
+            after_cursor,
+            limit,
+            self.source_overflow.load(Ordering::Relaxed),
+        ))
+    }
+}
+
+impl LiveTaskUpdates {
+    fn page(
+        &mut self,
+        after_cursor: Option<u64>,
+        limit: u16,
+        source_overflow: u64,
+    ) -> (Vec<LiveUpdateEnvelope>, Option<u64>, bool) {
+        if source_overflow > self.observed_source_overflow {
+            self.observed_source_overflow = source_overflow;
+            return (
+                Vec::new(),
+                self.ring
+                    .back()
+                    .map(|update| update.cursor)
+                    .or(after_cursor),
+                true,
+            );
+        }
+        live_update_page(self, after_cursor, limit)
+    }
+}
+
+fn live_update_page(
+    task: &LiveTaskUpdates,
+    after_cursor: Option<u64>,
+    limit: u16,
+) -> (Vec<LiveUpdateEnvelope>, Option<u64>, bool) {
+    let oldest = task.ring.front().map(|update| update.cursor);
+    let latest = task.ring.back().map(|update| update.cursor);
+    let overflowed = match (after_cursor, oldest) {
+        (Some(cursor), Some(oldest)) => cursor.saturating_add(1) < oldest,
+        (None, Some(oldest)) => oldest > 1,
+        _ => false,
+    };
+    if overflowed {
+        return (Vec::new(), latest, true);
+    }
+    let updates = task
+        .ring
+        .iter()
+        .filter(|update| after_cursor.is_none_or(|cursor| update.cursor > cursor))
+        .take(usize::from(limit))
+        .cloned()
+        .collect::<Vec<_>>();
+    let updates = if updates.is_empty()
+        && let (Some(after), Some(pending)) = (after_cursor, task.pending_approval.as_ref())
+        && after >= pending.cursor
+    {
+        vec![pending.clone()]
+    } else {
+        updates
+    };
+    let cursor = updates.last().map(|update| update.cursor).or(after_cursor);
+    (updates, cursor, false)
+}
+
+fn map_live_update((task_id, update): (TaskId, TaskEngineUpdate)) -> Option<(TaskId, TaskUpdate)> {
+    match update {
+        TaskEngineUpdate::AgentMessageChunk(text)
+            if text.len() <= 64 * 1024
+                && crate::security::SecretFilter
+                    .inspect(text.as_bytes())
+                    .is_ok() =>
+        {
+            Some((task_id, TaskUpdate::AssistantDelta(text)))
+        }
+        TaskEngineUpdate::DiffUpdated(diff)
+            if diff.len() <= 64 * 1024
+                && crate::security::SecretFilter
+                    .inspect(diff.as_bytes())
+                    .is_ok() =>
+        {
+            Some((task_id, TaskUpdate::Diff(diff)))
+        }
+        _ => None,
+    }
 }
 
 enum ActorCommand {
@@ -546,6 +768,9 @@ async fn run_task_actor<P: AgentPort + 'static>(
         }
         if let Some(task_id) = scheduled.pop_front() {
             *active_task.lock().await = Some(task_id);
+            engine
+                .install_owner_frontend_context(task_id)
+                .map_err(map_engine)?;
             let _ = engine.run(task_id).await;
             let _ = engine.take_updates();
             *active_task.lock().await = None;
@@ -704,29 +929,43 @@ async fn dispatch_request(
     shared: &ServiceShared,
     request: ServiceRequest,
 ) -> Result<ServiceResult, TaskServiceError> {
+    if !is_mutation(&request.command) {
+        return execute_command(shared, &request, false).await;
+    }
+    let _gate = shared.mutation_gate.lock().await;
     let digest = command_digest(&request.command)
         .map_err(|_| service_error(TaskServiceErrorCode::InvalidRequest))?;
-    let mut completed = shared.completed_idempotency.lock().await;
-    if let Some((existing_digest, result)) = completed.entries.get(&request.idempotency_key) {
-        return if existing_digest == &digest {
-            Ok(result.clone())
-        } else {
-            Err(service_error(TaskServiceErrorCode::InvalidRequest))
-        };
+    let receipt = ServiceCommandReceiptInput {
+        idempotency_key: request.idempotency_key.clone(),
+        command_digest: Sha256Digest::from_bytes(digest),
+        command_kind: service_command_kind(&request.command).to_owned(),
+        created_at: Utc::now(),
+    };
+    let claim = lock_store(&shared.read_store)?
+        .claim_service_command(receipt.clone())
+        .map_err(|_| service_error(TaskServiceErrorCode::InvalidRequest))?;
+    if let ServiceCommandReceiptClaim::Replay { result_json } = claim {
+        let result = serde_json::from_str(&result_json)
+            .map_err(|_| service_error(TaskServiceErrorCode::Storage))?;
+        if matches!(request.command, ServiceCommand::Shutdown) {
+            shutdown_owner(shared).await?;
+        }
+        return Ok(result);
     }
-    if completed.entries.len() >= MAX_COMPLETED_IDEMPOTENCY {
-        return Err(service_error(TaskServiceErrorCode::Busy));
-    }
-    let result = execute_command(shared, &request).await?;
-    completed
-        .entries
-        .insert(request.idempotency_key, (digest, result.clone()));
+    let recovering_pending = claim == ServiceCommandReceiptClaim::Pending;
+    let result = execute_command(shared, &request, recovering_pending).await?;
+    let result_json =
+        serde_json::to_string(&result).map_err(|_| service_error(TaskServiceErrorCode::Storage))?;
+    lock_store(&shared.read_store)?
+        .complete_service_command(&receipt, &result_json, Utc::now())
+        .map_err(|_| service_error(TaskServiceErrorCode::Storage))?;
     Ok(result)
 }
 
 async fn execute_command(
     shared: &ServiceShared,
     request: &ServiceRequest,
+    recovering_pending: bool,
 ) -> Result<ServiceResult, TaskServiceError> {
     match &request.command {
         ServiceCommand::Info => Ok(ServiceResult::Info(shared.info.clone())),
@@ -813,6 +1052,32 @@ async fn execute_command(
                 .map_err(|_| service_error(TaskServiceErrorCode::Storage))?;
             Ok(ServiceResult::Events(events))
         }
+        ServiceCommand::LiveUpdates {
+            task_id,
+            after_cursor,
+            limit,
+        } => {
+            let (updates, cursor, overflowed) = shared
+                .live_updates
+                .page(*task_id, *after_cursor, *limit)
+                .await?;
+            let snapshot = if overflowed {
+                Some(
+                    lock_store(&shared.read_store)?
+                        .get_task(*task_id)
+                        .map_err(|_| service_error(TaskServiceErrorCode::Storage))?
+                        .map(|record| record.snapshot)
+                        .ok_or_else(|| service_error(TaskServiceErrorCode::InvalidRequest))?,
+                )
+            } else {
+                None
+            };
+            Ok(ServiceResult::LiveUpdates(LiveUpdatePage {
+                updates,
+                cursor,
+                snapshot,
+            }))
+        }
         ServiceCommand::Cancel { task_id } => {
             mutate_task(shared, *task_id, request, Mutation::Cancel).await?;
             Ok(ServiceResult::Applied)
@@ -861,6 +1126,7 @@ async fn execute_command(
                             actor_id: actor_id.clone(),
                             channel_id: channel_id.clone(),
                             event_id: event_id.clone(),
+                            recover_existing: recovering_pending,
                         },
                     },
                     reply,
@@ -894,12 +1160,13 @@ async fn execute_command(
                         request: command.start.request.clone(),
                         model: command.start.model.clone(),
                         effort: command.start.effort,
-                        permission_mode: PermissionMode::Default,
+                        permission_mode: command.start.permission_mode,
                         trusted_admission: Some(OwnerTrustedAdmission {
                             frontend: command.frontend,
                             actor_id: command.actor_id.clone(),
                             channel_id: command.channel_id.clone(),
                             event_id: command.event_id.clone(),
+                            recover_existing: recovering_pending,
                         }),
                         idempotency_key: request.idempotency_key.clone(),
                         command_digest: command_digest(&request.command)
@@ -916,6 +1183,117 @@ async fn execute_command(
             Ok(ServiceResult::Accepted {
                 task_id: snapshot.task_id,
             })
+        }
+        ServiceCommand::ConfigureTrustedSession {
+            external_session_id,
+            workspace,
+            frontend,
+            actor_id,
+            channel_id,
+            event_id,
+            permission_mode,
+        } => {
+            let (reply, response) = oneshot::channel();
+            shared
+                .controls
+                .send(TaskEngineControl::ConfigureOwnerSession {
+                    input: OwnerConfigureSession {
+                        external_session_id: external_session_id.clone(),
+                        workspace: workspace.clone(),
+                        permission_mode: *permission_mode,
+                        admission: OwnerTrustedAdmission {
+                            frontend: *frontend,
+                            actor_id: actor_id.clone(),
+                            channel_id: channel_id.clone(),
+                            event_id: event_id.clone(),
+                            recover_existing: recovering_pending,
+                        },
+                    },
+                    reply,
+                })
+                .await
+                .map_err(|_| service_error(TaskServiceErrorCode::Stopped))?;
+            response
+                .await
+                .map_err(|_| service_error(TaskServiceErrorCode::Stopped))?
+                .map_err(map_engine)?;
+            Ok(ServiceResult::Applied)
+        }
+        ServiceCommand::ResolveApproval {
+            task_id,
+            external_session_id,
+            workspace,
+            frontend,
+            actor_id,
+            channel_id,
+            event_id,
+            display_code,
+            session_id,
+            turn_id,
+            decision,
+        } => {
+            if *frontend == Frontend::Buzz {
+                let (reply, response) = oneshot::channel();
+                shared
+                    .controls
+                    .send(TaskEngineControl::AdmitTrusted {
+                        input: OwnerTrustedMessage {
+                            workspace: workspace.clone(),
+                            admission: OwnerTrustedAdmission {
+                                frontend: *frontend,
+                                actor_id: actor_id.clone(),
+                                channel_id: channel_id.clone().ok_or_else(|| {
+                                    service_error(TaskServiceErrorCode::InvalidRequest)
+                                })?,
+                                event_id: event_id.clone().ok_or_else(|| {
+                                    service_error(TaskServiceErrorCode::InvalidRequest)
+                                })?,
+                                recover_existing: recovering_pending,
+                            },
+                        },
+                        reply,
+                    })
+                    .await
+                    .map_err(|_| service_error(TaskServiceErrorCode::Stopped))?;
+                response
+                    .await
+                    .map_err(|_| service_error(TaskServiceErrorCode::Stopped))?
+                    .map_err(map_engine)?;
+            }
+            let binding_valid = {
+                let store = lock_store(&shared.read_store)?;
+                let binding = store
+                    .get_frontend_session(external_session_id)
+                    .map_err(|_| service_error(TaskServiceErrorCode::Storage))?
+                    .ok_or_else(|| service_error(TaskServiceErrorCode::InvalidRequest))?;
+                let task = store
+                    .get_task(*task_id)
+                    .map_err(|_| service_error(TaskServiceErrorCode::Storage))?
+                    .ok_or_else(|| service_error(TaskServiceErrorCode::InvalidRequest))?;
+                binding.frontend == *frontend
+                    && binding.cwd == *workspace
+                    && binding.session_id == *session_id
+                    && task.snapshot.session_id == *session_id
+            };
+            if !binding_valid || *shared.active_task.lock().await != Some(*task_id) {
+                return Err(service_error(TaskServiceErrorCode::InvalidRequest));
+            }
+            send_active_control(
+                shared,
+                TaskEngineControl::Approval {
+                    display_code: display_code.clone(),
+                    decision: match decision {
+                        super::protocol::ServiceApprovalDecision::Approve => EffectDecision::Allow,
+                        super::protocol::ServiceApprovalDecision::Deny => EffectDecision::Deny,
+                    },
+                    session_id: *session_id,
+                    turn_id: *turn_id,
+                    acknowledgement: next_ack(shared)?,
+                },
+            )
+            .await?;
+            shared.live_updates.clear_pending_approval(*task_id);
+            Ok(ServiceResult::Applied)
         }
         ServiceCommand::Configure {
             task_id,
@@ -998,6 +1376,27 @@ enum Mutation {
         effort: crate::delegates::ReasoningEffort,
         permission_mode: PermissionMode,
     },
+}
+
+const fn service_command_kind(command: &ServiceCommand) -> &'static str {
+    match command {
+        ServiceCommand::StartTask(_) => "start_task",
+        ServiceCommand::StartTrustedTask(_) => "start_trusted_task",
+        ServiceCommand::ConfigureTrustedSession { .. } => "configure_trusted_session",
+        ServiceCommand::ResolveApproval { .. } => "resolve_approval",
+        ServiceCommand::Resume { .. } => "resume",
+        ServiceCommand::Steer { .. } => "steer",
+        ServiceCommand::SteerTrusted { .. } => "steer_trusted",
+        ServiceCommand::Cancel { .. } => "cancel",
+        ServiceCommand::Configure { .. } => "configure",
+        ServiceCommand::Shutdown => "shutdown",
+        ServiceCommand::Info
+        | ServiceCommand::Session { .. }
+        | ServiceCommand::Status { .. }
+        | ServiceCommand::List
+        | ServiceCommand::Events { .. }
+        | ServiceCommand::LiveUpdates { .. } => "read",
+    }
 }
 
 async fn mutate_task(
@@ -1144,7 +1543,9 @@ async fn send_active_control(
         | TaskEngineControl::Approval {
             acknowledgement, ..
         } => *acknowledgement,
-        TaskEngineControl::Enqueue { .. } | TaskEngineControl::AdmitTrusted { .. } => {
+        TaskEngineControl::Enqueue { .. }
+        | TaskEngineControl::AdmitTrusted { .. }
+        | TaskEngineControl::ConfigureOwnerSession { .. } => {
             return Err(service_error(TaskServiceErrorCode::InvalidRequest));
         }
     };
@@ -1281,5 +1682,71 @@ const fn service_code(code: TaskServiceErrorCode) -> &'static str {
         TaskServiceErrorCode::InvalidRequest => "invalid_request",
         TaskServiceErrorCode::Busy => "busy",
         TaskServiceErrorCode::Stopped => "stopped",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::events::SessionId;
+    use crate::runtime::task::OperationId;
+
+    #[test]
+    fn source_queue_loss_forces_one_snapshot_fallback() {
+        let mut updates = LiveTaskUpdates::default();
+        updates.ring.push_back(LiveUpdateEnvelope {
+            cursor: 1,
+            update: TaskUpdate::AssistantDelta("visible".to_owned()),
+        });
+
+        let (page, cursor, overflowed) = updates.page(None, 128, 0);
+        assert_eq!(page.len(), 1);
+        assert_eq!(cursor, Some(1));
+        assert!(!overflowed);
+
+        let (page, cursor, overflowed) = updates.page(Some(1), 128, 1);
+        assert!(page.is_empty());
+        assert_eq!(cursor, Some(1));
+        assert!(overflowed);
+
+        let (_, _, overflowed) = updates.page(Some(1), 128, 1);
+        assert!(
+            !overflowed,
+            "one source loss must not loop snapshot fallback"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_approval_replays_at_the_live_cursor_until_cleared() {
+        let task_id = TaskId::new();
+        let hub = LiveUpdateHub::new(Arc::new(AtomicU64::new(0)));
+        hub.publish(
+            task_id,
+            TaskUpdate::ApprovalRequired {
+                task_id,
+                operation_id: OperationId::new(),
+                display_code: "123456".to_owned(),
+                summary: "run a command".to_owned(),
+                request_id: "approval-request".to_owned(),
+                session_id: SessionId::new(),
+                turn_id: TurnId::new(),
+                external_session_id: "external-session".to_owned(),
+            },
+        );
+
+        let (replayed, cursor, overflowed) = hub.page(task_id, Some(1), 128).await.unwrap();
+        assert_eq!(replayed.len(), 1);
+        assert_eq!(cursor, Some(1));
+        assert!(!overflowed);
+        assert!(matches!(
+            replayed[0].update,
+            TaskUpdate::ApprovalRequired { .. }
+        ));
+
+        hub.clear_pending_approval(task_id);
+        let (cleared, cursor, overflowed) = hub.page(task_id, Some(1), 128).await.unwrap();
+        assert!(cleared.is_empty());
+        assert_eq!(cursor, Some(1));
+        assert!(!overflowed);
     }
 }

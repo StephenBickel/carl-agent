@@ -67,6 +67,9 @@ fn fresh_database_is_migrated_and_configured_for_durable_use() -> Result<(), Box
         "processed_telegram_updates".to_owned(),
         "remote_codes".to_owned(),
         "sessions".to_owned(),
+        "service_command_receipts".to_owned(),
+        "service_configuration_controls".to_owned(),
+        "service_task_receipts".to_owned(),
         "session_delegate_settings".to_owned(),
         "subscription_run_baseline_entries".to_owned(),
         "subscription_run_baseline_directories".to_owned(),
@@ -99,12 +102,12 @@ fn fresh_database_is_migrated_and_configured_for_durable_use() -> Result<(), Box
     let migrations = connection.query_row("SELECT COUNT(*) FROM migrations", [], |row| {
         row.get::<_, u64>(0)
     })?;
-    assert_eq!(migrations, 10);
+    assert_eq!(migrations, 12);
     let checksums = connection
         .prepare("SELECT checksum FROM migrations ORDER BY version")?
         .query_map([], |row| row.get::<_, String>(0))?
         .collect::<Result<Vec<_>, _>>()?;
-    assert_eq!(checksums.len(), 10);
+    assert_eq!(checksums.len(), 12);
     assert_eq!(
         &checksums[..3],
         [
@@ -152,7 +155,7 @@ fn fresh_database_is_migrated_and_configured_for_durable_use() -> Result<(), Box
     let migrations = connection.query_row("SELECT COUNT(*) FROM migrations", [], |row| {
         row.get::<_, u64>(0)
     })?;
-    assert_eq!(migrations, 10);
+    assert_eq!(migrations, 12);
 
     Ok(())
 }
@@ -217,7 +220,7 @@ fn every_pre_task_schema_version_upgrades_without_rewriting_its_ledger()
             connection.query_row("SELECT COUNT(*) FROM migrations", [], |row| {
                 row.get::<_, u64>(0)
             })?,
-            10,
+            12,
             "migration prefix {prefix_length} did not upgrade"
         );
         assert_eq!(
@@ -383,7 +386,7 @@ fn store_open_rejects_a_future_database_migration() -> Result<(), Box<dyn Error>
     ensure_checksum_column(&connection)?;
     connection.execute(
         "INSERT INTO migrations (version, name, applied_at, checksum)
-         VALUES (11, 'future migration', '2026-07-13T12:00:00Z', ?1)",
+         VALUES (13, 'future migration', '2026-07-13T12:00:00Z', ?1)",
         ["ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"],
     )?;
     drop(connection);
@@ -392,7 +395,7 @@ fn store_open_rejects_a_future_database_migration() -> Result<(), Box<dyn Error>
     assert!(matches!(
         error,
         CarlError::Storage { ref detail }
-            if detail.contains("unsupported database migration version 11")
+            if detail.contains("unsupported database migration version 13")
     ));
     Ok(())
 }
@@ -510,13 +513,13 @@ fn pre_subscription_run_database_upgrades_without_rewriting_old_migrations()
         connection.query_row("SELECT COUNT(*) FROM migrations", [], |row| {
             row.get::<_, u64>(0)
         })?,
-        10
+        12
     );
     let checksums = connection
         .prepare("SELECT checksum FROM migrations ORDER BY version")?
         .query_map([], |row| row.get::<_, String>(0))?
         .collect::<Result<Vec<_>, _>>()?;
-    assert_eq!(checksums.len(), 10);
+    assert_eq!(checksums.len(), 12);
     assert_eq!(
         &checksums[..3],
         [
@@ -590,7 +593,7 @@ fn pre_proposal_artifact_database_upgrades_through_migration_eight_and_reopens()
         connection.query_row("SELECT COUNT(*) FROM migrations", [], |row| {
             row.get::<_, u64>(0)
         })?,
-        10
+        12
     );
     let tables = connection
         .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")?
@@ -619,7 +622,7 @@ fn pre_proposal_artifact_database_upgrades_through_migration_eight_and_reopens()
         connection.query_row("SELECT COUNT(*) FROM migrations", [], |row| {
             row.get::<_, u64>(0)
         })?,
-        10
+        12
     );
 
     Ok(())
@@ -656,7 +659,7 @@ fn pre_verification_database_applies_migrations_five_through_eight_and_reopens()
         connection.query_row("SELECT COUNT(*) FROM migrations", [], |row| {
             row.get::<_, u64>(0)
         })?,
-        10
+        12
     );
     assert_eq!(
         connection.query_row(

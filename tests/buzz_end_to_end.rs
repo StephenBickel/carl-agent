@@ -36,6 +36,10 @@ fn main() {
                 },
             ),
             Trial::test(
+                "service approval responses are exact durable and single use",
+                || durable_service_approval().map_err(|error| Failed::from(error.to_string())),
+            ),
+            Trial::test(
                 "configuration supersession derives authority from durable effective state",
                 || {
                     durable_configuration_supersession()
@@ -195,9 +199,13 @@ fn durable_configuration_boundaries() -> TestResult {
     let mut client = Client::spawn(&loosening, false)?;
     let session = initialize_session(&mut client, &loosening, 1, 2)?;
     client.send(&prompt_frame(3, &session, "/permissions readOnly", 'a'))?;
-    assert_eq!(client.read_id(3)?["result"]["stopReason"], "end_turn");
+    let configured = client.read_id(3)?;
+    assert_eq!(
+        configured["result"]["stopReason"], "end_turn",
+        "{configured}"
+    );
     client.send(&prompt_frame(4, &session, "wait for cancel", 'b'))?;
-    loosening.wait_for_provider_method("turn/start", 2)?;
+    loosening.wait_for_provider_method("turn/start", 1)?;
     for (id, config_id, value) in [
         (5, "model", "gpt-5.6-codex"),
         (6, "thought_level", "high"),
@@ -218,7 +226,7 @@ fn durable_configuration_boundaries() -> TestResult {
         }
     }))?;
     assert_eq!(client.read_id(8)?["result"]["outcome"], "injected");
-    loosening.wait_for_provider_method("turn/start", 3)?;
+    loosening.wait_for_provider_method("turn/start", 2)?;
     let next_epoch = loosening
         .provider_requests()?
         .into_iter()
@@ -240,7 +248,7 @@ fn durable_configuration_boundaries() -> TestResult {
     let mut client = Client::spawn(&tightening, false)?;
     let session = initialize_session(&mut client, &tightening, 11, 12)?;
     client.send(&prompt_frame(13, &session, "wait for cancel", 'c'))?;
-    tightening.wait_for_provider_method("turn/start", 2)?;
+    tightening.wait_for_provider_method("turn/start", 1)?;
     let checkpoints_before = tightening.task_lifecycle_event_count("checkpoint_committed")?;
     let progress_before = tightening.task_lifecycle_event_count("progress_assessed")?;
     client.send(&json!({
@@ -257,7 +265,7 @@ fn durable_configuration_boundaries() -> TestResult {
     }
     assert_eq!(tightening.provider_method_count("turn/interrupt")?, 1);
     assert_eq!(tightening.started_operation_count()?, 0);
-    tightening.wait_for_provider_method("turn/start", 3)?;
+    tightening.wait_for_provider_method("turn/start", 2)?;
     let next_epoch = tightening
         .provider_requests()?
         .into_iter()
@@ -298,7 +306,7 @@ fn durable_configuration_boundaries() -> TestResult {
         active_operation.provider_requests()?,
     );
     assert_eq!(active_operation.started_operation_count()?, 1);
-    assert_eq!(active_operation.provider_method_count("turn/start")?, 2);
+    assert_eq!(active_operation.provider_method_count("turn/start")?, 1);
     client.send(&json!({
         "jsonrpc":"2.0","id":25,"method":"session/set_config_option","params":{
             "sessionId":session,"configId":"mode","value":"plan"
@@ -313,12 +321,87 @@ fn durable_configuration_boundaries() -> TestResult {
     }))?;
     assert_eq!(client.read_id(26)?["result"]["task"]["status"], "blocked");
     assert_eq!(active_operation.provider_method_count("turn/interrupt")?, 1);
-    assert_eq!(active_operation.provider_method_count("turn/start")?, 2);
+    assert_eq!(active_operation.provider_method_count("turn/start")?, 1);
     assert_eq!(active_operation.started_operation_count()?, 0);
     assert_eq!(active_operation.operation_status_count("uncertain")?, 1);
     assert_eq!(active_operation.permission_tightening_interrupt_count()?, 1);
     let _ = client.finish()?;
     Ok(())
+}
+
+fn durable_service_approval() -> TestResult {
+    let layout = Layout::new("durable-approval")?;
+    layout.trust_owner()?;
+    let mut client = Client::spawn(&layout, false)?;
+    let session = initialize_session(&mut client, &layout, 51, 52)?;
+    client.send(&prompt_frame(53, &session, "/permissions approval", 'a'))?;
+    assert_eq!(client.read_id(53)?["result"]["stopReason"], "end_turn");
+
+    client.send(&prompt_frame(54, &session, "approval scenario", 'b'))?;
+    let (first, updates) = client.read_id_with_updates(54)?;
+    assert_eq!(first["result"]["stopReason"], "waiting_for_approval");
+    let first_code = approval_code(&updates)?;
+
+    client.send(&prompt_frame(
+        55,
+        &session,
+        &format!("/approve {first_code}-wrong"),
+        'c',
+    ))?;
+    assert_eq!(client.read_id(55)?["error"]["code"], -32602);
+
+    client.send(&prompt_frame(
+        56,
+        &session,
+        &format!("/approve {first_code}"),
+        'd',
+    ))?;
+    let (second, updates) = client.read_id_with_updates(56)?;
+    assert_eq!(second["result"]["stopReason"], "waiting_for_approval");
+    let second_code = approval_code(&updates)?;
+    assert_ne!(first_code, second_code);
+
+    client.send(&prompt_frame(
+        57,
+        &session,
+        &format!("/approve {second_code}"),
+        'e',
+    ))?;
+    let completed = client.read_id(57)?;
+    assert_eq!(
+        completed["result"]["stopReason"],
+        "end_turn",
+        "completed={completed}; events={:?}; requests={:?}",
+        layout.task_lifecycle_events()?,
+        layout.provider_requests()?
+    );
+    assert_eq!(layout.action_count("approved-command")?, 1);
+    assert_eq!(
+        fs::read_to_string(layout.workspace.join("target.txt"))?,
+        "fixed\n"
+    );
+
+    client.send(&prompt_frame(
+        58,
+        &session,
+        &format!("/approve {first_code}"),
+        'f',
+    ))?;
+    assert_eq!(client.read_id(58)?["error"]["code"], -32602);
+    let _ = client.finish()?;
+    Ok(())
+}
+
+fn approval_code(updates: &[serde_json::Value]) -> TestResult<String> {
+    updates
+        .iter()
+        .filter_map(|update| update.pointer("/params/update/content/text")?.as_str())
+        .find_map(|text| {
+            text.split_once("Approve with /approve ")
+                .and_then(|(_, tail)| tail.split_whitespace().next())
+                .map(str::to_owned)
+        })
+        .ok_or_else(|| format!("approval code missing from updates: {updates:?}").into())
 }
 
 fn durable_configuration_supersession() -> TestResult {
@@ -327,9 +410,13 @@ fn durable_configuration_supersession() -> TestResult {
     let mut client = Client::spawn(&layout, false)?;
     let session = initialize_session(&mut client, &layout, 31, 32)?;
     client.send(&prompt_frame(33, &session, "/permissions readOnly", 'f'))?;
-    assert_eq!(client.read_id(33)?["result"]["stopReason"], "end_turn");
+    let configured = client.read_id(33)?;
+    assert_eq!(
+        configured["result"]["stopReason"], "end_turn",
+        "{configured}"
+    );
     client.send(&prompt_frame(34, &session, "wait for cancel", 'a'))?;
-    layout.wait_for_provider_method("turn/start", 2)?;
+    layout.wait_for_provider_method("turn/start", 1)?;
     let task_id = layout.latest_task_id()?;
 
     for (id, value) in [(35, "fullAccess"), (36, "default")] {
@@ -362,7 +449,7 @@ fn durable_configuration_supersession() -> TestResult {
         }
     }))?;
     assert_eq!(client.read_id(37)?["result"]["outcome"], "injected");
-    layout.wait_for_provider_method("turn/start", 3)?;
+    layout.wait_for_provider_method("turn/start", 2)?;
     let dispatched = layout
         .provider_requests()?
         .into_iter()
@@ -408,9 +495,13 @@ fn rejected_configuration_delivery_rolls_back_session() -> TestResult {
     let mut client = Client::spawn(&layout, false)?;
     let session = initialize_session(&mut client, &layout, 41, 42)?;
     client.send(&prompt_frame(43, &session, "/permissions readOnly", 'b'))?;
-    assert_eq!(client.read_id(43)?["result"]["stopReason"], "end_turn");
+    let configured = client.read_id(43)?;
+    assert_eq!(
+        configured["result"]["stopReason"], "end_turn",
+        "{configured}"
+    );
     client.send(&prompt_frame(44, &session, "wait for cancel", 'c'))?;
-    layout.wait_for_provider_method("turn/start", 2)?;
+    layout.wait_for_provider_method("turn/start", 1)?;
     let task_id = layout.latest_task_id()?;
     let connection = Connection::open(layout.data.join("carl.sqlite3"))?;
     connection.execute_batch(
@@ -427,7 +518,13 @@ fn rejected_configuration_delivery_rolls_back_session() -> TestResult {
         }
     }))?;
     assert!(client.read_id(45)?["error"].is_object());
-    assert_eq!(client.read_id(44)?["result"]["stopReason"], "failed");
+    let prompt = client.read_id(44)?;
+    assert_eq!(
+        prompt["result"]["stopReason"],
+        "failed",
+        "prompt={prompt}; events={:?}",
+        layout.task_lifecycle_events()?
+    );
     let connection = Connection::open(layout.data.join("carl.sqlite3"))?;
     assert_eq!(
         connection.query_row(
