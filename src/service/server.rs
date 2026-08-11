@@ -449,7 +449,7 @@ impl<P: AgentPort + 'static> TaskService<P> {
         loop {
             tokio::select! {
                 () = cancellation.cancelled() => {
-                    shutdown_owner(&shared).await?;
+                    shutdown_owner_after_mutations(&shared).await?;
                     break;
                 }
                 () = stop.cancelled() => break,
@@ -1842,6 +1842,11 @@ async fn shutdown_owner(shared: &ServiceShared) -> Result<(), TaskServiceError> 
         .map_err(|_| service_error(TaskServiceErrorCode::Stopped))?
 }
 
+async fn shutdown_owner_after_mutations(shared: &ServiceShared) -> Result<(), TaskServiceError> {
+    let _gate = shared.mutation_gate.lock().await;
+    shutdown_owner(shared).await
+}
+
 async fn read_bounded_line<R: tokio::io::AsyncBufRead + Unpin>(
     reader: &mut R,
 ) -> Result<Option<Vec<u8>>, TaskServiceError> {
@@ -2181,6 +2186,124 @@ mod tests {
         );
         assert_eq!(pending, 0);
         assert_eq!(queued_status, "queued");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn signal_shutdown_waits_for_an_admitted_mutation_to_finish() {
+        let layout = ShutdownTestLayout::new();
+        let port_state = Arc::new(Mutex::new(HandoffPortState {
+            workspace: layout.workspace.clone(),
+            ..HandoffPortState::default()
+        }));
+        let service = TaskService::bind(&layout.data, HandoffPort::new(Arc::clone(&port_state)))
+            .await
+            .unwrap();
+        let TaskService {
+            endpoint,
+            engine,
+            read_store,
+            initial_tasks,
+            controls,
+            acknowledgements,
+            mutation_gate,
+            live_updates,
+            live_update_receiver,
+            permission_receiver,
+            next_acknowledgement,
+            actor_state,
+            info,
+        } = service;
+        let (actor_sender, actor_receiver) = mpsc::channel(SERVICE_COMMAND_CAPACITY);
+        let actor_task = tokio::spawn(run_task_actor(
+            engine,
+            initial_tasks,
+            actor_receiver,
+            Arc::clone(&actor_state),
+        ));
+        let shared = Arc::new(ServiceShared {
+            read_store,
+            controls,
+            acknowledgements,
+            mutation_gate,
+            live_updates,
+            next_acknowledgement,
+            actor_state,
+            actor_sender,
+            info,
+        });
+        let receipt = ServiceCommandReceiptInput {
+            idempotency_key: "signal-admitted-mutation".to_owned(),
+            command_digest: Sha256Digest::from_bytes([0x5a; 32]),
+            command_kind: "cancel".to_owned(),
+            created_at: Utc::now(),
+        };
+        assert_eq!(
+            claim_service_command(&shared, receipt.clone())
+                .await
+                .unwrap(),
+            ServiceCommandReceiptClaim::Fresh
+        );
+
+        // Holding this guard models a mutation that passed admission and owns the
+        // service's serialization boundary while it finishes its durable receipt.
+        let mutation_guard = shared.mutation_gate.lock().await;
+        let signal_shared = Arc::clone(&shared);
+        let signal_shutdown =
+            tokio::spawn(async move { shutdown_owner_after_mutations(&signal_shared).await });
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            port_state.lock().unwrap().shutdowns,
+            0,
+            "signal shutdown bypassed an admitted mutation"
+        );
+
+        complete_service_command(
+            &shared,
+            receipt,
+            serde_json::to_string(&ServiceResult::Applied).unwrap(),
+        )
+        .await
+        .unwrap();
+        drop(mutation_guard);
+        tokio::time::timeout(Duration::from_secs(1), signal_shutdown)
+            .await
+            .expect("serialized signal shutdown timed out")
+            .expect("serialized signal shutdown task panicked")
+            .expect("serialized signal shutdown failed");
+
+        let database = layout.data.join("carl.sqlite3");
+        let connection = Connection::open(&database).unwrap();
+        let (receipt_state, pending) = connection
+            .query_row(
+                "SELECT state, (SELECT COUNT(*) FROM service_command_receipts WHERE state = 'pending')
+                 FROM service_command_receipts WHERE idempotency_key = 'signal-admitted-mutation'",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .unwrap();
+        drop(connection);
+        assert_eq!(receipt_state, "completed");
+        assert_eq!(pending, 0);
+        assert_eq!(
+            {
+                let state = port_state.lock().unwrap();
+                (state.shutdowns, state.operations_after_shutdown)
+            },
+            (1, 0)
+        );
+
+        drop(shared);
+        drop(live_update_receiver);
+        drop(permission_receiver);
+        tokio::time::timeout(Duration::from_secs(1), actor_task)
+            .await
+            .expect("signal shutdown actor did not stop")
+            .expect("signal shutdown actor panicked")
+            .expect("signal shutdown actor failed");
+        drop(endpoint);
     }
 
     #[test]
