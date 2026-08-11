@@ -17,6 +17,7 @@ from carl_bench.adapters.base import AgentAdapter
 from carl_bench.adapters.carl_acp import CarlAcpAdapter
 from carl_bench.adapters.codex_cli import CodexCliAdapter
 from carl_bench.adapters.scripted import ScriptedAdapter
+from carl_bench.candidate_evidence import scorecard_from_public
 from carl_bench.canonical import canonical_json_bytes
 from carl_bench.experiment import (
     EventType,
@@ -26,14 +27,7 @@ from carl_bench.experiment import (
     evaluate_dry_run,
 )
 from carl_bench.ledger import ExperimentLedger
-from carl_bench.models import (
-    FailureClass,
-    OutcomeStatus,
-    RunManifest,
-    Scorecard,
-    TrackScorecard,
-    TrialResult,
-)
+from carl_bench.models import RunManifest, TrialResult
 from carl_bench.report import compare_runs, summarize_run
 from carl_bench.runner import BenchmarkRunner
 from carl_bench.sanitize import PublicSafetyError, assert_public_safe, write_public_json
@@ -387,128 +381,14 @@ def _experiment_command(args: argparse.Namespace) -> int:
     return 0
 
 
-def _exact_keys(value: dict[str, Any], expected: set[str]) -> None:
-    if set(value) != expected:
-        raise ValueError("scorecard keys are invalid")
-
-
-def _trial_from_public(value: Any) -> TrialResult:
-    if not isinstance(value, dict):
-        raise ValueError("trial must be an object")
-    required = {
-        "adapter_id",
-        "adapter_version",
-        "attempt",
-        "elapsed_ms",
-        "seed",
-        "status",
-        "task_digest",
-        "task_id",
-        "track",
-        "trial_id",
-    }
-    optional = {"failure_class", "failure_code", "checks_passed", "checks_total", "tool_calls"}
-    if not required <= set(value) or set(value) - required - optional:
-        raise ValueError("trial keys are invalid")
-    return TrialResult(
-        trial_id=value["trial_id"],
-        task_id=value["task_id"],
-        task_digest=value["task_digest"],
-        adapter_id=value["adapter_id"],
-        adapter_version=value["adapter_version"],
-        attempt=value["attempt"],
-        seed=value["seed"],
-        status=OutcomeStatus(value["status"]),
-        elapsed_ms=value["elapsed_ms"],
-        failure_class=(FailureClass(value["failure_class"]) if "failure_class" in value else None),
-        failure_code=value.get("failure_code"),
-        checks_passed=value.get("checks_passed"),
-        checks_total=value.get("checks_total"),
-        tool_calls=value.get("tool_calls"),
-        track=value["track"],
-    )
-
-
-def _track_from_public(value: Any) -> TrackScorecard:
-    if not isinstance(value, dict):
-        raise ValueError("track score must be an object")
-    _exact_keys(
-        value,
-        {
-            "failed_trials",
-            "invalid_trials",
-            "pass_rate",
-            "passed_trials",
-            "track",
-            "valid_trials",
-        },
-    )
-    return TrackScorecard(**value)
-
-
-def _scorecard_from_public(value: dict[str, Any]) -> Scorecard:
-    _exact_keys(
-        value,
-        {
-            "effort",
-            "failed_trials",
-            "failure_counts",
-            "invalid_trials",
-            "league",
-            "median_elapsed_ms",
-            "median_tool_calls",
-            "model",
-            "pass_rate",
-            "passed_trials",
-            "run_digest",
-            "run_id",
-            "schema_version",
-            "tracks",
-            "trials",
-            "valid_trials",
-        },
-    )
-    failures = value["failure_counts"]
-    if not isinstance(failures, list):
-        raise ValueError("failure_counts must be a list")
-    failure_counts: list[tuple[str, int]] = []
-    for failure in failures:
-        if not isinstance(failure, dict):
-            raise ValueError("failure count must be an object")
-        _exact_keys(failure, {"code", "count"})
-        failure_counts.append((failure["code"], failure["count"]))
-    trials = value["trials"]
-    tracks = value["tracks"]
-    if not isinstance(trials, list) or not isinstance(tracks, list):
-        raise ValueError("scorecard trials and tracks must be lists")
-    return Scorecard(
-        schema_version=value["schema_version"],
-        run_id=value["run_id"],
-        run_digest=value["run_digest"],
-        valid_trials=value["valid_trials"],
-        invalid_trials=value["invalid_trials"],
-        passed_trials=value["passed_trials"],
-        failed_trials=value["failed_trials"],
-        pass_rate=value["pass_rate"],
-        median_elapsed_ms=value["median_elapsed_ms"],
-        median_tool_calls=value["median_tool_calls"],
-        failure_counts=tuple(failure_counts),
-        tracks=tuple(_track_from_public(track) for track in tracks),
-        league=value["league"],
-        model=value["model"],
-        effort=value["effort"],
-        trials=tuple(_trial_from_public(trial) for trial in trials),
-    )
-
-
 def _compare_command(args: argparse.Namespace) -> int:
     destination = _safe_result_path(args.public_result, ())
     baseline_path = _anchored(args.baseline)
     candidate_path = _anchored(args.candidate)
     if destination in {baseline_path, candidate_path}:
         raise ValueError("comparison output cannot overwrite an input scorecard")
-    baseline = _scorecard_from_public(_read_public_object(baseline_path))
-    candidate = _scorecard_from_public(_read_public_object(candidate_path))
+    baseline = scorecard_from_public(_read_public_object(baseline_path))
+    candidate = scorecard_from_public(_read_public_object(candidate_path))
     comparison = compare_runs(baseline, candidate, comparison_seed=args.comparison_seed)
     write_public_json(destination, comparison.to_public_dict(), REPOSITORY_ROOT)
     print(
