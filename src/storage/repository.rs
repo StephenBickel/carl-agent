@@ -6316,6 +6316,7 @@ fn apply_task_child_projection(
         | TaskEvent::OperationEvidenceRecorded { .. }
         | TaskEvent::NormalizedOperationEvidenceRecorded { .. }
         | TaskEvent::OperationPostconditionBound { .. }
+        | TaskEvent::OperationFilePostconditionBound { .. }
         | TaskEvent::ProgressAssessed { .. }
         | TaskEvent::RecoveryAttemptStarted { .. }
         | TaskEvent::RecoveryAttemptRecorded { .. }

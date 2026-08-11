@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use carl::acp::PermissionMode;
 use carl::delegates::{ModelId, ReasoningEffort};
 use carl::error::CarlError;
+use carl::policy::Sha256Digest;
 use carl::runtime::task::{
     CheckpointId, ClauseStatus, CompletionClause, CompletionContract, ContextPackageId,
     EffectClass, EpochId, OperationId, OperationStatus, TaskBudget, TaskEvent, TaskSnapshot,
@@ -577,6 +578,124 @@ fn runtime_startup_atomically_marks_every_abandoned_started_operation_uncertain(
         record.snapshot,
         replay(&runtime.read_task_events(task_id)?)?,
         "the reconciled journal remains authoritative for its projection"
+    );
+    Ok(())
+}
+
+#[test]
+fn runtime_reopens_literal_legacy_v4_postcondition_and_preserves_projection_digest()
+-> Result<(), Box<dyn Error>> {
+    let fixture = TemporaryTaskDatabase::new()?;
+    let mut store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let created = store.create_task(new_task(session.id, &fixture.workspace))?;
+    let task_id = created.snapshot.task_id;
+    let epoch_id = EpochId::new();
+    let operation_id = OperationId::new();
+    let legacy_digest =
+        Sha256Digest::parse("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")?;
+    let mut revision = created.revision;
+    for event in [
+        TaskEvent::StateTransitioned {
+            from: TaskStatus::Queued,
+            to: TaskStatus::Active,
+            reason: "legacy task activated".to_owned(),
+        },
+        TaskEvent::ProviderContextBound {
+            context_id: "legacy-provider-context".to_owned(),
+        },
+        TaskEvent::EpochStarted {
+            epoch_id,
+            objective: "reopen a legacy mutation".to_owned(),
+        },
+        TaskEvent::OperationIntentRecorded {
+            operation_id,
+            epoch_id,
+            item_id: "legacy-file-change".to_owned(),
+            effect_class: EffectClass::IdempotentMutation,
+            request_digest: "legacy-request-digest".to_owned(),
+        },
+        TaskEvent::OperationPostconditionBound {
+            operation_id,
+            postcondition_digest: legacy_digest,
+        },
+        TaskEvent::OperationTransitioned {
+            operation_id,
+            from: OperationStatus::IntentRecorded,
+            to: OperationStatus::Started,
+            evidence_sequences: Vec::new(),
+        },
+    ] {
+        revision = store
+            .append_task_event(task_id, revision, event, timestamp(1))?
+            .expect("legacy setup event appends")
+            .revision;
+    }
+    let legacy_sequence = store
+        .read_task_events(task_id)?
+        .into_iter()
+        .find(|envelope| {
+            matches!(
+                envelope.event,
+                carl::events::Event::TaskLifecycle {
+                    event: TaskEvent::OperationPostconditionBound { .. },
+                    ..
+                }
+            )
+        })
+        .expect("legacy event is present")
+        .sequence;
+    let projection = serde_json::to_value(store.get_task(task_id)?.unwrap().snapshot)?;
+    assert_eq!(
+        projection["operations"][operation_id.to_string()]["postcondition_digest"],
+        legacy_digest.to_string()
+    );
+    drop(store);
+
+    let literal_old_v4 = format!(
+        r#"{{"schema_version":4,"type":"task_lifecycle","task_id":"{task_id}","event":{{"task_event":"operation_postcondition_bound","operation_id":"{operation_id}","postcondition_digest":"{legacy_digest}"}}}}"#
+    );
+    let connection = Connection::open(&fixture.database)?;
+    connection.execute(
+        "UPDATE events SET event_json = ?1 WHERE session_id = ?2 AND sequence = ?3",
+        (
+            literal_old_v4,
+            session.id.to_string(),
+            i64::try_from(legacy_sequence)?,
+        ),
+    )?;
+    let snapshot_json = connection.query_row(
+        "SELECT snapshot_json FROM agent_tasks WHERE id = ?1",
+        [task_id.to_string()],
+        |row| row.get::<_, String>(0),
+    )?;
+    let mut old_projection = serde_json::from_str::<serde_json::Value>(&snapshot_json)?;
+    old_projection["operations"][operation_id.to_string()]
+        .as_object_mut()
+        .expect("operation projection is an object")
+        .remove("file_postcondition");
+    connection.execute(
+        "UPDATE agent_tasks SET snapshot_json = ?1 WHERE id = ?2",
+        (serde_json::to_string(&old_projection)?, task_id.to_string()),
+    )?;
+    drop(connection);
+
+    let runtime = RuntimeStore::open(DataRootLock::acquire(&fixture.root)?, timestamp(3))?;
+    let record = runtime
+        .get_task(task_id)?
+        .expect("legacy task remains durable");
+    assert_eq!(
+        record.snapshot.operation_status(operation_id),
+        Some(OperationStatus::Uncertain)
+    );
+    assert_eq!(
+        record.snapshot,
+        replay(&runtime.read_task_events(task_id)?)?
+    );
+    let reopened_projection = serde_json::to_value(record.snapshot)?;
+    assert_eq!(
+        reopened_projection["operations"][operation_id.to_string()]["postcondition_digest"],
+        legacy_digest.to_string()
     );
     Ok(())
 }

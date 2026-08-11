@@ -714,6 +714,7 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                         | TaskEvent::ProviderEpochBound { .. }
                         | TaskEvent::OperationIntentRecorded { .. }
                         | TaskEvent::OperationPostconditionBound { .. }
+                        | TaskEvent::OperationFilePostconditionBound { .. }
                         | TaskEvent::OperationTransitioned { .. },
                     ..
                 }
@@ -935,7 +936,7 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                 } => {
                     operations.insert(operation_id, (effect_class, item_id, None));
                 }
-                TaskEvent::OperationPostconditionBound {
+                TaskEvent::OperationFilePostconditionBound {
                     operation_id,
                     postcondition,
                 } => {
@@ -2946,7 +2947,7 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                     };
                     self.append(
                         task_id,
-                        TaskEvent::OperationPostconditionBound {
+                        TaskEvent::OperationFilePostconditionBound {
                             operation_id: active.operation_id,
                             postcondition,
                         },

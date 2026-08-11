@@ -461,7 +461,9 @@ struct OperationSnapshot {
     status: OperationStatus,
     last_transition_sequence: u64,
     #[serde(default)]
-    postcondition: Option<FilePostcondition>,
+    postcondition_digest: Option<Sha256Digest>,
+    #[serde(default)]
+    file_postcondition: Option<FilePostcondition>,
     #[serde(default)]
     evidence: OperationEvidenceState,
 }
@@ -532,7 +534,8 @@ impl TaskSnapshot {
                     epoch_id,
                     status: OperationStatus::IntentRecorded,
                     last_transition_sequence: sequence,
-                    postcondition: None,
+                    postcondition_digest: None,
+                    file_postcondition: None,
                     evidence: OperationEvidenceState::default(),
                 },
             )
@@ -552,7 +555,24 @@ impl TaskSnapshot {
         })
     }
 
-    pub(crate) fn bind_operation_postcondition(
+    pub(crate) fn bind_legacy_operation_postcondition(
+        &mut self,
+        operation_id: OperationId,
+        postcondition_digest: Sha256Digest,
+    ) -> bool {
+        let Some(operation) = self.operations.get_mut(&operation_id) else {
+            return false;
+        };
+        if operation.status != OperationStatus::IntentRecorded
+            || operation.postcondition_digest.is_some()
+        {
+            return false;
+        }
+        operation.postcondition_digest = Some(postcondition_digest);
+        true
+    }
+
+    pub(crate) fn bind_operation_file_postcondition(
         &mut self,
         operation_id: OperationId,
         postcondition: FilePostcondition,
@@ -560,10 +580,10 @@ impl TaskSnapshot {
         let Some(operation) = self.operations.get_mut(&operation_id) else {
             return false;
         };
-        if operation.status != OperationStatus::Started || operation.postcondition.is_some() {
+        if operation.status != OperationStatus::Started || operation.file_postcondition.is_some() {
             return false;
         }
-        operation.postcondition = Some(postcondition);
+        operation.file_postcondition = Some(postcondition);
         true
     }
 
@@ -829,6 +849,10 @@ pub enum TaskEvent {
     },
     OperationPostconditionBound {
         operation_id: OperationId,
+        postcondition_digest: Sha256Digest,
+    },
+    OperationFilePostconditionBound {
+        operation_id: OperationId,
         postcondition: FilePostcondition,
     },
     OperationTransitioned {
@@ -946,7 +970,8 @@ impl TaskEvent {
                 validate_event_identifier(item_id)?;
                 validate_event_identifier(request_digest)
             }
-            Self::OperationPostconditionBound { postcondition, .. } => postcondition.validate(),
+            Self::OperationPostconditionBound { .. } => Ok(()),
+            Self::OperationFilePostconditionBound { postcondition, .. } => postcondition.validate(),
             Self::OperationTransitioned {
                 evidence_sequences, ..
             } => validate_evidence_sequences(evidence_sequences),

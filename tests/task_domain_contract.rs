@@ -338,11 +338,12 @@ fn file_postconditions_are_canonical_revalidated_and_debug_redacted() {
         FilePostconditionEntry::new("src/lib.rs".to_owned(), Some(digest)).unwrap(),
     ])
     .unwrap();
-    let event = TaskEvent::OperationPostconditionBound {
+    let event = TaskEvent::OperationFilePostconditionBound {
         operation_id: operation_id(),
         postcondition,
     };
     let encoded = serde_json::to_value(&event).unwrap();
+    assert_eq!(encoded["task_event"], "operation_file_postcondition_bound");
     assert_eq!(
         encoded["postcondition"]["entries"]
             .as_array()
@@ -410,6 +411,74 @@ fn file_postconditions_are_canonical_revalidated_and_debug_redacted() {
     let mut hostile = encoded;
     hostile["postcondition"]["entries"][0]["relative_path"] = json!("../outside");
     assert!(serde_json::from_value::<TaskEvent>(hostile).is_err());
+}
+
+#[test]
+fn literal_v4_legacy_postcondition_event_deserializes_without_changing_its_payload() {
+    const LEGACY_EVENT: &str = r#"{
+        "schema_version":4,
+        "type":"task_lifecycle",
+        "task_id":"11111111-1111-4111-8111-111111111111",
+        "event":{
+            "task_event":"operation_postcondition_bound",
+            "operation_id":"44444444-4444-4444-8444-444444444444",
+            "postcondition_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+    }"#;
+
+    let event = serde_json::from_str::<Event>(LEGACY_EVENT)
+        .expect("the bbe3edf-era v4 event remains readable");
+    let encoded = serde_json::to_value(event).unwrap();
+    assert_eq!(
+        encoded["event"]["task_event"],
+        "operation_postcondition_bound"
+    );
+    assert_eq!(
+        encoded["event"]["postcondition_digest"],
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    );
+    assert!(encoded["event"].get("postcondition").is_none());
+}
+
+#[test]
+fn legacy_projection_postcondition_digest_survives_decode_and_encode() {
+    let snapshot = reduce_events(&[
+        created(),
+        TaskEvent::StateTransitioned {
+            from: TaskStatus::Queued,
+            to: TaskStatus::Active,
+            reason: "activate".to_owned(),
+        },
+        TaskEvent::EpochStarted {
+            epoch_id: epoch_id(),
+            objective: "legacy replay".to_owned(),
+        },
+        TaskEvent::OperationIntentRecorded {
+            operation_id: operation_id(),
+            epoch_id: epoch_id(),
+            item_id: "legacy-edit".to_owned(),
+            effect_class: EffectClass::IdempotentMutation,
+            request_digest: "legacy-request".to_owned(),
+        },
+    ])
+    .unwrap();
+    let mut old_projection = serde_json::to_value(snapshot).unwrap();
+    let operation = old_projection["operations"][operation_id().to_string()]
+        .as_object_mut()
+        .unwrap();
+    operation.remove("file_postcondition");
+    operation.insert(
+        "postcondition_digest".to_owned(),
+        json!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+    );
+
+    let decoded = serde_json::from_value::<TaskSnapshot>(old_projection)
+        .expect("the bbe3edf-era projection remains readable");
+    let reencoded = serde_json::to_value(decoded).unwrap();
+    assert_eq!(
+        reencoded["operations"][operation_id().to_string()]["postcondition_digest"],
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    );
 }
 
 #[test]

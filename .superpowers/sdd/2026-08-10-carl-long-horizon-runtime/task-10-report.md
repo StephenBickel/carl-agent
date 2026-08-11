@@ -209,3 +209,61 @@ PASS: exit 0
 
 The full `cargo test --all-features` suite was deliberately not run during this fix
 round, as required.
+
+## Fix Round 2/5
+
+### Compatibility repair
+
+The Round 1 typed filesystem proof had reused the existing v4
+`operation_postcondition_bound` tag and replaced its
+`postcondition_digest` payload. That made bbe3edf-era journals unreadable and caused
+old projection digests to be silently discarded.
+
+The serialized forms are now deliberately separate:
+
+- Legacy v4 remains exactly `OperationPostconditionBound { operation_id,
+  postcondition_digest }`, serialized as `operation_postcondition_bound`. The
+  reducer accepts it at the original intent-recorded boundary and preserves its
+  digest in `TaskSnapshot` projection JSON.
+- Carl-owned filesystem proof uses `OperationFilePostconditionBound {
+  operation_id, postcondition }`, serialized as
+  `operation_file_postcondition_bound`. Production capture and reconciliation use
+  only this new event and typed canonical filesystem state.
+
+The engine ignores the legacy provider-correlated digest when reconstructing
+postcondition evidence. A legacy started mutation therefore becomes `Uncertain` on
+`RuntimeStore` startup and blocks without provider or effect redispatch; it can
+never become `Reconciled` from the old digest.
+
+### Regression evidence
+
+- RED: `cargo test --test task_domain_contract legacy -- --nocapture` failed 2/2:
+  literal old v4 JSON reported `missing field postcondition`, and old
+  `postcondition_digest` projection state re-encoded as null.
+- GREEN: the same command passes 2/2. The projection fixture omits the new field,
+  matching the old shape rather than relying on current enum round-trip output.
+- A storage regression replaces the journal row with a literal old-v4 JSON payload,
+  strips the new field from `agent_tasks.snapshot_json`, reopens through
+  `RuntimeStore`, checks the operation is `Uncertain`, verifies projection equals
+  authoritative replay, and proves the legacy digest survives: 1/1 passed.
+- An engine regression proves a legacy digest equal to the current file content
+  digest still blocks and causes zero new epochs/effects: 1/1 passed.
+- Round 1 filesystem reconciliation remains 7/7 and the real twelve-cut restart
+  matrix remains 1/1.
+
+Focused compatibility verification:
+
+```text
+cargo test --test epoch_engine_contract --test task_domain_contract \
+  --test task_storage_contract
+PASS: 110 passed, 0 failed
+```
+
+Current ledger line included with this round:
+
+```text
+Task 10: fix round 1/5 (5 addressed, 1 open; commits bbe3edf..10bcb81)
+```
+
+The full `cargo test --all-features` suite was not run; it remains reserved for the
+root clean re-review.

@@ -83,7 +83,7 @@ fn install_postcondition_crash_cut(database: &Path) -> TestResult {
          WHEN instr(NEW.event_json, 'normalized_operation_evidence_recorded') > 0
           AND EXISTS (
               SELECT 1 FROM events
-              WHERE instr(event_json, 'operation_postcondition_bound') > 0
+              WHERE instr(event_json, 'operation_file_postcondition_bound') > 0
           )
          BEGIN
              SELECT RAISE(ABORT, 'scripted crash after postcondition binding');
@@ -3588,7 +3588,7 @@ async fn restart_requires_postcondition_proof_before_retrying_an_idempotent_muta
                 !matches!(
                     envelope.event,
                     carl::events::Event::TaskLifecycle {
-                        event: carl::runtime::task::TaskEvent::OperationPostconditionBound { .. },
+                        event: carl::runtime::task::TaskEvent::OperationFilePostconditionBound { .. },
                         ..
                     }
                 )
@@ -3619,6 +3619,100 @@ async fn restart_requires_postcondition_proof_before_retrying_an_idempotent_muta
             )),
         "without postcondition evidence, the exact operation stays blocked"
     );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn legacy_postcondition_digest_never_reconciles_an_uncertain_file_mutation() -> TestResult {
+    let fixture = EngineFixture::new()?;
+    fs::create_dir_all(fixture.workspace.join("src"))?;
+    fs::write(fixture.workspace.join("src/lib.rs"), b"legacy file bytes\n")?;
+    let mut store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let created = store.create_task(NewTask {
+        session_id: session.id,
+        workspace: fixture.workspace.clone(),
+        contract: CompletionContract {
+            version: 1,
+            goal: "Recover a legacy mutation safely".to_owned(),
+            constraints: Vec::new(),
+            clauses: vec![CompletionClause {
+                id: "safe-recovery".to_owned(),
+                description: "The legacy mutation is not replayed".to_owned(),
+                required: true,
+                status: ClauseStatus::Pending,
+                evidence: Vec::new(),
+            }],
+        },
+        model: ModelId::parse("gpt-5.6-codex")?,
+        effort: ReasoningEffort::High,
+        permission_mode: PermissionMode::BypassPermissions,
+        budget: TaskBudget::default(),
+        created_at: chrono::Utc::now(),
+    })?;
+    let task_id = created.snapshot.task_id;
+    let epoch_id = EpochId::new();
+    let operation_id = OperationId::new();
+    let mut revision = created.revision;
+    for event in [
+        carl::runtime::task::TaskEvent::StateTransitioned {
+            from: TaskStatus::Queued,
+            to: TaskStatus::Active,
+            reason: "legacy execution started".to_owned(),
+        },
+        carl::runtime::task::TaskEvent::ProviderContextBound {
+            context_id: "legacy-context".to_owned(),
+        },
+        carl::runtime::task::TaskEvent::EpochStarted {
+            epoch_id,
+            objective: "legacy file mutation".to_owned(),
+        },
+        carl::runtime::task::TaskEvent::OperationIntentRecorded {
+            operation_id,
+            epoch_id,
+            item_id: "legacy-file-change".to_owned(),
+            effect_class: EffectClass::IdempotentMutation,
+            request_digest: "legacy-request".to_owned(),
+        },
+        carl::runtime::task::TaskEvent::OperationPostconditionBound {
+            operation_id,
+            postcondition_digest: Sha256Digest::parse(digest(b"legacy file bytes\n"))
+                .expect("fixed digest is valid"),
+        },
+        carl::runtime::task::TaskEvent::OperationTransitioned {
+            operation_id,
+            from: OperationStatus::IntentRecorded,
+            to: OperationStatus::Started,
+            evidence_sequences: Vec::new(),
+        },
+    ] {
+        revision = store
+            .append_task_event(task_id, revision, event, chrono::Utc::now())?
+            .expect("legacy event appends")
+            .revision;
+    }
+    drop(store);
+
+    let runtime = RuntimeStore::open(DataRootLock::acquire(&fixture.root)?, chrono::Utc::now())?;
+    let port = EnginePort::resume_small_edit();
+    let shared = port.shared();
+    let mut restarted = TaskEngine::new_runtime(runtime, port);
+
+    assert_eq!(
+        restarted.run(task_id).await.unwrap_err().code(),
+        carl::runtime::task::TaskEngineErrorCode::Blocked
+    );
+    let snapshot = restarted.store().get_task(task_id)?.unwrap().snapshot;
+    assert_eq!(snapshot.status, TaskStatus::Blocked);
+    assert_eq!(
+        snapshot.operation_status(operation_id),
+        Some(OperationStatus::Uncertain)
+    );
+    let state = shared.lock().unwrap();
+    assert_eq!(state.durable_effect_count, 0);
+    assert!(state.epoch_starts.is_empty());
+    drop(state);
+    assert_task_projection_matches_replay(restarted.store(), task_id, "legacy digest recovery")?;
     Ok(())
 }
 
@@ -3673,7 +3767,7 @@ async fn startup_reconciles_a_matching_bound_postcondition_without_redispatch() 
             matches!(
                 envelope.event,
                 carl::events::Event::TaskLifecycle {
-                    event: carl::runtime::task::TaskEvent::OperationPostconditionBound { .. },
+                    event: carl::runtime::task::TaskEvent::OperationFilePostconditionBound { .. },
                     ..
                 }
             )
@@ -3721,22 +3815,21 @@ async fn startup_blocks_a_mismatched_bound_postcondition_without_redispatch() ->
         carl::runtime::task::TaskEngineErrorCode::Storage
     );
     let task_id = first.store().list_resumable_tasks()?[0].snapshot.task_id;
-    let operation_id =
-        first
-            .store()
-            .read_task_events(task_id)?
-            .into_iter()
-            .find_map(|envelope| match envelope.event {
-                carl::events::Event::TaskLifecycle {
-                    event:
-                        carl::runtime::task::TaskEvent::OperationPostconditionBound {
-                            operation_id, ..
-                        },
-                    ..
-                } => Some(operation_id),
-                _ => None,
-            })
-            .expect("the postcondition binding is durable");
+    let operation_id = first
+        .store()
+        .read_task_events(task_id)?
+        .into_iter()
+        .find_map(|envelope| match envelope.event {
+            carl::events::Event::TaskLifecycle {
+                event:
+                    carl::runtime::task::TaskEvent::OperationFilePostconditionBound {
+                        operation_id, ..
+                    },
+                ..
+            } => Some(operation_id),
+            _ => None,
+        })
+        .expect("the postcondition binding is durable");
     let epoch_starts_before = shared.lock().unwrap().epoch_starts.len();
     let (store, port) = first.into_parts();
     drop(store);
@@ -3835,7 +3928,7 @@ async fn postcondition_rejects_a_symlink_target_after_mutation() -> TestResult {
             .all(|envelope| !matches!(
                 envelope.event,
                 carl::events::Event::TaskLifecycle {
-                    event: carl::runtime::task::TaskEvent::OperationPostconditionBound { .. },
+                    event: carl::runtime::task::TaskEvent::OperationFilePostconditionBound { .. },
                     ..
                 }
             ))
@@ -3879,7 +3972,7 @@ async fn postcondition_rejects_a_hard_link_after_mutation() -> TestResult {
             .all(|envelope| !matches!(
                 envelope.event,
                 carl::events::Event::TaskLifecycle {
-                    event: carl::runtime::task::TaskEvent::OperationPostconditionBound { .. },
+                    event: carl::runtime::task::TaskEvent::OperationFilePostconditionBound { .. },
                     ..
                 }
             ))
@@ -4369,7 +4462,7 @@ async fn every_required_engine_restart_cut_restarts_from_real_engine_state() -> 
                 install_engine_event_cut(
                     &fixture.database,
                     "usage_observed",
-                    Some("operation_postcondition_bound"),
+                    Some("operation_file_postcondition_bound"),
                 )?;
                 let first_port =
                     EnginePort::pending_file_effect(&fixture.workspace, b"item complete\n");
