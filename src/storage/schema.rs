@@ -50,6 +50,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "ACP frontends",
         sql: include_str!("../../migrations/0007_acp_frontends.sql"),
     },
+    Migration {
+        version: 8,
+        name: "long-horizon tasks",
+        sql: include_str!("../../migrations/0008_long_horizon_tasks.sql"),
+    },
 ];
 
 pub(crate) fn migrate(connection: &mut Connection) -> Result<(), CarlError> {

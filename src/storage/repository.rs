@@ -28,6 +28,10 @@ use crate::runtime::subscription::{
     ProviderReported, RunConfigSnapshot, RunFailureCode, RunId, RunState, RunTransition,
     RunTrustLabel, VerificationId,
 };
+use crate::runtime::task::{
+    CompletionContract, EffectClass, OperationStatus, TaskBudget, TaskEvent, TaskId, TaskSnapshot,
+    TaskStatus, reduce_task,
+};
 use crate::security::SecretFilter;
 use crate::sidecar::DataRootLock;
 use crate::staging::{
@@ -267,6 +271,26 @@ pub struct DeliveryRecord {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionRecord {
     pub id: SessionId,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NewTask {
+    pub session_id: SessionId,
+    pub workspace: PathBuf,
+    pub contract: CompletionContract,
+    pub model: ModelId,
+    pub effort: ReasoningEffort,
+    pub permission_mode: PermissionMode,
+    pub budget: TaskBudget,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaskRecord {
+    pub snapshot: TaskSnapshot,
+    pub revision: u64,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -721,6 +745,7 @@ impl Store {
             });
         }
         schema::migrate(&mut connection)?;
+        validate_resumable_task_projections(&connection)?;
         checkpoint_for_secure_deletion(&connection)?;
 
         Ok(Self { connection })
@@ -1427,6 +1452,11 @@ impl Store {
                 detail: "subscription run events require the transactional run API".to_owned(),
             });
         }
+        if matches!(event, Event::TaskLifecycle { .. }) {
+            return Err(CarlError::Validation {
+                detail: "task lifecycle events require the transactional task API".to_owned(),
+            });
+        }
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -1466,6 +1496,143 @@ impl Store {
         rows.into_iter()
             .map(|row| row.into_envelope(session_id))
             .collect()
+    }
+
+    pub fn create_task(&mut self, input: NewTask) -> Result<TaskRecord, CarlError> {
+        let workspace = fs::canonicalize(&input.workspace).map_err(|_| CarlError::Validation {
+            detail: "task workspace is unavailable".to_owned(),
+        })?;
+        if !workspace.is_dir() {
+            return Err(CarlError::Validation {
+                detail: "task workspace is not a directory".to_owned(),
+            });
+        }
+        let task_id = TaskId::new();
+        let created_event = TaskEvent::Created {
+            session_id: input.session_id,
+            workspace: workspace.clone(),
+            contract: input.contract,
+            budget: input.budget,
+            model: input.model.clone(),
+            effort: input.effort,
+            permission_mode: input.permission_mode,
+        };
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage_error)?;
+        let envelope = append_event_in_transaction(
+            &transaction,
+            input.session_id,
+            None,
+            Event::TaskLifecycle {
+                task_id,
+                event: created_event,
+            },
+            input.created_at,
+        )?;
+        let snapshot = reduce_task(None, &envelope).map_err(task_reduce_error)?;
+        insert_task_projection(
+            &transaction,
+            &snapshot,
+            &workspace,
+            &input.model,
+            input.effort,
+            input.permission_mode,
+            input.created_at,
+        )?;
+        transaction.commit().map_err(storage_error)?;
+        Ok(TaskRecord {
+            revision: snapshot.revision,
+            snapshot,
+            created_at: input.created_at,
+            updated_at: input.created_at,
+        })
+    }
+
+    pub fn append_task_event(
+        &mut self,
+        task_id: TaskId,
+        expected_revision: u64,
+        event: TaskEvent,
+        at: DateTime<Utc>,
+    ) -> Result<Option<TaskRecord>, CarlError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage_error)?;
+        let Some(current) = load_task_record(&transaction, task_id)? else {
+            return Ok(None);
+        };
+        if current.revision != expected_revision {
+            return Ok(None);
+        }
+        let envelope = append_event_in_transaction(
+            &transaction,
+            current.snapshot.session_id,
+            None,
+            Event::TaskLifecycle { task_id, event },
+            at,
+        )?;
+        let snapshot = reduce_task(Some(current.snapshot), &envelope).map_err(task_reduce_error)?;
+        apply_task_child_projection(&transaction, task_id, &envelope, &snapshot)?;
+        update_task_projection(&transaction, &snapshot, at)?;
+        transaction.commit().map_err(storage_error)?;
+        Ok(Some(TaskRecord {
+            revision: snapshot.revision,
+            snapshot,
+            created_at: current.created_at,
+            updated_at: at,
+        }))
+    }
+
+    pub fn get_task(&self, task_id: TaskId) -> Result<Option<TaskRecord>, CarlError> {
+        load_task_record(&self.connection, task_id)
+    }
+
+    pub fn list_resumable_tasks(&self) -> Result<Vec<TaskRecord>, CarlError> {
+        let ids = self
+            .connection
+            .prepare(
+                "SELECT id FROM agent_tasks
+                 WHERE status NOT IN ('cancelled', 'completed', 'failed')
+                 ORDER BY updated_at ASC, id ASC",
+            )
+            .map_err(storage_error)?
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(storage_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(storage_error)?;
+        ids.into_iter()
+            .map(|id| {
+                let task_id = parse_id("task ID", &id)?;
+                load_task_record(&self.connection, task_id)?
+                    .ok_or_else(|| storage_invariant("listed task projection disappeared"))
+            })
+            .collect()
+    }
+
+    pub fn read_task_events(&self, task_id: TaskId) -> Result<Vec<EventEnvelope>, CarlError> {
+        let mut events = Vec::new();
+        let mut after_sequence = None;
+        loop {
+            let page = self.read_task_event_page(task_id, after_sequence, 512)?;
+            if page.is_empty() {
+                break;
+            }
+            after_sequence = page.last().map(|event| event.sequence);
+            events.extend(page);
+        }
+        Ok(events)
+    }
+
+    pub fn read_task_event_page(
+        &self,
+        task_id: TaskId,
+        after_sequence: Option<u64>,
+        limit: u16,
+    ) -> Result<Vec<EventEnvelope>, CarlError> {
+        read_task_event_page_from_connection(&self.connection, task_id, after_sequence, limit)
     }
 
     pub fn set_session_delegate_settings(
@@ -5090,6 +5257,545 @@ fn usize_to_sql(value: usize, kind: &str) -> Result<i64, CarlError> {
 
 fn stored_u64(value: i64, kind: &str) -> Result<u64, CarlError> {
     u64::try_from(value).map_err(|_| storage_invariant(&format!("stored {kind} is invalid")))
+}
+
+fn insert_task_projection(
+    transaction: &Transaction<'_>,
+    snapshot: &TaskSnapshot,
+    workspace: &Path,
+    model: &ModelId,
+    effort: ReasoningEffort,
+    permission_mode: PermissionMode,
+    created_at: DateTime<Utc>,
+) -> Result<(), CarlError> {
+    let workspace = workspace.to_str().ok_or_else(|| CarlError::Validation {
+        detail: "task workspace is not UTF-8".to_owned(),
+    })?;
+    let contract_json = serde_json::to_string(&snapshot.contract).map_err(storage_error)?;
+    let budget_json = serde_json::to_string(&snapshot.budget).map_err(storage_error)?;
+    let snapshot_json = serde_json::to_string(snapshot).map_err(storage_error)?;
+    transaction
+        .execute(
+            "INSERT INTO agent_tasks (
+                id, session_id, status, contract_json, budget_json, snapshot_json,
+                canonical_workspace, provider, model, effort, permission_mode,
+                revision, current_epoch_id, latest_checkpoint_id, provider_context,
+                created_at, updated_at
+             ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, 'codex', ?8, ?9, ?10,
+                ?11, NULL, NULL, NULL, ?12, ?12
+             )",
+            params![
+                snapshot.task_id.to_string(),
+                snapshot.session_id.to_string(),
+                task_status_str(snapshot.status),
+                contract_json,
+                budget_json,
+                snapshot_json,
+                workspace,
+                model.as_str(),
+                effort.as_codex_value(),
+                permission_mode.as_wire_str(),
+                revision_to_sql(snapshot.revision)?,
+                format_timestamp(created_at),
+            ],
+        )
+        .map_err(storage_error)?;
+    Ok(())
+}
+
+fn update_task_projection(
+    transaction: &Transaction<'_>,
+    snapshot: &TaskSnapshot,
+    updated_at: DateTime<Utc>,
+) -> Result<(), CarlError> {
+    let changed = transaction
+        .execute(
+            "UPDATE agent_tasks SET
+                status = ?2,
+                contract_json = ?3,
+                budget_json = ?4,
+                snapshot_json = ?5,
+                revision = ?6,
+                current_epoch_id = ?7,
+                latest_checkpoint_id = ?8,
+                provider_context = ?9,
+                updated_at = ?10
+             WHERE id = ?1 AND revision = ?11",
+            params![
+                snapshot.task_id.to_string(),
+                task_status_str(snapshot.status),
+                serde_json::to_string(&snapshot.contract).map_err(storage_error)?,
+                serde_json::to_string(&snapshot.budget).map_err(storage_error)?,
+                serde_json::to_string(snapshot).map_err(storage_error)?,
+                revision_to_sql(snapshot.revision)?,
+                snapshot.active_epoch.map(|id| id.to_string()),
+                snapshot.latest_checkpoint.map(|id| id.to_string()),
+                snapshot.provider_context.as_deref(),
+                format_timestamp(updated_at),
+                revision_to_sql(snapshot.revision.saturating_sub(1))?,
+            ],
+        )
+        .map_err(storage_error)?;
+    if changed != 1 {
+        return Err(storage_invariant(
+            "task projection revision changed during transactional append",
+        ));
+    }
+    Ok(())
+}
+
+fn apply_task_child_projection(
+    transaction: &Transaction<'_>,
+    task_id: TaskId,
+    envelope: &EventEnvelope,
+    _snapshot: &TaskSnapshot,
+) -> Result<(), CarlError> {
+    let Event::TaskLifecycle { event, .. } = &envelope.event else {
+        return Err(storage_invariant(
+            "task projection received a non-task event",
+        ));
+    };
+    let task_id = task_id.to_string();
+    let event_sequence = revision_to_sql(envelope.sequence)?;
+    let timestamp = format_timestamp(envelope.timestamp);
+    match event {
+        TaskEvent::EpochStarted {
+            epoch_id,
+            objective,
+        } => {
+            transaction
+                .execute(
+                    "INSERT INTO task_epochs (
+                        id, task_id, objective, status, started_sequence,
+                        finished_sequence, report_digest, created_at, updated_at
+                     ) VALUES (?1, ?2, ?3, 'active', ?4, NULL, NULL, ?5, ?5)",
+                    params![
+                        epoch_id.to_string(),
+                        task_id,
+                        objective,
+                        event_sequence,
+                        timestamp,
+                    ],
+                )
+                .map_err(storage_error)?;
+        }
+        TaskEvent::EpochFinished {
+            epoch_id,
+            report_digest,
+        } => {
+            let changed = transaction
+                .execute(
+                    "UPDATE task_epochs
+                     SET status = 'finished', finished_sequence = ?3,
+                         report_digest = ?4, updated_at = ?5
+                     WHERE id = ?1 AND task_id = ?2 AND status = 'active'",
+                    params![
+                        epoch_id.to_string(),
+                        task_id,
+                        event_sequence,
+                        report_digest,
+                        timestamp,
+                    ],
+                )
+                .map_err(storage_error)?;
+            require_projection_change(changed, "active task epoch projection is missing")?;
+        }
+        TaskEvent::OperationIntentRecorded {
+            operation_id,
+            epoch_id,
+            item_id,
+            effect_class,
+            request_digest,
+        } => {
+            transaction
+                .execute(
+                    "INSERT INTO task_operations (
+                        id, task_id, epoch_id, item_id, effect_class, request_digest,
+                        status, intent_sequence, last_transition_sequence,
+                        evidence_sequences_json, created_at, updated_at
+                     ) VALUES (
+                        ?1, ?2, ?3, ?4, ?5, ?6, 'intent_recorded', ?7, ?7, '[]', ?8, ?8
+                     )",
+                    params![
+                        operation_id.to_string(),
+                        task_id,
+                        epoch_id.to_string(),
+                        item_id,
+                        effect_class_str(*effect_class),
+                        request_digest,
+                        event_sequence,
+                        timestamp,
+                    ],
+                )
+                .map_err(storage_error)?;
+        }
+        TaskEvent::OperationTransitioned {
+            operation_id,
+            from,
+            to,
+            evidence_sequences,
+        } => {
+            let changed = transaction
+                .execute(
+                    "UPDATE task_operations
+                     SET status = ?4, last_transition_sequence = ?5,
+                         evidence_sequences_json = ?6, updated_at = ?7
+                     WHERE id = ?1 AND task_id = ?2 AND status = ?3",
+                    params![
+                        operation_id.to_string(),
+                        task_id,
+                        operation_status_str(*from),
+                        operation_status_str(*to),
+                        event_sequence,
+                        serde_json::to_string(evidence_sequences).map_err(storage_error)?,
+                        timestamp,
+                    ],
+                )
+                .map_err(storage_error)?;
+            require_projection_change(changed, "task operation projection is missing")?;
+        }
+        TaskEvent::CheckpointCommitted {
+            checkpoint_id,
+            digest,
+        } => {
+            transaction
+                .execute(
+                    "INSERT INTO task_checkpoints (
+                        id, task_id, digest, event_sequence, checkpoint_json, created_at
+                     ) VALUES (?1, ?2, ?3, ?4, NULL, ?5)",
+                    params![
+                        checkpoint_id.to_string(),
+                        task_id,
+                        digest,
+                        event_sequence,
+                        timestamp,
+                    ],
+                )
+                .map_err(storage_error)?;
+        }
+        TaskEvent::CompactionCompleted {
+            generation,
+            checkpoint_id,
+            context_package_id,
+        } => {
+            transaction
+                .execute(
+                    "INSERT INTO task_context_packages (
+                        id, task_id, checkpoint_id, generation, event_sequence,
+                        package_json, created_at
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6)",
+                    params![
+                        context_package_id.to_string(),
+                        task_id,
+                        checkpoint_id.to_string(),
+                        i64::from(*generation),
+                        event_sequence,
+                        timestamp,
+                    ],
+                )
+                .map_err(storage_error)?;
+        }
+        TaskEvent::SteeringQueued {
+            steering_sequence,
+            text_digest,
+        } => {
+            transaction
+                .execute(
+                    "INSERT INTO task_steering (
+                        task_id, steering_sequence, text_digest, event_sequence, created_at
+                     ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        task_id,
+                        revision_to_sql(*steering_sequence)?,
+                        text_digest,
+                        event_sequence,
+                        timestamp,
+                    ],
+                )
+                .map_err(storage_error)?;
+        }
+        TaskEvent::Created { .. }
+        | TaskEvent::StateTransitioned { .. }
+        | TaskEvent::ContractRevised { .. }
+        | TaskEvent::UsageObserved { .. }
+        | TaskEvent::ProgressAssessed { .. }
+        | TaskEvent::CompactionRequested { .. }
+        | TaskEvent::ProviderContextBound { .. }
+        | TaskEvent::ProviderContextLost { .. }
+        | TaskEvent::CancellationRequested
+        | TaskEvent::Blocked { .. }
+        | TaskEvent::Completed => {}
+    }
+    Ok(())
+}
+
+fn require_projection_change(changed: usize, detail: &str) -> Result<(), CarlError> {
+    if changed == 1 {
+        Ok(())
+    } else {
+        Err(storage_invariant(detail))
+    }
+}
+
+fn load_task_record(
+    connection: &Connection,
+    task_id: TaskId,
+) -> Result<Option<TaskRecord>, CarlError> {
+    let raw = connection
+        .query_row(
+            "SELECT session_id, status, contract_json, budget_json, snapshot_json,
+                    revision, current_epoch_id, latest_checkpoint_id, provider_context,
+                    created_at, updated_at
+             FROM agent_tasks WHERE id = ?1",
+            [task_id.to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, String>(9)?,
+                    row.get::<_, String>(10)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(storage_error)?;
+    raw.map(
+        |(
+            session_id,
+            status,
+            contract_json,
+            budget_json,
+            snapshot_json,
+            revision,
+            current_epoch_id,
+            latest_checkpoint_id,
+            provider_context,
+            created_at,
+            updated_at,
+        )| {
+            let snapshot: TaskSnapshot =
+                serde_json::from_str(&snapshot_json).map_err(storage_error)?;
+            let contract: CompletionContract =
+                serde_json::from_str(&contract_json).map_err(storage_error)?;
+            let budget: TaskBudget = serde_json::from_str(&budget_json).map_err(storage_error)?;
+            let stored_revision = stored_u64(revision, "task revision")?;
+            let stored_status = parse_task_status(&status)?;
+            let stored_session_id = parse_id("task session ID", &session_id)?;
+            let stored_epoch = current_epoch_id
+                .as_deref()
+                .map(|value| parse_id("task epoch ID", value))
+                .transpose()?;
+            let stored_checkpoint = latest_checkpoint_id
+                .as_deref()
+                .map(|value| parse_id("task checkpoint ID", value))
+                .transpose()?;
+            if snapshot.task_id != task_id
+                || snapshot.session_id != stored_session_id
+                || snapshot.status != stored_status
+                || snapshot.contract != contract
+                || snapshot.budget != budget
+                || snapshot.revision != stored_revision
+                || snapshot.active_epoch != stored_epoch
+                || snapshot.latest_checkpoint != stored_checkpoint
+                || snapshot.provider_context != provider_context
+            {
+                return Err(storage_invariant(
+                    "stored task projection is internally inconsistent",
+                ));
+            }
+            Ok(TaskRecord {
+                snapshot,
+                revision: stored_revision,
+                created_at: parse_timestamp(&created_at)?,
+                updated_at: parse_timestamp(&updated_at)?,
+            })
+        },
+    )
+    .transpose()
+}
+
+fn read_task_event_page_from_connection(
+    connection: &Connection,
+    task_id: TaskId,
+    after_sequence: Option<u64>,
+    limit: u16,
+) -> Result<Vec<EventEnvelope>, CarlError> {
+    if !(1..=512).contains(&limit) {
+        return Err(CarlError::Validation {
+            detail: "task event page limit must be between 1 and 512".to_owned(),
+        });
+    }
+    let after_sequence = match after_sequence {
+        Some(sequence) => i64::try_from(sequence).map_err(|_| CarlError::Validation {
+            detail: "task event page cursor is too large".to_owned(),
+        })?,
+        None => 0,
+    };
+    let task_id_text = task_id.to_string();
+    let Some(session_id) = connection
+        .query_row(
+            "SELECT session_id FROM agent_tasks WHERE id = ?1",
+            [&task_id_text],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(storage_error)?
+    else {
+        return Ok(Vec::new());
+    };
+    let session_id: SessionId = parse_id("task session ID", &session_id)?;
+    let rows = connection
+        .prepare(
+            "SELECT id, turn_id, sequence, timestamp, schema_version, event_json
+             FROM events
+             WHERE session_id = ?1
+               AND sequence > ?2
+               AND json_extract(event_json, '$.type') = 'task_lifecycle'
+               AND json_extract(event_json, '$.task_id') = ?3
+             ORDER BY sequence ASC
+             LIMIT ?4",
+        )
+        .map_err(storage_error)?
+        .query_map(
+            params![
+                session_id.to_string(),
+                after_sequence,
+                task_id_text,
+                i64::from(limit),
+            ],
+            |row| {
+                Ok(RawEvent {
+                    id: row.get(0)?,
+                    turn_id: row.get(1)?,
+                    sequence: row.get(2)?,
+                    timestamp: row.get(3)?,
+                    schema_version: row.get(4)?,
+                    event_json: row.get(5)?,
+                })
+            },
+        )
+        .map_err(storage_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(storage_error)?;
+    rows.into_iter()
+        .map(|row| row.into_envelope(session_id))
+        .collect()
+}
+
+fn validate_resumable_task_projections(connection: &Connection) -> Result<(), CarlError> {
+    let ids = connection
+        .prepare(
+            "SELECT id FROM agent_tasks
+             WHERE status NOT IN ('cancelled', 'completed', 'failed')
+             ORDER BY id ASC",
+        )
+        .map_err(storage_error)?
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(storage_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(storage_error)?;
+    for id in ids {
+        let task_id = parse_id("task ID", &id)?;
+        let projection = load_task_record(connection, task_id)?
+            .ok_or_else(|| storage_invariant("resumable task projection disappeared"))?;
+        let mut replayed = None;
+        let mut after_sequence = None;
+        loop {
+            let page =
+                read_task_event_page_from_connection(connection, task_id, after_sequence, 512)?;
+            if page.is_empty() {
+                break;
+            }
+            after_sequence = page.last().map(|event| event.sequence);
+            for envelope in page {
+                replayed = Some(reduce_task(replayed, &envelope).map_err(task_replay_error)?);
+            }
+        }
+        let replayed = replayed
+            .ok_or_else(|| storage_invariant("resumable task projection has no journal events"))?;
+        if replayed.revision != projection.revision
+            || replayed.status != projection.snapshot.status
+            || replayed.active_epoch != projection.snapshot.active_epoch
+            || replayed.latest_checkpoint != projection.snapshot.latest_checkpoint
+            || replayed != projection.snapshot
+        {
+            return Err(storage_invariant(
+                "task projection disagrees with journal replay",
+            ));
+        }
+    }
+    Ok(())
+}
+
+const fn task_status_str(status: TaskStatus) -> &'static str {
+    match status {
+        TaskStatus::Queued => "queued",
+        TaskStatus::Active => "active",
+        TaskStatus::Checkpointing => "checkpointing",
+        TaskStatus::Paused => "paused",
+        TaskStatus::Blocked => "blocked",
+        TaskStatus::Cancelling => "cancelling",
+        TaskStatus::Cancelled => "cancelled",
+        TaskStatus::Completing => "completing",
+        TaskStatus::Completed => "completed",
+        TaskStatus::Failed => "failed",
+    }
+}
+
+fn parse_task_status(value: &str) -> Result<TaskStatus, CarlError> {
+    match value {
+        "queued" => Ok(TaskStatus::Queued),
+        "active" => Ok(TaskStatus::Active),
+        "checkpointing" => Ok(TaskStatus::Checkpointing),
+        "paused" => Ok(TaskStatus::Paused),
+        "blocked" => Ok(TaskStatus::Blocked),
+        "cancelling" => Ok(TaskStatus::Cancelling),
+        "cancelled" => Ok(TaskStatus::Cancelled),
+        "completing" => Ok(TaskStatus::Completing),
+        "completed" => Ok(TaskStatus::Completed),
+        "failed" => Ok(TaskStatus::Failed),
+        other => Err(invalid_stored_value("task status", other)),
+    }
+}
+
+const fn operation_status_str(status: OperationStatus) -> &'static str {
+    match status {
+        OperationStatus::IntentRecorded => "intent_recorded",
+        OperationStatus::Started => "started",
+        OperationStatus::Succeeded => "succeeded",
+        OperationStatus::Failed => "failed",
+        OperationStatus::Cancelled => "cancelled",
+        OperationStatus::Uncertain => "uncertain",
+        OperationStatus::Reconciled => "reconciled",
+    }
+}
+
+const fn effect_class_str(effect_class: EffectClass) -> &'static str {
+    match effect_class {
+        EffectClass::Observation => "observation",
+        EffectClass::IdempotentMutation => "idempotent_mutation",
+        EffectClass::AmbiguousConsequential => "ambiguous_consequential",
+    }
+}
+
+fn task_reduce_error(error: crate::runtime::task::TaskReduceError) -> CarlError {
+    CarlError::Validation {
+        detail: format!("task event cannot be applied: {}", error.code().as_str()),
+    }
+}
+
+fn task_replay_error(error: crate::runtime::task::TaskReduceError) -> CarlError {
+    CarlError::Storage {
+        detail: format!("task journal replay failed: {}", error.code().as_str()),
+    }
 }
 
 fn append_event_in_transaction(
