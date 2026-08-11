@@ -245,3 +245,140 @@ PASS, exit 0
 - No Critical or Important Task 9 finding remains. Process-startup invocation of
   durable task discovery/resumption remains the explicit Task 10 integration
   boundary; Task 9's discovery and storage behavior is covered independently.
+
+## Fix Round 2/5
+
+### Findings fixed
+
+- Every planning provider read, validation, reported-failure, unexpected-event,
+  planning-control, and planning-start failure now interrupts where possible,
+  finishes the logical epoch, durably blocks the task, emits `TaskStatus::Blocked`,
+  and returns `TaskEngineErrorCode::Blocked` instead of leaking a raw provider
+  error.
+- Work-event read, validation, sequencing, catch-all, queued-steering, and soft
+  boundary steering failures now close every `Started` operation according to
+  provenance, finish the active epoch, and take the same typed blocked path.
+  `Uncertain` may close a provider epoch but remains unresolved for checkpoint and
+  completion safety.
+- The hard wall deadline now covers approval-notice delivery, owner approval wait,
+  the final pre-Allow checks, and `resolve_effect`. All pending awaits race the
+  remaining deadline. A pre-dispatch expiry closes the current operation `Failed`;
+  an in-flight Allow resolution closes it `Uncertain`; both interrupt and close the
+  work epoch before durable blocking.
+- A definitely-not-applied provider start for a pending recovery epoch now finishes
+  that exact epoch, appends `RecoveryAttemptRecorded` with `Failed`, clears the
+  pending identity, and blocks. Restart therefore cannot reinsert the same
+  `task_epochs.id` and observes the truthful terminal attempt outcome.
+- Authoritative usage updates no longer discard conservative accounting for later
+  assistant or diff bytes. Terminal planning/work flushes merge the accumulated
+  post-update estimate into a new durable `UsageObserved` value before compaction.
+- Approval-notice failure, approval control-channel closure, invalid approval
+  validation, planning approval control, and general work-control closure now close
+  operations/epochs and return the typed blocked outcome. Cancellation retains one
+  provider interrupt while still closing an uncertain epoch durably.
+
+### RED evidence
+
+1. Provider/safe-closure cluster:
+
+   `cargo test --test epoch_engine_contract faults_close -- --nocapture`
+
+   **FAIL, exit 101: 0 passed, 2 failed.** Planning next-event/validation/
+   unexpected failures and work sequencing/catch-all/soft-steer failures returned
+   `Provider` instead of `Blocked`.
+
+2. Post-usage accounting:
+
+   `cargo test --test epoch_engine_contract post_usage_assistant_and_diff_bytes_are_merged_before_terminal_compaction -- --exact --nocapture`
+
+   **FAIL, exit 101.** The final durable total remained below the hand-derived
+   105,096-token lower bound because terminal flush suppressed 4,096 diff bytes and
+   the later assistant report after an authoritative 101,000-token update.
+
+3. Recovery identity:
+
+   `cargo test --test epoch_engine_contract definitely_not_applied_recovery_start_is_recorded_failed_and_restart_safe -- --exact --nocapture`
+
+   **FAIL, exit 101.** The first failed recovery start returned `Provider` rather
+   than recording the attempt and returning `Blocked`; a subsequent run could
+   reuse the finished epoch identity.
+
+4. Hard wall during effect resolution:
+
+   `cargo test --test epoch_engine_contract hard_wall_budget_covers_pending_allow_resolution_and_closes_the_epoch -- --exact --nocapture`
+
+   **FAIL, exit 101.** The outer two-second diagnostic timed out because the
+   one-second task deadline was not polled while `resolve_effect(Allow)` was
+   pending.
+
+5. Approval/control harness:
+
+   The first internal-module behavioral run reported **1 passed, 3 failed**: the
+   deadline and notice paths left a definitely-not-dispatched operation
+   `Uncertain`, and the first control-close fixture could strand its waiter. The
+   fixture was then corrected to bind a real frontend session and close controls
+   only after receiving the approval notice; the production fix makes all four
+   owner-visible behaviors pass.
+
+### GREEN evidence
+
+- Provider/safe-closure cluster: **2 passed, 0 failed**, plus the ambiguous-read
+  active-epoch closure regression **1 passed, 0 failed**.
+- Post-usage accounting: **1 passed, 0 failed**; the merged durable total crosses
+  the compaction threshold and compaction runs once.
+- Recovery start/restart identity: **1 passed, 0 failed** with one exact
+  `EpochStarted`, one matching failed recovery outcome, and typed Blocked after
+  restart.
+- Pending Allow resolution deadline: **1 passed, 0 failed** in 1.04 seconds with
+  one interrupt, `Uncertain`, and no active epoch.
+- Internal approval/control contract:
+
+  `cargo test --lib 'runtime::task::engine::tests::' -- --nocapture`
+
+  **PASS, exit 0: 4 passed, 0 failed, 47 filtered.**
+- Focused cross-cutting compatibility:
+
+  `cargo test --test epoch_engine_contract --test acp_kernel_contract --test task_domain_contract`
+
+  **PASS, exit 0: ACP kernel 32 passed; epoch engine 53 passed; task domain 14
+  passed; 0 failures.** An earlier focused run exposed a double cancellation
+  interrupt in two ACP tests; exact reruns passed after epoch closure was moved
+  into the already-interrupted cancellation path.
+
+### Diagnostics and static gates
+
+- An early approval RED fixture left process group 43201 after its waiter became
+  stranded. It was manually interrupted, the fixture was made timeout-safe, and a
+  process-table check immediately before the full gate confirmed no Cargo/test
+  process remained. This diagnostic orphan is not counted as verification.
+- The first strict Clippy pass failed with one test-only `enum_variant_names`
+  diagnostic. The fixture variants were renamed and the complete static gate was
+  rerun.
+
+```text
+cargo fmt --all -- --check
+PASS, exit 0
+
+cargo clippy --all-targets --all-features -- -D warnings
+PASS, exit 0, no warnings
+
+cargo test --all-features
+PASS, exit 0: every unit, integration, contract, binary, and doc-test target
+passed with 0 failures under default parallel scheduling
+
+git diff --check
+PASS, exit 0
+```
+
+### Fix-round self-review and concerns
+
+- A logical epoch can close with durable `Uncertain` operations so a provider is
+  never represented as still running after interruption, but checkpoints and
+  completion continue to reject those unresolved operations.
+- Pre-Allow timeout/failure records `Failed` only before provider dispatch;
+  ambiguous resolution and post-dispatch failures record `Uncertain`.
+- Recovery attempt identity is never reused after an `EpochFinished`, and its
+  terminal event agrees with the failed provider start.
+- No plan, design specification, or security policy was edited. No Important
+  residual from this round remains; process-startup discovery/resumption stays the
+  explicit Task 10 boundary.

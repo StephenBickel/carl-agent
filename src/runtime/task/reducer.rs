@@ -194,7 +194,7 @@ pub fn reduce_task(
         }
         TaskEvent::EpochFinished { epoch_id, .. } => {
             require_active_epoch(&state, *epoch_id)?;
-            if state.has_unresolved_operations() {
+            if state.has_in_flight_operations() {
                 return Err(error(TaskReduceErrorCode::UnsafeBoundary));
             }
             state.active_epoch = None;

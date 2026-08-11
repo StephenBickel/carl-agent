@@ -612,6 +612,15 @@ impl TaskSnapshot {
             .any(|operation| !operation.status.is_resolved())
     }
 
+    pub(crate) fn has_in_flight_operations(&self) -> bool {
+        self.operations.values().any(|operation| {
+            matches!(
+                operation.status,
+                OperationStatus::IntentRecorded | OperationStatus::Started
+            )
+        })
+    }
+
     pub(crate) fn started_operation_ids(&self) -> Vec<OperationId> {
         self.operations
             .iter()

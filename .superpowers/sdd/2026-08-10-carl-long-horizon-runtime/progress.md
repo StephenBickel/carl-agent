@@ -1,0 +1,27 @@
+# SDD ledger — plan: docs/superpowers/plans/2026-08-10-carl-long-horizon-runtime.md
+
+Task 1: fix round 1/5 (1 addressed, 0 open; commits 2c128ff..a3bba95)
+Task 1: complete (commits d9c6b88..a3bba95, review clean)
+Task 2: fix round 1/5 (4 addressed, 1 open; commits 29e2306..b524f49)
+Task 2: fix round 2/5 (1 addressed, 0 open; commits b524f49..df1b5fd)
+Task 2: complete (commits a3bba95..df1b5fd, review clean)
+Task 3: fix round 1/5 (5 addressed, 3 open; commits 315a695..2c85843)
+Task 3: fix round 2/5 (2 addressed, 1 open; commits 2c85843..47c0314)
+Task 3: fix round 3/5 (1 addressed, 0 open; commits 47c0314..80ca930)
+Task 3: complete (commits df1b5fd..80ca930, review clean)
+Task 4: minor (deferred): TaskValidationErrorCode lacks the stable snake-case serde and literal as_str contract provided by TaskReduceErrorCode.
+Task 4: fix round 1/5 (3 addressed, 1 open; commits c170b0a..58e410e)
+Task 4: fix round 2/5 (1 addressed, 0 open; commits 58e410e..322c2d9)
+Task 4: complete (commits 80ca930..322c2d9, review clean)
+Task 5: fix round 1/5 (1 addressed, 0 open; commits f16c5f2..393c3d4)
+Task 5: complete (commits 25fb990..393c3d4, review clean)
+Task 6: minor (deferred): initial-generation provider identity is caller-supplied without explicit durable provenance.
+Task 6: fix round 1/5 (7 addressed, 2 open; commits 64ac963..5ad5f8d)
+Task 6: fix round 2/5 (2 addressed, 0 open; commits 5ad5f8d..ad6e799)
+Task 6: complete (commits 393c3d4..ad6e799, review clean)
+Task 7: fix round 1/5 (4 addressed, 0 open; commits 321e062..b59fd4f)
+Task 7: complete (commits ad6e799..b59fd4f, review clean)
+Task 8: minor (deferred): public EpochReport and OperationEvidence constructors do not enforce the parser's aggregate 64 KiB bound.
+Task 8: fix round 1/5 (4 addressed, 0 open; commits 8a946ca..8d0a7b4)
+Task 8: complete (commits b59fd4f..8d0a7b4, review clean)
+Task 9: fix round 1/5 (6 addressed, 5 open; commits 03a22f1..8e500f5)
