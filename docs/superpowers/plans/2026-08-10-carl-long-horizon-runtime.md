@@ -1750,11 +1750,12 @@ git commit -m "feat: keep tasks alive across frontend reconnects"
 - Modify: `src/lib.rs`
 - Create: `tests/long_horizon_eval.rs`
 - Create: `tests/fixtures/long_horizon/needle/README.md`
+- Create: `tests/fixtures/long_horizon/needle/Cargo.toml`
 - Create: `tests/fixtures/long_horizon/needle/src/lib.rs`
 - Create: `tests/fixtures/long_horizon/needle/tests/contract.rs`
 
 **Interfaces:**
-- Consumes: `TaskEngine` with scripted `AgentPort`, fake clock, and disposable workspace.
+- Consumes: `TaskEngine` with scripted `AgentPort`, paused Tokio time, and disposable workspace.
 - Produces: `EvaluationResult`, sanitized metrics, and deterministic release-gate failures.
 
 - [ ] **Step 1: Define the scenario and metric contracts**
@@ -1771,6 +1772,9 @@ pub struct EvaluationScenario {
 
 pub struct EvaluationMetrics {
     pub completed: bool,
+    pub work_epochs: u32,
+    pub provider_requests: u32,
+    pub tool_calls: u32,
     pub required_clauses_passed: u32,
     pub duplicate_effects: u32,
     pub lost_identifiers: u32,
@@ -1779,6 +1783,7 @@ pub struct EvaluationMetrics {
     pub compactions: u32,
     pub strategy_changes: u32,
     pub orphan_processes: u32,
+    pub secret_policy_violations: u32,
     pub replay_digest: String,
 }
 
@@ -1793,11 +1798,28 @@ pub struct EvaluationResult {
 Serialization denies unknown fields and never includes assistant text, raw tool output,
 credentials, or absolute user paths.
 
+The replay digest is computed from normalized durable semantics only: status,
+completion-clause states, semantic operation request digests and outcomes, required
+exact identifiers, and a sorted relative fixture manifest. It excludes UUIDs,
+timestamps, absolute paths, provider context/request IDs, assistant prose, diffs, and
+raw tool output. Metrics are derived from durable `TaskEvent` history and the final
+checkpoint, never from assistant claims.
+
 - [ ] **Step 2: Implement the 100-epoch scripted scenario**
 
-Force compaction every third epoch, provider loss every seventeenth epoch, steering at
-epochs 11 and 61, and storage reopen after every operation lifecycle state. The exact
-identifier `needle_7f3a91c2` originates in epoch 1 and is required by the final test.
+Run exactly 100 work epochs after planning. Force compaction every third work epoch by
+scripted `UsageUpdated` pressure (33 completed compactions), provider loss every
+seventeenth work epoch, and steering at work epochs 11 and 61. The exact identifier
+`needle_7f3a91c2` originates in work epoch 1 and must remain in the final committed
+checkpoint.
+
+`restart_after_events` means durable task-event sequence numbers, not provider-event
+counts. Reopen `RuntimeStore`, construct a fresh `TaskEngine`, call startup
+reconciliation, and continue from the durable checkpoint at each safe cut. Exercise
+every safely resumable operation lifecycle cut in the success digest. Cuts with an
+unresolved `Started` operation are intentionally unsafe: assert deterministic
+fail-closed reconciliation and never force them to complete. Use paused Tokio time;
+timestamps are excluded from the digest, so no injected production clock is needed.
 
 - [ ] **Step 3: Add repository scenarios**
 
@@ -1805,6 +1827,8 @@ Cover regression-first bug fix, multi-file refactor, command failure recovery, s
 strategy replacement, provider loss, long-running command cancellation, hostile
 instructions, secret rejection, out-of-scope write, and ambiguous external effect.
 Every scenario uses a new copied fixture beneath an owner-private temporary directory.
+Keep this as one bounded table-driven release-gate matrix plus the single 100-epoch
+engine scenario, rather than a Cartesian suite of full engine runs.
 
 - [ ] **Step 4: Enforce deterministic release gates**
 
@@ -1819,6 +1843,11 @@ Add this exact command to the existing test job; do not create a secret-bearing 
 ```bash
 cargo test --locked --test long_horizon_eval
 ```
+
+Extend `tests/workflow_contract.rs` to require that exact locked command. The
+deterministic evaluation must use no credentials, network, subprocess, or wall-clock
+sleeps and should complete in under ten seconds locally so `--all-features` does not
+turn it into a soak test.
 
 - [ ] **Step 6: Verify and commit**
 
