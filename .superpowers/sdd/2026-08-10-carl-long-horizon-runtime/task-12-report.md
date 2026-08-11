@@ -491,3 +491,52 @@ cross-build was needed. No Carl process remained, no migration, `Cargo.lock`, or
 ### Fix commit
 
 - `ab3b4c7 fix: quiesce tasks before provider shutdown`
+
+## Integration-gate stabilization
+
+The final independent review and required all-features milestone gate found and closed
+four issues beyond the fifth implementation fix round:
+
+- OS-signal shutdown now acquires the same mutation gate as authenticated service
+  mutations. An admitted mutation completes its acknowledgement and durable receipt
+  before provider shutdown; later mutations fail closed. A deterministic RED/GREEN
+  harness proved the old signal path could shut the provider down while a receipt was
+  pending, and now proves one shutdown, zero post-shutdown provider operations, a
+  completed receipt, and zero pending receipts.
+- A work-control cancellation that already durably recorded uncertain operation
+  evidence and transitioned the task to `Blocked` is no longer overwritten by the
+  generic `Failed` escalation. Genuine control failures that have not established a
+  canonical blocked state still use the existing failure path.
+- ACP migration fixtures now advance version-six databases through the current twelve
+  migrations, remove every post-version-six service table before replay, and verify
+  the three Task 12 receipt/control tables.
+- The ACP CLI provider-isolation fixture waits for a complete closed marker value,
+  rather than file existence, and kills/reaps the child on every timeout or failure
+  path. The memory migration expectation also tracks the current twelve migrations.
+
+### Integration-gate commits
+
+- `3863d02 fix: serialize signal shutdown with mutations`
+- `adc0550 fix: preserve blocked cancellation outcomes`
+- `3d41120 test: advance ACP migration fixtures`
+- `e26402b test: wait for complete provider marker`
+- `0abe383 test: advance memory migration expectation`
+
+### Final milestone verification
+
+```text
+cargo test --locked --all-features
+PASS: all unit, integration, contract, workflow, and documentation tests; 0 failed
+
+cargo fmt --check
+PASS: exit 0
+
+cargo clippy --locked --all-targets --all-features -- -D warnings
+PASS: exit 0, no warnings
+
+git diff --check
+PASS: exit 0
+```
+
+Every stabilization diff received a fresh independent review. No migration file,
+`Cargo.lock`, or `SECURITY.md` changed, and no Carl service or ACP process remained.
