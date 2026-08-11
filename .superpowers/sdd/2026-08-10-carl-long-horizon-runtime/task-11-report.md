@@ -358,3 +358,64 @@ milestone rerun after this integration fix.
   code consumption, delivery persistence, migrations, or security documentation.
 - No new regression test was needed because the two existing failing contracts are
   exact end-to-end coverage for the affected bound-session behavior.
+
+## Fix Round 4/5
+
+### Integration failure fixed
+
+- The proposal corruption contract now expects `RuntimeStore::open` to reject its
+  two deliberately orphaned databases. The fixture disables SQLite foreign-key
+  enforcement before deleting an artifact parent and later an inspection parent;
+  both states are genuine FK violations and must fail closed at startup.
+- No production validation changed. Task 11 Round 1 enabled foreign keys after
+  migration and added a global `PRAGMA foreign_key_check`, so the corruption is now
+  detected earlier than the proposal-specific getters. The candidate-digest tamper
+  does not violate an FK and still opens successfully before the getter rejects its
+  recomputed digest mismatch.
+
+### RED / GREEN evidence
+
+1. `proposal_load_rejects_tampered_candidate_digest_and_orphaned_rows` initially
+   escaped through `?` when the first intentionally orphaned database was rejected by
+   `RuntimeStore::open`. It now explicitly requires startup rejection for both orphan
+   variants while retaining the getter-level digest-tamper assertion.
+2. The complete `proposal_storage_contract` binary passes all 14 tests.
+3. The focused core, ACP, subscription-run, and task-storage suites pass all 67
+   tests, including migration upgrades, corrupt-history rejection, and Task 11 child
+   projection validation.
+
+### Verification
+
+```text
+cargo test --locked --test proposal_storage_contract -- \
+  proposal_load_rejects_tampered_candidate_digest_and_orphaned_rows --exact --nocapture
+PASS: 1 passed, 0 failed
+
+cargo test --locked --test proposal_storage_contract
+PASS: 14 passed, 0 failed
+
+cargo test --locked --test storage_contract --test acp_storage_contract \
+  --test task_storage_contract --test subscription_run_storage_contract
+PASS: 67 passed, 0 failed
+
+cargo clippy --locked --all-targets --all-features -- -D warnings
+PASS: exit 0, no warnings
+
+cargo fmt --all -- --check
+PASS: exit 0
+
+git diff --check
+PASS: exit 0
+```
+
+No `cargo test --all-features` command was run; the root agent owns the final
+milestone rerun after this compatibility correction.
+
+### Fix-round self-review
+
+- The startup FK check remains global and unconditional after migration; the test
+  does not whitelist proposal tables or permit orphaned rows to reach runtime code.
+- Migrations 1–10, production storage code, `SECURITY.md`, and Task 11 journal/child
+  validation are unchanged.
+- The updated assertions exercise real startup behavior against the existing
+  intentionally corrupt SQLite fixture and do not depend on exact error prose.
