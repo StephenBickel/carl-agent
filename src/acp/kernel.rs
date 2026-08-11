@@ -871,7 +871,9 @@ impl KernelActor {
                 },
             )
             .map_err(map_storage)?;
-        let provider_context = if request.frontend == Frontend::Buzz {
+        let awaits_buzz_admission =
+            request.frontend == Frontend::Buzz && request.buzz_context.is_none();
+        let provider_context = if awaits_buzz_admission {
             None
         } else {
             let context = self
