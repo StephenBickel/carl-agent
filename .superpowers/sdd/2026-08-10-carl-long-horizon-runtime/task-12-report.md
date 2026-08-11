@@ -333,3 +333,77 @@ all-features test run was performed.
 ### Fix commit
 
 - `6cd31b7 fix: preempt queued work on service shutdown`
+
+## Fix round 4/5
+
+The multithreaded shutdown/start TOCTOU is closed with one shared actor lifecycle
+state:
+
+- A task start now holds the active-task mutex while it checks the acquired
+  `shutdown_requested` flag and publishes `Some(task_id)`. Shutdown holds that
+  same mutex while it release-publishes terminal intent and reads the active task.
+  The two operations therefore have a total order: shutdown-first refuses the
+  start without popping it, while start-first makes the task visible for owner
+  cancellation.
+- Durable refill, scheduled-pop, and resumed-task enqueue all stop when shutdown
+  intent is published. Successful provider shutdown also clears the schedule and
+  independently rejects resume.
+- Non-shutdown mutations that were waiting behind the shutdown mutation gate are
+  rejected before claiming a durable receipt. A `Resume` command already at the
+  actor rechecks shutdown before both its control marker and its queue insertion,
+  so it cannot restart work after shutdown.
+- The owner actor still services engine controls after provider shutdown, preserving
+  canonical shutdown receipt completion and idempotent shutdown retry behavior.
+
+### RED / GREEN evidence
+
+The ordering tests were written before the lifecycle coordinator. The focused RED
+failed because production had no shared `TaskActorState` (`E0433` at all three new
+tests) and no guarded resume enqueue operation (`E0425`), which is the missing
+coordination the tests require.
+
+For each ordering, the GREEN test holds the real active-task mutex, polls both
+contenders into the mutex wait queue in the selected order, and only then releases
+the lock. No sleep or scheduler timing is involved:
+
+- shutdown-first returns no active task; the following start claim is false and
+  active state remains `None`;
+- start-first claims exactly the selected task; shutdown observes that same task;
+- after published shutdown, resume returns `Stopped` and the schedule stays empty.
+
+The existing active-A/queued-B service regression remains canonical: shutdown
+returns `Applied`, B makes no provider start/resume/epoch call, provider shutdown
+occurs exactly once, its receipt is completed with valid JSON, and zero receipts
+remain pending.
+
+### Verification
+
+```text
+cargo test --locked --lib service::server::tests
+PASS: 7 passed, 0 failed
+
+cargo test --locked --test service_end_to_end \
+  shutdown_preempts_queued_work_and_completes_its_receipt
+PASS: 1 passed, 0 failed
+
+cargo test --locked --test service_end_to_end
+PASS: 20 passed, 0 failed
+
+cargo fmt --all -- --check
+PASS: exit 0
+
+cargo clippy --locked --all-targets --all-features -- -D warnings
+PASS: exit 0, no warnings
+
+git diff --check
+PASS: exit 0
+```
+
+This lifecycle synchronization is platform-neutral and does not change the Unix
+socket or Windows named-pipe transport/security implementation. No cross-build was
+needed. No Carl process remained, no migration, `Cargo.lock`, or `SECURITY.md`
+changed, and no full all-features test suite was run.
+
+### Fix commit
+
+- `fe2ad37 fix: linearize service shutdown with task starts`
