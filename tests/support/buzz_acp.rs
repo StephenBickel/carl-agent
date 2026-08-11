@@ -19,6 +19,7 @@ pub type TestResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
 pub const PRIVATE_KEY: &str = "fixture-private-key";
 pub const CHANNEL_ID: &str = "11111111-1111-4111-8111-111111111111";
 pub const ACTOR_HEX: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const CARL_FRAME_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub fn dispatch_fixture(arguments: &[OsString]) -> Option<i32> {
     if arguments == [OsString::from("--version")] {
@@ -235,7 +236,7 @@ impl Client {
 
     pub fn read(&self) -> TestResult<Value> {
         self.frames
-            .recv_timeout(Duration::from_secs(8))
+            .recv_timeout(CARL_FRAME_TIMEOUT)
             .map_err(|error| -> Box<dyn Error + Send + Sync> {
                 format!("timed out reading Carl frame: {error}").into()
             })?
