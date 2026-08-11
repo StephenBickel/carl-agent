@@ -5,6 +5,7 @@ pub mod buzz_mcp;
 pub mod cli;
 pub mod delegates;
 pub mod error;
+pub mod evals;
 pub mod events;
 pub mod memory;
 pub mod policy;

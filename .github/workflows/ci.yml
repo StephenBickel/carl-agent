@@ -47,5 +47,7 @@ jobs:
         run: '"CARGO_TARGET_DIR=$env:USERPROFILE\carl-ci-target" >> $env:GITHUB_ENV'
       - name: Test pinned Buzz ACP compatibility
         run: cargo test --locked --test buzz_acp_contract --test buzz_end_to_end
+      - name: Test deterministic long-horizon evaluation
+        run: cargo test --locked --test long_horizon_eval
       - name: Test all features
         run: cargo test --all-features

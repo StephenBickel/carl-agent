@@ -369,6 +369,7 @@ fn validate_ci_workflow(workflow: &str) -> Result<(), String> {
             ),
             ("cargo test --doc", "quality"),
             ("cargo deny check", "quality"),
+            ("cargo test --locked --test long_horizon_eval", "test"),
             ("cargo test --all-features", "test"),
         ],
     )?;
@@ -426,7 +427,14 @@ fn validate_ci_workflow(workflow: &str) -> Result<(), String> {
             ));
         }
     }
-    require_commands(test, "jobs.test", &["cargo test --all-features"])?;
+    require_commands(
+        test,
+        "jobs.test",
+        &[
+            "cargo test --locked --test long_horizon_eval",
+            "cargo test --all-features",
+        ],
+    )?;
     validate_required_job_steps(test, "jobs.test")?;
 
     let all_feature_test_count = jobs
