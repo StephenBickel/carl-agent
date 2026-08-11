@@ -141,6 +141,10 @@ def test_gateway_rejects_even_fabricated_eligible_projection_before_git_or_githu
     assert decision.outcome == "blocked"
     assert decision.next_action == "await_isolated_signer"
     assert decision.reasons == ("experimental_publication_disabled",)
+    for alternate in ("_open_or_reconcile_unreachable", "_git", "_gh", "_inspect"):
+        assert not hasattr(gateway, alternate)
+    for capability in ("repository_root", "gh_executable", "command_env"):
+        assert not hasattr(gateway, capability)
     redirected = tmp_path / "redirected.git"
     _run("git", "init", "--bare", os.fspath(redirected), cwd=tmp_path)
     _run(

@@ -16,6 +16,7 @@ from test_experiment import (
 from test_report import manifest as run_manifest
 from test_report import trial
 
+import carl_bench.candidate_evidence as candidate_evidence_module
 from carl_bench.artifacts import PrivateArtifactStore
 from carl_bench.candidate_evidence import (
     CandidateEvidenceError,
@@ -244,6 +245,12 @@ def test_review_apis_are_disabled_before_artifact_access(tmp_path: Path) -> None
         )
 
     assert tuple(store.root.iterdir()) == ()
+    for alternate in (
+        "_bind_paired_evidence_unreachable",
+        "_issue_review_packet_unreachable",
+        "_record_review_attestation_unreachable",
+    ):
+        assert not hasattr(candidate_evidence_module, alternate)
 
 
 @pytest.mark.parametrize(
