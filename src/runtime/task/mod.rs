@@ -37,6 +37,6 @@ pub use types::{
     CheckpointId, ClauseStatus, CompletionClause, CompletionContract, ContextPackageId,
     EffectClass, EpochId, EpochInterruptReason, EvidenceRef, FilePostcondition,
     FilePostconditionEntry, NormalizedOperationEvidence, OperationId, OperationStatus,
-    ProviderRequestPurpose, TaskBudget, TaskEvent, TaskId, TaskSnapshot, TaskStatus,
-    TaskValidationError, TaskValidationErrorCode, classify_effect,
+    ProviderRequestPurpose, TaskBudget, TaskControlKind, TaskEvent, TaskId, TaskSnapshot,
+    TaskStatus, TaskValidationError, TaskValidationErrorCode, classify_effect,
 };

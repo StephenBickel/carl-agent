@@ -38,7 +38,7 @@ use super::{
     FilePostcondition, FilePostconditionEntry, NormalizedOperationEvidence, OperationEvidence,
     OperationId, OperationStatus, ProcessCheckpoint, ProgressAssessment, ProviderCheckpoint,
     ProviderRequestPurpose, RecoveryAttempt, RecoveryAttemptOutcome, RecoveryStrategy,
-    RepositoryCheckpoint, TaskBudget, TaskEvent, TaskId, TaskSnapshot, TaskStatus,
+    RepositoryCheckpoint, TaskBudget, TaskControlKind, TaskEvent, TaskId, TaskSnapshot, TaskStatus,
     assess_progress_with_recovery_attempts, classify_effect, decide_completion, parse_epoch_report,
     recovery_attempt_fingerprint,
 };
@@ -171,6 +171,7 @@ pub enum TaskEngineUpdate {
 
 pub(crate) enum TaskEngineControl {
     Steer {
+        task_id: TaskId,
         text: String,
         control_id: Option<String>,
         session_id: SessionId,
@@ -178,11 +179,15 @@ pub(crate) enum TaskEngineControl {
         acknowledgement: u64,
     },
     Cancel {
+        task_id: TaskId,
+        control_id: Option<String>,
         session_id: SessionId,
         turn_id: crate::events::TurnId,
         acknowledgement: u64,
     },
     Configure {
+        task_id: TaskId,
+        control_id: String,
         model: ModelId,
         effort: ReasoningEffort,
         permission_mode: PermissionMode,
@@ -220,6 +225,7 @@ struct RuntimeTask {
     model: ModelId,
     effort: ReasoningEffort,
     permission_mode: PermissionMode,
+    effective_permission_mode: PermissionMode,
     context_id: AgentContextId,
     next_objective: String,
     previous_checkpoint: Option<CanonicalCheckpoint>,
@@ -240,7 +246,15 @@ struct RuntimeTask {
     completed_tools: u64,
     started_tools: u64,
     provider_requests: u64,
-    pending_configuration: Option<(ModelId, ReasoningEffort, PermissionMode)>,
+    pending_configuration: Option<PendingTaskConfiguration>,
+}
+
+#[derive(Clone)]
+struct PendingTaskConfiguration {
+    control_id: String,
+    model: ModelId,
+    effort: ReasoningEffort,
+    permission_mode: PermissionMode,
 }
 
 struct ActiveOperation {
@@ -543,6 +557,7 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
             model: input.model.clone(),
             effort: input.effort,
             permission_mode: input.permission_mode,
+            effective_permission_mode: input.permission_mode,
             context_id,
             next_objective: format!(
                 "Implement and explicitly verify: {}",
@@ -1228,16 +1243,38 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
     }
 
     pub async fn cancel(&mut self, task_id: TaskId) -> Result<(), TaskEngineError> {
+        self.cancel_controlled(task_id, None).await
+    }
+
+    pub(crate) async fn cancel_controlled(
+        &mut self,
+        task_id: TaskId,
+        control_id: Option<&str>,
+    ) -> Result<(), TaskEngineError> {
         let record = self
             .store()
             .get_task(task_id)
             .map_err(storage_error)?
             .ok_or_else(invalid_task)?;
-        if record.snapshot.status == TaskStatus::Cancelled {
+        let marker_exists = match control_id {
+            Some(control_id) => self
+                .store()
+                .task_has_control_marker(task_id, control_id, TaskControlKind::Cancel)
+                .map_err(storage_error)?,
+            None => false,
+        };
+        if record.snapshot.status == TaskStatus::Cancelled
+            && (control_id.is_none() || marker_exists)
+        {
             return Ok(());
         }
         if record.snapshot.status.is_terminal() {
             return Err(invalid_task());
+        }
+        if let Some(control_id) = control_id
+            && !marker_exists
+        {
+            self.mark_control_requested(task_id, control_id, TaskControlKind::Cancel)?;
         }
         if !self.tasks.contains_key(&task_id) {
             let mut runtime = self.rehydrate_runtime(task_id, &record.snapshot)?;
@@ -1314,6 +1351,29 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
             Err(error) if error.code() == TaskEngineErrorCode::Cancelled => Ok(()),
             result => result,
         }
+    }
+
+    pub(crate) fn mark_control_requested(
+        &mut self,
+        task_id: TaskId,
+        control_id: &str,
+        kind: TaskControlKind,
+    ) -> Result<(), TaskEngineError> {
+        if self
+            .store()
+            .task_has_control_marker(task_id, control_id, kind)
+            .map_err(storage_error)?
+        {
+            return Ok(());
+        }
+        self.append(
+            task_id,
+            TaskEvent::ControlRequested {
+                control_id: control_id.to_owned(),
+                kind,
+            },
+        )?;
+        Ok(())
     }
 
     async fn plan_contract(
@@ -1624,27 +1684,8 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
         provider_epoch_id: &AgentEpochId,
         control: TaskEngineControl,
     ) -> Result<(), TaskEngineError> {
-        match control {
-            TaskEngineControl::Cancel {
-                session_id,
-                turn_id,
-                ..
-            } => {
-                self.cancel_active_epoch(
-                    task_id,
-                    Some(epoch_id),
-                    Some(&runtime.context_id),
-                    Some(provider_epoch_id),
-                    &[],
-                    Some((session_id, turn_id)),
-                )
-                .await
-            }
-            control => {
-                self.apply_control(task_id, epoch_id, runtime, provider_epoch_id, &[], control)
-                    .await
-            }
-        }
+        self.apply_control(task_id, epoch_id, runtime, provider_epoch_id, &[], control)
+            .await
     }
 
     async fn run_loop(
@@ -1697,10 +1738,18 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                 objective: objective.clone(),
             });
             let provider_input = self.assemble_epoch_context(task_id, runtime, &objective)?;
-            if let Some((model, effort, permission_mode)) = runtime.pending_configuration.take() {
-                runtime.model = model;
-                runtime.effort = effort;
-                runtime.permission_mode = permission_mode;
+            if let Some(configuration) = runtime.pending_configuration.clone() {
+                self.append(
+                    task_id,
+                    TaskEvent::ConfigurationApplied {
+                        control_id: configuration.control_id,
+                    },
+                )?;
+                runtime.model = configuration.model;
+                runtime.effort = configuration.effort;
+                runtime.permission_mode = configuration.permission_mode;
+                runtime.effective_permission_mode = configuration.permission_mode;
+                runtime.pending_configuration = None;
             }
             let purpose = if runtime.pending_recovery.is_some() || runtime.fresh_context_diagnosis {
                 ProviderRequestPurpose::Recovery
@@ -2709,12 +2758,16 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
     ) -> Result<(), TaskEngineError> {
         match control {
             TaskEngineControl::Steer {
+                task_id: control_task_id,
                 text,
                 control_id,
                 session_id,
                 turn_id,
                 ..
             } => {
+                if control_task_id != task_id {
+                    return Err(invalid_task());
+                }
                 validate_steering(&text)?;
                 let text_digest = sha256(text.as_bytes());
                 if let Some(control_id) = control_id.as_deref()
@@ -2765,10 +2818,18 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                     .map_err(provider_error)
             }
             TaskEngineControl::Cancel {
+                task_id: control_task_id,
+                control_id,
                 session_id,
                 turn_id,
                 ..
             } => {
+                if control_task_id != task_id {
+                    return Err(invalid_task());
+                }
+                if let Some(control_id) = control_id.as_deref() {
+                    self.mark_control_requested(task_id, control_id, TaskControlKind::Cancel)?;
+                }
                 self.cancel_active_epoch(
                     task_id,
                     Some(logical_epoch_id),
@@ -2780,13 +2841,29 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                 .await
             }
             TaskEngineControl::Configure {
+                task_id: control_task_id,
+                control_id,
                 model,
                 effort,
                 permission_mode,
                 tightening,
                 ..
             } => {
-                runtime.pending_configuration = Some((model, effort, permission_mode));
+                if control_task_id != task_id
+                    || tightening
+                        != (permission_strength(permission_mode)
+                            < permission_strength(runtime.effective_permission_mode))
+                {
+                    return Err(invalid_task());
+                }
+                self.queue_configuration(
+                    task_id,
+                    runtime,
+                    control_id,
+                    model,
+                    effort,
+                    permission_mode,
+                )?;
                 if tightening {
                     self.port
                         .interrupt(&runtime.context_id, provider_epoch_id)
@@ -2797,6 +2874,45 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
             }
             TaskEngineControl::Approval { .. } => Err(error(TaskEngineErrorCode::Blocked)),
         }
+    }
+
+    fn queue_configuration(
+        &mut self,
+        task_id: TaskId,
+        runtime: &mut RuntimeTask,
+        control_id: String,
+        model: ModelId,
+        effort: ReasoningEffort,
+        permission_mode: PermissionMode,
+    ) -> Result<(), TaskEngineError> {
+        if runtime
+            .pending_configuration
+            .as_ref()
+            .is_some_and(|pending| pending.control_id == control_id)
+        {
+            return Ok(());
+        }
+        self.append(
+            task_id,
+            TaskEvent::ConfigurationQueued {
+                control_id: control_id.clone(),
+                model: model.clone(),
+                effort,
+                permission_mode,
+            },
+        )?;
+        if permission_strength(permission_mode)
+            < permission_strength(runtime.effective_permission_mode)
+        {
+            runtime.effective_permission_mode = permission_mode;
+        }
+        runtime.pending_configuration = Some(PendingTaskConfiguration {
+            control_id,
+            model,
+            effort,
+            permission_mode,
+        });
+        Ok(())
     }
 
     async fn cancel_active_epoch(
@@ -3231,7 +3347,7 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
         let decision = if !supported || !summary_safe {
             EffectDecision::Deny
         } else {
-            match runtime.permission_mode.profile() {
+            match runtime.effective_permission_mode.profile() {
                 PermissionProfile::FullAccess => EffectDecision::Allow,
                 PermissionProfile::Approval if self.frontend_context.is_some() => {
                     self.await_approval(
@@ -3260,7 +3376,7 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
             )?;
             return Err(error(TaskEngineErrorCode::Blocked));
         }
-        if runtime.permission_mode.profile() == PermissionProfile::FullAccess
+        if runtime.effective_permission_mode.profile() == PermissionProfile::FullAccess
             && decision == EffectDecision::Allow
             && let (Some(context), Some(tool_call_id)) =
                 (self.frontend_context.clone(), frontend_tool_call_id)
@@ -3638,22 +3754,20 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                     self.acknowledge(acknowledgement, Err(error(TaskEngineErrorCode::Blocked)))
                         .await;
                 }
-                TaskEngineControl::Configure {
-                    model,
-                    effort,
-                    permission_mode,
-                    tightening,
-                    ..
-                } => {
-                    runtime.pending_configuration = Some((model, effort, permission_mode));
+                control @ TaskEngineControl::Configure { tightening, .. } => {
+                    let configured = self
+                        .apply_control(
+                            task_id,
+                            epoch_id,
+                            runtime,
+                            &request.epoch_id,
+                            &[operation_id],
+                            control,
+                        )
+                        .await;
                     if tightening {
-                        let interrupted = self
-                            .port
-                            .interrupt(&runtime.context_id, &request.epoch_id)
-                            .await
-                            .map_err(provider_error);
-                        self.acknowledge(acknowledgement, interrupted.clone()).await;
-                        let reason = if interrupted.is_ok() {
+                        self.acknowledge(acknowledgement, configured.clone()).await;
+                        let reason = if configured.is_ok() {
                             "permission tightening interrupted an operation awaiting approval"
                         } else {
                             "permission tightening could not confirm interruption of an operation awaiting approval"
@@ -3674,7 +3788,8 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                         self.block_task(task_id, reason)?;
                         return Err(error(TaskEngineErrorCode::Blocked));
                     }
-                    self.acknowledge(acknowledgement, Ok(())).await;
+                    self.acknowledge(acknowledgement, configured.clone()).await;
+                    configured?;
                 }
             }
         }
@@ -4047,7 +4162,7 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
             .store()
             .read_task_events(task_id)
             .map_err(storage_error)?;
-        let mut configuration = None;
+        let mut workspace = None;
         let mut progress = Vec::new();
         let mut recovery_attempts = Vec::new();
         let mut pending_recovery = None;
@@ -4067,14 +4182,10 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
             };
             match event {
                 TaskEvent::Created {
-                    workspace,
-                    model,
-                    effort,
-                    permission_mode,
+                    workspace: created_workspace,
                     ..
                 } => {
-                    configuration =
-                        Some((workspace.clone(), model.clone(), *effort, *permission_mode));
+                    workspace = Some(created_workspace.clone());
                 }
                 TaskEvent::ProviderRequestRecorded { .. } => {
                     provider_requests = provider_requests.saturating_add(1);
@@ -4177,7 +4288,29 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                 _ => {}
             }
         }
-        let (workspace, model, effort, permission_mode) = configuration.ok_or_else(invalid_task)?;
+        let workspace = workspace.ok_or_else(invalid_task)?;
+        let configuration = self
+            .store()
+            .get_task_configuration(task_id)
+            .map_err(storage_error)?
+            .ok_or_else(invalid_task)?;
+        let pending_configuration = match (
+            configuration.pending_control_id,
+            configuration.pending_model,
+            configuration.pending_effort,
+            configuration.pending_permission_mode,
+        ) {
+            (Some(control_id), Some(model), Some(effort), Some(permission_mode)) => {
+                Some(PendingTaskConfiguration {
+                    control_id,
+                    model,
+                    effort,
+                    permission_mode,
+                })
+            }
+            (None, None, None, None) => None,
+            _ => return Err(error(TaskEngineErrorCode::Storage)),
+        };
         let previous_checkpoint = self
             .store()
             .get_latest_task_checkpoint(task_id)
@@ -4207,9 +4340,10 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
         Ok(RuntimeTask {
             workspace,
             request: snapshot.contract.goal.clone(),
-            model,
-            effort,
-            permission_mode,
+            model: configuration.active_model,
+            effort: configuration.active_effort,
+            permission_mode: configuration.active_permission_mode,
+            effective_permission_mode: configuration.effective_permission_mode,
             context_id,
             next_objective,
             previous_checkpoint,
@@ -4230,7 +4364,7 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
             completed_tools,
             started_tools,
             provider_requests,
-            pending_configuration: None,
+            pending_configuration,
         })
     }
 }
@@ -4247,6 +4381,14 @@ fn validate_start(input: &StartTask) -> Result<(), TaskEngineError> {
         return Err(invalid_task());
     }
     Ok(())
+}
+
+const fn permission_strength(mode: PermissionMode) -> u8 {
+    match mode.profile() {
+        PermissionProfile::ReadOnly => 0,
+        PermissionProfile::Approval => 1,
+        PermissionProfile::FullAccess => 2,
+    }
 }
 
 async fn receive_control(

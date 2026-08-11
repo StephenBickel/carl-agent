@@ -53,8 +53,12 @@ fn acp_startup_options_parse_exactly() {
         carl::acp::PermissionMode::FullAccess
     );
     assert_eq!(
-        carl::acp::PermissionMode::from(AcpPermissionMode::BypassPermissions).profile(),
+        carl::acp::PermissionMode::from(AcpPermissionMode::FullAccess).profile(),
         carl::acp::PermissionProfile::FullAccess
+    );
+    assert!(
+        Cli::try_parse_from(["carl", "acp", "--permission-mode", "bypassPermissions"]).is_err(),
+        "the legacy wire value must not remain an advertised CLI choice"
     );
 }
 

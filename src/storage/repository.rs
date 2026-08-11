@@ -30,8 +30,8 @@ use crate::runtime::subscription::{
 };
 use crate::runtime::task::{
     CanonicalCheckpoint, CompletionContract, ContextPackage, EffectClass, EpochInterruptReason,
-    OperationEvidenceState, OperationStatus, TaskBudget, TaskEvent, TaskId, TaskSnapshot,
-    TaskStatus, reduce_task,
+    OperationEvidenceState, OperationStatus, TaskBudget, TaskControlKind, TaskEvent, TaskId,
+    TaskSnapshot, TaskStatus, reduce_task,
 };
 use crate::security::SecretFilter;
 use crate::sidecar::DataRootLock;
@@ -172,7 +172,10 @@ pub struct TaskControlMutationInput {
 pub enum TaskControlMutationClaim {
     Fresh,
     Pending,
-    Replay { result_json: String },
+    Replay {
+        result_json: String,
+        failure_code: Option<i64>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -332,6 +335,18 @@ pub struct TaskRecord {
     pub revision: u64,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaskConfigurationRecord {
+    pub active_model: ModelId,
+    pub active_effort: ReasoningEffort,
+    pub active_permission_mode: PermissionMode,
+    pub effective_permission_mode: PermissionMode,
+    pub pending_control_id: Option<String>,
+    pub pending_model: Option<ModelId>,
+    pub pending_effort: Option<ReasoningEffort>,
+    pub pending_permission_mode: Option<PermissionMode>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -781,9 +796,6 @@ impl Store {
             .busy_timeout(BUSY_TIMEOUT)
             .map_err(storage_error)?;
         connection
-            .pragma_update(None, "foreign_keys", "ON")
-            .map_err(storage_error)?;
-        connection
             .pragma_update(None, "secure_delete", "ON")
             .map_err(storage_error)?;
         connection
@@ -802,6 +814,19 @@ impl Store {
             });
         }
         schema::migrate(&mut connection)?;
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .map_err(storage_error)?;
+        if connection
+            .prepare("PRAGMA foreign_key_check")
+            .map_err(storage_error)?
+            .exists([])
+            .map_err(storage_error)?
+        {
+            return Err(storage_invariant(
+                "database contains a foreign key violation after migration",
+            ));
+        }
         validate_task_projection_completeness(&connection)?;
         validate_task_canonical_payloads(&connection)?;
         checkpoint_for_secure_deletion(&connection)?;
@@ -1435,7 +1460,7 @@ impl Store {
         }
         let existing = transaction
             .query_row(
-                "SELECT task_id, method, request_digest, state, result_json
+                "SELECT task_id, method, request_digest, state, result_json, failure_code
                  FROM task_control_receipts
                  WHERE external_session_id = ?1 AND idempotency_key = ?2",
                 params![input.external_session_id.as_str(), input.idempotency_key],
@@ -1446,22 +1471,27 @@ impl Store {
                         row.get::<_, String>(2)?,
                         row.get::<_, String>(3)?,
                         row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<i64>>(5)?,
                     ))
                 },
             )
             .optional()
             .map_err(storage_error)?;
-        if let Some((task_id, method, request_digest, state, result_json)) = existing {
+        if let Some((task_id, method, request_digest, state, result_json, failure_code)) = existing
+        {
             if task_id != input.task_id.to_string()
                 || method != input.method
                 || request_digest != input.request_digest.to_string()
             {
                 return Err(policy_error("task control idempotency key was rebound"));
             }
-            return match (state.as_str(), result_json) {
-                ("pending", None) => Ok(TaskControlMutationClaim::Pending),
-                ("completed", Some(result_json)) => {
-                    Ok(TaskControlMutationClaim::Replay { result_json })
+            return match (state.as_str(), result_json, failure_code) {
+                ("pending", None, None) => Ok(TaskControlMutationClaim::Pending),
+                ("completed", Some(result_json), failure_code) => {
+                    Ok(TaskControlMutationClaim::Replay {
+                        result_json,
+                        failure_code,
+                    })
                 }
                 _ => Err(storage_invariant("task control receipt state is invalid")),
             };
@@ -1557,6 +1587,52 @@ impl Store {
         }
         transaction.commit().map_err(storage_error)?;
         Ok(input.result_json)
+    }
+
+    pub fn fail_task_control_mutation(
+        &self,
+        input: TaskControlMutationInput,
+        failure_code: i64,
+    ) -> Result<(), CarlError> {
+        if failure_code != -32602 {
+            return Err(policy_error("task control failure code is invalid"));
+        }
+        let transaction = self
+            .connection
+            .unchecked_transaction()
+            .map_err(storage_error)?;
+        let current_revision = transaction
+            .query_row(
+                "SELECT revision FROM agent_tasks WHERE id = ?1",
+                [input.task_id.to_string()],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(storage_error)?
+            .ok_or_else(|| policy_error("task control task is unavailable"))?;
+        let changed = transaction
+            .execute(
+                "UPDATE task_control_receipts
+                 SET state = 'completed', applied_revision = ?6, result_json = ?7,
+                     completed_at = ?8, failure_code = ?9
+                 WHERE external_session_id = ?1 AND idempotency_key = ?2
+                   AND task_id = ?3 AND method = ?4 AND request_digest = ?5
+                   AND state = 'pending' AND starting_revision <= ?6",
+                params![
+                    input.external_session_id.as_str(),
+                    input.idempotency_key,
+                    input.task_id.to_string(),
+                    input.method,
+                    input.request_digest.to_string(),
+                    current_revision,
+                    input.result_json,
+                    format_timestamp(input.created_at),
+                    failure_code,
+                ],
+            )
+            .map_err(storage_error)?;
+        require_projection_change(changed, "task control failure was not durably recorded")?;
+        transaction.commit().map_err(storage_error)
     }
 
     pub fn create_remote_code(
@@ -2186,6 +2262,96 @@ impl Store {
 
     pub fn get_task(&self, task_id: TaskId) -> Result<Option<TaskRecord>, CarlError> {
         load_task_record(&self.connection, task_id)
+    }
+
+    pub fn get_task_configuration(
+        &self,
+        task_id: TaskId,
+    ) -> Result<Option<TaskConfigurationRecord>, CarlError> {
+        self.connection
+            .query_row(
+                "SELECT active_model, active_effort, active_permission_mode,
+                        effective_permission_mode, pending_control_id, pending_model,
+                        pending_effort, pending_permission_mode
+                 FROM task_configuration_state WHERE task_id = ?1",
+                [task_id.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, Option<String>>(7)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(storage_error)?
+            .map(
+                |(
+                    active_model,
+                    active_effort,
+                    active_permission_mode,
+                    effective_permission_mode,
+                    pending_control_id,
+                    pending_model,
+                    pending_effort,
+                    pending_permission_mode,
+                )| {
+                    Ok(TaskConfigurationRecord {
+                        active_model: ModelId::parse(active_model)?,
+                        active_effort: parse_reasoning_effort(&active_effort)?,
+                        active_permission_mode: active_permission_mode.parse().map_err(|_| {
+                            invalid_stored_value("task permission mode", &active_permission_mode)
+                        })?,
+                        effective_permission_mode: effective_permission_mode.parse().map_err(
+                            |_| {
+                                invalid_stored_value(
+                                    "effective task permission mode",
+                                    &effective_permission_mode,
+                                )
+                            },
+                        )?,
+                        pending_control_id,
+                        pending_model: pending_model.map(ModelId::parse).transpose()?,
+                        pending_effort: pending_effort
+                            .as_deref()
+                            .map(parse_reasoning_effort)
+                            .transpose()?,
+                        pending_permission_mode: pending_permission_mode
+                            .as_deref()
+                            .map(|mode| {
+                                mode.parse().map_err(|_| {
+                                    invalid_stored_value("pending task permission mode", mode)
+                                })
+                            })
+                            .transpose()?,
+                    })
+                },
+            )
+            .transpose()
+    }
+
+    pub fn task_has_control_marker(
+        &self,
+        task_id: TaskId,
+        control_id: &str,
+        kind: TaskControlKind,
+    ) -> Result<bool, CarlError> {
+        validate_task_control_id(control_id)?;
+        self.connection
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM task_control_markers
+                    WHERE task_id = ?1 AND control_id = ?2 AND kind = ?3
+                 )",
+                params![task_id.to_string(), control_id, task_control_kind_str(kind)],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(storage_error)
     }
 
     pub fn list_tasks_for_session(
@@ -6609,6 +6775,20 @@ fn insert_task_projection(
             ],
         )
         .map_err(storage_error)?;
+    transaction
+        .execute(
+            "INSERT INTO task_configuration_state (
+                task_id, active_model, active_effort, active_permission_mode,
+                effective_permission_mode
+             ) VALUES (?1, ?2, ?3, ?4, ?4)",
+            params![
+                snapshot.task_id.to_string(),
+                model.as_str(),
+                effort.as_codex_value(),
+                permission_mode.as_wire_str(),
+            ],
+        )
+        .map_err(storage_error)?;
     Ok(())
 }
 
@@ -6710,6 +6890,19 @@ fn apply_task_child_projection(
             require_projection_change(changed, "active task epoch projection is missing")?;
         }
         TaskEvent::EpochInterrupted { epoch_id, reason } => {
+            let changed = transaction
+                .execute(
+                    "UPDATE task_epochs
+                     SET status = 'interrupted', finished_sequence = ?3,
+                         report_digest = NULL, updated_at = ?4
+                     WHERE id = ?1 AND task_id = ?2 AND status = 'active'",
+                    params![epoch_id.to_string(), task_id, event_sequence, timestamp],
+                )
+                .map_err(storage_error)?;
+            require_projection_change(
+                changed,
+                "active interrupted task epoch projection is missing",
+            )?;
             transaction
                 .execute(
                     "INSERT INTO task_epoch_interruptions (
@@ -6719,6 +6912,84 @@ fn apply_task_child_projection(
                         task_id,
                         epoch_id.to_string(),
                         epoch_interrupt_reason_str(*reason),
+                        event_sequence,
+                        timestamp,
+                    ],
+                )
+                .map_err(storage_error)?;
+        }
+        TaskEvent::ConfigurationQueued {
+            control_id,
+            model,
+            effort,
+            permission_mode,
+        } => {
+            let effective = transaction
+                .query_row(
+                    "SELECT effective_permission_mode FROM task_configuration_state
+                     WHERE task_id = ?1",
+                    [&task_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .map_err(storage_error)?;
+            let effective_mode = effective
+                .parse::<PermissionMode>()
+                .map_err(|_| invalid_stored_value("effective task permission mode", &effective))?;
+            let effective_mode =
+                if permission_strength(*permission_mode) < permission_strength(effective_mode) {
+                    *permission_mode
+                } else {
+                    effective_mode
+                };
+            let changed = transaction
+                .execute(
+                    "UPDATE task_configuration_state
+                     SET pending_control_id = ?2, pending_model = ?3,
+                         pending_effort = ?4, pending_permission_mode = ?5,
+                         effective_permission_mode = ?6, queued_sequence = ?7
+                     WHERE task_id = ?1",
+                    params![
+                        task_id,
+                        control_id,
+                        model.as_str(),
+                        effort.as_codex_value(),
+                        permission_mode.as_wire_str(),
+                        effective_mode.as_wire_str(),
+                        event_sequence,
+                    ],
+                )
+                .map_err(storage_error)?;
+            require_projection_change(changed, "task configuration projection is missing")?;
+        }
+        TaskEvent::ConfigurationApplied { control_id } => {
+            let changed = transaction
+                .execute(
+                    "UPDATE task_configuration_state
+                     SET active_model = pending_model, active_effort = pending_effort,
+                         active_permission_mode = pending_permission_mode,
+                         effective_permission_mode = pending_permission_mode,
+                         pending_control_id = NULL, pending_model = NULL,
+                         pending_effort = NULL, pending_permission_mode = NULL,
+                         queued_sequence = NULL, applied_sequence = ?3
+                     WHERE task_id = ?1 AND pending_control_id = ?2",
+                    params![task_id, control_id, event_sequence],
+                )
+                .map_err(storage_error)?;
+            require_projection_change(
+                changed,
+                "queued task configuration control identity is missing",
+            )?;
+        }
+        TaskEvent::ControlRequested { control_id, kind } => {
+            transaction
+                .execute(
+                    "INSERT INTO task_control_markers (
+                        task_id, control_id, kind, event_sequence, created_at
+                     ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        task_id,
+                        control_id,
+                        task_control_kind_str(*kind),
                         event_sequence,
                         timestamp,
                     ],
@@ -7214,6 +7485,33 @@ const fn task_status_str(status: TaskStatus) -> &'static str {
 const fn epoch_interrupt_reason_str(reason: EpochInterruptReason) -> &'static str {
     match reason {
         EpochInterruptReason::PermissionTightening => "permission_tightening",
+    }
+}
+
+const fn task_control_kind_str(kind: TaskControlKind) -> &'static str {
+    match kind {
+        TaskControlKind::Resume => "resume",
+        TaskControlKind::Cancel => "cancel",
+    }
+}
+
+fn validate_task_control_id(control_id: &str) -> Result<(), CarlError> {
+    if control_id.len() == 64
+        && control_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        Ok(())
+    } else {
+        Err(policy_error("task control ID is invalid"))
+    }
+}
+
+const fn permission_strength(mode: PermissionMode) -> u8 {
+    match mode.profile() {
+        crate::acp::PermissionProfile::ReadOnly => 0,
+        crate::acp::PermissionProfile::Approval => 1,
+        crate::acp::PermissionProfile::FullAccess => 2,
     }
 }
 

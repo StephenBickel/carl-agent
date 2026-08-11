@@ -60,6 +60,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "trusted frontend owners",
         sql: include_str!("../../migrations/0009_trusted_frontend_owners.sql"),
     },
+    Migration {
+        version: 10,
+        name: "durable task controls",
+        sql: include_str!("../../migrations/0010_durable_task_controls.sql"),
+    },
 ];
 
 pub(crate) fn migrate(connection: &mut Connection) -> Result<(), CarlError> {

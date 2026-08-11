@@ -427,6 +427,13 @@ pub enum EpochInterruptReason {
     PermissionTightening,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskControlKind {
+    Resume,
+    Cancel,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "evidence_kind", rename_all = "snake_case")]
 pub enum NormalizedOperationEvidence {
@@ -836,6 +843,22 @@ pub enum TaskEvent {
         epoch_id: EpochId,
         reason: EpochInterruptReason,
     },
+    ConfigurationQueued {
+        #[serde(deserialize_with = "deserialize_control_id")]
+        control_id: String,
+        model: ModelId,
+        effort: ReasoningEffort,
+        permission_mode: PermissionMode,
+    },
+    ConfigurationApplied {
+        #[serde(deserialize_with = "deserialize_control_id")]
+        control_id: String,
+    },
+    ControlRequested {
+        #[serde(deserialize_with = "deserialize_control_id")]
+        control_id: String,
+        kind: TaskControlKind,
+    },
     ProviderRequestRecorded {
         epoch_id: EpochId,
         purpose: ProviderRequestPurpose,
@@ -969,6 +992,9 @@ impl TaskEvent {
             Self::ProviderRequestRecorded { request_digest, .. } => {
                 validate_event_identifier(request_digest)
             }
+            Self::ConfigurationQueued { control_id, .. }
+            | Self::ConfigurationApplied { control_id }
+            | Self::ControlRequested { control_id, .. } => validate_control_id(control_id),
             Self::ProviderEpochBound {
                 provider_epoch_id, ..
             } => validate_event_identifier(provider_epoch_id),
@@ -1055,6 +1081,25 @@ fn is_lowercase_sha256(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn validate_control_id(value: &str) -> Result<(), TaskValidationError> {
+    if is_lowercase_sha256(value) {
+        Ok(())
+    } else {
+        Err(TaskValidationError::from_code(
+            TaskValidationErrorCode::EmptyEventField,
+        ))
+    }
+}
+
+fn deserialize_control_id<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    validate_control_id(&value).map_err(|_| D::Error::custom("invalid task control identifier"))?;
+    Ok(value)
 }
 
 fn validate_event_text(value: &str) -> Result<(), TaskValidationError> {

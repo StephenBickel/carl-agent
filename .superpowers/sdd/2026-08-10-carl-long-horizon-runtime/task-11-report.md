@@ -115,3 +115,97 @@ this task deliberately did not run it.
 
 No known Task 11 correctness or integration gap remains. The branch is intentionally
 left for the root agent's clean review and one reserved all-features test run.
+
+## Fix Round 1/5
+
+### Findings fixed
+
+- Autonomous task configuration is now journal-owned. `ConfigurationQueued` records
+  the exact control identity, model, effort, and permission; its projection keeps
+  active, pending, and immediately effective permission state separately.
+  `ConfigurationApplied` is appended at the safe epoch boundary before the next
+  provider dispatch. Rehydration restores all of that state exactly, so an immediate
+  tightening ceiling survives every interruption/restart cut while model, effort,
+  and permission loosening remain deferred.
+- Every active steering, cancellation, and configuration control now carries its
+  exact task identity through the kernel channel into `TaskEngine::apply_control`.
+  Both the durable actor and engine reject a request for queued task B while task A
+  is executing, before provider interruption or a B control marker can occur.
+- Resume and cancel have durable `ControlRequested` markers tied to their receipt
+  identities. A pending receipt can be reconstructed after a real engine/store
+  restart when the action committed but receipt completion failed, without another
+  provider start or interrupt. Deterministic invalid-input outcomes are completed
+  durably with the receipt and replay the same rejection instead of leaking a
+  permanently pending reservation.
+- Interrupted epochs are projected truthfully as `interrupted`, with their exact
+  finishing event sequence and no provider report digest. Migration 10 also
+  backfills pre-existing v9 interruption rows rather than carrying their obsolete
+  `active` epoch status forward.
+- The legacy `bypassPermissions` value remains readable for stored/wire
+  compatibility but is no longer exposed as a normal `--permission-mode` CLI value.
+  Full access remains available only through the canonical explicit route.
+
+### RED / GREEN evidence
+
+1. The first durable-configuration storage regression failed to compile because
+   configuration events, their projection, and exact rehydration APIs did not
+   exist. It now proves queued model `gpt-5.6-codex`, `ultra` effort, and `plan`
+   permission survive reopen, then apply atomically and clear the pending state.
+2. The CLI regression initially parsed
+   `--permission-mode bypassPermissions`; after removing that Clap variant, the
+   exact command is rejected while canonical `fullAccess` still parses.
+3. Four configuration interruption cuts now restart from durable state: after the
+   configuration append, before provider interrupt confirmation, after confirmation,
+   and before the next epoch dispatch. Every row starts the next provider epoch in
+   the exact tightened configuration and authorizes no intervening effect.
+4. The busy-task Buzz regression proves both `_task/cancel` and `_task/steer` for
+   queued task B return `-32602` while A is executing, with zero provider interrupts
+   and zero B control markers.
+5. SQLite completion-failure triggers first proved same-process action recovery for
+   resume and cancel. The final table-driven regression performs the real action,
+   forces receipt completion to fail, drops both engine and store, opens fresh
+   instances, and proves retry completes the pending receipt with zero duplicate
+   starts or interrupts.
+6. The literal v9 migration regression initially observed a NULL
+   `finished_sequence` for an existing interruption. Migration 10 now produces
+   `status = interrupted`, the exact interruption sequence, and a NULL report
+   digest.
+
+### Verification
+
+```text
+cargo test --locked --test storage_contract --test acp_storage_contract \
+  --test task_storage_contract --test acp_server_contract \
+  --test acp_protocol_contract --test acp_cli_contract --test cli_contract \
+  --test buzz_adapter_contract --test buzz_acp_contract \
+  --test buzz_end_to_end --test memory_contract
+PASS: 86 passed, 0 failed
+
+cargo test --locked --test epoch_engine_contract
+PASS: 81 passed, 0 failed
+
+cargo clippy --locked --all-targets --all-features -- -D warnings
+PASS: exit 0, no warnings
+
+cargo fmt --all -- --check
+PASS: exit 0
+
+git diff --check
+PASS: exit 0
+```
+
+The required full `cargo test --all-features` milestone remains reserved for the
+root agent after clean review and was not run in this fix round.
+
+### Fix-round self-review
+
+- Configuration events and projections commit in the same SQLite transaction;
+  acknowledgement follows that commit. Tightening changes only the immediate
+  authority ceiling until the complete configuration is promoted at a boundary.
+- Receipt markers record intent before provider action. Terminal task state plus
+  the exact marker distinguishes committed-action recovery from an unrelated
+  terminal request, while receipt rebinding checks remain unchanged.
+- Foreign keys are enabled and checked immediately after migration 10 rebuilds the
+  epoch table. Migrations 1–9 and `SECURITY.md` remain byte-for-byte unchanged.
+- No task-control path holds the admission-store mutex across an async provider or
+  engine operation. No Important or Critical finding remains open from this round.

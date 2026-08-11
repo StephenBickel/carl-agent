@@ -16,6 +16,7 @@ use carl::runtime::task::{ClauseStatus, CompletionClause, CompletionContract, Ta
 use carl::sidecar::DataRootLock;
 use carl::storage::{NewTask, RuntimeStore, Store};
 use chrono::Utc;
+use rusqlite::Connection;
 use serde_json::{Value, json};
 use tokio::io::{AsyncWriteExt, BufReader, DuplexStream, ReadHalf, WriteHalf};
 use uuid::Uuid;
@@ -258,12 +259,9 @@ async fn steering_and_idless_cancellation_remain_responsive_during_prompt() -> T
 #[tokio::test(flavor = "current_thread")]
 async fn task_resume_executes_a_bound_queued_task_and_returns_its_result() -> TestResult {
     let layout = Layout::new()?;
-    let kernel = Kernel::start_with_ports(
-        layout.runtime()?,
-        Box::new(FakePort::autonomous_completion()?),
-        None,
-    )
-    .await?;
+    let port = FakePort::autonomous_completion()?;
+    let port_state = Arc::clone(&port.state);
+    let kernel = Kernel::start_with_ports(layout.runtime()?, Box::new(port), None).await?;
     let mut client = Client::start(AcpServer::new(kernel, Frontend::Acp)).await;
     client
         .send(json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":2,"clientInfo":{"name":"contract","version":"1"}}}))
@@ -305,14 +303,26 @@ async fn task_resume_executes_a_bound_queued_task_and_returns_its_result() -> Te
     })?;
     drop(store);
 
-    client
-        .send(
-            json!({"jsonrpc":"2.0","id":3,"method":"_task/resume","params":{
-                "sessionId":session_id,"taskId":task.snapshot.task_id.to_string(),
-                "idempotencyKey":"resume-success"
-            }}),
-        )
-        .await?;
+    Connection::open(layout.root.join("carl.sqlite3"))?.execute_batch(
+        "CREATE TRIGGER fail_resume_receipt_completion
+         BEFORE UPDATE OF state ON task_control_receipts
+         WHEN NEW.state = 'completed' AND NEW.method = 'resume'
+         BEGIN SELECT RAISE(ABORT, 'injected crash before resume receipt completion'); END;",
+    )?;
+
+    let mut request = json!({"jsonrpc":"2.0","id":3,"method":"_task/resume","params":{
+        "sessionId":session_id,"taskId":task.snapshot.task_id.to_string(),
+        "idempotencyKey":"resume-success"
+    }});
+    client.send(request.clone()).await?;
+    let interrupted = client.read().await?;
+    assert_eq!(interrupted.value()["error"]["code"], -32602);
+    assert_eq!(port_state.lock().unwrap().starts, 1);
+    Connection::open(layout.root.join("carl.sqlite3"))?
+        .execute_batch("DROP TRIGGER fail_resume_receipt_completion;")?;
+
+    request["id"] = json!(4);
+    client.send(request).await?;
     let resumed = client.read().await?;
     assert_eq!(
         resumed.value()["result"]["outcome"],
@@ -320,6 +330,7 @@ async fn task_resume_executes_a_bound_queued_task_and_returns_its_result() -> Te
         "{}",
         resumed.value(),
     );
+    assert_eq!(port_state.lock().unwrap().starts, 1);
     client.finish().await?;
     Ok(())
 }

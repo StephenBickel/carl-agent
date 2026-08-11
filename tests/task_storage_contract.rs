@@ -9,7 +9,7 @@ use carl::policy::{Frontend, Sha256Digest};
 use carl::runtime::task::{
     CheckpointId, ClauseStatus, CompletionClause, CompletionContract, ContextPackageId,
     EffectClass, EpochId, EpochInterruptReason, OperationId, OperationStatus, TaskBudget,
-    TaskEvent, TaskSnapshot, TaskStatus, reduce_task,
+    TaskControlKind, TaskEvent, TaskSnapshot, TaskStatus, reduce_task,
 };
 use carl::sidecar::DataRootLock;
 use carl::storage::{
@@ -87,6 +87,107 @@ fn permission_tightening_interrupts_an_epoch_without_provider_report_evidence()
     )?;
     assert_eq!(projection.0, "permission_tightening");
     assert!(projection.1 > 0);
+    let epoch_projection = connection.query_row(
+        "SELECT status, finished_sequence, report_digest FROM task_epochs
+         WHERE task_id = ?1 AND id = ?2",
+        [task_id.to_string(), epoch_id.to_string()],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<i64>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        },
+    )?;
+    assert_eq!(epoch_projection.0, "interrupted");
+    assert!(epoch_projection.1.is_some());
+    assert_eq!(epoch_projection.2, None);
+    Ok(())
+}
+
+#[test]
+fn queued_configuration_and_receipt_control_markers_survive_reopen() -> Result<(), Box<dyn Error>> {
+    let fixture = TemporaryTaskDatabase::new()?;
+    let mut store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let created = store.create_task(new_task(session.id, &fixture.workspace))?;
+    let task_id = created.snapshot.task_id;
+    let configuration_control = "a".repeat(64);
+    let resume_control = "b".repeat(64);
+    let queued = store
+        .append_task_event(
+            task_id,
+            created.revision,
+            TaskEvent::ConfigurationQueued {
+                control_id: configuration_control.clone(),
+                model: ModelId::parse("gpt-5.6-codex")?,
+                effort: ReasoningEffort::Ultra,
+                permission_mode: PermissionMode::Plan,
+            },
+            timestamp(1),
+        )?
+        .expect("configuration queue revision matches");
+    let marked = store
+        .append_task_event(
+            task_id,
+            queued.revision,
+            TaskEvent::ControlRequested {
+                control_id: resume_control.clone(),
+                kind: TaskControlKind::Resume,
+            },
+            timestamp(2),
+        )?
+        .expect("control marker revision matches");
+    drop(store);
+
+    let mut reopened = Store::open(&fixture.database)?;
+    let configuration = reopened
+        .get_task_configuration(task_id)?
+        .ok_or("task configuration projection missing")?;
+    assert_eq!(
+        configuration.pending_control_id.as_deref(),
+        Some(configuration_control.as_str())
+    );
+    assert_eq!(
+        configuration.pending_model.as_ref().map(ModelId::as_str),
+        Some("gpt-5.6-codex")
+    );
+    assert_eq!(configuration.pending_effort, Some(ReasoningEffort::Ultra));
+    assert_eq!(
+        configuration.pending_permission_mode,
+        Some(PermissionMode::Plan)
+    );
+    assert_eq!(
+        configuration.effective_permission_mode,
+        PermissionMode::Plan
+    );
+    assert!(reopened.task_has_control_marker(task_id, &resume_control, TaskControlKind::Resume)?);
+
+    let applied = reopened
+        .append_task_event(
+            task_id,
+            marked.revision,
+            TaskEvent::ConfigurationApplied {
+                control_id: configuration_control,
+            },
+            timestamp(3),
+        )?
+        .expect("configuration application revision matches");
+    let configuration = reopened
+        .get_task_configuration(task_id)?
+        .ok_or("task configuration projection missing after apply")?;
+    assert_eq!(configuration.active_model.as_str(), "gpt-5.6-codex");
+    assert_eq!(configuration.active_effort, ReasoningEffort::Ultra);
+    assert_eq!(configuration.active_permission_mode, PermissionMode::Plan);
+    assert_eq!(
+        configuration.effective_permission_mode,
+        PermissionMode::Plan
+    );
+    assert!(configuration.pending_control_id.is_none());
+    assert_eq!(
+        applied.snapshot,
+        replay(&reopened.read_task_events(task_id)?)?
+    );
     Ok(())
 }
 
@@ -253,6 +354,7 @@ fn task_control_receipts_survive_both_crash_windows_without_key_rebinding()
         store.claim_task_control_mutation(input.clone())?,
         TaskControlMutationClaim::Replay {
             result_json: completed,
+            failure_code: None,
         }
     );
     assert!(
@@ -263,6 +365,51 @@ fn task_control_receipts_survive_both_crash_windows_without_key_rebinding()
             })
             .is_err(),
         "method or payload reuse must never rebind an idempotency key"
+    );
+    Ok(())
+}
+
+#[test]
+fn deterministic_task_control_failure_is_completed_and_replayed() -> Result<(), Box<dyn Error>> {
+    let fixture = TemporaryTaskDatabase::new()?;
+    let mut store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let external_session_id = ExternalSessionId::try_from("failed-task-control-session")?;
+    store.bind_frontend_session(NewFrontendSession {
+        frontend: Frontend::Acp,
+        external_session_id: external_session_id.clone(),
+        session_id: session.id,
+        cwd: fs::canonicalize(&fixture.workspace)?,
+        protocol_version: 2,
+        client_name: ClientName::try_from("failed-task-control-test")?,
+        permission_mode: PermissionMode::Default,
+        channel_id: None,
+        created_at: timestamp(0),
+    })?;
+    let task_id = store
+        .create_task(new_task(session.id, &fixture.workspace))?
+        .snapshot
+        .task_id;
+    let input = TaskControlMutationInput {
+        external_session_id,
+        idempotency_key: "terminal-resume".to_owned(),
+        task_id,
+        method: "resume".to_owned(),
+        request_digest: Sha256Digest::parse("c".repeat(64))?,
+        result_json: format!(r#"{{"outcome":"rejected","taskId":"{task_id}"}}"#),
+        created_at: timestamp(1),
+    };
+    assert_eq!(
+        store.claim_task_control_mutation(input.clone())?,
+        TaskControlMutationClaim::Fresh
+    );
+    store.fail_task_control_mutation(input.clone(), -32602)?;
+    assert_eq!(
+        store.claim_task_control_mutation(input.clone())?,
+        TaskControlMutationClaim::Replay {
+            result_json: input.result_json,
+            failure_code: Some(-32602),
+        }
     );
     Ok(())
 }

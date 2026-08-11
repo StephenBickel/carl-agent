@@ -206,6 +206,9 @@ pub fn reduce_task(
             }
             state.active_epoch = None;
         }
+        TaskEvent::ConfigurationQueued { .. }
+        | TaskEvent::ConfigurationApplied { .. }
+        | TaskEvent::ControlRequested { .. } => {}
         TaskEvent::OperationIntentRecorded {
             operation_id,
             epoch_id,

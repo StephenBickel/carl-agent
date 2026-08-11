@@ -202,8 +202,6 @@ pub enum AcpPermissionMode {
     DontAsk,
     #[value(name = "fullAccess")]
     FullAccess,
-    #[value(name = "bypassPermissions")]
-    BypassPermissions,
 }
 
 impl From<AcpPermissionMode> for PermissionMode {
@@ -214,7 +212,6 @@ impl From<AcpPermissionMode> for PermissionMode {
             AcpPermissionMode::AcceptEdits => Self::AcceptEdits,
             AcpPermissionMode::DontAsk => Self::DontAsk,
             AcpPermissionMode::FullAccess => Self::FullAccess,
-            AcpPermissionMode::BypassPermissions => Self::BypassPermissions,
         }
     }
 }

@@ -9,7 +9,7 @@ use std::time::Duration;
 use carl::acp::PermissionMode;
 use carl::delegates::{ModelId, ReasoningEffort};
 use carl::events::SessionId;
-use carl::policy::Sha256Digest;
+use carl::policy::{Frontend, Sha256Digest};
 use carl::runtime::agent_port::{
     AgentCapabilities, AgentContextId, AgentEffectKind, AgentEffectRequest, AgentEpochId,
     AgentErrorProvenance, AgentEvent, AgentFuture, AgentItem, AgentModel, AgentPort,
@@ -27,7 +27,10 @@ use carl::runtime::task::{
     parse_epoch_report, recovery_attempt_fingerprint, reduce_task,
 };
 use carl::sidecar::DataRootLock;
-use carl::storage::{NewTask, RuntimeStore, Store};
+use carl::storage::{
+    ClientName, ExternalSessionId, NewFrontendSession, NewTask, RuntimeStore, Store,
+    TaskControlMutationClaim, TaskControlMutationInput,
+};
 use rusqlite::Connection;
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -3713,6 +3716,282 @@ async fn legacy_postcondition_digest_never_reconciles_an_uncertain_file_mutation
     assert!(state.epoch_starts.is_empty());
     drop(state);
     assert_task_projection_matches_replay(restarted.store(), task_id, "legacy digest recovery")?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn queued_permission_tightening_survives_each_interrupt_restart_cut() -> TestResult {
+    for (cut, close_interrupted_epoch) in [
+        ("after configuration event append", false),
+        ("before provider interrupt confirmation", false),
+        ("after provider interrupt confirmation", false),
+        ("before next epoch dispatch", true),
+    ] {
+        let fixture = EngineFixture::new()?;
+        let mut store = Store::open(&fixture.database)?;
+        let session = store.create_session()?;
+        let created = store.create_task(NewTask {
+            session_id: session.id,
+            workspace: fixture.workspace.clone(),
+            contract: CompletionContract {
+                version: 1,
+                goal: "Resume under the durable authorization ceiling".to_owned(),
+                constraints: Vec::new(),
+                clauses: Vec::new(),
+            },
+            model: ModelId::parse("gpt-5.6-codex")?,
+            effort: ReasoningEffort::High,
+            permission_mode: PermissionMode::FullAccess,
+            budget: TaskBudget::default(),
+            created_at: chrono::Utc::now(),
+        })?;
+        let task_id = created.snapshot.task_id;
+        let epoch_id = EpochId::new();
+        let mut revision = created.revision;
+        for event in [
+            carl::runtime::task::TaskEvent::StateTransitioned {
+                from: TaskStatus::Queued,
+                to: TaskStatus::Active,
+                reason: "execution started".to_owned(),
+            },
+            carl::runtime::task::TaskEvent::ProviderContextBound {
+                context_id: "engine-context".to_owned(),
+            },
+            carl::runtime::task::TaskEvent::EpochStarted {
+                epoch_id,
+                objective: "work under full access".to_owned(),
+            },
+            carl::runtime::task::TaskEvent::ConfigurationQueued {
+                control_id: "a".repeat(64),
+                model: ModelId::parse("gpt-5.6-codex")?,
+                effort: ReasoningEffort::Ultra,
+                permission_mode: PermissionMode::Plan,
+            },
+        ] {
+            revision = store
+                .append_task_event(task_id, revision, event, chrono::Utc::now())?
+                .unwrap_or_else(|| panic!("{cut}: event revision matches"))
+                .revision;
+        }
+        if close_interrupted_epoch {
+            store
+                .append_task_event(
+                    task_id,
+                    revision,
+                    carl::runtime::task::TaskEvent::EpochInterrupted {
+                        epoch_id,
+                        reason: carl::runtime::task::EpochInterruptReason::PermissionTightening,
+                    },
+                    chrono::Utc::now(),
+                )?
+                .unwrap_or_else(|| panic!("{cut}: interruption revision matches"));
+        }
+        drop(store);
+
+        let runtime =
+            RuntimeStore::open(DataRootLock::acquire(&fixture.root)?, chrono::Utc::now())?;
+        let port = EnginePort::resume_small_edit();
+        let shared = port.shared();
+        let mut restarted = TaskEngine::new_runtime(runtime, port);
+        let _ = restarted.run(task_id).await;
+        let state = shared.lock().unwrap();
+        let dispatched = state
+            .epoch_starts
+            .last()
+            .unwrap_or_else(|| panic!("{cut}: a replacement work epoch starts"));
+        assert_eq!(dispatched.permission_mode, PermissionMode::Plan, "{cut}");
+        assert_eq!(dispatched.effort, ReasoningEffort::Ultra, "{cut}");
+        assert_eq!(state.durable_effect_count, 0, "{cut}");
+        drop(state);
+        let configuration = restarted
+            .store()
+            .get_task_configuration(task_id)?
+            .expect("configuration remains projected");
+        assert_eq!(
+            configuration.active_permission_mode,
+            PermissionMode::Plan,
+            "{cut}"
+        );
+        assert_eq!(
+            configuration.effective_permission_mode,
+            PermissionMode::Plan,
+            "{cut}"
+        );
+        assert!(configuration.pending_control_id.is_none(), "{cut}");
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cancel_and_resume_receipts_recover_after_engine_restart_without_duplicate_actions()
+-> TestResult {
+    for method in ["resume", "cancel"] {
+        let fixture = EngineFixture::new()?;
+        let mut store = Store::open(&fixture.database)?;
+        let session = store.create_session()?;
+        let external_session_id = ExternalSessionId::try_from(format!("{method}-restart-session"))?;
+        store.bind_frontend_session(NewFrontendSession {
+            frontend: Frontend::Acp,
+            external_session_id: external_session_id.clone(),
+            session_id: session.id,
+            cwd: fs::canonicalize(&fixture.workspace)?,
+            protocol_version: 2,
+            client_name: ClientName::try_from("receipt-restart-test")?,
+            permission_mode: PermissionMode::FullAccess,
+            channel_id: None,
+            created_at: chrono::Utc::now(),
+        })?;
+        let created = store.create_task(NewTask {
+            session_id: session.id,
+            workspace: fixture.workspace.clone(),
+            contract: CompletionContract {
+                version: 1,
+                goal: "Complete one receipt-scoped action".to_owned(),
+                constraints: Vec::new(),
+                clauses: vec![
+                    CompletionClause {
+                        id: "requested-outcome".to_owned(),
+                        description: "Complete the action".to_owned(),
+                        required: true,
+                        status: ClauseStatus::Pending,
+                        evidence: Vec::new(),
+                    },
+                    CompletionClause {
+                        id: "explicit-verification".to_owned(),
+                        description: "Verify the action".to_owned(),
+                        required: true,
+                        status: ClauseStatus::Pending,
+                        evidence: Vec::new(),
+                    },
+                ],
+            },
+            model: ModelId::parse("gpt-5.6-codex")?,
+            effort: ReasoningEffort::High,
+            permission_mode: PermissionMode::FullAccess,
+            budget: TaskBudget::default(),
+            created_at: chrono::Utc::now(),
+        })?;
+        let task_id = created.snapshot.task_id;
+        let control_id = if method == "resume" {
+            "d".repeat(64)
+        } else {
+            "e".repeat(64)
+        };
+        let receipt = TaskControlMutationInput {
+            external_session_id,
+            idempotency_key: format!("{method}-restart-key"),
+            task_id,
+            method: method.to_owned(),
+            request_digest: Sha256Digest::parse("f".repeat(64))?,
+            result_json: format!(r#"{{"outcome":"accepted","taskId":"{task_id}"}}"#),
+            created_at: chrono::Utc::now(),
+        };
+        assert_eq!(
+            store.claim_task_control_mutation(receipt.clone())?,
+            TaskControlMutationClaim::Fresh
+        );
+        let mut revision = created.revision;
+        if method == "cancel" {
+            let epoch_id = EpochId::new();
+            for event in [
+                carl::runtime::task::TaskEvent::StateTransitioned {
+                    from: TaskStatus::Queued,
+                    to: TaskStatus::Active,
+                    reason: "prepare cancellation".to_owned(),
+                },
+                carl::runtime::task::TaskEvent::ProviderContextBound {
+                    context_id: "engine-context".to_owned(),
+                },
+                carl::runtime::task::TaskEvent::EpochStarted {
+                    epoch_id,
+                    objective: "cancel this active epoch".to_owned(),
+                },
+                carl::runtime::task::TaskEvent::ProviderEpochBound {
+                    epoch_id,
+                    provider_epoch_id: "engine-epoch-1".to_owned(),
+                },
+            ] {
+                revision = store
+                    .append_task_event(task_id, revision, event, chrono::Utc::now())?
+                    .expect("cancel setup revision matches")
+                    .revision;
+            }
+        }
+        store
+            .append_task_event(
+                task_id,
+                revision,
+                carl::runtime::task::TaskEvent::ControlRequested {
+                    control_id: control_id.clone(),
+                    kind: if method == "resume" {
+                        carl::runtime::task::TaskControlKind::Resume
+                    } else {
+                        carl::runtime::task::TaskControlKind::Cancel
+                    },
+                },
+                chrono::Utc::now(),
+            )?
+            .expect("control marker revision matches");
+
+        let first_port = if method == "resume" {
+            EnginePort::small_edit()
+        } else {
+            EnginePort::resume_small_edit()
+        };
+        let first_state = first_port.shared();
+        let mut first = TaskEngine::new(store, first_port);
+        if method == "resume" {
+            assert_eq!(first.run(task_id).await?.status, TaskStatus::Completed);
+            assert_eq!(first_state.lock().unwrap().epoch_starts.len(), 1);
+        } else {
+            first.cancel(task_id).await?;
+            assert_eq!(first_state.lock().unwrap().interrupts, 1);
+        }
+        Connection::open(&fixture.database)?.execute_batch(&format!(
+            "CREATE TRIGGER fail_{method}_receipt_completion
+             BEFORE UPDATE OF state ON task_control_receipts
+             WHEN NEW.state = 'completed' AND NEW.method = '{method}'
+             BEGIN SELECT RAISE(ABORT, 'injected receipt completion crash'); END;"
+        ))?;
+        assert!(
+            first
+                .store()
+                .complete_task_control_mutation(receipt.clone())
+                .is_err(),
+            "{method}: completion crash is injected after the action"
+        );
+        let (store, _) = first.into_parts();
+        drop(store);
+
+        Connection::open(&fixture.database)?
+            .execute_batch(&format!("DROP TRIGGER fail_{method}_receipt_completion;"))?;
+        let reopened = Store::open(&fixture.database)?;
+        assert_eq!(
+            reopened.claim_task_control_mutation(receipt.clone())?,
+            TaskControlMutationClaim::Pending,
+            "{method}: receipt remains pending across restart"
+        );
+        let restart_port = EnginePort::new([]);
+        let restart_state = restart_port.shared();
+        let mut restarted = TaskEngine::new(reopened, restart_port);
+        if method == "resume" {
+            assert_eq!(restarted.run(task_id).await?.status, TaskStatus::Completed);
+            assert!(restart_state.lock().unwrap().epoch_starts.is_empty());
+        } else {
+            restarted.cancel(task_id).await?;
+            assert_eq!(restart_state.lock().unwrap().interrupts, 0);
+        }
+        let completed = restarted
+            .store()
+            .complete_task_control_mutation(receipt.clone())?;
+        assert_eq!(
+            restarted.store().claim_task_control_mutation(receipt)?,
+            TaskControlMutationClaim::Replay {
+                result_json: completed,
+                failure_code: None,
+            }
+        );
+    }
     Ok(())
 }
 

@@ -13,9 +13,9 @@ use uuid::Uuid;
 
 use super::{
     BuzzContext, BuzzPublisher, BuzzPublisherConfig, ConfigOutcome, ConfigSelection, IncomingFrame,
-    JsonRpcId, KernelError, KernelHandle, KernelUpdate, OutgoingFrame, PermissionMode, Prompt,
-    PromptStopReason, SessionConfiguration, ToolKind, ToolStatus, config_options, read_frame,
-    write_frame,
+    JsonRpcId, KernelError, KernelErrorCode, KernelHandle, KernelUpdate, OutgoingFrame,
+    PermissionMode, Prompt, PromptStopReason, SessionConfiguration, ToolKind, ToolStatus,
+    config_options, read_frame, write_frame,
 };
 use crate::delegates::{ModelId, ReasoningEffort};
 use crate::events::SessionId;
@@ -556,25 +556,39 @@ impl AcpServer {
             .await
             .map_err(map_kernel)?;
         match claim {
-            TaskControlMutationClaim::Replay { result_json } => {
-                serde_json::from_str(&result_json).map_err(|_| invalid_input())
+            TaskControlMutationClaim::Replay {
+                result_json,
+                failure_code,
+            } => {
+                if failure_code.is_some() {
+                    Err(invalid_input())
+                } else {
+                    serde_json::from_str(&result_json).map_err(|_| invalid_input())
+                }
             }
-            TaskControlMutationClaim::Fresh | TaskControlMutationClaim::Pending => {
-                if current.status.is_terminal() {
+            claim @ (TaskControlMutationClaim::Fresh | TaskControlMutationClaim::Pending) => {
+                if matches!(claim, TaskControlMutationClaim::Fresh) && current.status.is_terminal()
+                {
+                    let mut failure = mutation;
+                    failure.result_json =
+                        format!(r#"{{"outcome":"rejected","taskId":"{task_id}"}}"#);
+                    failure.created_at = Utc::now();
+                    self.kernel
+                        .fail_task_mutation(failure)
+                        .await
+                        .map_err(map_kernel)?;
                     return Err(invalid_input());
                 }
-                match method {
-                    "resume" => {
-                        self.kernel
-                            .task_resume(binding.local_id, task_id)
-                            .await
-                            .map_err(map_kernel)?;
-                    }
+                let action = match method {
+                    "resume" => self
+                        .kernel
+                        .task_resume(binding.local_id, task_id, control_id)
+                        .await
+                        .map(|_| ()),
                     "cancel" => {
                         self.kernel
-                            .task_cancel(binding.local_id, task_id)
+                            .task_cancel(binding.local_id, task_id, control_id)
                             .await
-                            .map_err(map_kernel)?;
                     }
                     "steer" => {
                         self.kernel
@@ -585,9 +599,21 @@ impl AcpServer {
                                 control_id,
                             )
                             .await
-                            .map_err(map_kernel)?;
                     }
                     _ => return Err(invalid_input()),
+                };
+                if let Err(error) = action {
+                    if error.code() == KernelErrorCode::InvalidInput {
+                        let mut failure = mutation;
+                        failure.result_json =
+                            format!(r#"{{"outcome":"rejected","taskId":"{task_id}"}}"#);
+                        failure.created_at = Utc::now();
+                        self.kernel
+                            .fail_task_mutation(failure)
+                            .await
+                            .map_err(map_kernel)?;
+                    }
+                    return Err(map_kernel(error));
                 }
                 let mut completion = mutation;
                 completion.created_at = Utc::now();

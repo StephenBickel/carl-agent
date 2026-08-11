@@ -194,6 +194,8 @@ pub enum KernelCommand {
     },
     Cancel {
         session_id: SessionId,
+        task_id: Option<TaskId>,
+        control_id: Option<String>,
         reply: oneshot::Sender<Result<(), KernelError>>,
     },
     Steer {
@@ -220,6 +222,7 @@ pub enum KernelCommand {
     TaskResume {
         session_id: SessionId,
         task_id: TaskId,
+        control_id: String,
         reply: oneshot::Sender<Result<TaskView, KernelError>>,
     },
     ClaimTaskMutation {
@@ -229,6 +232,10 @@ pub enum KernelCommand {
     CompleteTaskMutation {
         input: TaskControlMutationInput,
         reply: oneshot::Sender<Result<String, KernelError>>,
+    },
+    FailTaskMutation {
+        input: TaskControlMutationInput,
+        reply: oneshot::Sender<Result<(), KernelError>>,
     },
     Shutdown {
         reply: oneshot::Sender<Result<(), KernelError>>,
@@ -320,8 +327,13 @@ impl KernelHandle {
 
     pub async fn cancel(&self, session_id: SessionId) -> Result<(), KernelError> {
         let (reply, result) = oneshot::channel();
-        self.send(KernelCommand::Cancel { session_id, reply })
-            .await?;
+        self.send(KernelCommand::Cancel {
+            session_id,
+            task_id: None,
+            control_id: None,
+            reply,
+        })
+        .await?;
         result.await.map_err(|_| stopped_error())?
     }
 
@@ -379,9 +391,17 @@ impl KernelHandle {
         &self,
         session_id: SessionId,
         task_id: TaskId,
+        control_id: String,
     ) -> Result<(), KernelError> {
-        self.task_status(session_id, task_id).await?;
-        self.cancel(session_id).await
+        let (reply, result) = oneshot::channel();
+        self.send(KernelCommand::Cancel {
+            session_id,
+            task_id: Some(task_id),
+            control_id: Some(control_id),
+            reply,
+        })
+        .await?;
+        result.await.map_err(|_| stopped_error())?
     }
 
     pub async fn task_steer(
@@ -407,11 +427,13 @@ impl KernelHandle {
         &self,
         session_id: SessionId,
         task_id: TaskId,
+        control_id: String,
     ) -> Result<TaskView, KernelError> {
         let (reply, result) = oneshot::channel();
         self.send(KernelCommand::TaskResume {
             session_id,
             task_id,
+            control_id,
             reply,
         })
         .await?;
@@ -434,6 +456,16 @@ impl KernelHandle {
     ) -> Result<String, KernelError> {
         let (reply, result) = oneshot::channel();
         self.send(KernelCommand::CompleteTaskMutation { input, reply })
+            .await?;
+        result.await.map_err(|_| stopped_error())?
+    }
+
+    pub async fn fail_task_mutation(
+        &self,
+        input: TaskControlMutationInput,
+    ) -> Result<(), KernelError> {
+        let (reply, result) = oneshot::channel();
+        self.send(KernelCommand::FailTaskMutation { input, reply })
             .await?;
         result.await.map_err(|_| stopped_error())?
     }
@@ -633,8 +665,31 @@ impl KernelActor {
                     let _ = reply.send(result);
                     false
                 }
-                KernelCommand::Cancel { session_id, reply } => {
-                    let result = self.cancel_session(session_id).await;
+                KernelCommand::Cancel {
+                    session_id,
+                    task_id,
+                    control_id,
+                    reply,
+                } => {
+                    let result = match (task_id, control_id) {
+                        (None, None) => self.cancel_session(session_id).await,
+                        (Some(task_id), Some(control_id)) => {
+                            match task_view(
+                                self.engine_ref().store(),
+                                &self.sessions,
+                                session_id,
+                                task_id,
+                            ) {
+                                Ok(_) => self
+                                    .engine_mut()
+                                    .cancel_controlled(task_id, Some(&control_id))
+                                    .await
+                                    .map_err(map_task_engine),
+                                Err(error) => Err(error),
+                            }
+                        }
+                        _ => Err(invalid_input()),
+                    };
                     let _ = reply.send(result);
                     false
                 }
@@ -704,9 +759,10 @@ impl KernelActor {
                 KernelCommand::TaskResume {
                     session_id,
                     task_id,
+                    control_id,
                     reply,
                 } => {
-                    let result = self.resume_task(session_id, task_id).await;
+                    let result = self.resume_task(session_id, task_id, &control_id).await;
                     let _ = reply.send(result);
                     false
                 }
@@ -724,6 +780,15 @@ impl KernelActor {
                         .engine_ref()
                         .store()
                         .complete_task_control_mutation(input)
+                        .map_err(map_storage);
+                    let _ = reply.send(result);
+                    false
+                }
+                KernelCommand::FailTaskMutation { input, reply } => {
+                    let result = self
+                        .engine_ref()
+                        .store()
+                        .fail_task_control_mutation(input, -32602)
                         .map_err(map_storage);
                     let _ = reply.send(result);
                     false
@@ -1278,8 +1343,11 @@ impl KernelActor {
                                     continue;
                                 }
                                 let turn_id = TurnId::new();
+                                let task_id =
+                                    locked_active_durable_task_id(admission_store, session_id)?;
                                 control_sender
                                     .send(TaskEngineControl::Steer {
+                                        task_id,
                                         text,
                                         control_id: None,
                                         session_id,
@@ -1372,8 +1440,16 @@ impl KernelActor {
                                     let _ = reply.send(result);
                                     continue;
                                 };
+                                let task_id =
+                                    locked_active_durable_task_id(admission_store, session_id)?;
                                 control_sender
                                     .send(TaskEngineControl::Configure {
+                                        task_id,
+                                        control_id: task_configuration_identity(
+                                            task_id,
+                                            acknowledgement,
+                                            configuration,
+                                        ),
                                         model: configuration.model().clone(),
                                         effort: configuration.effort(),
                                         permission_mode: configuration.mode(),
@@ -1413,9 +1489,18 @@ impl KernelActor {
                                         let _ = reply.send(Err(invalid_input()));
                                         continue;
                                     }
+                                    if locked_active_durable_task_id(admission_store, session_id)?
+                                        != task_id
+                                    {
+                                        let _ = reply.send(Err(invalid_input()));
+                                        continue;
+                                    }
                                 }
+                                let task_id =
+                                    locked_active_durable_task_id(admission_store, session_id)?;
                                 control_sender
                                     .send(TaskEngineControl::Steer {
+                                        task_id,
                                         text: input,
                                         control_id,
                                         session_id,
@@ -1487,12 +1572,35 @@ impl KernelActor {
                                     });
                                 let _ = reply.send(result);
                             }
+                            KernelCommand::FailTaskMutation { input, reply } => {
+                                let result = admission_store
+                                    .lock()
+                                    .map_err(|_| provider_error())
+                                    .and_then(|store| {
+                                        store
+                                            .fail_task_control_mutation(input, -32602)
+                                            .map_err(map_storage)
+                                    });
+                                let _ = reply.send(result);
+                            }
                             KernelCommand::Cancel {
                                 session_id: target,
+                                task_id: requested_task_id,
+                                control_id,
                                 reply,
                             } if target == session_id => {
+                                let task_id =
+                                    locked_active_durable_task_id(admission_store, session_id)?;
+                                if requested_task_id.is_some_and(|requested| requested != task_id)
+                                    || requested_task_id.is_some() != control_id.is_some()
+                                {
+                                    let _ = reply.send(Err(invalid_input()));
+                                    continue;
+                                }
                                 control_sender
                                     .send(TaskEngineControl::Cancel {
+                                        task_id,
+                                        control_id,
                                         session_id,
                                         turn_id,
                                         acknowledgement,
@@ -1505,6 +1613,11 @@ impl KernelActor {
                                 durable_shutdown = true;
                                 control_sender
                                     .send(TaskEngineControl::Cancel {
+                                        task_id: locked_active_durable_task_id(
+                                            admission_store,
+                                            session_id,
+                                        )?,
+                                        control_id: None,
                                         session_id,
                                         turn_id,
                                         acknowledgement,
@@ -1739,9 +1852,15 @@ impl KernelActor {
                 Next::Command(Some(command)) => match command {
                     KernelCommand::Cancel {
                         session_id: target,
+                        task_id,
+                        control_id,
                         reply,
                     } if target == session_id => {
-                        let result = self.cancel_session(session_id).await;
+                        let result = if task_id.is_none() && control_id.is_none() {
+                            self.cancel_session(session_id).await
+                        } else {
+                            Err(invalid_input())
+                        };
                         let accepted = result.is_ok();
                         let _ = reply.send(result);
                         if accepted {
@@ -1848,6 +1967,14 @@ impl KernelActor {
                             .engine_ref()
                             .store()
                             .complete_task_control_mutation(input)
+                            .map_err(map_storage);
+                        let _ = reply.send(result);
+                    }
+                    KernelCommand::FailTaskMutation { input, reply } => {
+                        let result = self
+                            .engine_ref()
+                            .store()
+                            .fail_task_control_mutation(input, -32602)
                             .map_err(map_storage);
                         let _ = reply.send(result);
                     }
@@ -2717,13 +2844,29 @@ impl KernelActor {
         &mut self,
         session_id: SessionId,
         task_id: TaskId,
+        control_id: &str,
     ) -> Result<TaskView, KernelError> {
-        task_view(
+        let current = task_view(
             self.engine_ref().store(),
             &self.sessions,
             session_id,
             task_id,
         )?;
+        let marker_exists = self
+            .engine_ref()
+            .store()
+            .task_has_control_marker(
+                task_id,
+                control_id,
+                crate::runtime::task::TaskControlKind::Resume,
+            )
+            .map_err(map_storage)?;
+        if current.status == crate::runtime::task::TaskStatus::Completed && marker_exists {
+            return Ok(current);
+        }
+        if current.status.is_terminal() {
+            return Err(invalid_input());
+        }
         if self
             .sessions
             .get(&session_id)
@@ -2732,6 +2875,15 @@ impl KernelActor {
             .is_some()
         {
             return Err(session_busy());
+        }
+        if !marker_exists {
+            self.engine_mut()
+                .mark_control_requested(
+                    task_id,
+                    control_id,
+                    crate::runtime::task::TaskControlKind::Resume,
+                )
+                .map_err(map_task_engine)?;
         }
         let snapshot = self
             .engine_mut()
@@ -3148,6 +3300,9 @@ fn reject_busy_command(command: KernelCommand) {
         KernelCommand::CompleteTaskMutation { reply, .. } => {
             let _ = reply.send(Err(session_busy()));
         }
+        KernelCommand::FailTaskMutation { reply, .. } => {
+            let _ = reply.send(Err(session_busy()));
+        }
         KernelCommand::Shutdown { reply } => {
             let _ = reply.send(Err(session_busy()));
         }
@@ -3278,6 +3433,36 @@ fn task_view(
         .filter(|record| record.snapshot.session_id == session_id)
         .ok_or_else(invalid_input)?;
     Ok(TaskView::from(&record.snapshot))
+}
+
+fn active_durable_task_id(store: &Store, session_id: SessionId) -> Result<TaskId, KernelError> {
+    let active = store
+        .list_tasks_for_session(session_id, 64)
+        .map_err(map_storage)?
+        .into_iter()
+        .filter(|record| {
+            matches!(
+                record.snapshot.status,
+                crate::runtime::task::TaskStatus::Active
+                    | crate::runtime::task::TaskStatus::Checkpointing
+                    | crate::runtime::task::TaskStatus::Cancelling
+                    | crate::runtime::task::TaskStatus::Completing
+            )
+        })
+        .map(|record| record.snapshot.task_id)
+        .collect::<Vec<_>>();
+    match active.as_slice() {
+        [task_id] => Ok(*task_id),
+        _ => Err(invalid_input()),
+    }
+}
+
+fn locked_active_durable_task_id(
+    store: &Mutex<Store>,
+    session_id: SessionId,
+) -> Result<TaskId, KernelError> {
+    let store = store.lock().map_err(|_| provider_error())?;
+    active_durable_task_id(&store, session_id)
 }
 
 fn task_views(
@@ -3431,6 +3616,25 @@ const fn permission_strength(mode: PermissionMode) -> u8 {
         PermissionProfile::Approval => 1,
         PermissionProfile::FullAccess => 2,
     }
+}
+
+fn task_configuration_identity(
+    task_id: TaskId,
+    acknowledgement: u64,
+    configuration: &SessionConfiguration,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"carl.task-configuration-control.v1\0");
+    hasher.update(task_id.to_string().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(acknowledgement.to_be_bytes());
+    hasher.update(b"\0");
+    hasher.update(configuration.model().as_str().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(configuration.effort().as_codex_value().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(configuration.mode().as_wire_str().as_bytes());
+    format!("{:x}", hasher.finalize())
 }
 
 fn queue_session_configuration(

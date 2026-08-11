@@ -4,7 +4,13 @@ mod support;
 use std::fs;
 use std::path::Path;
 
+use carl::acp::PermissionMode;
+use carl::delegates::{ModelId, ReasoningEffort};
+use carl::runtime::task::{ClauseStatus, CompletionClause, CompletionContract, TaskBudget};
+use carl::storage::{NewTask, Store};
+use chrono::Utc;
 use libtest_mimic::{Arguments, Failed, Trial};
+use rusqlite::Connection;
 use serde_json::json;
 use support::{
     ACTOR_HEX, CHANNEL_ID, Client, Layout, PRIVATE_KEY, TestResult, dispatch_fixture, fixture,
@@ -64,6 +70,22 @@ fn end_to_end() -> TestResult {
     client.send(&prompt_frame(20, &session, "wait for cancel", 'b'))?;
     layout.wait_for_provider_method("turn/start", 3)?;
     let task_id = layout.latest_task_id()?;
+    let other_task_id = create_queued_task(&layout, &session)?;
+    for (id, method, key) in [
+        (18, "_task/cancel", "wrong-task-cancel"),
+        (19, "_task/steer", "wrong-task-steer"),
+    ] {
+        let mut params = json!({
+            "sessionId":session,"taskId":other_task_id,"idempotencyKey":key
+        });
+        if method == "_task/steer" {
+            params["text"] = json!("must not steer the active task");
+        }
+        client.send(&json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}))?;
+        assert_eq!(client.read_id(id)?["error"]["code"], -32602);
+    }
+    assert_eq!(layout.provider_method_count("turn/interrupt")?, 0);
+    assert_eq!(layout.task_control_marker_count(&other_task_id)?, 0);
     for (id, method) in [(21, "_task/status"), (22, "_task/context")] {
         client.send(&json!({
             "jsonrpc":"2.0","id":id,"method":method,"params":{
@@ -112,19 +134,33 @@ fn end_to_end() -> TestResult {
             "sessionId":session,"taskId":task_id,"idempotencyKey":"cancel-key"
         }
     });
+    Connection::open(layout.data.join("carl.sqlite3"))?.execute_batch(
+        "CREATE TRIGGER fail_cancel_receipt_completion
+         BEFORE UPDATE OF state ON task_control_receipts
+         WHEN NEW.state = 'completed' AND NEW.method = 'cancel'
+         BEGIN SELECT RAISE(ABORT, 'injected crash before cancel receipt completion'); END;",
+    )?;
     client.send(&cancel)?;
-    let cancelled = client.read_id(30)?;
-    assert_eq!(cancelled["result"]["outcome"], "accepted");
+    assert_eq!(client.read_id(30)?["error"]["code"], -32602);
+    assert_eq!(layout.provider_method_count("turn/interrupt")?, 1);
+    Connection::open(layout.data.join("carl.sqlite3"))?
+        .execute_batch("DROP TRIGGER fail_cancel_receipt_completion;")?;
     let mut cancel_replay = cancel;
     cancel_replay["id"] = json!(31);
     client.send(&cancel_replay)?;
-    assert_eq!(client.read_id(31)?["result"], cancelled["result"]);
-    client.send(&json!({
+    assert_eq!(client.read_id(31)?["result"]["outcome"], "accepted");
+    assert_eq!(layout.provider_method_count("turn/interrupt")?, 1);
+    let rejected_resume = json!({
         "jsonrpc":"2.0","id":32,"method":"_task/resume","params":{
             "sessionId":session,"taskId":task_id,"idempotencyKey":"resume-key"
         }
-    }))?;
+    });
+    client.send(&rejected_resume)?;
     assert_eq!(client.read_id(32)?["error"]["code"], -32602);
+    let mut rejected_resume_replay = rejected_resume;
+    rejected_resume_replay["id"] = json!(33);
+    client.send(&rejected_resume_replay)?;
+    assert_eq!(client.read_id(33)?["error"]["code"], -32602);
     let first = client.finish()?;
     assert_eq!(
         fs::read_to_string(layout.workspace.join("target.txt"))?,
@@ -162,6 +198,36 @@ fn end_to_end() -> TestResult {
             .any(|window| window == PRIVATE_KEY.as_bytes())
     );
     Ok(())
+}
+
+fn create_queued_task(layout: &Layout, external_session_id: &str) -> TestResult<String> {
+    let mut store = Store::open(layout.data.join("carl.sqlite3"))?;
+    let session_id = store
+        .get_frontend_session(external_session_id)?
+        .ok_or("frontend session missing")?
+        .session_id;
+    let task = store.create_task(NewTask {
+        session_id,
+        workspace: fs::canonicalize(&layout.workspace)?,
+        contract: CompletionContract {
+            version: 1,
+            goal: "Remain a distinct queued task".to_owned(),
+            constraints: Vec::new(),
+            clauses: vec![CompletionClause {
+                id: "distinct".to_owned(),
+                description: "Do not mutate the active task".to_owned(),
+                required: false,
+                status: ClauseStatus::Pending,
+                evidence: Vec::new(),
+            }],
+        },
+        model: ModelId::parse("gpt-5.6-codex")?,
+        effort: ReasoningEffort::High,
+        permission_mode: PermissionMode::FullAccess,
+        budget: TaskBudget::default(),
+        created_at: Utc::now(),
+    })?;
+    Ok(task.snapshot.task_id.to_string())
 }
 
 fn admission_precedes_execution() -> TestResult {

@@ -49,7 +49,7 @@ fn migration_six_binds_and_recovers_frontend_sessions() -> Result<(), Box<dyn Er
     assert_eq!(
         connection.query_row("SELECT COUNT(*) FROM migrations", [], |row| row
             .get::<_, u64>(0))?,
-        9
+        10
     );
     for table in [
         "frontend_sessions",
@@ -58,6 +58,8 @@ fn migration_six_binds_and_recovers_frontend_sessions() -> Result<(), Box<dyn Er
         "trusted_frontend_owners",
         "trusted_frontend_events",
         "task_control_receipts",
+        "task_configuration_state",
+        "task_control_markers",
     ] {
         assert_eq!(
             connection.query_row(
@@ -112,6 +114,67 @@ fn migration_nine_preserves_legacy_wire_values_and_adds_canonical_profiles()
             |row| row.get::<_, String>(0),
         )?,
         "approval"
+    );
+    Ok(())
+}
+
+#[test]
+fn migration_ten_backfills_existing_epoch_interruptions_truthfully() -> Result<(), Box<dyn Error>> {
+    let layout = TestLayout::new()?;
+    prepare_version_eight_database(&layout.database, &layout.workspace)?;
+    let connection = Connection::open(&layout.database)?;
+    connection.execute_batch(include_str!(
+        "../migrations/0009_trusted_frontend_owners.sql"
+    ))?;
+    let session_id =
+        connection.query_row("SELECT id FROM sessions ORDER BY id LIMIT 1", [], |row| {
+            row.get::<_, String>(0)
+        })?;
+    let task_id = "11111111-1111-4111-8111-111111111111";
+    let epoch_id = "22222222-2222-4222-8222-222222222222";
+    connection.execute(
+        "INSERT INTO agent_tasks (
+            id, session_id, status, contract_json, budget_json, snapshot_json,
+            canonical_workspace, model, effort, permission_mode, revision,
+            created_at, updated_at
+         ) VALUES (?1, ?2, 'active', '{}', '{}', '{}', ?3,
+                   'gpt-5.6-codex', 'ultra', 'default', 3, ?4, ?4)",
+        rusqlite::params![
+            task_id,
+            session_id,
+            layout.workspace.to_str(),
+            fixed_time().to_rfc3339(),
+        ],
+    )?;
+    connection.execute(
+        "INSERT INTO task_epochs (
+            id, task_id, objective, status, started_sequence,
+            created_at, updated_at
+         ) VALUES (?1, ?2, 'tighten permissions', 'active', 2, ?3, ?3)",
+        rusqlite::params![epoch_id, task_id, fixed_time().to_rfc3339()],
+    )?;
+    connection.execute(
+        "INSERT INTO task_epoch_interruptions (
+            task_id, epoch_id, reason, event_sequence, interrupted_at
+         ) VALUES (?1, ?2, 'permission_tightening', 3, ?3)",
+        rusqlite::params![task_id, epoch_id, fixed_time().to_rfc3339()],
+    )?;
+    drop(connection);
+
+    let connection = Connection::open(&layout.database)?;
+    connection.execute_batch(include_str!("../migrations/0010_durable_task_controls.sql"))?;
+    assert_eq!(
+        connection.query_row(
+            "SELECT status, finished_sequence, report_digest
+             FROM task_epochs WHERE id = ?1",
+            [epoch_id],
+            |row| Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Option<String>>(2)?
+            )),
+        )?,
+        ("interrupted".to_owned(), 3, None),
     );
     Ok(())
 }
@@ -213,7 +276,9 @@ fn migration_six_database_upgrades_through_eight_and_reopens() -> Result<(), Box
     drop(Store::open(&layout.database)?);
     let connection = Connection::open(&layout.database)?;
     connection.execute_batch(
-        "DROP TABLE task_control_receipts;
+        "DROP TABLE task_control_markers;
+         DROP TABLE task_configuration_state;
+         DROP TABLE task_control_receipts;
          DROP TABLE trusted_frontend_events;
          DROP TABLE trusted_frontend_owners;
          DROP TABLE task_epoch_interruptions;

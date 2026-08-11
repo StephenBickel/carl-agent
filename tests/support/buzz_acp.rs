@@ -225,6 +225,15 @@ impl Layout {
         )?)
     }
 
+    pub fn task_control_marker_count(&self, task_id: &str) -> TestResult<i64> {
+        let connection = rusqlite::Connection::open(self.data.join("carl.sqlite3"))?;
+        Ok(connection.query_row(
+            "SELECT COUNT(*) FROM task_control_markers WHERE task_id = ?1",
+            [task_id],
+            |row| row.get(0),
+        )?)
+    }
+
     pub fn task_lifecycle_events(&self) -> TestResult<Vec<Value>> {
         let connection = rusqlite::Connection::open(self.data.join("carl.sqlite3"))?;
         let mut statement = connection.prepare(
