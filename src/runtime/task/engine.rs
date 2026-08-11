@@ -8,7 +8,7 @@ use chrono::{TimeDelta, Utc};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 #[cfg(windows)]
 use cap_primitives::fs::_WindowsByHandle;
@@ -19,7 +19,7 @@ use cap_std::fs::{Dir, OpenOptions};
 use crate::acp::{PermissionMode, PermissionProfile};
 use crate::delegates::{ModelId, ReasoningEffort};
 use crate::events::{SessionId, ToolCallId, TurnId};
-use crate::policy::{ActorId, Sha256Digest};
+use crate::policy::{ActorId, Frontend, Sha256Digest};
 use crate::runtime::agent_port::{
     AgentContextId, AgentEffectRequest, AgentEpochId, AgentErrorProvenance, AgentEvent, AgentItem,
     AgentPort, AgentPortError, AgentPortErrorCode, AgentProcess, AgentUsage, ContextRecovery,
@@ -27,8 +27,9 @@ use crate::runtime::agent_port::{
 };
 use crate::security::SecretFilter;
 use crate::storage::{
-    ApprovalStatus, BoundApprovalBinding, ExternalSessionId, NewCheckpoint, NewRemoteCode, NewTask,
-    ProviderRequestId, RemoteCodeClaim, RemoteCodeKind, RuntimeStore, Store, TaskRecord,
+    ApprovalStatus, BoundApprovalBinding, ChannelId, ClientName, ExternalSessionId, NewCheckpoint,
+    NewFrontendSession, NewRemoteCode, NewTask, ProviderRequestId, RemoteCodeClaim, RemoteCodeKind,
+    RuntimeStore, Store, TaskRecord,
 };
 
 use super::{
@@ -170,6 +171,14 @@ pub enum TaskEngineUpdate {
 }
 
 pub(crate) enum TaskEngineControl {
+    Enqueue {
+        input: OwnerStartTask,
+        reply: oneshot::Sender<Result<TaskSnapshot, TaskEngineError>>,
+    },
+    AdmitTrusted {
+        input: OwnerTrustedMessage,
+        reply: oneshot::Sender<Result<(), TaskEngineError>>,
+    },
     Steer {
         task_id: TaskId,
         text: String,
@@ -200,6 +209,30 @@ pub(crate) enum TaskEngineControl {
         turn_id: crate::events::TurnId,
         acknowledgement: u64,
     },
+}
+
+pub(crate) struct OwnerStartTask {
+    pub external_session_id: String,
+    pub workspace: PathBuf,
+    pub request: String,
+    pub model: ModelId,
+    pub effort: ReasoningEffort,
+    pub permission_mode: PermissionMode,
+    pub trusted_admission: Option<OwnerTrustedAdmission>,
+    pub idempotency_key: String,
+    pub command_digest: [u8; 32],
+}
+
+pub(crate) struct OwnerTrustedAdmission {
+    pub frontend: Frontend,
+    pub actor_id: ActorId,
+    pub channel_id: String,
+    pub event_id: String,
+}
+
+pub(crate) struct OwnerTrustedMessage {
+    pub workspace: PathBuf,
+    pub admission: OwnerTrustedAdmission,
 }
 
 pub(crate) type TaskEngineAcknowledgement = (u64, Result<(), TaskEngineError>);
@@ -509,6 +542,179 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
             .await
             .map_err(provider_error)?;
         self.start_in_context(input, context_id).await
+    }
+
+    fn enqueue_with_receipt(
+        &mut self,
+        input: StartTask,
+        receipt: Option<(&str, [u8; 32])>,
+    ) -> Result<TaskSnapshot, TaskEngineError> {
+        validate_start(&input)?;
+        SecretFilter
+            .inspect(input.request.as_bytes())
+            .map_err(|_| invalid_task())?;
+        let new_task = NewTask {
+            session_id: input.session_id,
+            workspace: input.workspace,
+            contract: fallback_contract(&input.request),
+            model: input.model,
+            effort: input.effort,
+            permission_mode: input.permission_mode,
+            budget: input.budget,
+            created_at: Utc::now(),
+        };
+        let created = match receipt {
+            Some((idempotency_key, command_digest)) => {
+                self.store_mut()
+                    .create_task_idempotent(new_task, idempotency_key, command_digest)
+            }
+            None => self.store_mut().create_task(new_task),
+        }
+        .map_err(storage_error)?;
+        self.updates.push(TaskEngineUpdate::TaskStatus {
+            task_id: created.snapshot.task_id,
+            status: created.snapshot.status,
+        });
+        Ok(created.snapshot)
+    }
+
+    pub(crate) async fn receive_owner_control_while_idle(&mut self) -> bool {
+        let Some(control) = receive_control(&mut self.controls).await else {
+            self.controls = None;
+            self.acknowledgements = None;
+            return false;
+        };
+        if let Some(control) = self.process_owner_control(control) {
+            let acknowledgement = control_acknowledgement(&control);
+            self.acknowledge(acknowledgement, Err(invalid_task())).await;
+        }
+        true
+    }
+
+    fn process_owner_control(&mut self, control: TaskEngineControl) -> Option<TaskEngineControl> {
+        match control {
+            TaskEngineControl::Enqueue { input, reply } => {
+                let _ = reply.send(self.enqueue_owner_task(input));
+                None
+            }
+            TaskEngineControl::AdmitTrusted { input, reply } => {
+                let _ = reply.send(self.admit_owner_message(input));
+                None
+            }
+            control => Some(control),
+        }
+    }
+
+    fn admit_owner_message(&self, input: OwnerTrustedMessage) -> Result<(), TaskEngineError> {
+        let workspace = std::fs::canonicalize(&input.workspace).map_err(|_| invalid_task())?;
+        if workspace != input.workspace
+            || !workspace.is_dir()
+            || input.admission.frontend != Frontend::Buzz
+        {
+            return Err(invalid_task());
+        }
+        let channel_id = ChannelId::try_from(input.admission.channel_id).map_err(storage_error)?;
+        self.store()
+            .admit_trusted_frontend_message(
+                input.admission.frontend,
+                &input.admission.actor_id,
+                &channel_id,
+                &workspace,
+                &input.admission.event_id,
+                Utc::now(),
+            )
+            .map_err(|_| invalid_task())?;
+        Ok(())
+    }
+
+    fn enqueue_owner_task(
+        &mut self,
+        input: OwnerStartTask,
+    ) -> Result<TaskSnapshot, TaskEngineError> {
+        let workspace = std::fs::canonicalize(&input.workspace).map_err(|_| invalid_task())?;
+        if workspace != input.workspace || !workspace.is_dir() {
+            return Err(invalid_task());
+        }
+        let external_session_id =
+            ExternalSessionId::try_from(input.external_session_id).map_err(|_| invalid_task())?;
+        let admitted = input
+            .trusted_admission
+            .as_ref()
+            .map(|admission| {
+                if admission.frontend != Frontend::Buzz {
+                    return Err(invalid_task());
+                }
+                let channel_id =
+                    ChannelId::try_from(admission.channel_id.clone()).map_err(storage_error)?;
+                let owner = self
+                    .store()
+                    .admit_trusted_frontend_message(
+                        admission.frontend,
+                        &admission.actor_id,
+                        &channel_id,
+                        &workspace,
+                        &admission.event_id,
+                        Utc::now(),
+                    )
+                    .map_err(|_| invalid_task())?;
+                Ok((admission.frontend, channel_id, owner.permission_mode))
+            })
+            .transpose()?;
+        let expected_frontend = admitted
+            .as_ref()
+            .map_or(Frontend::Acp, |(frontend, _, _)| *frontend);
+        let (session_id, permission_mode) = match self
+            .store()
+            .get_frontend_session(external_session_id.as_str())
+            .map_err(storage_error)?
+        {
+            Some(binding) => {
+                if binding.frontend != expected_frontend
+                    || binding.cwd != workspace
+                    || admitted
+                        .as_ref()
+                        .is_some_and(|(_, channel, _)| binding.channel_id.as_ref() != Some(channel))
+                {
+                    return Err(invalid_task());
+                }
+                let permission_mode = admitted
+                    .as_ref()
+                    .map_or(binding.permission_mode, |(_, _, mode)| *mode);
+                (binding.session_id, permission_mode)
+            }
+            None => {
+                let session = self.store().create_session().map_err(storage_error)?;
+                let binding = self
+                    .store()
+                    .bind_frontend_session(NewFrontendSession {
+                        frontend: expected_frontend,
+                        external_session_id,
+                        session_id: session.id,
+                        cwd: workspace.clone(),
+                        protocol_version: 1,
+                        client_name: ClientName::try_from("carl-service").map_err(storage_error)?,
+                        permission_mode: admitted
+                            .as_ref()
+                            .map_or(input.permission_mode, |(_, _, mode)| *mode),
+                        channel_id: admitted.as_ref().map(|(_, channel, _)| channel.clone()),
+                        created_at: Utc::now(),
+                    })
+                    .map_err(storage_error)?;
+                (session.id, binding.permission_mode)
+            }
+        };
+        self.enqueue_with_receipt(
+            StartTask {
+                session_id,
+                workspace,
+                request: input.request,
+                model: input.model,
+                effort: input.effort,
+                permission_mode,
+                budget: TaskBudget::default(),
+            },
+            Some((&input.idempotency_key, input.command_digest)),
+        )
     }
 
     pub async fn start_in_context(
@@ -1375,6 +1581,47 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
         Ok(())
     }
 
+    pub(crate) fn configure_controlled(
+        &mut self,
+        task_id: TaskId,
+        control_id: String,
+        model: ModelId,
+        effort: ReasoningEffort,
+        permission_mode: PermissionMode,
+    ) -> Result<(), TaskEngineError> {
+        let record = self
+            .store()
+            .get_task(task_id)
+            .map_err(storage_error)?
+            .ok_or_else(invalid_task)?;
+        if record.snapshot.status.is_terminal() {
+            return Err(invalid_task());
+        }
+        if let Some(mut runtime) = self.tasks.remove(&task_id) {
+            let result = self.queue_configuration(
+                task_id,
+                &mut runtime,
+                control_id,
+                model,
+                effort,
+                permission_mode,
+            );
+            self.tasks.insert(task_id, runtime);
+            result
+        } else {
+            self.append(
+                task_id,
+                TaskEvent::ConfigurationQueued {
+                    control_id,
+                    model,
+                    effort,
+                    permission_mode,
+                },
+            )?;
+            Ok(())
+        }
+    }
+
     async fn plan_contract(
         &mut self,
         task_id: TaskId,
@@ -1477,6 +1724,9 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                     return Err(error(TaskEngineErrorCode::Blocked));
                 }
                 Next::Control(Some(control)) => {
+                    let Some(control) = self.process_owner_control(control) else {
+                        continue;
+                    };
                     let acknowledgement = control_acknowledgement(&control);
                     let result = self
                         .apply_planning_control(
@@ -2603,6 +2853,9 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                     return Err(error(TaskEngineErrorCode::Blocked));
                 }
                 Next::Control(Some(control)) => {
+                    let Some(control) = self.process_owner_control(control) else {
+                        continue;
+                    };
                     let tightening_configuration =
                         configuration_tightens(&control, runtime.effective_permission_mode);
                     let acknowledgement = match &control {
@@ -2618,6 +2871,10 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                         | TaskEngineControl::Configure {
                             acknowledgement, ..
                         } => *acknowledgement,
+                        TaskEngineControl::Enqueue { .. }
+                        | TaskEngineControl::AdmitTrusted { .. } => {
+                            unreachable!("owner control was processed before work dispatch")
+                        }
                     };
                     let result = self
                         .apply_control(
@@ -2864,6 +3121,9 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                 Ok(())
             }
             TaskEngineControl::Approval { .. } => Err(error(TaskEngineErrorCode::Blocked)),
+            TaskEngineControl::Enqueue { .. } | TaskEngineControl::AdmitTrusted { .. } => {
+                unreachable!("owner control was processed before task control dispatch")
+            }
         }
     }
 
@@ -3607,22 +3867,24 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                 .ok_or_else(invalid_task)?;
             let remaining = remaining_wall_budget(&record);
             enum ApprovalWait {
-                Control(Option<TaskEngineControl>),
+                Control(Box<Option<TaskEngineControl>>),
                 HardBudget,
             }
             let wait = if let Some(remaining) = remaining {
                 tokio::select! {
                     control = receive_control(&mut self.controls) => {
-                        ApprovalWait::Control(control)
+                        ApprovalWait::Control(Box::new(control))
                     }
                     () = tokio::time::sleep(remaining) => ApprovalWait::HardBudget,
                 }
             } else {
-                ApprovalWait::Control(receive_control(&mut self.controls).await)
+                ApprovalWait::Control(Box::new(receive_control(&mut self.controls).await))
             };
             let control = match wait {
-                ApprovalWait::Control(Some(control)) => control,
-                ApprovalWait::Control(None) => {
+                ApprovalWait::Control(control) if control.is_some() => {
+                    control.expect("approval control was checked")
+                }
+                ApprovalWait::Control(_) => {
                     self.fail_before_effect_dispatch(
                         task_id,
                         operation_id,
@@ -3639,6 +3901,9 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                     return Err(error(TaskEngineErrorCode::Blocked));
                 }
             };
+            let Some(control) = self.process_owner_control(control) else {
+                continue;
+            };
             let acknowledgement = match &control {
                 TaskEngineControl::Steer {
                     acknowledgement, ..
@@ -3652,6 +3917,9 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                 | TaskEngineControl::Configure {
                     acknowledgement, ..
                 } => *acknowledgement,
+                TaskEngineControl::Enqueue { .. } | TaskEngineControl::AdmitTrusted { .. } => {
+                    unreachable!("owner controls are handled before approval dispatch")
+                }
             };
             match control {
                 TaskEngineControl::Approval {
@@ -3783,6 +4051,9 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                     }
                     self.acknowledge(acknowledgement, configured.clone()).await;
                     configured?;
+                }
+                TaskEngineControl::Enqueue { .. } | TaskEngineControl::AdmitTrusted { .. } => {
+                    unreachable!("owner control was processed before approval dispatch")
                 }
             }
         }
@@ -4406,7 +4677,7 @@ async fn receive_control(
     }
 }
 
-const fn control_acknowledgement(control: &TaskEngineControl) -> u64 {
+fn control_acknowledgement(control: &TaskEngineControl) -> u64 {
     match control {
         TaskEngineControl::Steer {
             acknowledgement, ..
@@ -4420,6 +4691,9 @@ const fn control_acknowledgement(control: &TaskEngineControl) -> u64 {
         | TaskEngineControl::Configure {
             acknowledgement, ..
         } => *acknowledgement,
+        TaskEngineControl::Enqueue { .. } | TaskEngineControl::AdmitTrusted { .. } => {
+            unreachable!("owner controls do not use task acknowledgements")
+        }
     }
 }
 
@@ -5257,7 +5531,7 @@ const fn invalid_task() -> TaskEngineError {
     error(TaskEngineErrorCode::InvalidTask)
 }
 
-fn storage_error(_error: crate::error::CarlError) -> TaskEngineError {
+fn storage_error(_source: crate::error::CarlError) -> TaskEngineError {
     error(TaskEngineErrorCode::Storage)
 }
 

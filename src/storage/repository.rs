@@ -2035,6 +2035,54 @@ impl Store {
     }
 
     pub fn create_task(&mut self, input: NewTask) -> Result<TaskRecord, CarlError> {
+        self.create_task_inner(input, None)
+    }
+
+    pub fn create_task_idempotent(
+        &mut self,
+        input: NewTask,
+        idempotency_key: &str,
+        command_digest: [u8; 32],
+    ) -> Result<TaskRecord, CarlError> {
+        if idempotency_key.is_empty()
+            || idempotency_key.len() > 128
+            || idempotency_key.chars().any(char::is_control)
+        {
+            return Err(policy_error("service task idempotency key is invalid"));
+        }
+        self.create_task_inner(input, Some((idempotency_key, command_digest)))
+    }
+
+    fn create_task_inner(
+        &mut self,
+        input: NewTask,
+        receipt: Option<(&str, [u8; 32])>,
+    ) -> Result<TaskRecord, CarlError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage_error)?;
+        if let Some((idempotency_key, command_digest)) = receipt {
+            let existing = transaction
+                .query_row(
+                    "SELECT command_digest, task_id FROM service_task_receipts
+                     WHERE idempotency_key = ?1",
+                    [idempotency_key],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()
+                .map_err(storage_error)?;
+            if let Some((stored_digest, task_id)) = existing {
+                if stored_digest != hex_bytes(command_digest) {
+                    return Err(policy_error("service task idempotency key was rebound"));
+                }
+                let task_id = task_id
+                    .parse::<TaskId>()
+                    .map_err(|_| storage_invariant("service task receipt is corrupt"))?;
+                return load_task_record(&transaction, task_id)?
+                    .ok_or_else(|| storage_invariant("service task receipt lost its task"));
+            }
+        }
         let workspace = fs::canonicalize(&input.workspace).map_err(|_| CarlError::Validation {
             detail: "task workspace is unavailable".to_owned(),
         })?;
@@ -2053,10 +2101,6 @@ impl Store {
             effort: input.effort,
             permission_mode: input.permission_mode,
         };
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(storage_error)?;
         let envelope = append_event_in_transaction(
             &transaction,
             input.session_id,
@@ -2077,6 +2121,21 @@ impl Store {
             input.permission_mode,
             input.created_at,
         )?;
+        if let Some((idempotency_key, command_digest)) = receipt {
+            transaction
+                .execute(
+                    "INSERT INTO service_task_receipts (
+                        idempotency_key, command_digest, task_id, created_at
+                     ) VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        idempotency_key,
+                        hex_bytes(command_digest),
+                        task_id.to_string(),
+                        format_timestamp(input.created_at),
+                    ],
+                )
+                .map_err(storage_error)?;
+        }
         transaction.commit().map_err(storage_error)?;
         Ok(TaskRecord {
             revision: snapshot.revision,
@@ -2397,6 +2456,27 @@ impl Store {
                 .cmp(&right.updated_at)
                 .then_with(|| left.snapshot.task_id.cmp(&right.snapshot.task_id))
         });
+        Ok(records)
+    }
+
+    pub fn list_tasks(&self, limit: u16) -> Result<Vec<TaskRecord>, CarlError> {
+        if !(1..=64).contains(&limit) {
+            return Err(CarlError::Validation {
+                detail: "task list limit must be between 1 and 64".to_owned(),
+            });
+        }
+        let mut records = Vec::new();
+        visit_authoritative_task_records(&self.connection, |record| {
+            records.push(record);
+            Ok(())
+        })?;
+        records.sort_by(|left, right| {
+            right
+                .updated_at
+                .cmp(&left.updated_at)
+                .then_with(|| right.snapshot.task_id.cmp(&left.snapshot.task_id))
+        });
+        records.truncate(usize::from(limit));
         Ok(records)
     }
 
@@ -8926,6 +9006,16 @@ fn frontend_workspace_digest(workspace: &Path) -> Sha256Digest {
     hasher.update(b"carl.trusted-frontend-workspace.v1\0");
     hasher.update(workspace.as_os_str().as_encoded_bytes());
     Sha256Digest::from_bytes(hasher.finalize().into())
+}
+
+fn hex_bytes(bytes: [u8; 32]) -> String {
+    use std::fmt::Write as _;
+
+    let mut encoded = String::with_capacity(64);
+    for byte in bytes {
+        write!(&mut encoded, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    encoded
 }
 
 const fn stored_permission_mode(mode: PermissionMode) -> &'static str {

@@ -2,6 +2,13 @@ use carl::cli::{AcpEffort, AcpPermissionMode, Cli, Command, TrustCommand};
 use clap::Parser;
 use predicates::prelude::PredicateBooleanExt;
 
+#[tokio::test(flavor = "current_thread")]
+async fn serve_dispatch_is_implemented() {
+    let result =
+        carl::cli::run_command_with_cancellation(Command::Serve, std::future::ready(())).await;
+    assert!(!result.stderr().contains("not implemented"));
+}
+
 #[test]
 fn help_exposes_the_v1_commands() {
     let mut command = assert_cmd::Command::cargo_bin("carl").unwrap();

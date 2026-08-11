@@ -22,6 +22,7 @@ pub use protocol::{
 };
 pub use server::{
     AcpServer, AcpServerConfig, AcpServerError, AcpServerErrorCode, BuzzPublisherBootstrap,
+    ServiceAcpServer,
 };
 pub use session::{
     ConfigOutcome, ConfigSelection, KernelError, KernelErrorCode, KernelSession, KernelUpdate,

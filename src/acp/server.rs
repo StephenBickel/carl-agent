@@ -18,9 +18,14 @@ use super::{
     config_options, read_frame, write_frame,
 };
 use crate::delegates::{ModelId, ReasoningEffort};
-use crate::events::SessionId;
+use crate::events::{Event, EventEnvelope, SessionId};
 use crate::policy::{ActorId, Frontend, Sha256Digest};
-use crate::runtime::task::TaskId;
+use crate::runtime::task::{TaskEvent, TaskId, TaskStatus};
+use crate::service::client::TaskServiceClient;
+use crate::service::protocol::{
+    SERVICE_PROTOCOL_VERSION, ServiceCommand, ServiceRequest, ServiceResult, StartTaskCommand,
+    TrustedStartTaskCommand,
+};
 use crate::sidecar::{ExecutionWorkspace, TrustedExecutable};
 use crate::storage::{
     ClientName, ExternalSessionId, TaskControlMutationClaim, TaskControlMutationInput,
@@ -757,6 +762,1138 @@ impl AcpServer {
     }
 }
 
+#[derive(Clone)]
+struct ServiceSessionBinding {
+    cwd: PathBuf,
+    model: ModelId,
+    effort: ReasoningEffort,
+    permission_mode: PermissionMode,
+    task_id: Option<TaskId>,
+    last_event_cursor: Option<u64>,
+    prompt_active: bool,
+    buzz_context: Option<BuzzContext>,
+}
+
+/// ACP transport adapter backed by Carl's persistent owner service. Dropping
+/// stdio drops only this client connection; it never sends service shutdown.
+pub struct ServiceAcpServer {
+    data_root: PathBuf,
+    client: TaskServiceClient,
+    config: AcpServerConfig,
+    info: crate::service::protocol::ServiceInfo,
+    initialized: bool,
+    sessions: std::sync::Arc<tokio::sync::Mutex<HashMap<String, ServiceSessionBinding>>>,
+    buzz_bootstrap: Option<BuzzPublisherBootstrap>,
+    buzz_publisher: Option<std::sync::Arc<BuzzPublisher>>,
+}
+
+impl fmt::Debug for ServiceAcpServer {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ServiceAcpServer")
+            .field("initialized", &self.initialized)
+            .field("frontend", &self.config.frontend)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ServiceAcpServer {
+    pub async fn new(
+        data_root: impl AsRef<std::path::Path>,
+        mut config: AcpServerConfig,
+    ) -> Result<Self, AcpServerError> {
+        if !matches!(config.frontend, Frontend::Acp | Frontend::Buzz)
+            || (config.frontend == Frontend::Acp && config.buzz_publisher.is_some())
+            || (config.frontend == Frontend::Buzz && config.buzz_publisher.is_none())
+        {
+            return Err(invalid_input());
+        }
+        let data_root = data_root.as_ref().to_path_buf();
+        let client = TaskServiceClient::connect(&data_root)
+            .await
+            .map_err(|_| server_error(AcpServerErrorCode::KernelFailed))?;
+        let info = client.info().clone();
+        let model = config
+            .model
+            .clone()
+            .or_else(|| info.default_model.clone())
+            .ok_or_else(invalid_input)?;
+        let descriptor = info
+            .models
+            .iter()
+            .find(|candidate| candidate.id == model)
+            .ok_or_else(invalid_input)?;
+        let effort = config.effort.unwrap_or(descriptor.default_effort);
+        if !descriptor.supported_efforts.contains(&effort) {
+            return Err(invalid_input());
+        }
+        config.model = Some(model);
+        config.effort = Some(effort);
+        let buzz_bootstrap = config.buzz_publisher.take();
+        Ok(Self {
+            data_root,
+            client,
+            config,
+            info,
+            initialized: false,
+            sessions: std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            buzz_bootstrap,
+            buzz_publisher: None,
+        })
+    }
+
+    pub async fn serve<R, W>(mut self, mut reader: R, writer: W) -> Result<(), AcpServerError>
+    where
+        R: AsyncBufRead + Unpin + Send + 'static,
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
+        let (outbound, receiver) = mpsc::channel(WRITER_CAPACITY);
+        let cancelled = CancellationToken::new();
+        let writer_cancel = cancelled.clone();
+        let writer_task =
+            tokio::spawn(async move { writer_loop(writer, receiver, writer_cancel).await });
+        let mut frontend_eof = false;
+        loop {
+            let frame = tokio::select! {
+                () = cancelled.cancelled() => break,
+                frame = read_frame(&mut reader, MAX_FRAME_BYTES) => frame,
+            }
+            .map_err(|_| server_error(AcpServerErrorCode::InvalidInput))?;
+            let Some(frame) = frame else {
+                frontend_eof = true;
+                break;
+            };
+            let id = frame.id().cloned();
+            let method = frame.method().map(str::to_owned);
+            let params = frame
+                .value()
+                .get("params")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            let response = match (method.as_deref(), id) {
+                (Some("initialize"), Some(id)) => {
+                    let result = self.service_initialize(params);
+                    service_outgoing(id, result)
+                }
+                (Some("session/new"), Some(id)) => {
+                    let result = self.service_new_session(params).await;
+                    service_outgoing(id, result)
+                }
+                (Some("session/load"), Some(id)) => {
+                    let replay_params = params.clone();
+                    let result = self.service_load_session(params).await;
+                    if result.is_ok() {
+                        self.start_service_replay(
+                            &replay_params,
+                            outbound.clone(),
+                            cancelled.clone(),
+                        )
+                        .await?;
+                    }
+                    service_outgoing(id, result)
+                }
+                (Some("session/set_config_option"), Some(id)) => {
+                    let result = self.service_set_config(params).await;
+                    service_outgoing(id, result)
+                }
+                (Some("session/prompt"), Some(id)) => {
+                    if self
+                        .start_service_prompt(
+                            params,
+                            id.clone(),
+                            outbound.clone(),
+                            cancelled.clone(),
+                        )
+                        .await
+                        .is_err()
+                    {
+                        service_outgoing(id, Err(invalid_input()))
+                    } else {
+                        continue;
+                    }
+                }
+                (Some("_session/steering"), Some(id)) => {
+                    let result = self.service_session_steer(params).await;
+                    service_outgoing(id, result)
+                }
+                (Some("session/cancel"), None) => {
+                    let _ = self.service_session_cancel(params).await;
+                    continue;
+                }
+                (Some("_task/status"), Some(id)) => {
+                    let result = self.service_task_status(params).await;
+                    service_outgoing(id, result)
+                }
+                (Some("_task/list"), Some(id)) => {
+                    let result = self.service_task_list(params).await;
+                    service_outgoing(id, result)
+                }
+                (Some("_task/context"), Some(id)) => {
+                    let result = self.service_task_context(params).await;
+                    service_outgoing(id, result)
+                }
+                (Some("_task/resume"), Some(id)) => {
+                    let result = self.service_task_mutation(params, "resume").await;
+                    service_outgoing(id, result)
+                }
+                (Some("_task/cancel"), Some(id)) => {
+                    let result = self.service_task_mutation(params, "cancel").await;
+                    service_outgoing(id, result)
+                }
+                (Some("_task/steer"), Some(id)) => {
+                    let result = self.service_task_mutation(params, "steer").await;
+                    service_outgoing(id, result)
+                }
+                (_, Some(id)) => OutgoingFrame::error(id, -32601, "method not found"),
+                (_, None) => continue,
+            };
+            enqueue(&outbound, response, &cancelled)?;
+        }
+        cancelled.cancel();
+        drop(outbound);
+        let writer_result = writer_task
+            .await
+            .map_err(|_| server_error(AcpServerErrorCode::Transport))?;
+        if frontend_eof { Ok(()) } else { writer_result }
+    }
+
+    fn service_initialize(&mut self, params: Value) -> Result<Value, AcpServerError> {
+        if self.initialized {
+            return Err(invalid_input());
+        }
+        let params = params.as_object().ok_or_else(invalid_input)?;
+        require_keys(
+            params,
+            &["protocolVersion", "clientInfo"],
+            &["clientCapabilities"],
+        )?;
+        let version = params
+            .get("protocolVersion")
+            .and_then(Value::as_u64)
+            .filter(|version| matches!(version, 1 | 2))
+            .ok_or_else(invalid_input)?;
+        let client = params
+            .get("clientInfo")
+            .and_then(Value::as_object)
+            .ok_or_else(invalid_input)?;
+        require_keys(client, &["name", "version"], &["title"])?;
+        bounded_string(client.get("name"), 128)?;
+        bounded_string(client.get("version"), 128)?;
+        self.initialized = true;
+        Ok(json!({
+            "protocolVersion":version,
+            "agentCapabilities":{
+                "loadSession":true,
+                "promptCapabilities":{
+                    "image":false,"audio":false,"embeddedContext":false,
+                    "mcpCapabilities":{"http":false,"sse":false}
+                },
+                "sessionCapabilities":{}
+            },
+            "agentInfo":{"name":"carl","title":"Carl","version":env!("CARGO_PKG_VERSION")},
+            "_meta":{"steering":{"supported":true},"persistentService":true}
+        }))
+    }
+
+    async fn service_new_session(&mut self, params: Value) -> Result<Value, AcpServerError> {
+        if !self.initialized {
+            return Err(invalid_input());
+        }
+        let params = params.as_object().ok_or_else(invalid_input)?;
+        require_keys(params, &["cwd", "mcpServers"], &[])?;
+        self.prepare_service_publisher(params.get("mcpServers"))
+            .await?;
+        let cwd = PathBuf::from(bounded_string(params.get("cwd"), 32 * 1024)?);
+        let canonical = std::fs::canonicalize(&cwd).map_err(|_| invalid_input())?;
+        if canonical != cwd || !canonical.is_dir() {
+            return Err(invalid_input());
+        }
+        let external = Uuid::new_v4().to_string();
+        let model = self.config.model.clone().ok_or_else(invalid_input)?;
+        let effort = self.config.effort.ok_or_else(invalid_input)?;
+        self.sessions.lock().await.insert(
+            external.clone(),
+            ServiceSessionBinding {
+                cwd,
+                model: model.clone(),
+                effort,
+                permission_mode: self.config.permission_mode,
+                task_id: None,
+                last_event_cursor: None,
+                prompt_active: false,
+                buzz_context: None,
+            },
+        );
+        Ok(json!({
+            "sessionId":external,
+            "configOptions":service_config_options(&self.info, &model, effort, self.config.permission_mode)
+        }))
+    }
+
+    async fn service_load_session(&mut self, params: Value) -> Result<Value, AcpServerError> {
+        if !self.initialized {
+            return Err(invalid_input());
+        }
+        let params = params.as_object().ok_or_else(invalid_input)?;
+        require_keys(
+            params,
+            &["sessionId", "cwd", "mcpServers"],
+            &["lastEventCursor", "taskId"],
+        )?;
+        self.prepare_service_publisher(params.get("mcpServers"))
+            .await?;
+        let external = bounded_string(params.get("sessionId"), 128)?;
+        let cwd = PathBuf::from(bounded_string(params.get("cwd"), 32 * 1024)?);
+        let canonical = std::fs::canonicalize(&cwd).map_err(|_| invalid_input())?;
+        if canonical != cwd || !canonical.is_dir() {
+            return Err(invalid_input());
+        }
+        let last_event_cursor = params.get("lastEventCursor").map_or(Ok(None), |value| {
+            value.as_u64().map(Some).ok_or_else(invalid_input)
+        })?;
+        let requested_task = params
+            .get("taskId")
+            .map(|value| {
+                bounded_string(Some(value), 128)?
+                    .parse()
+                    .map_err(|_| invalid_input())
+            })
+            .transpose()?;
+        let service_session = match self
+            .service_request(ServiceCommand::Session {
+                external_session_id: external.clone(),
+            })
+            .await?
+        {
+            ServiceResult::Session(session) => session,
+            _ => return Err(server_error(AcpServerErrorCode::KernelFailed)),
+        };
+        if service_session.frontend != self.config.frontend
+            || service_session.workspace != cwd
+            || requested_task.is_some_and(|task_id| !service_session.task_ids.contains(&task_id))
+        {
+            return Err(invalid_input());
+        }
+        let task_id = requested_task.or_else(|| service_session.task_ids.first().copied());
+        let model = self.config.model.clone().ok_or_else(invalid_input)?;
+        let effort = self.config.effort.ok_or_else(invalid_input)?;
+        self.sessions.lock().await.insert(
+            external.clone(),
+            ServiceSessionBinding {
+                cwd,
+                model: model.clone(),
+                effort,
+                permission_mode: service_session.permission_mode,
+                task_id,
+                last_event_cursor,
+                prompt_active: false,
+                buzz_context: None,
+            },
+        );
+        Ok(json!({
+            "sessionId":external,
+            "configOptions":service_config_options(&self.info, &model, effort, service_session.permission_mode),
+            "_meta":{"lastEventCursor":last_event_cursor,"taskId":task_id}
+        }))
+    }
+
+    async fn start_service_replay(
+        &mut self,
+        params: &Value,
+        outbound: mpsc::Sender<OutgoingFrame>,
+        cancelled: CancellationToken,
+    ) -> Result<(), AcpServerError> {
+        let params = params.as_object().ok_or_else(invalid_input)?;
+        let external = bounded_string(params.get("sessionId"), 128)?;
+        let session = self
+            .sessions
+            .lock()
+            .await
+            .get(&external)
+            .cloned()
+            .ok_or_else(invalid_input)?;
+        let Some(task_id) = session.task_id else {
+            return Ok(());
+        };
+        let data_root = self.data_root.clone();
+        let sessions = std::sync::Arc::clone(&self.sessions);
+        tokio::spawn(async move {
+            replay_service_events(
+                data_root,
+                sessions,
+                external,
+                task_id,
+                session.last_event_cursor,
+                outbound,
+                cancelled,
+            )
+            .await;
+        });
+        Ok(())
+    }
+
+    async fn service_set_config(&mut self, params: Value) -> Result<Value, AcpServerError> {
+        let params = params.as_object().ok_or_else(invalid_input)?;
+        require_keys(params, &["sessionId", "configId", "value"], &[])?;
+        let external = bounded_string(params.get("sessionId"), 128)?;
+        let config_id = bounded_string(params.get("configId"), 64)?;
+        let value = bounded_string(params.get("value"), 128)?;
+        let mut session = self
+            .sessions
+            .lock()
+            .await
+            .get(&external)
+            .cloned()
+            .ok_or_else(invalid_input)?;
+        match config_id.as_str() {
+            "model" => session.model = ModelId::parse(value).map_err(|_| invalid_input())?,
+            "thought_level" => session.effort = parse_effort(&value)?,
+            "mode" => session.permission_mode = value.parse().map_err(|_| invalid_input())?,
+            _ => return Err(invalid_input()),
+        }
+        validate_service_selection(&self.info, &session.model, session.effort)?;
+        if let Some(task_id) = session.task_id {
+            match self
+                .service_request(ServiceCommand::Configure {
+                    task_id,
+                    model: session.model.clone(),
+                    effort: session.effort,
+                    permission_mode: session.permission_mode,
+                })
+                .await?
+            {
+                ServiceResult::Applied => {}
+                _ => return Err(server_error(AcpServerErrorCode::KernelFailed)),
+            }
+        }
+        self.sessions.lock().await.insert(external, session.clone());
+        Ok(json!({
+            "configOptions":service_config_options(
+                &self.info,
+                &session.model,
+                session.effort,
+                session.permission_mode
+            )
+        }))
+    }
+
+    async fn start_service_prompt(
+        &mut self,
+        params: Value,
+        id: JsonRpcId,
+        outbound: mpsc::Sender<OutgoingFrame>,
+        cancelled: CancellationToken,
+    ) -> Result<(), AcpServerError> {
+        let params = params.as_object().ok_or_else(invalid_input)?;
+        require_keys(params, &["sessionId", "prompt"], &[])?;
+        let external = bounded_string(params.get("sessionId"), 128)?;
+        let blocks = parse_service_prompt_blocks(params.get("prompt"))?;
+        let text = blocks.join("\n\n");
+        let mut session = self
+            .sessions
+            .lock()
+            .await
+            .get(&external)
+            .cloned()
+            .ok_or_else(invalid_input)?;
+        if session.prompt_active {
+            return Err(invalid_input());
+        }
+        let buzz_context = if self.config.frontend == Frontend::Buzz {
+            let refs = blocks.iter().map(String::as_str).collect::<Vec<_>>();
+            Some(BuzzContext::parse(&refs).map_err(|_| invalid_input())?)
+        } else {
+            None
+        };
+        let reusable_task = if let Some(task_id) = session.task_id {
+            match self
+                .service_request(ServiceCommand::Status { task_id })
+                .await?
+            {
+                ServiceResult::Snapshot(snapshot) if !snapshot.status.is_terminal() => {
+                    Some(task_id)
+                }
+                ServiceResult::Snapshot(_) => None,
+                _ => return Err(server_error(AcpServerErrorCode::KernelFailed)),
+            }
+        } else {
+            None
+        };
+        let request_id = Uuid::new_v4().to_string();
+        let result = if let Some(task_id) = reusable_task {
+            self.client
+                .request(ServiceRequest {
+                    protocol_version: SERVICE_PROTOCOL_VERSION,
+                    request_id: request_id.clone(),
+                    idempotency_key: request_id,
+                    command: service_steer_command(
+                        &session,
+                        &external,
+                        task_id,
+                        text,
+                        buzz_context.as_ref(),
+                        self.config.frontend,
+                    )?,
+                })
+                .await
+        } else {
+            self.client
+                .request(ServiceRequest {
+                    protocol_version: SERVICE_PROTOCOL_VERSION,
+                    request_id: request_id.clone(),
+                    idempotency_key: request_id,
+                    command: service_start_command(
+                        &session,
+                        &external,
+                        text,
+                        buzz_context.as_ref(),
+                        self.config.frontend,
+                    )?,
+                })
+                .await
+        }
+        .map_err(|_| server_error(AcpServerErrorCode::KernelFailed))?;
+        let task_id = match result {
+            ServiceResult::Accepted { task_id } => {
+                session.task_id = Some(task_id);
+                session.last_event_cursor = None;
+                task_id
+            }
+            ServiceResult::Applied => session.task_id.ok_or_else(invalid_input)?,
+            _ => return Err(server_error(AcpServerErrorCode::KernelFailed)),
+        };
+        session.prompt_active = true;
+        session.buzz_context = buzz_context;
+        let cursor = session.last_event_cursor;
+        self.sessions.lock().await.insert(external.clone(), session);
+        let data_root = self.data_root.clone();
+        let sessions = std::sync::Arc::clone(&self.sessions);
+        tokio::spawn(async move {
+            poll_service_prompt(
+                data_root, sessions, external, task_id, cursor, id, outbound, cancelled,
+            )
+            .await;
+        });
+        Ok(())
+    }
+
+    async fn service_session_steer(&mut self, params: Value) -> Result<Value, AcpServerError> {
+        let params = params.as_object().ok_or_else(invalid_input)?;
+        require_keys(params, &["sessionId", "prompt"], &[])?;
+        let external = bounded_string(params.get("sessionId"), 128)?;
+        let blocks = parse_service_prompt_blocks(params.get("prompt"))?;
+        let text = blocks.join("\n\n");
+        let session = self
+            .sessions
+            .lock()
+            .await
+            .get(&external)
+            .cloned()
+            .ok_or_else(invalid_input)?;
+        let task_id = session.task_id.ok_or_else(invalid_input)?;
+        let buzz_context = if self.config.frontend == Frontend::Buzz {
+            let refs = blocks.iter().map(String::as_str).collect::<Vec<_>>();
+            Some(BuzzContext::parse(&refs).map_err(|_| invalid_input())?)
+        } else {
+            None
+        };
+        match self
+            .service_request(service_steer_command(
+                &session,
+                &external,
+                task_id,
+                text,
+                buzz_context.as_ref(),
+                self.config.frontend,
+            )?)
+            .await?
+        {
+            ServiceResult::Applied => Ok(json!({"outcome":"injected","taskId":task_id})),
+            _ => Err(server_error(AcpServerErrorCode::KernelFailed)),
+        }
+    }
+
+    async fn service_session_cancel(&mut self, params: Value) -> Result<(), AcpServerError> {
+        let params = params.as_object().ok_or_else(invalid_input)?;
+        require_keys(params, &["sessionId"], &[])?;
+        let external = bounded_string(params.get("sessionId"), 128)?;
+        let task_id = self
+            .sessions
+            .lock()
+            .await
+            .get(&external)
+            .and_then(|session| session.task_id)
+            .ok_or_else(invalid_input)?;
+        match self
+            .service_request(ServiceCommand::Cancel { task_id })
+            .await?
+        {
+            ServiceResult::Applied => Ok(()),
+            _ => Err(server_error(AcpServerErrorCode::KernelFailed)),
+        }
+    }
+
+    async fn service_task_status(&mut self, params: Value) -> Result<Value, AcpServerError> {
+        let task_id = self.bound_service_task(&params).await?;
+        let result = self
+            .service_request(ServiceCommand::Status { task_id })
+            .await?;
+        match result {
+            ServiceResult::Snapshot(task) => Ok(json!({"task":task})),
+            _ => Err(server_error(AcpServerErrorCode::KernelFailed)),
+        }
+    }
+
+    async fn service_task_list(&mut self, params: Value) -> Result<Value, AcpServerError> {
+        let params = params.as_object().ok_or_else(invalid_input)?;
+        require_keys(params, &["sessionId"], &[])?;
+        let external = bounded_string(params.get("sessionId"), 128)?;
+        let session = self
+            .sessions
+            .lock()
+            .await
+            .get(&external)
+            .cloned()
+            .ok_or_else(invalid_input)?;
+        match self.service_request(ServiceCommand::List).await? {
+            ServiceResult::TaskList(tasks) => Ok(
+                json!({"tasks":tasks.into_iter().filter(|task| Some(task.task_id) == session.task_id).collect::<Vec<_>>() }),
+            ),
+            _ => Err(server_error(AcpServerErrorCode::KernelFailed)),
+        }
+    }
+
+    async fn service_task_context(&mut self, params: Value) -> Result<Value, AcpServerError> {
+        let task_id = self.bound_service_task(&params).await?;
+        match self
+            .service_request(ServiceCommand::Status { task_id })
+            .await?
+        {
+            ServiceResult::Snapshot(task) => {
+                Ok(json!({"context":super::TaskContextView::from(&task)}))
+            }
+            _ => Err(server_error(AcpServerErrorCode::KernelFailed)),
+        }
+    }
+
+    async fn service_task_mutation(
+        &mut self,
+        params: Value,
+        method: &'static str,
+    ) -> Result<Value, AcpServerError> {
+        if self.config.frontend == Frontend::Buzz && method == "steer" {
+            return Err(invalid_input());
+        }
+        let (task_id, idempotency_key) = self
+            .bound_service_mutation(&params, method == "steer")
+            .await?;
+        let params = params.as_object().ok_or_else(invalid_input)?;
+        let command = match method {
+            "resume" => ServiceCommand::Resume { task_id },
+            "cancel" => ServiceCommand::Cancel { task_id },
+            "steer" => ServiceCommand::Steer {
+                task_id,
+                text: bounded_text(
+                    params.get("text"),
+                    crate::service::protocol::MAX_TASK_TEXT_BYTES,
+                )?,
+            },
+            _ => return Err(invalid_input()),
+        };
+        match self
+            .service_request_with_key(command, idempotency_key)
+            .await?
+        {
+            ServiceResult::Applied => Ok(json!({"outcome":"accepted","taskId":task_id})),
+            _ => Err(server_error(AcpServerErrorCode::KernelFailed)),
+        }
+    }
+
+    async fn bound_service_task(&mut self, params: &Value) -> Result<TaskId, AcpServerError> {
+        let params = params.as_object().ok_or_else(invalid_input)?;
+        require_keys(params, &["sessionId", "taskId"], &[])?;
+        let external = bounded_string(params.get("sessionId"), 128)?;
+        let task_id = bounded_string(params.get("taskId"), 128)?
+            .parse::<TaskId>()
+            .map_err(|_| invalid_input())?;
+        let matches = self
+            .sessions
+            .lock()
+            .await
+            .get(&external)
+            .is_some_and(|session| session.task_id == Some(task_id));
+        if !matches {
+            return Err(invalid_input());
+        }
+        Ok(task_id)
+    }
+
+    async fn bound_service_mutation(
+        &mut self,
+        params: &Value,
+        steer: bool,
+    ) -> Result<(TaskId, String), AcpServerError> {
+        let params = params.as_object().ok_or_else(invalid_input)?;
+        let optional = if steer { &["text"][..] } else { &[][..] };
+        require_keys(params, &["sessionId", "taskId", "idempotencyKey"], optional)?;
+        if steer && !params.contains_key("text") {
+            return Err(invalid_input());
+        }
+        let external = bounded_string(params.get("sessionId"), 128)?;
+        let task_id = bounded_string(params.get("taskId"), 128)?
+            .parse::<TaskId>()
+            .map_err(|_| invalid_input())?;
+        let idempotency_key = bounded_string(params.get("idempotencyKey"), 128)?;
+        let matches = self
+            .sessions
+            .lock()
+            .await
+            .get(&external)
+            .is_some_and(|session| session.task_id == Some(task_id));
+        if !matches {
+            return Err(invalid_input());
+        }
+        Ok((task_id, idempotency_key))
+    }
+
+    async fn prepare_service_publisher(
+        &mut self,
+        servers: Option<&Value>,
+    ) -> Result<(), AcpServerError> {
+        let servers = servers
+            .and_then(Value::as_array)
+            .ok_or_else(invalid_input)?;
+        match self.config.frontend {
+            Frontend::Acp if servers.is_empty() => Ok(()),
+            Frontend::Buzz => {
+                let configuration =
+                    BuzzPublisherConfig::from_mcp_servers(&Value::Array(servers.clone()))
+                        .map_err(|_| invalid_input())?;
+                if self.buzz_publisher.is_none() {
+                    let bootstrap = self.buzz_bootstrap.take().ok_or_else(invalid_input)?;
+                    let publisher = BuzzPublisher::connect(
+                        bootstrap.executable,
+                        bootstrap.workspace,
+                        configuration,
+                    )
+                    .await
+                    .map_err(|_| invalid_input())?;
+                    self.buzz_publisher = Some(std::sync::Arc::new(publisher));
+                }
+                Ok(())
+            }
+            _ => Err(invalid_input()),
+        }
+    }
+
+    async fn service_request(
+        &mut self,
+        command: ServiceCommand,
+    ) -> Result<ServiceResult, AcpServerError> {
+        self.service_request_with_key(command, Uuid::new_v4().to_string())
+            .await
+    }
+
+    async fn service_request_with_key(
+        &mut self,
+        command: ServiceCommand,
+        idempotency_key: String,
+    ) -> Result<ServiceResult, AcpServerError> {
+        self.client
+            .request(ServiceRequest {
+                protocol_version: SERVICE_PROTOCOL_VERSION,
+                request_id: Uuid::new_v4().to_string(),
+                idempotency_key,
+                command,
+            })
+            .await
+            .map_err(|_| server_error(AcpServerErrorCode::KernelFailed))
+    }
+}
+
+fn service_start_command(
+    session: &ServiceSessionBinding,
+    external_session_id: &str,
+    request: String,
+    buzz_context: Option<&BuzzContext>,
+    frontend: Frontend,
+) -> Result<ServiceCommand, AcpServerError> {
+    let start = StartTaskCommand {
+        external_session_id: external_session_id.to_owned(),
+        workspace: session.cwd.clone(),
+        request,
+        model: session.model.clone(),
+        effort: session.effort,
+        permission_mode: session.permission_mode,
+    };
+    match frontend {
+        Frontend::Acp if buzz_context.is_none() => Ok(ServiceCommand::StartTask(start)),
+        Frontend::Buzz => {
+            let context = buzz_context.ok_or_else(invalid_input)?;
+            Ok(ServiceCommand::StartTrustedTask(TrustedStartTaskCommand {
+                start,
+                frontend,
+                actor_id: ActorId::parse(context.actor_hex()).map_err(|_| invalid_input())?,
+                channel_id: context.channel_id().to_string(),
+                event_id: context.reply_to().to_owned(),
+            }))
+        }
+        _ => Err(invalid_input()),
+    }
+}
+
+fn service_steer_command(
+    session: &ServiceSessionBinding,
+    external_session_id: &str,
+    task_id: TaskId,
+    text: String,
+    buzz_context: Option<&BuzzContext>,
+    frontend: Frontend,
+) -> Result<ServiceCommand, AcpServerError> {
+    match frontend {
+        Frontend::Acp if buzz_context.is_none() => Ok(ServiceCommand::Steer { task_id, text }),
+        Frontend::Buzz => {
+            let context = buzz_context.ok_or_else(invalid_input)?;
+            Ok(ServiceCommand::SteerTrusted {
+                task_id,
+                external_session_id: external_session_id.to_owned(),
+                text,
+                workspace: session.cwd.clone(),
+                frontend,
+                actor_id: ActorId::parse(context.actor_hex()).map_err(|_| invalid_input())?,
+                channel_id: context.channel_id().to_string(),
+                event_id: context.reply_to().to_owned(),
+            })
+        }
+        _ => Err(invalid_input()),
+    }
+}
+
+fn validate_service_selection(
+    info: &crate::service::protocol::ServiceInfo,
+    model: &ModelId,
+    effort: ReasoningEffort,
+) -> Result<(), AcpServerError> {
+    if info
+        .models
+        .iter()
+        .any(|candidate| candidate.id == *model && candidate.supported_efforts.contains(&effort))
+    {
+        Ok(())
+    } else {
+        Err(invalid_input())
+    }
+}
+
+fn parse_service_prompt_blocks(value: Option<&Value>) -> Result<Vec<String>, AcpServerError> {
+    let blocks = parse_prompt_blocks(value)?;
+    let aggregate = blocks
+        .iter()
+        .map(String::len)
+        .sum::<usize>()
+        .saturating_add(blocks.len().saturating_sub(1).saturating_mul(2));
+    if aggregate > crate::service::protocol::MAX_TASK_TEXT_BYTES {
+        return Err(invalid_input());
+    }
+    Ok(blocks)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn poll_service_prompt(
+    data_root: PathBuf,
+    sessions: std::sync::Arc<tokio::sync::Mutex<HashMap<String, ServiceSessionBinding>>>,
+    external_session_id: String,
+    task_id: TaskId,
+    mut cursor: Option<u64>,
+    response_id: JsonRpcId,
+    outbound: mpsc::Sender<OutgoingFrame>,
+    cancelled: CancellationToken,
+) {
+    let Ok(mut client) = TaskServiceClient::connect_with_cursor(&data_root, cursor).await else {
+        let _ = enqueue(
+            &outbound,
+            OutgoingFrame::error(response_id, -32000, "service unavailable"),
+            &cancelled,
+        );
+        return;
+    };
+    loop {
+        if cancelled.is_cancelled() {
+            return;
+        }
+        let event_key = Uuid::new_v4().to_string();
+        let events = client
+            .request(ServiceRequest {
+                protocol_version: SERVICE_PROTOCOL_VERSION,
+                request_id: Uuid::new_v4().to_string(),
+                idempotency_key: event_key,
+                command: ServiceCommand::Events {
+                    task_id,
+                    after_sequence: cursor,
+                    limit: 128,
+                },
+            })
+            .await;
+        let Ok(ServiceResult::Events(events)) = events else {
+            let _ = enqueue(
+                &outbound,
+                OutgoingFrame::error(response_id, -32000, "service event stream failed"),
+                &cancelled,
+            );
+            return;
+        };
+        for event in events {
+            if cursor.is_some_and(|sequence| event.sequence <= sequence) {
+                continue;
+            }
+            cursor = Some(event.sequence);
+            for params in render_service_event(&external_session_id, task_id, &event) {
+                let Ok(frame) = OutgoingFrame::notification("session/update", params) else {
+                    return;
+                };
+                if enqueue(&outbound, frame, &cancelled).is_err() {
+                    return;
+                }
+            }
+        }
+        let status_key = Uuid::new_v4().to_string();
+        let status = client
+            .request(ServiceRequest {
+                protocol_version: SERVICE_PROTOCOL_VERSION,
+                request_id: Uuid::new_v4().to_string(),
+                idempotency_key: status_key,
+                command: ServiceCommand::Status { task_id },
+            })
+            .await;
+        let Ok(ServiceResult::Snapshot(snapshot)) = status else {
+            let _ = enqueue(
+                &outbound,
+                OutgoingFrame::error(response_id, -32000, "service status failed"),
+                &cancelled,
+            );
+            return;
+        };
+        if snapshot.status.is_terminal()
+            || matches!(snapshot.status, TaskStatus::Blocked | TaskStatus::Paused)
+        {
+            if let Some(session) = sessions.lock().await.get_mut(&external_session_id) {
+                session.last_event_cursor = cursor;
+                session.prompt_active = false;
+            }
+            let stop_reason = match snapshot.status {
+                TaskStatus::Completed => "end_turn",
+                TaskStatus::Cancelled => "cancelled",
+                TaskStatus::Blocked | TaskStatus::Paused => "waiting_for_approval",
+                TaskStatus::Failed => "failed",
+                _ => "failed",
+            };
+            let _ = enqueue(
+                &outbound,
+                OutgoingFrame::result(
+                    response_id,
+                    json!({
+                        "stopReason":stop_reason,
+                        "_meta":{"taskId":task_id,"lastEventCursor":cursor}
+                    }),
+                ),
+                &cancelled,
+            );
+            return;
+        }
+        tokio::select! {
+            () = cancelled.cancelled() => return,
+            () = tokio::time::sleep(std::time::Duration::from_millis(25)) => {}
+        }
+    }
+}
+
+async fn replay_service_events(
+    data_root: PathBuf,
+    sessions: std::sync::Arc<tokio::sync::Mutex<HashMap<String, ServiceSessionBinding>>>,
+    external_session_id: String,
+    task_id: TaskId,
+    mut cursor: Option<u64>,
+    outbound: mpsc::Sender<OutgoingFrame>,
+    cancelled: CancellationToken,
+) {
+    let Ok(mut client) = TaskServiceClient::connect_with_cursor(&data_root, cursor).await else {
+        return;
+    };
+    loop {
+        if cancelled.is_cancelled() {
+            return;
+        }
+        let key = Uuid::new_v4().to_string();
+        let Ok(ServiceResult::Events(events)) = client
+            .request(ServiceRequest {
+                protocol_version: SERVICE_PROTOCOL_VERSION,
+                request_id: Uuid::new_v4().to_string(),
+                idempotency_key: key,
+                command: ServiceCommand::Events {
+                    task_id,
+                    after_sequence: cursor,
+                    limit: 128,
+                },
+            })
+            .await
+        else {
+            return;
+        };
+        let fetched = events.len();
+        for event in events {
+            if cancelled.is_cancelled() || cursor.is_some_and(|sequence| event.sequence <= sequence)
+            {
+                return;
+            }
+            cursor = Some(event.sequence);
+            for params in render_service_event(&external_session_id, task_id, &event) {
+                let Ok(frame) = OutgoingFrame::notification("session/update", params) else {
+                    return;
+                };
+                if enqueue(&outbound, frame, &cancelled).is_err() {
+                    return;
+                }
+            }
+        }
+        if let Some(session) = sessions.lock().await.get_mut(&external_session_id) {
+            session.last_event_cursor = cursor;
+        }
+
+        let status_key = Uuid::new_v4().to_string();
+        let Ok(ServiceResult::Snapshot(snapshot)) = client
+            .request(ServiceRequest {
+                protocol_version: SERVICE_PROTOCOL_VERSION,
+                request_id: Uuid::new_v4().to_string(),
+                idempotency_key: status_key,
+                command: ServiceCommand::Status { task_id },
+            })
+            .await
+        else {
+            return;
+        };
+        if snapshot.status.is_terminal()
+            || matches!(snapshot.status, TaskStatus::Blocked | TaskStatus::Paused)
+        {
+            return;
+        }
+        if fetched < 128 {
+            tokio::select! {
+                () = cancelled.cancelled() => return,
+                () = tokio::time::sleep(std::time::Duration::from_millis(25)) => {}
+            }
+        }
+    }
+}
+
+fn render_service_event(session_id: &str, task_id: TaskId, envelope: &EventEnvelope) -> Vec<Value> {
+    let Event::TaskLifecycle { event, .. } = &envelope.event else {
+        return Vec::new();
+    };
+    let update = match event {
+        TaskEvent::Created { .. } => json!({
+            "sessionUpdate":"task_status","taskId":task_id,"status":"queued"
+        }),
+        TaskEvent::StateTransitioned { to, .. } => json!({
+            "sessionUpdate":"task_status","taskId":task_id,"status":to
+        }),
+        TaskEvent::ContractRevised { contract } => json!({
+            "sessionUpdate":"completion_clauses","taskId":task_id,
+            "clauses":contract.clauses
+        }),
+        TaskEvent::EpochStarted {
+            epoch_id,
+            objective,
+        } => json!({
+            "sessionUpdate":"epoch_objective","taskId":task_id,
+            "epochId":epoch_id,"objective":objective
+        }),
+        TaskEvent::CheckpointCommitted {
+            checkpoint_id,
+            digest,
+        } => json!({
+            "sessionUpdate":"checkpoint_committed","taskId":task_id,
+            "checkpointId":checkpoint_id,"digest":digest
+        }),
+        TaskEvent::UsageObserved {
+            total_tokens,
+            context_window,
+            ..
+        } => json!({
+            "sessionUpdate":"context_usage","taskId":task_id,
+            "totalTokens":total_tokens,"contextWindow":context_window
+        }),
+        TaskEvent::CompactionCompleted { generation, .. } => json!({
+            "sessionUpdate":"compaction","taskId":task_id,"generation":generation
+        }),
+        TaskEvent::OperationIntentRecorded {
+            operation_id,
+            effect_class,
+            ..
+        } => json!({
+            "sessionUpdate":"tool_call","taskId":task_id,
+            "toolCallId":operation_id,"title":format!("{effect_class:?}"),
+            "kind":"execute","status":"pending"
+        }),
+        TaskEvent::OperationTransitioned {
+            operation_id, to, ..
+        } => json!({
+            "sessionUpdate":"tool_call_update","taskId":task_id,
+            "toolCallId":operation_id,"status":format!("{to:?}").to_lowercase()
+        }),
+        TaskEvent::ConfigurationQueued {
+            model,
+            effort,
+            permission_mode,
+            ..
+        } => json!({
+            "sessionUpdate":"session_info_update","taskId":task_id,
+            "_meta":{"model":model.as_str(),"thoughtLevel":effort.as_codex_value(),
+                "mode":permission_mode.as_wire_str(),"pending":true}
+        }),
+        TaskEvent::CancellationRequested => json!({
+            "sessionUpdate":"task_status","taskId":task_id,"status":"cancelling"
+        }),
+        TaskEvent::Blocked { reason } => json!({
+            "sessionUpdate":"task_status","taskId":task_id,"status":"blocked","reason":reason
+        }),
+        TaskEvent::Completed => json!({
+            "sessionUpdate":"task_status","taskId":task_id,"status":"completed"
+        }),
+        _ => return Vec::new(),
+    };
+    vec![json!({
+        "sessionId":session_id,
+        "update":update,
+        "_meta":{"eventSequence":envelope.sequence}
+    })]
+}
+
+fn service_outgoing(id: JsonRpcId, result: Result<Value, AcpServerError>) -> OutgoingFrame {
+    match result {
+        Ok(value) => OutgoingFrame::result(id, value),
+        Err(_) => OutgoingFrame::error(id, -32602, "invalid params"),
+    }
+}
+
+fn service_config_options(
+    info: &crate::service::protocol::ServiceInfo,
+    model: &ModelId,
+    effort: ReasoningEffort,
+    mode: PermissionMode,
+) -> Vec<Value> {
+    let effort_options = info
+        .models
+        .iter()
+        .find(|candidate| candidate.id == *model)
+        .map(|candidate| candidate.supported_efforts.as_slice())
+        .unwrap_or(&[]);
+    vec![
+        json!({"configId":"model","name":"Model","type":"select","currentValue":model.as_str(),"options":info.models.iter().map(|candidate| json!({"value":candidate.id.as_str(),"displayName":candidate.display_name})).collect::<Vec<_>>()}),
+        json!({"configId":"thought_level","name":"Thought level","type":"select","currentValue":effort.as_codex_value(),"options":effort_options.iter().map(|candidate| json!({"value":candidate.as_codex_value(),"displayName":candidate.as_codex_value()})).collect::<Vec<_>>()}),
+        json!({"configId":"mode","name":"Mode","type":"select","currentValue":mode.as_wire_str(),"options":PermissionMode::ALL.map(|candidate| json!({"value":candidate.as_wire_str(),"displayName":candidate.as_wire_str()}))}),
+    ]
+}
+
 fn enqueue_result(
     outbound: &mpsc::Sender<OutgoingFrame>,
     id: JsonRpcId,
@@ -790,12 +1927,16 @@ where
     W: AsyncWrite + Unpin,
 {
     while let Some(frame) = receiver.recv().await {
-        if write_frame(&mut writer, &frame, MAX_FRAME_BYTES)
-            .await
-            .is_err()
-        {
-            cancelled.cancel();
-            return Err(server_error(AcpServerErrorCode::Transport));
+        tokio::select! {
+            () = cancelled.cancelled() => {
+                return Err(server_error(AcpServerErrorCode::OutputUnavailable));
+            }
+            result = write_frame(&mut writer, &frame, MAX_FRAME_BYTES) => {
+                if result.is_err() {
+                    cancelled.cancel();
+                    return Err(server_error(AcpServerErrorCode::Transport));
+                }
+            }
         }
     }
     Ok(())

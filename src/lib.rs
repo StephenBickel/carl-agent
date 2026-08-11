@@ -11,6 +11,7 @@ pub mod policy;
 pub mod providers;
 pub mod runtime;
 pub mod security;
+pub mod service;
 pub mod sidecar;
 pub mod staging;
 pub mod storage;

@@ -13,8 +13,8 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::acp::{
-    AcpServer, AcpServerConfig, AcpServerErrorCode, BuzzPublisher, BuzzPublisherBootstrap,
-    BuzzPublisherConfig, Kernel, PermissionMode,
+    AcpServerConfig, BuzzPublisher, BuzzPublisherBootstrap, BuzzPublisherConfig, PermissionMode,
+    ServiceAcpServer,
 };
 use crate::auth::codex::{CODEX_LOGOUT_WARNING, CodexAuth, CodexAuthTimeouts};
 use crate::auth::grok::{GrokAuth, GrokAuthTimeouts};
@@ -31,6 +31,7 @@ use crate::memory::{
     MemoryKind, MemoryPartition, MemoryQuery, MemoryScope, MemorySettings, MemoryWrite,
 };
 use crate::policy::Frontend;
+use crate::service::server::TaskService;
 use crate::sidecar::{
     DataRootLock, DataRootLockErrorCode, ExecutableTrustDecision, ExecutionWorkspace,
     ProviderEnvironmentProfile, ProviderHome, ResolvedExecutable, SidecarError, SidecarErrorCode,
@@ -544,10 +545,79 @@ where
         Command::Acp(_) => CliRunResult::not_implemented("acp streaming dispatch"),
         Command::Memory { command } => run_memory(command),
         Command::Trust { command } => run_trust(command),
-        Command::Serve => CliRunResult::not_implemented("serve"),
+        Command::Serve => run_serve(cancellation.as_mut()).await,
         Command::Pair => CliRunResult::not_implemented("pair"),
         Command::Doctor => CliRunResult::not_implemented("doctor"),
         Command::Sessions => CliRunResult::not_implemented("sessions"),
+    }
+}
+
+async fn run_serve<C>(mut cancellation: Pin<&mut C>) -> CliRunResult
+where
+    C: Future<Output = ()> + ?Sized,
+{
+    if env::var_os("OPENAI_API_KEY").is_some() {
+        return service_cli_result(
+            ExitClassification::Failure,
+            "carl serve: API-key authentication is not supported",
+        );
+    }
+    let Ok(configuration) = load_common_configuration() else {
+        return service_cli_result(
+            ExitClassification::Failure,
+            "carl serve: invalid Carl data directory or workspace",
+        );
+    };
+    let Ok((codex_executable, codex_home)) = prepare_provider(AuthService::Openai, &configuration)
+    else {
+        return service_cli_result(
+            ExitClassification::Failure,
+            "carl serve: Codex executable or provider home is invalid",
+        );
+    };
+    let Ok(codex) =
+        CodexAppServer::connect(&codex_executable, codex_home, SidecarLimits::default()).await
+    else {
+        return service_cli_result(
+            ExitClassification::Failure,
+            "carl serve: Codex app-server startup failed",
+        );
+    };
+    let Ok(service) = TaskService::bind(&configuration.data_root, codex).await else {
+        return service_cli_result(
+            ExitClassification::Failure,
+            "carl serve: Carl data directory is unsafe or already owned",
+        );
+    };
+    let stop = CancellationToken::new();
+    let serve = service.serve(stop.clone());
+    tokio::pin!(serve);
+    let (result, cancelled) = tokio::select! {
+        result = &mut serve => (result, false),
+        () = cancellation.as_mut() => {
+            stop.cancel();
+            (serve.await, true)
+        }
+    };
+    match (result, cancelled) {
+        (Ok(()), false) => service_cli_result(ExitClassification::Success, ""),
+        (Ok(()), true) => service_cli_result(ExitClassification::Cancelled, ""),
+        (Err(_), _) => service_cli_result(
+            ExitClassification::Failure,
+            "carl serve: persistent task service failed",
+        ),
+    }
+}
+
+fn service_cli_result(exit: ExitClassification, message: &'static str) -> CliRunResult {
+    CliRunResult {
+        stdout: String::new(),
+        stderr: if message.is_empty() {
+            String::new()
+        } else {
+            format!("{message}\n")
+        },
+        exit,
     }
 }
 
@@ -618,44 +688,27 @@ pub async fn run_acp_stdio(args: AcpArgs) -> ExitClassification {
     let Ok(configuration) = load_common_configuration() else {
         return acp_failure("carl acp: invalid Carl data directory or workspace");
     };
-    let Ok(data_root_lock) = acquire_data_root_lock(&configuration) else {
-        return acp_failure("carl acp: Carl data directory is unsafe or already in use");
-    };
-    let Ok((codex_executable, codex_home)) = prepare_provider(AuthService::Openai, &configuration)
-    else {
-        return acp_failure("carl acp: Codex executable or provider home is invalid");
-    };
     let frontend = if env::var_os("BUZZ_ACP_AGENTS").as_deref() == Some(std::ffi::OsStr::new("1")) {
         Frontend::Buzz
     } else {
         Frontend::Acp
     };
-    let buzz_publisher = if frontend == Frontend::Buzz {
-        let Ok(executable) = prepare_buzz_executable() else {
-            return acp_failure("carl acp: Buzz executable is unavailable or untrusted");
-        };
-        let Ok(workspace) = ExecutionWorkspace::open(&configuration.workspace) else {
-            return acp_failure("carl acp: workspace is invalid");
-        };
-        Some(BuzzPublisherBootstrap::new(executable, workspace))
-    } else {
-        None
-    };
-    let Ok(runtime_store) = crate::storage::RuntimeStore::open(data_root_lock, Utc::now()) else {
-        return acp_failure("carl acp: durable state failed to open");
-    };
-    let Ok(codex) =
-        CodexAppServer::connect(&codex_executable, codex_home, SidecarLimits::default()).await
-    else {
-        return acp_failure("carl acp: Codex app-server startup failed");
-    };
-    let Ok(kernel) = Kernel::start(runtime_store, codex, None).await else {
-        return acp_failure("carl acp: Codex model discovery failed");
-    };
+    try_run_service_acp(&configuration, args, frontend)
+        .await
+        .unwrap_or_else(|| {
+            acp_failure("carl acp: persistent service unavailable; run `carl serve`")
+        })
+}
+
+async fn try_run_service_acp(
+    configuration: &CommonConfiguration,
+    args: AcpArgs,
+    frontend: Frontend,
+) -> Option<ExitClassification> {
     let model = match args.model {
         Some(model) => match ModelId::parse(model) {
             Ok(model) => Some(model),
-            Err(_) => return shutdown_failure(kernel, "carl acp: model ID is invalid").await,
+            Err(_) => return Some(acp_failure("carl acp: model ID is invalid")),
         },
         None => None,
     };
@@ -670,8 +723,15 @@ pub async fn run_acp_stdio(args: AcpArgs) -> ExitClassification {
                 PermissionMode::Default
             })
     };
-    let server = AcpServer::configured(
-        kernel.clone(),
+    let buzz_publisher = if frontend == Frontend::Buzz {
+        let executable = prepare_buzz_executable().ok()?;
+        let workspace = ExecutionWorkspace::open(&configuration.workspace).ok()?;
+        Some(BuzzPublisherBootstrap::new(executable, workspace))
+    } else {
+        None
+    };
+    let Ok(server) = ServiceAcpServer::new(
+        &configuration.data_root,
         AcpServerConfig {
             frontend,
             model,
@@ -679,32 +739,21 @@ pub async fn run_acp_stdio(args: AcpArgs) -> ExitClassification {
             permission_mode,
             buzz_publisher,
         },
-    );
-    let cancellation = CancellationToken::new();
-    let signal = cancellation.clone();
-    tokio::spawn(async move {
-        registered_ctrl_c().await;
-        signal.cancel();
-    });
+    )
+    .await
+    else {
+        return None;
+    };
     let input = BufReader::new(tokio::io::stdin());
-    match server
-        .serve_with_cancellation(input, tokio::io::stdout(), cancellation)
-        .await
-    {
-        Ok(()) => ExitClassification::Success,
-        Err(error) if error.code() == AcpServerErrorCode::Cancelled => {
-            ExitClassification::Cancelled
-        }
-        Err(_) => acp_failure("carl acp: ACP transport failed"),
-    }
-}
-
-async fn shutdown_failure(
-    kernel: crate::acp::KernelHandle,
-    message: &'static str,
-) -> ExitClassification {
-    let _ = kernel.shutdown().await;
-    acp_failure(message)
+    let serving = server.serve(input, tokio::io::stdout());
+    tokio::pin!(serving);
+    Some(tokio::select! {
+        result = &mut serving => match result {
+            Ok(()) => ExitClassification::Success,
+            Err(_) => acp_failure("carl acp: ACP transport failed"),
+        },
+        () = registered_ctrl_c() => ExitClassification::Cancelled,
+    })
 }
 
 fn acp_failure(message: &'static str) -> ExitClassification {

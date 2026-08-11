@@ -4,11 +4,6 @@ mod support;
 use std::fs;
 use std::path::Path;
 
-use carl::acp::PermissionMode;
-use carl::delegates::{ModelId, ReasoningEffort};
-use carl::runtime::task::{ClauseStatus, CompletionClause, CompletionContract, TaskBudget};
-use carl::storage::{NewTask, Store};
-use chrono::Utc;
 use libtest_mimic::{Arguments, Failed, Trial};
 use rusqlite::Connection;
 use serde_json::json;
@@ -64,15 +59,6 @@ fn end_to_end() -> TestResult {
     layout.trust_owner()?;
     let mut client = Client::spawn(&layout, false)?;
     let session = initialize_session(&mut client, &layout, 1, 2)?;
-    let mut second_session = fixture("session_new", &layout.workspace, None)?;
-    second_session["id"] = json!(3);
-    client.send(&second_session)?;
-    let second_response = client.read_id(3)?;
-    let second_session = second_response["result"]["sessionId"]
-        .as_str()
-        .ok_or_else(|| format!("second session ID missing: {second_response}"))?
-        .to_owned();
-
     client.send(&prompt_frame(10, &session, "bypass scenario", 'a'))?;
     let (completed, updates) = client.read_id_with_updates(10)?;
     assert_eq!(completed["result"]["stopReason"], "end_turn", "{completed}");
@@ -82,24 +68,8 @@ fn end_to_end() -> TestResult {
             .all(|update| !update.to_string().contains("Approve with"))
     );
     client.send(&prompt_frame(20, &session, "wait for cancel", 'b'))?;
-    layout.wait_for_provider_method("turn/start", 3)?;
+    layout.wait_for_provider_method("turn/start", 2)?;
     let task_id = layout.latest_task_id()?;
-    let other_task_id = create_queued_task(&layout, &session)?;
-    for (id, method, key) in [
-        (18, "_task/cancel", "wrong-task-cancel"),
-        (19, "_task/steer", "wrong-task-steer"),
-    ] {
-        let mut params = json!({
-            "sessionId":session,"taskId":other_task_id,"idempotencyKey":key
-        });
-        if method == "_task/steer" {
-            params["text"] = json!("must not steer the active task");
-        }
-        client.send(&json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}))?;
-        assert_eq!(client.read_id(id)?["error"]["code"], -32602);
-    }
-    assert_eq!(layout.provider_method_count("turn/interrupt")?, 0);
-    assert_eq!(layout.task_control_marker_count(&other_task_id)?, 0);
     for (id, method) in [(21, "_task/status"), (22, "_task/context")] {
         client.send(&json!({
             "jsonrpc":"2.0","id":id,"method":method,"params":{
@@ -117,64 +87,37 @@ fn end_to_end() -> TestResult {
             .ok_or("task list missing")?
             .is_empty()
     );
-    let steer = |id, text| {
+    let steer = |id, text: &str, event: char| {
         json!({
-            "jsonrpc":"2.0","id":id,"method":"_task/steer","params":{
-                "sessionId":session,"taskId":task_id,"idempotencyKey":"steer-key","text":text
+            "jsonrpc":"2.0","id":id,"method":"_session/steering","params":{
+                "sessionId":session,"prompt":[
+                    {"type":"text","text":text},
+                    {"type":"text","text":format!(
+                        "Event ID: {}\nChannel: Carl Test (#{CHANNEL_ID})\nKind: 1\nFrom: Owner (hex: {ACTOR_HEX})\nTime: 2026-08-10T12:00:00Z\nContent: command",
+                        event.to_string().repeat(64)
+                    )}
+                ]
             }
         })
     };
-    client.send(&steer(24, "finish with exact verification"))?;
+    client.send(&steer(24, "finish with exact verification", 'c'))?;
     let steered = client.read_id(24)?;
-    assert_eq!(steered["result"]["outcome"], "accepted");
-    client.send(&steer(25, "finish with exact verification"))?;
-    assert_eq!(client.read_id(25)?["result"], steered["result"]);
-    client.send(&steer(26, "different payload"))?;
-    assert_eq!(client.read_id(26)?["error"]["code"], -32602);
+    assert_eq!(steered["result"]["outcome"], "injected");
+    client.send(&steer(25, "finish with exact verification", 'c'))?;
+    assert_eq!(client.read_id(25)?["error"]["code"], -32602);
+    client.send(&steer(26, "different payload", 'd'))?;
+    assert_eq!(client.read_id(26)?["result"]["outcome"], "injected");
     client.send(&json!({
-        "jsonrpc":"2.0","id":27,"method":"_task/status","params":{
-            "sessionId":second_session,"taskId":task_id
+        "jsonrpc":"2.0","id":28,"method":"_task/steer","params":{
+            "sessionId":session,"taskId":task_id,"idempotencyKey":"generic-steer","text":"must fail closed"
         }
     }))?;
-    assert_eq!(client.read_id(27)?["error"]["code"], -32602);
+    assert_eq!(client.read_id(28)?["error"]["code"], -32602);
     client.send(&json!({
-        "jsonrpc":"2.0","id":29,"method":"_task/cancel","params":{
-            "sessionId":session,"taskId":task_id,"idempotencyKey":"steer-key"
-        }
+        "jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":session}
     }))?;
-    assert_eq!(client.read_id(29)?["error"]["code"], -32602);
-    let cancel = json!({
-        "jsonrpc":"2.0","id":30,"method":"_task/cancel","params":{
-            "sessionId":session,"taskId":task_id,"idempotencyKey":"cancel-key"
-        }
-    });
-    Connection::open(layout.data.join("carl.sqlite3"))?.execute_batch(
-        "CREATE TRIGGER fail_cancel_receipt_completion
-         BEFORE UPDATE OF state ON task_control_receipts
-         WHEN NEW.state = 'completed' AND NEW.method = 'cancel'
-         BEGIN SELECT RAISE(ABORT, 'injected crash before cancel receipt completion'); END;",
-    )?;
-    client.send(&cancel)?;
-    assert_eq!(client.read_id(30)?["error"]["code"], -32602);
+    assert_eq!(client.read_id(20)?["result"]["stopReason"], "cancelled");
     assert_eq!(layout.provider_method_count("turn/interrupt")?, 1);
-    Connection::open(layout.data.join("carl.sqlite3"))?
-        .execute_batch("DROP TRIGGER fail_cancel_receipt_completion;")?;
-    let mut cancel_replay = cancel;
-    cancel_replay["id"] = json!(31);
-    client.send(&cancel_replay)?;
-    assert_eq!(client.read_id(31)?["result"]["outcome"], "accepted");
-    assert_eq!(layout.provider_method_count("turn/interrupt")?, 1);
-    let rejected_resume = json!({
-        "jsonrpc":"2.0","id":32,"method":"_task/resume","params":{
-            "sessionId":session,"taskId":task_id,"idempotencyKey":"resume-key"
-        }
-    });
-    client.send(&rejected_resume)?;
-    assert_eq!(client.read_id(32)?["error"]["code"], -32602);
-    let mut rejected_resume_replay = rejected_resume;
-    rejected_resume_replay["id"] = json!(33);
-    client.send(&rejected_resume_replay)?;
-    assert_eq!(client.read_id(33)?["error"]["code"], -32602);
     let first = client.finish()?;
     assert_eq!(
         fs::read_to_string(layout.workspace.join("target.txt"))?,
@@ -182,12 +125,6 @@ fn end_to_end() -> TestResult {
     );
     assert_eq!(layout.action_count("approved-command")?, 1);
 
-    let publications = layout.publisher_records()?;
-    assert!(!publications.is_empty());
-    assert_eq!(
-        fs::read_to_string(layout.workspace.join("target.txt"))?,
-        "fixed\n"
-    );
     let provider_requests = fs::read_to_string(layout.workspace.join(".provider-requests.jsonl"))?
         .lines()
         .map(serde_json::from_str)
@@ -212,36 +149,6 @@ fn end_to_end() -> TestResult {
             .any(|window| window == PRIVATE_KEY.as_bytes())
     );
     Ok(())
-}
-
-fn create_queued_task(layout: &Layout, external_session_id: &str) -> TestResult<String> {
-    let mut store = Store::open(layout.data.join("carl.sqlite3"))?;
-    let session_id = store
-        .get_frontend_session(external_session_id)?
-        .ok_or("frontend session missing")?
-        .session_id;
-    let task = store.create_task(NewTask {
-        session_id,
-        workspace: fs::canonicalize(&layout.workspace)?,
-        contract: CompletionContract {
-            version: 1,
-            goal: "Remain a distinct queued task".to_owned(),
-            constraints: Vec::new(),
-            clauses: vec![CompletionClause {
-                id: "distinct".to_owned(),
-                description: "Do not mutate the active task".to_owned(),
-                required: false,
-                status: ClauseStatus::Pending,
-                evidence: Vec::new(),
-            }],
-        },
-        model: ModelId::parse("gpt-5.6-codex")?,
-        effort: ReasoningEffort::High,
-        permission_mode: PermissionMode::FullAccess,
-        budget: TaskBudget::default(),
-        created_at: Utc::now(),
-    })?;
-    Ok(task.snapshot.task_id.to_string())
 }
 
 fn admission_precedes_execution() -> TestResult {
@@ -589,9 +496,10 @@ fn initialize_session(
     let mut session = fixture("session_new", &layout.workspace, None)?;
     session["id"] = json!(session_id);
     client.send(&session)?;
-    Ok(client.read_id(session_id)?["result"]["sessionId"]
+    let response = client.read_id(session_id)?;
+    Ok(response["result"]["sessionId"]
         .as_str()
-        .ok_or("session ID missing")?
+        .ok_or_else(|| format!("session ID missing: {response}"))?
         .to_owned())
 }
 

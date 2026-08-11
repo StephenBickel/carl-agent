@@ -66,10 +66,12 @@ pub struct Layout {
 
 impl Layout {
     pub fn new(name: &str) -> TestResult<Self> {
-        let root = std::env::current_exe()?
-            .parent()
-            .ok_or("test executable has no parent")?
-            .join(format!("carl-buzz-{name}-{}", Uuid::new_v4()));
+        let serial = Uuid::new_v4().simple().to_string();
+        let root = PathBuf::from("/tmp").join(format!(
+            "carl-buzz-{}-{}",
+            &name[..name.len().min(12)],
+            &serial[..12]
+        ));
         let data = root.join("data");
         let workspace = root.join("workspace");
         fs::create_dir_all(&data)?;
@@ -81,9 +83,9 @@ impl Layout {
         }
         fs::write(workspace.join("target.txt"), "broken\n")?;
         Ok(Self {
-            root,
-            data,
-            workspace,
+            root: fs::canonicalize(root)?,
+            data: fs::canonicalize(data)?,
+            workspace: fs::canonicalize(workspace)?,
         })
     }
 
@@ -292,6 +294,7 @@ impl Drop for Layout {
 
 pub struct Client {
     child: Child,
+    service: Child,
     stdin: Option<ChildStdin>,
     frames: mpsc::Receiver<Result<Value, String>>,
     raw_stdout: Arc<Mutex<Vec<u8>>>,
@@ -304,11 +307,46 @@ impl Client {
     pub fn spawn(layout: &Layout, bypass: bool) -> TestResult<Self> {
         let binary = assert_cmd::cargo::cargo_bin!("carl");
         let fixture = fs::canonicalize(std::env::current_exe()?)?;
+        let data_root = fs::canonicalize(&layout.data)?;
+        let mut service = Command::new(binary)
+            .current_dir(&layout.workspace)
+            .env_clear()
+            .env("CARL_DATA_DIR", &data_root)
+            .env("CARL_CODEX_EXECUTABLE", &fixture)
+            .env("CARL_BUZZ_EXECUTABLE", &fixture)
+            .arg("serve")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let endpoint = data_root.join("carl.sock");
+        for _ in 0..500 {
+            if endpoint.exists() {
+                break;
+            }
+            if let Some(status) = service.try_wait()? {
+                let mut stderr = String::new();
+                if let Some(mut output) = service.stderr.take() {
+                    let _ = output.read_to_string(&mut stderr);
+                }
+                return Err(format!(
+                    "Carl service exited before startup at {}: {status}: {stderr}",
+                    data_root.display()
+                )
+                .into());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if !endpoint.exists() {
+            let _ = service.kill();
+            let _ = service.wait();
+            return Err("Carl service endpoint was not created".into());
+        }
         let mut command = Command::new(binary);
         command
             .current_dir(&layout.workspace)
             .env_clear()
-            .env("CARL_DATA_DIR", fs::canonicalize(&layout.data)?)
+            .env("CARL_DATA_DIR", data_root)
             .env("CARL_CODEX_EXECUTABLE", &fixture)
             .env("CARL_BUZZ_EXECUTABLE", &fixture)
             .env("BUZZ_ACP_AGENTS", "1")
@@ -359,6 +397,7 @@ impl Client {
         });
         Ok(Self {
             child,
+            service,
             stdin: Some(stdin),
             frames,
             raw_stdout,
@@ -412,7 +451,7 @@ impl Client {
             }
             updates.push(frame);
         }
-        Err("Carl response ID was not observed".into())
+        Err(format!("Carl response ID {expected} was not observed; frames={updates:?}").into())
     }
 
     pub fn finish(mut self) -> TestResult<CapturedProcess> {
@@ -427,6 +466,8 @@ impl Client {
         let stdout = self.raw_stdout.lock().unwrap().clone();
         let stderr = self.raw_stderr.lock().unwrap().clone();
         if !status.success() {
+            let _ = self.service.kill();
+            let _ = self.service.wait();
             return Err(format!(
                 "Carl exited {:?}: {}",
                 status.code(),
@@ -434,6 +475,8 @@ impl Client {
             )
             .into());
         }
+        let _ = self.service.kill();
+        let _ = self.service.wait();
         Ok(CapturedProcess { stdout, stderr })
     }
 }
@@ -533,6 +576,7 @@ fn app_server_fixture() -> i32 {
     let mut thread_count = 0_u64;
     let mut turn_count = 0_u64;
     let mut pending: Option<PendingApproval> = None;
+    let mut operation_ids = HashMap::<String, String>::new();
     for line in std::io::stdin().lock().lines() {
         let Ok(line) = line else {
             return 74;
@@ -707,6 +751,15 @@ fn app_server_fixture() -> i32 {
                 }
             }
             Some("turn/steer") => {
+                let steering = request
+                    .pointer("/params/input/0/text")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if let Some(operation_id) = steering.strip_prefix("carl-operation-id: ")
+                    && let Some(turn_id) = request["params"]["expectedTurnId"].as_str()
+                {
+                    operation_ids.insert(turn_id.to_owned(), operation_id.to_owned());
+                }
                 let boundary_configuration = request
                     .pointer("/params/input/0/text")
                     .and_then(Value::as_str)
@@ -808,6 +861,11 @@ fn app_server_fixture() -> i32 {
                         if !accepted {
                             return 65;
                         }
+                        let Some(operation_id) = operation_ids.get(&approval.turn_id) else {
+                            return 65;
+                        };
+                        let report =
+                            completion_report("Bypass verification completed.", operation_id);
                         if fs::write(workspace.join("target.txt"), "fixed\n")
                             .and_then(|()| {
                                 append_line(&workspace.join(".fixture-actions"), "approved-command")
@@ -823,11 +881,7 @@ fn app_server_fixture() -> i32 {
                             })
                             .and_then(|()| diff_update(&approval.thread_id, &approval.turn_id))
                             .and_then(|()| {
-                                agent_delta(
-                                    &approval.thread_id,
-                                    &approval.turn_id,
-                                    "Bypass verification completed. <carl-epoch-report>{\"schema_version\":1,\"disposition\":\"complete\",\"summary\":\"Bypass verification completed.\",\"clause_evidence\":[],\"exact_identifiers\":[]}</carl-epoch-report>",
-                                )
+                                agent_delta(&approval.thread_id, &approval.turn_id, &report)
                             })
                             .and_then(|()| turn_completed(&approval.thread_id, &approval.turn_id))
                             .is_err()
@@ -841,6 +895,22 @@ fn app_server_fixture() -> i32 {
         }
     }
     0
+}
+
+fn completion_report(summary: &str, operation_id: &str) -> String {
+    format!(
+        "{summary} <carl-epoch-report>{}</carl-epoch-report>",
+        json!({
+            "schema_version":1,
+            "disposition":"complete",
+            "summary":summary,
+            "clause_evidence":[
+                {"clause_id":"requested-outcome","operation_ids":[operation_id],"event_sequences":[],"artifact_digests":[]},
+                {"clause_id":"explicit-verification","operation_ids":[operation_id],"event_sequences":[],"artifact_digests":[]}
+            ],
+            "exact_identifiers":[]
+        })
+    )
 }
 
 #[derive(Clone, Copy)]

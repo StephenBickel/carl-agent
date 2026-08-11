@@ -65,6 +65,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "durable task controls",
         sql: include_str!("../../migrations/0010_durable_task_controls.sql"),
     },
+    Migration {
+        version: 11,
+        name: "service task receipts",
+        sql: include_str!("../../migrations/0011_service_task_receipts.sql"),
+    },
 ];
 
 pub(crate) fn migrate(connection: &mut Connection) -> Result<(), CarlError> {

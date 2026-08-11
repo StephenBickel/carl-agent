@@ -20,8 +20,8 @@ pub use engine::{
     TaskEngineUpdate,
 };
 pub(crate) use engine::{
-    TaskEngineAcknowledgement, TaskEngineControl, TaskEngineFrontendContext,
-    TaskEnginePermissionNotice,
+    OwnerStartTask, OwnerTrustedAdmission, OwnerTrustedMessage, TaskEngineAcknowledgement,
+    TaskEngineControl, TaskEngineFrontendContext, TaskEnginePermissionNotice,
 };
 pub use progress::{
     ProgressAssessment, RecoveryAttempt, RecoveryAttemptOutcome, RecoveryStrategy, assess_progress,
