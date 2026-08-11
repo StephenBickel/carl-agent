@@ -29,8 +29,8 @@ use crate::runtime::subscription::{
     RunTrustLabel, VerificationId,
 };
 use crate::runtime::task::{
-    CompletionContract, EffectClass, OperationStatus, TaskBudget, TaskEvent, TaskId, TaskSnapshot,
-    TaskStatus, reduce_task,
+    CanonicalCheckpoint, CompletionContract, ContextPackage, EffectClass, OperationStatus,
+    TaskBudget, TaskEvent, TaskId, TaskSnapshot, TaskStatus, reduce_task,
 };
 use crate::security::SecretFilter;
 use crate::sidecar::DataRootLock;
@@ -293,6 +293,24 @@ pub struct TaskRecord {
     pub revision: u64,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NewCheckpoint {
+    pub task_id: TaskId,
+    pub checkpoint: CanonicalCheckpoint,
+    pub checkpoint_digest: String,
+    pub context_package: ContextPackage,
+    pub context_package_digest: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CheckpointRecord {
+    pub checkpoint: CanonicalCheckpoint,
+    pub checkpoint_digest: String,
+    pub context_package_digest: String,
+    pub created_at: DateTime<Utc>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -746,6 +764,7 @@ impl Store {
         }
         schema::migrate(&mut connection)?;
         validate_task_projection_completeness(&connection)?;
+        validate_task_canonical_payloads(&connection)?;
         checkpoint_for_secure_deletion(&connection)?;
 
         Ok(Self { connection })
@@ -1583,6 +1602,98 @@ impl Store {
             snapshot,
             created_at: current.created_at,
             updated_at: at,
+        }))
+    }
+
+    pub fn commit_checkpoint(
+        &mut self,
+        input: NewCheckpoint,
+        expected_task_revision: u64,
+    ) -> Result<Option<CheckpointRecord>, CarlError> {
+        validate_checkpoint_input(&input)?;
+        let checkpoint_json = String::from_utf8(
+            input
+                .checkpoint
+                .canonical_bytes()
+                .map_err(checkpoint_validation_error)?,
+        )
+        .map_err(|_| checkpoint_validation("canonical checkpoint is not UTF-8"))?;
+        let package_json = String::from_utf8(
+            input
+                .context_package
+                .canonical_bytes()
+                .map_err(context_validation_error)?,
+        )
+        .map_err(|_| checkpoint_validation("canonical context package is not UTF-8"))?;
+
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage_error)?;
+        let Some(current) = load_task_record(&transaction, input.task_id)? else {
+            return Ok(None);
+        };
+        if current.revision != expected_task_revision {
+            return Ok(None);
+        }
+        validate_checkpoint_history(&transaction, &current, &input)?;
+        validate_checkpoint_artifacts(&transaction, &input.checkpoint)?;
+
+        let envelope = append_event_in_transaction(
+            &transaction,
+            current.snapshot.session_id,
+            None,
+            Event::TaskLifecycle {
+                task_id: input.task_id,
+                event: TaskEvent::CheckpointCommitted {
+                    checkpoint_id: input.checkpoint.checkpoint_id,
+                    digest: input.checkpoint_digest.clone(),
+                },
+            },
+            input.created_at,
+        )?;
+        let snapshot = reduce_task(Some(current.snapshot), &envelope).map_err(task_reduce_error)?;
+        let event_sequence = revision_to_sql(envelope.sequence)?;
+        let timestamp = format_timestamp(input.created_at);
+        transaction
+            .execute(
+                "INSERT INTO task_checkpoints (
+                    id, task_id, digest, event_sequence, checkpoint_json, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    input.checkpoint.checkpoint_id.to_string(),
+                    input.task_id.to_string(),
+                    input.checkpoint_digest,
+                    event_sequence,
+                    checkpoint_json,
+                    timestamp,
+                ],
+            )
+            .map_err(storage_error)?;
+        transaction
+            .execute(
+                "INSERT INTO task_context_packages (
+                    id, task_id, checkpoint_id, generation, event_sequence,
+                    package_json, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    input.context_package.package_id.to_string(),
+                    input.task_id.to_string(),
+                    input.checkpoint.checkpoint_id.to_string(),
+                    i64::from(input.checkpoint.compaction_generation),
+                    event_sequence,
+                    package_json,
+                    timestamp,
+                ],
+            )
+            .map_err(storage_error)?;
+        update_task_projection(&transaction, &snapshot, input.created_at)?;
+        transaction.commit().map_err(storage_error)?;
+        Ok(Some(CheckpointRecord {
+            checkpoint: input.checkpoint,
+            checkpoint_digest: input.checkpoint_digest,
+            context_package_digest: input.context_package_digest,
+            created_at: input.created_at,
         }))
     }
 
@@ -3654,23 +3765,22 @@ fn reconcile_runtime_artifacts(
     artifacts
         .retain_only(&referenced)
         .map_err(artifact_storage_error)?;
-    transaction
-        .execute(
-            "DELETE FROM artifact_objects
-             WHERE id NOT IN (
-                 SELECT manifest_artifact_id FROM subscription_run_baselines
-                 UNION
-                 SELECT source_preconditions_artifact_id FROM subscription_run_baselines
-                 UNION
-                 SELECT content_artifact_id FROM subscription_run_baseline_entries
-                 UNION
-                 SELECT proposal_artifact_id FROM subscription_run_proposals
-                 UNION
-                 SELECT payload_sha256 FROM subscription_run_proposals
-             )",
-            [],
-        )
+    let registered = transaction
+        .prepare("SELECT id FROM artifact_objects ORDER BY id")
+        .map_err(storage_error)?
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(storage_error)?
+        .collect::<Result<Vec<_>, _>>()
         .map_err(storage_error)?;
+    for identifier in registered {
+        let artifact_id = ArtifactId::parse(&identifier)
+            .map_err(|_| storage_invariant("registered artifact identifier is invalid"))?;
+        if !referenced.contains(&artifact_id) {
+            transaction
+                .execute("DELETE FROM artifact_objects WHERE id = ?1", [identifier])
+                .map_err(storage_error)?;
+        }
+    }
     transaction.commit().map_err(storage_error)
 }
 
@@ -3694,13 +3804,46 @@ fn referenced_artifact_ids(connection: &Connection) -> Result<HashSet<ArtifactId
         .map_err(storage_error)?
         .collect::<Result<Vec<_>, _>>()
         .map_err(storage_error)?;
-    identifiers
+    let mut referenced = identifiers
         .into_iter()
         .map(|identifier| {
             ArtifactId::parse(identifier)
                 .map_err(|_| storage_invariant("durable artifact identifier is invalid"))
         })
-        .collect()
+        .collect::<Result<HashSet<_>, _>>()?;
+    let checkpoints = connection
+        .prepare(
+            "SELECT checkpoint_json, digest
+             FROM task_checkpoints
+             WHERE checkpoint_json IS NOT NULL
+             ORDER BY task_id, event_sequence",
+        )
+        .map_err(storage_error)?
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(storage_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(storage_error)?;
+    for (checkpoint_json, stored_digest) in checkpoints {
+        let checkpoint = serde_json::from_str::<CanonicalCheckpoint>(&checkpoint_json)
+            .map_err(|_| storage_invariant("stored canonical checkpoint is invalid"))?;
+        let canonical_digest = checkpoint
+            .digest()
+            .map_err(|_| storage_invariant("stored canonical checkpoint is invalid"))?;
+        if canonical_digest != stored_digest {
+            return Err(storage_invariant(
+                "stored canonical checkpoint digest does not match",
+            ));
+        }
+        for digest in checkpoint.artifact_digests() {
+            referenced.insert(
+                ArtifactId::parse(digest)
+                    .map_err(|_| storage_invariant("checkpoint artifact identifier is invalid"))?,
+            );
+        }
+    }
+    Ok(referenced)
 }
 
 impl Deref for RuntimeStore {
@@ -5251,6 +5394,319 @@ fn usize_to_sql(value: usize, kind: &str) -> Result<i64, CarlError> {
 
 fn stored_u64(value: i64, kind: &str) -> Result<u64, CarlError> {
     u64::try_from(value).map_err(|_| storage_invariant(&format!("stored {kind} is invalid")))
+}
+
+fn validate_checkpoint_input(input: &NewCheckpoint) -> Result<(), CarlError> {
+    if input.checkpoint.task_id != input.task_id
+        || input.context_package.checkpoint_id != input.checkpoint.checkpoint_id
+        || input.context_package.source_sequence_start != input.checkpoint.source_sequence_start
+        || input.context_package.source_sequence_end != input.checkpoint.source_sequence_end
+    {
+        return Err(checkpoint_validation(
+            "checkpoint and context package metadata do not match",
+        ));
+    }
+    let checkpoint_digest = input
+        .checkpoint
+        .digest()
+        .map_err(checkpoint_validation_error)?;
+    if checkpoint_digest != input.checkpoint_digest {
+        return Err(checkpoint_validation(
+            "canonical checkpoint digest does not match",
+        ));
+    }
+    let package_digest = input
+        .context_package
+        .digest()
+        .map_err(context_validation_error)?;
+    if package_digest != input.context_package_digest {
+        return Err(checkpoint_validation(
+            "canonical context package digest does not match",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_checkpoint_history(
+    transaction: &Transaction<'_>,
+    current: &TaskRecord,
+    input: &NewCheckpoint,
+) -> Result<(), CarlError> {
+    let task_id = input.task_id.to_string();
+    let bounds = transaction
+        .query_row(
+            "SELECT MIN(sequence), MAX(sequence)
+             FROM events
+             WHERE session_id = ?1
+               AND json_extract(event_json, '$.type') = 'task_lifecycle'
+               AND json_extract(event_json, '$.task_id') = ?2",
+            params![current.snapshot.session_id.to_string(), task_id],
+            |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?)),
+        )
+        .map_err(storage_error)?;
+    let (Some(start), Some(end)) = bounds else {
+        return Err(storage_invariant(
+            "checkpoint task has no authoritative journal",
+        ));
+    };
+    let start = stored_u64(start, "checkpoint source start")?;
+    let end = stored_u64(end, "checkpoint source end")?;
+    if input.checkpoint.source_sequence_start != start
+        || input.checkpoint.source_sequence_end != end
+    {
+        return Err(checkpoint_validation(
+            "checkpoint source range does not match the task journal",
+        ));
+    }
+
+    let expected_previous = current
+        .snapshot
+        .latest_checkpoint
+        .map(|checkpoint_id| {
+            transaction
+                .query_row(
+                    "SELECT digest
+                     FROM task_checkpoints
+                     WHERE task_id = ?1 AND id = ?2",
+                    params![input.task_id.to_string(), checkpoint_id.to_string()],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(storage_error)?
+                .ok_or_else(|| storage_invariant("latest task checkpoint projection is missing"))
+        })
+        .transpose()?;
+    if input.checkpoint.previous_digest != expected_previous {
+        return Err(checkpoint_validation(
+            "checkpoint previous digest does not match durable history",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_checkpoint_artifacts(
+    transaction: &Connection,
+    checkpoint: &CanonicalCheckpoint,
+) -> Result<(), CarlError> {
+    for digest in checkpoint.artifact_digests() {
+        let registered = transaction
+            .query_row(
+                "SELECT 1 FROM artifact_objects WHERE id = ?1",
+                [&digest],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(storage_error)?;
+        if registered.is_none() {
+            return Err(checkpoint_validation(
+                "checkpoint references an unknown artifact",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_task_canonical_payloads(connection: &Connection) -> Result<(), CarlError> {
+    let rows = connection
+        .prepare(
+            "SELECT checkpoint.id, checkpoint.task_id, checkpoint.digest,
+                    checkpoint.event_sequence, checkpoint.checkpoint_json,
+                    package.id, package.generation, package.event_sequence,
+                    package.package_json
+             FROM task_checkpoints AS checkpoint
+             LEFT JOIN task_context_packages AS package
+               ON package.task_id = checkpoint.task_id
+              AND package.checkpoint_id = checkpoint.id
+             WHERE checkpoint.checkpoint_json IS NOT NULL
+                OR package.package_json IS NOT NULL
+             ORDER BY checkpoint.task_id, checkpoint.event_sequence, package.generation",
+        )
+        .map_err(storage_error)?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<i64>>(6)?,
+                row.get::<_, Option<i64>>(7)?,
+                row.get::<_, Option<String>>(8)?,
+            ))
+        })
+        .map_err(storage_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(storage_error)?;
+
+    for (
+        checkpoint_id,
+        task_id,
+        stored_digest,
+        checkpoint_event_sequence,
+        checkpoint_json,
+        package_id,
+        package_generation,
+        package_event_sequence,
+        package_json,
+    ) in rows
+    {
+        let (
+            Some(checkpoint_json),
+            Some(package_id),
+            Some(package_generation),
+            Some(package_event_sequence),
+            Some(package_json),
+        ) = (
+            checkpoint_json,
+            package_id,
+            package_generation,
+            package_event_sequence,
+            package_json,
+        )
+        else {
+            return Err(storage_invariant(
+                "canonical checkpoint and context package are not atomic",
+            ));
+        };
+        let checkpoint = serde_json::from_str::<CanonicalCheckpoint>(&checkpoint_json)
+            .map_err(|_| storage_invariant("stored canonical checkpoint is invalid"))?;
+        let context_package = serde_json::from_str::<ContextPackage>(&package_json)
+            .map_err(|_| storage_invariant("stored canonical context package is invalid"))?;
+        let stored_task_id = task_id
+            .parse::<TaskId>()
+            .map_err(|_| storage_invariant("stored checkpoint task identifier is invalid"))?;
+        let stored_checkpoint_id = checkpoint_id
+            .parse()
+            .map_err(|_| storage_invariant("stored checkpoint identifier is invalid"))?;
+        let stored_package_id = package_id
+            .parse()
+            .map_err(|_| storage_invariant("stored context package identifier is invalid"))?;
+        let stored_generation = u32::try_from(stored_u64(
+            package_generation,
+            "context package generation",
+        )?)
+        .map_err(|_| storage_invariant("stored context package generation is too large"))?;
+        if checkpoint.task_id != stored_task_id
+            || checkpoint.checkpoint_id != stored_checkpoint_id
+            || context_package.package_id != stored_package_id
+            || context_package.checkpoint_id != stored_checkpoint_id
+            || checkpoint.compaction_generation != stored_generation
+            || package_event_sequence != checkpoint_event_sequence
+            || context_package.source_sequence_start != checkpoint.source_sequence_start
+            || context_package.source_sequence_end != checkpoint.source_sequence_end
+        {
+            return Err(storage_invariant(
+                "stored canonical checkpoint metadata is inconsistent",
+            ));
+        }
+        if checkpoint
+            .digest()
+            .map_err(|_| storage_invariant("stored canonical checkpoint is invalid"))?
+            != stored_digest
+        {
+            return Err(storage_invariant(
+                "stored canonical checkpoint digest does not match",
+            ));
+        }
+        context_package
+            .canonical_bytes()
+            .map_err(|_| storage_invariant("stored canonical context package is invalid"))?;
+        validate_canonical_source_bounds(connection, &checkpoint, checkpoint_event_sequence)?;
+        let expected_previous = connection
+            .query_row(
+                "SELECT digest
+                 FROM task_checkpoints
+                 WHERE task_id = ?1 AND event_sequence < ?2
+                 ORDER BY event_sequence DESC
+                 LIMIT 1",
+                params![task_id, checkpoint_event_sequence],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(storage_error)?;
+        if checkpoint.previous_digest != expected_previous {
+            return Err(storage_invariant(
+                "stored canonical checkpoint previous digest does not match",
+            ));
+        }
+        validate_checkpoint_artifacts(connection, &checkpoint).map_err(|_| {
+            storage_invariant("stored canonical checkpoint references an unknown artifact")
+        })?;
+    }
+    Ok(())
+}
+
+fn validate_canonical_source_bounds(
+    connection: &Connection,
+    checkpoint: &CanonicalCheckpoint,
+    checkpoint_event_sequence: i64,
+) -> Result<(), CarlError> {
+    let bounds = connection
+        .query_row(
+            "SELECT MIN(sequence), MAX(sequence)
+             FROM events
+             WHERE json_extract(event_json, '$.type') = 'task_lifecycle'
+               AND json_extract(event_json, '$.task_id') = ?1
+               AND sequence < ?2",
+            params![checkpoint.task_id.to_string(), checkpoint_event_sequence],
+            |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?)),
+        )
+        .map_err(storage_error)?;
+    let (Some(start), Some(end)) = bounds else {
+        return Err(storage_invariant(
+            "stored canonical checkpoint has no source journal",
+        ));
+    };
+    if checkpoint.source_sequence_start != stored_u64(start, "checkpoint source start")?
+        || checkpoint.source_sequence_end != stored_u64(end, "checkpoint source end")?
+    {
+        return Err(storage_invariant(
+            "stored canonical checkpoint source range does not match the journal",
+        ));
+    }
+    let committed = connection
+        .query_row(
+            "SELECT 1
+             FROM events
+             WHERE sequence = ?1
+               AND json_extract(event_json, '$.type') = 'task_lifecycle'
+               AND json_extract(event_json, '$.task_id') = ?2
+               AND json_extract(event_json, '$.event.task_event') = 'checkpoint_committed'
+               AND json_extract(event_json, '$.event.checkpoint_id') = ?3
+               AND json_extract(event_json, '$.event.digest') = ?4",
+            params![
+                checkpoint_event_sequence,
+                checkpoint.task_id.to_string(),
+                checkpoint.checkpoint_id.to_string(),
+                checkpoint
+                    .digest()
+                    .map_err(|_| { storage_invariant("stored canonical checkpoint is invalid") })?,
+            ],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(storage_error)?;
+    if committed.is_none() {
+        return Err(storage_invariant(
+            "stored canonical checkpoint has no matching journal event",
+        ));
+    }
+    Ok(())
+}
+
+fn checkpoint_validation_error(_error: crate::runtime::task::CheckpointError) -> CarlError {
+    checkpoint_validation("canonical checkpoint is invalid")
+}
+
+fn context_validation_error(_error: crate::runtime::task::ContextError) -> CarlError {
+    checkpoint_validation("canonical context package is invalid")
+}
+
+fn checkpoint_validation(detail: &str) -> CarlError {
+    CarlError::Validation {
+        detail: detail.to_owned(),
+    }
 }
 
 fn insert_task_projection(

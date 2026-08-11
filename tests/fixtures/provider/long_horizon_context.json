@@ -1,0 +1,30 @@
+{
+  "required_identifier": "needle_7f3a91c2",
+  "narratives": [
+    "provider prose generation 0",
+    "provider prose generation 1",
+    "provider prose generation 2",
+    "provider prose generation 3",
+    "provider prose generation 4",
+    "provider prose generation 5",
+    "provider prose generation 6",
+    "provider prose generation 7",
+    "provider prose generation 8",
+    "provider prose generation 9",
+    "provider prose generation 10",
+    "provider prose generation 11"
+  ],
+  "event_fingerprints": [
+    "durable-progress-1",
+    "durable-progress-2",
+    "durable-progress-3",
+    "durable-progress-4",
+    "durable-progress-5",
+    "durable-progress-6",
+    "durable-progress-7",
+    "durable-progress-8",
+    "durable-progress-9",
+    "durable-progress-10",
+    "durable-progress-11"
+  ]
+}
