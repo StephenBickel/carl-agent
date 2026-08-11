@@ -14,6 +14,9 @@ use carl::delegates::codex::{
     DelegateErrorCode, StartThread, StartTurn,
 };
 use carl::delegates::{ModelId, ReasoningEffort};
+use carl::runtime::agent_port::{
+    AgentContextId, AgentPort, AgentPortErrorCode, ResumeAgentContext,
+};
 use carl::sidecar::{
     ExecutableTrustDecision, ProviderEnvironmentProfile, ProviderHome, SidecarCommand,
     SidecarLimits, VersionOutputFormat,
@@ -54,8 +57,50 @@ fn main() {
             "Codex normalized item diagnostics redact execution evidence",
             normalized_item_diagnostics_are_redacted,
         ),
+        test(
+            "Codex native resume and compact stay unsupported without binding proof",
+            unsupported_native_lifecycle_capabilities_are_truthful,
+        ),
     ];
     libtest_mimic::run(&Arguments::from_args(), trials).exit();
+}
+
+fn unsupported_native_lifecycle_capabilities_are_truthful()
+-> Result<(), Box<dyn Error + Send + Sync>> {
+    run_async(async {
+        let layout = TestLayout::new()?;
+        let mut server = connect(&layout).await?;
+        let capabilities = server.capabilities();
+        assert!(!capabilities.resume);
+        assert!(!capabilities.compact);
+        assert!(capabilities.token_usage);
+        assert!(capabilities.pre_dispatch_effects);
+
+        let context_id = AgentContextId::parse("thr_123")?;
+        let resume_error = server
+            .resume_context(ResumeAgentContext {
+                context_id: context_id.clone(),
+                cwd: layout.workspace.clone(),
+                model: ModelId::parse("gpt-5.6-codex")?,
+                permission_mode: PermissionMode::Default,
+            })
+            .await
+            .expect_err("unproved resume support must fail before provider dispatch");
+        assert_eq!(resume_error.code(), AgentPortErrorCode::Unsupported);
+        let compact_error = server
+            .compact_context(&context_id)
+            .await
+            .expect_err("unproved compact support must fail before provider dispatch");
+        assert_eq!(compact_error.code(), AgentPortErrorCode::Unsupported);
+        assert!(read_requests(&layout)?.iter().all(|request| {
+            !matches!(
+                request["method"].as_str(),
+                Some("thread/resume" | "thread/compact/start")
+            )
+        }));
+        server.cancel().await?;
+        Ok(())
+    })
 }
 
 fn normalized_item_diagnostics_are_redacted() -> Result<(), Box<dyn Error + Send + Sync>> {

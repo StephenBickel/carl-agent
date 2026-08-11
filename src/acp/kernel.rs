@@ -654,6 +654,10 @@ impl KernelActor {
         event: AgentEvent,
         updates: &mut Vec<KernelUpdate>,
     ) -> Result<Option<PromptOutcome>, KernelError> {
+        event.validate().map_err(map_agent_port)?;
+        if !self.active_event_matches(session_id, &event)? {
+            return Ok(None);
+        }
         let turn_id = self.active_turn(session_id)?.local_turn_id;
         match event {
             AgentEvent::ContextStarted { context_id } => {
@@ -789,34 +793,10 @@ impl KernelActor {
                     .await
                     .map(Some);
             }
-            AgentEvent::CompactionStarted {
-                context_id,
-                item_id,
-            } => {
-                if context_id
-                    != self
-                        .sessions
-                        .get(&session_id)
-                        .ok_or_else(unknown_session)?
-                        .provider_context
-                {
-                    return Err(provider_error());
-                }
+            AgentEvent::CompactionStarted { item_id, .. } => {
                 self.persist_lifecycle(session_id, Some(turn_id), "compaction_started", &item_id)?;
             }
-            AgentEvent::CompactionCompleted {
-                context_id,
-                item_id,
-            } => {
-                if context_id
-                    != self
-                        .sessions
-                        .get(&session_id)
-                        .ok_or_else(unknown_session)?
-                        .provider_context
-                {
-                    return Err(provider_error());
-                }
+            AgentEvent::CompactionCompleted { item_id, .. } => {
                 self.persist_lifecycle(
                     session_id,
                     Some(turn_id),
@@ -881,6 +861,7 @@ impl KernelActor {
         approval: AgentEffectRequest,
         updates: &mut Vec<KernelUpdate>,
     ) -> Result<(), KernelError> {
+        self.deny_unsupported_effect(&approval).await?;
         let tool_call_id = {
             let state = self.sessions.get(&session_id).ok_or_else(unknown_session)?;
             let active = state.active.as_ref().ok_or_else(session_busy)?;
@@ -954,6 +935,7 @@ impl KernelActor {
         approval: AgentEffectRequest,
         updates: &mut Vec<KernelUpdate>,
     ) -> Result<PromptOutcome, KernelError> {
+        self.deny_unsupported_effect(&approval).await?;
         let (actor_id, external_session_id, frontend) = {
             let state = self.sessions.get(&session_id).ok_or_else(unknown_session)?;
             (
@@ -1550,6 +1532,61 @@ impl KernelActor {
             .get_mut(&session_id)
             .and_then(|state| state.active.as_mut())
             .ok_or_else(session_busy)
+    }
+
+    fn active_event_matches(
+        &self,
+        session_id: SessionId,
+        event: &AgentEvent,
+    ) -> Result<bool, KernelError> {
+        let state = self.sessions.get(&session_id).ok_or_else(unknown_session)?;
+        let active = state.active.as_ref().ok_or_else(session_busy)?;
+        let context_matches = |context_id: &AgentContextId| context_id == &state.provider_context;
+        let epoch_matches = |epoch_id: &AgentEpochId| epoch_id == &active.provider_epoch_id;
+        let valid = match event {
+            AgentEvent::ContextStarted { context_id } => context_matches(context_id),
+            AgentEvent::EpochStarted {
+                context_id,
+                epoch_id,
+            } => context_matches(context_id) && epoch_matches(epoch_id),
+            AgentEvent::ItemStarted { epoch_id, .. }
+            | AgentEvent::AssistantDelta { epoch_id, .. }
+            | AgentEvent::DiffUpdated { epoch_id, .. }
+            | AgentEvent::UsageUpdated { epoch_id, .. }
+            | AgentEvent::ItemCompleted { epoch_id, .. }
+            | AgentEvent::EpochCompleted { epoch_id, .. } => epoch_matches(epoch_id),
+            AgentEvent::EffectRequested(_) => true,
+            AgentEvent::CompactionStarted { context_id, .. }
+            | AgentEvent::CompactionCompleted { context_id, .. } => context_matches(context_id),
+            AgentEvent::ProviderFailed {
+                context_id,
+                epoch_id,
+            } => match (context_id, epoch_id) {
+                (None, None) => true,
+                (Some(context_id), Some(epoch_id)) => {
+                    context_matches(context_id) && epoch_matches(epoch_id)
+                }
+                _ => false,
+            },
+        };
+        Ok(valid)
+    }
+
+    async fn deny_unsupported_effect(
+        &mut self,
+        request: &AgentEffectRequest,
+    ) -> Result<(), KernelError> {
+        if matches!(
+            request.kind,
+            AgentEffectKind::Network | AgentEffectKind::External
+        ) {
+            self.agent
+                .resolve_effect(&request.request_id, EffectDecision::Deny)
+                .await
+                .map_err(map_agent_port)?;
+            return Err(provider_error());
+        }
+        Ok(())
     }
 
     fn persist_lifecycle(

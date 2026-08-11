@@ -7,9 +7,9 @@ use carl::delegates::{ModelId, ReasoningEffort};
 use carl::policy::Sha256Digest;
 use carl::runtime::agent_port::{
     AgentCapabilities, AgentContextId, AgentEffectKind, AgentEffectRequest, AgentEpochId,
-    AgentEvent, AgentFuture, AgentItem, AgentModel, AgentPort, AgentPortError, AgentProcess,
-    AgentRequestId, AgentUsage, EffectDecision, ResumeAgentContext, StartAgentContext,
-    StartAgentEpoch,
+    AgentEvent, AgentFuture, AgentItem, AgentModel, AgentPort, AgentPortError, AgentPortErrorCode,
+    AgentProcess, AgentRequestId, AgentUsage, EffectDecision, ResumeAgentContext,
+    StartAgentContext, StartAgentEpoch,
 };
 use carl::storage::RuntimeStore;
 
@@ -145,6 +145,114 @@ fn opaque_agent_ids_are_bounded_and_redacted() -> TestResult {
         assert!(AgentEpochId::parse(invalid.clone()).is_err());
         assert!(AgentRequestId::parse(invalid).is_err());
     }
+    Ok(())
+}
+
+#[test]
+fn neutral_payload_bounds_reject_untrusted_adapter_values() -> TestResult {
+    let epoch_id = AgentEpochId::parse("epoch-bounds")?;
+    let context_id = AgentContextId::parse("context-bounds")?;
+    let request_id = AgentRequestId::parse("request-bounds")?;
+    let digest = Sha256Digest::parse("22".repeat(32))?;
+    let oversized_id = "i".repeat(129);
+
+    for event in [
+        AgentEvent::ItemStarted {
+            epoch_id: epoch_id.clone(),
+            item: AgentItem::Other {
+                item_id: oversized_id.clone(),
+                item_type: "reasoning".into(),
+            },
+        },
+        AgentEvent::ItemStarted {
+            epoch_id: epoch_id.clone(),
+            item: AgentItem::Command {
+                item_id: "command-bounds".into(),
+                command: "cargo test".into(),
+                cwd: PathBuf::from("/workspace"),
+                status: "inProgress".into(),
+                exit_code: None,
+                aggregated_output: None,
+                process_id: Some(oversized_id.clone()),
+            },
+        },
+        AgentEvent::EffectRequested(AgentEffectRequest {
+            request_id: request_id.clone(),
+            item_id: oversized_id.clone(),
+            kind: AgentEffectKind::Command,
+            summary: "Run tests".into(),
+            request_digest: digest,
+        }),
+        AgentEvent::EffectRequested(AgentEffectRequest {
+            request_id,
+            item_id: "effect-bounds".into(),
+            kind: AgentEffectKind::Command,
+            summary: "s".repeat(32 * 1_024 + 1),
+            request_digest: digest,
+        }),
+        AgentEvent::CompactionStarted {
+            context_id,
+            item_id: oversized_id.clone(),
+        },
+    ] {
+        let error = event
+            .validate()
+            .expect_err("an untrusted adapter value must be rejected at the seam");
+        assert_eq!(error.code(), AgentPortErrorCode::InvalidResponse);
+    }
+
+    let process_error = AgentProcess {
+        process_id: oversized_id,
+        item_id: "process-item".into(),
+        command: "cargo test".into(),
+        cwd: PathBuf::from("/workspace"),
+        os_pid: None,
+    }
+    .validate()
+    .expect_err("an oversized process identifier must be rejected");
+    assert_eq!(process_error.code(), AgentPortErrorCode::InvalidResponse);
+    Ok(())
+}
+
+#[test]
+fn agent_event_diagnostics_redact_text_diffs_and_item_ids() -> TestResult {
+    let epoch_id = AgentEpochId::parse("epoch-debug")?;
+    let context_id = AgentContextId::parse("context-debug")?;
+    let rendered = [
+        format!(
+            "{:?}",
+            AgentEvent::AssistantDelta {
+                epoch_id: epoch_id.clone(),
+                text: "assistant-secret-bf92".into(),
+            }
+        ),
+        format!(
+            "{:?}",
+            AgentEvent::DiffUpdated {
+                epoch_id,
+                diff: "diff-secret-bf92".into(),
+            }
+        ),
+        format!(
+            "{:?}",
+            AgentEvent::CompactionCompleted {
+                context_id,
+                item_id: "item-secret-bf92".into(),
+            }
+        ),
+    ]
+    .join("\n");
+
+    for secret in [
+        "assistant-secret-bf92",
+        "diff-secret-bf92",
+        "item-secret-bf92",
+    ] {
+        assert!(!rendered.contains(secret));
+    }
+    assert!(rendered.contains("AssistantDelta"));
+    assert!(rendered.contains("DiffUpdated"));
+    assert!(rendered.contains("CompactionCompleted"));
     Ok(())
 }
 

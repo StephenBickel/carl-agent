@@ -10,6 +10,11 @@ use crate::delegates::{ModelId, ReasoningEffort};
 use crate::policy::Sha256Digest;
 
 const MAX_AGENT_ID_BYTES: usize = 128;
+const MAX_AGENT_TEXT_BYTES: usize = 1_048_576;
+const MAX_COMMAND_BYTES: usize = 256 * 1_024;
+const MAX_EFFECT_SUMMARY_BYTES: usize = 32 * 1_024;
+const MAX_AGGREGATED_OUTPUT_BYTES: usize = 512 * 1_024;
+const MAX_ITEM_PAYLOAD_BYTES: usize = 1_048_576;
 
 pub type AgentFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, AgentPortError>> + Send + 'a>>;
 
@@ -205,6 +210,48 @@ impl AgentItem {
             | Self::Other { item_id, .. } => item_id,
         }
     }
+
+    pub fn validate(&self) -> Result<(), AgentPortError> {
+        validate_bounded_string(self.item_id(), MAX_AGENT_ID_BYTES)?;
+        match self {
+            Self::Command {
+                command,
+                cwd,
+                status,
+                aggregated_output,
+                process_id,
+                ..
+            } => {
+                validate_bounded_string(command, MAX_COMMAND_BYTES)?;
+                validate_bounded_bytes(cwd.as_os_str().as_encoded_bytes(), MAX_COMMAND_BYTES)?;
+                validate_bounded_string(status, MAX_AGENT_ID_BYTES)?;
+                if let Some(output) = aggregated_output {
+                    validate_bounded_string(output, MAX_AGGREGATED_OUTPUT_BYTES)?;
+                }
+                if let Some(process_id) = process_id {
+                    validate_bounded_string(process_id, MAX_AGENT_ID_BYTES)?;
+                }
+            }
+            Self::FileChange {
+                status, changes, ..
+            } => {
+                validate_bounded_string(status, MAX_AGENT_ID_BYTES)?;
+                if !changes.is_array()
+                    || serde_json::to_vec(changes)
+                        .map_err(|_| invalid_response())?
+                        .len()
+                        > MAX_ITEM_PAYLOAD_BYTES
+                {
+                    return Err(invalid_response());
+                }
+            }
+            Self::ContextCompaction { .. } => {}
+            Self::Other { item_type, .. } => {
+                validate_bounded_string(item_type, MAX_AGENT_ID_BYTES)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 impl fmt::Debug for AgentItem {
@@ -286,6 +333,13 @@ impl fmt::Debug for AgentEffectRequest {
     }
 }
 
+impl AgentEffectRequest {
+    pub fn validate(&self) -> Result<(), AgentPortError> {
+        validate_bounded_string(&self.item_id, MAX_AGENT_ID_BYTES)?;
+        validate_bounded_string(&self.summary, MAX_EFFECT_SUMMARY_BYTES)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AgentUsage {
     pub last_total_tokens: u64,
@@ -293,7 +347,7 @@ pub struct AgentUsage {
     pub model_context_window: Option<u64>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub enum AgentEvent {
     ContextStarted {
         context_id: AgentContextId,
@@ -341,6 +395,100 @@ pub enum AgentEvent {
     },
 }
 
+impl AgentEvent {
+    pub fn validate(&self) -> Result<(), AgentPortError> {
+        match self {
+            Self::ContextStarted { .. } | Self::EpochStarted { .. } => Ok(()),
+            Self::ItemStarted { item, .. } | Self::ItemCompleted { item, .. } => item.validate(),
+            Self::AssistantDelta { text, .. } => {
+                validate_bounded_string(text, MAX_AGENT_TEXT_BYTES)
+            }
+            Self::DiffUpdated { diff, .. } => validate_bounded_string(diff, MAX_AGENT_TEXT_BYTES),
+            Self::UsageUpdated { .. } | Self::ProviderFailed { .. } => Ok(()),
+            Self::EffectRequested(request) => request.validate(),
+            Self::CompactionStarted { item_id, .. } | Self::CompactionCompleted { item_id, .. } => {
+                validate_bounded_string(item_id, MAX_AGENT_ID_BYTES)
+            }
+            Self::EpochCompleted { status, .. } => {
+                validate_bounded_string(status, MAX_AGENT_ID_BYTES)
+            }
+        }
+    }
+}
+
+impl fmt::Debug for AgentEvent {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ContextStarted { context_id } => formatter
+                .debug_struct("AgentEvent::ContextStarted")
+                .field("context_id", context_id)
+                .finish(),
+            Self::EpochStarted {
+                context_id,
+                epoch_id,
+            } => formatter
+                .debug_struct("AgentEvent::EpochStarted")
+                .field("context_id", context_id)
+                .field("epoch_id", epoch_id)
+                .finish(),
+            Self::ItemStarted { epoch_id, item } => formatter
+                .debug_struct("AgentEvent::ItemStarted")
+                .field("epoch_id", epoch_id)
+                .field("item", item)
+                .finish(),
+            Self::AssistantDelta { epoch_id, .. } => formatter
+                .debug_struct("AgentEvent::AssistantDelta")
+                .field("epoch_id", epoch_id)
+                .field("text", &"<redacted>")
+                .finish(),
+            Self::DiffUpdated { epoch_id, .. } => formatter
+                .debug_struct("AgentEvent::DiffUpdated")
+                .field("epoch_id", epoch_id)
+                .field("diff", &"<redacted>")
+                .finish(),
+            Self::UsageUpdated { epoch_id, usage } => formatter
+                .debug_struct("AgentEvent::UsageUpdated")
+                .field("epoch_id", epoch_id)
+                .field("usage", usage)
+                .finish(),
+            Self::EffectRequested(request) => formatter
+                .debug_tuple("AgentEvent::EffectRequested")
+                .field(request)
+                .finish(),
+            Self::ItemCompleted { epoch_id, item } => formatter
+                .debug_struct("AgentEvent::ItemCompleted")
+                .field("epoch_id", epoch_id)
+                .field("item", item)
+                .finish(),
+            Self::CompactionStarted { context_id, .. } => formatter
+                .debug_struct("AgentEvent::CompactionStarted")
+                .field("context_id", context_id)
+                .field("item_id", &"<redacted>")
+                .finish(),
+            Self::CompactionCompleted { context_id, .. } => formatter
+                .debug_struct("AgentEvent::CompactionCompleted")
+                .field("context_id", context_id)
+                .field("item_id", &"<redacted>")
+                .finish(),
+            Self::EpochCompleted {
+                epoch_id, status, ..
+            } => formatter
+                .debug_struct("AgentEvent::EpochCompleted")
+                .field("epoch_id", epoch_id)
+                .field("status", status)
+                .finish(),
+            Self::ProviderFailed {
+                context_id,
+                epoch_id,
+            } => formatter
+                .debug_struct("AgentEvent::ProviderFailed")
+                .field("context_id", context_id)
+                .field("epoch_id", epoch_id)
+                .finish(),
+        }
+    }
+}
+
 #[derive(Clone, PartialEq)]
 pub struct AgentProcess {
     pub process_id: String,
@@ -360,6 +508,15 @@ impl fmt::Debug for AgentProcess {
             .field("cwd", &"<redacted>")
             .field("os_pid", &self.os_pid)
             .finish()
+    }
+}
+
+impl AgentProcess {
+    pub fn validate(&self) -> Result<(), AgentPortError> {
+        validate_bounded_string(&self.process_id, MAX_AGENT_ID_BYTES)?;
+        validate_bounded_string(&self.item_id, MAX_AGENT_ID_BYTES)?;
+        validate_bounded_string(&self.command, MAX_COMMAND_BYTES)?;
+        validate_bounded_bytes(self.cwd.as_os_str().as_encoded_bytes(), MAX_COMMAND_BYTES)
     }
 }
 
@@ -397,4 +554,20 @@ pub trait AgentPort: Send {
         process_id: &str,
     ) -> AgentFuture<'_, bool>;
     fn shutdown(&mut self) -> AgentFuture<'_, ()>;
+}
+
+fn validate_bounded_string(value: &str, maximum_bytes: usize) -> Result<(), AgentPortError> {
+    validate_bounded_bytes(value.as_bytes(), maximum_bytes)
+}
+
+fn validate_bounded_bytes(value: &[u8], maximum_bytes: usize) -> Result<(), AgentPortError> {
+    if value.is_empty() || value.len() > maximum_bytes || value.contains(&0) {
+        Err(invalid_response())
+    } else {
+        Ok(())
+    }
+}
+
+const fn invalid_response() -> AgentPortError {
+    AgentPortError::from_code(AgentPortErrorCode::InvalidResponse)
 }

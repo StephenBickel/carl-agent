@@ -15,8 +15,8 @@ use carl::policy::{ActorId, Frontend, Sha256Digest};
 use carl::runtime::agent_port::{
     AgentCapabilities, AgentContextId, AgentEffectKind, AgentEffectRequest, AgentEpochId,
     AgentEvent, AgentFuture, AgentItem, AgentModel, AgentPort, AgentPortError, AgentPortErrorCode,
-    AgentProcess, AgentRequestId, EffectDecision, ResumeAgentContext, StartAgentContext,
-    StartAgentEpoch,
+    AgentProcess, AgentRequestId, AgentUsage, EffectDecision, ResumeAgentContext,
+    StartAgentContext, StartAgentEpoch,
 };
 use carl::sidecar::DataRootLock;
 use carl::storage::{ChannelId, ClientName, ExternalSessionId, RuntimeStore, Store};
@@ -124,6 +124,207 @@ async fn unknown_agent_items_are_not_reported_as_successful_tools() -> TestResul
             .iter()
             .all(|update| !matches!(update, carl::acp::KernelUpdate::ToolCompleted { .. }))
     );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cross_bound_agent_events_are_quarantined_before_mutating_the_active_turn() -> TestResult {
+    let expected_context = context()?;
+    let expected_epoch = epoch()?;
+    let other_context = AgentContextId::parse("thr_other")?;
+    let other_epoch = AgentEpochId::parse("turn_other")?;
+    let cases = vec![
+        (
+            "context start",
+            AgentEvent::ContextStarted {
+                context_id: other_context.clone(),
+            },
+        ),
+        (
+            "epoch start context",
+            AgentEvent::EpochStarted {
+                context_id: other_context.clone(),
+                epoch_id: expected_epoch.clone(),
+            },
+        ),
+        (
+            "epoch start epoch",
+            AgentEvent::EpochStarted {
+                context_id: expected_context.clone(),
+                epoch_id: other_epoch.clone(),
+            },
+        ),
+        (
+            "item start",
+            AgentEvent::ItemStarted {
+                epoch_id: other_epoch.clone(),
+                item: AgentItem::Other {
+                    item_id: "item-start".into(),
+                    item_type: "reasoning".into(),
+                },
+            },
+        ),
+        (
+            "assistant delta",
+            AgentEvent::AssistantDelta {
+                epoch_id: other_epoch.clone(),
+                text: "stale text".into(),
+            },
+        ),
+        (
+            "item completion",
+            AgentEvent::ItemCompleted {
+                epoch_id: other_epoch.clone(),
+                item: AgentItem::Other {
+                    item_id: "item-complete".into(),
+                    item_type: "reasoning".into(),
+                },
+            },
+        ),
+        (
+            "usage",
+            AgentEvent::UsageUpdated {
+                epoch_id: other_epoch.clone(),
+                usage: AgentUsage {
+                    last_total_tokens: 3,
+                    total_tokens: 5,
+                    model_context_window: Some(8_192),
+                },
+            },
+        ),
+        (
+            "diff",
+            AgentEvent::DiffUpdated {
+                epoch_id: other_epoch.clone(),
+                diff: "@@ stale @@".into(),
+            },
+        ),
+        (
+            "epoch completion",
+            AgentEvent::EpochCompleted {
+                epoch_id: other_epoch.clone(),
+                status: "completed".into(),
+            },
+        ),
+        (
+            "provider failure",
+            AgentEvent::ProviderFailed {
+                context_id: Some(expected_context.clone()),
+                epoch_id: Some(other_epoch.clone()),
+            },
+        ),
+        (
+            "compaction start",
+            AgentEvent::CompactionStarted {
+                context_id: other_context.clone(),
+                item_id: "compact-start".into(),
+            },
+        ),
+        (
+            "compaction completion",
+            AgentEvent::CompactionCompleted {
+                context_id: other_context.clone(),
+                item_id: "compact-complete".into(),
+            },
+        ),
+    ];
+
+    for (case, event) in cases {
+        let forbidden_provider_id = match &event {
+            AgentEvent::ContextStarted { context_id }
+            | AgentEvent::CompactionStarted { context_id, .. }
+            | AgentEvent::CompactionCompleted { context_id, .. } => Some(context_id.as_str()),
+            AgentEvent::EpochStarted { epoch_id, .. }
+            | AgentEvent::ItemStarted { epoch_id, .. }
+            | AgentEvent::AssistantDelta { epoch_id, .. }
+            | AgentEvent::ItemCompleted { epoch_id, .. }
+            | AgentEvent::UsageUpdated { epoch_id, .. }
+            | AgentEvent::DiffUpdated { epoch_id, .. }
+            | AgentEvent::EpochCompleted { epoch_id, .. } => Some(epoch_id.as_str()),
+            AgentEvent::ProviderFailed { epoch_id, .. } => {
+                epoch_id.as_ref().map(AgentEpochId::as_str)
+            }
+            AgentEvent::EffectRequested(_) => None,
+        }
+        .map(str::to_owned);
+        let layout = Layout::new()?;
+        let port = ScriptedPort::with_events([
+            event,
+            AgentEvent::EpochCompleted {
+                epoch_id: expected_epoch.clone(),
+                status: "completed".into(),
+            },
+        ]);
+        let kernel = Kernel::start_with_ports(layout.runtime()?, Box::new(port), None).await?;
+        let session = kernel
+            .new_session(new_session(&layout, Frontend::Acp, None)?)
+            .await?;
+        let outcome = kernel
+            .prompt(session.id(), Prompt::new(vec![format!("reject {case}")])?)
+            .await?;
+        assert_eq!(outcome.stop_reason, PromptStopReason::EndTurn);
+        let events = Store::open(&layout.database)?.read_events(session.id())?;
+        assert!(!events.iter().any(|event| matches!(
+            event.event,
+            Event::AssistantTextDelta { .. }
+                | Event::WorkspaceDiffUpdated { .. }
+                | Event::ToolCompleted { .. }
+                | Event::TurnInterrupted { .. }
+        )));
+        if let Some(forbidden_provider_id) = forbidden_provider_id {
+            assert!(!events.iter().any(|event| matches!(
+                &event.event,
+                Event::ProviderLifecycle {
+                    provider_id: Some(provider_id),
+                    ..
+                } if provider_id == &forbidden_provider_id
+            )));
+        }
+        assert!(matches!(
+            events.last().map(|event| &event.event),
+            Some(Event::TurnCompleted)
+        ));
+        kernel.shutdown().await?;
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn unbounded_agent_events_fail_before_mutating_the_active_turn() -> TestResult {
+    let layout = Layout::new()?;
+    let port = ScriptedPort::with_events([
+        AgentEvent::ItemStarted {
+            epoch_id: epoch()?,
+            item: AgentItem::Other {
+                item_id: "i".repeat(129),
+                item_type: "reasoning".into(),
+            },
+        },
+        AgentEvent::EpochCompleted {
+            epoch_id: epoch()?,
+            status: "completed".into(),
+        },
+    ]);
+    let kernel = Kernel::start_with_ports(layout.runtime()?, Box::new(port), None).await?;
+    let session = kernel
+        .new_session(new_session(&layout, Frontend::Acp, None)?)
+        .await?;
+
+    let error = kernel
+        .prompt(
+            session.id(),
+            Prompt::new(vec!["reject oversized item".into()])?,
+        )
+        .await
+        .expect_err("an unbounded neutral event must fail at the kernel boundary");
+
+    assert_eq!(error.code(), carl::acp::KernelErrorCode::ProviderFailed);
+    let events = Store::open(&layout.database)?.read_events(session.id())?;
+    assert!(!events.iter().any(|event| matches!(
+        event.event,
+        Event::ProviderLifecycle { .. } | Event::TurnCompleted
+    )));
+    kernel.shutdown().await?;
     Ok(())
 }
 
@@ -555,6 +756,41 @@ async fn full_access_denies_unknown_and_completed_approval_items() -> TestResult
                 .any(|event| matches!(event.event, Event::ToolDispatchAuthorized { .. }))
         );
         kernel.shutdown().await?;
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn unsupported_effect_kinds_are_denied_before_turn_failure() -> TestResult {
+    for mode in [PermissionMode::Default, PermissionMode::BypassPermissions] {
+        for kind in [AgentEffectKind::Network, AgentEffectKind::External] {
+            let layout = Layout::new()?;
+            let port =
+                ScriptedPort::with_events([AgentEvent::EffectRequested(effect_request_with_kind(
+                    "approval-unsupported",
+                    "item-unsupported",
+                    kind,
+                    "unsupported consequential effect",
+                )?)]);
+            let shared = Arc::clone(&port.shared);
+            let kernel = Kernel::start_with_ports(layout.runtime()?, Box::new(port), None).await?;
+            let mut request = new_session(&layout, Frontend::Acp, None)?;
+            request.mode = mode;
+            let session = kernel.new_session(request).await?;
+
+            let error = kernel
+                .prompt(session.id(), Prompt::new(vec!["request effect".into()])?)
+                .await
+                .expect_err("an unsupported consequential effect must fail the turn");
+
+            assert_eq!(error.code(), carl::acp::KernelErrorCode::ProviderFailed);
+            {
+                let state = shared.lock().unwrap();
+                assert_eq!(state.resolved, [EffectDecision::Deny]);
+                assert_eq!(state.allowed_effects, 0);
+            }
+            kernel.shutdown().await?;
+        }
     }
     Ok(())
 }
@@ -1054,10 +1290,19 @@ fn effect_request(
     item_id: &str,
     summary: &str,
 ) -> TestResult<AgentEffectRequest> {
+    effect_request_with_kind(request_id, item_id, AgentEffectKind::Command, summary)
+}
+
+fn effect_request_with_kind(
+    request_id: &str,
+    item_id: &str,
+    kind: AgentEffectKind,
+    summary: &str,
+) -> TestResult<AgentEffectRequest> {
     Ok(AgentEffectRequest {
         request_id: AgentRequestId::parse(request_id)?,
         item_id: item_id.into(),
-        kind: AgentEffectKind::Command,
+        kind,
         summary: summary.into(),
         request_digest: Sha256Digest::parse("11".repeat(32))?,
     })

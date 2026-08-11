@@ -361,57 +361,6 @@ impl CodexAppServer {
         Ok(thread_id)
     }
 
-    async fn resume_thread(
-        &mut self,
-        request: ResumeAgentContext,
-    ) -> Result<CodexThreadId, DelegateError> {
-        let cwd = canonical_directory(request.cwd)?;
-        self.require_model(&request.model, None)?;
-        let codex_id = CodexThreadId::parse(request.context_id.as_str())?;
-        let result = self
-            .request("thread/resume", json!({"threadId":codex_id.as_str()}))
-            .await?;
-        let object = result.as_object().ok_or_else(protocol_error)?;
-        require_keys(object, &["thread"], &[])?;
-        let thread = object
-            .get("thread")
-            .and_then(Value::as_object)
-            .ok_or_else(protocol_error)?;
-        let resumed = CodexThreadId::from_value(thread.get("id").ok_or_else(protocol_error)?)?;
-        if resumed != codex_id {
-            return Err(protocol_error());
-        }
-        self.threads.insert(
-            resumed.as_str().to_owned(),
-            ThreadState {
-                _cwd: cwd,
-                mode: request.permission_mode,
-                active_turn: None,
-            },
-        );
-        Ok(resumed)
-    }
-
-    async fn compact_thread(&mut self, context_id: &AgentContextId) -> Result<(), DelegateError> {
-        let thread_id = CodexThreadId::parse(context_id.as_str())?;
-        let state = self
-            .threads
-            .get(thread_id.as_str())
-            .ok_or_else(protocol_error)?;
-        if state.active_turn.is_some() {
-            return Err(protocol_error());
-        }
-        let result = self
-            .request(
-                "thread/compact/start",
-                json!({"threadId":thread_id.as_str()}),
-            )
-            .await?;
-        let object = result.as_object().ok_or_else(protocol_error)?;
-        require_keys(object, &[], &[])?;
-        Ok(())
-    }
-
     pub async fn start_turn(&mut self, request: StartTurn) -> Result<CodexTurnId, DelegateError> {
         validate_text(&request.input)?;
         let state = self
@@ -728,8 +677,8 @@ impl CodexAppServer {
 impl AgentPort for CodexAppServer {
     fn capabilities(&self) -> AgentCapabilities {
         AgentCapabilities {
-            resume: true,
-            compact: true,
+            resume: false,
+            compact: false,
             token_usage: true,
             pre_dispatch_effects: true,
             history_paging: false,
@@ -772,20 +721,12 @@ impl AgentPort for CodexAppServer {
         })
     }
 
-    fn resume_context(&mut self, request: ResumeAgentContext) -> AgentFuture<'_, AgentContextId> {
-        Box::pin(async move {
-            let thread_id = self.resume_thread(request).await.map_err(map_agent_error)?;
-            AgentContextId::parse(thread_id.as_str())
-        })
+    fn resume_context(&mut self, _request: ResumeAgentContext) -> AgentFuture<'_, AgentContextId> {
+        Box::pin(async { Err(AgentPortError::from_code(AgentPortErrorCode::Unsupported)) })
     }
 
-    fn compact_context(&mut self, context_id: &AgentContextId) -> AgentFuture<'_, ()> {
-        let context_id = context_id.clone();
-        Box::pin(async move {
-            self.compact_thread(&context_id)
-                .await
-                .map_err(map_agent_error)
-        })
+    fn compact_context(&mut self, _context_id: &AgentContextId) -> AgentFuture<'_, ()> {
+        Box::pin(async { Err(AgentPortError::from_code(AgentPortErrorCode::Unsupported)) })
     }
 
     fn start_epoch(&mut self, request: StartAgentEpoch) -> AgentFuture<'_, AgentEpochId> {

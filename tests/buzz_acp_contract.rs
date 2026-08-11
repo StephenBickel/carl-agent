@@ -120,7 +120,11 @@ fn process_boundary_conforms() -> TestResult {
     assert_eq!(client.read_id(24)?["error"]["code"], -32601);
 
     client.send_partial(&fixture("prompt", &layout.workspace, Some(&session))?)?;
-    assert_eq!(client.read_id(2)?["result"]["stopReason"], "end_turn");
+    let prompt_response = client.read_id(2)?;
+    assert_eq!(
+        prompt_response["result"]["stopReason"], "end_turn",
+        "{prompt_response}"
+    );
 
     client.send(&prompt_frame_for_channel(
         30,
