@@ -34,3 +34,4 @@ Task 10: fix round 3/5 (1 integration failure addressed, 0 open; commits bed1309
 Task 10: complete (commits 5c641b3..7ac94d5, review clean; final cargo test --all-features passed)
 Task 11: fix round 1/5 (5 addressed, 0 open; commits dc39163..02a43c3)
 Task 11: fix round 2/5 (2 blockers addressed, 0 open; commits 02a43c3..5c5ef9d)
+Task 11: fix round 3/5 (1 integration failure addressed, 0 open; commits 5c5ef9d..d9b0a38)

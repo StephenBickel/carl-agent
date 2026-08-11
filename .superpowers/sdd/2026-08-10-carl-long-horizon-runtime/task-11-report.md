@@ -296,3 +296,65 @@ reserved for the root agent after clean review.
   and startup failure semantics remain explicit and deterministic.
 - Migrations 1–10, `SECURITY.md`, and the broader task lifecycle reducer were not
   modified. Both review blockers are closed with no deferred finding.
+
+## Fix Round 3/5
+
+### Integration failure fixed
+
+- Buzz session creation now defers provider startup only when the request has no
+  pre-bound Buzz context. This preserves the Task 11 rule that production Buzz
+  `session/new` is non-executing until trusted-owner admission, while restoring the
+  existing bound-session path used by legacy approval and publication flows.
+- The failure was unrelated to Round 2 configuration reconciliation. Task 11 had
+  widened the non-executing condition from context-free Buzz sessions to every Buzz
+  session, so bound Default-mode sessions reached `begin_prompt` without a provider
+  context and returned `ApprovalUnavailable` before either delivery or approval.
+
+### RED / GREEN evidence
+
+1. `remote_approval_is_exact_single_use_and_resumes_the_same_turn` initially failed
+   on its first prompt with `ApprovalUnavailable`. It now reaches the approval pause,
+   resumes the same turn exactly once, and rejects replay.
+2. `ambiguous_buzz_delivery_is_durable_and_distinct_from_provider_failure` initially
+   returned `ApprovalUnavailable` before publication. It now returns
+   `DeliveryUncertain` and records the durable uncertain-delivery transition and turn
+   interruption.
+3. The complete `acp_kernel_contract` suite passes all 32 tests, including autonomous
+   task routing and the legacy ACP/Buzz approval paths.
+
+### Verification
+
+```text
+cargo test --locked --test acp_kernel_contract -- \
+  remote_approval_is_exact_single_use_and_resumes_the_same_turn --exact --nocapture
+PASS: 1 passed, 0 failed
+
+cargo test --locked --test acp_kernel_contract -- \
+  ambiguous_buzz_delivery_is_durable_and_distinct_from_provider_failure --exact --nocapture
+PASS: 1 passed, 0 failed
+
+cargo test --locked --test acp_kernel_contract
+PASS: 32 passed, 0 failed
+
+cargo clippy --locked --all-targets --all-features -- -D warnings
+PASS: exit 0, no warnings
+
+cargo fmt --all
+PASS: exit 0
+
+git diff --check
+PASS: exit 0
+```
+
+No `cargo test --all-features` command was run; the root agent owns the final
+milestone rerun after this integration fix.
+
+### Fix-round self-review
+
+- Context-free Buzz sessions remain unable to start provider work before exact
+  trusted-owner admission. The production ACP server still creates Buzz sessions
+  without a context and attaches one only after the admission check.
+- The fix does not alter durable task routing, journal-owned configuration, remote
+  code consumption, delivery persistence, migrations, or security documentation.
+- No new regression test was needed because the two existing failing contracts are
+  exact end-to-end coverage for the affected bound-session behavior.
