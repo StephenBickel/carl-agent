@@ -64,12 +64,10 @@ pub struct Layout {
 
 impl Layout {
     pub fn new(name: &str) -> TestResult<Self> {
-        let root = std::env::current_exe()?
-            .parent()
-            .ok_or("test executable has no parent")?
-            .join(format!("carl-buzz-{name}-{}", Uuid::new_v4()));
-        let data = root.join("data");
-        let workspace = root.join("workspace");
+        let requested_root =
+            std::env::temp_dir().join(format!("carl-buzz-{name}-{}", Uuid::new_v4()));
+        let data = requested_root.join("data");
+        let workspace = requested_root.join("workspace");
         fs::create_dir_all(&data)?;
         fs::create_dir_all(&workspace)?;
         #[cfg(unix)]
@@ -77,6 +75,9 @@ impl Layout {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&data, fs::Permissions::from_mode(0o700))?;
         }
+        let root = fs::canonicalize(requested_root)?;
+        let data = root.join("data");
+        let workspace = root.join("workspace");
         fs::write(workspace.join("target.txt"), "broken\n")?;
         Ok(Self {
             root,

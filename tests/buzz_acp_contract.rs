@@ -83,7 +83,7 @@ fn process_boundary_conforms() -> TestResult {
     let created = client.read_id(1)?;
     let session = created["result"]["sessionId"]
         .as_str()
-        .ok_or("first session missing")?
+        .ok_or_else(|| format!("first session missing: {created}"))?
         .to_owned();
     assert_eq!(created["result"]["configOptions"][0]["configId"], "model");
 
