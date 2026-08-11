@@ -159,8 +159,12 @@ fn acp_isolates_codex_and_enforces_one_owner() -> TestResult {
         .stderr(Stdio::piped())
         .spawn()?;
     let marker = layout.data.join("providers/codex/environment-check");
+    let mut marker_contents = None;
     for _ in 0..200 {
-        if marker.exists() {
+        if let Ok(contents) = fs::read_to_string(&marker)
+            && matches!(contents.as_str(), "isolated\n" | "leaked\n")
+        {
+            marker_contents = Some(contents);
             break;
         }
         if service.try_wait()?.is_some() {
@@ -168,17 +172,26 @@ fn acp_isolates_codex_and_enforces_one_owner() -> TestResult {
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
-    if !marker.exists() {
-        drop(service.stdin.take());
+    let Some(marker_contents) = marker_contents else {
+        let _ = service.kill();
         let output = service.wait_with_output()?;
         return Err(format!(
-            "owner service exited {:?}: {}",
+            "owner service did not finish its environment marker and exited {:?}: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    };
+    if marker_contents != "isolated\n" {
+        let _ = service.kill();
+        let output = service.wait_with_output()?;
+        return Err(format!(
+            "provider environment isolation failed; owner service exited {:?}: {}",
             output.status.code(),
             String::from_utf8_lossy(&output.stderr)
         )
         .into());
     }
-    assert_eq!(fs::read_to_string(&marker)?, "isolated\n");
 
     let second_owner = Command::new(binary)
         .current_dir(&layout.workspace)
