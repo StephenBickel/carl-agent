@@ -22,6 +22,8 @@ const MAX_CONSTRAINTS: usize = 128;
 const MAX_TASK_EVENT_TEXT_BYTES: usize = 16 * 1024;
 const MAX_TASK_EVENT_IDENTIFIER_BYTES: usize = 128;
 const MAX_TASK_EVENT_EVIDENCE_SEQUENCES: usize = 256;
+const MAX_FILE_POSTCONDITION_ENTRIES: usize = 256;
+const MAX_FILE_POSTCONDITION_PATH_BYTES: usize = 4 * 1024;
 const DEFAULT_SOFT_EPOCH_SECONDS: u64 = 15 * 60;
 const DEFAULT_SOFT_EPOCH_TOOL_CALLS: u32 = 40;
 
@@ -231,6 +233,8 @@ pub enum TaskValidationErrorCode {
     TooManyEvidenceSequences,
     #[error("task event evidence sequence is invalid")]
     InvalidEvidenceSequence,
+    #[error("file postcondition is invalid")]
+    InvalidFilePostcondition,
 }
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
@@ -457,7 +461,7 @@ struct OperationSnapshot {
     status: OperationStatus,
     last_transition_sequence: u64,
     #[serde(default)]
-    postcondition_digest: Option<Sha256Digest>,
+    postcondition: Option<FilePostcondition>,
     #[serde(default)]
     evidence: OperationEvidenceState,
 }
@@ -528,7 +532,7 @@ impl TaskSnapshot {
                     epoch_id,
                     status: OperationStatus::IntentRecorded,
                     last_transition_sequence: sequence,
-                    postcondition_digest: None,
+                    postcondition: None,
                     evidence: OperationEvidenceState::default(),
                 },
             )
@@ -551,17 +555,15 @@ impl TaskSnapshot {
     pub(crate) fn bind_operation_postcondition(
         &mut self,
         operation_id: OperationId,
-        postcondition_digest: Sha256Digest,
+        postcondition: FilePostcondition,
     ) -> bool {
         let Some(operation) = self.operations.get_mut(&operation_id) else {
             return false;
         };
-        if operation.status != OperationStatus::IntentRecorded
-            || operation.postcondition_digest.is_some()
-        {
+        if operation.status != OperationStatus::Started || operation.postcondition.is_some() {
             return false;
         }
-        operation.postcondition_digest = Some(postcondition_digest);
+        operation.postcondition = Some(postcondition);
         true
     }
 
@@ -652,6 +654,126 @@ impl TaskSnapshot {
     }
 }
 
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(try_from = "UnvalidatedFilePostcondition")]
+pub struct FilePostcondition {
+    entries: Vec<FilePostconditionEntry>,
+}
+
+#[derive(Deserialize)]
+struct UnvalidatedFilePostcondition {
+    entries: Vec<FilePostconditionEntry>,
+}
+
+impl TryFrom<UnvalidatedFilePostcondition> for FilePostcondition {
+    type Error = TaskValidationError;
+
+    fn try_from(value: UnvalidatedFilePostcondition) -> Result<Self, Self::Error> {
+        Self::new(value.entries)
+    }
+}
+
+impl fmt::Debug for FilePostcondition {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FilePostcondition")
+            .field("entry_count", &self.entries.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl FilePostcondition {
+    pub fn new(entries: Vec<FilePostconditionEntry>) -> Result<Self, TaskValidationError> {
+        if entries.is_empty()
+            || entries.len() > MAX_FILE_POSTCONDITION_ENTRIES
+            || entries
+                .windows(2)
+                .any(|pair| pair[0].relative_path >= pair[1].relative_path)
+        {
+            return Err(TaskValidationError::from_code(
+                TaskValidationErrorCode::InvalidFilePostcondition,
+            ));
+        }
+        for entry in &entries {
+            entry.validate()?;
+        }
+        Ok(Self { entries })
+    }
+
+    #[must_use]
+    pub fn entries(&self) -> &[FilePostconditionEntry] {
+        &self.entries
+    }
+
+    fn validate(&self) -> Result<(), TaskValidationError> {
+        Self::new(self.entries.clone()).map(|_| ())
+    }
+}
+
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+pub struct FilePostconditionEntry {
+    relative_path: String,
+    regular_file_digest: Option<Sha256Digest>,
+}
+
+impl fmt::Debug for FilePostconditionEntry {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FilePostconditionEntry")
+            .field("path", &"<redacted>")
+            .field(
+                "state",
+                &if self.regular_file_digest.is_some() {
+                    "regular_file"
+                } else {
+                    "missing"
+                },
+            )
+            .finish()
+    }
+}
+
+impl FilePostconditionEntry {
+    pub fn new(
+        relative_path: String,
+        regular_file_digest: Option<Sha256Digest>,
+    ) -> Result<Self, TaskValidationError> {
+        let entry = Self {
+            relative_path,
+            regular_file_digest,
+        };
+        entry.validate()?;
+        Ok(entry)
+    }
+
+    #[must_use]
+    pub fn relative_path(&self) -> &str {
+        &self.relative_path
+    }
+
+    #[must_use]
+    pub const fn regular_file_digest(&self) -> Option<Sha256Digest> {
+        self.regular_file_digest
+    }
+
+    fn validate(&self) -> Result<(), TaskValidationError> {
+        let path = self.relative_path.as_str();
+        if path.is_empty()
+            || path.len() > MAX_FILE_POSTCONDITION_PATH_BYTES
+            || path.contains(['\\', '\0', ':'])
+            || path.chars().any(char::is_control)
+            || path
+                .split('/')
+                .any(|component| component.is_empty() || matches!(component, "." | ".."))
+        {
+            return Err(TaskValidationError::from_code(
+                TaskValidationErrorCode::InvalidFilePostcondition,
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "task_event", rename_all = "snake_case")]
 pub enum TaskEvent {
@@ -707,7 +829,7 @@ pub enum TaskEvent {
     },
     OperationPostconditionBound {
         operation_id: OperationId,
-        postcondition_digest: Sha256Digest,
+        postcondition: FilePostcondition,
     },
     OperationTransitioned {
         operation_id: OperationId,
@@ -824,7 +946,7 @@ impl TaskEvent {
                 validate_event_identifier(item_id)?;
                 validate_event_identifier(request_digest)
             }
-            Self::OperationPostconditionBound { .. } => Ok(()),
+            Self::OperationPostconditionBound { postcondition, .. } => postcondition.validate(),
             Self::OperationTransitioned {
                 evidence_sequences, ..
             } => validate_evidence_sequences(evidence_sequences),

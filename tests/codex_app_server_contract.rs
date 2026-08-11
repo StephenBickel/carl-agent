@@ -69,6 +69,10 @@ fn main() {
             "Codex lifecycle controls reject mismatched bindings and hostile process pages",
             lifecycle_controls_fail_closed,
         ),
+        test(
+            "Codex resume classifies only the exact missing-rollout response as unavailable",
+            resume_classifies_only_exact_missing_rollout,
+        ),
     ];
     libtest_mimic::run(&Arguments::from_args(), trials).exit();
 }
@@ -262,6 +266,31 @@ fn lifecycle_controls_fail_closed() -> Result<(), Box<dyn Error + Send + Sync>> 
                     .expect_err("hostile background terminal pages must fail closed");
                 assert_eq!(error.code(), AgentPortErrorCode::InvalidResponse);
             }
+            server.cancel().await?;
+        }
+        Ok(())
+    })
+}
+
+fn resume_classifies_only_exact_missing_rollout() -> Result<(), Box<dyn Error + Send + Sync>> {
+    run_async(async {
+        for (context, expected) in [
+            ("thr_unavailable", AgentPortErrorCode::UnavailableContext),
+            ("thr_resume_failure", AgentPortErrorCode::Transport),
+        ] {
+            let layout = TestLayout::new()?;
+            let mut server = connect(&layout).await?;
+            server.models().await?;
+            let error = server
+                .resume_context(ResumeAgentContext {
+                    context_id: AgentContextId::parse(context)?,
+                    cwd: layout.workspace.clone(),
+                    model: ModelId::parse("gpt-5.6-codex")?,
+                    permission_mode: PermissionMode::Default,
+                })
+                .await
+                .expect_err("the fixture returns a structured resume failure");
+            assert_eq!(error.code(), expected, "context {context}");
             server.cancel().await?;
         }
         Ok(())
@@ -793,6 +822,22 @@ fn app_server_fixture() -> i32 {
             }
             Some("thread/resume") => {
                 let requested_thread = request["params"]["threadId"].as_str().unwrap_or_default();
+                if matches!(requested_thread, "thr_unavailable" | "thr_resume_failure") {
+                    let message = if requested_thread == "thr_unavailable" {
+                        "no rollout found for thread id thr_unavailable"
+                    } else {
+                        "failed to load rollout"
+                    };
+                    if write_message(&json!({
+                        "id":id,
+                        "error":{"code":-32600,"message":message}
+                    }))
+                    .is_err()
+                    {
+                        return 74;
+                    }
+                    continue;
+                }
                 let returned_thread = if requested_thread == "thr_mismatch" {
                     "thr_other"
                 } else {

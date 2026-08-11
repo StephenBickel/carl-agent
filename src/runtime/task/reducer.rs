@@ -214,7 +214,7 @@ pub fn reduce_task(
         }
         TaskEvent::OperationPostconditionBound {
             operation_id,
-            postcondition_digest,
+            postcondition,
         } => {
             let (operation_epoch, _, _) = state
                 .operation(*operation_id)
@@ -222,7 +222,7 @@ pub fn reduce_task(
             if state.active_epoch != Some(operation_epoch) {
                 return Err(error(TaskReduceErrorCode::EpochMismatch));
             }
-            if !state.bind_operation_postcondition(*operation_id, *postcondition_digest) {
+            if !state.bind_operation_postcondition(*operation_id, postcondition.clone()) {
                 return Err(error(TaskReduceErrorCode::OperationAlreadyExists));
             }
         }

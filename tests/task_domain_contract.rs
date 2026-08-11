@@ -9,8 +9,9 @@ use carl::runtime::agent_port::{
 };
 use carl::runtime::task::{
     CheckpointId, ClauseStatus, CompletionClause, CompletionContract, ContextPackageId,
-    EffectClass, EpochId, EvidenceRef, OperationId, OperationStatus, TaskBudget, TaskEvent, TaskId,
-    TaskReduceErrorCode, TaskSnapshot, TaskStatus, classify_effect, reduce_task,
+    EffectClass, EpochId, EvidenceRef, FilePostcondition, FilePostconditionEntry, OperationId,
+    OperationStatus, TaskBudget, TaskEvent, TaskId, TaskReduceErrorCode, TaskSnapshot, TaskStatus,
+    TaskValidationErrorCode, classify_effect, reduce_task,
 };
 use chrono::{TimeZone, Utc};
 use serde_json::json;
@@ -327,6 +328,88 @@ fn only_exact_file_change_effect_requests_are_idempotent_mutations() {
             EffectClass::AmbiguousConsequential
         );
     }
+}
+
+#[test]
+fn file_postconditions_are_canonical_revalidated_and_debug_redacted() {
+    let digest = Sha256Digest::parse("a".repeat(64)).unwrap();
+    let postcondition = FilePostcondition::new(vec![
+        FilePostconditionEntry::new("src/created.rs".to_owned(), None).unwrap(),
+        FilePostconditionEntry::new("src/lib.rs".to_owned(), Some(digest)).unwrap(),
+    ])
+    .unwrap();
+    let event = TaskEvent::OperationPostconditionBound {
+        operation_id: operation_id(),
+        postcondition,
+    };
+    let encoded = serde_json::to_value(&event).unwrap();
+    assert_eq!(
+        encoded["postcondition"]["entries"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        serde_json::from_value::<TaskEvent>(encoded.clone()).unwrap(),
+        event
+    );
+    let rendered = format!("{event:?}");
+    assert!(!rendered.contains("src/lib.rs"));
+    assert!(!rendered.contains(&digest.to_string()));
+
+    let events = [
+        created(),
+        TaskEvent::StateTransitioned {
+            from: TaskStatus::Queued,
+            to: TaskStatus::Active,
+            reason: "activate".to_owned(),
+        },
+        TaskEvent::EpochStarted {
+            epoch_id: epoch_id(),
+            objective: "edit safely".to_owned(),
+        },
+        TaskEvent::OperationIntentRecorded {
+            operation_id: operation_id(),
+            epoch_id: epoch_id(),
+            item_id: "edit-1".to_owned(),
+            effect_class: EffectClass::IdempotentMutation,
+            request_digest: "request-digest".to_owned(),
+        },
+        TaskEvent::OperationTransitioned {
+            operation_id: operation_id(),
+            from: OperationStatus::IntentRecorded,
+            to: OperationStatus::Started,
+            evidence_sequences: Vec::new(),
+        },
+        event,
+    ];
+    assert_every_replay_split_matches(&events);
+
+    for path in [
+        "../outside",
+        "/absolute",
+        "src//lib.rs",
+        "src\\lib.rs",
+        "C:/lib.rs",
+    ] {
+        assert_eq!(
+            FilePostconditionEntry::new(path.to_owned(), None)
+                .unwrap_err()
+                .code(),
+            TaskValidationErrorCode::InvalidFilePostcondition
+        );
+    }
+    let entry = FilePostconditionEntry::new("src/lib.rs".to_owned(), None).unwrap();
+    assert_eq!(
+        FilePostcondition::new(vec![entry.clone(), entry])
+            .unwrap_err()
+            .code(),
+        TaskValidationErrorCode::InvalidFilePostcondition
+    );
+    let mut hostile = encoded;
+    hostile["postcondition"]["entries"][0]["relative_path"] = json!("../outside");
+    assert!(serde_json::from_value::<TaskEvent>(hostile).is_err());
 }
 
 #[test]

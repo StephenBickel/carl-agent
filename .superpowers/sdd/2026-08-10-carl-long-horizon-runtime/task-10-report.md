@@ -110,3 +110,102 @@ The all-features milestone suite was run exactly once.
 ## Concerns
 
 No known Task 10 correctness or integration gap remains.
+
+## Fix Round 1/5
+
+This round supersedes the earlier postcondition-inspector and label-only restart-matrix
+claims above.
+
+### Reviewer findings resolved
+
+1. Background processes now enter and leave `RuntimeTask::running_processes` from
+   normal `ItemStarted`/`ItemCompleted` command events. Checkpoint construction
+   hashes the current command and cwd from that engine-owned lifecycle state.
+   Recovery and cancellation tests consume the resulting engine-built checkpoint;
+   none rewrites checkpoint JSON with SQL. Exact recovery requires one match on
+   process ID, item ID, command digest, and cwd digest. Tests also prove completed
+   metadata replaces started metadata, a completed command without a process removes
+   it, every individual identity mismatch blocks before a new epoch, and both true
+   and false termination results are durable.
+2. The production Codex adapter now recognizes only the stable structured
+   `-32600` response whose message is exactly `no rollout found for thread id
+   <requested-id>` and whose object shape contains no unrecognized fields. It maps
+   that response to definitely-not-applied `UnavailableContext`; an ordinary
+   same-code `failed to load rollout` response remains a transport failure. The
+   shape was first confirmed against pinned Codex app-server `0.146.0`.
+3. Provider-supplied postcondition inspection and the fake digest echo were removed.
+   A successful file mutation is bound only after a validated `ItemCompleted`
+   mutation event. Carl validates a bounded, sorted, unique set of portable relative
+   paths, opens the workspace and every parent through held no-follow handles, and
+   records for each path either missing state or the SHA-256 content digest of a
+   bounded regular single-link file. The durable typed spec revalidates on decode
+   and redacts paths and digests from Debug. Restart compares the current held-
+   workspace observation directly. A crash before the durable spec blocks; an exact
+   match reconciles without redispatch; a mismatch blocks. Traversal is rejected
+   before dispatch, while symlink and hard-link topologies remain uncertain after
+   mutation and persist no spec.
+4. An `Active` task whose activation committed without any provider binding now
+   starts and binds exactly one fresh context when history proves no provider epoch,
+   request, or operation could have started. It does not repeat the activation or
+   attempt resume. If provider-work evidence is present, recovery durably blocks
+   instead of returning an invalid-task kernel failure.
+5. The twelve-cut test is now a real table-driven `TaskEngine` fault/restart matrix.
+   Every row uses an event-transaction abort or provider pending fault, checks the
+   projection against authoritative reducer replay at the cut, drops the engine and
+   store, reopens through `RuntimeStore`, verifies the expected completed/blocked
+   outcome and exact dispatch/effect/mutation counters, then checks replay again.
+   Item-started, operation-intent, effect-authorized, and workspace-mutated are
+   independently observable cuts. Provider replacement-started and replacement-
+   binding-committed also execute through the real unavailable-context path. The
+   old storage-only test remains only as a representative journal-prefix replay
+   test and is no longer described as the crash matrix.
+
+### RED / GREEN evidence
+
+- Background RED: `cargo test --test epoch_engine_contract background_process --
+  --nocapture` initially failed 3/3 because checkpoints were empty and recovery did
+  not enumerate or terminate provider processes. GREEN: 4/4, plus the exact process-
+  removal and false-termination tests each pass 1/1.
+- Codex RED: the exact pinned missing-rollout response produced `Transport` instead
+  of `UnavailableContext`. GREEN: the exact adapter contract passes 1/1, while the
+  ordinary same-code failure remains `Transport`.
+- Filesystem postcondition RED: 3/3 failed because binding preceded dispatch and a
+  provider echo reconciled mismatched real bytes. GREEN: `cargo test --test
+  epoch_engine_contract postcondition -- --nocapture` passes 6/6 for absent, exact,
+  mismatched, traversal, symlink, and hard-link cases. The typed canonical/redacted
+  domain round trip passes 1/1.
+- Missing binding RED: the activation-only cut returned `InvalidTask`. GREEN: fresh
+  binding and unsafe-history blocking each pass 1/1.
+- Matrix RED first exposed a checkpoint-committed expectation that ignored the
+  legitimate new verification epoch. The corrected matrix asserts exact total
+  dispatches and no second filesystem mutation. GREEN: all twelve rows pass in the
+  single table-driven test.
+
+### Verification
+
+Focused compatibility command:
+
+```text
+cargo test --test agent_port_contract --test acp_kernel_contract \
+  --test epoch_engine_contract --test task_domain_contract \
+  --test task_storage_contract --test codex_app_server_contract
+PASS: 156 passed, 0 failed
+```
+
+Strict lint:
+
+```text
+cargo clippy --all-targets --all-features -- -D warnings
+PASS: exit 0, no warnings
+```
+
+```text
+cargo fmt --all -- --check
+PASS: exit 0
+
+git diff --check
+PASS: exit 0
+```
+
+The full `cargo test --all-features` suite was deliberately not run during this fix
+round, as required.

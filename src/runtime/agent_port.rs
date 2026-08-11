@@ -1,6 +1,6 @@
 use std::fmt;
 use std::future::Future;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::pin::Pin;
 
 use thiserror::Error;
@@ -677,16 +677,6 @@ pub trait AgentPort: Send {
         request_id: &AgentRequestId,
         decision: EffectDecision,
     ) -> AgentFuture<'_, ()>;
-    /// Returns the observed postcondition digest for an interrupted idempotent
-    /// mutation. `None` means the adapter cannot prove the postcondition.
-    fn inspect_effect_postcondition<'a>(
-        &'a mut self,
-        _cwd: &'a Path,
-        _item_id: &'a str,
-        _expected_digest: &'a Sha256Digest,
-    ) -> AgentFuture<'a, Option<Sha256Digest>> {
-        Box::pin(async { Ok(None) })
-    }
     fn list_background_processes(
         &mut self,
         context_id: &AgentContextId,
@@ -755,15 +745,6 @@ impl<T: AgentPort + ?Sized> AgentPort for Box<T> {
         decision: EffectDecision,
     ) -> AgentFuture<'_, ()> {
         (**self).resolve_effect(request_id, decision)
-    }
-
-    fn inspect_effect_postcondition<'a>(
-        &'a mut self,
-        cwd: &'a Path,
-        item_id: &'a str,
-        expected_digest: &'a Sha256Digest,
-    ) -> AgentFuture<'a, Option<Sha256Digest>> {
-        (**self).inspect_effect_postcondition(cwd, item_id, expected_digest)
     }
 
     fn list_background_processes(

@@ -18,13 +18,13 @@ use carl::runtime::agent_port::{
 };
 use carl::runtime::task::{
     CanonicalCheckpoint, CheckpointId, ClauseEvidence, ClauseStatus, CompletionClause,
-    CompletionContract, DecisionRecord, EffectClass, EpochDisposition, EvidenceRef,
+    CompletionContract, DecisionRecord, EffectClass, EpochDisposition, EpochId, EvidenceRef,
     ExactIdentifier, OperationCheckpoint, OperationEvidence, OperationId, OperationStatus,
     ProcessCheckpoint, ProgressAssessment, ProviderCheckpoint, ProviderRequestPurpose,
     RecoveryAttempt, RecoveryAttemptOutcome, RecoveryStrategy, ReportErrorCode,
     RepositoryCheckpoint, StartTask, TaskBudget, TaskEngine, TaskEngineUpdate, TaskId, TaskStatus,
     WorkEvidence, assess_progress, assess_progress_with_recovery_attempts, decide_completion,
-    parse_epoch_report, recovery_attempt_fingerprint,
+    parse_epoch_report, recovery_attempt_fingerprint, reduce_task,
 };
 use carl::sidecar::DataRootLock;
 use carl::storage::{NewTask, RuntimeStore, Store};
@@ -76,6 +76,151 @@ fn make_owner_only(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+fn install_postcondition_crash_cut(database: &Path) -> TestResult {
+    Connection::open(database)?.execute_batch(
+        "CREATE TRIGGER crash_after_postcondition_bound
+         BEFORE INSERT ON events
+         WHEN instr(NEW.event_json, 'normalized_operation_evidence_recorded') > 0
+          AND EXISTS (
+              SELECT 1 FROM events
+              WHERE instr(event_json, 'operation_postcondition_bound') > 0
+          )
+         BEGIN
+             SELECT RAISE(ABORT, 'scripted crash after postcondition binding');
+         END;",
+    )?;
+    Ok(())
+}
+
+fn remove_postcondition_crash_cut(database: &Path) -> TestResult {
+    Connection::open(database)?
+        .execute_batch("DROP TRIGGER IF EXISTS crash_after_postcondition_bound;")?;
+    Ok(())
+}
+
+fn install_engine_event_cut(
+    database: &Path,
+    abort_event_fragment: &str,
+    prerequisite_fragment: Option<&str>,
+) -> TestResult {
+    let prerequisite = prerequisite_fragment.map_or_else(String::new, |fragment| {
+        format!(" AND EXISTS (SELECT 1 FROM events WHERE instr(event_json, '{fragment}') > 0)")
+    });
+    Connection::open(database)?.execute_batch(&format!(
+        "CREATE TRIGGER engine_crash_cut
+         BEFORE INSERT ON events
+         WHEN instr(NEW.event_json, '{abort_event_fragment}') > 0{prerequisite}
+         BEGIN SELECT RAISE(ABORT, 'scripted engine crash cut'); END;"
+    ))?;
+    Ok(())
+}
+
+fn remove_engine_event_cut(database: &Path) -> TestResult {
+    Connection::open(database)?.execute_batch("DROP TRIGGER IF EXISTS engine_crash_cut;")?;
+    Ok(())
+}
+
+fn assert_task_projection_matches_replay(store: &Store, task_id: TaskId, cut: &str) -> TestResult {
+    let events = store.read_task_events(task_id)?;
+    let mut replayed = None;
+    for envelope in &events {
+        replayed = Some(reduce_task(replayed, envelope)?);
+    }
+    assert_eq!(
+        store
+            .get_task(task_id)?
+            .expect("task remains projected")
+            .snapshot,
+        replayed.expect("created event exists"),
+        "projection diverged from replay at {cut}"
+    );
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MatrixOutcome {
+    Completed,
+    Blocked,
+}
+
+async fn restart_matrix_task(
+    fixture: &EngineFixture,
+    first: TaskEngine<EnginePort>,
+    task_id: TaskId,
+    restart_port: EnginePort,
+    outcome: MatrixOutcome,
+    cut: &str,
+) -> TestResult<TaskEngine<EnginePort, RuntimeStore>> {
+    assert_task_projection_matches_replay(first.store(), task_id, cut)?;
+    let (store, _) = first.into_parts();
+    drop(store);
+    remove_engine_event_cut(&fixture.database)?;
+    let runtime = RuntimeStore::open(DataRootLock::acquire(&fixture.root)?, chrono::Utc::now())?;
+    let mut restarted = TaskEngine::new_runtime(runtime, restart_port);
+    assert_task_projection_matches_replay(restarted.store(), task_id, cut)?;
+    match outcome {
+        MatrixOutcome::Completed => assert_eq!(
+            restarted.run(task_id).await?.status,
+            TaskStatus::Completed,
+            "restart cut {cut}"
+        ),
+        MatrixOutcome::Blocked => assert_eq!(
+            restarted.run(task_id).await.unwrap_err().code(),
+            carl::runtime::task::TaskEngineErrorCode::Blocked,
+            "restart cut {cut}"
+        ),
+    }
+    assert_task_projection_matches_replay(restarted.store(), task_id, cut)?;
+    Ok(restarted)
+}
+
+async fn restart_matrix_runtime_task(
+    fixture: &EngineFixture,
+    first: TaskEngine<EnginePort, RuntimeStore>,
+    task_id: TaskId,
+    restart_port: EnginePort,
+    outcome: MatrixOutcome,
+    cut: &str,
+) -> TestResult<TaskEngine<EnginePort, RuntimeStore>> {
+    assert_task_projection_matches_replay(first.store(), task_id, cut)?;
+    let (runtime, _) = first.into_parts();
+    drop(runtime);
+    remove_engine_event_cut(&fixture.database)?;
+    let runtime = RuntimeStore::open(DataRootLock::acquire(&fixture.root)?, chrono::Utc::now())?;
+    let mut restarted = TaskEngine::new_runtime(runtime, restart_port);
+    assert_task_projection_matches_replay(restarted.store(), task_id, cut)?;
+    match outcome {
+        MatrixOutcome::Completed => assert_eq!(
+            restarted.run(task_id).await?.status,
+            TaskStatus::Completed,
+            "restart cut {cut}"
+        ),
+        MatrixOutcome::Blocked => assert_eq!(
+            restarted.run(task_id).await.unwrap_err().code(),
+            carl::runtime::task::TaskEngineErrorCode::Blocked,
+            "restart cut {cut}"
+        ),
+    }
+    assert_task_projection_matches_replay(restarted.store(), task_id, cut)?;
+    Ok(restarted)
+}
+
+#[derive(Clone, Copy, Debug)]
+enum RequiredEngineRestartCut {
+    TaskCreated,
+    EpochStarted,
+    OperationIntentRecorded,
+    EffectAuthorized,
+    ItemStarted,
+    WorkspaceMutated,
+    ItemCompleted,
+    CheckpointCandidateBuilt,
+    CheckpointCommitted,
+    CompactionRequested,
+    ProviderReplacementStarted,
+    ProviderBindingCommitted,
+}
+
 impl Drop for EngineFixture {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.root);
@@ -101,6 +246,7 @@ enum WorkFault {
     UnexpectedEvent,
 }
 
+#[derive(Clone)]
 struct EnginePort {
     state: Arc<Mutex<EnginePortState>>,
 }
@@ -134,8 +280,10 @@ struct EnginePortState {
     terminal_statuses: VecDeque<&'static str>,
     additional_effects_in_epoch: usize,
     current_item_id: Option<String>,
+    item_started_deliveries: usize,
     interrupts: usize,
     pending_work_stream: bool,
+    pending_after_item_started: bool,
     pending_planning_stream: bool,
     oversized_planning_stream: bool,
     oversized_work_stream: bool,
@@ -148,7 +296,9 @@ struct EnginePortState {
     invalid_work_report: bool,
     post_usage_diff_bytes: usize,
     pending_resolve: bool,
+    pending_replacement: bool,
     durable_effect_count: u64,
+    durable_mutation_count: u64,
     resume_attempts: Vec<String>,
     resume_unavailable: bool,
     active_context_id: String,
@@ -157,8 +307,10 @@ struct EnginePortState {
     background_lists: usize,
     termination_result: bool,
     terminations: Vec<String>,
-    postcondition_matches: Option<bool>,
-    postcondition_inspections: Vec<(PathBuf, String, String)>,
+    started_process: Option<AgentProcess>,
+    completed_process: Option<AgentProcess>,
+    file_mutation: Option<(PathBuf, Vec<u8>)>,
+    file_change_path: String,
 }
 
 impl EnginePort {
@@ -221,8 +373,10 @@ impl EnginePort {
                 terminal_statuses: VecDeque::new(),
                 additional_effects_in_epoch: 0,
                 current_item_id: None,
+                item_started_deliveries: 0,
                 interrupts: 0,
                 pending_work_stream: false,
+                pending_after_item_started: false,
                 pending_planning_stream: false,
                 oversized_planning_stream: false,
                 oversized_work_stream: false,
@@ -235,7 +389,9 @@ impl EnginePort {
                 invalid_work_report: false,
                 post_usage_diff_bytes: 0,
                 pending_resolve: false,
+                pending_replacement: false,
                 durable_effect_count: 0,
+                durable_mutation_count: 0,
                 resume_attempts: Vec::new(),
                 resume_unavailable: false,
                 active_context_id: "engine-context".to_owned(),
@@ -244,8 +400,10 @@ impl EnginePort {
                 background_lists: 0,
                 termination_result: false,
                 terminations: Vec::new(),
-                postcondition_matches: None,
-                postcondition_inspections: Vec::new(),
+                started_process: None,
+                completed_process: None,
+                file_mutation: None,
+                file_change_path: "src/lib.rs".to_owned(),
             })),
         }
     }
@@ -291,6 +449,18 @@ impl EnginePort {
             state.usage = Some((102_400, 128_000));
             state.compaction_failure_once = true;
         }
+        port
+    }
+
+    fn continuation_checkpoint_with_process_then_compaction_failure(
+        started_process: AgentProcess,
+        completed_process: Option<AgentProcess>,
+    ) -> Self {
+        let port = Self::continuation_checkpoint_then_compaction_failure();
+        let mut state = port.state.lock().unwrap();
+        state.started_process = Some(started_process);
+        state.completed_process = completed_process;
+        drop(state);
         port
     }
 
@@ -357,9 +527,28 @@ impl EnginePort {
         port
     }
 
-    fn pending_effect_with_postcondition(matches: bool) -> Self {
-        let port = Self::pending_effect();
-        port.state.lock().unwrap().postcondition_matches = Some(matches);
+    fn pending_after_item_started() -> Self {
+        let port = Self::small_edit();
+        port.state.lock().unwrap().pending_after_item_started = true;
+        port
+    }
+
+    fn pending_file_effect(workspace: &Path, contents: &[u8]) -> Self {
+        Self::file_effect_with_path(workspace, "src/lib.rs", contents)
+    }
+
+    fn pending_workspace_mutation(workspace: &Path, contents: &[u8]) -> Self {
+        let port = Self::pending_file_effect(workspace, contents);
+        port.state.lock().unwrap().pending_work_stream = true;
+        port
+    }
+
+    fn file_effect_with_path(workspace: &Path, path: &str, contents: &[u8]) -> Self {
+        let port = Self::small_edit();
+        let mut state = port.state.lock().unwrap();
+        state.file_change_path = path.to_owned();
+        state.file_mutation = Some((workspace.join(path), contents.to_vec()));
+        drop(state);
         port
     }
 
@@ -460,6 +649,12 @@ impl EnginePort {
         port
     }
 
+    fn unavailable_context_with_pending_replacement() -> Self {
+        let port = Self::unavailable_context_then_small_edit();
+        port.state.lock().unwrap().pending_replacement = true;
+        port
+    }
+
     fn resume_with_background_process(process: AgentProcess, termination_result: bool) -> Self {
         let port = Self::resume_small_edit();
         let mut state = port.state.lock().unwrap();
@@ -484,6 +679,17 @@ impl EnginePort {
 
     fn shared(&self) -> Arc<Mutex<EnginePortState>> {
         Arc::clone(&self.state)
+    }
+
+    fn prepare_after_crash(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.events.clear();
+        state.latest_operation_id = None;
+        state.current_item_id = None;
+        state.pending_work_stream = false;
+        state.pending_after_item_started = false;
+        state.pending_resolve = false;
+        state.pending_replacement = false;
     }
 }
 
@@ -547,7 +753,14 @@ impl AgentPort for EnginePort {
     ) -> AgentFuture<'a, carl::runtime::agent_port::ContextRecovery> {
         let state = Arc::clone(&self.state);
         Box::pin(async move {
-            state.lock().unwrap().replacements += 1;
+            let pending = {
+                let mut state = state.lock().unwrap();
+                state.replacements += 1;
+                state.pending_replacement
+            };
+            if pending {
+                return std::future::pending().await;
+            }
             let context_id = AgentContextId::parse("replacement-context")?;
             state.lock().unwrap().active_context_id = context_id.as_str().to_owned();
             Ok(carl::runtime::agent_port::ContextRecovery::Replaced(
@@ -657,7 +870,13 @@ impl AgentPort for EnginePort {
                 };
                 let item_id = format!("work-item-{work_number}");
                 state.current_item_id = Some(item_id.clone());
-                let item = work_item(kind, &item_id, "inProgress");
+                let item = work_item_with_process(
+                    kind,
+                    &item_id,
+                    "inProgress",
+                    state.started_process.as_ref(),
+                );
+                let item = work_item_with_file_change_path(item, &state.file_change_path);
                 state.events.push_back(AgentEvent::ItemStarted {
                     context_id: context_id.clone(),
                     epoch_id: epoch_id.clone(),
@@ -734,9 +953,20 @@ impl AgentPort for EnginePort {
     fn next_event(&mut self) -> AgentFuture<'_, AgentEvent> {
         let state = Arc::clone(&self.state);
         Box::pin(async move {
+            let pending_after_item_started = {
+                let state = state.lock().unwrap();
+                state.pending_after_item_started
+                    && matches!(state.events.front(), Some(AgentEvent::EffectRequested(_)))
+            };
+            if pending_after_item_started {
+                return std::future::pending().await;
+            }
             let pending_work_stream = {
                 let mut state = state.lock().unwrap();
                 if let Some(event) = state.events.pop_front() {
+                    if matches!(event, AgentEvent::ItemStarted { .. }) {
+                        state.item_started_deliveries += 1;
+                    }
                     return Ok(event);
                 }
                 (state.pending_work_stream && state.latest_operation_id.is_some())
@@ -805,10 +1035,18 @@ impl AgentPort for EnginePort {
                 .latest_operation_id
                 .take()
                 .expect("engine reports the durable operation binding");
+            let completed_item = work_item_with_process(
+                kind,
+                &item_id,
+                "completed",
+                state.completed_process.as_ref(),
+            );
+            let completed_item =
+                work_item_with_file_change_path(completed_item, &state.file_change_path);
             state.events.push_back(AgentEvent::ItemCompleted {
                 context_id: context_id.clone(),
                 epoch_id: epoch_id.clone(),
-                item: work_item(kind, &item_id, "completed"),
+                item: completed_item,
             });
             if state.additional_effects_in_epoch > 0 {
                 state.additional_effects_in_epoch -= 1;
@@ -934,10 +1172,18 @@ impl AgentPort for EnginePort {
             let (failure, pending) = {
                 let mut state = state.lock().unwrap();
                 state.resolved.push(decision);
-                if decision == EffectDecision::Allow {
+                let pending = state.pending_resolve;
+                if decision == EffectDecision::Allow && !pending {
                     state.durable_effect_count = state.durable_effect_count.saturating_add(1);
+                    if let Some((path, contents)) = state.file_mutation.clone() {
+                        state.durable_mutation_count =
+                            state.durable_mutation_count.saturating_add(1);
+                        fs::create_dir_all(path.parent().expect("the file has a parent"))
+                            .expect("the fake creates the mutation parent");
+                        fs::write(path, contents).expect("the fake applies the file mutation");
+                    }
                 }
-                (state.resolve_failure.take(), state.pending_resolve)
+                (state.resolve_failure.take(), pending)
             };
             if let Some(provenance) = failure {
                 return Err(scripted_error(provenance));
@@ -946,31 +1192,6 @@ impl AgentPort for EnginePort {
                 return std::future::pending().await;
             }
             Ok(())
-        })
-    }
-
-    fn inspect_effect_postcondition<'a>(
-        &'a mut self,
-        cwd: &'a Path,
-        item_id: &'a str,
-        expected_digest: &'a Sha256Digest,
-    ) -> AgentFuture<'a, Option<Sha256Digest>> {
-        let state = Arc::clone(&self.state);
-        let cwd = cwd.to_owned();
-        let item_id = item_id.to_owned();
-        let expected_digest = *expected_digest;
-        Box::pin(async move {
-            let mut state = state.lock().unwrap();
-            state
-                .postcondition_inspections
-                .push((cwd, item_id, expected_digest.to_string()));
-            Ok(state.postcondition_matches.map(|matches| {
-                if matches {
-                    expected_digest
-                } else {
-                    Sha256Digest::parse("f".repeat(64)).expect("fixed digest is valid")
-                }
-            }))
         })
     }
 
@@ -1017,21 +1238,46 @@ const fn scripted_error(provenance: AgentErrorProvenance) -> AgentPortError {
 }
 
 fn work_item(kind: WorkKind, item_id: &str, status: &str) -> AgentItem {
+    work_item_with_process(kind, item_id, status, None)
+}
+
+fn work_item_with_process(
+    kind: WorkKind,
+    item_id: &str,
+    status: &str,
+    process: Option<&AgentProcess>,
+) -> AgentItem {
     match kind {
         WorkKind::Command => AgentItem::Command {
             item_id: item_id.into(),
-            command: "cargo test".into(),
-            cwd: PathBuf::from("/workspace"),
+            command: process.map_or_else(|| "cargo test".into(), |process| process.command.clone()),
+            cwd: process.map_or_else(
+                || PathBuf::from("/workspace"),
+                |process| process.cwd.clone(),
+            ),
             status: status.into(),
             exit_code: (status == "completed").then_some(0),
             aggregated_output: Some("ok".into()),
-            process_id: None,
+            process_id: process.map(|process| process.process_id.clone()),
         },
         WorkKind::FileChange => AgentItem::FileChange {
             item_id: item_id.into(),
             status: status.into(),
             changes: json!([{"path":"src/lib.rs","kind":"update"}]),
         },
+    }
+}
+
+fn work_item_with_file_change_path(item: AgentItem, path: &str) -> AgentItem {
+    match item {
+        AgentItem::FileChange {
+            item_id, status, ..
+        } => AgentItem::FileChange {
+            item_id,
+            status,
+            changes: json!([{"path":path,"kind":"update"}]),
+        },
+        item => item,
     }
 }
 
@@ -1091,36 +1337,6 @@ fn operation_statuses(store: &Store, task_id: TaskId) -> TestResult<Vec<Operatio
                 .expect("operation remains projected")
         })
         .collect())
-}
-
-fn install_running_process_checkpoint(
-    store: &Store,
-    database: &Path,
-    task_id: TaskId,
-    process: &AgentProcess,
-) -> TestResult {
-    let mut checkpoint = store
-        .get_latest_task_checkpoint(task_id)?
-        .expect("the restart fixture has a committed checkpoint");
-    checkpoint.running_processes = vec![ProcessCheckpoint {
-        process_id: process.process_id.clone(),
-        item_id: process.item_id.clone(),
-        command_digest: digest(process.command.as_bytes()),
-        cwd_digest: digest(process.cwd.as_os_str().as_encoded_bytes()),
-    }];
-    let checkpoint_json = String::from_utf8(checkpoint.canonical_bytes()?)?;
-    let checkpoint_digest = checkpoint.digest()?;
-    Connection::open(database)?.execute(
-        "UPDATE task_checkpoints SET checkpoint_json = ?2, digest = ?3
-         WHERE task_id = ?1 AND id = ?4",
-        rusqlite::params![
-            task_id.to_string(),
-            checkpoint_json,
-            checkpoint_digest,
-            checkpoint.checkpoint_id.to_string(),
-        ],
-    )?;
-    Ok(())
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1531,7 +1747,7 @@ async fn hard_wall_budget_interrupts_a_pending_effect_inside_the_provider_stream
     let fixture = EngineFixture::new()?;
     let store = Store::open(&fixture.database)?;
     let session = store.create_session()?;
-    let port = EnginePort::pending_effect();
+    let port = EnginePort::pending_resolve();
     let shared = port.shared();
     let mut engine = TaskEngine::new(store, port);
     let mut input = start_task(session.id, &fixture.workspace)?;
@@ -2639,13 +2855,31 @@ async fn restart_after_replacement_binding_retains_fresh_context_diagnosis() -> 
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn resumed_context_restores_only_an_exact_background_process_identity() -> TestResult {
+async fn completed_background_process_metadata_replaces_started_metadata_and_restores_exactly()
+-> TestResult {
     let fixture = EngineFixture::new()?;
     let store = Store::open(&fixture.database)?;
     let session = store.create_session()?;
+    let started_process = AgentProcess {
+        process_id: "process-123".to_owned(),
+        item_id: "work-item-1".to_owned(),
+        command: "cargo test old".to_owned(),
+        cwd: fixture.workspace.join("old-cwd"),
+        os_pid: Some(123),
+    };
+    let completed_process = AgentProcess {
+        process_id: "process-123".to_owned(),
+        item_id: "work-item-1".to_owned(),
+        command: "cargo test new".to_owned(),
+        cwd: fixture.workspace.join("new-cwd"),
+        os_pid: Some(456),
+    };
     let mut first = TaskEngine::new(
         store,
-        EnginePort::continuation_checkpoint_then_compaction_failure(),
+        EnginePort::continuation_checkpoint_with_process_then_compaction_failure(
+            started_process,
+            Some(completed_process.clone()),
+        ),
     );
     assert!(
         first
@@ -2654,16 +2888,21 @@ async fn resumed_context_restores_only_an_exact_background_process_identity() ->
             .is_err()
     );
     let task_id = first.store().list_resumable_tasks()?[0].snapshot.task_id;
-    let process = AgentProcess {
-        process_id: "process-123".to_owned(),
-        item_id: "verification-item".to_owned(),
-        command: "cargo test --workspace".to_owned(),
-        cwd: fixture.workspace.clone(),
-        os_pid: Some(123),
-    };
-    install_running_process_checkpoint(first.store(), &fixture.database, task_id, &process)?;
+    let checkpoint = first
+        .store()
+        .get_latest_task_checkpoint(task_id)?
+        .expect("the engine committed a checkpoint before compaction");
+    assert_eq!(
+        checkpoint.running_processes,
+        [ProcessCheckpoint {
+            process_id: "process-123".to_owned(),
+            item_id: "work-item-1".to_owned(),
+            command_digest: digest(b"cargo test new"),
+            cwd_digest: digest(completed_process.cwd.as_os_str().as_encoded_bytes()),
+        }]
+    );
     let (store, _) = first.into_parts();
-    let port = EnginePort::resume_with_background_process(process, true);
+    let port = EnginePort::resume_with_background_process(completed_process, true);
     let shared = port.shared();
     let mut restarted = TaskEngine::new(store, port);
 
@@ -2677,13 +2916,111 @@ async fn resumed_context_restores_only_an_exact_background_process_identity() ->
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn completed_command_without_a_process_removes_the_started_process_from_checkpoint()
+-> TestResult {
+    let fixture = EngineFixture::new()?;
+    let store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let started_process = AgentProcess {
+        process_id: "process-finished".to_owned(),
+        item_id: "work-item-1".to_owned(),
+        command: "cargo test --workspace".to_owned(),
+        cwd: fs::canonicalize(&fixture.workspace)?,
+        os_pid: Some(123),
+    };
+    let mut first = TaskEngine::new(
+        store,
+        EnginePort::continuation_checkpoint_with_process_then_compaction_failure(
+            started_process,
+            None,
+        ),
+    );
+
+    assert!(
+        first
+            .start(start_task(session.id, &fixture.workspace)?)
+            .await
+            .is_err()
+    );
+    let task_id = first.store().list_resumable_tasks()?[0].snapshot.task_id;
+    let checkpoint = first
+        .store()
+        .get_latest_task_checkpoint(task_id)?
+        .expect("the engine committed a checkpoint before compaction");
+    assert!(checkpoint.running_processes.is_empty());
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn every_background_process_identity_field_mismatch_blocks_before_new_epoch() -> TestResult {
+    for field in ["process_id", "item_id", "command", "cwd"] {
+        let fixture = EngineFixture::new()?;
+        let store = Store::open(&fixture.database)?;
+        let session = store.create_session()?;
+        let expected = AgentProcess {
+            process_id: "process-exact".to_owned(),
+            item_id: "work-item-1".to_owned(),
+            command: "cargo test --workspace".to_owned(),
+            cwd: fs::canonicalize(&fixture.workspace)?,
+            os_pid: Some(123),
+        };
+        let mut first = TaskEngine::new(
+            store,
+            EnginePort::continuation_checkpoint_with_process_then_compaction_failure(
+                expected.clone(),
+                Some(expected.clone()),
+            ),
+        );
+        assert!(
+            first
+                .start(start_task(session.id, &fixture.workspace)?)
+                .await
+                .is_err()
+        );
+        let task_id = first.store().list_resumable_tasks()?[0].snapshot.task_id;
+        let (store, _) = first.into_parts();
+        let mut observed = expected;
+        match field {
+            "process_id" => observed.process_id = "process-other".to_owned(),
+            "item_id" => observed.item_id = "work-item-other".to_owned(),
+            "command" => observed.command = "cargo test --other".to_owned(),
+            "cwd" => observed.cwd = fixture.workspace.join("other-cwd"),
+            _ => unreachable!(),
+        }
+        let port = EnginePort::resume_with_background_process(observed, true);
+        let shared = port.shared();
+        let mut restarted = TaskEngine::new(store, port);
+
+        assert_eq!(
+            restarted.run(task_id).await.unwrap_err().code(),
+            carl::runtime::task::TaskEngineErrorCode::Blocked,
+            "mismatch in {field} must block"
+        );
+        let state = shared.lock().unwrap();
+        assert_eq!(state.background_lists, 1, "mismatch in {field}");
+        assert!(state.epoch_starts.is_empty(), "mismatch in {field}");
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn missing_background_process_blocks_before_any_new_provider_epoch() -> TestResult {
     let fixture = EngineFixture::new()?;
     let store = Store::open(&fixture.database)?;
     let session = store.create_session()?;
+    let process = AgentProcess {
+        process_id: "process-missing".to_owned(),
+        item_id: "work-item-1".to_owned(),
+        command: "cargo test --workspace".to_owned(),
+        cwd: fs::canonicalize(&fixture.workspace)?,
+        os_pid: Some(123),
+    };
     let mut first = TaskEngine::new(
         store,
-        EnginePort::continuation_checkpoint_then_compaction_failure(),
+        EnginePort::continuation_checkpoint_with_process_then_compaction_failure(
+            process.clone(),
+            Some(process),
+        ),
     );
     assert!(
         first
@@ -2692,14 +3029,6 @@ async fn missing_background_process_blocks_before_any_new_provider_epoch() -> Te
             .is_err()
     );
     let task_id = first.store().list_resumable_tasks()?[0].snapshot.task_id;
-    let process = AgentProcess {
-        process_id: "process-missing".to_owned(),
-        item_id: "verification-item".to_owned(),
-        command: "cargo test --workspace".to_owned(),
-        cwd: fixture.workspace.clone(),
-        os_pid: Some(123),
-    };
-    install_running_process_checkpoint(first.store(), &fixture.database, task_id, &process)?;
     let (store, _) = first.into_parts();
     let port = EnginePort::resume_with_missing_background_process();
     let shared = port.shared();
@@ -2736,9 +3065,19 @@ async fn background_process_cancellation_journals_the_true_termination_result() 
     let fixture = EngineFixture::new()?;
     let store = Store::open(&fixture.database)?;
     let session = store.create_session()?;
+    let process = AgentProcess {
+        process_id: "process-cancel".to_owned(),
+        item_id: "work-item-1".to_owned(),
+        command: "cargo test --workspace".to_owned(),
+        cwd: fs::canonicalize(&fixture.workspace)?,
+        os_pid: Some(123),
+    };
     let mut first = TaskEngine::new(
         store,
-        EnginePort::continuation_checkpoint_then_compaction_failure(),
+        EnginePort::continuation_checkpoint_with_process_then_compaction_failure(
+            process.clone(),
+            Some(process.clone()),
+        ),
     );
     assert!(
         first
@@ -2747,14 +3086,6 @@ async fn background_process_cancellation_journals_the_true_termination_result() 
             .is_err()
     );
     let task_id = first.store().list_resumable_tasks()?[0].snapshot.task_id;
-    let process = AgentProcess {
-        process_id: "process-cancel".to_owned(),
-        item_id: "verification-item".to_owned(),
-        command: "cargo test --workspace".to_owned(),
-        cwd: fixture.workspace.clone(),
-        os_pid: Some(123),
-    };
-    install_running_process_checkpoint(first.store(), &fixture.database, task_id, &process)?;
     let (store, _) = first.into_parts();
     let port = EnginePort::resume_with_background_process(process, true);
     let shared = port.shared();
@@ -2782,7 +3113,7 @@ async fn background_process_cancellation_journals_the_true_termination_result() 
                     terminated: true,
                 },
                 ..
-            } if process_id == "process-cancel" && item_id == "verification-item"
+            } if process_id == "process-cancel" && item_id == "work-item-1"
         )
     }));
     Ok(())
@@ -2794,9 +3125,19 @@ async fn failed_background_termination_is_journaled_false_and_cleanup_stays_bloc
     let fixture = EngineFixture::new()?;
     let store = Store::open(&fixture.database)?;
     let session = store.create_session()?;
+    let process = AgentProcess {
+        process_id: "process-still-running".to_owned(),
+        item_id: "work-item-1".to_owned(),
+        command: "cargo test --workspace".to_owned(),
+        cwd: fs::canonicalize(&fixture.workspace)?,
+        os_pid: Some(123),
+    };
     let mut first = TaskEngine::new(
         store,
-        EnginePort::continuation_checkpoint_then_compaction_failure(),
+        EnginePort::continuation_checkpoint_with_process_then_compaction_failure(
+            process.clone(),
+            Some(process.clone()),
+        ),
     );
     assert!(
         first
@@ -2805,14 +3146,6 @@ async fn failed_background_termination_is_journaled_false_and_cleanup_stays_bloc
             .is_err()
     );
     let task_id = first.store().list_resumable_tasks()?[0].snapshot.task_id;
-    let process = AgentProcess {
-        process_id: "process-still-running".to_owned(),
-        item_id: "verification-item".to_owned(),
-        command: "cargo test --workspace".to_owned(),
-        cwd: fixture.workspace.clone(),
-        os_pid: Some(123),
-    };
-    install_running_process_checkpoint(first.store(), &fixture.database, task_id, &process)?;
     let (store, _) = first.into_parts();
     let port = EnginePort::resume_with_background_process(process, false);
     let mut restarted = TaskEngine::new(store, port);
@@ -2840,7 +3173,7 @@ async fn failed_background_termination_is_journaled_false_and_cleanup_stays_bloc
                     terminated: false,
                 },
                 ..
-            } if process_id == "process-still-running" && item_id == "verification-item"
+            } if process_id == "process-still-running" && item_id == "work-item-1"
         )
     }));
     Ok(())
@@ -3246,6 +3579,21 @@ async fn restart_requires_postcondition_proof_before_retrying_an_idempotent_muta
             _ => None,
         })
         .expect("the idempotent operation ID is durable");
+    assert!(
+        first
+            .store()
+            .read_task_events(task_id)?
+            .iter()
+            .all(|envelope| {
+                !matches!(
+                    envelope.event,
+                    carl::events::Event::TaskLifecycle {
+                        event: carl::runtime::task::TaskEvent::OperationPostconditionBound { .. },
+                        ..
+                    }
+                )
+            })
+    );
     let (store, port) = first.into_parts();
     drop(store);
 
@@ -3279,38 +3627,66 @@ async fn startup_reconciles_a_matching_bound_postcondition_without_redispatch() 
     let fixture = EngineFixture::new()?;
     let store = Store::open(&fixture.database)?;
     let session = store.create_session()?;
-    let port = EnginePort::pending_effect_with_postcondition(true);
+    let port = EnginePort::pending_file_effect(&fixture.workspace, b"trusted postcondition\n");
     let shared = port.shared();
     let mut first = TaskEngine::new(store, port);
+    install_postcondition_crash_cut(&fixture.database)?;
 
-    assert!(
-        tokio::time::timeout(
-            Duration::from_millis(50),
-            first.start(start_task(session.id, &fixture.workspace)?)
-        )
-        .await
-        .is_err()
+    assert_eq!(
+        first
+            .start(start_task(session.id, &fixture.workspace)?)
+            .await
+            .unwrap_err()
+            .code(),
+        carl::runtime::task::TaskEngineErrorCode::Storage
     );
     let task_id = first.store().list_resumable_tasks()?[0].snapshot.task_id;
-    let (operation_id, expected_digest) = first
-        .store()
-        .read_task_events(task_id)?
-        .into_iter()
+    let events = first.store().read_task_events(task_id)?;
+    let operation_id = events
+        .iter()
         .find_map(|envelope| match envelope.event {
             carl::events::Event::TaskLifecycle {
-                event:
-                    carl::runtime::task::TaskEvent::OperationPostconditionBound {
-                        operation_id,
-                        postcondition_digest,
-                    },
+                event: carl::runtime::task::TaskEvent::OperationIntentRecorded { operation_id, .. },
                 ..
-            } => Some((operation_id, postcondition_digest)),
+            } => Some(operation_id),
             _ => None,
         })
-        .expect("the exact postcondition is bound before dispatch");
+        .expect("the operation intent is durable");
+    let started = events
+        .iter()
+        .position(|envelope| {
+            matches!(
+                envelope.event,
+                carl::events::Event::TaskLifecycle {
+                    event: carl::runtime::task::TaskEvent::OperationTransitioned {
+                        to: OperationStatus::Started,
+                        ..
+                    },
+                    ..
+                }
+            )
+        })
+        .expect("dispatch start is durable");
+    let postcondition = events
+        .iter()
+        .position(|envelope| {
+            matches!(
+                envelope.event,
+                carl::events::Event::TaskLifecycle {
+                    event: carl::runtime::task::TaskEvent::OperationPostconditionBound { .. },
+                    ..
+                }
+            )
+        })
+        .expect("Carl binds directly observed filesystem state");
+    assert!(
+        started < postcondition,
+        "postcondition observation follows dispatch"
+    );
     let epoch_starts_before = shared.lock().unwrap().epoch_starts.len();
     let (store, port) = first.into_parts();
     drop(store);
+    remove_postcondition_crash_cut(&fixture.database)?;
     let runtime = RuntimeStore::open(DataRootLock::acquire(&fixture.root)?, chrono::Utc::now())?;
     let mut restarted = TaskEngine::new_runtime(runtime, Box::new(port));
 
@@ -3323,14 +3699,6 @@ async fn startup_reconciles_a_matching_bound_postcondition_without_redispatch() 
     let state = shared.lock().unwrap();
     assert_eq!(state.durable_effect_count, 1);
     assert_eq!(state.epoch_starts.len(), epoch_starts_before);
-    assert_eq!(
-        state.postcondition_inspections,
-        [(
-            fs::canonicalize(&fixture.workspace)?,
-            "work-item-1".to_owned(),
-            expected_digest.to_string()
-        )]
-    );
     Ok(())
 }
 
@@ -3339,17 +3707,18 @@ async fn startup_blocks_a_mismatched_bound_postcondition_without_redispatch() ->
     let fixture = EngineFixture::new()?;
     let store = Store::open(&fixture.database)?;
     let session = store.create_session()?;
-    let port = EnginePort::pending_effect_with_postcondition(false);
+    let port = EnginePort::pending_file_effect(&fixture.workspace, b"trusted postcondition\n");
     let shared = port.shared();
     let mut first = TaskEngine::new(store, port);
+    install_postcondition_crash_cut(&fixture.database)?;
 
-    assert!(
-        tokio::time::timeout(
-            Duration::from_millis(50),
-            first.start(start_task(session.id, &fixture.workspace)?)
-        )
-        .await
-        .is_err()
+    assert_eq!(
+        first
+            .start(start_task(session.id, &fixture.workspace)?)
+            .await
+            .unwrap_err()
+            .code(),
+        carl::runtime::task::TaskEngineErrorCode::Storage
     );
     let task_id = first.store().list_resumable_tasks()?[0].snapshot.task_id;
     let operation_id =
@@ -3371,6 +3740,11 @@ async fn startup_blocks_a_mismatched_bound_postcondition_without_redispatch() ->
     let epoch_starts_before = shared.lock().unwrap().epoch_starts.len();
     let (store, port) = first.into_parts();
     drop(store);
+    remove_postcondition_crash_cut(&fixture.database)?;
+    fs::write(
+        fixture.workspace.join("src/lib.rs"),
+        b"mismatched filesystem state\n",
+    )?;
     let runtime = RuntimeStore::open(DataRootLock::acquire(&fixture.root)?, chrono::Utc::now())?;
     let mut restarted = TaskEngine::new_runtime(runtime, port);
 
@@ -3384,7 +3758,132 @@ async fn startup_blocks_a_mismatched_bound_postcondition_without_redispatch() ->
     let state = shared.lock().unwrap();
     assert_eq!(state.durable_effect_count, 1);
     assert_eq!(state.epoch_starts.len(), epoch_starts_before);
-    assert_eq!(state.postcondition_inspections.len(), 1);
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn postcondition_rejects_parent_traversal_before_dispatch() -> TestResult {
+    let fixture = EngineFixture::new()?;
+    let store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let port = EnginePort::file_effect_with_path(
+        &fixture.workspace,
+        "../outside.txt",
+        b"must not be written\n",
+    );
+    let shared = port.shared();
+    let mut engine = TaskEngine::new(store, port);
+
+    assert_eq!(
+        engine
+            .start(start_task(session.id, &fixture.workspace)?)
+            .await
+            .unwrap_err()
+            .code(),
+        carl::runtime::task::TaskEngineErrorCode::Blocked
+    );
+    assert_eq!(shared.lock().unwrap().durable_effect_count, 0);
+    let record = engine.store().list_resumable_tasks()?.remove(0);
+    assert_eq!(
+        only_operation_status(engine.store(), record.snapshot.task_id)?,
+        OperationStatus::Failed
+    );
+    let rendered = format!(
+        "{:?}",
+        engine.store().read_task_events(record.snapshot.task_id)?
+    );
+    assert!(!rendered.contains("../outside.txt"));
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+async fn postcondition_rejects_a_symlink_target_after_mutation() -> TestResult {
+    use std::os::unix::fs::symlink;
+
+    let fixture = EngineFixture::new()?;
+    fs::create_dir_all(fixture.workspace.join("src"))?;
+    let outside = fixture.root.join("outside.txt");
+    fs::write(&outside, b"before\n")?;
+    symlink(&outside, fixture.workspace.join("src/lib.rs"))?;
+    let store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let port = EnginePort::pending_file_effect(&fixture.workspace, b"mutated\n");
+    let shared = port.shared();
+    let mut engine = TaskEngine::new(store, port);
+
+    assert_eq!(
+        engine
+            .start(start_task(session.id, &fixture.workspace)?)
+            .await
+            .unwrap_err()
+            .code(),
+        carl::runtime::task::TaskEngineErrorCode::Blocked
+    );
+    assert_eq!(fs::read(&outside)?, b"mutated\n");
+    assert_eq!(shared.lock().unwrap().durable_effect_count, 1);
+    let record = engine.store().list_resumable_tasks()?.remove(0);
+    assert_eq!(
+        only_operation_status(engine.store(), record.snapshot.task_id)?,
+        OperationStatus::Uncertain
+    );
+    assert!(
+        engine
+            .store()
+            .read_task_events(record.snapshot.task_id)?
+            .iter()
+            .all(|envelope| !matches!(
+                envelope.event,
+                carl::events::Event::TaskLifecycle {
+                    event: carl::runtime::task::TaskEvent::OperationPostconditionBound { .. },
+                    ..
+                }
+            ))
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn postcondition_rejects_a_hard_link_after_mutation() -> TestResult {
+    let fixture = EngineFixture::new()?;
+    fs::create_dir_all(fixture.workspace.join("src"))?;
+    let sibling = fixture.root.join("same-inode.txt");
+    fs::write(&sibling, b"before\n")?;
+    fs::hard_link(&sibling, fixture.workspace.join("src/lib.rs"))?;
+    let store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let port = EnginePort::pending_file_effect(&fixture.workspace, b"mutated\n");
+    let shared = port.shared();
+    let mut engine = TaskEngine::new(store, port);
+
+    assert_eq!(
+        engine
+            .start(start_task(session.id, &fixture.workspace)?)
+            .await
+            .unwrap_err()
+            .code(),
+        carl::runtime::task::TaskEngineErrorCode::Blocked
+    );
+    assert_eq!(fs::read(&sibling)?, b"mutated\n");
+    assert_eq!(shared.lock().unwrap().durable_effect_count, 1);
+    let record = engine.store().list_resumable_tasks()?.remove(0);
+    assert_eq!(
+        only_operation_status(engine.store(), record.snapshot.task_id)?,
+        OperationStatus::Uncertain
+    );
+    assert!(
+        engine
+            .store()
+            .read_task_events(record.snapshot.task_id)?
+            .iter()
+            .all(|envelope| !matches!(
+                envelope.event,
+                carl::events::Event::TaskLifecycle {
+                    event: carl::runtime::task::TaskEvent::OperationPostconditionBound { .. },
+                    ..
+                }
+            ))
+    );
     Ok(())
 }
 
@@ -3439,6 +3938,171 @@ async fn restart_after_task_creation_activates_and_binds_a_new_context_once() ->
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn restart_after_activation_commit_binds_a_fresh_context_once() -> TestResult {
+    let fixture = EngineFixture::new()?;
+    let mut store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let created = store.create_task(NewTask {
+        session_id: session.id,
+        workspace: fixture.workspace.clone(),
+        contract: CompletionContract {
+            version: 1,
+            goal: "Finish after activation recovery".to_owned(),
+            constraints: Vec::new(),
+            clauses: vec![
+                CompletionClause {
+                    id: "requested-outcome".to_owned(),
+                    description: "The requested outcome is implemented".to_owned(),
+                    required: true,
+                    status: ClauseStatus::Pending,
+                    evidence: Vec::new(),
+                },
+                CompletionClause {
+                    id: "explicit-verification".to_owned(),
+                    description: "The outcome is verified".to_owned(),
+                    required: true,
+                    status: ClauseStatus::Pending,
+                    evidence: Vec::new(),
+                },
+            ],
+        },
+        model: ModelId::parse("gpt-5.6-codex")?,
+        effort: ReasoningEffort::High,
+        permission_mode: PermissionMode::BypassPermissions,
+        budget: TaskBudget::default(),
+        created_at: chrono::Utc::now(),
+    })?;
+    let task_id = created.snapshot.task_id;
+    store
+        .append_task_event(
+            task_id,
+            created.revision,
+            carl::runtime::task::TaskEvent::StateTransitioned {
+                from: TaskStatus::Queued,
+                to: TaskStatus::Active,
+                reason: "activation committed before provider binding".to_owned(),
+            },
+            chrono::Utc::now(),
+        )?
+        .expect("activation is appended");
+    drop(store);
+    let store = Store::open(&fixture.database)?;
+    let port = EnginePort::resume_small_edit();
+    let shared = port.shared();
+    let mut restarted = TaskEngine::new(store, port);
+
+    let snapshot = restarted.run(task_id).await?;
+
+    assert_eq!(snapshot.status, TaskStatus::Completed);
+    let state = shared.lock().unwrap();
+    assert_eq!(state.context_starts, 1);
+    assert!(state.resume_attempts.is_empty());
+    assert_eq!(state.epoch_starts.len(), 1);
+    drop(state);
+    let events = restarted.store().read_task_events(task_id)?;
+    assert_eq!(
+        events
+            .iter()
+            .filter(|envelope| matches!(
+                envelope.event,
+                carl::events::Event::TaskLifecycle {
+                    event: carl::runtime::task::TaskEvent::StateTransitioned {
+                        from: TaskStatus::Queued,
+                        to: TaskStatus::Active,
+                        ..
+                    },
+                    ..
+                }
+            ))
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|envelope| matches!(
+                envelope.event,
+                carl::events::Event::TaskLifecycle {
+                    event: carl::runtime::task::TaskEvent::ProviderContextBound { .. },
+                    ..
+                }
+            ))
+            .count(),
+        1
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn missing_binding_with_durable_provider_work_blocks_instead_of_fresh_binding() -> TestResult
+{
+    let fixture = EngineFixture::new()?;
+    let mut store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let created = store.create_task(NewTask {
+        session_id: session.id,
+        workspace: fixture.workspace.clone(),
+        contract: CompletionContract {
+            version: 1,
+            goal: "Do not replay provider work without a binding".to_owned(),
+            constraints: Vec::new(),
+            clauses: vec![CompletionClause {
+                id: "safe-recovery".to_owned(),
+                description: "Recovery is safe".to_owned(),
+                required: true,
+                status: ClauseStatus::Pending,
+                evidence: Vec::new(),
+            }],
+        },
+        model: ModelId::parse("gpt-5.6-codex")?,
+        effort: ReasoningEffort::High,
+        permission_mode: PermissionMode::BypassPermissions,
+        budget: TaskBudget::default(),
+        created_at: chrono::Utc::now(),
+    })?;
+    let task_id = created.snapshot.task_id;
+    let mut revision = created.revision;
+    for event in [
+        carl::runtime::task::TaskEvent::StateTransitioned {
+            from: TaskStatus::Queued,
+            to: TaskStatus::Active,
+            reason: "activation committed".to_owned(),
+        },
+        carl::runtime::task::TaskEvent::EpochStarted {
+            epoch_id: EpochId::new(),
+            objective: "provider work may have started".to_owned(),
+        },
+    ] {
+        revision = store
+            .append_task_event(task_id, revision, event, chrono::Utc::now())?
+            .expect("setup event appends")
+            .revision;
+    }
+    let port = EnginePort::resume_small_edit();
+    let shared = port.shared();
+    let mut restarted = TaskEngine::new(store, port);
+
+    assert_eq!(
+        restarted.run(task_id).await.unwrap_err().code(),
+        carl::runtime::task::TaskEngineErrorCode::Blocked
+    );
+    assert_eq!(
+        restarted
+            .store()
+            .get_task(task_id)?
+            .unwrap()
+            .snapshot
+            .status,
+        TaskStatus::Blocked
+    );
+    let state = shared.lock().unwrap();
+    assert_eq!(state.context_starts, 0);
+    assert!(state.resume_attempts.is_empty());
+    assert!(state.epoch_starts.is_empty());
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn startup_reconciliation_prepares_resumable_tasks_without_dispatching_work() -> TestResult {
     let fixture = EngineFixture::new()?;
     let store = Store::open(&fixture.database)?;
@@ -3469,6 +4133,540 @@ async fn startup_reconciliation_prepares_resumable_tasks_without_dispatching_wor
     let snapshot = restarted.run(task_id).await?;
     assert_eq!(snapshot.status, TaskStatus::Completed);
     assert_eq!(shared.lock().unwrap().resume_attempts, ["engine-context"]);
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn every_required_engine_restart_cut_restarts_from_real_engine_state() -> TestResult {
+    for cut in [
+        RequiredEngineRestartCut::TaskCreated,
+        RequiredEngineRestartCut::EpochStarted,
+        RequiredEngineRestartCut::OperationIntentRecorded,
+        RequiredEngineRestartCut::EffectAuthorized,
+        RequiredEngineRestartCut::ItemStarted,
+        RequiredEngineRestartCut::WorkspaceMutated,
+        RequiredEngineRestartCut::ItemCompleted,
+        RequiredEngineRestartCut::CheckpointCandidateBuilt,
+        RequiredEngineRestartCut::CheckpointCommitted,
+        RequiredEngineRestartCut::CompactionRequested,
+        RequiredEngineRestartCut::ProviderReplacementStarted,
+        RequiredEngineRestartCut::ProviderBindingCommitted,
+    ] {
+        match cut {
+            RequiredEngineRestartCut::TaskCreated => {
+                let fixture = EngineFixture::new()?;
+                let store = Store::open(&fixture.database)?;
+                let session = store.create_session()?;
+                install_engine_event_cut(&fixture.database, "state_transitioned", None)?;
+                let port = EnginePort::small_edit();
+                let shared = port.shared();
+                let mut first = TaskEngine::new(store, port.clone());
+                assert_eq!(
+                    first
+                        .start(start_task(session.id, &fixture.workspace)?)
+                        .await
+                        .unwrap_err()
+                        .code(),
+                    carl::runtime::task::TaskEngineErrorCode::Storage
+                );
+                let task_id = first.store().list_resumable_tasks()?[0].snapshot.task_id;
+                port.prepare_after_crash();
+                let _restarted = restart_matrix_task(
+                    &fixture,
+                    first,
+                    task_id,
+                    port,
+                    MatrixOutcome::Completed,
+                    "task created",
+                )
+                .await?;
+                let state = shared.lock().unwrap();
+                assert_eq!(state.context_starts, 2);
+                assert_eq!(state.epoch_starts.len(), 1);
+                assert_eq!(state.durable_effect_count, 1);
+            }
+            RequiredEngineRestartCut::EpochStarted => {
+                let fixture = EngineFixture::new()?;
+                let store = Store::open(&fixture.database)?;
+                let session = store.create_session()?;
+                install_engine_event_cut(&fixture.database, "provider_request_recorded", None)?;
+                let port = EnginePort::small_edit();
+                let shared = port.shared();
+                let mut first = TaskEngine::new(store, port.clone());
+                assert_eq!(
+                    first
+                        .start(start_task(session.id, &fixture.workspace)?)
+                        .await
+                        .unwrap_err()
+                        .code(),
+                    carl::runtime::task::TaskEngineErrorCode::Storage
+                );
+                let task_id = first.store().list_resumable_tasks()?[0].snapshot.task_id;
+                port.prepare_after_crash();
+                let _restarted = restart_matrix_task(
+                    &fixture,
+                    first,
+                    task_id,
+                    port,
+                    MatrixOutcome::Completed,
+                    "epoch started",
+                )
+                .await?;
+                let state = shared.lock().unwrap();
+                assert_eq!(state.context_starts, 1);
+                assert_eq!(state.resume_attempts, ["engine-context"]);
+                assert_eq!(state.epoch_starts.len(), 1);
+                assert_eq!(state.durable_effect_count, 1);
+            }
+            RequiredEngineRestartCut::OperationIntentRecorded => {
+                let fixture = EngineFixture::new()?;
+                let store = Store::open(&fixture.database)?;
+                let session = store.create_session()?;
+                install_engine_event_cut(
+                    &fixture.database,
+                    "operation_transitioned",
+                    Some("operation_intent_recorded"),
+                )?;
+                let port = EnginePort::small_edit();
+                let shared = port.shared();
+                let mut first = TaskEngine::new(store, port.clone());
+                assert_eq!(
+                    first
+                        .start(start_task(session.id, &fixture.workspace)?)
+                        .await
+                        .unwrap_err()
+                        .code(),
+                    carl::runtime::task::TaskEngineErrorCode::Storage
+                );
+                let task_id = first.store().list_resumable_tasks()?[0].snapshot.task_id;
+                assert_eq!(
+                    only_operation_status(first.store(), task_id)?,
+                    OperationStatus::IntentRecorded
+                );
+                port.prepare_after_crash();
+                let _restarted = restart_matrix_task(
+                    &fixture,
+                    first,
+                    task_id,
+                    port,
+                    MatrixOutcome::Completed,
+                    "operation intent recorded",
+                )
+                .await?;
+                let state = shared.lock().unwrap();
+                assert_eq!(state.epoch_starts.len(), 3);
+                assert_eq!(state.resolved, [EffectDecision::Allow]);
+                assert_eq!(state.durable_effect_count, 1);
+            }
+            RequiredEngineRestartCut::EffectAuthorized => {
+                let fixture = EngineFixture::new()?;
+                let store = Store::open(&fixture.database)?;
+                let session = store.create_session()?;
+                let port = EnginePort::pending_resolve();
+                let shared = port.shared();
+                let mut first = TaskEngine::new(store, port.clone());
+                assert!(
+                    tokio::time::timeout(
+                        Duration::from_millis(50),
+                        first.start(start_task(session.id, &fixture.workspace)?)
+                    )
+                    .await
+                    .is_err()
+                );
+                let task_id = first.store().list_resumable_tasks()?[0].snapshot.task_id;
+                {
+                    let state = shared.lock().unwrap();
+                    assert_eq!(state.resolved, [EffectDecision::Allow]);
+                    assert_eq!(state.durable_effect_count, 0);
+                }
+                port.prepare_after_crash();
+                let _restarted = restart_matrix_task(
+                    &fixture,
+                    first,
+                    task_id,
+                    port,
+                    MatrixOutcome::Blocked,
+                    "effect authorized",
+                )
+                .await?;
+                let state = shared.lock().unwrap();
+                assert_eq!(state.resolved, [EffectDecision::Allow]);
+                assert_eq!(state.durable_effect_count, 0);
+                assert_eq!(state.epoch_starts.len(), 2);
+            }
+            RequiredEngineRestartCut::ItemStarted => {
+                let fixture = EngineFixture::new()?;
+                let store = Store::open(&fixture.database)?;
+                let session = store.create_session()?;
+                let port = EnginePort::pending_after_item_started();
+                let shared = port.shared();
+                let mut first = TaskEngine::new(store, port.clone());
+                assert!(
+                    tokio::time::timeout(
+                        Duration::from_millis(50),
+                        first.start(start_task(session.id, &fixture.workspace)?)
+                    )
+                    .await
+                    .is_err()
+                );
+                let task_id = first.store().list_resumable_tasks()?[0].snapshot.task_id;
+                assert!(operation_statuses(first.store(), task_id)?.is_empty());
+                assert_eq!(shared.lock().unwrap().item_started_deliveries, 1);
+                port.prepare_after_crash();
+                let _restarted = restart_matrix_task(
+                    &fixture,
+                    first,
+                    task_id,
+                    port,
+                    MatrixOutcome::Completed,
+                    "item started",
+                )
+                .await?;
+                let state = shared.lock().unwrap();
+                assert_eq!(state.item_started_deliveries, 2);
+                assert_eq!(state.durable_effect_count, 1);
+                assert_eq!(state.epoch_starts.len(), 3);
+            }
+            RequiredEngineRestartCut::WorkspaceMutated => {
+                let fixture = EngineFixture::new()?;
+                let store = Store::open(&fixture.database)?;
+                let session = store.create_session()?;
+                let port = EnginePort::pending_workspace_mutation(
+                    &fixture.workspace,
+                    b"matrix mutation\n",
+                );
+                let shared = port.shared();
+                let mut first = TaskEngine::new(store, port.clone());
+                assert!(
+                    tokio::time::timeout(
+                        Duration::from_millis(50),
+                        first.start(start_task(session.id, &fixture.workspace)?)
+                    )
+                    .await
+                    .is_err()
+                );
+                let task_id = first.store().list_resumable_tasks()?[0].snapshot.task_id;
+                assert_eq!(shared.lock().unwrap().durable_mutation_count, 1);
+                port.prepare_after_crash();
+                let _restarted = restart_matrix_task(
+                    &fixture,
+                    first,
+                    task_id,
+                    port,
+                    MatrixOutcome::Blocked,
+                    "workspace mutated",
+                )
+                .await?;
+                let state = shared.lock().unwrap();
+                assert_eq!(state.durable_effect_count, 1);
+                assert_eq!(state.durable_mutation_count, 1);
+                assert_eq!(state.epoch_starts.len(), 2);
+            }
+            RequiredEngineRestartCut::ItemCompleted => {
+                let fixture = EngineFixture::new()?;
+                let store = Store::open(&fixture.database)?;
+                let session = store.create_session()?;
+                install_engine_event_cut(
+                    &fixture.database,
+                    "usage_observed",
+                    Some("operation_postcondition_bound"),
+                )?;
+                let first_port =
+                    EnginePort::pending_file_effect(&fixture.workspace, b"item complete\n");
+                let first_shared = first_port.shared();
+                let mut first = TaskEngine::new(store, first_port);
+                assert_eq!(
+                    first
+                        .start(start_task(session.id, &fixture.workspace)?)
+                        .await
+                        .unwrap_err()
+                        .code(),
+                    carl::runtime::task::TaskEngineErrorCode::Storage
+                );
+                let task_id = first.store().list_resumable_tasks()?[0].snapshot.task_id;
+                assert_eq!(
+                    only_operation_status(first.store(), task_id)?,
+                    OperationStatus::Succeeded
+                );
+                let restart_port = EnginePort::resume_small_edit();
+                let restart_shared = restart_port.shared();
+                let _restarted = restart_matrix_task(
+                    &fixture,
+                    first,
+                    task_id,
+                    restart_port,
+                    MatrixOutcome::Completed,
+                    "item completed",
+                )
+                .await?;
+                assert_eq!(first_shared.lock().unwrap().durable_mutation_count, 1);
+                assert_eq!(restart_shared.lock().unwrap().durable_effect_count, 1);
+                assert_eq!(
+                    first_shared.lock().unwrap().durable_effect_count
+                        + restart_shared.lock().unwrap().durable_effect_count,
+                    2
+                );
+            }
+            RequiredEngineRestartCut::CheckpointCandidateBuilt => {
+                let fixture = EngineFixture::new()?;
+                let store = Store::open(&fixture.database)?;
+                let session = store.create_session()?;
+                install_engine_event_cut(&fixture.database, "checkpoint_committed", None)?;
+                let first_port =
+                    EnginePort::pending_file_effect(&fixture.workspace, b"candidate\n");
+                let first_shared = first_port.shared();
+                let mut first = TaskEngine::new(store, first_port);
+                assert_eq!(
+                    first
+                        .start(start_task(session.id, &fixture.workspace)?)
+                        .await
+                        .unwrap_err()
+                        .code(),
+                    carl::runtime::task::TaskEngineErrorCode::Storage
+                );
+                let task_id = first.store().list_resumable_tasks()?[0].snapshot.task_id;
+                assert_eq!(
+                    first.store().get_task(task_id)?.unwrap().snapshot.status,
+                    TaskStatus::Checkpointing
+                );
+                assert!(first.store().get_latest_task_checkpoint(task_id)?.is_none());
+                let restart_port = EnginePort::resume_small_edit();
+                let restart_shared = restart_port.shared();
+                let _restarted = restart_matrix_task(
+                    &fixture,
+                    first,
+                    task_id,
+                    restart_port,
+                    MatrixOutcome::Blocked,
+                    "checkpoint candidate built",
+                )
+                .await?;
+                assert_eq!(first_shared.lock().unwrap().durable_effect_count, 1);
+                assert_eq!(restart_shared.lock().unwrap().durable_effect_count, 0);
+            }
+            RequiredEngineRestartCut::CheckpointCommitted => {
+                let fixture = EngineFixture::new()?;
+                let store = Store::open(&fixture.database)?;
+                let session = store.create_session()?;
+                install_engine_event_cut(
+                    &fixture.database,
+                    "\"to\":\"completing\"",
+                    Some("checkpoint_committed"),
+                )?;
+                let first_port =
+                    EnginePort::pending_file_effect(&fixture.workspace, b"committed\n");
+                let first_shared = first_port.shared();
+                let mut first = TaskEngine::new(store, first_port);
+                assert_eq!(
+                    first
+                        .start(start_task(session.id, &fixture.workspace)?)
+                        .await
+                        .unwrap_err()
+                        .code(),
+                    carl::runtime::task::TaskEngineErrorCode::Storage
+                );
+                let task_id = first.store().list_resumable_tasks()?[0].snapshot.task_id;
+                assert!(first.store().get_latest_task_checkpoint(task_id)?.is_some());
+                let restart_port = EnginePort::resume_small_edit();
+                let restart_shared = restart_port.shared();
+                let _restarted = restart_matrix_task(
+                    &fixture,
+                    first,
+                    task_id,
+                    restart_port,
+                    MatrixOutcome::Completed,
+                    "checkpoint committed",
+                )
+                .await?;
+                assert_eq!(first_shared.lock().unwrap().durable_effect_count, 1);
+                let restarted = restart_shared.lock().unwrap();
+                assert_eq!(restarted.durable_effect_count, 1);
+                assert_eq!(restarted.durable_mutation_count, 0);
+            }
+            RequiredEngineRestartCut::CompactionRequested => {
+                let fixture = EngineFixture::new()?;
+                let store = Store::open(&fixture.database)?;
+                let session = store.create_session()?;
+                let first_port = EnginePort::continuation_checkpoint_then_compaction_failure();
+                let first_shared = first_port.shared();
+                let mut first = TaskEngine::new(store, first_port);
+                assert_eq!(
+                    first
+                        .start(start_task(session.id, &fixture.workspace)?)
+                        .await
+                        .unwrap_err()
+                        .code(),
+                    carl::runtime::task::TaskEngineErrorCode::Provider
+                );
+                let task_id = first.store().list_resumable_tasks()?[0].snapshot.task_id;
+                assert!(first.store().read_task_events(task_id)?.iter().any(|envelope| {
+                    matches!(
+                        envelope.event,
+                        carl::events::Event::TaskLifecycle {
+                            event: carl::runtime::task::TaskEvent::CompactionRequested { .. },
+                            ..
+                        }
+                    )
+                }));
+                let restart_port = EnginePort::resume_small_edit();
+                let restart_shared = restart_port.shared();
+                let _restarted = restart_matrix_task(
+                    &fixture,
+                    first,
+                    task_id,
+                    restart_port,
+                    MatrixOutcome::Completed,
+                    "compaction requested",
+                )
+                .await?;
+                assert_eq!(first_shared.lock().unwrap().durable_effect_count, 1);
+                assert_eq!(restart_shared.lock().unwrap().durable_effect_count, 1);
+                assert_eq!(
+                    restart_shared.lock().unwrap().resume_attempts,
+                    ["engine-context"]
+                );
+            }
+            RequiredEngineRestartCut::ProviderReplacementStarted => {
+                let fixture = EngineFixture::new()?;
+                let store = Store::open(&fixture.database)?;
+                let session = store.create_session()?;
+                let first_port = EnginePort::continuation_checkpoint_then_compaction_failure();
+                let first_shared = first_port.shared();
+                let mut first = TaskEngine::new(store, first_port);
+                assert!(
+                    first
+                        .start(start_task(session.id, &fixture.workspace)?)
+                        .await
+                        .is_err()
+                );
+                let task_id = first.store().list_resumable_tasks()?[0].snapshot.task_id;
+                assert_task_projection_matches_replay(
+                    first.store(),
+                    task_id,
+                    "provider replacement setup",
+                )?;
+                let (store, _) = first.into_parts();
+                drop(store);
+                let runtime =
+                    RuntimeStore::open(DataRootLock::acquire(&fixture.root)?, chrono::Utc::now())?;
+                let replacement_port = EnginePort::unavailable_context_with_pending_replacement();
+                let replacement_shared = replacement_port.shared();
+                let mut replacement = TaskEngine::new_runtime(runtime, replacement_port.clone());
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(50), replacement.run(task_id))
+                        .await
+                        .is_err()
+                );
+                assert!(
+                    replacement
+                        .store()
+                        .read_task_events(task_id)?
+                        .iter()
+                        .any(|envelope| {
+                            matches!(
+                                &envelope.event,
+                                carl::events::Event::TaskLifecycle {
+                                    event: carl::runtime::task::TaskEvent::ProviderContextLost {
+                                        context_id,
+                                        ..
+                                    },
+                                    ..
+                                } if context_id == "engine-context"
+                            )
+                        })
+                );
+                assert_eq!(replacement_shared.lock().unwrap().replacements, 1);
+                replacement_port.prepare_after_crash();
+                let _restarted = restart_matrix_runtime_task(
+                    &fixture,
+                    replacement,
+                    task_id,
+                    replacement_port,
+                    MatrixOutcome::Completed,
+                    "provider replacement started",
+                )
+                .await?;
+                assert_eq!(first_shared.lock().unwrap().durable_effect_count, 1);
+                let state = replacement_shared.lock().unwrap();
+                assert_eq!(state.replacements, 2);
+                assert_eq!(state.durable_effect_count, 1);
+                assert_eq!(state.resume_attempts, ["engine-context"]);
+            }
+            RequiredEngineRestartCut::ProviderBindingCommitted => {
+                let fixture = EngineFixture::new()?;
+                let store = Store::open(&fixture.database)?;
+                let session = store.create_session()?;
+                let first_port = EnginePort::continuation_checkpoint_then_compaction_failure();
+                let first_shared = first_port.shared();
+                let mut first = TaskEngine::new(store, first_port);
+                assert!(
+                    first
+                        .start(start_task(session.id, &fixture.workspace)?)
+                        .await
+                        .is_err()
+                );
+                let task_id = first.store().list_resumable_tasks()?[0].snapshot.task_id;
+                assert_task_projection_matches_replay(
+                    first.store(),
+                    task_id,
+                    "provider binding setup",
+                )?;
+                let (store, _) = first.into_parts();
+                drop(store);
+                let runtime =
+                    RuntimeStore::open(DataRootLock::acquire(&fixture.root)?, chrono::Utc::now())?;
+                install_engine_event_cut(
+                    &fixture.database,
+                    "epoch_started",
+                    Some("replacement-context"),
+                )?;
+                let replacement_port = EnginePort::unavailable_context_then_small_edit();
+                let replacement_shared = replacement_port.shared();
+                let mut replacement = TaskEngine::new_runtime(runtime, replacement_port);
+                assert_eq!(
+                    replacement.run(task_id).await.unwrap_err().code(),
+                    carl::runtime::task::TaskEngineErrorCode::Storage
+                );
+                assert!(
+                    replacement
+                        .store()
+                        .read_task_events(task_id)?
+                        .iter()
+                        .any(|envelope| {
+                            matches!(
+                                &envelope.event,
+                                carl::events::Event::TaskLifecycle {
+                                    event: carl::runtime::task::TaskEvent::ProviderContextBound {
+                                        context_id
+                                    },
+                                    ..
+                                } if context_id == "replacement-context"
+                            )
+                        })
+                );
+                let restart_port = EnginePort::resume_small_edit();
+                let restart_shared = restart_port.shared();
+                let _restarted = restart_matrix_runtime_task(
+                    &fixture,
+                    replacement,
+                    task_id,
+                    restart_port,
+                    MatrixOutcome::Completed,
+                    "provider binding committed",
+                )
+                .await?;
+                assert_eq!(first_shared.lock().unwrap().durable_effect_count, 1);
+                let replacement = replacement_shared.lock().unwrap();
+                assert_eq!(replacement.resume_attempts, ["engine-context"]);
+                assert_eq!(replacement.replacements, 1);
+                assert_eq!(replacement.durable_effect_count, 0);
+                drop(replacement);
+                let restarted = restart_shared.lock().unwrap();
+                assert_eq!(restarted.resume_attempts, ["replacement-context"]);
+                assert_eq!(restarted.durable_effect_count, 1);
+            }
+        }
+    }
     Ok(())
 }
 

@@ -661,7 +661,7 @@ fn runtime_startup_rolls_back_all_task_reconciliation_when_one_projection_write_
 }
 
 #[test]
-fn every_required_restart_cut_reconstructs_the_same_snapshot_as_authoritative_replay()
+fn representative_journal_prefixes_reconstruct_the_same_snapshot_as_authoritative_replay()
 -> Result<(), Box<dyn Error>> {
     for (label, cut) in [
         ("task created", 0_usize),

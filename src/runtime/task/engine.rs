@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -8,6 +9,12 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::sync::mpsc;
+
+#[cfg(windows)]
+use cap_primitives::fs::_WindowsByHandle;
+#[cfg(any(unix, windows))]
+use cap_std::fs::OpenOptionsExt as _;
+use cap_std::fs::{Dir, OpenOptions};
 
 use crate::acp::{PermissionMode, PermissionProfile};
 use crate::delegates::{ModelId, ReasoningEffort};
@@ -27,12 +34,13 @@ use crate::storage::{
 use super::{
     CanonicalCheckpoint, CheckpointBuildInput, CheckpointId, ClauseStatus, CompactionDecision,
     CompletionClause, CompletionContract, CompletionDecision, ContextBudget, ContextEngine,
-    ContextInput, EpochId, EpochReport, EvidenceRef, ExactIdentifier, NormalizedOperationEvidence,
-    OperationEvidence, OperationId, OperationStatus, ProcessCheckpoint, ProgressAssessment,
-    ProviderCheckpoint, ProviderRequestPurpose, RecoveryAttempt, RecoveryAttemptOutcome,
-    RecoveryStrategy, RepositoryCheckpoint, TaskBudget, TaskEvent, TaskId, TaskSnapshot,
-    TaskStatus, assess_progress_with_recovery_attempts, classify_effect, decide_completion,
-    parse_epoch_report, recovery_attempt_fingerprint,
+    ContextInput, EpochId, EpochReport, EvidenceRef, ExactIdentifier, FilePostcondition,
+    FilePostconditionEntry, NormalizedOperationEvidence, OperationEvidence, OperationId,
+    OperationStatus, ProcessCheckpoint, ProgressAssessment, ProviderCheckpoint,
+    ProviderRequestPurpose, RecoveryAttempt, RecoveryAttemptOutcome, RecoveryStrategy,
+    RepositoryCheckpoint, TaskBudget, TaskEvent, TaskId, TaskSnapshot, TaskStatus,
+    assess_progress_with_recovery_attempts, classify_effect, decide_completion, parse_epoch_report,
+    recovery_attempt_fingerprint,
 };
 
 const MAX_REQUEST_BYTES: usize = 16 * 1024;
@@ -42,6 +50,7 @@ const MAX_EPOCH_DIFF_BYTES: usize = 1024 * 1024;
 const MAX_EPOCH_PROVIDER_EVENTS: usize = 8_192;
 const MAX_ENGINE_UPDATES: usize = 4_096;
 const MAX_ENGINE_UPDATE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_POSTCONDITION_FILE_BYTES: u64 = 1024 * 1024;
 const RESERVED_STATUS_UPDATE_BYTES: usize = 256;
 const DEFAULT_CONTEXT_WINDOW: u64 = 128_000;
 const CONTEXT_TRIGGER_PERCENT: u8 = 80;
@@ -228,6 +237,7 @@ struct RuntimeTask {
 struct ActiveOperation {
     operation_id: OperationId,
     item: AgentItem,
+    postcondition_paths: Option<Vec<String>>,
     frontend_tool_call_id: Option<ToolCallId>,
 }
 
@@ -426,6 +436,17 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                 .map_err(storage_error)?
                 .ok_or_else(invalid_task)?;
         }
+        if record.snapshot.status == TaskStatus::Active
+            && record.snapshot.provider_context.is_none()
+            && self.bind_never_bound_active_context(task_id).await?
+        {
+            provider_ready = true;
+            record = self
+                .store()
+                .get_task(task_id)
+                .map_err(storage_error)?
+                .ok_or_else(invalid_task)?;
+        }
         if record.snapshot.active_epoch.is_some() {
             if self.reconcile_abandoned_epoch(task_id).await? {
                 return Ok(false);
@@ -571,6 +592,17 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                 .map_err(storage_error)?
                 .ok_or_else(invalid_task)?;
         }
+        if record.snapshot.status == TaskStatus::Active
+            && record.snapshot.provider_context.is_none()
+            && self.bind_never_bound_active_context(task_id).await?
+        {
+            provider_ready = true;
+            record = self
+                .store()
+                .get_task(task_id)
+                .map_err(storage_error)?
+                .ok_or_else(invalid_task)?;
+        }
         if record.snapshot.active_epoch.is_some() {
             if self.reconcile_abandoned_epoch(task_id).await? {
                 return Err(error(TaskEngineErrorCode::Blocked));
@@ -652,6 +684,80 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
             },
         )?;
         Ok(())
+    }
+
+    async fn bind_never_bound_active_context(
+        &mut self,
+        task_id: TaskId,
+    ) -> Result<bool, TaskEngineError> {
+        let events = self
+            .store()
+            .read_task_events(task_id)
+            .map_err(storage_error)?;
+        if events.iter().any(|envelope| {
+            matches!(
+                envelope.event,
+                crate::events::Event::TaskLifecycle {
+                    event: TaskEvent::ProviderContextBound { .. },
+                    ..
+                }
+            )
+        }) {
+            return Ok(false);
+        }
+        let safe_to_bind = events.iter().all(|envelope| {
+            !matches!(
+                envelope.event,
+                crate::events::Event::TaskLifecycle {
+                    event: TaskEvent::EpochStarted { .. }
+                        | TaskEvent::ProviderRequestRecorded { .. }
+                        | TaskEvent::ProviderEpochBound { .. }
+                        | TaskEvent::OperationIntentRecorded { .. }
+                        | TaskEvent::OperationPostconditionBound { .. }
+                        | TaskEvent::OperationTransitioned { .. },
+                    ..
+                }
+            )
+        });
+        if !safe_to_bind {
+            self.block_task(
+                task_id,
+                "provider binding is absent after provider work may have started",
+            )?;
+            return Err(error(TaskEngineErrorCode::Blocked));
+        }
+        let configuration = events
+            .into_iter()
+            .find_map(|envelope| match envelope.event {
+                crate::events::Event::TaskLifecycle {
+                    event:
+                        TaskEvent::Created {
+                            workspace,
+                            model,
+                            permission_mode,
+                            ..
+                        },
+                    ..
+                } => Some((workspace, model, permission_mode)),
+                _ => None,
+            })
+            .ok_or_else(invalid_task)?;
+        let context_id = self
+            .port
+            .start_context(StartAgentContext {
+                cwd: configuration.0,
+                model: configuration.1,
+                permission_mode: configuration.2,
+            })
+            .await
+            .map_err(provider_error)?;
+        self.append(
+            task_id,
+            TaskEvent::ProviderContextBound {
+                context_id: context_id.as_str().to_owned(),
+            },
+        )?;
+        Ok(true)
     }
 
     async fn resume_provider_context(
@@ -831,12 +937,12 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                 }
                 TaskEvent::OperationPostconditionBound {
                     operation_id,
-                    postcondition_digest,
+                    postcondition,
                 } => {
                     let Some((_, _, bound)) = operations.get_mut(&operation_id) else {
                         return Err(error(TaskEngineErrorCode::Storage));
                     };
-                    if bound.replace(postcondition_digest).is_some() {
+                    if bound.replace(postcondition).is_some() {
                         return Err(error(TaskEngineErrorCode::Storage));
                     }
                 }
@@ -845,7 +951,7 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
         }
         let workspace = workspace.ok_or_else(invalid_task)?;
         let mut uncertain = Vec::new();
-        for (operation_id, (effect_class, item_id, postcondition_digest)) in operations {
+        for (operation_id, (effect_class, _item_id, postcondition)) in operations {
             let Some(status) = self.snapshot(task_id)?.operation_status(operation_id) else {
                 return Err(error(TaskEngineErrorCode::Storage));
             };
@@ -887,16 +993,12 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                     self.reconcile_observation(task_id, operation_id)?;
                 }
                 super::EffectClass::IdempotentMutation => {
-                    if !self
-                        .reconcile_idempotent_postcondition(
-                            task_id,
-                            operation_id,
-                            &workspace,
-                            &item_id,
-                            postcondition_digest.as_ref(),
-                        )
-                        .await?
-                    {
+                    if !self.reconcile_idempotent_postcondition(
+                        task_id,
+                        operation_id,
+                        &workspace,
+                        postcondition.as_ref(),
+                    )? {
                         uncertain.push(operation_id);
                     }
                 }
@@ -925,15 +1027,14 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
         Ok(true)
     }
 
-    async fn reconcile_idempotent_postcondition(
+    fn reconcile_idempotent_postcondition(
         &mut self,
         task_id: TaskId,
         operation_id: OperationId,
         workspace: &Path,
-        item_id: &str,
-        postcondition_digest: Option<&Sha256Digest>,
+        postcondition: Option<&FilePostcondition>,
     ) -> Result<bool, TaskEngineError> {
-        let Some(postcondition_digest) = postcondition_digest else {
+        let Some(postcondition) = postcondition else {
             self.append(
                 task_id,
                 TaskEvent::OperationEvidenceRecorded {
@@ -943,17 +1044,12 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
             )?;
             return Ok(false);
         };
-        let expected = *postcondition_digest;
-        let observed = self
-            .port
-            .inspect_effect_postcondition(workspace, item_id, &expected)
-            .await
-            .ok()
-            .flatten();
-        let result_digest = observed.map_or_else(
-            || sha256(b"restart-postcondition-inspection-unavailable"),
-            |digest| digest.to_string(),
-        );
+        let observed = inspect_file_postcondition(workspace, postcondition);
+        let result_digest = match &observed {
+            Ok(true) => sha256(b"restart-postcondition-matched"),
+            Ok(false) => sha256(b"restart-postcondition-mismatched"),
+            Err(_) => sha256(b"restart-postcondition-inspection-unavailable"),
+        };
         self.append(
             task_id,
             TaskEvent::OperationEvidenceRecorded {
@@ -962,7 +1058,7 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
             },
         )?;
         let evidence_sequence = self.last_task_sequence(task_id)?;
-        if observed != Some(expected) {
+        if observed != Ok(true) {
             return Ok(false);
         }
         self.append(
@@ -2689,6 +2785,7 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                 if items.insert(item_id.clone(), item.clone()).is_some() {
                     return Err(error(TaskEngineErrorCode::Provider));
                 }
+                update_running_processes(runtime, &item, false)?;
                 if let Some(kind) = engine_tool_kind(&item) {
                     self.updates.push(TaskEngineUpdate::ToolStarted {
                         title: item_id,
@@ -2709,6 +2806,43 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                 }
                 let operation_id = OperationId::new();
                 let effect_class = classify_effect(&request, &item);
+                let postcondition_paths = if effect_class == super::EffectClass::IdempotentMutation
+                {
+                    match validated_file_change_paths(&item) {
+                        Ok(paths) => Some(paths),
+                        Err(_) => {
+                            self.append(
+                                task_id,
+                                TaskEvent::OperationIntentRecorded {
+                                    operation_id,
+                                    epoch_id,
+                                    item_id: request.item_id.clone(),
+                                    effect_class,
+                                    request_digest: request.request_digest.to_string(),
+                                },
+                            )?;
+                            self.append(
+                                task_id,
+                                TaskEvent::OperationTransitioned {
+                                    operation_id,
+                                    from: OperationStatus::IntentRecorded,
+                                    to: OperationStatus::Started,
+                                    evidence_sequences: Vec::new(),
+                                },
+                            )?;
+                            self.close_operation_with_evidence(
+                                task_id,
+                                operation_id,
+                                OperationStatus::Failed,
+                                "file mutation paths are not trustworthy",
+                            )?;
+                            self.block_task(task_id, "file mutation paths are not trustworthy")?;
+                            return Err(error(TaskEngineErrorCode::Blocked));
+                        }
+                    }
+                } else {
+                    None
+                };
                 self.append(
                     task_id,
                     TaskEvent::OperationIntentRecorded {
@@ -2719,15 +2853,6 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                         request_digest: request.request_digest.to_string(),
                     },
                 )?;
-                if effect_class == super::EffectClass::IdempotentMutation {
-                    self.append(
-                        task_id,
-                        TaskEvent::OperationPostconditionBound {
-                            operation_id,
-                            postcondition_digest: file_change_postcondition_digest(&item)?,
-                        },
-                    )?;
-                }
                 self.append(
                     task_id,
                     TaskEvent::OperationTransitioned {
@@ -2748,6 +2873,7 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                     ActiveOperation {
                         operation_id,
                         item,
+                        postcondition_paths,
                         frontend_tool_call_id,
                     },
                 );
@@ -2796,6 +2922,36 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                     return Err(error(TaskEngineErrorCode::Provider));
                 }
                 let terminal = terminal_status(&item);
+                if terminal == OperationStatus::Succeeded
+                    && let Some(expected_paths) = active.postcondition_paths.as_ref()
+                {
+                    let postcondition = match validated_file_change_paths(&item) {
+                        Ok(paths) if paths == *expected_paths => {
+                            capture_file_postcondition(&runtime.workspace, &paths)
+                        }
+                        Ok(_) | Err(_) => Err(error(TaskEngineErrorCode::Verification)),
+                    };
+                    let Ok(postcondition) = postcondition else {
+                        self.close_operation_with_evidence(
+                            task_id,
+                            active.operation_id,
+                            OperationStatus::Uncertain,
+                            "file mutation postcondition could not be captured",
+                        )?;
+                        self.block_task(
+                            task_id,
+                            "file mutation postcondition could not be captured",
+                        )?;
+                        return Err(error(TaskEngineErrorCode::Blocked));
+                    };
+                    self.append(
+                        task_id,
+                        TaskEvent::OperationPostconditionBound {
+                            operation_id: active.operation_id,
+                            postcondition,
+                        },
+                    )?;
+                }
                 let result_digest = normalized_item_digest(&item)?;
                 if let (Some(context), Some(tool_call_id)) =
                     (self.frontend_context.clone(), active.frontend_tool_call_id)
@@ -2844,6 +3000,7 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                     title: item_id.clone(),
                     status: engine_tool_status(terminal),
                 });
+                update_running_processes(runtime, &item, true)?;
                 items.remove(&item_id);
             }
             AgentEvent::AssistantDelta {
@@ -3528,7 +3685,16 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                 diff_artifact_digest: None,
                 file_hashes: runtime.file_hashes.clone(),
             },
-            running_processes: Vec::<ProcessCheckpoint>::new(),
+            running_processes: runtime
+                .running_processes
+                .iter()
+                .map(|process| ProcessCheckpoint {
+                    process_id: process.process_id.clone(),
+                    item_id: process.item_id.clone(),
+                    command_digest: sha256(process.command.as_bytes()),
+                    cwd_digest: sha256(process.cwd.as_os_str().as_encoded_bytes()),
+                })
+                .collect(),
             pending_approval_digests: Vec::new(),
             pending_steering_digests: runtime
                 .steering
@@ -4172,13 +4338,351 @@ fn retain_normalized_evidence(
     Ok(())
 }
 
-fn file_change_postcondition_digest(item: &AgentItem) -> Result<Sha256Digest, TaskEngineError> {
+fn validated_file_change_paths(item: &AgentItem) -> Result<Vec<String>, TaskEngineError> {
     let AgentItem::FileChange { changes, .. } = item else {
         return Err(error(TaskEngineErrorCode::Verification));
     };
-    serde_json::to_vec(changes)
-        .map(|bytes| Sha256Digest::from_bytes(Sha256::digest(bytes).into()))
-        .map_err(|_| error(TaskEngineErrorCode::Verification))
+    let changes = changes
+        .as_array()
+        .ok_or_else(|| error(TaskEngineErrorCode::Verification))?;
+    if changes.is_empty() || changes.len() > 256 {
+        return Err(error(TaskEngineErrorCode::Verification));
+    }
+    let mut paths = Vec::with_capacity(changes.len());
+    for change in changes {
+        let path = change
+            .as_object()
+            .and_then(|change| change.get("path"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| error(TaskEngineErrorCode::Verification))?;
+        if path.is_empty()
+            || path.len() > 4 * 1024
+            || path.contains(['\\', '\0', ':'])
+            || path.chars().any(char::is_control)
+            || path
+                .split('/')
+                .any(|component| component.is_empty() || matches!(component, "." | ".."))
+            || SecretFilter.inspect(path.as_bytes()).is_err()
+        {
+            return Err(error(TaskEngineErrorCode::Verification));
+        }
+        paths.push(path.to_owned());
+    }
+    paths.sort_unstable();
+    paths.dedup();
+    if paths.len() != changes.len() {
+        return Err(error(TaskEngineErrorCode::Verification));
+    }
+    Ok(paths)
+}
+
+fn capture_file_postcondition(
+    workspace: &Path,
+    paths: &[String],
+) -> Result<FilePostcondition, TaskEngineError> {
+    let root = open_held_workspace(workspace)?;
+    let entries = paths
+        .iter()
+        .map(|path| {
+            let digest = inspect_relative_regular_file(&root, path)?;
+            FilePostconditionEntry::new(path.clone(), digest)
+                .map_err(|_| error(TaskEngineErrorCode::Verification))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    FilePostcondition::new(entries).map_err(|_| error(TaskEngineErrorCode::Verification))
+}
+
+fn inspect_file_postcondition(
+    workspace: &Path,
+    expected: &FilePostcondition,
+) -> Result<bool, TaskEngineError> {
+    let paths = expected
+        .entries()
+        .iter()
+        .map(|entry| entry.relative_path().to_owned())
+        .collect::<Vec<_>>();
+    let observed = capture_file_postcondition(workspace, &paths)?;
+    Ok(&observed == expected)
+}
+
+#[cfg(unix)]
+fn open_held_workspace(workspace: &Path) -> Result<Dir, TaskEngineError> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(workspace)
+        .map_err(|_| error(TaskEngineErrorCode::Verification))?;
+    let directory = Dir::from_std_file(file);
+    if !directory
+        .dir_metadata()
+        .map_err(|_| error(TaskEngineErrorCode::Verification))?
+        .is_dir()
+    {
+        return Err(error(TaskEngineErrorCode::Verification));
+    }
+    Ok(directory)
+}
+
+#[cfg(windows)]
+fn open_held_workspace(workspace: &Path) -> Result<Dir, TaskEngineError> {
+    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(
+            windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT
+                | windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS,
+        )
+        .open(workspace)
+        .map_err(|_| error(TaskEngineErrorCode::Verification))?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| error(TaskEngineErrorCode::Verification))?;
+    if !metadata.is_dir()
+        || metadata.file_attributes()
+            & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+            != 0
+    {
+        return Err(error(TaskEngineErrorCode::Verification));
+    }
+    Ok(Dir::from_std_file(file))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_held_workspace(_workspace: &Path) -> Result<Dir, TaskEngineError> {
+    Err(error(TaskEngineErrorCode::Verification))
+}
+
+fn inspect_relative_regular_file(
+    root: &Dir,
+    relative_path: &str,
+) -> Result<Option<Sha256Digest>, TaskEngineError> {
+    let mut components = relative_path.split('/').peekable();
+    let mut parent = root
+        .try_clone()
+        .map_err(|_| error(TaskEngineErrorCode::Verification))?;
+    let file_name = loop {
+        let component = components
+            .next()
+            .ok_or_else(|| error(TaskEngineErrorCode::Verification))?;
+        if components.peek().is_none() {
+            break component;
+        }
+        match open_held_child_directory(&parent, component) {
+            Ok(child) => parent = child,
+            Err(open_error) if open_error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(None);
+            }
+            Err(_) => return Err(error(TaskEngineErrorCode::Verification)),
+        }
+    };
+    let mut options = OpenOptions::new();
+    options.read(true);
+    set_postcondition_no_follow(&mut options);
+    let mut file = match parent.open_with(file_name, &options) {
+        Ok(file) => file,
+        Err(open_error) if open_error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(error(TaskEngineErrorCode::Verification)),
+    };
+    let before = file
+        .metadata()
+        .map_err(|_| error(TaskEngineErrorCode::Verification))?;
+    if !postcondition_metadata_is_safe(&before) || before.len() > MAX_POSTCONDITION_FILE_BYTES {
+        return Err(error(TaskEngineErrorCode::Verification));
+    }
+    let mut contents = Vec::with_capacity(before.len() as usize);
+    file.by_ref()
+        .take(MAX_POSTCONDITION_FILE_BYTES + 1)
+        .read_to_end(&mut contents)
+        .map_err(|_| error(TaskEngineErrorCode::Verification))?;
+    if contents.len() as u64 > MAX_POSTCONDITION_FILE_BYTES {
+        return Err(error(TaskEngineErrorCode::Verification));
+    }
+    let after = file
+        .metadata()
+        .map_err(|_| error(TaskEngineErrorCode::Verification))?;
+    if !same_postcondition_file(&before, &after) {
+        return Err(error(TaskEngineErrorCode::Verification));
+    }
+    let reopened = parent
+        .open_with(file_name, &options)
+        .map_err(|_| error(TaskEngineErrorCode::Verification))?;
+    let rebound = reopened
+        .metadata()
+        .map_err(|_| error(TaskEngineErrorCode::Verification))?;
+    if !same_postcondition_file(&after, &rebound) {
+        return Err(error(TaskEngineErrorCode::Verification));
+    }
+    Ok(Some(Sha256Digest::from_bytes(
+        Sha256::digest(contents).into(),
+    )))
+}
+
+fn open_held_child_directory(parent: &Dir, component: &str) -> std::io::Result<Dir> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    set_postcondition_directory_no_follow(&mut options);
+    let child = Dir::from_std_file(parent.open_with(component, &options)?.into_std());
+    if postcondition_directory_is_safe(&child.dir_metadata()?) {
+        Ok(child)
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "postcondition path parent is not a directory",
+        ))
+    }
+}
+
+#[cfg(unix)]
+fn postcondition_directory_is_safe(metadata: &cap_std::fs::Metadata) -> bool {
+    metadata.is_dir()
+}
+
+#[cfg(windows)]
+fn postcondition_directory_is_safe(metadata: &cap_std::fs::Metadata) -> bool {
+    use cap_std::fs::MetadataExt as _;
+
+    metadata.is_dir()
+        && metadata.file_attributes()
+            & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+            == 0
+}
+
+#[cfg(not(any(unix, windows)))]
+fn postcondition_directory_is_safe(_metadata: &cap_std::fs::Metadata) -> bool {
+    false
+}
+
+#[cfg(unix)]
+fn set_postcondition_directory_no_follow(options: &mut OpenOptions) {
+    options.custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+}
+
+#[cfg(windows)]
+fn set_postcondition_directory_no_follow(options: &mut OpenOptions) {
+    options.custom_flags(
+        windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT
+            | windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS,
+    );
+}
+
+#[cfg(not(any(unix, windows)))]
+fn set_postcondition_directory_no_follow(_options: &mut OpenOptions) {}
+
+#[cfg(unix)]
+fn set_postcondition_no_follow(options: &mut OpenOptions) {
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+}
+
+#[cfg(windows)]
+fn set_postcondition_no_follow(options: &mut OpenOptions) {
+    options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
+}
+
+#[cfg(not(any(unix, windows)))]
+fn set_postcondition_no_follow(_options: &mut OpenOptions) {}
+
+#[cfg(unix)]
+fn postcondition_metadata_is_safe(metadata: &cap_std::fs::Metadata) -> bool {
+    use cap_std::fs::MetadataExt as _;
+
+    metadata.is_file() && metadata.nlink() == 1
+}
+
+#[cfg(windows)]
+fn postcondition_metadata_is_safe(metadata: &cap_std::fs::Metadata) -> bool {
+    use cap_std::fs::MetadataExt as _;
+
+    metadata.is_file()
+        && metadata.file_attributes()
+            & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+            == 0
+        && metadata.number_of_links() == Some(1)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn postcondition_metadata_is_safe(_metadata: &cap_std::fs::Metadata) -> bool {
+    false
+}
+
+#[cfg(unix)]
+fn same_postcondition_file(first: &cap_std::fs::Metadata, second: &cap_std::fs::Metadata) -> bool {
+    use cap_std::fs::MetadataExt as _;
+
+    postcondition_metadata_is_safe(first)
+        && postcondition_metadata_is_safe(second)
+        && first.dev() == second.dev()
+        && first.ino() == second.ino()
+        && first.len() == second.len()
+        && first.mtime() == second.mtime()
+        && first.mtime_nsec() == second.mtime_nsec()
+}
+
+#[cfg(windows)]
+fn same_postcondition_file(first: &cap_std::fs::Metadata, second: &cap_std::fs::Metadata) -> bool {
+    postcondition_metadata_is_safe(first)
+        && postcondition_metadata_is_safe(second)
+        && first.volume_serial_number() == second.volume_serial_number()
+        && first.file_index() == second.file_index()
+        && first.volume_serial_number().is_some()
+        && first.file_index().is_some()
+        && first.len() == second.len()
+        && first.modified().ok() == second.modified().ok()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn same_postcondition_file(
+    _first: &cap_std::fs::Metadata,
+    _second: &cap_std::fs::Metadata,
+) -> bool {
+    false
+}
+
+fn update_running_processes(
+    runtime: &mut RuntimeTask,
+    item: &AgentItem,
+    completed: bool,
+) -> Result<(), TaskEngineError> {
+    let AgentItem::Command {
+        item_id,
+        command,
+        cwd,
+        process_id,
+        ..
+    } = item
+    else {
+        return Ok(());
+    };
+    let Some(process_id) = process_id else {
+        if completed {
+            runtime
+                .running_processes
+                .retain(|process| process.item_id != *item_id);
+        }
+        return Ok(());
+    };
+    let process = AgentProcess {
+        process_id: process_id.clone(),
+        item_id: item_id.clone(),
+        command: command.clone(),
+        cwd: cwd.clone(),
+        os_pid: None,
+    };
+    process
+        .validate()
+        .map_err(|_| error(TaskEngineErrorCode::Provider))?;
+    if runtime.running_processes.iter().any(|existing| {
+        existing.process_id == process.process_id && existing.item_id != process.item_id
+    }) {
+        return Err(error(TaskEngineErrorCode::Provider));
+    }
+    runtime
+        .running_processes
+        .retain(|existing| existing.item_id != process.item_id);
+    runtime.running_processes.push(process);
+    Ok(())
 }
 
 fn normalize_operation_evidence(

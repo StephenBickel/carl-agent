@@ -375,17 +375,17 @@ impl CodexAppServer {
     async fn resume_thread(
         &mut self,
         request: ResumeAgentContext,
-    ) -> Result<CodexThreadId, DelegateError> {
+    ) -> Result<CodexThreadId, ResumeThreadError> {
         let cwd = canonical_directory(request.cwd)?;
         self.require_model(&request.model, None)?;
         if self.threads.contains_key(request.context_id.as_str()) {
-            return Err(protocol_error());
+            return Err(protocol_error().into());
         }
         let thread_id = CodexThreadId::parse(request.context_id.as_str())?;
         let (approval_policy, _) = thread_mode(request.permission_mode);
         let sandbox = "read-only";
-        let result = self
-            .request(
+        let response = self
+            .request_raw(
                 "thread/resume",
                 json!({
                     "threadId": thread_id.as_str(),
@@ -397,6 +397,7 @@ impl CodexAppServer {
                 }),
             )
             .await?;
+        let result = resume_response_result(response, &thread_id)?;
         validate_resumed_thread(
             &result,
             &thread_id,
@@ -736,17 +737,19 @@ impl CodexAppServer {
     }
 
     async fn request(&mut self, method: &str, params: Value) -> Result<Value, DelegateError> {
+        response_result(self.request_raw(method, params).await?)
+    }
+
+    async fn request_raw(&mut self, method: &str, params: Value) -> Result<Value, DelegateError> {
         let id = self.next_request_id;
         self.next_request_id = self
             .next_request_id
             .checked_add(1)
             .ok_or_else(protocol_error)?;
-        let response = self
-            .sidecar
+        self.sidecar
             .request(json!({"id":id,"method":method,"params":params}))
             .await
-            .map_err(map_sidecar_error)?;
-        response_result(response)
+            .map_err(map_sidecar_error)
     }
 
     fn require_model(
@@ -928,9 +931,15 @@ impl AgentPort for CodexAppServer {
                     AgentPortErrorCode::Unsupported,
                 ));
             }
-            let thread_id = CodexAppServer::resume_thread(self, request)
-                .await
-                .map_err(map_agent_error)?;
+            let thread_id = match CodexAppServer::resume_thread(self, request).await {
+                Ok(thread_id) => thread_id,
+                Err(ResumeThreadError::Unavailable) => {
+                    return Err(AgentPortError::definitely_not_applied(
+                        AgentPortErrorCode::UnavailableContext,
+                    ));
+                }
+                Err(ResumeThreadError::Delegate(error)) => return Err(map_agent_error(error)),
+            };
             AgentContextId::parse(thread_id.as_str())
         })
     }
@@ -1908,6 +1917,50 @@ fn response_result(response: Value) -> Result<Value, DelegateError> {
         .get("result")
         .cloned()
         .ok_or_else(|| DelegateError::new(DelegateErrorCode::ProviderFailed))
+}
+
+fn resume_response_result(
+    response: Value,
+    thread_id: &CodexThreadId,
+) -> Result<Value, ResumeThreadError> {
+    if exact_missing_rollout_response(&response, thread_id) {
+        return Err(ResumeThreadError::Unavailable);
+    }
+    response_result(response).map_err(ResumeThreadError::Delegate)
+}
+
+fn exact_missing_rollout_response(response: &Value, thread_id: &CodexThreadId) -> bool {
+    let Some(object) = response.as_object() else {
+        return false;
+    };
+    if !object.contains_key("id")
+        || object
+            .keys()
+            .any(|key| !["id", "error", "jsonrpc"].contains(&key.as_str()))
+        || object
+            .get("jsonrpc")
+            .is_some_and(|value| value.as_str() != Some("2.0"))
+    {
+        return false;
+    }
+    let Some(error) = object.get("error").and_then(Value::as_object) else {
+        return false;
+    };
+    error.len() == 2
+        && error.get("code").and_then(Value::as_i64) == Some(-32600)
+        && error.get("message").and_then(Value::as_str)
+            == Some(format!("no rollout found for thread id {}", thread_id.as_str()).as_str())
+}
+
+enum ResumeThreadError {
+    Unavailable,
+    Delegate(DelegateError),
+}
+
+impl From<DelegateError> for ResumeThreadError {
+    fn from(error: DelegateError) -> Self {
+        Self::Delegate(error)
+    }
 }
 
 fn canonical_directory(path: PathBuf) -> Result<PathBuf, DelegateError> {
