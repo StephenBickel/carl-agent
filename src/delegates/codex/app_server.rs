@@ -871,6 +871,10 @@ impl CodexAppServer {
 }
 
 impl AgentPort for CodexAppServer {
+    fn supports_autonomous_tasks(&self) -> bool {
+        true
+    }
+
     fn capabilities(&self) -> AgentCapabilities {
         AgentCapabilities {
             resume: self.experimental_api_negotiated,

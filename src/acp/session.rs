@@ -7,6 +7,9 @@ use super::{BuzzContext, PermissionMode, SessionConfiguration};
 use crate::delegates::{ModelId, ReasoningEffort};
 use crate::events::SessionId;
 use crate::policy::{ActorId, Frontend};
+use crate::runtime::task::{
+    CheckpointId, CompletionClause, EpochId, RecoveryStrategy, TaskId, TaskStatus,
+};
 use crate::storage::{ChannelId, ClientName, ExternalSessionId};
 
 const MAX_PROMPT_BLOCKS: usize = 12;
@@ -205,11 +208,51 @@ pub enum ToolStatus {
 #[derive(Clone, Debug, PartialEq)]
 pub enum KernelUpdate {
     AgentMessageChunk(String),
-    ToolStarted { title: String, kind: ToolKind },
-    ToolCompleted { title: String, status: ToolStatus },
+    ToolStarted {
+        title: String,
+        kind: ToolKind,
+    },
+    ToolCompleted {
+        title: String,
+        status: ToolStatus,
+    },
     DiffUpdated(String),
     AvailableCommandsChanged,
-    SessionInfoChanged { configuration: SessionConfiguration },
+    SessionInfoChanged {
+        configuration: SessionConfiguration,
+    },
+    TaskStatus {
+        task_id: TaskId,
+        status: TaskStatus,
+    },
+    EpochObjective {
+        task_id: TaskId,
+        epoch_id: EpochId,
+        objective: String,
+    },
+    CheckpointCommitted {
+        task_id: TaskId,
+        checkpoint_id: CheckpointId,
+        digest: String,
+    },
+    ContextUsage {
+        task_id: TaskId,
+        total_tokens: u64,
+        context_window: Option<u64>,
+    },
+    Compaction {
+        task_id: TaskId,
+        generation: u32,
+        replaced_provider: bool,
+    },
+    RecoveryStrategy {
+        task_id: TaskId,
+        strategy: RecoveryStrategy,
+    },
+    CompletionClauses {
+        task_id: TaskId,
+        clauses: Vec<CompletionClause>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]

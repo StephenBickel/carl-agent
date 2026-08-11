@@ -670,6 +670,61 @@ fn render_update(
                 }
             }
         })],
+        KernelUpdate::TaskStatus { task_id, status } => vec![json!({
+            "sessionUpdate":"task_status",
+            "taskId":task_id.to_string(),
+            "status":status,
+        })],
+        KernelUpdate::EpochObjective {
+            task_id,
+            epoch_id,
+            objective,
+        } => vec![json!({
+            "sessionUpdate":"epoch_objective",
+            "taskId":task_id.to_string(),
+            "epochId":epoch_id.to_string(),
+            "objective":objective,
+        })],
+        KernelUpdate::CheckpointCommitted {
+            task_id,
+            checkpoint_id,
+            digest,
+        } => vec![json!({
+            "sessionUpdate":"checkpoint_committed",
+            "taskId":task_id.to_string(),
+            "checkpointId":checkpoint_id.to_string(),
+            "digest":digest,
+        })],
+        KernelUpdate::ContextUsage {
+            task_id,
+            total_tokens,
+            context_window,
+        } => vec![json!({
+            "sessionUpdate":"context_usage",
+            "taskId":task_id.to_string(),
+            "totalTokens":total_tokens,
+            "contextWindow":context_window,
+        })],
+        KernelUpdate::Compaction {
+            task_id,
+            generation,
+            replaced_provider,
+        } => vec![json!({
+            "sessionUpdate":"compaction",
+            "taskId":task_id.to_string(),
+            "generation":generation,
+            "replacedProvider":replaced_provider,
+        })],
+        KernelUpdate::RecoveryStrategy { task_id, strategy } => vec![json!({
+            "sessionUpdate":"recovery_strategy",
+            "taskId":task_id.to_string(),
+            "strategy":strategy,
+        })],
+        KernelUpdate::CompletionClauses { task_id, clauses } => vec![json!({
+            "sessionUpdate":"completion_clauses",
+            "taskId":task_id.to_string(),
+            "clauses":clauses,
+        })],
     }
 }
 

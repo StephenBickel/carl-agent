@@ -1,15 +1,33 @@
 use std::collections::BTreeMap;
+use std::collections::VecDeque;
 use std::error::Error;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
+use carl::acp::PermissionMode;
+use carl::delegates::{ModelId, ReasoningEffort};
+use carl::events::SessionId;
+use carl::policy::Sha256Digest;
+use carl::runtime::agent_port::{
+    AgentCapabilities, AgentContextId, AgentEffectKind, AgentEffectRequest, AgentEpochId,
+    AgentEvent, AgentFuture, AgentItem, AgentModel, AgentPort, AgentPortError, AgentPortErrorCode,
+    AgentProcess, AgentRequestId, EffectDecision, ResumeAgentContext, StartAgentContext,
+    StartAgentEpoch,
+};
 use carl::runtime::task::{
     CanonicalCheckpoint, CheckpointId, ClauseEvidence, ClauseStatus, CompletionClause,
     CompletionContract, DecisionRecord, EffectClass, EpochDisposition, EvidenceRef,
     ExactIdentifier, OperationCheckpoint, OperationEvidence, OperationId, OperationStatus,
     ProcessCheckpoint, ProgressAssessment, ProviderCheckpoint, RecoveryAttempt,
-    RecoveryAttemptOutcome, RecoveryStrategy, ReportErrorCode, RepositoryCheckpoint, TaskId,
-    WorkEvidence, assess_progress, assess_progress_with_recovery_attempts, decide_completion,
-    parse_epoch_report, recovery_attempt_fingerprint,
+    RecoveryAttemptOutcome, RecoveryStrategy, ReportErrorCode, RepositoryCheckpoint, StartTask,
+    TaskBudget, TaskEngine, TaskEngineUpdate, TaskId, TaskStatus, WorkEvidence, assess_progress,
+    assess_progress_with_recovery_attempts, decide_completion, parse_epoch_report,
+    recovery_attempt_fingerprint,
 };
+use carl::storage::Store;
+use rusqlite::Connection;
+use serde_json::json;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -21,6 +39,749 @@ fn uuid(value: &str) -> Uuid {
 
 fn digest(value: &[u8]) -> String {
     format!("{:x}", Sha256::digest(value))
+}
+
+struct EngineFixture {
+    root: PathBuf,
+    workspace: PathBuf,
+    database: PathBuf,
+}
+
+impl EngineFixture {
+    fn new() -> TestResult<Self> {
+        let root = std::env::temp_dir().join(format!("carl-epoch-engine-{}", Uuid::new_v4()));
+        let workspace = root.join("workspace");
+        let database = root.join("carl.sqlite3");
+        fs::create_dir_all(&workspace)?;
+        Ok(Self {
+            root,
+            workspace,
+            database,
+        })
+    }
+}
+
+impl Drop for EngineFixture {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+#[derive(Clone, Copy)]
+enum WorkKind {
+    Command,
+    FileChange,
+}
+
+struct EnginePort {
+    state: Arc<Mutex<EnginePortState>>,
+}
+
+struct EnginePortState {
+    context_starts: usize,
+    epoch_starts: Vec<StartAgentEpoch>,
+    epoch_number: usize,
+    events: VecDeque<AgentEvent>,
+    work: VecDeque<(WorkKind, &'static str, &'static str)>,
+    latest_operation_id: Option<String>,
+    steers: Vec<String>,
+    resolved: Vec<EffectDecision>,
+    compactions: usize,
+    replacements: usize,
+    usage: Option<(u64, u64)>,
+    ambiguous_event_failure: bool,
+}
+
+impl EnginePort {
+    fn three_epochs() -> Self {
+        Self::new([
+            (
+                WorkKind::Command,
+                "Reproduced the failure",
+                "continue:Implement the repair",
+            ),
+            (
+                WorkKind::Command,
+                "Edited the parser and ran focused tests",
+                "continue:Run final verification",
+            ),
+            (
+                WorkKind::Command,
+                "All final checks passed",
+                "complete:requested-outcome,explicit-verification",
+            ),
+        ])
+    }
+
+    fn small_edit() -> Self {
+        Self::new([(
+            WorkKind::FileChange,
+            "Edited src/lib.rs and verified it",
+            "complete:requested-outcome,explicit-verification",
+        )])
+    }
+
+    fn new<const N: usize>(work: [(WorkKind, &'static str, &'static str); N]) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(EnginePortState {
+                context_starts: 0,
+                epoch_starts: Vec::new(),
+                epoch_number: 0,
+                events: VecDeque::new(),
+                work: work.into(),
+                latest_operation_id: None,
+                steers: Vec::new(),
+                resolved: Vec::new(),
+                compactions: 0,
+                replacements: 0,
+                usage: None,
+                ambiguous_event_failure: false,
+            })),
+        }
+    }
+
+    fn ambiguous_event_failure() -> Self {
+        let port = Self::small_edit();
+        port.state.lock().unwrap().ambiguous_event_failure = true;
+        port
+    }
+
+    fn small_edit_under_context_pressure() -> Self {
+        let port = Self::small_edit();
+        port.state.lock().unwrap().usage = Some((102_400, 128_000));
+        port
+    }
+
+    fn resume_small_edit() -> Self {
+        let port = Self::small_edit();
+        port.state.lock().unwrap().epoch_number = 1;
+        port
+    }
+
+    fn shared(&self) -> Arc<Mutex<EnginePortState>> {
+        Arc::clone(&self.state)
+    }
+}
+
+impl AgentPort for EnginePort {
+    fn capabilities(&self) -> AgentCapabilities {
+        AgentCapabilities {
+            resume: true,
+            compact: true,
+            token_usage: true,
+            pre_dispatch_effects: true,
+            history_paging: false,
+            background_processes: false,
+        }
+    }
+
+    fn models(&mut self) -> AgentFuture<'_, Vec<AgentModel>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    fn start_context(&mut self, _request: StartAgentContext) -> AgentFuture<'_, AgentContextId> {
+        let state = Arc::clone(&self.state);
+        Box::pin(async move {
+            state.lock().unwrap().context_starts += 1;
+            AgentContextId::parse("engine-context")
+        })
+    }
+
+    fn resume_context(&mut self, request: ResumeAgentContext) -> AgentFuture<'_, AgentContextId> {
+        Box::pin(async move { Ok(request.context_id) })
+    }
+
+    fn compact_context(&mut self, _context_id: &AgentContextId) -> AgentFuture<'_, ()> {
+        let state = Arc::clone(&self.state);
+        Box::pin(async move {
+            state.lock().unwrap().compactions += 1;
+            Ok(())
+        })
+    }
+
+    fn replace_context<'a>(
+        &'a mut self,
+        _request: ResumeAgentContext,
+        _context_package: &'a carl::runtime::task::ContextPackage,
+    ) -> AgentFuture<'a, carl::runtime::agent_port::ContextRecovery> {
+        let state = Arc::clone(&self.state);
+        Box::pin(async move {
+            state.lock().unwrap().replacements += 1;
+            Ok(carl::runtime::agent_port::ContextRecovery::Replaced(
+                AgentContextId::parse("replacement-context")?,
+            ))
+        })
+    }
+
+    fn start_epoch(&mut self, request: StartAgentEpoch) -> AgentFuture<'_, AgentEpochId> {
+        let state = Arc::clone(&self.state);
+        Box::pin(async move {
+            let mut state = state.lock().unwrap();
+            state.epoch_starts.push(request);
+            state.epoch_number += 1;
+            let epoch_number = state.epoch_number;
+            let epoch_id = AgentEpochId::parse(format!("engine-epoch-{epoch_number}"))?;
+            let context_id = AgentContextId::parse("engine-context")?;
+            state.events.push_back(AgentEvent::EpochStarted {
+                context_id: context_id.clone(),
+                epoch_id: epoch_id.clone(),
+            });
+            if epoch_number == 1 {
+                state.events.push_back(AgentEvent::AssistantDelta {
+                    context_id: context_id.clone(),
+                    epoch_id: epoch_id.clone(),
+                    text: "<carl-completion-contract>{\"version\":1,\"goal\":\"Complete the owner request\",\"constraints\":[],\"clauses\":[{\"id\":\"requested-outcome\",\"description\":\"The requested change is implemented\",\"required\":true,\"status\":\"pending\",\"evidence\":[]},{\"id\":\"explicit-verification\",\"description\":\"The change is explicitly verified\",\"required\":true,\"status\":\"pending\",\"evidence\":[]}]}</carl-completion-contract>".into(),
+                });
+                state.events.push_back(AgentEvent::EpochCompleted {
+                    context_id,
+                    epoch_id: epoch_id.clone(),
+                    status: "completed".into(),
+                });
+            } else {
+                let Some((kind, _, _)) = state.work.front().copied() else {
+                    return Err(AgentPortError::definitely_not_applied(
+                        AgentPortErrorCode::Transport,
+                    ));
+                };
+                let item_id = format!("work-item-{}", epoch_number - 1);
+                let item = work_item(kind, &item_id, "inProgress");
+                state.events.push_back(AgentEvent::ItemStarted {
+                    context_id: context_id.clone(),
+                    epoch_id: epoch_id.clone(),
+                    item,
+                });
+                state
+                    .events
+                    .push_back(AgentEvent::EffectRequested(AgentEffectRequest {
+                        context_id,
+                        epoch_id: epoch_id.clone(),
+                        request_id: AgentRequestId::parse(format!("request-{epoch_number}"))?,
+                        item_id,
+                        kind: match kind {
+                            WorkKind::Command => AgentEffectKind::Command,
+                            WorkKind::FileChange => AgentEffectKind::FileChange,
+                        },
+                        summary: "bounded scripted work".into(),
+                        request_digest: Sha256Digest::parse(format!("{:064x}", epoch_number))
+                            .expect("fixed digest is valid"),
+                    }));
+            }
+            Ok(epoch_id)
+        })
+    }
+
+    fn steer(
+        &mut self,
+        _context_id: &AgentContextId,
+        _epoch_id: &AgentEpochId,
+        text: String,
+    ) -> AgentFuture<'_, ()> {
+        let state = Arc::clone(&self.state);
+        Box::pin(async move {
+            state.lock().unwrap().steers.push(text.clone());
+            if let Some(operation_id) = text.strip_prefix("carl-operation-id:") {
+                state.lock().unwrap().latest_operation_id = Some(operation_id.trim().to_owned());
+            }
+            Ok(())
+        })
+    }
+
+    fn interrupt(
+        &mut self,
+        _context_id: &AgentContextId,
+        _epoch_id: &AgentEpochId,
+    ) -> AgentFuture<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn next_event(&mut self) -> AgentFuture<'_, AgentEvent> {
+        let state = Arc::clone(&self.state);
+        Box::pin(async move {
+            let mut state = state.lock().unwrap();
+            if let Some(event) = state.events.pop_front() {
+                return Ok(event);
+            }
+            if state.ambiguous_event_failure && state.latest_operation_id.is_some() {
+                state.ambiguous_event_failure = false;
+                return Err(AgentPortError::from_code(AgentPortErrorCode::Transport));
+            }
+            let (kind, summary, disposition) = state.work.pop_front().expect("scripted event");
+            let epoch_number = state.epoch_number;
+            let context_id = AgentContextId::parse("engine-context")?;
+            let epoch_id = AgentEpochId::parse(format!("engine-epoch-{epoch_number}"))?;
+            let item_id = format!("work-item-{}", epoch_number - 1);
+            let operation_id = state
+                .latest_operation_id
+                .take()
+                .expect("engine reports the durable operation binding");
+            state.events.push_back(AgentEvent::ItemCompleted {
+                context_id: context_id.clone(),
+                epoch_id: epoch_id.clone(),
+                item: work_item(kind, &item_id, "completed"),
+            });
+            if let Some((total_tokens, context_window)) = state.usage.take() {
+                state.events.push_back(AgentEvent::UsageUpdated {
+                    context_id: context_id.clone(),
+                    epoch_id: epoch_id.clone(),
+                    usage: carl::runtime::agent_port::AgentUsage {
+                        last_total_tokens: total_tokens,
+                        total_tokens,
+                        model_context_window: Some(context_window),
+                    },
+                });
+            }
+            let (disposition, next_objective, clauses) = if let Some(next) =
+                disposition.strip_prefix("continue:")
+            {
+                (
+                    "continue",
+                    format!(",\"next_objective\":{next:?}"),
+                    String::new(),
+                )
+            } else {
+                let clause_ids = disposition
+                    .strip_prefix("complete:")
+                    .expect("complete script")
+                    .split(',');
+                let clauses = clause_ids
+                    .map(|clause_id| {
+                        format!("{{\"clause_id\":{clause_id:?},\"operation_ids\":[{operation_id:?}],\"event_sequences\":[],\"artifact_digests\":[]}}")
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                ("complete", String::new(), clauses)
+            };
+            state.events.push_back(AgentEvent::AssistantDelta {
+                context_id: context_id.clone(),
+                epoch_id: epoch_id.clone(),
+                text: format!("<carl-epoch-report>{{\"schema_version\":1,\"disposition\":{disposition:?},\"summary\":{summary:?}{next_objective},\"clause_evidence\":[{clauses}],\"exact_identifiers\":[]}}</carl-epoch-report>"),
+            });
+            state.events.push_back(AgentEvent::EpochCompleted {
+                context_id,
+                epoch_id,
+                status: "completed".into(),
+            });
+            Ok(state.events.pop_front().expect("completion event queued"))
+        })
+    }
+
+    fn resolve_effect(
+        &mut self,
+        _request_id: &AgentRequestId,
+        decision: EffectDecision,
+    ) -> AgentFuture<'_, ()> {
+        let state = Arc::clone(&self.state);
+        Box::pin(async move {
+            state.lock().unwrap().resolved.push(decision);
+            Ok(())
+        })
+    }
+
+    fn list_background_processes(
+        &mut self,
+        _context_id: &AgentContextId,
+    ) -> AgentFuture<'_, Vec<AgentProcess>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    fn terminate_background_process(
+        &mut self,
+        _context_id: &AgentContextId,
+        _process_id: &str,
+    ) -> AgentFuture<'_, bool> {
+        Box::pin(async { Ok(false) })
+    }
+
+    fn shutdown(&mut self) -> AgentFuture<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+fn work_item(kind: WorkKind, item_id: &str, status: &str) -> AgentItem {
+    match kind {
+        WorkKind::Command => AgentItem::Command {
+            item_id: item_id.into(),
+            command: "cargo test".into(),
+            cwd: PathBuf::from("/workspace"),
+            status: status.into(),
+            exit_code: (status == "completed").then_some(0),
+            aggregated_output: Some("ok".into()),
+            process_id: None,
+        },
+        WorkKind::FileChange => AgentItem::FileChange {
+            item_id: item_id.into(),
+            status: status.into(),
+            changes: json!([{"path":"src/lib.rs","kind":"update"}]),
+        },
+    }
+}
+
+fn start_task(session_id: SessionId, workspace: &Path) -> TestResult<StartTask> {
+    Ok(StartTask {
+        session_id,
+        workspace: workspace.to_owned(),
+        request: "Fix the parser and prove the fix".into(),
+        model: ModelId::parse("gpt-5.6-codex")?,
+        effort: ReasoningEffort::High,
+        permission_mode: PermissionMode::BypassPermissions,
+        budget: TaskBudget::default(),
+    })
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn one_owner_request_runs_three_durable_epochs_to_evidenced_completion() -> TestResult {
+    let fixture = EngineFixture::new()?;
+    let store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let port = EnginePort::three_epochs();
+    let shared = port.shared();
+    let mut engine = TaskEngine::new(store, port);
+
+    let snapshot = engine
+        .start(start_task(session.id, &fixture.workspace)?)
+        .await?;
+
+    assert_eq!(snapshot.status, TaskStatus::Completed);
+    assert!(snapshot.contract.required_clauses_satisfied());
+    assert!(
+        snapshot.contract.clauses.iter().all(|clause| {
+            clause.status == ClauseStatus::Satisfied && !clause.evidence.is_empty()
+        })
+    );
+    let connection = Connection::open(&fixture.database)?;
+    assert_eq!(
+        connection.query_row("SELECT COUNT(*) FROM task_epochs", [], |row| row
+            .get::<_, u64>(0))?,
+        3
+    );
+    assert_eq!(
+        connection.query_row("SELECT COUNT(*) FROM task_checkpoints", [], |row| row
+            .get::<_, u64>(0))?,
+        3
+    );
+    assert_eq!(
+        engine
+            .store()
+            .read_task_events(snapshot.task_id)?
+            .iter()
+            .filter(|event| matches!(
+                event.event,
+                carl::events::Event::TaskLifecycle {
+                    event: carl::runtime::task::TaskEvent::ProviderContextBound { .. },
+                    ..
+                }
+            ))
+            .count(),
+        1
+    );
+    let state = shared.lock().unwrap();
+    assert_eq!(state.context_starts, 1);
+    assert_eq!(
+        state.epoch_starts.len(),
+        4,
+        "one planner plus three work epochs"
+    );
+    assert_eq!(state.resolved, vec![EffectDecision::Allow; 3]);
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn small_full_access_edit_uses_one_plan_one_work_and_no_compaction_ceremony() -> TestResult {
+    let fixture = EngineFixture::new()?;
+    let store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let port = EnginePort::small_edit();
+    let shared = port.shared();
+    let mut engine = TaskEngine::new(store, port);
+
+    let snapshot = engine
+        .start(start_task(session.id, &fixture.workspace)?)
+        .await?;
+
+    assert_eq!(snapshot.status, TaskStatus::Completed);
+    let state = shared.lock().unwrap();
+    assert_eq!(state.epoch_starts.len(), 2);
+    assert_eq!(state.epoch_starts[0].permission_mode, PermissionMode::Plan);
+    assert_eq!(
+        state.epoch_starts[1].permission_mode,
+        PermissionMode::BypassPermissions
+    );
+    assert_eq!(state.compactions, 0);
+    assert_eq!(state.replacements, 0);
+    assert_eq!(state.resolved, [EffectDecision::Allow]);
+    assert!(
+        engine
+            .take_updates()
+            .iter()
+            .all(|update| !matches!(update, TaskEngineUpdate::PermissionRequired { .. }))
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn exhausted_provider_budget_is_durably_blocked_before_work_dispatch() -> TestResult {
+    let fixture = EngineFixture::new()?;
+    let store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let port = EnginePort::small_edit();
+    let shared = port.shared();
+    let mut engine = TaskEngine::new(store, port);
+    let mut input = start_task(session.id, &fixture.workspace)?;
+    input.budget.max_provider_requests = Some(1);
+
+    let error = engine.start(input).await.unwrap_err();
+
+    assert_eq!(
+        error.code(),
+        carl::runtime::task::TaskEngineErrorCode::Blocked
+    );
+    let resumable = engine.store().list_resumable_tasks()?;
+    assert_eq!(resumable.len(), 1);
+    assert_eq!(resumable[0].snapshot.status, TaskStatus::Blocked);
+    assert_eq!(
+        shared.lock().unwrap().epoch_starts.len(),
+        1,
+        "the read-only planning request consumes the entire provider budget"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn ambiguous_provider_failure_marks_started_operation_uncertain_and_blocks() -> TestResult {
+    let fixture = EngineFixture::new()?;
+    let store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let mut engine = TaskEngine::new(store, EnginePort::ambiguous_event_failure());
+
+    let error = engine
+        .start(start_task(session.id, &fixture.workspace)?)
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        error.code(),
+        carl::runtime::task::TaskEngineErrorCode::Provider
+    );
+    let record = engine.store().list_resumable_tasks()?.remove(0);
+    assert_eq!(record.snapshot.status, TaskStatus::Blocked);
+    let operation_id = engine
+        .store()
+        .read_task_events(record.snapshot.task_id)?
+        .into_iter()
+        .find_map(|event| match event.event {
+            carl::events::Event::TaskLifecycle {
+                event: carl::runtime::task::TaskEvent::OperationIntentRecorded { operation_id, .. },
+                ..
+            } => Some(operation_id),
+            _ => None,
+        })
+        .expect("operation intent is durable");
+    assert_eq!(
+        record.snapshot.operation_status(operation_id),
+        Some(OperationStatus::Uncertain)
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn recovery_attempt_outcomes_are_persisted_only_after_the_recovery_epoch_finishes()
+-> TestResult {
+    let fixture = EngineFixture::new()?;
+    let store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let port = EnginePort::new([
+        (WorkKind::Command, "diagnosed", "continue:Repeat diagnosis"),
+        (
+            WorkKind::Command,
+            "same diagnosis",
+            "continue:Repeat diagnosis",
+        ),
+        (
+            WorkKind::Command,
+            "recovery failed",
+            "continue:Repeat diagnosis",
+        ),
+        (
+            WorkKind::Command,
+            "independent verification passed",
+            "complete:requested-outcome,explicit-verification",
+        ),
+    ]);
+    let mut engine = TaskEngine::new(store, port);
+
+    let snapshot = engine
+        .start(start_task(session.id, &fixture.workspace)?)
+        .await?;
+
+    let attempts = engine
+        .store()
+        .read_task_events(snapshot.task_id)?
+        .into_iter()
+        .filter_map(|event| match event.event {
+            carl::events::Event::TaskLifecycle {
+                event:
+                    carl::runtime::task::TaskEvent::RecoveryAttemptRecorded {
+                        strategy,
+                        strategy_fingerprint,
+                        outcome,
+                    },
+                ..
+            } => Some((strategy, strategy_fingerprint, outcome)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0].0, RecoveryStrategy::ReconstructFromEvidence);
+    assert_eq!(attempts[0].2, RecoveryAttemptOutcome::Failed);
+    assert_eq!(attempts[1].0, RecoveryStrategy::ReplaceApproach);
+    assert_eq!(attempts[1].2, RecoveryAttemptOutcome::Succeeded);
+    assert!(attempts.iter().all(|attempt| attempt.1.len() == 64));
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn completed_tool_soft_limit_durably_requests_a_safe_boundary_before_steering() -> TestResult
+{
+    let fixture = EngineFixture::new()?;
+    let store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let port = EnginePort::small_edit();
+    let shared = port.shared();
+    let mut engine = TaskEngine::new(store, port);
+    let mut input = start_task(session.id, &fixture.workspace)?;
+    input.budget.soft_epoch_tool_calls = 1;
+
+    let snapshot = engine.start(input).await?;
+
+    let boundary_steer = shared
+        .lock()
+        .unwrap()
+        .steers
+        .iter()
+        .position(|steer| steer.contains("soft epoch boundary"))
+        .expect("soft boundary is steered");
+    assert!(
+        boundary_steer > 0,
+        "operation binding precedes boundary steering"
+    );
+    assert!(
+        engine
+            .store()
+            .read_task_events(snapshot.task_id)?
+            .iter()
+            .any(|event| matches!(
+                event.event,
+                carl::events::Event::TaskLifecycle {
+                    event: carl::runtime::task::TaskEvent::SteeringQueued { .. },
+                    ..
+                }
+            ))
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn context_pressure_compacts_only_after_the_checkpoint_is_committed() -> TestResult {
+    let fixture = EngineFixture::new()?;
+    let store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let port = EnginePort::small_edit_under_context_pressure();
+    let shared = port.shared();
+    let mut engine = TaskEngine::new(store, port);
+
+    let snapshot = engine
+        .start(start_task(session.id, &fixture.workspace)?)
+        .await?;
+
+    let events = engine.store().read_task_events(snapshot.task_id)?;
+    let checkpoint = events
+        .iter()
+        .position(|event| {
+            matches!(
+                event.event,
+                carl::events::Event::TaskLifecycle {
+                    event: carl::runtime::task::TaskEvent::CheckpointCommitted { .. },
+                    ..
+                }
+            )
+        })
+        .expect("checkpoint committed");
+    let requested = events
+        .iter()
+        .position(|event| {
+            matches!(
+                event.event,
+                carl::events::Event::TaskLifecycle {
+                    event: carl::runtime::task::TaskEvent::CompactionRequested { .. },
+                    ..
+                }
+            )
+        })
+        .expect("compaction requested");
+    let completed = events
+        .iter()
+        .position(|event| {
+            matches!(
+                event.event,
+                carl::events::Event::TaskLifecycle {
+                    event: carl::runtime::task::TaskEvent::CompactionCompleted { .. },
+                    ..
+                }
+            )
+        })
+        .expect("compaction completed");
+    assert!(checkpoint < requested && requested < completed);
+    assert_eq!(shared.lock().unwrap().compactions, 1);
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_new_engine_continues_a_safe_checkpoint_without_another_owner_prompt() -> TestResult {
+    let fixture = EngineFixture::new()?;
+    let store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let first_port = EnginePort::new([(
+        WorkKind::Command,
+        "reproduced before restart",
+        "continue:Finish after restart",
+    )]);
+    let mut first_engine = TaskEngine::new(store, first_port);
+
+    assert_eq!(
+        first_engine
+            .start(start_task(session.id, &fixture.workspace)?)
+            .await
+            .unwrap_err()
+            .code(),
+        carl::runtime::task::TaskEngineErrorCode::Provider
+    );
+    let task_id = first_engine.store().list_resumable_tasks()?[0]
+        .snapshot
+        .task_id;
+    let (store, _) = first_engine.into_parts();
+    let mut resumed = TaskEngine::new(store, EnginePort::resume_small_edit());
+
+    let snapshot = resumed.run(task_id).await?;
+
+    assert_eq!(snapshot.status, TaskStatus::Completed);
+    assert_eq!(
+        resumed
+            .store()
+            .read_task_events(task_id)?
+            .iter()
+            .filter(|event| matches!(
+                event.event,
+                carl::events::Event::TaskLifecycle {
+                    event: carl::runtime::task::TaskEvent::EpochStarted { .. },
+                    ..
+                }
+            ))
+            .count(),
+        3,
+        "the definitely-not-applied provider start is durably closed before restart"
+    );
+    assert_eq!(snapshot.active_epoch, None);
+    Ok(())
 }
 
 fn report(disposition: &str, clauses: &str) -> String {

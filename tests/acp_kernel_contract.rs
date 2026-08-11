@@ -19,6 +19,10 @@ use carl::runtime::agent_port::{
     AgentProcess, AgentRequestId, AgentUsage, EffectDecision, ResumeAgentContext,
     StartAgentContext, StartAgentEpoch,
 };
+use carl::runtime::task::{
+    CheckpointId, ClauseStatus, CompletionClause, EpochId, OperationStatus, RecoveryStrategy,
+    TaskEngineUpdate, TaskId, TaskStatus,
+};
 use carl::sidecar::DataRootLock;
 use carl::storage::{ChannelId, ClientName, ExternalSessionId, RuntimeStore, Store};
 use chrono::Utc;
@@ -27,6 +31,92 @@ use serde_json::json;
 use uuid::Uuid;
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
+
+#[test]
+fn durable_engine_updates_map_to_frontend_kernel_updates() {
+    let task_id = TaskId::new();
+    let epoch_id = EpochId::new();
+    let checkpoint_id = CheckpointId::new();
+    let clauses = vec![CompletionClause {
+        id: "verified".into(),
+        description: "The change is verified".into(),
+        required: true,
+        status: ClauseStatus::Satisfied,
+        evidence: Vec::new(),
+    }];
+    let updates = vec![
+        TaskEngineUpdate::TaskStatus {
+            task_id,
+            status: TaskStatus::Active,
+        },
+        TaskEngineUpdate::EpochObjective {
+            task_id,
+            epoch_id,
+            objective: "Reproduce the failure".into(),
+        },
+        TaskEngineUpdate::CheckpointCommitted {
+            task_id,
+            checkpoint_id,
+            digest: "a".repeat(64),
+        },
+        TaskEngineUpdate::ContextUsage {
+            task_id,
+            total_tokens: 80,
+            context_window: Some(100),
+        },
+        TaskEngineUpdate::Compaction {
+            task_id,
+            generation: 2,
+            replaced_provider: true,
+        },
+        TaskEngineUpdate::RecoveryStrategy {
+            task_id,
+            strategy: RecoveryStrategy::ReplaceApproach,
+        },
+        TaskEngineUpdate::CompletionClauses {
+            task_id,
+            clauses: clauses.clone(),
+        },
+    ]
+    .into_iter()
+    .map(carl::acp::KernelUpdate::from)
+    .collect::<Vec<_>>();
+
+    assert_eq!(
+        updates,
+        vec![
+            carl::acp::KernelUpdate::TaskStatus {
+                task_id,
+                status: TaskStatus::Active,
+            },
+            carl::acp::KernelUpdate::EpochObjective {
+                task_id,
+                epoch_id,
+                objective: "Reproduce the failure".into(),
+            },
+            carl::acp::KernelUpdate::CheckpointCommitted {
+                task_id,
+                checkpoint_id,
+                digest: "a".repeat(64),
+            },
+            carl::acp::KernelUpdate::ContextUsage {
+                task_id,
+                total_tokens: 80,
+                context_window: Some(100),
+            },
+            carl::acp::KernelUpdate::Compaction {
+                task_id,
+                generation: 2,
+                replaced_provider: true,
+            },
+            carl::acp::KernelUpdate::RecoveryStrategy {
+                task_id,
+                strategy: RecoveryStrategy::ReplaceApproach,
+            },
+            carl::acp::KernelUpdate::CompletionClauses { task_id, clauses },
+        ]
+    );
+}
 
 #[test]
 fn permission_modes_have_canonical_product_authority_profiles() {
@@ -39,6 +129,369 @@ fn permission_modes_have_canonical_product_authority_profiles() {
         PermissionMode::BypassPermissions.profile(),
         PermissionProfile::FullAccess,
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn autonomous_capability_routes_initial_prompt_through_the_durable_task_engine() -> TestResult
+{
+    let layout = Layout::new()?;
+    let port = ScriptedPort::autonomous_small_edit();
+    let shared = Arc::clone(&port.shared);
+    let kernel = Kernel::start_with_ports(layout.runtime()?, Box::new(port), None).await?;
+    let mut request = new_session(&layout, Frontend::Acp, None)?;
+    request.mode = PermissionMode::BypassPermissions;
+    let session = kernel.new_session(request).await?;
+
+    let outcome = kernel
+        .prompt(
+            session.id(),
+            Prompt::new(vec!["edit the file and verify it".into()])?,
+        )
+        .await?;
+
+    assert_eq!(outcome.stop_reason, PromptStopReason::EndTurn);
+    assert!(outcome.updates.iter().any(|update| matches!(
+        update,
+        carl::acp::KernelUpdate::TaskStatus {
+            status: TaskStatus::Completed,
+            ..
+        }
+    )));
+    let tasks = Store::open(&layout.database)?.list_resumable_tasks()?;
+    assert!(tasks.is_empty(), "the routed durable task completed");
+    let events = Store::open(&layout.database)?.read_events(session.id())?;
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event.event, Event::TaskLifecycle { .. }))
+    );
+    let operation_started = events
+        .iter()
+        .position(|event| {
+            matches!(
+                event.event,
+                Event::TaskLifecycle {
+                    event: carl::runtime::task::TaskEvent::OperationTransitioned {
+                        to: OperationStatus::Started,
+                        ..
+                    },
+                    ..
+                }
+            )
+        })
+        .expect("task operation start is durable");
+    let dispatch_authorized = events
+        .iter()
+        .position(|event| {
+            matches!(
+                event.event,
+                Event::ToolDispatchAuthorized {
+                    automatic: true,
+                    ..
+                }
+            )
+        })
+        .expect("Task 1 dispatch authority is durable");
+    assert!(operation_started < dispatch_authorized);
+    assert_eq!(
+        shared.lock().unwrap().starts,
+        2,
+        "one planning request plus one work request proves the legacy one-turn path was not used"
+    );
+    kernel.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_prompt_after_terminal_completion_starts_a_new_durable_task() -> TestResult {
+    let layout = Layout::new()?;
+    let port = ScriptedPort::autonomous_small_edit();
+    let shared = Arc::clone(&port.shared);
+    let kernel = Kernel::start_with_ports(layout.runtime()?, Box::new(port), None).await?;
+    let mut request = new_session(&layout, Frontend::Acp, None)?;
+    request.mode = PermissionMode::BypassPermissions;
+    let session = kernel.new_session(request).await?;
+
+    let first = kernel
+        .prompt(
+            session.id(),
+            Prompt::new(vec!["complete the first durable edit".into()])?,
+        )
+        .await?;
+    let second = kernel
+        .prompt(
+            session.id(),
+            Prompt::new(vec!["complete a second durable edit".into()])?,
+        )
+        .await?;
+
+    assert_eq!(first.stop_reason, PromptStopReason::EndTurn);
+    assert_eq!(second.stop_reason, PromptStopReason::EndTurn);
+    assert_eq!(
+        shared.lock().unwrap().starts,
+        4,
+        "each durable task has one planning and one work request"
+    );
+    let events = Store::open(&layout.database)?.read_events(session.id())?;
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(
+                event.event,
+                Event::TaskLifecycle {
+                    event: carl::runtime::task::TaskEvent::Created { .. },
+                    ..
+                }
+            ))
+            .count(),
+        2
+    );
+
+    kernel.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn autonomous_prompt_durably_steers_and_cancels_while_provider_read_is_pending() -> TestResult
+{
+    let layout = Layout::new()?;
+    let port = ScriptedPort::autonomous_pending_edit();
+    let shared = Arc::clone(&port.shared);
+    let kernel = Kernel::start_with_ports(layout.runtime()?, Box::new(port), None).await?;
+    let mut request = new_session(&layout, Frontend::Acp, None)?;
+    request.mode = PermissionMode::BypassPermissions;
+    let session = kernel.new_session(request).await?;
+    let prompt_kernel = kernel.clone();
+    let session_id = session.id();
+    let prompt = tokio::spawn(async move {
+        prompt_kernel
+            .prompt(
+                session_id,
+                Prompt::new(vec!["start the durable edit".into()]).expect("prompt is valid"),
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if shared.lock().unwrap().starts >= 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+
+    let steered = kernel
+        .prompt(
+            session.id(),
+            Prompt::new(vec!["also verify the regression case".into()])?,
+        )
+        .await?;
+    assert_eq!(steered.stop_reason, PromptStopReason::EndTurn);
+    let events = Store::open(&layout.database)?.read_events(session.id())?;
+    let task_id = events
+        .iter()
+        .find_map(|event| match event.event {
+            Event::TaskLifecycle { task_id, .. } => Some(task_id),
+            _ => None,
+        })
+        .expect("durable task exists");
+    assert!(events.iter().any(|event| matches!(
+        &event.event,
+        Event::UserInput { text } if text == "also verify the regression case"
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event.event,
+        Event::TaskLifecycle {
+            event: carl::runtime::task::TaskEvent::SteeringQueued { .. },
+            ..
+        }
+    )));
+
+    kernel.cancel(session.id()).await?;
+    let initial = prompt.await??;
+    assert_eq!(initial.stop_reason, PromptStopReason::Cancelled);
+    let record = Store::open(&layout.database)?
+        .get_task(task_id)?
+        .expect("cancelled durable task remains projected");
+    assert_eq!(record.snapshot.status, TaskStatus::Cancelled);
+    assert_eq!(shared.lock().unwrap().interrupts, 1);
+    kernel.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn dropping_an_autonomous_prompt_caller_does_not_cancel_the_durable_task() -> TestResult {
+    let layout = Layout::new()?;
+    let port = ScriptedPort::autonomous_pending_edit();
+    let shared = Arc::clone(&port.shared);
+    let kernel = Kernel::start_with_ports(layout.runtime()?, Box::new(port), None).await?;
+    let mut request = new_session(&layout, Frontend::Acp, None)?;
+    request.mode = PermissionMode::BypassPermissions;
+    let session = kernel.new_session(request).await?;
+    let prompt_kernel = kernel.clone();
+    let session_id = session.id();
+    let prompt = tokio::spawn(async move {
+        prompt_kernel
+            .prompt(
+                session_id,
+                Prompt::new(vec!["start the durable edit".into()]).expect("prompt is valid"),
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if shared.lock().unwrap().starts >= 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+
+    prompt.abort();
+    assert!(
+        prompt
+            .await
+            .expect_err("the caller was dropped")
+            .is_cancelled()
+    );
+    tokio::task::yield_now().await;
+    assert_eq!(shared.lock().unwrap().interrupts, 0);
+    let task = Store::open(&layout.database)?
+        .list_resumable_tasks()?
+        .into_iter()
+        .next()
+        .expect("disconnect leaves the durable task resumable");
+    assert_eq!(task.snapshot.status, TaskStatus::Active);
+
+    kernel.cancel(session.id()).await?;
+    assert_eq!(shared.lock().unwrap().interrupts, 1);
+    kernel.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn autonomous_task_pauses_for_exact_approval_and_resumes_the_same_provider_epoch()
+-> TestResult {
+    let layout = Layout::new()?;
+    let port = ScriptedPort::autonomous_small_edit();
+    let shared = Arc::clone(&port.shared);
+    let kernel = Kernel::start_with_ports(layout.runtime()?, Box::new(port), None).await?;
+    let session = kernel
+        .new_session(new_session(&layout, Frontend::Acp, None)?)
+        .await?;
+
+    let waiting = kernel
+        .prompt(
+            session.id(),
+            Prompt::new(vec!["edit the file after approval".into()])?,
+        )
+        .await?;
+    assert_eq!(waiting.stop_reason, PromptStopReason::WaitingForApproval);
+    let code = local_approval_code(&waiting)?;
+
+    let completed = kernel
+        .prompt(session.id(), Prompt::new(vec![format!("/approve {code}")])?)
+        .await?;
+    assert_eq!(completed.stop_reason, PromptStopReason::EndTurn);
+    assert!(completed.updates.iter().any(|update| matches!(
+        update,
+        carl::acp::KernelUpdate::TaskStatus {
+            status: TaskStatus::Completed,
+            ..
+        }
+    )));
+    {
+        let state = shared.lock().unwrap();
+        assert_eq!(state.resolved, [EffectDecision::Allow]);
+        assert_eq!(state.starts, 2, "approval resumes the same work epoch");
+    }
+    let events = Store::open(&layout.database)?.read_events(session.id())?;
+    let operation_started = events
+        .iter()
+        .position(|event| {
+            matches!(
+                event.event,
+                Event::TaskLifecycle {
+                    event: carl::runtime::task::TaskEvent::OperationTransitioned {
+                        to: OperationStatus::Started,
+                        ..
+                    },
+                    ..
+                }
+            )
+        })
+        .expect("operation starts durably");
+    let approval_requested = events
+        .iter()
+        .position(|event| matches!(event.event, Event::ApprovalRequested { .. }))
+        .expect("approval is durable before provider resolution");
+    assert!(operation_started < approval_requested);
+    let replay = kernel
+        .prompt(session.id(), Prompt::new(vec![format!("/approve {code}")])?)
+        .await
+        .expect_err("approval code is exact and single use");
+    assert_eq!(
+        replay.code(),
+        carl::acp::KernelErrorCode::ApprovalUnavailable
+    );
+    kernel.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn autonomous_task_denial_blocks_the_task_without_restarting_the_provider_epoch() -> TestResult
+{
+    let layout = Layout::new()?;
+    let port = ScriptedPort::autonomous_small_edit();
+    let shared = Arc::clone(&port.shared);
+    let kernel = Kernel::start_with_ports(layout.runtime()?, Box::new(port), None).await?;
+    let session = kernel
+        .new_session(new_session(&layout, Frontend::Acp, None)?)
+        .await?;
+
+    let waiting = kernel
+        .prompt(
+            session.id(),
+            Prompt::new(vec!["edit the file after approval".into()])?,
+        )
+        .await?;
+    assert_eq!(waiting.stop_reason, PromptStopReason::WaitingForApproval);
+    let code = local_approval_code(&waiting)?;
+
+    let denied = kernel
+        .prompt(session.id(), Prompt::new(vec![format!("/deny {code}")])?)
+        .await?;
+    assert_eq!(denied.stop_reason, PromptStopReason::Failed);
+    assert!(denied.updates.iter().any(|update| matches!(
+        update,
+        carl::acp::KernelUpdate::TaskStatus {
+            status: TaskStatus::Blocked,
+            ..
+        }
+    )));
+
+    let events = Store::open(&layout.database)?.read_events(session.id())?;
+    let task_id = events
+        .iter()
+        .find_map(|event| match event.event {
+            Event::TaskLifecycle { task_id, .. } => Some(task_id),
+            _ => None,
+        })
+        .expect("durable task exists");
+    let record = Store::open(&layout.database)?
+        .get_task(task_id)?
+        .expect("denied durable task remains projected");
+    assert_eq!(record.snapshot.status, TaskStatus::Blocked);
+    {
+        let state = shared.lock().unwrap();
+        assert_eq!(state.resolved, [EffectDecision::Deny]);
+        assert_eq!(state.starts, 2, "denial does not restart the work epoch");
+    }
+
+    kernel.shutdown().await?;
+    Ok(())
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1284,6 +1737,9 @@ struct PortState {
     starts: usize,
     steers: Vec<String>,
     interrupts: usize,
+    autonomous: bool,
+    latest_operation_id: Option<String>,
+    hold_autonomous_work: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -1293,6 +1749,18 @@ enum InvalidApprovalCase {
 }
 
 impl ScriptedPort {
+    fn autonomous_small_edit() -> Self {
+        let port = Self::with_events([]);
+        port.shared.lock().unwrap().autonomous = true;
+        port
+    }
+
+    fn autonomous_pending_edit() -> Self {
+        let port = Self::autonomous_small_edit();
+        port.shared.lock().unwrap().hold_autonomous_work = true;
+        port
+    }
+
     fn lifecycle() -> TestResult<Self> {
         Ok(Self::with_events([
             AgentEvent::EpochStarted {
@@ -1412,6 +1880,9 @@ impl ScriptedPort {
                 starts: 0,
                 steers: Vec::new(),
                 interrupts: 0,
+                autonomous: false,
+                latest_operation_id: None,
+                hold_autonomous_work: false,
             })),
         })
     }
@@ -1442,6 +1913,9 @@ impl ScriptedPort {
                 starts: 0,
                 steers: Vec::new(),
                 interrupts: 0,
+                autonomous: false,
+                latest_operation_id: None,
+                hold_autonomous_work: false,
             })),
         }
     }
@@ -1463,6 +1937,9 @@ impl ScriptedPort {
                 starts: 0,
                 steers: Vec::new(),
                 interrupts: 0,
+                autonomous: false,
+                latest_operation_id: None,
+                hold_autonomous_work: false,
             })),
         }
     }
@@ -1489,6 +1966,10 @@ fn file_change_item(item_id: &str, status: &str) -> AgentItem {
 }
 
 impl AgentPort for ScriptedPort {
+    fn supports_autonomous_tasks(&self) -> bool {
+        self.shared.lock().unwrap().autonomous
+    }
+
     fn capabilities(&self) -> AgentCapabilities {
         AgentCapabilities {
             resume: true,
@@ -1524,12 +2005,54 @@ impl AgentPort for ScriptedPort {
         Box::pin(async { Ok(()) })
     }
 
-    fn start_epoch(&mut self, _request: StartAgentEpoch) -> AgentFuture<'_, AgentEpochId> {
+    fn start_epoch(&mut self, request: StartAgentEpoch) -> AgentFuture<'_, AgentEpochId> {
         let shared = Arc::clone(&self.shared);
         Box::pin(async move {
             let mut state = shared.lock().unwrap();
             state.starts += 1;
-            state.epoch_ids.pop_front().map_or_else(epoch, Ok)
+            if !state.autonomous {
+                return state.epoch_ids.pop_front().map_or_else(epoch, Ok);
+            }
+            let epoch_id = AgentEpochId::parse(format!("durable-turn-{}", state.starts))?;
+            state.events.push_back(AgentEvent::EpochStarted {
+                context_id: request.context_id.clone(),
+                epoch_id: epoch_id.clone(),
+            });
+            if state.starts % 2 == 1 {
+                state.events.push_back(AgentEvent::AssistantDelta {
+                    context_id: request.context_id.clone(),
+                    epoch_id: epoch_id.clone(),
+                    text: "<carl-completion-contract>{\"version\":1,\"goal\":\"Edit and verify\",\"constraints\":[],\"clauses\":[{\"id\":\"requested-outcome\",\"description\":\"edit\",\"required\":true,\"status\":\"pending\",\"evidence\":[]},{\"id\":\"explicit-verification\",\"description\":\"verify\",\"required\":true,\"status\":\"pending\",\"evidence\":[]}]}</carl-completion-contract>".into(),
+                });
+                state.events.push_back(AgentEvent::EpochCompleted {
+                    context_id: request.context_id,
+                    epoch_id: epoch_id.clone(),
+                    status: "completed".into(),
+                });
+            } else {
+                let work_number = state.starts / 2;
+                let item_id = format!("durable-item-{work_number}");
+                let request_id = format!("durable-request-{work_number}");
+                let item = command_item(&item_id, "inProgress");
+                state.events.push_back(AgentEvent::ItemStarted {
+                    context_id: request.context_id.clone(),
+                    epoch_id: epoch_id.clone(),
+                    item,
+                });
+                state
+                    .events
+                    .push_back(AgentEvent::EffectRequested(AgentEffectRequest {
+                        context_id: request.context_id,
+                        epoch_id: epoch_id.clone(),
+                        request_id: AgentRequestId::parse(request_id)?,
+                        item_id,
+                        kind: AgentEffectKind::Command,
+                        summary: "run focused verification".into(),
+                        request_digest: Sha256Digest::parse("44".repeat(32))
+                            .map_err(|_| invalid())?,
+                    }));
+            }
+            Ok(epoch_id)
         })
     }
 
@@ -1541,7 +2064,11 @@ impl AgentPort for ScriptedPort {
     ) -> AgentFuture<'_, ()> {
         let shared = Arc::clone(&self.shared);
         Box::pin(async move {
-            shared.lock().unwrap().steers.push(input);
+            let mut state = shared.lock().unwrap();
+            if let Some(operation_id) = input.strip_prefix("carl-operation-id:") {
+                state.latest_operation_id = Some(operation_id.trim().to_owned());
+            }
+            state.steers.push(input);
             Ok(())
         })
     }
@@ -1559,12 +2086,44 @@ impl AgentPort for ScriptedPort {
     }
 
     fn next_event(&mut self) -> AgentFuture<'_, AgentEvent> {
-        let event = self.shared.lock().unwrap().events.pop_front();
+        let shared = Arc::clone(&self.shared);
         Box::pin(async move {
-            match event {
-                Some(event) => Ok(event),
-                None => std::future::pending().await,
+            let event = {
+                let mut state = shared.lock().unwrap();
+                if let Some(event) = state.events.pop_front() {
+                    Some(event)
+                } else if state.autonomous && !state.hold_autonomous_work {
+                    let operation_id = state
+                        .latest_operation_id
+                        .take()
+                        .expect("durable operation binding");
+                    let context_id = context()?;
+                    let epoch_id = AgentEpochId::parse(format!("durable-turn-{}", state.starts))?;
+                    let item_id = format!("durable-item-{}", state.starts / 2);
+                    state.events.push_back(AgentEvent::ItemCompleted {
+                        context_id: context_id.clone(),
+                        epoch_id: epoch_id.clone(),
+                        item: command_item(&item_id, "completed"),
+                    });
+                    state.events.push_back(AgentEvent::AssistantDelta {
+                        context_id: context_id.clone(),
+                        epoch_id: epoch_id.clone(),
+                        text: format!("<carl-epoch-report>{{\"schema_version\":1,\"disposition\":\"complete\",\"summary\":\"done\",\"clause_evidence\":[{{\"clause_id\":\"requested-outcome\",\"operation_ids\":[{operation_id:?}],\"event_sequences\":[],\"artifact_digests\":[]}},{{\"clause_id\":\"explicit-verification\",\"operation_ids\":[{operation_id:?}],\"event_sequences\":[],\"artifact_digests\":[]}}],\"exact_identifiers\":[]}}</carl-epoch-report>"),
+                    });
+                    state.events.push_back(AgentEvent::EpochCompleted {
+                        context_id,
+                        epoch_id,
+                        status: "completed".into(),
+                    });
+                    state.events.pop_front()
+                } else {
+                    None
+                }
+            };
+            if let Some(event) = event {
+                return Ok(event);
             }
+            std::future::pending().await
         })
     }
 

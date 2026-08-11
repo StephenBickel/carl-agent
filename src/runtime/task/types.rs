@@ -13,6 +13,8 @@ use crate::delegates::{ModelId, ReasoningEffort};
 use crate::events::SessionId;
 use crate::runtime::agent_port::{AgentEffectKind, AgentEffectRequest, AgentItem};
 
+use super::progress::{RecoveryAttemptOutcome, RecoveryStrategy};
+
 const MAX_CONTRACT_TEXT_BYTES: usize = 16 * 1024;
 const MAX_CLAUSES: usize = 64;
 const MAX_CONSTRAINTS: usize = 128;
@@ -414,6 +416,19 @@ pub enum EffectClass {
     AmbiguousConsequential,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "evidence_kind", rename_all = "snake_case")]
+pub enum NormalizedOperationEvidence {
+    Command {
+        completed: bool,
+        exit_code: Option<i32>,
+    },
+    FileChange {
+        completed: bool,
+        artifact_digests: Vec<String>,
+    },
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct TaskBudget {
     pub max_wall_time_seconds: Option<u64>,
@@ -619,6 +634,10 @@ pub enum TaskEvent {
         #[serde(deserialize_with = "deserialize_event_identifier")]
         result_digest: String,
     },
+    NormalizedOperationEvidenceRecorded {
+        operation_id: OperationId,
+        evidence: NormalizedOperationEvidence,
+    },
     UsageObserved {
         epoch_id: EpochId,
         total_tokens: u64,
@@ -628,6 +647,12 @@ pub enum TaskEvent {
         #[serde(deserialize_with = "deserialize_event_identifier")]
         fingerprint: String,
         stalled: bool,
+    },
+    RecoveryAttemptRecorded {
+        strategy: RecoveryStrategy,
+        #[serde(deserialize_with = "deserialize_event_identifier")]
+        strategy_fingerprint: String,
+        outcome: RecoveryAttemptOutcome,
     },
     CheckpointCommitted {
         checkpoint_id: CheckpointId,
@@ -698,7 +723,39 @@ impl TaskEvent {
             Self::OperationEvidenceRecorded { result_digest, .. } => {
                 validate_event_identifier(result_digest)
             }
+            Self::NormalizedOperationEvidenceRecorded { evidence, .. } => match evidence {
+                NormalizedOperationEvidence::Command { .. } => Ok(()),
+                NormalizedOperationEvidence::FileChange {
+                    artifact_digests, ..
+                } => {
+                    if artifact_digests.len() > MAX_TASK_EVENT_EVIDENCE_SEQUENCES
+                        || artifact_digests
+                            .iter()
+                            .any(|digest| !is_lowercase_sha256(digest))
+                    {
+                        Err(TaskValidationError::from_code(
+                            TaskValidationErrorCode::InvalidEvidenceSequence,
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                }
+            },
             Self::ProgressAssessed { fingerprint, .. } => validate_event_identifier(fingerprint),
+            Self::RecoveryAttemptRecorded {
+                strategy,
+                strategy_fingerprint,
+                ..
+            } => {
+                if *strategy == RecoveryStrategy::DeclareBlocked
+                    || !is_lowercase_sha256(strategy_fingerprint)
+                {
+                    return Err(TaskValidationError::from_code(
+                        TaskValidationErrorCode::EmptyEventField,
+                    ));
+                }
+                Ok(())
+            }
             Self::CheckpointCommitted { digest, .. } => validate_event_identifier(digest),
             Self::ProviderContextBound { context_id } => validate_event_identifier(context_id),
             Self::ProviderContextLost { context_id, reason } => {
@@ -712,6 +769,13 @@ impl TaskEvent {
             | Self::Completed => Ok(()),
         }
     }
+}
+
+fn is_lowercase_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn validate_event_text(value: &str) -> Result<(), TaskValidationError> {

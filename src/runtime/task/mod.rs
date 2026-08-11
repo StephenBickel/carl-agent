@@ -1,5 +1,6 @@
 mod checkpoint;
 mod context;
+mod engine;
 mod progress;
 mod reducer;
 mod report;
@@ -14,6 +15,14 @@ pub use context::{
     CompactionDecision, ContextBudget, ContextEngine, ContextError, ContextInput, ContextLedger,
     ContextLedgerEntry, ContextPackage, ContextSourceKind, ContextTrust, ContextUnit,
 };
+pub use engine::{
+    EngineToolKind, EngineToolStatus, StartTask, TaskEngine, TaskEngineError, TaskEngineErrorCode,
+    TaskEngineUpdate,
+};
+pub(crate) use engine::{
+    TaskEngineAcknowledgement, TaskEngineControl, TaskEngineFrontendContext,
+    TaskEnginePermissionNotice,
+};
 pub use progress::{
     ProgressAssessment, RecoveryAttempt, RecoveryAttemptOutcome, RecoveryStrategy, assess_progress,
     assess_progress_with_recovery_attempts, recovery_attempt_fingerprint,
@@ -26,6 +35,7 @@ pub use report::{
 pub(crate) use types::OperationEvidenceState;
 pub use types::{
     CheckpointId, ClauseStatus, CompletionClause, CompletionContract, ContextPackageId,
-    EffectClass, EpochId, EvidenceRef, OperationId, OperationStatus, TaskBudget, TaskEvent, TaskId,
-    TaskSnapshot, TaskStatus, TaskValidationError, TaskValidationErrorCode, classify_effect,
+    EffectClass, EpochId, EvidenceRef, NormalizedOperationEvidence, OperationId, OperationStatus,
+    TaskBudget, TaskEvent, TaskId, TaskSnapshot, TaskStatus, TaskValidationError,
+    TaskValidationErrorCode, classify_effect,
 };

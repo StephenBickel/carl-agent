@@ -1702,6 +1702,47 @@ impl Store {
         load_task_record(&self.connection, task_id)
     }
 
+    pub fn get_latest_task_checkpoint(
+        &self,
+        task_id: TaskId,
+    ) -> Result<Option<CanonicalCheckpoint>, CarlError> {
+        let Some(record) = self.get_task(task_id)? else {
+            return Ok(None);
+        };
+        let Some(checkpoint_id) = record.snapshot.latest_checkpoint else {
+            return Ok(None);
+        };
+        let raw = self
+            .connection
+            .query_row(
+                "SELECT digest, checkpoint_json FROM task_checkpoints
+                 WHERE task_id = ?1 AND id = ?2",
+                params![task_id.to_string(), checkpoint_id.to_string()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .optional()
+            .map_err(storage_error)?;
+        let Some((stored_digest, Some(checkpoint_json))) = raw else {
+            return Err(storage_invariant(
+                "latest task checkpoint has no canonical payload",
+            ));
+        };
+        let checkpoint = serde_json::from_str::<CanonicalCheckpoint>(&checkpoint_json)
+            .map_err(|_| storage_invariant("latest task checkpoint is invalid"))?;
+        if checkpoint.task_id != task_id
+            || checkpoint.checkpoint_id != checkpoint_id
+            || checkpoint
+                .digest()
+                .map_err(|_| storage_invariant("latest task checkpoint is invalid"))?
+                != stored_digest
+        {
+            return Err(storage_invariant(
+                "latest task checkpoint does not match its projection",
+            ));
+        }
+        Ok(Some(checkpoint))
+    }
+
     pub fn list_resumable_tasks(&self) -> Result<Vec<TaskRecord>, CarlError> {
         let mut records = Vec::new();
         visit_authoritative_task_records(&self.connection, |record| {
@@ -6151,22 +6192,52 @@ fn apply_task_child_projection(
             checkpoint_id,
             context_package_id,
         } => {
-            transaction
-                .execute(
-                    "INSERT INTO task_context_packages (
-                        id, task_id, checkpoint_id, generation, event_sequence,
-                        package_json, created_at
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6)",
-                    params![
-                        context_package_id.to_string(),
-                        task_id,
-                        checkpoint_id.to_string(),
-                        i64::from(*generation),
-                        event_sequence,
-                        timestamp,
-                    ],
+            let existing = transaction
+                .query_row(
+                    "SELECT task_id, checkpoint_id, generation, package_json
+                     FROM task_context_packages WHERE id = ?1",
+                    [context_package_id.to_string()],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, Option<String>>(3)?,
+                        ))
+                    },
                 )
+                .optional()
                 .map_err(storage_error)?;
+            if let Some((stored_task, stored_checkpoint, stored_generation, package_json)) =
+                existing
+            {
+                if stored_task != task_id
+                    || stored_checkpoint != checkpoint_id.to_string()
+                    || stored_generation != i64::from(*generation)
+                    || package_json.is_none()
+                {
+                    return Err(storage_invariant(
+                        "completed compaction does not match its atomic context package",
+                    ));
+                }
+            } else {
+                transaction
+                    .execute(
+                        "INSERT INTO task_context_packages (
+                            id, task_id, checkpoint_id, generation, event_sequence,
+                            package_json, created_at
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6)",
+                        params![
+                            context_package_id.to_string(),
+                            task_id,
+                            checkpoint_id.to_string(),
+                            i64::from(*generation),
+                            event_sequence,
+                            timestamp,
+                        ],
+                    )
+                    .map_err(storage_error)?;
+            }
         }
         TaskEvent::SteeringQueued {
             steering_sequence,
@@ -6192,7 +6263,9 @@ fn apply_task_child_projection(
         | TaskEvent::ContractRevised { .. }
         | TaskEvent::UsageObserved { .. }
         | TaskEvent::OperationEvidenceRecorded { .. }
+        | TaskEvent::NormalizedOperationEvidenceRecorded { .. }
         | TaskEvent::ProgressAssessed { .. }
+        | TaskEvent::RecoveryAttemptRecorded { .. }
         | TaskEvent::CompactionRequested { .. }
         | TaskEvent::ProviderContextBound { .. }
         | TaskEvent::ProviderContextLost { .. }

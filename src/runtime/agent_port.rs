@@ -591,6 +591,12 @@ impl AgentProcess {
 }
 
 pub trait AgentPort: Send {
+    /// Whether this provider instance is ready to be driven by Carl's durable
+    /// autonomous task loop. Legacy adapters default to the direct turn path.
+    fn supports_autonomous_tasks(&self) -> bool {
+        false
+    }
+
     fn capabilities(&self) -> AgentCapabilities;
     fn models(&mut self) -> AgentFuture<'_, Vec<AgentModel>>;
     fn start_context(&mut self, request: StartAgentContext) -> AgentFuture<'_, AgentContextId>;
@@ -681,6 +687,84 @@ pub trait AgentPort: Send {
         process_id: &str,
     ) -> AgentFuture<'_, bool>;
     fn shutdown(&mut self) -> AgentFuture<'_, ()>;
+}
+
+impl<T: AgentPort + ?Sized> AgentPort for Box<T> {
+    fn supports_autonomous_tasks(&self) -> bool {
+        (**self).supports_autonomous_tasks()
+    }
+
+    fn capabilities(&self) -> AgentCapabilities {
+        (**self).capabilities()
+    }
+
+    fn models(&mut self) -> AgentFuture<'_, Vec<AgentModel>> {
+        (**self).models()
+    }
+
+    fn start_context(&mut self, request: StartAgentContext) -> AgentFuture<'_, AgentContextId> {
+        (**self).start_context(request)
+    }
+
+    fn resume_context(&mut self, request: ResumeAgentContext) -> AgentFuture<'_, AgentContextId> {
+        (**self).resume_context(request)
+    }
+
+    fn compact_context(&mut self, context_id: &AgentContextId) -> AgentFuture<'_, ()> {
+        (**self).compact_context(context_id)
+    }
+
+    fn start_epoch(&mut self, request: StartAgentEpoch) -> AgentFuture<'_, AgentEpochId> {
+        (**self).start_epoch(request)
+    }
+
+    fn steer(
+        &mut self,
+        context_id: &AgentContextId,
+        epoch_id: &AgentEpochId,
+        text: String,
+    ) -> AgentFuture<'_, ()> {
+        (**self).steer(context_id, epoch_id, text)
+    }
+
+    fn interrupt(
+        &mut self,
+        context_id: &AgentContextId,
+        epoch_id: &AgentEpochId,
+    ) -> AgentFuture<'_, ()> {
+        (**self).interrupt(context_id, epoch_id)
+    }
+
+    fn next_event(&mut self) -> AgentFuture<'_, AgentEvent> {
+        (**self).next_event()
+    }
+
+    fn resolve_effect(
+        &mut self,
+        request_id: &AgentRequestId,
+        decision: EffectDecision,
+    ) -> AgentFuture<'_, ()> {
+        (**self).resolve_effect(request_id, decision)
+    }
+
+    fn list_background_processes(
+        &mut self,
+        context_id: &AgentContextId,
+    ) -> AgentFuture<'_, Vec<AgentProcess>> {
+        (**self).list_background_processes(context_id)
+    }
+
+    fn terminate_background_process(
+        &mut self,
+        context_id: &AgentContextId,
+        process_id: &str,
+    ) -> AgentFuture<'_, bool> {
+        (**self).terminate_background_process(context_id, process_id)
+    }
+
+    fn shutdown(&mut self) -> AgentFuture<'_, ()> {
+        (**self).shutdown()
+    }
 }
 
 fn is_recoverable_lifecycle_error(error: &AgentPortError) -> bool {

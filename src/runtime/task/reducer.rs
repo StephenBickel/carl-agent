@@ -240,6 +240,8 @@ pub fn reduce_task(
             require_active_epoch(&state, *epoch_id)?;
         }
         TaskEvent::ProgressAssessed { .. }
+        | TaskEvent::RecoveryAttemptRecorded { .. }
+        | TaskEvent::NormalizedOperationEvidenceRecorded { .. }
         | TaskEvent::CompactionRequested { .. }
         | TaskEvent::SteeringQueued { .. } => {}
         TaskEvent::CheckpointCommitted { checkpoint_id, .. } => {

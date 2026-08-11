@@ -25,6 +25,14 @@ use crate::runtime::agent_port::{
     AgentContextId, AgentEffectKind, AgentEffectRequest, AgentEpochId, AgentEvent, AgentItem,
     AgentModel, AgentPort, AgentPortError, EffectDecision, StartAgentContext, StartAgentEpoch,
 };
+use crate::runtime::task::{
+    EngineToolKind, EngineToolStatus, StartTask, TaskBudget, TaskEngine, TaskEngineError,
+    TaskEngineErrorCode, TaskEngineUpdate,
+};
+use crate::runtime::task::{
+    TaskEngineAcknowledgement, TaskEngineControl, TaskEngineFrontendContext,
+    TaskEnginePermissionNotice,
+};
 use crate::security::SecretFilter;
 use crate::storage::{
     ApprovalStatus, BoundApprovalBinding, DeliveryKind, DeliveryStatus, ExternalSessionId,
@@ -37,6 +45,80 @@ const ROUTED_EVENT_CAPACITY: usize = 1_024;
 const ROUTED_EVENTS_PER_SESSION: usize = 256;
 const APPROVAL_LIFETIME: TimeDelta = TimeDelta::minutes(15);
 const MAX_FINAL_MESSAGE_BYTES: usize = 256 * 1_024;
+
+impl From<TaskEngineUpdate> for KernelUpdate {
+    fn from(update: TaskEngineUpdate) -> Self {
+        match update {
+            TaskEngineUpdate::TaskStatus { task_id, status } => {
+                Self::TaskStatus { task_id, status }
+            }
+            TaskEngineUpdate::EpochObjective {
+                task_id,
+                epoch_id,
+                objective,
+            } => Self::EpochObjective {
+                task_id,
+                epoch_id,
+                objective,
+            },
+            TaskEngineUpdate::CheckpointCommitted {
+                task_id,
+                checkpoint_id,
+                digest,
+            } => Self::CheckpointCommitted {
+                task_id,
+                checkpoint_id,
+                digest,
+            },
+            TaskEngineUpdate::ContextUsage {
+                task_id,
+                total_tokens,
+                context_window,
+            } => Self::ContextUsage {
+                task_id,
+                total_tokens,
+                context_window,
+            },
+            TaskEngineUpdate::Compaction {
+                task_id,
+                generation,
+                replaced_provider,
+            } => Self::Compaction {
+                task_id,
+                generation,
+                replaced_provider,
+            },
+            TaskEngineUpdate::RecoveryStrategy { task_id, strategy } => {
+                Self::RecoveryStrategy { task_id, strategy }
+            }
+            TaskEngineUpdate::CompletionClauses { task_id, clauses } => {
+                Self::CompletionClauses { task_id, clauses }
+            }
+            TaskEngineUpdate::AgentMessageChunk(text) => Self::AgentMessageChunk(text),
+            TaskEngineUpdate::ToolStarted { title, kind } => Self::ToolStarted {
+                title,
+                kind: match kind {
+                    EngineToolKind::Execute => ToolKind::Execute,
+                    EngineToolKind::Edit => ToolKind::Edit,
+                },
+            },
+            TaskEngineUpdate::ToolCompleted { title, status } => Self::ToolCompleted {
+                title,
+                status: match status {
+                    EngineToolStatus::Completed => ToolStatus::Completed,
+                    EngineToolStatus::Failed | EngineToolStatus::Cancelled => ToolStatus::Failed,
+                },
+            },
+            TaskEngineUpdate::DiffUpdated(diff) => Self::DiffUpdated(diff),
+            TaskEngineUpdate::PermissionRequired {
+                request_id,
+                summary,
+            } => {
+                Self::AgentMessageChunk(format!("Permission required for {request_id}: {summary}"))
+            }
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PublicationFailure {
@@ -265,16 +347,18 @@ impl Kernel {
             commands,
             catalog: Arc::clone(&catalog),
         };
+        let durable_tasks = agent.supports_autonomous_tasks();
         tokio::spawn(
             KernelActor {
-                store,
-                agent,
+                engine: Some(TaskEngine::new_runtime(store, agent)),
+                durable_tasks,
                 publisher,
                 catalog,
                 sessions: HashMap::new(),
                 routed_events: HashMap::new(),
                 routed_event_count: 0,
                 routed_failures: HashSet::new(),
+                shutdown_requested: false,
                 receiver,
             }
             .run(),
@@ -292,6 +376,7 @@ struct SessionState {
     provider_context: AgentContextId,
     active: Option<ActiveTurn>,
     pending_bypass: Option<PendingBypass>,
+    task_id: Option<crate::runtime::task::TaskId>,
 }
 
 struct ActiveTurn {
@@ -313,15 +398,24 @@ struct PendingBypass {
 }
 
 struct KernelActor {
-    store: RuntimeStore,
-    agent: Box<dyn AgentPort>,
+    engine: Option<TaskEngine<Box<dyn AgentPort>, RuntimeStore>>,
+    durable_tasks: bool,
     publisher: Option<Box<dyn KernelPublisher>>,
     catalog: Arc<ModelCatalog>,
     sessions: HashMap<SessionId, SessionState>,
     routed_events: HashMap<SessionId, VecDeque<AgentEvent>>,
     routed_event_count: usize,
     routed_failures: HashSet<SessionId>,
+    shutdown_requested: bool,
     receiver: mpsc::Receiver<KernelCommand>,
+}
+
+enum PendingDurableReply {
+    Prompt(oneshot::Sender<Result<PromptOutcome, KernelError>>),
+    Steer(oneshot::Sender<Result<(), KernelError>>),
+    Cancel(oneshot::Sender<Result<(), KernelError>>),
+    Shutdown(oneshot::Sender<Result<(), KernelError>>),
+    Approval,
 }
 
 enum AgentEventOwner {
@@ -331,6 +425,23 @@ enum AgentEventOwner {
 }
 
 impl KernelActor {
+    fn engine_ref(&self) -> &TaskEngine<Box<dyn AgentPort>, RuntimeStore> {
+        self.engine.as_ref().expect("kernel engine is actor-owned")
+    }
+
+    fn engine_mut(&mut self) -> &mut TaskEngine<Box<dyn AgentPort>, RuntimeStore> {
+        self.engine.as_mut().expect("kernel engine is actor-owned")
+    }
+
+    fn should_drive_durable_prompt(&self, session_id: SessionId, prompt: &Prompt) -> bool {
+        self.durable_tasks
+            && prompt.leading_slash_command().is_none()
+            && self
+                .sessions
+                .get(&session_id)
+                .is_some_and(|state| state.active.is_none())
+    }
+
     async fn run(mut self) {
         while let Some(command) = self.receiver.recv().await {
             let should_stop = match command {
@@ -343,9 +454,13 @@ impl KernelActor {
                     prompt,
                     reply,
                 } => {
-                    let outcome = self.begin_prompt(session_id, prompt).await;
-                    let _ = reply.send(outcome);
-                    false
+                    if self.should_drive_durable_prompt(session_id, &prompt) {
+                        let _ = self.begin_durable_prompt(session_id, prompt, reply).await;
+                    } else {
+                        let outcome = self.begin_prompt(session_id, prompt).await;
+                        let _ = reply.send(outcome);
+                    }
+                    self.shutdown_requested
                 }
                 KernelCommand::SetConfig {
                     session_id,
@@ -390,7 +505,12 @@ impl KernelActor {
                     false
                 }
                 KernelCommand::Shutdown { reply } => {
-                    let result = self.agent.shutdown().await.map_err(map_agent_port);
+                    let result = self
+                        .engine_mut()
+                        .port_mut()
+                        .shutdown()
+                        .await
+                        .map_err(map_agent_port);
                     let _ = reply.send(result);
                     true
                 }
@@ -399,7 +519,9 @@ impl KernelActor {
                 break;
             }
         }
-        let _ = self.agent.shutdown().await;
+        if let Some(engine) = self.engine.as_mut() {
+            let _ = engine.port_mut().shutdown().await;
+        }
     }
 
     async fn new_session(
@@ -427,9 +549,13 @@ impl KernelActor {
         let configuration =
             SessionConfiguration::new((*self.catalog).clone(), model.clone(), effort, request.mode)
                 .map_err(|_| invalid_input())?;
-        let created = self.store.store().create_session().map_err(map_storage)?;
+        let created = self
+            .engine_ref()
+            .store()
+            .create_session()
+            .map_err(map_storage)?;
         let bound = self
-            .store
+            .engine_ref()
             .store()
             .bind_frontend_session(NewFrontendSession {
                 frontend: request.frontend,
@@ -443,7 +569,7 @@ impl KernelActor {
                 created_at: created.created_at,
             })
             .map_err(map_storage)?;
-        self.store
+        self.engine_mut()
             .store_mut()
             .append(
                 created.id,
@@ -456,7 +582,8 @@ impl KernelActor {
             )
             .map_err(map_storage)?;
         let provider_context = self
-            .agent
+            .engine_mut()
+            .port_mut()
             .start_context(StartAgentContext {
                 cwd: request.cwd.clone(),
                 model,
@@ -466,7 +593,7 @@ impl KernelActor {
             .map_err(map_agent_port)?;
         let provider_thread_id =
             ProviderThreadId::try_from(provider_context.as_str()).map_err(|_| provider_error())?;
-        self.store
+        self.engine_ref()
             .store()
             .configure_frontend_session(
                 &bound.external_session_id,
@@ -488,6 +615,7 @@ impl KernelActor {
                 provider_context,
                 active: None,
                 pending_bypass: None,
+                task_id: None,
             },
         );
         Ok(public)
@@ -565,7 +693,7 @@ impl KernelActor {
             .inspect(input.as_bytes())
             .map_err(|_| invalid_input())?;
         let local_turn_id = TurnId::new();
-        self.store
+        self.engine_mut()
             .store_mut()
             .append(
                 session_id,
@@ -576,14 +704,19 @@ impl KernelActor {
             )
             .map_err(map_storage)?;
         let state = self.sessions.get(&session_id).ok_or_else(unknown_session)?;
+        let context_id = state.provider_context.clone();
+        let model = state.public.configuration().model().clone();
+        let effort = state.public.configuration().effort();
+        let permission_mode = state.public.configuration().mode();
         let provider_epoch_id = self
-            .agent
+            .engine_mut()
+            .port_mut()
             .start_epoch(StartAgentEpoch {
-                context_id: state.provider_context.clone(),
+                context_id,
                 input,
-                model: state.public.configuration().model().clone(),
-                effort: state.public.configuration().effort(),
-                permission_mode: state.public.configuration().mode(),
+                model,
+                effort,
+                permission_mode,
             })
             .await
             .map_err(map_agent_port)?;
@@ -600,6 +733,377 @@ impl KernelActor {
         self.drive_turn(session_id).await
     }
 
+    async fn begin_durable_prompt(
+        &mut self,
+        session_id: SessionId,
+        prompt: Prompt,
+        initial_reply: oneshot::Sender<Result<PromptOutcome, KernelError>>,
+    ) -> Result<(), KernelError> {
+        let actor_mismatch = self
+            .sessions
+            .get(&session_id)
+            .ok_or_else(unknown_session)
+            .map(|state| {
+                prompt
+                    .actor_id()
+                    .is_some_and(|actor| actor != &state.actor_id)
+            })?;
+        if actor_mismatch {
+            let _ = initial_reply.send(Err(KernelError::from_code(
+                KernelErrorCode::ApprovalUnavailable,
+            )));
+            return Ok(());
+        }
+        let mut current_reply = Some(initial_reply);
+        let input = prompt.provider_text();
+        SecretFilter
+            .inspect(input.as_bytes())
+            .map_err(|_| invalid_input())?;
+        let turn_id = TurnId::new();
+        self.engine_mut()
+            .store_mut()
+            .append(
+                session_id,
+                Some(turn_id),
+                Event::UserInput {
+                    text: input.clone(),
+                },
+            )
+            .map_err(map_storage)?;
+        let state = self.sessions.get(&session_id).ok_or_else(unknown_session)?;
+        let context_id = state.provider_context.clone();
+        let workspace = state.cwd.clone();
+        let model = state.public.configuration().model().clone();
+        let effort = state.public.configuration().effort();
+        let permission_mode = state.public.configuration().mode();
+        let session_task = state.task_id;
+        let actor_id = state.actor_id.clone();
+        let external_session_id = state.public.external_session_id.clone();
+        let existing_task = if let Some(task_id) = session_task {
+            self.engine_ref()
+                .store()
+                .get_task(task_id)
+                .map_err(map_storage)?
+                .filter(|record| !record.snapshot.status.is_terminal())
+                .map(|record| record.snapshot.task_id)
+        } else {
+            None
+        };
+        let (control_sender, control_receiver) = mpsc::channel(COMMAND_CAPACITY);
+        let (acknowledgement_sender, mut acknowledgement_receiver) =
+            mpsc::channel::<TaskEngineAcknowledgement>(COMMAND_CAPACITY);
+        let (permission_sender, mut permission_receiver) =
+            mpsc::channel::<TaskEnginePermissionNotice>(1);
+        self.engine_mut().install_controls(
+            control_receiver,
+            acknowledgement_sender,
+            permission_sender,
+        );
+        self.engine_mut()
+            .install_frontend_context(TaskEngineFrontendContext {
+                session_id,
+                turn_id,
+                external_session_id,
+                actor_id: actor_id.clone(),
+            });
+        let mut pending = HashMap::<u64, PendingDurableReply>::new();
+        let mut pending_permission = None::<TaskEnginePermissionNotice>;
+        let mut next_acknowledgement = 0_u64;
+        let mut receiver_open = true;
+        let mut durable_shutdown = false;
+        let result = {
+            let (engine, receiver) = (&mut self.engine, &mut self.receiver);
+            let engine = engine.as_mut().expect("kernel engine is actor-owned");
+            let execution = async {
+                if let Some(task_id) = existing_task {
+                    engine.steer(task_id, input).await?;
+                    engine.run(task_id).await
+                } else {
+                    engine
+                        .start_in_context(
+                            StartTask {
+                                session_id,
+                                workspace,
+                                request: input,
+                                model,
+                                effort,
+                                permission_mode,
+                                budget: TaskBudget::default(),
+                            },
+                            context_id,
+                        )
+                        .await
+                }
+            };
+            tokio::pin!(execution);
+            loop {
+                enum Next {
+                    Finished(Result<crate::runtime::task::TaskSnapshot, TaskEngineError>),
+                    Command(Option<KernelCommand>),
+                    Acknowledged(Option<TaskEngineAcknowledgement>),
+                    Permission(Option<TaskEnginePermissionNotice>),
+                }
+                let next = tokio::select! {
+                    result = &mut execution => Next::Finished(result),
+                    command = receiver.recv(), if receiver_open => Next::Command(command),
+                    acknowledgement = acknowledgement_receiver.recv(), if !pending.is_empty() => {
+                        Next::Acknowledged(acknowledgement)
+                    }
+                    permission = permission_receiver.recv() => Next::Permission(permission),
+                };
+                match next {
+                    Next::Finished(result) => break result,
+                    Next::Command(Some(command)) => {
+                        let acknowledgement = next_acknowledgement;
+                        next_acknowledgement = next_acknowledgement
+                            .checked_add(1)
+                            .ok_or_else(invalid_input)?;
+                        match command {
+                            KernelCommand::Prompt {
+                                session_id: target,
+                                prompt,
+                                reply,
+                            } if target == session_id => {
+                                if prompt
+                                    .actor_id()
+                                    .is_some_and(|candidate| candidate != &actor_id)
+                                {
+                                    let _ = reply.send(Err(KernelError::from_code(
+                                        KernelErrorCode::ApprovalUnavailable,
+                                    )));
+                                    continue;
+                                }
+                                if let Some(notice) = &pending_permission {
+                                    let Some(command) = prompt.leading_slash_command() else {
+                                        let _ = reply.send(Err(KernelError::from_code(
+                                            KernelErrorCode::ApprovalUnavailable,
+                                        )));
+                                        continue;
+                                    };
+                                    let (decision, display_code) =
+                                        if let Some(code) = command.strip_prefix("/approve ") {
+                                            (EffectDecision::Allow, code)
+                                        } else if let Some(code) = command.strip_prefix("/deny ") {
+                                            (EffectDecision::Deny, code)
+                                        } else {
+                                            let _ = reply.send(Err(KernelError::from_code(
+                                                KernelErrorCode::ApprovalUnavailable,
+                                            )));
+                                            continue;
+                                        };
+                                    if display_code != notice.display_code {
+                                        let _ = reply.send(Err(KernelError::from_code(
+                                            KernelErrorCode::ApprovalUnavailable,
+                                        )));
+                                        continue;
+                                    }
+                                    control_sender
+                                        .send(TaskEngineControl::Approval {
+                                            display_code: display_code.to_owned(),
+                                            decision,
+                                            session_id,
+                                            turn_id,
+                                            acknowledgement,
+                                        })
+                                        .await
+                                        .map_err(|_| stopped_error())?;
+                                    current_reply = Some(reply);
+                                    pending.insert(acknowledgement, PendingDurableReply::Approval);
+                                    continue;
+                                }
+                                let text = prompt.provider_text();
+                                if validate_durable_steering(&text).is_err() {
+                                    let _ = reply.send(Err(invalid_input()));
+                                    continue;
+                                }
+                                let turn_id = TurnId::new();
+                                control_sender
+                                    .send(TaskEngineControl::Steer {
+                                        text,
+                                        session_id,
+                                        turn_id,
+                                        acknowledgement,
+                                    })
+                                    .await
+                                    .map_err(|_| stopped_error())?;
+                                pending.insert(acknowledgement, PendingDurableReply::Prompt(reply));
+                            }
+                            KernelCommand::Steer {
+                                session_id: target,
+                                input,
+                                reply,
+                            } if target == session_id => {
+                                if validate_durable_steering(&input).is_err() {
+                                    let _ = reply.send(Err(invalid_input()));
+                                    continue;
+                                }
+                                control_sender
+                                    .send(TaskEngineControl::Steer {
+                                        text: input,
+                                        session_id,
+                                        turn_id: TurnId::new(),
+                                        acknowledgement,
+                                    })
+                                    .await
+                                    .map_err(|_| stopped_error())?;
+                                pending.insert(acknowledgement, PendingDurableReply::Steer(reply));
+                            }
+                            KernelCommand::Cancel {
+                                session_id: target,
+                                reply,
+                            } if target == session_id => {
+                                control_sender
+                                    .send(TaskEngineControl::Cancel {
+                                        session_id,
+                                        turn_id,
+                                        acknowledgement,
+                                    })
+                                    .await
+                                    .map_err(|_| stopped_error())?;
+                                pending.insert(acknowledgement, PendingDurableReply::Cancel(reply));
+                            }
+                            KernelCommand::Shutdown { reply } => {
+                                durable_shutdown = true;
+                                control_sender
+                                    .send(TaskEngineControl::Cancel {
+                                        session_id,
+                                        turn_id,
+                                        acknowledgement,
+                                    })
+                                    .await
+                                    .map_err(|_| stopped_error())?;
+                                pending
+                                    .insert(acknowledgement, PendingDurableReply::Shutdown(reply));
+                            }
+                            other => reject_busy_command(other),
+                        }
+                    }
+                    Next::Command(None) => receiver_open = false,
+                    Next::Acknowledged(Some((acknowledgement, result))) => {
+                        if let Some(reply) = pending.remove(&acknowledgement) {
+                            if matches!(reply, PendingDurableReply::Approval) {
+                                match result {
+                                    Ok(()) => pending_permission = None,
+                                    Err(error) => {
+                                        if let Some(reply) = current_reply.take() {
+                                            let _ = reply.send(Err(map_task_engine(error)));
+                                        }
+                                    }
+                                }
+                            } else {
+                                complete_durable_reply(reply, result);
+                            }
+                        }
+                    }
+                    Next::Acknowledged(None) => {}
+                    Next::Permission(Some(notice)) => {
+                        let publication = format!(
+                            "Approval required: {}\nApprove with /approve {} or deny with /deny {}",
+                            notice.summary, notice.display_code, notice.display_code
+                        );
+                        if let Some(reply) = current_reply.take() {
+                            let _ = reply.send(Ok(PromptOutcome {
+                                stop_reason: PromptStopReason::WaitingForApproval,
+                                updates: vec![
+                                    KernelUpdate::AgentMessageChunk(publication),
+                                    KernelUpdate::ToolStarted {
+                                        title: notice.request_id.clone(),
+                                        kind: ToolKind::Execute,
+                                    },
+                                ],
+                            }));
+                        }
+                        pending_permission = Some(notice);
+                    }
+                    Next::Permission(None) => {}
+                }
+            }
+        };
+        while let Ok((acknowledgement, result)) = acknowledgement_receiver.try_recv() {
+            if let Some(reply) = pending.remove(&acknowledgement) {
+                if matches!(reply, PendingDurableReply::Approval) {
+                    match result {
+                        Ok(()) => {}
+                        Err(error) => {
+                            if let Some(reply) = current_reply.take() {
+                                let _ = reply.send(Err(map_task_engine(error)));
+                            }
+                        }
+                    }
+                } else {
+                    complete_durable_reply(reply, result);
+                }
+            }
+        }
+        for (_, reply) in pending {
+            if !matches!(reply, PendingDurableReply::Approval) {
+                fail_durable_reply(reply, session_busy());
+            }
+        }
+        if durable_shutdown {
+            self.engine_mut()
+                .port_mut()
+                .shutdown()
+                .await
+                .map_err(map_agent_port)?;
+            self.shutdown_requested = true;
+        }
+        let updates = self
+            .engine_mut()
+            .take_updates()
+            .into_iter()
+            .map(KernelUpdate::from)
+            .collect::<Vec<_>>();
+        let outcome = match result {
+            Ok(snapshot) => {
+                self.sessions
+                    .get_mut(&session_id)
+                    .ok_or_else(unknown_session)?
+                    .task_id = Some(snapshot.task_id);
+                self.engine_mut()
+                    .store_mut()
+                    .append(session_id, Some(turn_id), Event::TurnCompleted)
+                    .map_err(map_storage)?;
+                Ok(PromptOutcome {
+                    stop_reason: PromptStopReason::EndTurn,
+                    updates,
+                })
+            }
+            Err(error) => {
+                if let Some(record) = self
+                    .engine_ref()
+                    .store()
+                    .list_resumable_tasks()
+                    .map_err(map_storage)?
+                    .into_iter()
+                    .find(|record| record.snapshot.session_id == session_id)
+                {
+                    self.sessions
+                        .get_mut(&session_id)
+                        .ok_or_else(unknown_session)?
+                        .task_id = Some(record.snapshot.task_id);
+                }
+                if error.code() == TaskEngineErrorCode::Cancelled {
+                    Ok(PromptOutcome {
+                        stop_reason: PromptStopReason::Cancelled,
+                        updates,
+                    })
+                } else if error.code() == TaskEngineErrorCode::Blocked {
+                    Ok(PromptOutcome {
+                        stop_reason: PromptStopReason::Failed,
+                        updates,
+                    })
+                } else {
+                    Err(map_task_engine(error))
+                }
+            }
+        };
+        if let Some(reply) = current_reply {
+            let _ = reply.send(outcome);
+        }
+        Ok(())
+    }
+
     async fn drive_turn(&mut self, session_id: SessionId) -> Result<PromptOutcome, KernelError> {
         let mut updates = Vec::new();
         loop {
@@ -614,9 +1118,14 @@ impl KernelActor {
             } else if let Some(event) = self.take_routed_event(session_id) {
                 Next::Routed(event)
             } else {
+                let (engine, receiver) = (&mut self.engine, &mut self.receiver);
+                let port = engine
+                    .as_mut()
+                    .expect("kernel engine is actor-owned")
+                    .port_mut();
                 tokio::select! {
-                    event = self.agent.next_event() => Next::Provider(event),
-                    command = self.receiver.recv() => Next::Command(command),
+                    event = port.next_event() => Next::Provider(event),
+                    command = receiver.recv() => Next::Command(command),
                 }
             };
             match next {
@@ -759,7 +1268,7 @@ impl KernelActor {
                     return Err(provider_error());
                 }
                 active.assistant_text.push_str(&text);
-                self.store
+                self.engine_mut()
                     .store_mut()
                     .append(
                         session_id,
@@ -796,7 +1305,7 @@ impl KernelActor {
                 if started_kind != kind {
                     return Err(provider_error());
                 }
-                self.store
+                self.engine_mut()
                     .store_mut()
                     .append(
                         session_id,
@@ -817,7 +1326,7 @@ impl KernelActor {
                 SecretFilter
                     .inspect(diff.as_bytes())
                     .map_err(|_| invalid_input())?;
-                self.store
+                self.engine_mut()
                     .store_mut()
                     .append(
                         session_id,
@@ -873,7 +1382,7 @@ impl KernelActor {
                     self.fail_active_turn(session_id, "publication_failed");
                     return Err(error);
                 }
-                self.store
+                self.engine_mut()
                     .store_mut()
                     .append(session_id, Some(turn_id), Event::TurnCompleted)
                     .map_err(map_storage)?;
@@ -887,7 +1396,7 @@ impl KernelActor {
                 }));
             }
             AgentEvent::ProviderFailed { .. } => {
-                self.store
+                self.engine_mut()
                     .store_mut()
                     .append(
                         session_id,
@@ -933,7 +1442,8 @@ impl KernelActor {
                 .flatten()
         };
         let Some(tool_call_id) = tool_call_id else {
-            self.agent
+            self.engine_mut()
+                .port_mut()
                 .resolve_effect(&approval.request_id, EffectDecision::Deny)
                 .await
                 .map_err(map_agent_port)?;
@@ -943,13 +1453,14 @@ impl KernelActor {
         let summary = approval.summary.clone();
         let title = effect_title(&approval);
         if SecretFilter.inspect(summary.as_bytes()).is_err() {
-            self.agent
+            self.engine_mut()
+                .port_mut()
                 .resolve_effect(&approval.request_id, EffectDecision::Deny)
                 .await
                 .map_err(map_agent_port)?;
             return Err(provider_error());
         }
-        self.store
+        self.engine_mut()
             .store_mut()
             .append(
                 session_id,
@@ -961,7 +1472,7 @@ impl KernelActor {
                 },
             )
             .map_err(map_storage)?;
-        self.store
+        self.engine_mut()
             .store_mut()
             .append(
                 session_id,
@@ -973,7 +1484,8 @@ impl KernelActor {
                 },
             )
             .map_err(map_storage)?;
-        self.agent
+        self.engine_mut()
+            .port_mut()
             .resolve_effect(&approval.request_id, EffectDecision::Allow)
             .await
             .map_err(map_agent_port)?;
@@ -1004,11 +1516,12 @@ impl KernelActor {
         let title = effect_title(&approval);
         let summary = approval.summary.clone();
         if SecretFilter.inspect(summary.as_bytes()).is_err() {
-            self.agent
+            self.engine_mut()
+                .port_mut()
                 .resolve_effect(&approval.request_id, EffectDecision::Deny)
                 .await
                 .map_err(map_agent_port)?;
-            self.store
+            self.engine_mut()
                 .store_mut()
                 .append(
                     session_id,
@@ -1035,7 +1548,8 @@ impl KernelActor {
             .filter(|(_, kind)| *kind == approval.kind)
             .map(|(tool_call_id, _)| tool_call_id);
         let Some(tool_call_id) = tool_call_id else {
-            self.agent
+            self.engine_mut()
+                .port_mut()
                 .resolve_effect(&approval.request_id, EffectDecision::Deny)
                 .await
                 .map_err(map_agent_port)?;
@@ -1053,7 +1567,7 @@ impl KernelActor {
             now + APPROVAL_LIFETIME,
         )
         .map_err(map_storage)?;
-        self.store
+        self.engine_mut()
             .store_mut()
             .append(
                 session_id,
@@ -1065,11 +1579,11 @@ impl KernelActor {
                 },
             )
             .map_err(map_storage)?;
-        self.store
+        self.engine_ref()
             .store()
             .create_bound_approval(approval_id, binding.clone(), summary.clone())
             .map_err(map_storage)?;
-        self.store
+        self.engine_mut()
             .store_mut()
             .append(
                 session_id,
@@ -1108,7 +1622,8 @@ impl KernelActor {
                 .request
                 .clone();
             let _ = self
-                .agent
+                .engine_mut()
+                .port_mut()
                 .resolve_effect(&request.request_id, EffectDecision::Deny)
                 .await;
             self.fail_active_turn(session_id, "approval_publication_failed");
@@ -1148,12 +1663,18 @@ impl KernelActor {
             .pending_approval
             .as_ref()
             .ok_or_else(|| KernelError::from_code(KernelErrorCode::ApprovalUnavailable))?;
+        let external_session_id = state.public.external_session_id.clone();
+        let actor_id = state.actor_id.clone();
+        let approval_id = pending.approval_id;
+        let binding = pending.binding.clone();
+        let approval = pending.request.clone();
+        let turn_id = active.local_turn_id;
         let provider_request_id = ProviderRequestId::try_from(pending.request.request_id.as_str())
             .map_err(|_| provider_error())?;
         let durable = self
-            .store
+            .engine_ref()
             .store()
-            .get_frontend_session(state.public.external_session_id.as_str())
+            .get_frontend_session(external_session_id.as_str())
             .map_err(map_storage)?
             .ok_or_else(|| KernelError::from_code(KernelErrorCode::ApprovalUnavailable))?;
         if durable.session_id != session_id
@@ -1171,31 +1692,30 @@ impl KernelActor {
             EffectDecision::Deny => ApprovalStatus::Denied,
         };
         let now = Utc::now();
-        self.store
+        self.engine_mut()
             .store_mut()
             .consume_remote_bound_approval(
                 RemoteCodeClaim {
                     display_code: code,
                     kind: RemoteCodeKind::Approval,
-                    external_session_id: state.public.external_session_id.clone(),
-                    approval_id: Some(pending.approval_id),
+                    external_session_id,
+                    approval_id: Some(approval_id),
                     provider_request_id: Some(provider_request_id),
-                    request_digest: pending.request.request_digest,
-                    actor_id: state.actor_id.clone(),
+                    request_digest: approval.request_digest,
+                    actor_id,
                     now,
                 },
-                &pending.binding,
+                &binding,
                 status,
             )
             .map_err(|_| KernelError::from_code(KernelErrorCode::ApprovalUnavailable))?;
-        let approval = pending.request.clone();
         let tool_title = effect_title(&approval);
-        let turn_id = active.local_turn_id;
-        self.agent
+        self.engine_mut()
+            .port_mut()
             .resolve_effect(&approval.request_id, decision)
             .await
             .map_err(map_agent_port)?;
-        self.store
+        self.engine_mut()
             .store_mut()
             .append(
                 session_id,
@@ -1242,23 +1762,26 @@ impl KernelActor {
             remote: true,
         } = selection
         {
-            let digest = bypass_digest(
-                &state.public.external_session_id,
-                &state.actor_id,
-                &state.cwd,
-            );
+            let external_session_id = state.public.external_session_id.clone();
+            let actor_id = state.actor_id.clone();
+            let cwd = state.cwd.clone();
+            let digest = bypass_digest(&external_session_id, &actor_id, &cwd);
             let now = Utc::now();
+            let _ = state;
             let display_code = create_remote_code(
-                self.store.store(),
+                self.engine_ref().store(),
                 RemoteCodeKind::BypassConfirmation,
-                &state.public.external_session_id,
+                &external_session_id,
                 None,
                 None,
                 digest,
-                &state.actor_id,
+                &actor_id,
                 now,
             )?;
-            state.pending_bypass = Some(PendingBypass {
+            self.sessions
+                .get_mut(&session_id)
+                .ok_or_else(unknown_session)?
+                .pending_bypass = Some(PendingBypass {
                 request_digest: digest,
             });
             return Ok(ConfigOutcome::PendingBypass { display_code });
@@ -1329,7 +1852,7 @@ impl KernelActor {
         {
             return Err(KernelError::from_code(KernelErrorCode::ApprovalUnavailable));
         }
-        self.store
+        self.engine_ref()
             .store()
             .claim_frontend_channel(&state.public.external_session_id, &channel, Utc::now())
             .map_err(map_storage)?;
@@ -1350,27 +1873,29 @@ impl KernelActor {
         let code = command
             .strip_prefix("/confirm-bypass ")
             .ok_or_else(invalid_input)?;
-        let state = self
-            .sessions
-            .get_mut(&session_id)
-            .ok_or_else(unknown_session)?;
+        let state = self.sessions.get(&session_id).ok_or_else(unknown_session)?;
         let pending = state
             .pending_bypass
             .as_ref()
             .ok_or_else(|| KernelError::from_code(KernelErrorCode::ApprovalUnavailable))?;
-        self.store
+        let claim = RemoteCodeClaim {
+            display_code: code,
+            kind: RemoteCodeKind::BypassConfirmation,
+            external_session_id: state.public.external_session_id.clone(),
+            approval_id: None,
+            provider_request_id: None,
+            request_digest: pending.request_digest,
+            actor_id: state.actor_id.clone(),
+            now: Utc::now(),
+        };
+        self.engine_mut()
             .store_mut()
-            .consume_remote_code(RemoteCodeClaim {
-                display_code: code,
-                kind: RemoteCodeKind::BypassConfirmation,
-                external_session_id: state.public.external_session_id.clone(),
-                approval_id: None,
-                provider_request_id: None,
-                request_digest: pending.request_digest,
-                actor_id: state.actor_id.clone(),
-                now: Utc::now(),
-            })
+            .consume_remote_code(claim)
             .map_err(|_| KernelError::from_code(KernelErrorCode::ApprovalUnavailable))?;
+        let state = self
+            .sessions
+            .get_mut(&session_id)
+            .ok_or_else(unknown_session)?;
         let mut configuration = state.public.configuration.clone();
         if configuration.set_mode(
             PermissionMode::BypassPermissions,
@@ -1391,37 +1916,35 @@ impl KernelActor {
 
     fn persist_configuration(&mut self, session_id: SessionId) -> Result<(), KernelError> {
         let state = self.sessions.get(&session_id).ok_or_else(unknown_session)?;
-        self.store
+        let external_session_id = state.public.external_session_id.clone();
+        let provider_thread_id =
+            ProviderThreadId::try_from(state.provider_context.as_str()).map_err(map_storage)?;
+        let permission_mode = state.public.configuration.mode();
+        let settings = DelegateSettings::new(
+            Some(state.public.configuration().model().clone()),
+            Some(state.public.configuration().effort()),
+        );
+        self.engine_ref()
             .store()
             .configure_frontend_session(
-                &state.public.external_session_id,
-                Some(
-                    &ProviderThreadId::try_from(state.provider_context.as_str())
-                        .map_err(map_storage)?,
-                ),
-                state.public.configuration.mode(),
+                &external_session_id,
+                Some(&provider_thread_id),
+                permission_mode,
                 Utc::now(),
             )
             .map_err(map_storage)?;
-        self.store
+        self.engine_ref()
             .store()
-            .set_session_delegate_settings(
-                session_id,
-                DelegateSettings::new(
-                    Some(state.public.configuration().model().clone()),
-                    Some(state.public.configuration().effort()),
-                ),
-                Utc::now(),
-            )
+            .set_session_delegate_settings(session_id, settings, Utc::now())
             .map_err(map_storage)?;
-        self.store
+        self.engine_mut()
             .store_mut()
             .append(
                 session_id,
                 None,
                 Event::FrontendPermissionChanged {
-                    external_session_id: state.public.external_session_id.as_str().to_owned(),
-                    permission_mode: state.public.configuration.mode(),
+                    external_session_id: external_session_id.as_str().to_owned(),
+                    permission_mode,
                 },
             )
             .map_err(map_storage)?;
@@ -1431,15 +1954,19 @@ impl KernelActor {
     async fn cancel_session(&mut self, session_id: SessionId) -> Result<(), KernelError> {
         let state = self.sessions.get(&session_id).ok_or_else(unknown_session)?;
         let active = state.active.as_ref().ok_or_else(session_busy)?;
-        self.agent
-            .interrupt(&state.provider_context, &active.provider_epoch_id)
+        let context_id = state.provider_context.clone();
+        let epoch_id = active.provider_epoch_id.clone();
+        let turn_id = active.local_turn_id;
+        self.engine_mut()
+            .port_mut()
+            .interrupt(&context_id, &epoch_id)
             .await
             .map_err(map_agent_port)?;
-        self.store
+        self.engine_mut()
             .store_mut()
             .append(
                 session_id,
-                Some(active.local_turn_id),
+                Some(turn_id),
                 Event::TurnInterrupted {
                     reason: "cancelled".to_owned(),
                 },
@@ -1468,18 +1995,22 @@ impl KernelActor {
         if active.pending_approval.is_some() {
             return Err(session_busy());
         }
-        self.store
+        let context_id = state.provider_context.clone();
+        let epoch_id = active.provider_epoch_id.clone();
+        let turn_id = active.local_turn_id;
+        self.engine_mut()
             .store_mut()
             .append(
                 session_id,
-                Some(active.local_turn_id),
+                Some(turn_id),
                 Event::UserInput {
                     text: input.clone(),
                 },
             )
             .map_err(map_storage)?;
-        self.agent
-            .steer(&state.provider_context, &active.provider_epoch_id, input)
+        self.engine_mut()
+            .port_mut()
+            .steer(&context_id, &epoch_id, input)
             .await
             .map_err(map_agent_port)
     }
@@ -1492,38 +2023,41 @@ impl KernelActor {
         content: &str,
     ) -> Result<(), KernelError> {
         let state = self.sessions.get(&session_id).ok_or_else(unknown_session)?;
-        let (Some(publisher), Some(context)) =
-            (self.publisher.as_mut(), state.buzz_context.as_ref())
-        else {
+        let Some(context) = state.buzz_context.clone() else {
             return Ok(());
         };
+        if self.publisher.is_none() {
+            return Ok(());
+        }
+        let external_session_id = state.public.external_session_id.clone();
         SecretFilter
             .inspect(content.as_bytes())
             .map_err(|_| invalid_input())?;
-        let digest = delivery_digest(session_id, turn_id, kind, content, context);
-        self.store
+        let digest = delivery_digest(session_id, turn_id, kind, content, &context);
+        self.engine_ref()
             .store()
             .create_delivery(NewDelivery {
                 action_digest: digest,
-                external_session_id: state.public.external_session_id.clone(),
+                external_session_id,
                 kind,
                 created_at: Utc::now(),
             })
             .map_err(map_storage)?;
+        let publisher = self.publisher.as_mut().expect("publisher checked above");
         let result = match kind {
-            DeliveryKind::Message => publisher.send_message(context, content).await,
-            DeliveryKind::Diff => publisher.send_diff(context, content).await,
+            DeliveryKind::Message => publisher.send_message(&context, content).await,
+            DeliveryKind::Diff => publisher.send_diff(&context, content).await,
         };
         let status = match result {
             Ok(()) => DeliveryStatus::Delivered,
             Err(PublicationFailure::Failed) => DeliveryStatus::Failed,
             Err(PublicationFailure::Uncertain) => DeliveryStatus::Uncertain,
         };
-        self.store
+        self.engine_ref()
             .store()
             .transition_delivery(digest, status, Utc::now())
             .map_err(map_storage)?;
-        self.store
+        self.engine_mut()
             .store_mut()
             .append(
                 session_id,
@@ -1565,7 +2099,7 @@ impl KernelActor {
         let provider_request_id =
             ProviderRequestId::try_from(approval.request_id.as_str()).map_err(map_storage)?;
         create_remote_code(
-            self.store.store(),
+            self.engine_ref().store(),
             RemoteCodeKind::Approval,
             external_session_id,
             Some(approval_id),
@@ -1722,11 +2256,16 @@ impl KernelActor {
             if let Some((context_id, epoch_id, pending_request_id)) = cleanup {
                 if let Some(request_id) = pending_request_id {
                     let _ = self
-                        .agent
+                        .engine_mut()
+                        .port_mut()
                         .resolve_effect(&request_id, EffectDecision::Deny)
                         .await;
                 }
-                let _ = self.agent.interrupt(&context_id, &epoch_id).await;
+                let _ = self
+                    .engine_mut()
+                    .port_mut()
+                    .interrupt(&context_id, &epoch_id)
+                    .await;
             }
             return;
         }
@@ -1753,7 +2292,8 @@ impl KernelActor {
             request.kind,
             AgentEffectKind::Network | AgentEffectKind::External
         ) {
-            self.agent
+            self.engine_mut()
+                .port_mut()
                 .resolve_effect(&request.request_id, EffectDecision::Deny)
                 .await
                 .map_err(map_agent_port)?;
@@ -1769,7 +2309,7 @@ impl KernelActor {
         phase: &str,
         provider_id: &str,
     ) -> Result<(), KernelError> {
-        self.store
+        self.engine_mut()
             .store_mut()
             .append(
                 session_id,
@@ -1790,7 +2330,7 @@ impl KernelActor {
             .and_then(|state| state.active.as_ref())
             .map(|active| active.local_turn_id);
         if let Some(turn_id) = turn_id {
-            let _ = self.store.store_mut().append(
+            let _ = self.engine_mut().store_mut().append(
                 session_id,
                 Some(turn_id),
                 Event::TurnInterrupted {
@@ -1945,6 +2485,71 @@ fn map_storage(_error: crate::error::CarlError) -> KernelError {
 
 fn map_agent_port(_error: AgentPortError) -> KernelError {
     provider_error()
+}
+
+fn validate_durable_steering(input: &str) -> Result<(), KernelError> {
+    if input.trim().is_empty() || input.len() > MAX_FINAL_MESSAGE_BYTES {
+        return Err(invalid_input());
+    }
+    SecretFilter
+        .inspect(input.as_bytes())
+        .map_err(|_| invalid_input())
+}
+
+fn complete_durable_reply(reply: PendingDurableReply, result: Result<(), TaskEngineError>) {
+    match reply {
+        PendingDurableReply::Prompt(reply) => {
+            let result = result.map_or_else(
+                |error| Err(map_task_engine(error)),
+                |()| {
+                    Ok(PromptOutcome {
+                        stop_reason: PromptStopReason::EndTurn,
+                        updates: Vec::new(),
+                    })
+                },
+            );
+            let _ = reply.send(result);
+        }
+        PendingDurableReply::Steer(reply) => {
+            let _ = reply.send(result.map_err(map_task_engine));
+        }
+        PendingDurableReply::Cancel(reply) | PendingDurableReply::Shutdown(reply) => {
+            let accepted = match result {
+                Ok(()) => Ok(()),
+                Err(error) if error.code() == TaskEngineErrorCode::Cancelled => Ok(()),
+                Err(error) => Err(map_task_engine(error)),
+            };
+            let _ = reply.send(accepted);
+        }
+        PendingDurableReply::Approval => {}
+    }
+}
+
+fn fail_durable_reply(reply: PendingDurableReply, error: KernelError) {
+    match reply {
+        PendingDurableReply::Prompt(reply) => {
+            let _ = reply.send(Err(error));
+        }
+        PendingDurableReply::Steer(reply)
+        | PendingDurableReply::Cancel(reply)
+        | PendingDurableReply::Shutdown(reply) => {
+            let _ = reply.send(Err(error));
+        }
+        PendingDurableReply::Approval => {}
+    }
+}
+
+const fn map_task_engine(error: TaskEngineError) -> KernelError {
+    let code = match error.code() {
+        TaskEngineErrorCode::InvalidTask => KernelErrorCode::InvalidInput,
+        TaskEngineErrorCode::Storage => KernelErrorCode::StorageFailed,
+        TaskEngineErrorCode::Provider
+        | TaskEngineErrorCode::Context
+        | TaskEngineErrorCode::Verification
+        | TaskEngineErrorCode::Blocked => KernelErrorCode::ProviderFailed,
+        TaskEngineErrorCode::Cancelled => KernelErrorCode::Cancelled,
+    };
+    KernelError::from_code(code)
 }
 
 fn effect_metadata(kind: AgentEffectKind) -> Result<(&'static str, ToolKind), KernelError> {
