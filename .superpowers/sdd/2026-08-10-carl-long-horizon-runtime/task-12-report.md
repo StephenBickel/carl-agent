@@ -116,3 +116,76 @@ Windows Rust diagnostic.
 ## Commit
 
 - `1a5fe3a feat: keep tasks alive across frontend reconnects`
+
+## Fix round 1/5
+
+The first review round closed every reported Task 12 issue:
+
+- Replaced process-local mutation replay with globally durable service-command
+  receipts (migration 12), including safe pending-receipt reconciliation,
+  command/payload rebinding rejection, and replayed owner shutdown.
+- Bounded per-connection ledgers and per-task live-update storage. Live updates
+  now carry exact task attribution, use cursor-based reconnect, and fall back to a
+  snapshot after source or ring overflow instead of retaining unbounded history.
+- Bridged approval-mode operations through typed service updates and exact,
+  durable, single-use `/approve CODE` and `/deny CODE` commands. A pending
+  approval survives frontend reconnect at the acknowledged live cursor and stops
+  replaying after resolution.
+- Preserved explicit permission modes for trusted starts and added durable,
+  taskless trusted-session permission configuration. Owner Full Access remains
+  the default ceiling while explicit Plan and Approval choices stay narrower.
+- Kept trusted Buzz admission, actor/channel/session binding, and replay defense
+  on steering, permission changes, and approval resolution. Plain steering is
+  accepted only for an already bound session.
+- Added stream generations so a replacement ACP subscriber owns delivery, made
+  Buzz publication live-prompt-only, and prevented replay subscribers from
+  duplicating pending approval messages.
+- Required deterministic completion verification before accepting provider
+  completion, retained marker-only cancel recovery, and made failed work-control
+  journaling transition durably to `Failed` before acknowledgement.
+- Hardened the Windows named-pipe endpoint with current-owner identity, DACL, and
+  server-PID checks. The host could not complete the GNU cross-build because the
+  MinGW C compiler required by bundled SQLite is not installed.
+- Corrected the provider fixtures to emit truthful item completion/report events
+  and made Buzz test teardown reap both ACP and service processes after failures.
+
+Verification after the final reconnect fix:
+
+```text
+cargo test --locked --lib
+PASS: 56 passed, 0 failed
+
+cargo test --locked --test buzz_end_to_end
+PASS: 6 passed, 0 failed
+
+cargo test --locked --test service_end_to_end
+PASS: 16 passed, 0 failed
+
+cargo test --locked --test service_protocol_contract
+PASS: 8 passed, 0 failed
+
+cargo test --locked --test storage_contract
+PASS: 21 passed, 0 failed
+
+cargo test --locked --test task_storage_contract
+PASS: 21 passed, 0 failed
+
+cargo test --locked --test acp_server_contract
+PASS: 4 passed, 0 failed
+
+cargo clippy --locked --all-targets --all-features -- -D warnings
+PASS: exit 0, no warnings
+
+cargo fmt --all -- --check
+PASS: exit 0
+
+git diff --check
+PASS: exit 0
+```
+
+No Task 12 review findings remain open. No service process remained after the
+process-level tests, and `SECURITY.md` was not changed.
+
+### Fix commit
+
+- `6cf7453 fix: harden persistent task service`
