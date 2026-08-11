@@ -5,7 +5,9 @@ use std::time::Duration;
 use std::{fs, io};
 
 use chrono::{DateTime, SecondsFormat, Utc};
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{
+    Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -4551,7 +4553,41 @@ impl RuntimeStore {
             .connection
             .path()
             .ok_or_else(|| storage_invariant("runtime database path is unavailable"))?;
-        Store::open(path)
+        let connection = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(storage_error)?;
+        connection
+            .busy_timeout(BUSY_TIMEOUT)
+            .map_err(storage_error)?;
+        connection
+            .pragma_update(None, "query_only", true)
+            .map_err(storage_error)?;
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .map_err(storage_error)?;
+        let journal_mode = connection
+            .pragma_query_value(None, "journal_mode", |row| row.get::<_, String>(0))
+            .map_err(storage_error)?;
+        if !journal_mode.eq_ignore_ascii_case("wal") {
+            return Err(storage_invariant(
+                "runtime peer requires the owner's WAL database",
+            ));
+        }
+        if connection
+            .prepare("PRAGMA foreign_key_check")
+            .map_err(storage_error)?
+            .exists([])
+            .map_err(storage_error)?
+        {
+            return Err(storage_invariant(
+                "database contains a foreign key violation for the runtime peer",
+            ));
+        }
+        validate_task_projection_completeness(&connection)?;
+        validate_task_canonical_payloads(&connection)?;
+        Ok(Store { connection })
     }
 
     #[must_use]
@@ -9504,6 +9540,24 @@ mod verification_persistence_tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
         }
+    }
+
+    #[test]
+    fn runtime_peer_store_is_query_only() -> TestResult {
+        let layout = VerificationLayout::new()?;
+        let runtime = RuntimeStore::open(DataRootLock::acquire(&layout.root)?, test_instant(0))?;
+        let peer = runtime.open_peer_store()?;
+        let write = peer.claim_service_command(ServiceCommandReceiptInput {
+            idempotency_key: "peer-write-must-fail".to_owned(),
+            command_digest: Sha256Digest::parse("1".repeat(64))?,
+            command_kind: "shutdown".to_owned(),
+            created_at: test_instant(1),
+        });
+        assert!(
+            write.is_err(),
+            "runtime peer connection accepted a mutation"
+        );
+        Ok(())
     }
 
     #[test]

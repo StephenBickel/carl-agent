@@ -102,6 +102,7 @@ pub enum ServiceCommand {
     },
     LiveUpdates {
         task_id: TaskId,
+        live_generation: String,
         after_cursor: Option<u64>,
         limit: u16,
     },
@@ -158,6 +159,7 @@ pub struct ServiceCapabilities {
 #[serde(deny_unknown_fields)]
 pub struct ServiceInfo {
     pub protocol_version: u16,
+    pub live_generation: String,
     pub models: Vec<ServiceModel>,
     pub default_model: Option<ModelId>,
     pub default_effort: Option<ReasoningEffort>,
@@ -216,6 +218,7 @@ pub enum ServiceResult {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct LiveUpdatePage {
+    pub live_generation: String,
     pub updates: Vec<LiveUpdateEnvelope>,
     pub cursor: Option<u64>,
     pub snapshot: Option<TaskSnapshot>,
@@ -496,6 +499,11 @@ fn validate_request(request: &ServiceRequest) -> Result<(), ProtocolError> {
             if !(1..=512).contains(limit) =>
         {
             return Err(protocol_error(ProtocolErrorCode::InvalidEventLimit));
+        }
+        ServiceCommand::LiveUpdates {
+            live_generation, ..
+        } if uuid::Uuid::parse_str(live_generation).is_err() => {
+            return Err(protocol_error(ProtocolErrorCode::InvalidRequest));
         }
         ServiceCommand::Info
         | ServiceCommand::Status { .. }

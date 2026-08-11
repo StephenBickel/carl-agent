@@ -235,40 +235,24 @@ pub(crate) fn windows_pipe_name(data_root: &Path) -> String {
     format!(r"\\.\pipe\carl-{:x}", hasher.finalize())
 }
 
+#[cfg(any(windows, test))]
+pub(crate) const WINDOWS_PIPE_ACCESS: u32 = 0xC000_0000;
+
 #[cfg(windows)]
-fn create_owner_pipe(
+pub(crate) fn create_owner_pipe(
     pipe_name: &str,
     first_instance: bool,
 ) -> Result<tokio::net::windows::named_pipe::NamedPipeServer, EndpointError> {
-    use std::os::windows::ffi::OsStrExt as _;
-    use windows_sys::Win32::Foundation::LocalFree;
-    use windows_sys::Win32::Security::Authorization::{
-        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
-    };
-    use windows_sys::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
+    use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 
-    let descriptor_string = std::ffi::OsStr::new("D:P(A;;GA;;;OW)")
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
-    // SAFETY: the SDDL buffer is NUL-terminated and both output pointers remain
-    // valid for the duration of the Windows conversion call.
-    let converted = unsafe {
-        ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            descriptor_string.as_ptr(),
-            SDDL_REVISION_1,
-            &mut descriptor,
-            std::ptr::null_mut(),
-        )
-    };
-    if converted == 0 || descriptor.is_null() {
-        return Err(endpoint_error(EndpointErrorCode::Unavailable));
-    }
+    let descriptor = crate::sidecar::windows_security::owner_only_security_descriptor_for_access(
+        WINDOWS_PIPE_ACCESS,
+    )
+    .map_err(|()| endpoint_error(EndpointErrorCode::Unavailable))?;
     let mut attributes = SECURITY_ATTRIBUTES {
         nLength: u32::try_from(std::mem::size_of::<SECURITY_ATTRIBUTES>())
             .map_err(|_| endpoint_error(EndpointErrorCode::Unavailable))?,
-        lpSecurityDescriptor: descriptor,
+        lpSecurityDescriptor: descriptor.as_ptr().cast_mut().cast(),
         bInheritHandle: 0,
     };
     let mut options = tokio::net::windows::named_pipe::ServerOptions::new();
@@ -277,18 +261,13 @@ fn create_owner_pipe(
         .reject_remote_clients(true);
     // SAFETY: `attributes` and its security descriptor are valid during pipe
     // creation. CreateNamedPipe copies the descriptor before returning.
-    let created = unsafe {
+    unsafe {
         options.create_with_security_attributes_raw(
             pipe_name,
             (&raw mut attributes).cast::<core::ffi::c_void>(),
         )
-    };
-    // SAFETY: the descriptor was allocated by ConvertStringSecurityDescriptor...
-    // and has not been freed or aliased for ownership elsewhere.
-    unsafe {
-        let _ = LocalFree(descriptor);
     }
-    created.map_err(|_| endpoint_error(EndpointErrorCode::Unavailable))
+    .map_err(|_| endpoint_error(EndpointErrorCode::Unavailable))
 }
 
 const fn endpoint_error(code: EndpointErrorCode) -> EndpointError {
@@ -541,7 +520,8 @@ struct LiveUpdateHub {
 struct LiveTaskUpdates {
     next_cursor: u64,
     ring: VecDeque<LiveUpdateEnvelope>,
-    subscribers: Vec<mpsc::Sender<LiveUpdateEnvelope>>,
+    next_subscriber: u64,
+    subscribers: HashMap<u64, mpsc::Sender<LiveUpdateEnvelope>>,
     observed_source_overflow: u64,
     pending_approval: Option<LiveUpdateEnvelope>,
 }
@@ -551,7 +531,8 @@ impl Default for LiveTaskUpdates {
         Self {
             next_cursor: 1,
             ring: VecDeque::new(),
-            subscribers: Vec::new(),
+            next_subscriber: 1,
+            subscribers: HashMap::new(),
             observed_source_overflow: 0,
             pending_approval: None,
         }
@@ -584,7 +565,7 @@ impl LiveUpdateHub {
         }
         task.ring.push_back(envelope.clone());
         task.subscribers
-            .retain(|subscriber| subscriber.try_send(envelope.clone()).is_ok());
+            .retain(|_, subscriber| subscriber.try_send(envelope.clone()).is_ok());
     }
 
     fn clear_pending_approval(&self, task_id: TaskId) {
@@ -616,11 +597,16 @@ impl LiveUpdateHub {
                 (initial, None)
             } else {
                 let (sender, receiver) = mpsc::channel(1);
-                task.subscribers.push(sender);
-                (initial, Some(receiver))
+                let subscriber = task.next_subscriber;
+                task.next_subscriber = task
+                    .next_subscriber
+                    .checked_add(1)
+                    .ok_or_else(|| service_error(TaskServiceErrorCode::Stopped))?;
+                task.subscribers.insert(subscriber, sender);
+                (initial, Some((subscriber, receiver)))
             }
         };
-        let Some(mut receiver) = receiver else {
+        let Some((subscriber, mut receiver)) = receiver else {
             return Ok(initial);
         };
         let _ = tokio::time::timeout(std::time::Duration::from_millis(25), receiver.recv()).await;
@@ -631,6 +617,7 @@ impl LiveUpdateHub {
         let Some(task) = tasks.get_mut(&task_id) else {
             return Ok((Vec::new(), after_cursor, false));
         };
+        task.subscribers.remove(&subscriber);
         Ok(task.page(
             after_cursor,
             limit,
@@ -695,6 +682,16 @@ fn live_update_page(
     (updates, cursor, false)
 }
 
+fn live_after_cursor(
+    requested_generation: &str,
+    current_generation: &str,
+    after_cursor: Option<u64>,
+) -> Option<u64> {
+    (requested_generation == current_generation)
+        .then_some(after_cursor)
+        .flatten()
+}
+
 fn map_live_update((task_id, update): (TaskId, TaskEngineUpdate)) -> Option<(TaskId, TaskUpdate)> {
     match update {
         TaskEngineUpdate::AgentMessageChunk(text)
@@ -742,7 +739,7 @@ enum ActorCommand {
         permission_mode: PermissionMode,
         reply: oneshot::Sender<Result<(), TaskServiceError>>,
     },
-    Shutdown {
+    ShutdownProvider {
         reply: oneshot::Sender<Result<(), TaskServiceError>>,
     },
 }
@@ -754,8 +751,9 @@ async fn run_task_actor<P: AgentPort + 'static>(
     active_task: Arc<tokio::sync::Mutex<Option<TaskId>>>,
 ) -> Result<(), TaskServiceError> {
     let mut scheduled = initial_tasks.into_iter().collect::<VecDeque<_>>();
+    let mut provider_shutdown = false;
     loop {
-        if scheduled.is_empty() {
+        if scheduled.is_empty() && !provider_shutdown {
             scheduled.extend(
                 engine
                     .store()
@@ -779,13 +777,19 @@ async fn run_task_actor<P: AgentPort + 'static>(
         tokio::select! {
             processed = engine.receive_owner_control_while_idle() => {
                 if !processed {
-                    return Err(service_error(TaskServiceErrorCode::Stopped));
+                    return if provider_shutdown {
+                        Ok(())
+                    } else {
+                        Err(service_error(TaskServiceErrorCode::Stopped))
+                    };
                 }
                 let _ = engine.take_updates();
             }
             command = commands.recv() => {
                 let Some(command) = command else {
-                    let _ = engine.port_mut().shutdown().await;
+                    if !provider_shutdown {
+                        let _ = engine.port_mut().shutdown().await;
+                    }
                     return Ok(());
                 };
                 match command {
@@ -841,17 +845,18 @@ async fn run_task_actor<P: AgentPort + 'static>(
                             .map_err(map_engine);
                         let _ = reply.send(result);
                     }
-                    ActorCommand::Shutdown { reply } => {
-                        let result = engine
-                            .port_mut()
-                            .shutdown()
-                            .await
-                            .map_err(|_| service_error(TaskServiceErrorCode::Engine));
-                        let succeeded = result.is_ok();
+                    ActorCommand::ShutdownProvider { reply } => {
+                        let result = if provider_shutdown {
+                            Ok(())
+                        } else {
+                            engine
+                                .port_mut()
+                                .shutdown()
+                                .await
+                                .map_err(|_| service_error(TaskServiceErrorCode::Engine))
+                        };
+                        provider_shutdown |= result.is_ok();
                         let _ = reply.send(result);
-                        if succeeded {
-                            return Ok(());
-                        }
                     }
                 }
                 let _ = engine.take_updates();
@@ -941,9 +946,7 @@ async fn dispatch_request(
         command_kind: service_command_kind(&request.command).to_owned(),
         created_at: Utc::now(),
     };
-    let claim = lock_store(&shared.read_store)?
-        .claim_service_command(receipt.clone())
-        .map_err(|_| service_error(TaskServiceErrorCode::InvalidRequest))?;
+    let claim = claim_service_command(shared, receipt.clone()).await?;
     if let ServiceCommandReceiptClaim::Replay { result_json } = claim {
         let result = serde_json::from_str(&result_json)
             .map_err(|_| service_error(TaskServiceErrorCode::Storage))?;
@@ -956,10 +959,47 @@ async fn dispatch_request(
     let result = execute_command(shared, &request, recovering_pending).await?;
     let result_json =
         serde_json::to_string(&result).map_err(|_| service_error(TaskServiceErrorCode::Storage))?;
-    lock_store(&shared.read_store)?
-        .complete_service_command(&receipt, &result_json, Utc::now())
-        .map_err(|_| service_error(TaskServiceErrorCode::Storage))?;
+    complete_service_command(shared, receipt, result_json).await?;
     Ok(result)
+}
+
+async fn claim_service_command(
+    shared: &ServiceShared,
+    input: ServiceCommandReceiptInput,
+) -> Result<ServiceCommandReceiptClaim, TaskServiceError> {
+    let (reply, response) = oneshot::channel();
+    shared
+        .controls
+        .send(TaskEngineControl::ClaimServiceCommand { input, reply })
+        .await
+        .map_err(|_| service_error(TaskServiceErrorCode::Stopped))?;
+    response
+        .await
+        .map_err(|_| service_error(TaskServiceErrorCode::Stopped))?
+        .map_err(|_| service_error(TaskServiceErrorCode::InvalidRequest))
+}
+
+async fn complete_service_command(
+    shared: &ServiceShared,
+    input: ServiceCommandReceiptInput,
+    result_json: String,
+) -> Result<(), TaskServiceError> {
+    let (reply, response) = oneshot::channel();
+    shared
+        .controls
+        .send(TaskEngineControl::CompleteServiceCommand {
+            input,
+            result_json,
+            completed_at: Utc::now(),
+            reply,
+        })
+        .await
+        .map_err(|_| service_error(TaskServiceErrorCode::Stopped))?;
+    response
+        .await
+        .map_err(|_| service_error(TaskServiceErrorCode::Stopped))?
+        .map(|_| ())
+        .map_err(map_engine)
 }
 
 async fn execute_command(
@@ -1054,12 +1094,15 @@ async fn execute_command(
         }
         ServiceCommand::LiveUpdates {
             task_id,
+            live_generation,
             after_cursor,
             limit,
         } => {
+            let after_cursor =
+                live_after_cursor(live_generation, &shared.info.live_generation, *after_cursor);
             let (updates, cursor, overflowed) = shared
                 .live_updates
-                .page(*task_id, *after_cursor, *limit)
+                .page(*task_id, after_cursor, *limit)
                 .await?;
             let snapshot = if overflowed {
                 Some(
@@ -1073,6 +1116,7 @@ async fn execute_command(
                 None
             };
             Ok(ServiceResult::LiveUpdates(LiveUpdatePage {
+                live_generation: shared.info.live_generation.clone(),
                 updates,
                 cursor,
                 snapshot,
@@ -1355,6 +1399,7 @@ fn service_info(
     let default_effort = models.first().map(|model| model.default_effort);
     Ok(ServiceInfo {
         protocol_version: super::protocol::SERVICE_PROTOCOL_VERSION,
+        live_generation: uuid::Uuid::new_v4().to_string(),
         models,
         default_model,
         default_effort,
@@ -1543,7 +1588,9 @@ async fn send_active_control(
         | TaskEngineControl::Approval {
             acknowledgement, ..
         } => *acknowledgement,
-        TaskEngineControl::Enqueue { .. }
+        TaskEngineControl::ClaimServiceCommand { .. }
+        | TaskEngineControl::CompleteServiceCommand { .. }
+        | TaskEngineControl::Enqueue { .. }
         | TaskEngineControl::AdmitTrusted { .. }
         | TaskEngineControl::ConfigureOwnerSession { .. } => {
             return Err(service_error(TaskServiceErrorCode::InvalidRequest));
@@ -1580,7 +1627,7 @@ async fn shutdown_owner(shared: &ServiceShared) -> Result<(), TaskServiceError> 
     let (reply, response) = oneshot::channel();
     shared
         .actor_sender
-        .send(ActorCommand::Shutdown { reply })
+        .send(ActorCommand::ShutdownProvider { reply })
         .await
         .map_err(|_| service_error(TaskServiceErrorCode::Stopped))?;
     response
@@ -1747,6 +1794,87 @@ mod tests {
         let (cleared, cursor, overflowed) = hub.page(task_id, Some(1), 128).await.unwrap();
         assert!(cleared.is_empty());
         assert_eq!(cursor, Some(1));
+        assert!(!overflowed);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn empty_live_polls_unregister_without_accumulating_senders() {
+        let task_id = TaskId::new();
+        let hub = LiveUpdateHub::new(Arc::new(AtomicU64::new(0)));
+
+        for _ in 0..10_000 {
+            let (updates, cursor, overflowed) = hub.page(task_id, None, 128).await.unwrap();
+            assert!(updates.is_empty());
+            assert_eq!(cursor, None);
+            assert!(!overflowed);
+        }
+        {
+            let tasks = hub.tasks.lock().unwrap();
+            let task = tasks.get(&task_id).unwrap();
+            assert_eq!(task.subscribers.len(), 0);
+            assert!(task.ring.is_empty());
+        }
+
+        let mut waiter = Box::pin(hub.page(task_id, None, 128));
+        tokio::select! {
+            biased;
+            result = &mut waiter => panic!("live poll returned before publish: {result:?}"),
+            () = tokio::task::yield_now() => {}
+        }
+        hub.publish(
+            task_id,
+            TaskUpdate::AssistantDelta("after empty polls".to_owned()),
+        );
+        let (updates, cursor, overflowed) = waiter.await.unwrap();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(cursor, Some(1));
+        assert!(!overflowed);
+    }
+
+    #[test]
+    fn foreign_generation_cursor_cannot_skip_replacement_live_update_types() {
+        let task_id = TaskId::new();
+        let mut task = LiveTaskUpdates::default();
+        task.ring.extend([
+            LiveUpdateEnvelope {
+                cursor: 1,
+                update: TaskUpdate::AssistantDelta("replacement assistant".to_owned()),
+            },
+            LiveUpdateEnvelope {
+                cursor: 2,
+                update: TaskUpdate::Diff("replacement diff".to_owned()),
+            },
+            LiveUpdateEnvelope {
+                cursor: 3,
+                update: TaskUpdate::ApprovalRequired {
+                    task_id,
+                    operation_id: OperationId::new(),
+                    display_code: "654321".to_owned(),
+                    summary: "replacement approval".to_owned(),
+                    request_id: "replacement-request".to_owned(),
+                    session_id: SessionId::new(),
+                    turn_id: TurnId::new(),
+                    external_session_id: "replacement-session".to_owned(),
+                },
+            },
+        ]);
+
+        let cursor = live_after_cursor("old-generation", "new-generation", Some(3));
+        let (updates, cursor, overflowed) = task.page(cursor, 128, 0);
+        assert_eq!(updates.len(), 3);
+        assert_eq!(cursor, Some(3));
+        assert!(!overflowed);
+        assert!(matches!(updates[0].update, TaskUpdate::AssistantDelta(_)));
+        assert!(matches!(updates[1].update, TaskUpdate::Diff(_)));
+        assert!(matches!(
+            updates[2].update,
+            TaskUpdate::ApprovalRequired { .. }
+        ));
+
+        let cursor = live_after_cursor("new-generation", "new-generation", cursor);
+        let (updates, cursor, overflowed) = task.page(cursor, 128, 0);
+        assert!(updates.is_empty());
+        assert_eq!(cursor, Some(3));
         assert!(!overflowed);
     }
 }

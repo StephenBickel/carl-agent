@@ -17,14 +17,15 @@ use carl::runtime::agent_port::{
 use carl::runtime::task::{TaskControlKind, TaskEvent, TaskId, TaskStatus};
 use carl::service::client::TaskServiceClient;
 use carl::service::protocol::{
-    ServiceCommand, ServiceRequest, ServiceResult, StartTaskCommand, TrustedStartTaskCommand,
-    command_digest,
+    ServiceCommand, ServiceRequest, ServiceResult, StartTaskCommand, TaskUpdate,
+    TrustedStartTaskCommand, command_digest,
 };
 use carl::service::server::{EndpointErrorCode, OwnedLocalEndpoint, TaskService};
 use carl::storage::{
     ServiceCommandReceiptClaim, ServiceCommandReceiptInput, Store, TrustedFrontendOwnerInput,
 };
 use chrono::Utc;
+use rusqlite::Connection;
 use serde_json::json;
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio_util::sync::CancellationToken;
@@ -397,6 +398,92 @@ async fn process_cancellation_checkpoints_and_cancels_the_active_task() -> TestR
 
 #[cfg(unix)]
 #[tokio::test(flavor = "current_thread")]
+async fn service_info_identifies_the_ephemeral_live_cursor_generation() -> TestResult {
+    let layout = Layout::new()?;
+    let service = TaskService::bind(&layout.data, PendingPort::new()).await?;
+    let running = tokio::spawn(service.serve(CancellationToken::new()));
+    let mut client = TaskServiceClient::connect(&layout.data).await?;
+    let info = serde_json::to_value(client.info())?;
+    let generation = info["live_generation"]
+        .as_str()
+        .ok_or("service live generation missing")?;
+    assert_eq!(generation.len(), 36);
+    assert!(Uuid::parse_str(generation).is_ok());
+    client
+        .request(ServiceRequest {
+            protocol_version: 1,
+            request_id: "generation-shutdown".to_owned(),
+            idempotency_key: "generation-shutdown-key".to_owned(),
+            command: ServiceCommand::Shutdown,
+        })
+        .await?;
+    running.await??;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+async fn live_update_pages_bind_cursors_to_the_owner_generation() -> TestResult {
+    let layout = Layout::new()?;
+    let service = TaskService::bind(&layout.data, PendingPort::new()).await?;
+    let running = tokio::spawn(service.serve(CancellationToken::new()));
+    let mut client = TaskServiceClient::connect(&layout.data).await?;
+    let generation = client.info().live_generation.clone();
+    let ServiceResult::Accepted { task_id } = client
+        .request(ServiceRequest {
+            protocol_version: 1,
+            request_id: "live-generation-start".to_owned(),
+            idempotency_key: "live-generation-start-key".to_owned(),
+            command: ServiceCommand::StartTask(StartTaskCommand {
+                external_session_id: "live-generation-session".to_owned(),
+                workspace: layout.workspace.clone(),
+                request: "hold for a generation-bound poll".to_owned(),
+                model: ModelId::parse("gpt-test")?,
+                effort: ReasoningEffort::High,
+                permission_mode: PermissionMode::FullAccess,
+            }),
+        })
+        .await?
+    else {
+        return Err("generation task missing".into());
+    };
+    let page = client
+        .request(ServiceRequest {
+            protocol_version: 1,
+            request_id: "live-generation-page".to_owned(),
+            idempotency_key: "live-generation-page-key".to_owned(),
+            command: ServiceCommand::LiveUpdates {
+                task_id,
+                live_generation: generation.clone(),
+                after_cursor: None,
+                limit: 128,
+            },
+        })
+        .await?;
+    let page = serde_json::to_value(page)?;
+    assert_eq!(page["value"]["live_generation"], generation);
+    client
+        .request(ServiceRequest {
+            protocol_version: 1,
+            request_id: "live-generation-cancel".to_owned(),
+            idempotency_key: "live-generation-cancel-key".to_owned(),
+            command: ServiceCommand::Cancel { task_id },
+        })
+        .await?;
+    client
+        .request(ServiceRequest {
+            protocol_version: 1,
+            request_id: "live-generation-page-shutdown".to_owned(),
+            idempotency_key: "live-generation-page-shutdown-key".to_owned(),
+            command: ServiceCommand::Shutdown,
+        })
+        .await?;
+    running.await??;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
 async fn start_idempotency_survives_owner_restart_without_a_second_task() -> TestResult {
     let layout = Layout::new()?;
     let command = ServiceCommand::StartTask(StartTaskCommand {
@@ -570,6 +657,33 @@ async fn every_service_mutation_replays_durably_and_keys_never_rebind() -> TestR
         ServiceResult::Applied
     );
     running.await??;
+    let connection = Connection::open(layout.data.join("carl.sqlite3"))?;
+    for kind in [
+        "start_task",
+        "resume",
+        "steer",
+        "configure",
+        "cancel",
+        "shutdown",
+    ] {
+        let (state, result): (String, String) = connection.query_row(
+            "SELECT state, result_json FROM service_command_receipts
+             WHERE command_kind = ?1",
+            [kind],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(state, "completed", "{kind} receipt remained non-canonical");
+        assert!(serde_json::from_str::<serde_json::Value>(&result)?.is_object());
+    }
+    assert_eq!(
+        connection.query_row(
+            "SELECT COUNT(*) FROM service_command_receipts WHERE state = 'pending'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?,
+        0,
+        "successful service mutations must not leave pending owner receipts"
+    );
 
     let replacement_port = PendingPort::new();
     let replacement_state = Arc::clone(&replacement_port.state);
@@ -1095,6 +1209,340 @@ async fn slow_acp_reader_is_bounded_and_does_not_interrupt_owner_work() -> TestR
 
 #[cfg(unix)]
 #[tokio::test(flavor = "current_thread")]
+async fn owner_restart_resets_live_cursor_for_assistant_diff_and_approval_once() -> TestResult {
+    let layout = Layout::new()?;
+    let shared = Arc::new(Mutex::new(RestartApprovalState {
+        workspace: layout.workspace.clone(),
+        ..RestartApprovalState::default()
+    }));
+    let first_service = TaskService::bind(
+        &layout.data,
+        RestartApprovalPort::new(Arc::clone(&shared), false),
+    )
+    .await?;
+    let first_running = tokio::spawn(first_service.serve(CancellationToken::new()));
+    let mut first = TaskServiceClient::connect(&layout.data).await?;
+    let first_generation = first.info().live_generation.clone();
+    let ServiceResult::Accepted { task_id } = first
+        .request(ServiceRequest {
+            protocol_version: 1,
+            request_id: "restart-live-start".to_owned(),
+            idempotency_key: "restart-live-start-key".to_owned(),
+            command: ServiceCommand::StartTask(StartTaskCommand {
+                external_session_id: "restart-live-session".to_owned(),
+                workspace: layout.workspace.clone(),
+                request: "request approval only after owner restart".to_owned(),
+                model: ModelId::parse("gpt-test")?,
+                effort: ReasoningEffort::High,
+                permission_mode: PermissionMode::Default,
+            }),
+        })
+        .await
+        .map_err(|error| format!("restart live start failed: {error}"))?
+    else {
+        return Err("restart live task missing".into());
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !shared.lock().unwrap().initial_work_started {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    let first_live_cursor = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let ServiceResult::LiveUpdates(page) = first
+                .request(ServiceRequest {
+                    protocol_version: 1,
+                    request_id: format!("restart-live-old-page-{}", Uuid::new_v4()),
+                    idempotency_key: format!("restart-live-old-key-{}", Uuid::new_v4()),
+                    command: ServiceCommand::LiveUpdates {
+                        task_id,
+                        live_generation: first_generation.clone(),
+                        after_cursor: None,
+                        limit: 128,
+                    },
+                })
+                .await
+                .expect("old-generation live page succeeds")
+            else {
+                continue;
+            };
+            if let Some(cursor) = page.cursor {
+                break cursor;
+            }
+        }
+    })
+    .await?;
+    assert!(first_live_cursor > 0);
+    drop(first);
+    first_running.abort();
+    let _ = first_running.await;
+    for _ in 0..100 {
+        if !layout.data.join("carl.sock").exists() {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+
+    let replacement_service = TaskService::bind(
+        &layout.data,
+        RestartApprovalPort::new(Arc::clone(&shared), true),
+    )
+    .await?;
+    let replacement_running = tokio::spawn(replacement_service.serve(CancellationToken::new()));
+    let mut replacement = TaskServiceClient::connect(&layout.data).await?;
+    let replacement_generation = replacement.info().live_generation.clone();
+    assert_ne!(replacement_generation, first_generation);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !shared.lock().unwrap().replacement_effect_requested {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+
+    let acp = ServiceAcpServer::new(
+        &layout.data,
+        AcpServerConfig {
+            frontend: Frontend::Acp,
+            model: Some(ModelId::parse("gpt-test")?),
+            effort: Some(ReasoningEffort::High),
+            permission_mode: PermissionMode::Default,
+            buzz_publisher: None,
+        },
+    )
+    .await?;
+    let (client_stream, server_stream) = tokio::io::duplex(128 * 1024);
+    let (client_read, mut client_write) = tokio::io::split(client_stream);
+    let (server_read, server_write) = tokio::io::split(server_stream);
+    let acp_task = tokio::spawn(acp.serve(BufReader::new(server_read), server_write));
+    let mut reader = BufReader::new(client_read);
+    client_write
+        .write_all(
+            format!(
+                "{}\n{}\n",
+                json!({"jsonrpc":"2.0","id":20,"method":"initialize","params":{"protocolVersion":1,"clientInfo":{"name":"restart-generation","version":"1.0.0"},"clientCapabilities":{}}}),
+                json!({"jsonrpc":"2.0","id":21,"method":"session/load","params":{"sessionId":"restart-live-session","cwd":layout.workspace.clone(),"mcpServers":[],"taskId":task_id,"lastLiveGeneration":first_generation.clone(),"lastLiveCursor":first_live_cursor}})
+            )
+            .as_bytes(),
+        )
+        .await?;
+    client_write.flush().await?;
+    let mut initialized = false;
+    let mut load_response = None;
+    let mut acp_assistant = 0_u64;
+    let mut acp_diff = 0_u64;
+    let mut acp_approval = 0_u64;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let frame = read_frame(&mut reader, 1024 * 1024)
+                .await
+                .expect("restart ACP frame is valid")
+                .expect("restart ACP frame missing");
+            initialized |= frame.value()["id"] == 20;
+            if frame.value()["id"] == 21 {
+                load_response = Some(frame.value().clone());
+            }
+            acp_assistant += u64::from(
+                frame.value()["params"]["update"]["content"]["text"] == "replacement assistant",
+            );
+            acp_diff += u64::from(
+                frame.value()["params"]["update"]["content"][0]["diff"]
+                    == "diff --git a/replacement b/replacement",
+            );
+            acp_approval += u64::from(
+                frame.value()["params"]["update"]["content"]["text"]
+                    .as_str()
+                    .is_some_and(|text| text.starts_with("Approval required:")),
+            );
+            if initialized
+                && load_response.is_some()
+                && acp_assistant == 1
+                && acp_diff == 1
+                && acp_approval == 1
+            {
+                break;
+            }
+        }
+    })
+    .await?;
+    let load_response = load_response.ok_or("restart ACP load response missing")?;
+    assert_eq!(
+        load_response["result"]["_meta"]["lastLiveGeneration"],
+        replacement_generation
+    );
+    assert!(load_response["result"]["_meta"]["lastLiveCursor"].is_null());
+    assert_eq!(acp_assistant, 1);
+    assert_eq!(acp_diff, 1);
+    assert_eq!(acp_approval, 1);
+    let unexpected = tokio::time::timeout(
+        Duration::from_millis(100),
+        read_frame(&mut reader, 1024 * 1024),
+    )
+    .await;
+    assert!(
+        unexpected.is_err(),
+        "ACP stale-generation replay emitted an unexpected duplicate frame"
+    );
+    drop(client_write);
+    drop(reader);
+    acp_task.await??;
+
+    let ServiceResult::LiveUpdates(page) = replacement
+        .request(ServiceRequest {
+            protocol_version: 1,
+            request_id: "restart-live-new-page".to_owned(),
+            idempotency_key: "restart-live-new-page-key".to_owned(),
+            command: ServiceCommand::LiveUpdates {
+                task_id,
+                live_generation: first_generation.clone(),
+                after_cursor: Some(first_live_cursor),
+                limit: 128,
+            },
+        })
+        .await
+        .map_err(|error| format!("replacement live page failed: {error}"))?
+    else {
+        return Err("replacement live page missing".into());
+    };
+    assert_eq!(page.live_generation, replacement_generation);
+    assert_eq!(
+        page.updates
+            .iter()
+            .filter(|update| matches!(update.update, TaskUpdate::AssistantDelta(_)))
+            .count(),
+        1
+    );
+    assert_eq!(
+        page.updates
+            .iter()
+            .filter(|update| matches!(update.update, TaskUpdate::Diff(_)))
+            .count(),
+        1
+    );
+    let approvals = page
+        .updates
+        .iter()
+        .filter_map(|update| match &update.update {
+            TaskUpdate::ApprovalRequired {
+                display_code,
+                session_id,
+                turn_id,
+                ..
+            } => Some((display_code.clone(), *session_id, *turn_id)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(approvals.len(), 1);
+    let (display_code, session_id, turn_id) = approvals[0].clone();
+    let live_cursor = page.cursor.ok_or("replacement live cursor missing")?;
+    assert_eq!(
+        replacement
+            .request(ServiceRequest {
+                protocol_version: 1,
+                request_id: "restart-live-approve".to_owned(),
+                idempotency_key: "restart-live-approve-key".to_owned(),
+                command: ServiceCommand::ResolveApproval {
+                    task_id,
+                    external_session_id: "restart-live-session".to_owned(),
+                    workspace: layout.workspace.clone(),
+                    frontend: Frontend::Acp,
+                    actor_id: ActorId::parse("local-owner")?,
+                    channel_id: None,
+                    event_id: None,
+                    display_code,
+                    session_id,
+                    turn_id,
+                    decision: carl::service::protocol::ServiceApprovalDecision::Approve,
+                },
+            })
+            .await
+            .map_err(|error| format!("restart approval resolution failed: {error}"))?,
+        ServiceResult::Applied
+    );
+    let ServiceResult::LiveUpdates(after_resolution) = replacement
+        .request(ServiceRequest {
+            protocol_version: 1,
+            request_id: "restart-live-after-resolution".to_owned(),
+            idempotency_key: "restart-live-after-resolution-key".to_owned(),
+            command: ServiceCommand::LiveUpdates {
+                task_id,
+                live_generation: replacement_generation,
+                after_cursor: Some(live_cursor),
+                limit: 128,
+            },
+        })
+        .await
+        .map_err(|error| format!("post-resolution live page failed: {error}"))?
+    else {
+        return Err("post-approval live page missing".into());
+    };
+    assert_eq!(
+        after_resolution
+            .updates
+            .iter()
+            .filter(|update| matches!(
+                &update.update,
+                TaskUpdate::AssistantDelta(text) if text == "replacement assistant"
+            ))
+            .count(),
+        0
+    );
+    assert_eq!(
+        after_resolution
+            .updates
+            .iter()
+            .filter(|update| matches!(
+                &update.update,
+                TaskUpdate::Diff(diff) if diff == "diff --git a/replacement b/replacement"
+            ))
+            .count(),
+        0
+    );
+    assert_eq!(
+        after_resolution
+            .updates
+            .iter()
+            .filter(|update| matches!(update.update, TaskUpdate::ApprovalRequired { .. }))
+            .count(),
+        0
+    );
+    let completed = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let ServiceResult::Snapshot(snapshot) = replacement
+                .request(ServiceRequest {
+                    protocol_version: 1,
+                    request_id: format!("restart-live-status-{}", Uuid::new_v4()),
+                    idempotency_key: format!("restart-live-status-key-{}", Uuid::new_v4()),
+                    command: ServiceCommand::Status { task_id },
+                })
+                .await
+                .expect("restart live status succeeds")
+            else {
+                continue;
+            };
+            if snapshot.status == TaskStatus::Completed {
+                break snapshot;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    assert_eq!(completed.task_id, task_id);
+    replacement
+        .request(ServiceRequest {
+            protocol_version: 1,
+            request_id: "restart-live-shutdown".to_owned(),
+            idempotency_key: "restart-live-shutdown-key".to_owned(),
+            command: ServiceCommand::Shutdown,
+        })
+        .await
+        .map_err(|error| format!("restart live shutdown failed: {error}"))?;
+    replacement_running.await??;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
 async fn service_restart_resumes_from_checkpoint_without_repeating_effect() -> TestResult {
     let layout = Layout::new()?;
     let shared = Arc::new(Mutex::new(ContinuityState {
@@ -1165,6 +1613,33 @@ async fn service_restart_resumes_from_checkpoint_without_repeating_effect() -> T
     };
     let cursor = events.last().ok_or("event cursor missing")?.sequence;
     assert_eq!(first.last_event_cursor(), Some(cursor));
+    let first_generation = first.info().live_generation.clone();
+    let first_live_cursor = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let ServiceResult::LiveUpdates(page) = first
+                .request(ServiceRequest {
+                    protocol_version: 1,
+                    request_id: format!("live-before-crash-{}", Uuid::new_v4()),
+                    idempotency_key: format!("live-before-crash-key-{}", Uuid::new_v4()),
+                    command: ServiceCommand::LiveUpdates {
+                        task_id,
+                        live_generation: first_generation.clone(),
+                        after_cursor: None,
+                        limit: 128,
+                    },
+                })
+                .await
+                .expect("live page before restart succeeds")
+            else {
+                continue;
+            };
+            if let Some(cursor) = page.cursor {
+                break cursor;
+            }
+        }
+    })
+    .await?;
+    assert!(first_live_cursor > 0);
     drop(first);
     first_task.abort();
     let _ = first_task.await;
@@ -1201,6 +1676,61 @@ async fn service_restart_resumes_from_checkpoint_without_repeating_effect() -> T
     })
     .await?;
     assert_eq!(completed.task_id, task_id);
+    let replacement_generation = replacement.info().live_generation.clone();
+    assert_ne!(replacement_generation, first_generation);
+    let ServiceResult::LiveUpdates(restarted_live) = replacement
+        .request(ServiceRequest {
+            protocol_version: 1,
+            request_id: "live-after-restart".to_owned(),
+            idempotency_key: "live-after-restart-key".to_owned(),
+            command: ServiceCommand::LiveUpdates {
+                task_id,
+                live_generation: first_generation,
+                after_cursor: Some(first_live_cursor),
+                limit: 128,
+            },
+        })
+        .await?
+    else {
+        return Err("live page after restart missing".into());
+    };
+    assert_eq!(restarted_live.live_generation, replacement_generation);
+    assert_eq!(
+        restarted_live
+            .updates
+            .iter()
+            .filter(|update| matches!(update.update, TaskUpdate::AssistantDelta(_)))
+            .count(),
+        1,
+        "the replacement owner's first assistant update must not be compared to the old cursor"
+    );
+    assert_eq!(
+        restarted_live
+            .updates
+            .iter()
+            .filter(|update| matches!(update.update, TaskUpdate::Diff(_)))
+            .count(),
+        1,
+        "the replacement owner's first diff must be delivered once"
+    );
+    let replacement_live_cursor = restarted_live.cursor.ok_or("replacement cursor missing")?;
+    let ServiceResult::LiveUpdates(no_duplicate_live) = replacement
+        .request(ServiceRequest {
+            protocol_version: 1,
+            request_id: "live-after-restart-again".to_owned(),
+            idempotency_key: "live-after-restart-again-key".to_owned(),
+            command: ServiceCommand::LiveUpdates {
+                task_id,
+                live_generation: replacement_generation,
+                after_cursor: Some(replacement_live_cursor),
+                limit: 128,
+            },
+        })
+        .await?
+    else {
+        return Err("second live page after restart missing".into());
+    };
+    assert!(no_duplicate_live.updates.is_empty());
     let ServiceResult::Events(after_restart) = replacement
         .request(ServiceRequest {
             protocol_version: 1,
@@ -1706,7 +2236,8 @@ async fn acp_reconnect_during_three_epoch_task_replays_once_and_completes() -> T
             tokio::task::yield_now().await;
         }
     })
-    .await?;
+    .await
+    .map_err(|_| "three-epoch initial effect was not ready")?;
 
     let mut owner = TaskServiceClient::connect(&layout.data).await?;
     let ServiceResult::TaskList(tasks) = owner
@@ -1739,7 +2270,9 @@ async fn acp_reconnect_during_three_epoch_task_replays_once_and_completes() -> T
     let cursor = events.last().ok_or("three-epoch cursor missing")?.sequence;
     drop(client_write);
     drop(reader);
-    tokio::time::timeout(Duration::from_secs(5), acp_task).await???;
+    tokio::time::timeout(Duration::from_secs(5), acp_task)
+        .await
+        .map_err(|_| "three-epoch first ACP connection did not close")???;
     assert_eq!(shared.lock().unwrap().interrupts, 0);
 
     shared.lock().unwrap().release_epoch_one = true;
@@ -1748,7 +2281,8 @@ async fn acp_reconnect_during_three_epoch_task_replays_once_and_completes() -> T
             tokio::task::yield_now().await;
         }
     })
-    .await?;
+    .await
+    .map_err(|_| "three-epoch second work epoch did not start")?;
 
     let reconnect = ServiceAcpServer::new(
         &layout.data,
@@ -1781,7 +2315,8 @@ async fn acp_reconnect_during_three_epoch_task_replays_once_and_completes() -> T
     while !loaded {
         let frame =
             tokio::time::timeout(Duration::from_secs(5), read_frame(&mut reader, 1024 * 1024))
-                .await??
+                .await
+                .map_err(|_| "three-epoch load response timed out")??
                 .ok_or("three-epoch load response missing")?;
         loaded = frame.value()["id"] == 11;
     }
@@ -1795,14 +2330,22 @@ async fn acp_reconnect_during_three_epoch_task_replays_once_and_completes() -> T
         )
         .await?;
     client_write.flush().await?;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while shared.lock().unwrap().user_steers < 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .map_err(|_| "three-epoch reconnect steer did not reach the provider")?;
     shared.lock().unwrap().release_epoch_two = true;
 
     let mut replayed = Vec::new();
     let mut visible_assistant = 0_u64;
     let mut visible_diff = 0_u64;
     let mut prompt_completed = false;
+    let mut prompt_response = None;
     let mut durable_completed = false;
-    tokio::time::timeout(Duration::from_secs(5), async {
+    let reconnect_result = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let frame = read_frame(&mut reader, 1024 * 1024)
                 .await
@@ -1821,13 +2364,24 @@ async fn acp_reconnect_during_three_epoch_task_replays_once_and_completes() -> T
                 frame.value()["params"]["update"]["content"][0]["diff"]
                     == "diff --git a/live b/live",
             );
-            prompt_completed |= frame.value()["id"] == 12;
+            if frame.value()["id"] == 12 {
+                prompt_completed = true;
+                prompt_response = Some(frame.value().clone());
+            }
             if durable_completed && prompt_completed {
                 break;
             }
         }
     })
-    .await?;
+    .await;
+    if reconnect_result.is_err() {
+        let state = shared.lock().unwrap();
+        return Err(format!(
+            "three-epoch reconnect replay did not complete: replayed={replayed:?}, assistant={visible_assistant}, diff={visible_diff}, prompt_completed={prompt_completed}, prompt_response={prompt_response:?}, durable_completed={durable_completed}, work_epochs={}, effects={}, completion_reports={}",
+            state.work_epochs, state.effect_count, state.completion_reports
+        )
+        .into());
+    }
     assert!(!replayed.is_empty());
     assert!(replayed.iter().all(|sequence| *sequence > cursor));
     assert!(
@@ -1861,7 +2415,9 @@ async fn acp_reconnect_during_three_epoch_task_replays_once_and_completes() -> T
     }
     drop(client_write);
     drop(reader);
-    tokio::time::timeout(Duration::from_secs(5), reconnect_task).await???;
+    tokio::time::timeout(Duration::from_secs(5), reconnect_task)
+        .await
+        .map_err(|_| "three-epoch reconnect ACP connection did not close")???;
     owner
         .request(ServiceRequest {
             protocol_version: 1,
@@ -2060,6 +2616,257 @@ impl AgentPort for PendingPort {
     }
 }
 
+struct RestartApprovalPort {
+    state: Arc<Mutex<RestartApprovalState>>,
+    replacement: bool,
+}
+
+#[derive(Default)]
+struct RestartApprovalState {
+    workspace: PathBuf,
+    events: VecDeque<AgentEvent>,
+    provider_epochs: u64,
+    initial_work_started: bool,
+    replacement_effect_requested: bool,
+    active_context_id: Option<AgentContextId>,
+    active_epoch_id: Option<AgentEpochId>,
+    operation_id: Option<String>,
+    completion_emitted: bool,
+}
+
+impl RestartApprovalPort {
+    fn new(state: Arc<Mutex<RestartApprovalState>>, replacement: bool) -> Self {
+        Self { state, replacement }
+    }
+}
+
+impl AgentPort for RestartApprovalPort {
+    fn supports_autonomous_tasks(&self) -> bool {
+        true
+    }
+
+    fn capabilities(&self) -> AgentCapabilities {
+        AgentCapabilities {
+            resume: true,
+            compact: true,
+            token_usage: false,
+            pre_dispatch_effects: true,
+            history_paging: false,
+            background_processes: false,
+        }
+    }
+
+    fn models(&mut self) -> AgentFuture<'_, Vec<AgentModel>> {
+        Box::pin(async {
+            Ok(vec![AgentModel {
+                id: ModelId::parse("gpt-test").expect("test model is valid"),
+                display_name: "GPT Test".to_owned(),
+                supported_efforts: vec![ReasoningEffort::High],
+                default_effort: ReasoningEffort::High,
+            }])
+        })
+    }
+
+    fn start_context(&mut self, _request: StartAgentContext) -> AgentFuture<'_, AgentContextId> {
+        Box::pin(async { AgentContextId::parse("restart-approval-context") })
+    }
+
+    fn resume_context(&mut self, request: ResumeAgentContext) -> AgentFuture<'_, AgentContextId> {
+        Box::pin(async move { Ok(request.context_id) })
+    }
+
+    fn compact_context(&mut self, _context_id: &AgentContextId) -> AgentFuture<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn start_epoch(&mut self, request: StartAgentEpoch) -> AgentFuture<'_, AgentEpochId> {
+        let state = Arc::clone(&self.state);
+        let replacement = self.replacement;
+        Box::pin(async move {
+            let mut state = state.lock().unwrap();
+            state.provider_epochs += 1;
+            let epoch_id =
+                AgentEpochId::parse(format!("restart-approval-{}", state.provider_epochs))?;
+            state.events.push_back(AgentEvent::EpochStarted {
+                context_id: request.context_id.clone(),
+                epoch_id: epoch_id.clone(),
+            });
+            if request.permission_mode == PermissionMode::Plan {
+                state.events.push_back(AgentEvent::AssistantDelta {
+                    context_id: request.context_id.clone(),
+                    epoch_id: epoch_id.clone(),
+                    text: "<carl-completion-contract>{\"version\":1,\"goal\":\"Restart and request approval\",\"constraints\":[],\"clauses\":[{\"id\":\"requested-outcome\",\"description\":\"Requested outcome\",\"required\":true,\"status\":\"pending\",\"evidence\":[]},{\"id\":\"explicit-verification\",\"description\":\"Explicit verification\",\"required\":true,\"status\":\"pending\",\"evidence\":[]}]}</carl-completion-contract>".to_owned(),
+                });
+                state.events.push_back(AgentEvent::EpochCompleted {
+                    context_id: request.context_id,
+                    epoch_id: epoch_id.clone(),
+                    status: "completed".to_owned(),
+                });
+            } else if replacement {
+                state.active_context_id = Some(request.context_id.clone());
+                state.active_epoch_id = Some(epoch_id.clone());
+                state.events.push_back(AgentEvent::AssistantDelta {
+                    context_id: request.context_id.clone(),
+                    epoch_id: epoch_id.clone(),
+                    text: "replacement assistant".to_owned(),
+                });
+                state.events.push_back(AgentEvent::DiffUpdated {
+                    context_id: request.context_id.clone(),
+                    epoch_id: epoch_id.clone(),
+                    diff: "diff --git a/replacement b/replacement".to_owned(),
+                });
+                let workspace = state.workspace.clone();
+                state.events.push_back(AgentEvent::ItemStarted {
+                    context_id: request.context_id.clone(),
+                    epoch_id: epoch_id.clone(),
+                    item: AgentItem::Command {
+                        item_id: "restart-approval-item".to_owned(),
+                        command: "restart-approval".to_owned(),
+                        cwd: workspace,
+                        status: "inProgress".to_owned(),
+                        exit_code: None,
+                        aggregated_output: None,
+                        process_id: None,
+                    },
+                });
+                state
+                    .events
+                    .push_back(AgentEvent::EffectRequested(AgentEffectRequest {
+                        context_id: request.context_id,
+                        epoch_id: epoch_id.clone(),
+                        request_id: AgentRequestId::parse("restart-approval-request")?,
+                        item_id: "restart-approval-item".to_owned(),
+                        kind: AgentEffectKind::Command,
+                        summary: "approve after restart".to_owned(),
+                        request_digest: Sha256Digest::parse("7".repeat(64))
+                            .expect("literal digest is valid"),
+                    }));
+                state.replacement_effect_requested = true;
+            } else {
+                state.initial_work_started = true;
+                state.events.push_back(AgentEvent::AssistantDelta {
+                    context_id: request.context_id,
+                    epoch_id: epoch_id.clone(),
+                    text: "old generation assistant".to_owned(),
+                });
+            }
+            Ok(epoch_id)
+        })
+    }
+
+    fn steer(
+        &mut self,
+        _context_id: &AgentContextId,
+        _epoch_id: &AgentEpochId,
+        text: String,
+    ) -> AgentFuture<'_, ()> {
+        let state = Arc::clone(&self.state);
+        Box::pin(async move {
+            if let Some(operation_id) = text.strip_prefix("carl-operation-id:") {
+                state.lock().unwrap().operation_id = Some(operation_id.trim().to_owned());
+            }
+            Ok(())
+        })
+    }
+
+    fn interrupt(
+        &mut self,
+        _context_id: &AgentContextId,
+        _epoch_id: &AgentEpochId,
+    ) -> AgentFuture<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn next_event(&mut self) -> AgentFuture<'_, AgentEvent> {
+        let state = Arc::clone(&self.state);
+        Box::pin(async move {
+            loop {
+                if let Some(event) = state.lock().unwrap().events.pop_front() {
+                    return Ok(event);
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+    }
+
+    fn resolve_effect(
+        &mut self,
+        _request_id: &AgentRequestId,
+        decision: EffectDecision,
+    ) -> AgentFuture<'_, ()> {
+        let state = Arc::clone(&self.state);
+        Box::pin(async move {
+            if decision != EffectDecision::Allow {
+                return Ok(());
+            }
+            let mut state = state.lock().unwrap();
+            if state.completion_emitted {
+                return Ok(());
+            }
+            let context_id = state.active_context_id.clone().ok_or_else(|| {
+                AgentPortError::from_code(
+                    carl::runtime::agent_port::AgentPortErrorCode::InvalidResponse,
+                )
+            })?;
+            let epoch_id = state.active_epoch_id.clone().ok_or_else(|| {
+                AgentPortError::from_code(
+                    carl::runtime::agent_port::AgentPortErrorCode::InvalidResponse,
+                )
+            })?;
+            let operation_id = state.operation_id.clone().ok_or_else(|| {
+                AgentPortError::from_code(
+                    carl::runtime::agent_port::AgentPortErrorCode::InvalidResponse,
+                )
+            })?;
+            state.completion_emitted = true;
+            let workspace = state.workspace.clone();
+            state.events.push_back(AgentEvent::ItemCompleted {
+                context_id: context_id.clone(),
+                epoch_id: epoch_id.clone(),
+                item: AgentItem::Command {
+                    item_id: "restart-approval-item".to_owned(),
+                    command: "restart-approval".to_owned(),
+                    cwd: workspace,
+                    status: "completed".to_owned(),
+                    exit_code: Some(0),
+                    aggregated_output: Some("approved after restart".to_owned()),
+                    process_id: None,
+                },
+            });
+            state.events.push_back(AgentEvent::AssistantDelta {
+                context_id: context_id.clone(),
+                epoch_id: epoch_id.clone(),
+                text: epoch_report("complete", None, Some(&operation_id)),
+            });
+            state.events.push_back(AgentEvent::EpochCompleted {
+                context_id,
+                epoch_id,
+                status: "completed".to_owned(),
+            });
+            Ok(())
+        })
+    }
+
+    fn list_background_processes(
+        &mut self,
+        _context_id: &AgentContextId,
+    ) -> AgentFuture<'_, Vec<AgentProcess>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    fn terminate_background_process(
+        &mut self,
+        _context_id: &AgentContextId,
+        _process_id: &str,
+    ) -> AgentFuture<'_, bool> {
+        Box::pin(async { Ok(true) })
+    }
+
+    fn shutdown(&mut self) -> AgentFuture<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
 struct ContinuityPort {
     state: Arc<Mutex<ContinuityState>>,
     replacement: bool,
@@ -2084,6 +2891,7 @@ struct ThreeEpochState {
     completion_reports: u64,
     interrupts: u64,
     emit_live: bool,
+    user_steers: u64,
 }
 
 impl ThreeEpochPort {
@@ -2232,6 +3040,8 @@ impl AgentPort for ThreeEpochPort {
         Box::pin(async move {
             if let Some(operation_id) = text.strip_prefix("carl-operation-id:") {
                 state.lock().unwrap().operation_id = Some(operation_id.trim().to_owned());
+            } else {
+                state.lock().unwrap().user_steers += 1;
             }
             Ok(())
         })
@@ -2471,6 +3281,11 @@ impl AgentPort for ContinuityPort {
                     context_id: request.context_id.clone(),
                     epoch_id: epoch_id.clone(),
                     text: report,
+                });
+                state.events.push_back(AgentEvent::DiffUpdated {
+                    context_id: request.context_id.clone(),
+                    epoch_id: epoch_id.clone(),
+                    diff: "diff --git a/restart b/restart".to_owned(),
                 });
                 state.events.push_back(AgentEvent::EpochCompleted {
                     context_id: request.context_id,

@@ -6,7 +6,7 @@ use std::path::Path;
 
 use libtest_mimic::{Arguments, Failed, Trial};
 use rusqlite::Connection;
-use serde_json::json;
+use serde_json::{Value, json};
 use support::{
     ACTOR_HEX, CHANNEL_ID, Client, Layout, PRIVATE_KEY, TestResult, dispatch_fixture, fixture,
     prompt_frame, prompt_frame_for_identity,
@@ -52,6 +52,10 @@ fn main() {
                     rejected_configuration_delivery_rolls_back_session()
                         .map_err(|error| Failed::from(error.to_string()))
                 },
+            ),
+            Trial::test(
+                "Buzz steering requires fresh exact owner metadata before mutation",
+                || strict_steering_admission().map_err(|error| Failed::from(error.to_string())),
             ),
         ],
     )
@@ -193,6 +197,119 @@ fn admission_precedes_execution() -> TestResult {
     Ok(())
 }
 
+fn strict_steering_admission() -> TestResult {
+    let layout = Layout::new("strict-steering-admission")?;
+    layout.trust_owner()?;
+    let mut client = Client::spawn(&layout, false)?;
+    let session = initialize_session(&mut client, &layout, 1, 2)?;
+    client.send(&prompt_frame(3, &session, "wait for cancel", 'a'))?;
+    layout.wait_for_provider_method("turn/start", 1)?;
+    let task_id = layout.latest_task_id()?;
+
+    let metadata = |event: char, actor: &str, channel: &str, kind: u32| {
+        format!(
+            "Event ID: {}\nChannel: Carl Test (#{channel})\nKind: {kind}\nFrom: Owner (hex: {actor})\nTime: 2026-08-10T12:00:00Z\nContent: command",
+            event.to_string().repeat(64)
+        )
+    };
+    let steering = |id: i64, prompt: Vec<String>| {
+        json!({
+            "jsonrpc":"2.0","id":id,"method":"_session/steering","params":{
+                "sessionId":session,
+                "prompt":prompt.into_iter().map(|text| json!({"type":"text","text":text})).collect::<Vec<_>>()
+            }
+        })
+    };
+    let wrong_actor = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let wrong_channel = "22222222-2222-4222-8222-222222222222";
+    let rejected = [
+        steering(10, vec!["missing metadata".to_owned()]),
+        steering(
+            11,
+            vec!["malformed metadata".to_owned(), "Event ID: nope".to_owned()],
+        ),
+        steering(
+            12,
+            vec![
+                "wrong actor".to_owned(),
+                metadata('b', wrong_actor, CHANNEL_ID, 1),
+            ],
+        ),
+        steering(
+            13,
+            vec![
+                "wrong channel".to_owned(),
+                metadata('c', ACTOR_HEX, wrong_channel, 1),
+            ],
+        ),
+        steering(
+            14,
+            vec![
+                "group-shaped".to_owned(),
+                metadata('d', ACTOR_HEX, CHANNEL_ID, 9),
+            ],
+        ),
+        steering(
+            15,
+            vec![
+                "ambiguous metadata".to_owned(),
+                metadata('e', ACTOR_HEX, CHANNEL_ID, 1),
+                metadata('f', ACTOR_HEX, CHANNEL_ID, 1),
+            ],
+        ),
+    ];
+    for request in rejected {
+        let id = request["id"].as_i64().ok_or("steering id missing")?;
+        let markers_before = layout.task_control_marker_count(&task_id)?;
+        let provider_steers_before = layout.provider_method_count("turn/steer")?;
+        client.send(&request)?;
+        assert_eq!(client.read_id(id)?["error"]["code"], -32602);
+        assert_eq!(layout.task_control_marker_count(&task_id)?, markers_before);
+        assert_eq!(
+            layout.provider_method_count("turn/steer")?,
+            provider_steers_before
+        );
+    }
+
+    let valid = steering(
+        16,
+        vec![
+            "fresh owner steering".to_owned(),
+            metadata('1', ACTOR_HEX, CHANNEL_ID, 1),
+        ],
+    );
+    client.send(&valid)?;
+    assert_eq!(client.read_id(16)?["result"]["outcome"], "injected");
+    let markers_after_valid = layout.task_control_marker_count(&task_id)?;
+    let provider_steers_after_valid = layout.provider_method_count("turn/steer")?;
+    client.send(
+        &valid
+            .as_object()
+            .map(|object| {
+                let mut replay = object.clone();
+                replay.insert("id".to_owned(), json!(17));
+                Value::Object(replay)
+            })
+            .ok_or("valid steering frame must be an object")?,
+    )?;
+    assert_eq!(client.read_id(17)?["error"]["code"], -32602);
+    assert_eq!(
+        layout.task_control_marker_count(&task_id)?,
+        markers_after_valid
+    );
+    assert_eq!(
+        layout.provider_method_count("turn/steer")?,
+        provider_steers_after_valid
+    );
+
+    client.send(&json!({
+        "jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":session}
+    }))?;
+    assert_eq!(client.read_id(3)?["result"]["stopReason"], "cancelled");
+    let _ = client.finish()?;
+    Ok(())
+}
+
 fn durable_configuration_boundaries() -> TestResult {
     let loosening = Layout::new("durable-config-loosening")?;
     loosening.trust_owner()?;
@@ -222,7 +339,13 @@ fn durable_configuration_boundaries() -> TestResult {
     client.send(&json!({
             "jsonrpc":"2.0","id":8,"method":"_session/steering","params":{
             "sessionId":session,
-            "prompt":[{"type":"text","text":"boundary configuration"}]
+            "prompt":[
+                {"type":"text","text":"boundary configuration"},
+                {"type":"text","text":format!(
+                    "Event ID: {}\nChannel: Carl Test (#{CHANNEL_ID})\nKind: 1\nFrom: Owner (hex: {ACTOR_HEX})\nTime: 2026-08-10T12:00:00Z\nContent: command",
+                    "c".repeat(64)
+                )}
+            ]
         }
     }))?;
     assert_eq!(client.read_id(8)?["result"]["outcome"], "injected");
@@ -381,6 +504,25 @@ fn durable_service_approval() -> TestResult {
         "fixed\n"
     );
 
+    let receipts = Connection::open(layout.data.join("carl.sqlite3"))?;
+    for (kind, minimum) in [
+        ("configure_trusted_session", 1_i64),
+        ("start_trusted_task", 1_i64),
+        ("resolve_approval", 2_i64),
+    ] {
+        let completed = receipts.query_row(
+            "SELECT COUNT(*) FROM service_command_receipts
+             WHERE command_kind = ?1 AND state = 'completed'
+               AND json_valid(result_json)",
+            [kind],
+            |row| row.get::<_, i64>(0),
+        )?;
+        assert!(
+            completed >= minimum,
+            "{kind} did not leave a canonical owner receipt"
+        );
+    }
+
     client.send(&prompt_frame(
         58,
         &session,
@@ -445,7 +587,13 @@ fn durable_configuration_supersession() -> TestResult {
     client.send(&json!({
         "jsonrpc":"2.0","id":37,"method":"_session/steering","params":{
             "sessionId":session,
-            "prompt":[{"type":"text","text":"boundary configuration"}]
+            "prompt":[
+                {"type":"text","text":"boundary configuration"},
+                {"type":"text","text":format!(
+                    "Event ID: {}\nChannel: Carl Test (#{CHANNEL_ID})\nKind: 1\nFrom: Owner (hex: {ACTOR_HEX})\nTime: 2026-08-10T12:00:00Z\nContent: command",
+                    "b".repeat(64)
+                )}
+            ]
         }
     }))?;
     assert_eq!(client.read_id(37)?["result"]["outcome"], "injected");

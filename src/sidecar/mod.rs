@@ -5300,28 +5300,37 @@ pub(crate) mod windows_security {
         }
     }
 
-    pub(super) struct OwnerOnlySecurityDescriptor {
+    pub(crate) struct OwnerOnlySecurityDescriptor {
         _current_user: CurrentUser,
         _acl: Vec<usize>,
         descriptor: SECURITY_DESCRIPTOR,
     }
 
     impl OwnerOnlySecurityDescriptor {
-        pub(super) fn as_ptr(&self) -> *const SECURITY_DESCRIPTOR {
+        pub(crate) fn as_ptr(&self) -> *const SECURITY_DESCRIPTOR {
             &raw const self.descriptor
         }
     }
 
     pub(super) fn owner_only_file_security_descriptor() -> Result<OwnerOnlySecurityDescriptor, ()> {
-        owner_only_security_descriptor(0)
+        owner_only_security_descriptor(0, FILE_ALL_ACCESS)
     }
 
     pub(super) fn owner_only_directory_security_descriptor()
     -> Result<OwnerOnlySecurityDescriptor, ()> {
-        owner_only_security_descriptor(OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE)
+        owner_only_security_descriptor(OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE, FILE_ALL_ACCESS)
     }
 
-    fn owner_only_security_descriptor(ace_flags: u32) -> Result<OwnerOnlySecurityDescriptor, ()> {
+    pub(crate) fn owner_only_security_descriptor_for_access(
+        access_mask: u32,
+    ) -> Result<OwnerOnlySecurityDescriptor, ()> {
+        owner_only_security_descriptor(0, access_mask)
+    }
+
+    fn owner_only_security_descriptor(
+        ace_flags: u32,
+        access_mask: u32,
+    ) -> Result<OwnerOnlySecurityDescriptor, ()> {
         let current_user = CurrentUser::query()?;
         // SAFETY: CurrentUser::query validated the SID and its backing storage is live.
         let sid_bytes =
@@ -5347,7 +5356,7 @@ pub(crate) mod windows_security {
                 acl_pointer,
                 ACL_REVISION,
                 ace_flags,
-                FILE_ALL_ACCESS,
+                access_mask,
                 current_user.sid(),
             )
         } == 0

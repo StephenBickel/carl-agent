@@ -151,6 +151,18 @@ fn process_boundary_conforms() -> TestResult {
     layout.wait_for_provider_method("turn/start", 2)?;
     let mut steer = fixture("steer", &layout.workspace, Some(&second_session))?;
     steer["id"] = json!(31);
+    steer["params"]["prompt"]
+        .as_array_mut()
+        .ok_or("steering prompt blocks missing")?
+        .push(json!({
+            "type":"text",
+            "text":format!(
+                "Event ID: {}\nChannel: Carl Test (#{})\nKind: 1\nFrom: Owner (hex: {})\nTime: 2026-08-10T12:00:00Z\nContent: command",
+                "e".repeat(64),
+                support::CHANNEL_ID,
+                support::ACTOR_HEX
+            )
+        }));
     client.send_partial(&steer)?;
     let steered = client.read_id(31)?;
     assert_eq!(steered["result"]["outcome"], "injected", "{steered}");

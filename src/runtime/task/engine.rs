@@ -31,7 +31,7 @@ use crate::security::SecretFilter;
 use crate::storage::{
     ApprovalStatus, BoundApprovalBinding, ChannelId, ClientName, ExternalSessionId, NewCheckpoint,
     NewFrontendSession, NewRemoteCode, NewTask, ProviderRequestId, RemoteCodeClaim, RemoteCodeKind,
-    RuntimeStore, Store, TaskRecord,
+    RuntimeStore, ServiceCommandReceiptClaim, ServiceCommandReceiptInput, Store, TaskRecord,
 };
 
 use super::{
@@ -173,6 +173,16 @@ pub enum TaskEngineUpdate {
 }
 
 pub(crate) enum TaskEngineControl {
+    ClaimServiceCommand {
+        input: ServiceCommandReceiptInput,
+        reply: oneshot::Sender<Result<ServiceCommandReceiptClaim, TaskEngineError>>,
+    },
+    CompleteServiceCommand {
+        input: ServiceCommandReceiptInput,
+        result_json: String,
+        completed_at: chrono::DateTime<Utc>,
+        reply: oneshot::Sender<Result<String, TaskEngineError>>,
+    },
     Enqueue {
         input: OwnerStartTask,
         reply: oneshot::Sender<Result<TaskSnapshot, TaskEngineError>>,
@@ -728,6 +738,27 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
 
     fn process_owner_control(&mut self, control: TaskEngineControl) -> Option<TaskEngineControl> {
         match control {
+            TaskEngineControl::ClaimServiceCommand { input, reply } => {
+                let result = self
+                    .store_mut()
+                    .claim_service_command(input)
+                    .map_err(storage_error);
+                let _ = reply.send(result);
+                None
+            }
+            TaskEngineControl::CompleteServiceCommand {
+                input,
+                result_json,
+                completed_at,
+                reply,
+            } => {
+                let result = self
+                    .store_mut()
+                    .complete_service_command(&input, &result_json, completed_at)
+                    .map_err(storage_error);
+                let _ = reply.send(result);
+                None
+            }
             TaskEngineControl::Enqueue { input, reply } => {
                 let _ = reply.send(self.enqueue_owner_task(input));
                 None
@@ -3166,7 +3197,9 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                         | TaskEngineControl::Configure {
                             acknowledgement, ..
                         } => *acknowledgement,
-                        TaskEngineControl::Enqueue { .. }
+                        TaskEngineControl::ClaimServiceCommand { .. }
+                        | TaskEngineControl::CompleteServiceCommand { .. }
+                        | TaskEngineControl::Enqueue { .. }
                         | TaskEngineControl::AdmitTrusted { .. }
                         | TaskEngineControl::ConfigureOwnerSession { .. } => {
                             unreachable!("owner control was processed before work dispatch")
@@ -3429,7 +3462,9 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                 Ok(())
             }
             TaskEngineControl::Approval { .. } => Err(error(TaskEngineErrorCode::Blocked)),
-            TaskEngineControl::Enqueue { .. }
+            TaskEngineControl::ClaimServiceCommand { .. }
+            | TaskEngineControl::CompleteServiceCommand { .. }
+            | TaskEngineControl::Enqueue { .. }
             | TaskEngineControl::AdmitTrusted { .. }
             | TaskEngineControl::ConfigureOwnerSession { .. } => {
                 unreachable!("owner control was processed before task control dispatch")
@@ -4234,7 +4269,9 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                 | TaskEngineControl::Configure {
                     acknowledgement, ..
                 } => *acknowledgement,
-                TaskEngineControl::Enqueue { .. }
+                TaskEngineControl::ClaimServiceCommand { .. }
+                | TaskEngineControl::CompleteServiceCommand { .. }
+                | TaskEngineControl::Enqueue { .. }
                 | TaskEngineControl::AdmitTrusted { .. }
                 | TaskEngineControl::ConfigureOwnerSession { .. } => {
                     unreachable!("owner controls are handled before approval dispatch")
@@ -4371,7 +4408,9 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                     self.acknowledge(acknowledgement, configured.clone()).await;
                     configured?;
                 }
-                TaskEngineControl::Enqueue { .. }
+                TaskEngineControl::ClaimServiceCommand { .. }
+                | TaskEngineControl::CompleteServiceCommand { .. }
+                | TaskEngineControl::Enqueue { .. }
                 | TaskEngineControl::AdmitTrusted { .. }
                 | TaskEngineControl::ConfigureOwnerSession { .. } => {
                     unreachable!("owner control was processed before approval dispatch")
@@ -5023,7 +5062,9 @@ fn control_acknowledgement(control: &TaskEngineControl) -> u64 {
         | TaskEngineControl::Configure {
             acknowledgement, ..
         } => *acknowledgement,
-        TaskEngineControl::Enqueue { .. }
+        TaskEngineControl::ClaimServiceCommand { .. }
+        | TaskEngineControl::CompleteServiceCommand { .. }
+        | TaskEngineControl::Enqueue { .. }
         | TaskEngineControl::AdmitTrusted { .. }
         | TaskEngineControl::ConfigureOwnerSession { .. } => {
             unreachable!("owner controls do not use task acknowledgements")

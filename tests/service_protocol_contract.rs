@@ -197,6 +197,29 @@ fn service_info_is_a_versioned_bounded_negotiation_command() -> TestResult {
 }
 
 #[test]
+fn live_poll_request_carries_the_generation_that_owns_its_cursor() -> TestResult {
+    let task_id = TaskId::new();
+    let mut frame = serde_json::to_vec(&json!({
+        "protocol_version":1,
+        "request_id":"live-generation-request",
+        "idempotency_key":"live-generation-key",
+        "command":{
+            "type":"live_updates",
+            "params":{
+                "task_id":task_id,
+                "live_generation":"11111111-1111-4111-8111-111111111111",
+                "after_cursor":7,
+                "limit":128
+            }
+        }
+    }))?;
+    frame.push(b'\n');
+    let decoded = decode_request_line(&frame, &mut RequestLedger::default())?;
+    assert_eq!(decoded.request_id, "live-generation-request");
+    Ok(())
+}
+
+#[test]
 fn read_polling_outlives_the_bounded_request_id_replay_window() -> TestResult {
     let task_id = TaskId::new();
     let mut ledger = RequestLedger::default();

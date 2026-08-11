@@ -770,6 +770,7 @@ struct ServiceSessionBinding {
     permission_mode: PermissionMode,
     task_id: Option<TaskId>,
     last_event_cursor: Option<u64>,
+    live_generation: String,
     last_live_cursor: Option<u64>,
     stream_generation: u64,
     prompt_active: bool,
@@ -1031,6 +1032,7 @@ impl ServiceAcpServer {
                 permission_mode: self.config.permission_mode,
                 task_id: None,
                 last_event_cursor: None,
+                live_generation: self.info.live_generation.clone(),
                 last_live_cursor: None,
                 stream_generation: 0,
                 prompt_active: false,
@@ -1040,7 +1042,8 @@ impl ServiceAcpServer {
         );
         Ok(json!({
             "sessionId":external,
-            "configOptions":service_config_options(&self.info, &model, effort, self.config.permission_mode)
+            "configOptions":service_config_options(&self.info, &model, effort, self.config.permission_mode),
+            "_meta":{"liveGeneration":self.info.live_generation}
         }))
     }
 
@@ -1052,7 +1055,12 @@ impl ServiceAcpServer {
         require_keys(
             params,
             &["sessionId", "cwd", "mcpServers"],
-            &["lastEventCursor", "lastLiveCursor", "taskId"],
+            &[
+                "lastEventCursor",
+                "lastLiveCursor",
+                "lastLiveGeneration",
+                "taskId",
+            ],
         )?;
         self.prepare_service_publisher(params.get("mcpServers"))
             .await?;
@@ -1065,9 +1073,26 @@ impl ServiceAcpServer {
         let last_event_cursor = params.get("lastEventCursor").map_or(Ok(None), |value| {
             value.as_u64().map(Some).ok_or_else(invalid_input)
         })?;
-        let last_live_cursor = params.get("lastLiveCursor").map_or(Ok(None), |value| {
+        let requested_live_cursor = params.get("lastLiveCursor").map_or(Ok(None), |value| {
             value.as_u64().map(Some).ok_or_else(invalid_input)
         })?;
+        let requested_live_generation = params
+            .get("lastLiveGeneration")
+            .map(|value| bounded_string(Some(value), 64))
+            .transpose()?;
+        if requested_live_generation
+            .as_deref()
+            .is_some_and(|generation| Uuid::parse_str(generation).is_err())
+        {
+            return Err(invalid_input());
+        }
+        let live_generation = self.info.live_generation.clone();
+        let last_live_cursor =
+            if requested_live_generation.as_deref() == Some(live_generation.as_str()) {
+                requested_live_cursor
+            } else {
+                None
+            };
         let requested_task = params
             .get("taskId")
             .map(|value| {
@@ -1103,6 +1128,7 @@ impl ServiceAcpServer {
                 permission_mode: service_session.permission_mode,
                 task_id,
                 last_event_cursor,
+                live_generation: live_generation.clone(),
                 last_live_cursor,
                 stream_generation: 0,
                 prompt_active: false,
@@ -1113,7 +1139,7 @@ impl ServiceAcpServer {
         Ok(json!({
             "sessionId":external,
             "configOptions":service_config_options(&self.info, &model, effort, service_session.permission_mode),
-            "_meta":{"lastEventCursor":last_event_cursor,"lastLiveCursor":last_live_cursor,"taskId":task_id}
+            "_meta":{"lastEventCursor":last_event_cursor,"lastLiveGeneration":live_generation,"lastLiveCursor":last_live_cursor,"taskId":task_id}
         }))
     }
 
@@ -1143,6 +1169,7 @@ impl ServiceAcpServer {
                 external,
                 task_id,
                 session.last_event_cursor,
+                session.live_generation,
                 session.last_live_cursor,
                 session.stream_generation,
                 outbound,
@@ -1378,6 +1405,7 @@ impl ServiceAcpServer {
             ServiceResult::Accepted { task_id } => {
                 session.task_id = Some(task_id);
                 session.last_event_cursor = None;
+                session.live_generation = self.client.info().live_generation.clone();
                 session.last_live_cursor = None;
                 task_id
             }
@@ -1388,14 +1416,16 @@ impl ServiceAcpServer {
         session.buzz_context = buzz_context;
         let buzz_publisher = self.buzz_publisher.clone();
         let buzz_context = session.buzz_context.clone();
-        let (cursor, live_cursor, stream_generation) = {
+        let (cursor, live_generation, live_cursor, stream_generation) = {
             let mut sessions = self.sessions.lock().await;
             let current = sessions.get(&external).ok_or_else(invalid_input)?;
             session.last_event_cursor = current.last_event_cursor;
+            session.live_generation.clone_from(&current.live_generation);
             session.last_live_cursor = current.last_live_cursor;
             session.stream_generation = current.stream_generation.saturating_add(1);
             let state = (
                 session.last_event_cursor,
+                session.live_generation.clone(),
                 session.last_live_cursor,
                 session.stream_generation,
             );
@@ -1411,6 +1441,7 @@ impl ServiceAcpServer {
                 external,
                 task_id,
                 cursor,
+                live_generation,
                 live_cursor,
                 stream_generation,
                 buzz_publisher,
@@ -1440,17 +1471,15 @@ impl ServiceAcpServer {
         let task_id = session.task_id.ok_or_else(invalid_input)?;
         let command = if self.config.frontend == Frontend::Buzz {
             let refs = blocks.iter().map(String::as_str).collect::<Vec<_>>();
-            match BuzzContext::parse(&refs) {
-                Ok(context) => service_steer_command(
-                    &session,
-                    &external,
-                    task_id,
-                    text,
-                    Some(&context),
-                    self.config.frontend,
-                )?,
-                Err(_) => ServiceCommand::Steer { task_id, text },
-            }
+            let context = BuzzContext::parse(&refs).map_err(|_| invalid_input())?;
+            service_steer_command(
+                &session,
+                &external,
+                task_id,
+                text,
+                Some(&context),
+                self.config.frontend,
+            )?
         } else {
             ServiceCommand::Steer { task_id, text }
         };
@@ -1752,6 +1781,7 @@ async fn poll_service_prompt(
     external_session_id: String,
     task_id: TaskId,
     mut cursor: Option<u64>,
+    mut live_generation: String,
     mut live_cursor: Option<u64>,
     stream_generation: u64,
     buzz_publisher: Option<std::sync::Arc<BuzzPublisher>>,
@@ -1817,16 +1847,18 @@ async fn poll_service_prompt(
             cursor = Some(event.sequence);
             binding.last_event_cursor = cursor;
         }
-        let Ok((next_live_cursor, live_frames, pending_approval)) = poll_live_service_updates(
-            &mut client,
-            &external_session_id,
-            task_id,
-            live_cursor,
-            buzz_publisher.as_deref(),
-            buzz_context.as_ref(),
-            &cancelled,
-        )
-        .await
+        let Ok((next_live_generation, next_live_cursor, live_frames, pending_approval)) =
+            poll_live_service_updates(
+                &mut client,
+                &external_session_id,
+                task_id,
+                &live_generation,
+                live_cursor,
+                buzz_publisher.as_deref(),
+                buzz_context.as_ref(),
+                &cancelled,
+            )
+            .await
         else {
             return;
         };
@@ -1842,7 +1874,9 @@ async fn poll_service_prompt(
                 return;
             }
         }
+        live_generation = next_live_generation;
         live_cursor = next_live_cursor;
+        binding.live_generation.clone_from(&live_generation);
         binding.last_live_cursor = live_cursor;
         if let Some(pending) = pending_approval {
             binding.pending_approval = Some(pending);
@@ -1854,7 +1888,7 @@ async fn poll_service_prompt(
                     response_id,
                     json!({
                         "stopReason":"waiting_for_approval",
-                        "_meta":{"taskId":task_id,"lastEventCursor":cursor,"lastLiveCursor":live_cursor}
+                        "_meta":{"taskId":task_id,"lastEventCursor":cursor,"lastLiveGeneration":live_generation,"lastLiveCursor":live_cursor}
                     }),
                 ),
                 &cancelled,
@@ -1889,6 +1923,7 @@ async fn poll_service_prompt(
                 .filter(|session| session.stream_generation == stream_generation)
             {
                 session.last_event_cursor = cursor;
+                session.live_generation.clone_from(&live_generation);
                 session.last_live_cursor = live_cursor;
                 session.prompt_active = false;
             }
@@ -1905,7 +1940,7 @@ async fn poll_service_prompt(
                     response_id,
                     json!({
                         "stopReason":stop_reason,
-                        "_meta":{"taskId":task_id,"lastEventCursor":cursor,"lastLiveCursor":live_cursor}
+                        "_meta":{"taskId":task_id,"lastEventCursor":cursor,"lastLiveGeneration":live_generation,"lastLiveCursor":live_cursor}
                     }),
                 ),
                 &cancelled,
@@ -1926,6 +1961,7 @@ async fn replay_service_events(
     external_session_id: String,
     task_id: TaskId,
     mut cursor: Option<u64>,
+    mut live_generation: String,
     mut live_cursor: Option<u64>,
     stream_generation: u64,
     outbound: mpsc::Sender<OutgoingFrame>,
@@ -1980,16 +2016,18 @@ async fn replay_service_events(
             cursor = Some(event.sequence);
             binding.last_event_cursor = cursor;
         }
-        let Ok((next_live_cursor, live_frames, pending_approval)) = poll_live_service_updates(
-            &mut client,
-            &external_session_id,
-            task_id,
-            live_cursor,
-            None,
-            None,
-            &cancelled,
-        )
-        .await
+        let Ok((next_live_generation, next_live_cursor, live_frames, pending_approval)) =
+            poll_live_service_updates(
+                &mut client,
+                &external_session_id,
+                task_id,
+                &live_generation,
+                live_cursor,
+                None,
+                None,
+                &cancelled,
+            )
+            .await
         else {
             return;
         };
@@ -2005,8 +2043,10 @@ async fn replay_service_events(
                 return;
             }
         }
+        live_generation = next_live_generation;
         live_cursor = next_live_cursor;
         binding.last_event_cursor = cursor;
+        binding.live_generation.clone_from(&live_generation);
         binding.last_live_cursor = live_cursor;
         let approval_pending = pending_approval.is_some();
         if let Some(pending) = pending_approval {
@@ -2055,16 +2095,19 @@ async fn owns_service_stream(
         .is_some_and(|session| session.stream_generation == generation)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn poll_live_service_updates(
     client: &mut TaskServiceClient,
     external_session_id: &str,
     task_id: TaskId,
+    live_generation: &str,
     live_cursor: Option<u64>,
     buzz_publisher: Option<&BuzzPublisher>,
     buzz_context: Option<&BuzzContext>,
     cancelled: &CancellationToken,
 ) -> Result<
     (
+        String,
         Option<u64>,
         Vec<OutgoingFrame>,
         Option<ServicePendingApproval>,
@@ -2078,6 +2121,7 @@ async fn poll_live_service_updates(
             idempotency_key: Uuid::new_v4().to_string(),
             command: ServiceCommand::LiveUpdates {
                 task_id,
+                live_generation: live_generation.to_owned(),
                 after_cursor: live_cursor,
                 limit: 128,
             },
@@ -2087,6 +2131,7 @@ async fn poll_live_service_updates(
     let ServiceResult::LiveUpdates(page) = result else {
         return Err(server_error(AcpServerErrorCode::KernelFailed));
     };
+    let page_generation = page.live_generation.clone();
     let mut frames = Vec::new();
     let mut pending_approval = None;
     if let Some(snapshot) = page.snapshot {
@@ -2095,7 +2140,7 @@ async fn poll_live_service_updates(
             json!({
                 "sessionId":external_session_id,
                 "update":{"sessionUpdate":"task_status","taskId":task_id,"status":snapshot.status},
-                "_meta":{"liveCursor":page.cursor,"snapshotFallback":true}
+                "_meta":{"liveGeneration":page_generation,"liveCursor":page.cursor,"snapshotFallback":true}
             }),
         )
         .map_err(|_| server_error(AcpServerErrorCode::KernelFailed))?);
@@ -2162,7 +2207,7 @@ async fn poll_live_service_updates(
                                 "kind":"execute",
                                 "status":"pending"
                             },
-                            "_meta":{"liveCursor":envelope.cursor}
+                            "_meta":{"liveGeneration":page_generation,"liveCursor":envelope.cursor}
                         }),
                     )
                     .map_err(|_| server_error(AcpServerErrorCode::KernelFailed))?,
@@ -2186,13 +2231,13 @@ async fn poll_live_service_updates(
                 json!({
                     "sessionId":external_session_id,
                     "update":update,
-                    "_meta":{"liveCursor":envelope.cursor}
+                    "_meta":{"liveGeneration":page_generation,"liveCursor":envelope.cursor}
                 }),
             )
             .map_err(|_| server_error(AcpServerErrorCode::KernelFailed))?,
         );
     }
-    Ok((page.cursor, frames, pending_approval))
+    Ok((page_generation, page.cursor, frames, pending_approval))
 }
 
 fn render_service_event(session_id: &str, task_id: TaskId, envelope: &EventEnvelope) -> Vec<Value> {

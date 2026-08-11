@@ -20,6 +20,34 @@ use tokio::net::UnixStream;
 type LocalReader = Pin<Box<dyn AsyncRead + Send>>;
 type LocalWriter = Pin<Box<dyn AsyncWrite + Send>>;
 
+#[cfg(any(windows, test))]
+#[derive(Clone, Copy)]
+struct WindowsPipeAceShape {
+    allow: bool,
+    inherited: bool,
+    mask: u32,
+    current_user: bool,
+}
+
+#[cfg(any(windows, test))]
+fn valid_windows_pipe_security_shape(
+    owner_is_current_user: bool,
+    dacl_protected: bool,
+    aces: &[WindowsPipeAceShape],
+) -> bool {
+    owner_is_current_user
+        && dacl_protected
+        && matches!(
+            aces,
+            [WindowsPipeAceShape {
+                allow: true,
+                inherited: false,
+                mask: super::server::WINDOWS_PIPE_ACCESS,
+                current_user: true,
+            }]
+        )
+}
+
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum ServiceClientErrorCode {
     #[error("the Carl service endpoint identity is invalid")]
@@ -169,6 +197,7 @@ impl TaskServiceClient {
 
 fn validate_info(info: &ServiceInfo) -> Result<(), ServiceClientError> {
     if info.protocol_version != SERVICE_PROTOCOL_VERSION
+        || uuid::Uuid::parse_str(&info.live_generation).is_err()
         || info.models.len() > 128
         || !info.capabilities.durable_events
         || !info.capabilities.reconnect
@@ -202,6 +231,7 @@ fn validate_info(info: &ServiceInfo) -> Result<(), ServiceClientError> {
 fn empty_info() -> ServiceInfo {
     ServiceInfo {
         protocol_version: 0,
+        live_generation: String::new(),
         models: Vec::new(),
         default_model: None,
         default_effort: None,
@@ -325,29 +355,46 @@ fn verify_windows_pipe_server(
     };
     // SAFETY: owner and current SID remain live.
     let owner_matches = unsafe { EqualSid(owner, current.sid()) != 0 };
-    // Exactly one current-user allow ACE prevents a permissive or foreign pre-created pipe.
+    // Exactly one current-user allow ACE with the intended read/write mask prevents a
+    // permissive, inherited, or foreign pre-created pipe.
     // SAFETY: dacl is non-null and remains owned by descriptor until LocalFree below.
     let ace_count = unsafe { (*dacl).AceCount };
-    let private_dacl = if protected && ace_count == 1 {
+    let private_dacl = if ace_count == 1 {
         let mut ace = std::ptr::null_mut();
         // SAFETY: dacl is live and advertises exactly one ACE.
-        (unsafe { GetAce(dacl, 0, &mut ace) }) != 0
-            && !ace.is_null()
-            // SAFETY: GetAce returned a live ACE_HEADER.
-            && unsafe { (*(ace.cast::<ACE_HEADER>())).AceType == ACCESS_ALLOWED_ACE_TYPE }
-            && {
+        if unsafe { GetAce(dacl, 0, &mut ace) } == 0 || ace.is_null() {
+            false
+        } else {
+            // SAFETY: GetAce returned a live ACE_HEADER and the declared allow
+            // ACE layout contains its mask and SID.
+            let header = unsafe { &*(ace.cast::<ACE_HEADER>()) };
+            let allow = header.AceType == ACCESS_ALLOWED_ACE_TYPE;
+            let (mask, current_user) = if allow {
                 // SAFETY: the ACE type is ACCESS_ALLOWED_ACE and SidStart begins its SID.
                 let allowed = unsafe { &*(ace.cast::<ACCESS_ALLOWED_ACE>()) };
                 let sid = std::ptr::addr_of!(allowed.SidStart).cast_mut().cast();
                 // SAFETY: both SIDs remain live for the comparison.
-                unsafe { EqualSid(sid, current.sid()) != 0 }
-            }
+                (allowed.Mask, unsafe { EqualSid(sid, current.sid()) != 0 })
+            } else {
+                (0, false)
+            };
+            valid_windows_pipe_security_shape(
+                owner_matches,
+                protected,
+                &[WindowsPipeAceShape {
+                    allow,
+                    inherited: header.AceFlags != 0,
+                    mask,
+                    current_user,
+                }],
+            )
+        }
     } else {
         false
     };
     // SAFETY: descriptor was allocated by GetSecurityInfo and is no longer used.
     unsafe { LocalFree(descriptor) };
-    if owner_matches && private_dacl {
+    if private_dacl {
         Ok(())
     } else {
         Err(client_error(ServiceClientErrorCode::InvalidEndpoint))
@@ -431,4 +478,75 @@ async fn read_bounded_line<R: tokio::io::AsyncBufRead + Unpin>(
 
 const fn client_error(code: ServiceClientErrorCode) -> ServiceClientError {
     ServiceClientError { code }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{WindowsPipeAceShape, valid_windows_pipe_security_shape};
+    use crate::service::server::WINDOWS_PIPE_ACCESS;
+
+    const LEGITIMATE: WindowsPipeAceShape = WindowsPipeAceShape {
+        allow: true,
+        inherited: false,
+        mask: WINDOWS_PIPE_ACCESS,
+        current_user: true,
+    };
+
+    #[test]
+    fn windows_pipe_security_shape_rejects_every_non_private_variant() {
+        assert!(valid_windows_pipe_security_shape(true, true, &[LEGITIMATE]));
+        assert!(!valid_windows_pipe_security_shape(
+            false,
+            true,
+            &[LEGITIMATE]
+        ));
+        assert!(!valid_windows_pipe_security_shape(
+            true,
+            false,
+            &[LEGITIMATE]
+        ));
+        assert!(!valid_windows_pipe_security_shape(
+            true,
+            true,
+            &[LEGITIMATE, LEGITIMATE]
+        ));
+        for ace in [
+            WindowsPipeAceShape {
+                allow: false,
+                ..LEGITIMATE
+            },
+            WindowsPipeAceShape {
+                inherited: true,
+                ..LEGITIMATE
+            },
+            WindowsPipeAceShape {
+                mask: WINDOWS_PIPE_ACCESS & !0x4000_0000,
+                ..LEGITIMATE
+            },
+            WindowsPipeAceShape {
+                mask: WINDOWS_PIPE_ACCESS | 0x1000_0000,
+                ..LEGITIMATE
+            },
+            WindowsPipeAceShape {
+                current_user: false,
+                ..LEGITIMATE
+            },
+        ] {
+            assert!(!valid_windows_pipe_security_shape(true, true, &[ace]));
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn owner_pipe_created_for_the_current_user_passes_client_verification() {
+        use std::os::windows::io::AsRawHandle as _;
+
+        let pipe_name = format!(r"\\.\pipe\carl-contract-{}", uuid::Uuid::new_v4());
+        let mut server = crate::service::server::create_owner_pipe(&pipe_name, true).unwrap();
+        let client = tokio::net::windows::named_pipe::ClientOptions::new()
+            .open(&pipe_name)
+            .unwrap();
+        server.connect().await.unwrap();
+        super::verify_windows_pipe_server(client.as_raw_handle().cast()).unwrap();
+    }
 }

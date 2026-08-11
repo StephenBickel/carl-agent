@@ -796,7 +796,7 @@ fn app_server_fixture() -> i32 {
                 let boundary_configuration = request
                     .pointer("/params/input/0/text")
                     .and_then(Value::as_str)
-                    == Some("boundary configuration");
+                    .is_some_and(|text| text.starts_with("boundary configuration\n\nEvent ID: "));
                 if respond(id, json!({"turnId":request["params"]["expectedTurnId"]})).is_err() {
                     return 74;
                 }
