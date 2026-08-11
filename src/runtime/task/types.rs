@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -310,6 +310,102 @@ impl OperationStatus {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OperationEvidenceError {
+    IllegalTransition,
+    Missing,
+    Invalid,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct OperationEvidenceState {
+    recorded_sequences: BTreeSet<u64>,
+    consumed_sequences: Vec<u64>,
+}
+
+impl OperationEvidenceState {
+    pub(crate) fn from_consumed(consumed_sequences: Vec<u64>) -> Self {
+        Self {
+            recorded_sequences: BTreeSet::new(),
+            consumed_sequences,
+        }
+    }
+
+    pub(crate) fn record(
+        &mut self,
+        status: OperationStatus,
+        last_transition_sequence: u64,
+        sequence: u64,
+    ) -> Result<(), OperationEvidenceError> {
+        if !matches!(
+            status,
+            OperationStatus::Started | OperationStatus::Uncertain
+        ) || sequence <= last_transition_sequence
+            || !self.recorded_sequences.insert(sequence)
+        {
+            return Err(OperationEvidenceError::Invalid);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn transition(
+        &mut self,
+        status: OperationStatus,
+        from: OperationStatus,
+        to: OperationStatus,
+        last_transition_sequence: u64,
+        transition_sequence: u64,
+        evidence_sequences: &[u64],
+    ) -> Result<(), OperationEvidenceError> {
+        if status != from || !legal_operation_edge(from, to) {
+            return Err(OperationEvidenceError::IllegalTransition);
+        }
+        if evidence_sequences.first() == Some(&0)
+            || evidence_sequences.windows(2).any(|pair| pair[0] >= pair[1])
+            || evidence_sequences
+                .iter()
+                .any(|sequence| *sequence >= transition_sequence)
+        {
+            return Err(OperationEvidenceError::Invalid);
+        }
+        if !to.requires_terminal_evidence() {
+            return Ok(());
+        }
+        if evidence_sequences.is_empty() {
+            return Err(OperationEvidenceError::Missing);
+        }
+        if evidence_sequences.iter().any(|sequence| {
+            *sequence <= last_transition_sequence
+                || !self.recorded_sequences.contains(sequence)
+                || self.consumed_sequences.contains(sequence)
+        }) {
+            return Err(OperationEvidenceError::Invalid);
+        }
+        self.consumed_sequences
+            .extend_from_slice(evidence_sequences);
+        Ok(())
+    }
+
+    pub(crate) fn consumed_sequences(&self) -> &[u64] {
+        &self.consumed_sequences
+    }
+}
+
+pub(crate) const fn legal_operation_edge(from: OperationStatus, to: OperationStatus) -> bool {
+    matches!(
+        (from, to),
+        (OperationStatus::IntentRecorded, OperationStatus::Started)
+            | (
+                OperationStatus::Started,
+                OperationStatus::Succeeded
+                    | OperationStatus::Failed
+                    | OperationStatus::Cancelled
+                    | OperationStatus::Uncertain
+            )
+            | (OperationStatus::Uncertain, OperationStatus::Reconciled)
+    )
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EffectClass {
@@ -344,6 +440,8 @@ struct OperationSnapshot {
     epoch_id: EpochId,
     status: OperationStatus,
     last_transition_sequence: u64,
+    #[serde(default)]
+    evidence: OperationEvidenceState,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -401,6 +499,7 @@ impl TaskSnapshot {
                     epoch_id,
                     status: OperationStatus::IntentRecorded,
                     last_transition_sequence: sequence,
+                    evidence: OperationEvidenceState::default(),
                 },
             )
             .map(|operation| operation.status)
@@ -419,18 +518,45 @@ impl TaskSnapshot {
         })
     }
 
-    pub(crate) fn set_operation_status(
+    pub(crate) fn transition_operation(
         &mut self,
         operation_id: OperationId,
-        status: OperationStatus,
+        from: OperationStatus,
+        to: OperationStatus,
         sequence: u64,
-    ) {
+        evidence_sequences: &[u64],
+    ) -> Result<(), OperationEvidenceError> {
         let operation = self
             .operations
             .get_mut(&operation_id)
             .expect("operation existence checked before transition");
-        operation.status = status;
+        operation.evidence.transition(
+            operation.status,
+            from,
+            to,
+            operation.last_transition_sequence,
+            sequence,
+            evidence_sequences,
+        )?;
+        operation.status = to;
         operation.last_transition_sequence = sequence;
+        Ok(())
+    }
+
+    pub(crate) fn record_operation_evidence(
+        &mut self,
+        operation_id: OperationId,
+        sequence: u64,
+    ) -> Result<(), OperationEvidenceError> {
+        let operation = self
+            .operations
+            .get_mut(&operation_id)
+            .expect("operation existence checked before evidence");
+        operation.evidence.record(
+            operation.status,
+            operation.last_transition_sequence,
+            sequence,
+        )
     }
 
     pub(crate) fn has_unresolved_operations(&self) -> bool {

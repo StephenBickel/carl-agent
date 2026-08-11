@@ -283,6 +283,7 @@ fn checkpoint_bytes_are_canonical_across_event_insertion_orders() -> TestResult 
     );
     assert_eq!(forward.operations[0].operation_id, operation_id);
     assert_eq!(forward.operations[0].status, OperationStatus::Succeeded);
+    assert_eq!(forward.operations[0].evidence_sequences, vec![6]);
     assert!(!String::from_utf8(forward.canonical_bytes()?)?.contains("provider prose"));
 
     let mut ordered = forward.clone();
@@ -387,6 +388,61 @@ fn checkpoint_validation_rejects_lost_ids_bad_operations_evidence_and_artifacts(
         CanonicalCheckpoint::build(non_utf8).unwrap_err(),
         CheckpointError::NonUtf8Artifact
     );
+}
+
+#[test]
+fn checkpoint_preserves_uncertain_and_reconciliation_evidence() -> TestResult {
+    let (snapshot, mut events, operation_id) = canonical_history();
+    events.truncate(6);
+    let epoch_id = EpochId::from_uuid(uuid("33333333-3333-4333-8333-333333333333"));
+    events.extend([
+        envelope(
+            snapshot.session_id,
+            snapshot.task_id,
+            7,
+            TaskEvent::OperationTransitioned {
+                operation_id,
+                from: OperationStatus::Started,
+                to: OperationStatus::Uncertain,
+                evidence_sequences: vec![6],
+            },
+        ),
+        envelope(
+            snapshot.session_id,
+            snapshot.task_id,
+            8,
+            TaskEvent::OperationEvidenceRecorded {
+                operation_id,
+                result_digest: digest(b"reconciliation result"),
+            },
+        ),
+        envelope(
+            snapshot.session_id,
+            snapshot.task_id,
+            9,
+            TaskEvent::OperationTransitioned {
+                operation_id,
+                from: OperationStatus::Uncertain,
+                to: OperationStatus::Reconciled,
+                evidence_sequences: vec![8],
+            },
+        ),
+        envelope(
+            snapshot.session_id,
+            snapshot.task_id,
+            10,
+            TaskEvent::EpochFinished {
+                epoch_id,
+                report_digest: digest(b"reconciled report"),
+            },
+        ),
+    ]);
+    let snapshot = replay(&events);
+    let checkpoint = CanonicalCheckpoint::build(build_input(snapshot, events))?;
+
+    assert_eq!(checkpoint.operations[0].status, OperationStatus::Reconciled);
+    assert_eq!(checkpoint.operations[0].evidence_sequences, vec![6, 8]);
+    Ok(())
 }
 
 #[test]
@@ -937,6 +993,25 @@ fn checkpoint_commit_cannot_hide_authoritative_operations_or_an_active_epoch() -
     ));
     assert_eq!(store.read_task_events(task_id)?.len(), before);
 
+    let mut forged_evidence = authoritative.clone();
+    forged_evidence.operations[0].evidence_sequences = vec![2];
+    let package = checkpoint_package(&forged_evidence)?;
+    assert!(matches!(
+        store.commit_checkpoint(
+            NewCheckpoint {
+                task_id,
+                checkpoint_digest: forged_evidence.digest()?,
+                context_package_digest: package.digest()?,
+                checkpoint: forged_evidence,
+                context_package: package,
+                created_at: timestamp(9),
+            },
+            task.revision,
+        ),
+        Err(CarlError::Validation { .. })
+    ));
+    assert_eq!(store.read_task_events(task_id)?.len(), before);
+
     let mut wrong_provider = authoritative.clone();
     wrong_provider.provider.model = "invented-model".to_owned();
     let mut wrong_generation = authoritative.clone();
@@ -995,6 +1070,90 @@ fn checkpoint_commit_cannot_hide_authoritative_operations_or_an_active_epoch() -
         Err(CarlError::Validation { .. })
     ));
     assert_eq!(store.read_task_events(task_id)?.len(), before + 1);
+    Ok(())
+}
+
+#[test]
+fn reconciled_checkpoint_commits_with_all_authoritative_evidence() -> TestResult {
+    let fixture = TemporaryTaskDatabase::new()?;
+    let mut store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let created = store.create_task(storage_task(session.id, &fixture.workspace))?;
+    let task_id = created.snapshot.task_id;
+    let epoch_id = EpochId::new();
+    let operation_id = OperationId::new();
+    let transitions = [
+        TaskEvent::StateTransitioned {
+            from: TaskStatus::Queued,
+            to: TaskStatus::Active,
+            reason: "start".to_owned(),
+        },
+        TaskEvent::EpochStarted {
+            epoch_id,
+            objective: "reconcile uncertain delivery".to_owned(),
+        },
+        TaskEvent::OperationIntentRecorded {
+            operation_id,
+            epoch_id,
+            item_id: "operation-item".to_owned(),
+            effect_class: EffectClass::AmbiguousConsequential,
+            request_digest: digest(b"storage request"),
+        },
+        TaskEvent::OperationTransitioned {
+            operation_id,
+            from: OperationStatus::IntentRecorded,
+            to: OperationStatus::Started,
+            evidence_sequences: vec![4],
+        },
+        TaskEvent::OperationEvidenceRecorded {
+            operation_id,
+            result_digest: digest(b"uncertain result"),
+        },
+        TaskEvent::OperationTransitioned {
+            operation_id,
+            from: OperationStatus::Started,
+            to: OperationStatus::Uncertain,
+            evidence_sequences: vec![6],
+        },
+        TaskEvent::OperationEvidenceRecorded {
+            operation_id,
+            result_digest: digest(b"reconciliation result"),
+        },
+        TaskEvent::OperationTransitioned {
+            operation_id,
+            from: OperationStatus::Uncertain,
+            to: OperationStatus::Reconciled,
+            evidence_sequences: vec![8],
+        },
+        TaskEvent::EpochFinished {
+            epoch_id,
+            report_digest: digest(b"storage report"),
+        },
+    ];
+    let mut task = created;
+    for (index, event) in transitions.into_iter().enumerate() {
+        task = store
+            .append_task_event(task_id, task.revision, event, timestamp(index as u32 + 1))?
+            .expect("revision matches");
+    }
+    let checkpoint = CanonicalCheckpoint::build(storage_checkpoint_input(
+        &task,
+        store.read_task_events(task_id)?,
+    ))?;
+    assert_eq!(checkpoint.operations[0].evidence_sequences, vec![6, 8]);
+    let package = checkpoint_package(&checkpoint)?;
+    let record = store.commit_checkpoint(
+        NewCheckpoint {
+            task_id,
+            checkpoint_digest: checkpoint.digest()?,
+            context_package_digest: package.digest()?,
+            checkpoint,
+            context_package: package,
+            created_at: timestamp(10),
+        },
+        task.revision,
+    )?;
+    assert!(record.is_some());
     Ok(())
 }
 

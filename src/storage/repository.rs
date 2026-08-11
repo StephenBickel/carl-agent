@@ -29,8 +29,8 @@ use crate::runtime::subscription::{
     RunTrustLabel, VerificationId,
 };
 use crate::runtime::task::{
-    CanonicalCheckpoint, CompletionContract, ContextPackage, EffectClass, OperationStatus,
-    TaskBudget, TaskEvent, TaskId, TaskSnapshot, TaskStatus, reduce_task,
+    CanonicalCheckpoint, CompletionContract, ContextPackage, EffectClass, OperationEvidenceState,
+    OperationStatus, TaskBudget, TaskEvent, TaskId, TaskSnapshot, TaskStatus, reduce_task,
 };
 use crate::security::SecretFilter;
 use crate::sidecar::DataRootLock;
@@ -5508,11 +5508,13 @@ fn validate_checkpoint_authority(
                     if journal_operations
                         .insert(
                             *operation_id,
-                            (
-                                OperationStatus::IntentRecorded,
-                                *effect_class,
-                                request_digest.clone(),
-                            ),
+                            JournalOperationState {
+                                status: OperationStatus::IntentRecorded,
+                                effect_class: *effect_class,
+                                request_digest: request_digest.clone(),
+                                last_transition_sequence: envelope.sequence,
+                                evidence: OperationEvidenceState::default(),
+                            },
                         )
                         .is_some()
                     {
@@ -5525,17 +5527,43 @@ fn validate_checkpoint_authority(
                     operation_id,
                     from,
                     to,
-                    ..
+                    evidence_sequences,
                 } => {
                     let operation = journal_operations.get_mut(operation_id).ok_or_else(|| {
                         storage_invariant("task journal operation transition has no intent")
                     })?;
-                    if operation.0 != *from {
-                        return Err(storage_invariant(
-                            "task journal operation transition disagrees with prior state",
-                        ));
-                    }
-                    operation.0 = *to;
+                    operation
+                        .evidence
+                        .transition(
+                            operation.status,
+                            *from,
+                            *to,
+                            operation.last_transition_sequence,
+                            envelope.sequence,
+                            evidence_sequences,
+                        )
+                        .map_err(|_| {
+                            storage_invariant(
+                                "task journal operation transition has invalid evidence",
+                            )
+                        })?;
+                    operation.status = *to;
+                    operation.last_transition_sequence = envelope.sequence;
+                }
+                TaskEvent::OperationEvidenceRecorded { operation_id, .. } => {
+                    let operation = journal_operations.get_mut(operation_id).ok_or_else(|| {
+                        storage_invariant("task journal operation evidence has no intent")
+                    })?;
+                    operation
+                        .evidence
+                        .record(
+                            operation.status,
+                            operation.last_transition_sequence,
+                            envelope.sequence,
+                        )
+                        .map_err(|_| {
+                            storage_invariant("task journal operation evidence is invalid")
+                        })?;
                 }
                 _ => {}
             }
@@ -5559,14 +5587,21 @@ fn validate_checkpoint_authority(
                 operation.status,
                 operation.effect_class,
                 operation.request_digest.clone(),
+                operation.evidence_sequences.clone(),
             )
         })
         .collect::<Vec<_>>();
     checkpoint_operations.sort_by_key(|operation| operation.0);
     let authoritative_operations = journal_operations
         .into_iter()
-        .map(|(operation_id, (status, effect_class, request_digest))| {
-            (operation_id, status, effect_class, request_digest)
+        .map(|(operation_id, operation)| {
+            (
+                operation_id,
+                operation.status,
+                operation.effect_class,
+                operation.request_digest,
+                operation.evidence.consumed_sequences().to_vec(),
+            )
         })
         .collect::<Vec<_>>();
     if checkpoint_operations != authoritative_operations {
@@ -5604,6 +5639,14 @@ fn validate_checkpoint_authority(
         ));
     }
     Ok(())
+}
+
+struct JournalOperationState {
+    status: OperationStatus,
+    effect_class: EffectClass,
+    request_digest: String,
+    last_transition_sequence: u64,
+    evidence: OperationEvidenceState,
 }
 
 fn validate_checkpoint_history(

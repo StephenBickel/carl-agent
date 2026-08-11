@@ -118,9 +118,9 @@ fn task_projection_reopens_and_matches_journal_replay_for_every_transition()
             to: OperationStatus::Started,
             evidence_sequences: Vec::new(),
         },
-        TaskEvent::ProgressAssessed {
-            fingerprint: "operation-result".to_owned(),
-            stalled: false,
+        TaskEvent::OperationEvidenceRecorded {
+            operation_id,
+            result_digest: "operation-result".to_owned(),
         },
         TaskEvent::OperationTransitioned {
             operation_id,

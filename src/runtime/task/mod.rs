@@ -13,6 +13,7 @@ pub use context::{
     ContextLedgerEntry, ContextPackage, ContextSourceKind, ContextTrust, ContextUnit,
 };
 pub use reducer::{TaskReduceError, TaskReduceErrorCode, reduce_task};
+pub(crate) use types::OperationEvidenceState;
 pub use types::{
     CheckpointId, ClauseStatus, CompletionClause, CompletionContract, ContextPackageId,
     EffectClass, EpochId, EvidenceRef, OperationId, OperationStatus, TaskBudget, TaskEvent, TaskId,

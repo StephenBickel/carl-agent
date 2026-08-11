@@ -3,7 +3,9 @@ use thiserror::Error;
 
 use crate::events::{Event, EventEnvelope};
 
-use super::types::{OperationStatus, TaskEvent, TaskSnapshot, TaskStatus, TaskValidationErrorCode};
+use super::types::{
+    OperationEvidenceError, TaskEvent, TaskSnapshot, TaskStatus, TaskValidationErrorCode,
+};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Error, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -207,41 +209,32 @@ pub fn reduce_task(
             to,
             evidence_sequences,
         } => {
-            let (operation_epoch, status, last_transition_sequence) = state
+            let (operation_epoch, _, _) = state
                 .operation(*operation_id)
                 .ok_or_else(|| error(TaskReduceErrorCode::OperationIntentMissing))?;
             if state.active_epoch != Some(operation_epoch) {
                 return Err(error(TaskReduceErrorCode::EpochMismatch));
             }
-            if status != *from || !legal_operation_edge(*from, *to) {
-                return Err(error(TaskReduceErrorCode::IllegalOperationTransition));
-            }
-            if to.requires_terminal_evidence() && evidence_sequences.is_empty() {
-                return Err(error(TaskReduceErrorCode::OperationEvidenceMissing));
-            }
-            if evidence_sequences
-                .iter()
-                .any(|sequence| *sequence > envelope.sequence)
-                || (to.requires_terminal_evidence()
-                    && (evidence_sequences.contains(&envelope.sequence)
-                        || !evidence_sequences
-                            .iter()
-                            .any(|sequence| *sequence > last_transition_sequence)))
-            {
-                return Err(error(TaskReduceErrorCode::InvalidOperationEvidence));
-            }
-            state.set_operation_status(*operation_id, *to, envelope.sequence);
+            state
+                .transition_operation(
+                    *operation_id,
+                    *from,
+                    *to,
+                    envelope.sequence,
+                    evidence_sequences,
+                )
+                .map_err(operation_evidence_error)?;
         }
         TaskEvent::OperationEvidenceRecorded { operation_id, .. } => {
-            let (operation_epoch, status, last_transition_sequence) = state
+            let (operation_epoch, _, _) = state
                 .operation(*operation_id)
                 .ok_or_else(|| error(TaskReduceErrorCode::OperationIntentMissing))?;
             if state.active_epoch != Some(operation_epoch) {
                 return Err(error(TaskReduceErrorCode::EpochMismatch));
             }
-            if status != OperationStatus::Started || envelope.sequence <= last_transition_sequence {
-                return Err(error(TaskReduceErrorCode::InvalidOperationEvidence));
-            }
+            state
+                .record_operation_evidence(*operation_id, envelope.sequence)
+                .map_err(operation_evidence_error)?;
         }
         TaskEvent::UsageObserved { epoch_id, .. } => {
             require_active_epoch(&state, *epoch_id)?;
@@ -359,19 +352,18 @@ const fn legal_status_edge(from: TaskStatus, to: TaskStatus) -> bool {
     )
 }
 
-const fn legal_operation_edge(from: OperationStatus, to: OperationStatus) -> bool {
-    matches!(
-        (from, to),
-        (OperationStatus::IntentRecorded, OperationStatus::Started)
-            | (
-                OperationStatus::Started,
-                OperationStatus::Succeeded
-                    | OperationStatus::Failed
-                    | OperationStatus::Cancelled
-                    | OperationStatus::Uncertain
-            )
-            | (OperationStatus::Uncertain, OperationStatus::Reconciled)
-    )
+const fn operation_evidence_error(error: OperationEvidenceError) -> TaskReduceError {
+    match error {
+        OperationEvidenceError::IllegalTransition => {
+            TaskReduceError::from_code(TaskReduceErrorCode::IllegalOperationTransition)
+        }
+        OperationEvidenceError::Missing => {
+            TaskReduceError::from_code(TaskReduceErrorCode::OperationEvidenceMissing)
+        }
+        OperationEvidenceError::Invalid => {
+            TaskReduceError::from_code(TaskReduceErrorCode::InvalidOperationEvidence)
+        }
+    }
 }
 
 const fn error(code: TaskReduceErrorCode) -> TaskReduceError {

@@ -8,8 +8,8 @@ use crate::events::{Event, EventEnvelope};
 use crate::security::{SecretFilter, SecretRule};
 
 use super::types::{
-    CheckpointId, CompletionContract, EffectClass, EvidenceRef, OperationId, OperationStatus,
-    TaskEvent, TaskId, TaskSnapshot,
+    CheckpointId, CompletionContract, EffectClass, EvidenceRef, OperationEvidenceError,
+    OperationEvidenceState, OperationId, OperationStatus, TaskEvent, TaskId, TaskSnapshot,
 };
 
 const CHECKPOINT_SCHEMA_VERSION: u16 = 1;
@@ -91,6 +91,7 @@ pub struct OperationCheckpoint {
     pub status: OperationStatus,
     pub effect_class: EffectClass,
     pub request_digest: String,
+    pub evidence_sequences: Vec<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -326,6 +327,20 @@ impl CanonicalCheckpoint {
             if !operation.status.is_resolved() {
                 return Err(CheckpointError::UnpairedOperation);
             }
+            if operation.evidence_sequences.is_empty()
+                || operation.evidence_sequences.first() == Some(&0)
+                || operation
+                    .evidence_sequences
+                    .windows(2)
+                    .any(|pair| pair[0] >= pair[1])
+            {
+                return Err(CheckpointError::InvalidEvidenceRange);
+            }
+            validate_evidence_sequences(
+                &operation.evidence_sequences,
+                self.source_sequence_start,
+                self.source_sequence_end,
+            )?;
         }
         validate_digest(&self.repository.workspace_digest)?;
         if let Some(digest) = &self.repository.git_status_digest {
@@ -552,10 +567,20 @@ fn build_operations(
             .operations
             .iter()
             .cloned()
-            .map(|operation| (operation.operation_id, operation))
+            .map(|operation| {
+                (
+                    operation.operation_id,
+                    OperationBuildState {
+                        last_transition_sequence: checkpoint.source_sequence_end,
+                        evidence: OperationEvidenceState::from_consumed(
+                            operation.evidence_sequences.clone(),
+                        ),
+                        checkpoint: operation,
+                    },
+                )
+            })
             .collect()
     });
-    let mut operation_evidence = BTreeMap::new();
     for envelope in events {
         let Event::TaskLifecycle { event, .. } = &envelope.event else {
             return Err(CheckpointError::InvalidSource);
@@ -570,11 +595,16 @@ fn build_operations(
                 if operations
                     .insert(
                         *operation_id,
-                        OperationCheckpoint {
-                            operation_id: *operation_id,
-                            status: OperationStatus::IntentRecorded,
-                            effect_class: *effect_class,
-                            request_digest: request_digest.clone(),
+                        OperationBuildState {
+                            checkpoint: OperationCheckpoint {
+                                operation_id: *operation_id,
+                                status: OperationStatus::IntentRecorded,
+                                effect_class: *effect_class,
+                                request_digest: request_digest.clone(),
+                                evidence_sequences: Vec::new(),
+                            },
+                            last_transition_sequence: envelope.sequence,
+                            evidence: OperationEvidenceState::default(),
                         },
                     )
                     .is_some()
@@ -591,14 +621,6 @@ fn build_operations(
                 let operation = operations
                     .get_mut(operation_id)
                     .ok_or(CheckpointError::DanglingOperation)?;
-                if operation.status != *from {
-                    return Err(CheckpointError::UnpairedOperation);
-                }
-                if !legal_operation_edge(*from, *to)
-                    || (to.requires_terminal_evidence() && evidence_sequences.is_empty())
-                {
-                    return Err(CheckpointError::UnpairedOperation);
-                }
                 if evidence_sequences.iter().any(|sequence| {
                     *sequence < source_sequence_start
                         || *sequence > source_sequence_end
@@ -606,14 +628,21 @@ fn build_operations(
                 }) {
                     return Err(CheckpointError::InvalidEvidenceRange);
                 }
-                if to.requires_terminal_evidence()
-                    && evidence_sequences
-                        .iter()
-                        .any(|sequence| operation_evidence.get(sequence) != Some(operation_id))
-                {
-                    return Err(CheckpointError::InvalidEvidenceRange);
-                }
-                operation.status = *to;
+                operation
+                    .evidence
+                    .transition(
+                        operation.checkpoint.status,
+                        *from,
+                        *to,
+                        operation.last_transition_sequence,
+                        envelope.sequence,
+                        evidence_sequences,
+                    )
+                    .map_err(checkpoint_operation_evidence_error)?;
+                operation.checkpoint.status = *to;
+                operation.last_transition_sequence = envelope.sequence;
+                operation.checkpoint.evidence_sequences =
+                    operation.evidence.consumed_sequences().to_vec();
             }
             TaskEvent::OperationEvidenceRecorded {
                 operation_id,
@@ -621,41 +650,45 @@ fn build_operations(
             } => {
                 validate_digest(result_digest)?;
                 let operation = operations
-                    .get(operation_id)
+                    .get_mut(operation_id)
                     .ok_or(CheckpointError::DanglingOperation)?;
-                if operation.status != OperationStatus::Started
-                    || operation_evidence
-                        .insert(envelope.sequence, *operation_id)
-                        .is_some()
-                {
-                    return Err(CheckpointError::InvalidEvidenceRange);
-                }
+                operation
+                    .evidence
+                    .record(
+                        operation.checkpoint.status,
+                        operation.last_transition_sequence,
+                        envelope.sequence,
+                    )
+                    .map_err(checkpoint_operation_evidence_error)?;
             }
             _ => {}
         }
     }
     if operations
         .values()
-        .any(|operation| !operation.status.is_resolved())
+        .any(|operation| !operation.checkpoint.status.is_resolved())
     {
         return Err(CheckpointError::UnpairedOperation);
     }
-    Ok(operations.into_values().collect())
+    Ok(operations
+        .into_values()
+        .map(|operation| operation.checkpoint)
+        .collect())
 }
 
-const fn legal_operation_edge(from: OperationStatus, to: OperationStatus) -> bool {
-    matches!(
-        (from, to),
-        (OperationStatus::IntentRecorded, OperationStatus::Started)
-            | (
-                OperationStatus::Started,
-                OperationStatus::Succeeded
-                    | OperationStatus::Failed
-                    | OperationStatus::Cancelled
-                    | OperationStatus::Uncertain
-            )
-            | (OperationStatus::Uncertain, OperationStatus::Reconciled)
-    )
+struct OperationBuildState {
+    checkpoint: OperationCheckpoint,
+    last_transition_sequence: u64,
+    evidence: OperationEvidenceState,
+}
+
+const fn checkpoint_operation_evidence_error(error: OperationEvidenceError) -> CheckpointError {
+    match error {
+        OperationEvidenceError::IllegalTransition | OperationEvidenceError::Missing => {
+            CheckpointError::UnpairedOperation
+        }
+        OperationEvidenceError::Invalid => CheckpointError::InvalidEvidenceRange,
+    }
 }
 
 fn verification_from_contract(contract: &CompletionContract) -> Vec<ClauseEvidence> {

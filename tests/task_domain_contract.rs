@@ -464,9 +464,9 @@ fn reducer_projects_a_complete_valid_lifecycle() {
     state = apply(
         Some(state),
         6,
-        TaskEvent::ProgressAssessed {
-            fingerprint: "operation-result".into(),
-            stalled: false,
+        TaskEvent::OperationEvidenceRecorded {
+            operation_id: operation_id(),
+            result_digest: "sha256:operation-result".into(),
         },
     );
     state = apply(
@@ -743,7 +743,7 @@ fn safe_boundaries_reject_active_epochs_and_unresolved_operations() {
             operation_id: operation_id(),
             from: OperationStatus::IntentRecorded,
             to: OperationStatus::Started,
-            evidence_sequences: vec![4, 5],
+            evidence_sequences: vec![4],
         },
     );
 
@@ -840,7 +840,7 @@ fn operation_transitions_require_epoch_ownership_and_terminal_evidence() {
             operation_id: operation_id(),
             from: OperationStatus::IntentRecorded,
             to: OperationStatus::Started,
-            evidence_sequences: vec![4, 5],
+            evidence_sequences: vec![4],
         },
     ];
     let started = reduce_events(&events).unwrap();
@@ -940,9 +940,9 @@ fn operation_transitions_require_epoch_ownership_and_terminal_evidence() {
     let prior_result = apply(
         Some(started),
         6,
-        TaskEvent::ProgressAssessed {
-            fingerprint: "operation-result".into(),
-            stalled: false,
+        TaskEvent::OperationEvidenceRecorded {
+            operation_id: operation_id(),
+            result_digest: "sha256:operation-result".into(),
         },
     );
     let succeeded = reduce_task(
@@ -963,6 +963,231 @@ fn operation_transitions_require_epoch_ownership_and_terminal_evidence() {
         succeeded.operation_status(operation_id()),
         Some(OperationStatus::Succeeded)
     );
+}
+
+#[test]
+fn uncertain_operations_accept_fresh_bound_evidence_and_reconcile() {
+    let reconciled = reduce_events(&[
+        created(),
+        TaskEvent::StateTransitioned {
+            from: TaskStatus::Queued,
+            to: TaskStatus::Active,
+            reason: "start".into(),
+        },
+        TaskEvent::EpochStarted {
+            epoch_id: epoch_id(),
+            objective: "reconcile uncertain delivery".into(),
+        },
+        TaskEvent::OperationIntentRecorded {
+            operation_id: operation_id(),
+            epoch_id: epoch_id(),
+            item_id: "operation".into(),
+            effect_class: EffectClass::AmbiguousConsequential,
+            request_digest: "sha256:request".into(),
+        },
+        TaskEvent::OperationTransitioned {
+            operation_id: operation_id(),
+            from: OperationStatus::IntentRecorded,
+            to: OperationStatus::Started,
+            evidence_sequences: vec![4],
+        },
+        TaskEvent::OperationEvidenceRecorded {
+            operation_id: operation_id(),
+            result_digest: "sha256:uncertain".into(),
+        },
+        TaskEvent::OperationTransitioned {
+            operation_id: operation_id(),
+            from: OperationStatus::Started,
+            to: OperationStatus::Uncertain,
+            evidence_sequences: vec![6],
+        },
+        TaskEvent::OperationEvidenceRecorded {
+            operation_id: operation_id(),
+            result_digest: "sha256:reconciled".into(),
+        },
+        TaskEvent::OperationTransitioned {
+            operation_id: operation_id(),
+            from: OperationStatus::Uncertain,
+            to: OperationStatus::Reconciled,
+            evidence_sequences: vec![8],
+        },
+        TaskEvent::EpochFinished {
+            epoch_id: epoch_id(),
+            report_digest: "sha256:report".into(),
+        },
+    ])
+    .unwrap();
+
+    assert_eq!(
+        reconciled.operation_status(operation_id()),
+        Some(OperationStatus::Reconciled)
+    );
+    assert_eq!(reconciled.active_epoch, None);
+}
+
+#[test]
+fn terminal_operation_evidence_rejects_unrelated_cross_operation_and_stale_sequences() {
+    let started = reduce_events(&[
+        created(),
+        TaskEvent::StateTransitioned {
+            from: TaskStatus::Queued,
+            to: TaskStatus::Active,
+            reason: "start".into(),
+        },
+        TaskEvent::EpochStarted {
+            epoch_id: epoch_id(),
+            objective: "bind terminal evidence".into(),
+        },
+        TaskEvent::OperationIntentRecorded {
+            operation_id: operation_id(),
+            epoch_id: epoch_id(),
+            item_id: "operation".into(),
+            effect_class: EffectClass::IdempotentMutation,
+            request_digest: "sha256:request".into(),
+        },
+        TaskEvent::OperationTransitioned {
+            operation_id: operation_id(),
+            from: OperationStatus::IntentRecorded,
+            to: OperationStatus::Started,
+            evidence_sequences: vec![4],
+        },
+    ])
+    .unwrap();
+    let unrelated = apply(
+        Some(started.clone()),
+        6,
+        TaskEvent::ProgressAssessed {
+            fingerprint: "not-operation-evidence".into(),
+            stalled: false,
+        },
+    );
+    let error = reduce_task(
+        Some(unrelated),
+        &envelope(
+            7,
+            task_id(),
+            TaskEvent::OperationTransitioned {
+                operation_id: operation_id(),
+                from: OperationStatus::Started,
+                to: OperationStatus::Succeeded,
+                evidence_sequences: vec![6],
+            },
+        ),
+    )
+    .unwrap_err();
+    assert_eq!(error.code(), TaskReduceErrorCode::InvalidOperationEvidence);
+
+    let bound = apply(
+        Some(started.clone()),
+        6,
+        TaskEvent::OperationEvidenceRecorded {
+            operation_id: operation_id(),
+            result_digest: "sha256:bound".into(),
+        },
+    );
+    let duplicate = reduce_task(
+        Some(bound),
+        &envelope(
+            7,
+            task_id(),
+            TaskEvent::OperationTransitioned {
+                operation_id: operation_id(),
+                from: OperationStatus::Started,
+                to: OperationStatus::Succeeded,
+                evidence_sequences: vec![6, 6],
+            },
+        ),
+    )
+    .unwrap_err();
+    assert_eq!(duplicate.code(), TaskReduceErrorCode::InvalidEventMetadata);
+
+    let other_operation = OperationId::new();
+    let other_intent = apply(
+        Some(started.clone()),
+        6,
+        TaskEvent::OperationIntentRecorded {
+            operation_id: other_operation,
+            epoch_id: epoch_id(),
+            item_id: "other-operation".into(),
+            effect_class: EffectClass::Observation,
+            request_digest: "sha256:other".into(),
+        },
+    );
+    let other_started = apply(
+        Some(other_intent),
+        7,
+        TaskEvent::OperationTransitioned {
+            operation_id: other_operation,
+            from: OperationStatus::IntentRecorded,
+            to: OperationStatus::Started,
+            evidence_sequences: vec![6],
+        },
+    );
+    let other_evidence = apply(
+        Some(other_started),
+        8,
+        TaskEvent::OperationEvidenceRecorded {
+            operation_id: other_operation,
+            result_digest: "sha256:other-result".into(),
+        },
+    );
+    let error = reduce_task(
+        Some(other_evidence),
+        &envelope(
+            9,
+            task_id(),
+            TaskEvent::OperationTransitioned {
+                operation_id: operation_id(),
+                from: OperationStatus::Started,
+                to: OperationStatus::Succeeded,
+                evidence_sequences: vec![8],
+            },
+        ),
+    )
+    .unwrap_err();
+    assert_eq!(error.code(), TaskReduceErrorCode::InvalidOperationEvidence);
+
+    let uncertain_evidence = apply(
+        Some(started),
+        6,
+        TaskEvent::OperationEvidenceRecorded {
+            operation_id: operation_id(),
+            result_digest: "sha256:uncertain".into(),
+        },
+    );
+    let uncertain = apply(
+        Some(uncertain_evidence),
+        7,
+        TaskEvent::OperationTransitioned {
+            operation_id: operation_id(),
+            from: OperationStatus::Started,
+            to: OperationStatus::Uncertain,
+            evidence_sequences: vec![6],
+        },
+    );
+    let fresh_evidence = apply(
+        Some(uncertain),
+        8,
+        TaskEvent::OperationEvidenceRecorded {
+            operation_id: operation_id(),
+            result_digest: "sha256:reconciled".into(),
+        },
+    );
+    let error = reduce_task(
+        Some(fresh_evidence),
+        &envelope(
+            9,
+            task_id(),
+            TaskEvent::OperationTransitioned {
+                operation_id: operation_id(),
+                from: OperationStatus::Uncertain,
+                to: OperationStatus::Reconciled,
+                evidence_sequences: vec![6, 8],
+            },
+        ),
+    )
+    .unwrap_err();
+    assert_eq!(error.code(), TaskReduceErrorCode::InvalidOperationEvidence);
 }
 
 #[test]
@@ -997,11 +1222,11 @@ fn generated_prefix_replay_matches_incremental_reduction_or_error_code() {
                 operation_id: operation_id(),
                 from: OperationStatus::IntentRecorded,
                 to: OperationStatus::Started,
-                evidence_sequences: vec![5, 6],
+                evidence_sequences: vec![5],
             },
-            TaskEvent::ProgressAssessed {
-                fingerprint: "operation-result".into(),
-                stalled: false,
+            TaskEvent::OperationEvidenceRecorded {
+                operation_id: operation_id(),
+                result_digest: "sha256:operation-result".into(),
             },
             TaskEvent::OperationTransitioned {
                 operation_id: operation_id(),
@@ -1072,11 +1297,11 @@ fn generated_prefix_replay_matches_incremental_reduction_or_error_code() {
             operation_id: operation_id(),
             from: OperationStatus::IntentRecorded,
             to: OperationStatus::Started,
-            evidence_sequences: vec![4, 5],
+            evidence_sequences: vec![4],
         },
-        TaskEvent::ProgressAssessed {
-            fingerprint: "uncertain-result".into(),
-            stalled: false,
+        TaskEvent::OperationEvidenceRecorded {
+            operation_id: operation_id(),
+            result_digest: "sha256:uncertain-result".into(),
         },
         TaskEvent::OperationTransitioned {
             operation_id: operation_id(),
@@ -1084,9 +1309,9 @@ fn generated_prefix_replay_matches_incremental_reduction_or_error_code() {
             to: OperationStatus::Uncertain,
             evidence_sequences: vec![6],
         },
-        TaskEvent::ProgressAssessed {
-            fingerprint: "reconciliation-result".into(),
-            stalled: false,
+        TaskEvent::OperationEvidenceRecorded {
+            operation_id: operation_id(),
+            result_digest: "sha256:reconciliation-result".into(),
         },
         TaskEvent::OperationTransitioned {
             operation_id: operation_id(),
@@ -1147,7 +1372,7 @@ fn generated_prefix_replay_matches_incremental_reduction_or_error_code() {
             operation_id: operation_id(),
             from: OperationStatus::IntentRecorded,
             to: OperationStatus::Started,
-            evidence_sequences: vec![4, 5],
+            evidence_sequences: vec![4],
         },
         TaskEvent::OperationTransitioned {
             operation_id: operation_id(),
