@@ -1,9 +1,10 @@
 # Carl benchmark lab
 
-This directory contains the first executable layer of the Carl improvement factory. It runs the
+This directory contains the first two executable layers of the Carl improvement factory. It runs the
 same portable coding, workflow-automation, and safety tasks against disposable workspaces and emits
-only bounded, sanitized scorecards. It does **not** autonomously merge or publish changes; the
-comparison is evidence for a later promotion controller.
+only bounded, sanitized scorecards, then records private experiment facts in a replayable dry-run
+graph. It does **not** build, autonomously merge, or publish changes; comparisons and simulated
+decisions are evidence for later isolated-builder and promotion-controller phases.
 
 ## Offline validation
 
@@ -101,3 +102,19 @@ Codex home, or provider API keys.
 
 The validator performs static task validation first. If Docker is missing or unhealthy it exits
 `77`; schema, network, verifier, and image-pin checks remain covered by the normal Python suite.
+
+## Dry-run control plane
+
+The `carl-bench experiment` commands register strict manifests, append normalized events, replay
+sanitized status, evaluate budget, and emit deterministic simulated decisions. The SQLite ledger
+must be outside the public repository and owner-only. Its event stream is hash-chained; exact stage
+redelivery is idempotent, while conflicts and corruption block.
+
+Start from [the public example manifest](examples/dry-run-manifest.json), but copy it into the
+private control directory and replace every example value. The full operator sequence and event
+boundary are in [the benchmark operator guide](../docs/benchmarks.md#dry-run-experiment-graph).
+
+This is deliberately not the recursive mutation loop yet. It has no builder adapter, protected
+holdout input, GitHub credential, PR operation, merge operation, or rollback operation. A future
+Codex director can call this interface every two hours in proposal-only mode after this branch is
+integrated; candidate generation remains gated on phase three.

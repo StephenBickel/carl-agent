@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
+
+from carl_bench.experiment import ExperimentManifest
 
 REPOSITORY_ROOT = Path(__file__).parents[2]
 WORKFLOW = REPOSITORY_ROOT / ".github" / "workflows" / "benchmark-contracts.yml"
 OPERATOR_DOCS = REPOSITORY_ROOT / "docs" / "benchmarks.md"
+EXAMPLE_MANIFEST = REPOSITORY_ROOT / "benchmarks" / "examples" / "dry-run-manifest.json"
 
 
 def test_benchmark_workflow_is_pinned_locked_offline_and_credential_free() -> None:
@@ -48,6 +52,11 @@ def test_operator_documentation_links_resolve_and_describes_manual_only_boundary
         assert (OPERATOR_DOCS.parent / link).resolve().exists(), link
     assert "advisory" in normalized
     assert "promotion controller is not implemented" in normalized
+    assert "dry-run experiment graph" in normalized
+    assert "hash-chained sqlite ledger" in normalized
+    assert "every two hours" in normalized
+    assert "manual and read-only" in normalized
+    assert "does not build carl or open, merge, or revert pull requests" in normalized
     assert "USD 25" in source
     assert "USD 150" in source
     assert "three" in normalized and "ten" in normalized
@@ -58,4 +67,12 @@ def test_root_readme_links_the_lab_without_claiming_autonomous_promotion() -> No
     assert "[benchmark lab](docs/benchmarks.md)" in source
     assert "[improvement-factory design](" in source
     section = source.split("## Benchmark lab", 1)[1].split("\n## ", 1)[0]
-    assert "does not autonomously" in section
+    assert "do not build, autonomously promote, or merge" in section
+    assert "append-only dry-run experiment graph" in section
+
+
+def test_public_dry_run_manifest_example_satisfies_the_strict_contract() -> None:
+    value = json.loads(EXAMPLE_MANIFEST.read_text(encoding="utf-8"))
+    parsed = ExperimentManifest.from_canonical_dict(value)
+    assert parsed.experiment_id == "exp-example-restart-recovery"
+    assert len(parsed.digest) == 64

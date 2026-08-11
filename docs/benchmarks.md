@@ -1,10 +1,11 @@
 # Operating the Carl benchmark lab
 
-The benchmark lab is the first executable part of the approved
+The benchmark lab and dry-run experiment graph are the first executable parts of the approved
 [improvement-factory design](superpowers/specs/2026-08-10-codex-carl-improvement-factory-design.md).
-It gives Codex a reproducible way to test Carl and other harnesses on coding,
-workflow-automation, and safety tasks. The current comparison output is advisory: the promotion
-controller is not implemented, and this lab does not open, merge, or revert pull requests.
+They give Codex a reproducible way to test Carl and other harnesses on coding,
+workflow-automation, and safety tasks, preregister hypotheses, replay normalized decisions, and
+account for budgets. The current comparison output is advisory: the promotion controller is not
+implemented, and this control plane does not build Carl or open, merge, or revert pull requests.
 
 The command reference and isolation details live in the
 [benchmark package guide](../benchmarks/README.md). This page defines the operator loop that Codex
@@ -104,6 +105,63 @@ Run it only with a healthy local container daemon:
 Exit `77` means Docker was unavailable after static validation; it is not a successful live Harbor
 run.
 
+## Dry-run experiment graph
+
+The phase-two graph is an owner-private control plane outside the Carl repository. Its immutable
+manifest fixes the hypothesis, allowed and forbidden source surfaces, affected tasks, primary and
+guard metrics, versions, paired-replica bounds, budget, risk, and rollback contract before a build.
+It also binds its UTC preregistration time and optional parent experiment, so a revised hypothesis
+becomes a traceable child rather than a rewrite of prior evidence.
+Every normalized fact is appended to a SHA-256 hash-chained SQLite ledger. Reopening the ledger
+revalidates the manifest, every event digest, every chain link, every state edge, and every stage
+attempt before reconstructing the projection.
+
+Copy the public [dry-run manifest example](../benchmarks/examples/dry-run-manifest.json) to an
+owner-private directory and replace every example identity and version with actual pinned values.
+The ledger path must also be outside the repository and must remain owner-only:
+
+```bash
+CONTROL_ROOT="/absolute/private/path/to/carl-improvement-control"
+
+uv run --offline --project benchmarks --locked carl-bench experiment init \
+  --ledger "$CONTROL_ROOT/experiments.sqlite3" \
+  --manifest "$CONTROL_ROOT/manifest.json"
+
+uv run --offline --project benchmarks --locked carl-bench experiment record \
+  --ledger "$CONTROL_ROOT/experiments.sqlite3" \
+  --event "$CONTROL_ROOT/next-event.json"
+
+uv run --offline --project benchmarks --locked carl-bench experiment status \
+  --ledger "$CONTROL_ROOT/experiments.sqlite3" \
+  --experiment-id exp-real-id \
+  --public-result "$CONTROL_ROOT/status.json"
+
+uv run --offline --project benchmarks --locked carl-bench experiment decide \
+  --ledger "$CONTROL_ROOT/experiments.sqlite3" \
+  --experiment-id exp-real-id \
+  --public-result "$CONTROL_ROOT/decision.json"
+```
+
+An event is a strict JSON envelope with `schema_version`, `experiment_id`, unique
+`stage_attempt_id`, UTC `occurred_at`, `event_type`, and an event-specific `payload`. Supported
+facts are state transitions, review results bound to private artifact digests, mutable-stage lease
+acquisition/reconciliation/release, and integer-microdollar live spend. Exact duplicate delivery is
+a no-op; a conflicting duplicate, illegal transition, stale lease, malformed role verdict, or
+corrupt chain blocks.
+
+`experiment budget-check` evaluates a proposed live run against the experiment cap, 24-hour elapsed
+limit, USD 25 UTC-calendar-day cap, USD 150 rolling-seven-day cap, and four-worker limit without
+reserving or spending money. The supplied UTC instant cannot predate the experiment or any already
+recorded spend.
+Status and decision files expose only counts, states, stable reasons, and digests—not the hypothesis,
+role prose, artifact identities, lease owner, provider settings, or raw benchmark evidence.
+
+The intended Improvement Director cadence is one Codex automation tick every two hours. It remains
+manual and read-only with respect to Carl and GitHub in this phase: each tick may inspect scorecards,
+author a private proposal, record normalized review facts, and emit a simulated next action. Do not
+schedule candidate builds until phase three adds disposable worktrees, independent review
+execution, protected validation, and crash/rollback drills.
+
 ## Budget and proposal handoff
 
 The approved factory caps live-model work at USD 25 per calendar day and USD 150 per rolling seven
@@ -111,9 +169,10 @@ days. It permits four read-only benchmark workers, one active code candidate, fo
 replicas total, two infrastructure retries per run, and a maximum of 24 hours for an ordinary
 experiment. Deterministic local checks do not consume the dollar budget.
 
-After a paired diagnostic, write a small experiment proposal before editing Carl. Record the exact
+After a paired diagnostic, register an experiment manifest before editing Carl. Record the exact
 baseline commit, task digests, model and effort, seed range, observed failure cluster, one causal
 hypothesis, files allowed to change, primary metric, non-regression metrics, budget, and a falsifying
-prediction. Then review the proposal independently before implementation. The next planned layer is
-the durable experiment graph and review loop; it will consume these scorecards instead of weakening
-or reimplementing them.
+prediction. Then record the three independent proposal reviews. Two approvals and no hard objection
+produce only `simulated_build_eligible`; this phase has no builder authority. The next layer is
+isolated candidate generation and independent review, followed by protected validation and the
+deterministic promotion controller as a separate later gate.
