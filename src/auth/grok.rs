@@ -1220,7 +1220,7 @@ exit 64
         let mut dropped = LocalFixture::new(
             "normal",
             false,
-            Duration::from_millis(120),
+            Duration::from_secs(1),
             Duration::from_secs(5),
         )
         .await;
@@ -1302,7 +1302,7 @@ exit 64
         let mut reconciliation = LocalFixture::new(
             "normal",
             false,
-            Duration::from_millis(120),
+            Duration::from_secs(1),
             Duration::from_secs(5),
         )
         .await;
