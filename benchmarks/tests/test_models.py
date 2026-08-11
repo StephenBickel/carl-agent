@@ -143,6 +143,7 @@ def test_scorecard_rejects_invalid_pass_rates(value: float) -> None:
             schema_version=1,
             run_id="run-01",
             run_digest=RUN_DIGEST,
+            subject_commit="c" * 40,
             valid_trials=1,
             invalid_trials=0,
             passed_trials=1,
@@ -159,6 +160,7 @@ def test_run_manifest_rejects_duplicate_trial_ids() -> None:
         RunManifest(
             schema_version=1,
             run_id="run-01",
+            subject_commit="c" * 40,
             league="plumbing",
             model=None,
             effort=None,
@@ -168,12 +170,29 @@ def test_run_manifest_rejects_duplicate_trial_ids() -> None:
         )
 
 
+def test_run_manifest_public_evidence_binds_the_exact_subject_commit() -> None:
+    run = RunManifest(
+        schema_version=1,
+        run_id="run-01",
+        subject_commit="c" * 40,
+        league="plumbing",
+        model=None,
+        effort=None,
+        started_at="2026-08-10T20:00:00Z",
+        seed=7,
+        trials=(passing_trial(),),
+    )
+
+    assert run.to_public_dict()["subject_commit"] == "c" * 40
+
+
 def test_scorecard_counts_must_equal_the_included_population() -> None:
     with pytest.raises(ValueError, match="trial counts"):
         Scorecard(
             schema_version=1,
             run_id="run-01",
             run_digest=RUN_DIGEST,
+            subject_commit="c" * 40,
             valid_trials=2,
             invalid_trials=0,
             passed_trials=2,

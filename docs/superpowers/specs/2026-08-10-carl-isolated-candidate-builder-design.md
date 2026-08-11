@@ -50,19 +50,24 @@ The controller uses a prepare/edit/seal workflow.
 3. `candidate seal` reads the real Git index and filesystem, rejects special files and
    out-of-scope paths, runs trusted argv-based checks without a shell, stores bounded evidence,
    commits the candidate, and appends a candidate event to the ledger.
-4. The benchmark operator runs baseline and candidate through the existing benchmark lab.
-   `candidate bind-comparison` recomputes the public comparison, checks exact commit bindings,
-   stores the evidence, and appends one paired-evaluation event.
+4. The benchmark operator runs baseline and candidate through the existing benchmark lab. Each
+   scorecard carries the exact subject commit inside its run digest. `candidate bind-comparison`
+   recomputes the public comparison, requires the baseline subject to equal the manifest parent
+   and the candidate subject to equal the sealed commit, stores the evidence, and appends one
+   paired-evaluation event.
 5. `candidate review-packet` emits one immutable, role-specific packet per reviewer. A reviewer
    works read-only and returns a strict attestation bound to the packet and candidate commit.
    Reviewer identities and context IDs must be unique across the four roles.
 6. `candidate record-review` stores the bounded private report and appends a normalized review
    event. Three approvals and no hard finding are required.
-7. `candidate open-draft-pr` replays the ledger, verifies the local branch still resolves to the
+7. `candidate open-draft-pr` first appends a durable authorization bound to the active lease,
+   repository, effective remote URL, base, branch, and sealed commit. It then replays the ledger,
+   revalidates both fetch and push destinations, verifies the local branch still resolves to the
    sealed commit, pushes that exact ref, and invokes a narrow GitHub gateway that can only inspect
    or create a draft PR. It records the PR identity only after reconciliation confirms the head
-   commit and draft state. The experiment remains in `paired_evaluation`; a draft is a review
-   surface, not evidence that protected validation happened.
+   commit and draft state. A crash between authorization, publication, and recording resumes by
+   reconciling the same immutable request. The experiment remains in `paired_evaluation`; a draft
+   is a review surface, not evidence that protected validation happened.
 
 The graph remains the authority. Chat text, process exit success, a Git branch, and a GitHub PR
 are observations until normalized evidence is appended to the hash-chained ledger.
@@ -84,7 +89,8 @@ and public eligibility decisions. Every contract has exact keys, bounded fields,
 and a stable digest.
 
 The experiment reducer gains normalized events for workspace preparation, candidate sealing,
-deterministic evidence, paired evidence, review packets/attestations, and draft PR publication.
+deterministic evidence, paired evidence, review packets/attestations, draft PR authorization, and
+draft PR publication. Mutable events carry the exact active lease owner and acquisition attempt.
 State transitions fail closed unless their required evidence is present:
 
 - leaving `building` requires a sealed candidate at the manifest parent;

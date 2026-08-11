@@ -26,6 +26,7 @@ from carl_bench.canonical import CanonicalizationError, canonical_json_bytes
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
 _COMMIT_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 _DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+_REPOSITORY_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
 
 class GraphContractError(ValueError):
@@ -130,6 +131,7 @@ class EventType(str, Enum):
     PAIRED_EVIDENCE_RECORDED = "paired_evidence_recorded"
     REVIEW_PACKET_RECORDED = "review_packet_recorded"
     REVIEW_ATTESTED = "review_attested"
+    DRAFT_PR_REQUESTED = "draft_pr_requested"
     DRAFT_PR_RECORDED = "draft_pr_recorded"
     WORKSPACE_DISPOSED = "workspace_disposed"
 
@@ -626,6 +628,7 @@ class ExperimentProjection:
     review_packets: tuple[ReviewPacket, ...]
     candidate_attestations: tuple[ReviewAttestation, ...]
     draft_pull_request: DraftPullRequest | None
+    draft_pull_request_request: dict[str, str] | None = None
     workspace_disposed: bool = False
 
     @property
@@ -687,6 +690,7 @@ class ExperimentProjection:
                 if self.draft_pull_request is not None
                 else None
             ),
+            "draft_pull_request_request": self.draft_pull_request_request,
             "review_packets": [packet.to_canonical_dict() for packet in self.review_packets],
             "state": self.state.value,
             "workspace_disposed": self.workspace_disposed,
@@ -735,7 +739,7 @@ _LEASE_REQUIRED_TARGETS = _MUTABLE_STATES | {ExperimentState.ACCEPTED}
 
 
 def _state_payload(event: ExperimentEvent) -> tuple[ExperimentState, ExperimentState]:
-    payload = event.payload
+    payload = _operation_payload(event)
     if set(payload) != {"from_state", "to_state"}:
         raise GraphContractError("invalid_transition_payload")
     try:
@@ -745,7 +749,7 @@ def _state_payload(event: ExperimentEvent) -> tuple[ExperimentState, ExperimentS
 
 
 def _review_payload(event: ExperimentEvent) -> ReviewOutput:
-    payload = event.payload
+    payload = _operation_payload(event)
     if set(payload) != {"artifact_digest", "role", "verdict"}:
         raise GraphContractError("invalid_review_payload")
     try:
@@ -777,9 +781,22 @@ def _candidate_quorum(reviews: tuple[ReviewOutput, ...]) -> tuple[bool, tuple[st
     return not reasons, tuple(reasons)
 
 
-def _require_live_lease(lease: MutableStageLease | None, occurred_at: str) -> None:
-    if lease is None or _parse_utc(occurred_at) > _parse_utc(lease.expires_at):
+def _operation_payload(event: ExperimentEvent) -> dict[str, Any]:
+    return {key: value for key, value in event.payload.items() if key != "_lease"}
+
+
+def _require_live_lease(lease: MutableStageLease | None, event: ExperimentEvent) -> dict[str, Any]:
+    if lease is None or _parse_utc(event.occurred_at) > _parse_utc(lease.expires_at):
         raise GraphContractError("mutable_lease_required")
+    authorization = event.payload.get("_lease")
+    if (
+        not isinstance(authorization, dict)
+        or set(authorization) != {"owner_id", "stage_attempt_id"}
+        or authorization["owner_id"] != lease.owner_id
+        or authorization["stage_attempt_id"] != lease.stage_attempt_id
+    ):
+        raise GraphContractError("lease_capability_invalid")
+    return _operation_payload(event)
 
 
 def _projection(
@@ -798,6 +815,7 @@ def _projection(
     review_packets: dict[str, ReviewPacket],
     candidate_attestations: dict[str, ReviewAttestation],
     draft_pull_request: DraftPullRequest | None,
+    draft_pull_request_request: dict[str, str] | None,
     workspace_disposed: bool,
 ) -> ExperimentProjection:
     return ExperimentProjection(
@@ -823,6 +841,7 @@ def _projection(
             candidate_attestations[role] for role in sorted(candidate_attestations)
         ),
         draft_pull_request=draft_pull_request,
+        draft_pull_request_request=draft_pull_request_request,
         workspace_disposed=workspace_disposed,
     )
 
@@ -845,6 +864,7 @@ def reduce_events(
     review_packets: dict[str, ReviewPacket] = {}
     candidate_attestations: dict[str, ReviewAttestation] = {}
     draft_pull_request: DraftPullRequest | None = None
+    draft_pull_request_request: dict[str, str] | None = None
     workspace_disposed = False
     for event in events:
         if event.experiment_id != manifest.experiment_id:
@@ -865,10 +885,8 @@ def reduce_events(
                 approved, _ = _proposal_quorum(tuple(proposal_reviews.values()))
                 if not approved:
                     raise GraphContractError("proposal_quorum_unsatisfied")
-            if target in _LEASE_REQUIRED_TARGETS and (
-                lease is None or _parse_utc(event.occurred_at) > _parse_utc(lease.expires_at)
-            ):
-                raise GraphContractError("mutable_lease_required")
+            if target in _LEASE_REQUIRED_TARGETS:
+                _require_live_lease(lease, event)
             if target is ExperimentState.REVIEW_COMPLETE:
                 approved, _ = _candidate_quorum(tuple(candidate_reviews.values()))
                 if not approved:
@@ -895,6 +913,7 @@ def reduce_events(
             else:
                 if state is not ExperimentState.HOLDOUT_VALIDATION:
                     raise GraphContractError("candidate_review_wrong_state")
+                _require_live_lease(lease, event)
                 if review.role in candidate_reviews:
                     raise GraphContractError("duplicate_review_role")
                 candidate_reviews[review.role] = review
@@ -965,11 +984,11 @@ def reduce_events(
         elif event.event_type is EventType.WORKSPACE_PREPARED:
             if state is not ExperimentState.BUILDING:
                 raise GraphContractError("candidate_prepare_wrong_state")
-            _require_live_lease(lease, event.occurred_at)
+            payload = _require_live_lease(lease, event)
             if prepared_candidate is not None:
                 raise GraphContractError("candidate_already_prepared")
             try:
-                prepared = PreparedCandidate.from_canonical_dict(event.payload)
+                prepared = PreparedCandidate.from_canonical_dict(payload)
             except CandidateContractError as error:
                 raise GraphContractError("invalid_prepared_candidate_payload") from error
             if (
@@ -982,13 +1001,13 @@ def reduce_events(
         elif event.event_type is EventType.CANDIDATE_SEALED:
             if state is not ExperimentState.BUILDING:
                 raise GraphContractError("candidate_seal_wrong_state")
-            _require_live_lease(lease, event.occurred_at)
+            payload = _require_live_lease(lease, event)
             if prepared_candidate is None:
                 raise GraphContractError("prepared_candidate_required")
             if candidate is not None:
                 raise GraphContractError("candidate_already_sealed")
             try:
-                sealed = SealedCandidate.from_canonical_dict(event.payload)
+                sealed = SealedCandidate.from_canonical_dict(payload)
             except CandidateContractError as error:
                 raise GraphContractError("invalid_sealed_candidate_payload") from error
             if (
@@ -1005,13 +1024,13 @@ def reduce_events(
         elif event.event_type is EventType.PAIRED_EVIDENCE_RECORDED:
             if state is not ExperimentState.PAIRED_EVALUATION:
                 raise GraphContractError("paired_evidence_wrong_state")
-            _require_live_lease(lease, event.occurred_at)
+            payload = _require_live_lease(lease, event)
             if candidate is None:
                 raise GraphContractError("sealed_candidate_required")
             if paired_evidence is not None:
                 raise GraphContractError("paired_evidence_already_recorded")
             try:
-                evidence = PairedEvidence.from_canonical_dict(event.payload)
+                evidence = PairedEvidence.from_canonical_dict(payload)
             except CandidateContractError as error:
                 raise GraphContractError("invalid_paired_evidence_payload") from error
             if (
@@ -1025,13 +1044,13 @@ def reduce_events(
         elif event.event_type is EventType.REVIEW_PACKET_RECORDED:
             if state is not ExperimentState.PAIRED_EVALUATION:
                 raise GraphContractError("review_packet_wrong_state")
-            _require_live_lease(lease, event.occurred_at)
+            payload = _require_live_lease(lease, event)
             if candidate is None or paired_evidence is None:
                 raise GraphContractError("paired_evidence_required")
             if paired_evidence.decision != "improvement":
                 raise GraphContractError("paired_improvement_required")
             try:
-                packet = ReviewPacket.from_canonical_dict(event.payload)
+                packet = ReviewPacket.from_canonical_dict(payload)
             except CandidateContractError as error:
                 raise GraphContractError("invalid_review_packet_payload") from error
             if packet.role in review_packets:
@@ -1049,9 +1068,9 @@ def reduce_events(
         elif event.event_type is EventType.REVIEW_ATTESTED:
             if state is not ExperimentState.PAIRED_EVALUATION:
                 raise GraphContractError("review_attestation_wrong_state")
-            _require_live_lease(lease, event.occurred_at)
+            payload = _require_live_lease(lease, event)
             try:
-                raw_role = event.payload.get("role")
+                raw_role = payload.get("role")
             except AttributeError as error:
                 raise GraphContractError("invalid_review_attestation_payload") from error
             packet = review_packets.get(raw_role)
@@ -1060,7 +1079,7 @@ def reduce_events(
             if raw_role in candidate_attestations:
                 raise GraphContractError("duplicate_review_attestation_role")
             try:
-                attestation = ReviewAttestation.from_packet_dict(event.payload, packet)
+                attestation = ReviewAttestation.from_packet_dict(payload, packet)
             except CandidateContractError as error:
                 raise GraphContractError("invalid_review_attestation_payload") from error
             if any(
@@ -1074,12 +1093,52 @@ def reduce_events(
             ):
                 raise GraphContractError("review_context_reused")
             candidate_attestations[attestation.role] = attestation
+        elif event.event_type is EventType.DRAFT_PR_REQUESTED:
+            if state is not ExperimentState.PAIRED_EVALUATION:
+                raise GraphContractError("draft_pr_wrong_state")
+            payload = _require_live_lease(lease, event)
+            if candidate is None or paired_evidence is None:
+                raise GraphContractError("paired_evidence_required")
+            if draft_pull_request_request is not None:
+                raise GraphContractError("draft_pr_authorization_already_recorded")
+            attestations = tuple(candidate_attestations.values())
+            if (
+                len(attestations) != len(_CANDIDATE_ROLES)
+                or set(candidate_attestations) != {role.value for role in _CANDIDATE_ROLES}
+                or sum(review.verdict == "approve" for review in attestations) < 3
+                or any(review.verdict == "hard_finding" for review in attestations)
+            ):
+                raise GraphContractError("candidate_attestation_quorum_unsatisfied")
+            expected = {
+                "base_branch",
+                "candidate_commit",
+                "expected_remote_url",
+                "head_branch",
+                "repository",
+            }
+            if (
+                set(payload) != expected
+                or not isinstance(payload["repository"], str)
+                or not _REPOSITORY_RE.fullmatch(payload["repository"])
+                or not isinstance(payload["base_branch"], str)
+                or not _ID_RE.fullmatch(payload["base_branch"])
+                or payload["head_branch"] != candidate.branch
+                or payload["candidate_commit"] != candidate.candidate_commit
+                or not isinstance(payload["expected_remote_url"], str)
+                or not payload["expected_remote_url"]
+                or "\x00" in payload["expected_remote_url"]
+                or len(payload["expected_remote_url"].encode("utf-8")) > 4_096
+            ):
+                raise GraphContractError("invalid_draft_pr_authorization")
+            draft_pull_request_request = dict(payload)
         elif event.event_type is EventType.DRAFT_PR_RECORDED:
             if state is not ExperimentState.PAIRED_EVALUATION:
                 raise GraphContractError("draft_pr_wrong_state")
-            _require_live_lease(lease, event.occurred_at)
+            payload = _operation_payload(event)
             if candidate is None or paired_evidence is None:
                 raise GraphContractError("paired_evidence_required")
+            if draft_pull_request_request is None:
+                raise GraphContractError("draft_pr_authorization_required")
             if draft_pull_request is not None:
                 raise GraphContractError("draft_pr_already_recorded")
             attestations = tuple(candidate_attestations.values())
@@ -1091,27 +1150,34 @@ def reduce_events(
             ):
                 raise GraphContractError("candidate_attestation_quorum_unsatisfied")
             try:
-                draft = DraftPullRequest.from_candidate_dict(event.payload, candidate)
+                draft = DraftPullRequest.from_candidate_dict(payload, candidate)
             except CandidateContractError as error:
                 raise GraphContractError("invalid_draft_pr_payload") from error
+            if (
+                draft.repository != draft_pull_request_request["repository"]
+                or draft.base_branch != draft_pull_request_request["base_branch"]
+                or draft.head_branch != draft_pull_request_request["head_branch"]
+                or draft.candidate_commit != draft_pull_request_request["candidate_commit"]
+            ):
+                raise GraphContractError("draft_pr_authorization_mismatch")
             draft_pull_request = draft
         elif event.event_type is EventType.WORKSPACE_DISPOSED:
             if state is not ExperimentState.PAIRED_EVALUATION:
                 raise GraphContractError("workspace_dispose_wrong_state")
-            _require_live_lease(lease, event.occurred_at)
+            payload = _require_live_lease(lease, event)
             if prepared_candidate is None or candidate is None or draft_pull_request is None:
                 raise GraphContractError("draft_pr_required")
             if workspace_disposed:
                 raise GraphContractError("workspace_already_disposed")
-            if not isinstance(event.payload, dict) or set(event.payload) != {
+            if set(payload) != {
                 "branch",
                 "candidate_commit",
             }:
                 raise GraphContractError("invalid_workspace_disposed_payload")
             if (
-                event.payload["branch"] != prepared_candidate.branch
-                or event.payload["branch"] != candidate.branch
-                or event.payload["candidate_commit"] != candidate.candidate_commit
+                payload["branch"] != prepared_candidate.branch
+                or payload["branch"] != candidate.branch
+                or payload["candidate_commit"] != candidate.candidate_commit
             ):
                 raise GraphContractError("workspace_disposed_candidate_mismatch")
             workspace_disposed = True
@@ -1135,6 +1201,7 @@ def reduce_events(
         review_packets=review_packets,
         candidate_attestations=candidate_attestations,
         draft_pull_request=draft_pull_request,
+        draft_pull_request_request=draft_pull_request_request,
         workspace_disposed=workspace_disposed,
     )
 

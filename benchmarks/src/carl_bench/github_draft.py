@@ -215,15 +215,14 @@ class DraftPrGateway:
         self.repository_root = repository
         self.repository_slug = repository_slug
         self.remote = remote
+        self.expected_remote_url = expected_remote_url
         self.base_branch = base_branch
         self.gh_executable = executable
         self.private_root = root
         self._hooks_root = hooks_root
         self._git_environment = git_environment
         self._github_environment = github_environment
-        remote_url = self._git("remote", "get-url", remote).decode("utf-8").strip()
-        if remote_url != expected_remote_url:
-            raise DraftPrGatewayError("candidate_remote_mismatch")
+        self._verify_remote_destination()
 
     def _git(self, *args: str) -> bytes:
         return _run_bounded(
@@ -249,6 +248,21 @@ class DraftPrGateway:
             environment=self._github_environment,
             failure_code="github_cli_failed",
         )
+
+    def _verify_remote_destination(self) -> None:
+        try:
+            fetch_urls = (
+                self._git("remote", "get-url", "--all", self.remote).decode("utf-8").splitlines()
+            )
+            push_urls = (
+                self._git("remote", "get-url", "--push", "--all", self.remote)
+                .decode("utf-8")
+                .splitlines()
+            )
+        except UnicodeError as error:
+            raise DraftPrGatewayError("candidate_remote_mismatch") from error
+        if fetch_urls != [self.expected_remote_url] or push_urls != [self.expected_remote_url]:
+            raise DraftPrGatewayError("candidate_remote_mismatch")
 
     def _inspect(self, head_branch: str) -> list[dict[str, Any]]:
         output = self._gh(
@@ -316,8 +330,9 @@ class DraftPrGateway:
         except CandidateContractError as error:
             raise DraftPrGatewayError(error.code) from error
 
-    @staticmethod
-    def _verify_projection(manifest: ExperimentManifest, projection: ExperimentProjection) -> None:
+    def _verify_projection(
+        self, manifest: ExperimentManifest, projection: ExperimentProjection
+    ) -> None:
         if (
             not isinstance(manifest, ExperimentManifest)
             or not isinstance(projection, ExperimentProjection)
@@ -331,6 +346,17 @@ class DraftPrGateway:
             raise DraftPrGatewayError("paired_evidence_required")
         if projection.paired_evidence.decision != "improvement":
             raise DraftPrGatewayError("paired_improvement_required")
+        request = projection.draft_pull_request_request
+        if request is None:
+            raise DraftPrGatewayError("draft_pr_authorization_required")
+        if request != {
+            "base_branch": self.base_branch,
+            "candidate_commit": projection.candidate.candidate_commit,
+            "expected_remote_url": self.expected_remote_url,
+            "head_branch": projection.candidate.branch,
+            "repository": self.repository_slug,
+        }:
+            raise DraftPrGatewayError("draft_pr_authorization_mismatch")
         roles = {review.role for review in projection.candidate_attestations}
         if (
             len(projection.review_packets) != 4
@@ -371,7 +397,15 @@ class DraftPrGateway:
                 or projection.draft_pull_request.head_branch != candidate.branch
             ):
                 raise DraftPrGatewayError("recorded_pull_request_mismatch")
-            return projection.draft_pull_request
+            live = self._inspect(candidate.branch)
+            if not live:
+                raise DraftPrGatewayError("pull_request_reconciliation_missing")
+            reconciled = self._reconciled_draft(
+                live[0], candidate.candidate_commit, candidate.branch
+            )
+            if reconciled != projection.draft_pull_request:
+                raise DraftPrGatewayError("recorded_pull_request_mismatch")
+            return reconciled
         local = (
             self._git("rev-parse", "--verify", f"refs/heads/{candidate.branch}^{{commit}}")
             .decode("utf-8")
@@ -382,11 +416,12 @@ class DraftPrGateway:
         existing = self._inspect(candidate.branch)
         if existing:
             return self._reconciled_draft(existing[0], candidate.candidate_commit, candidate.branch)
+        self._verify_remote_destination()
         self._git(
             "push",
             "--no-verify",
             "--porcelain",
-            self.remote,
+            self.expected_remote_url,
             f"{candidate.candidate_commit}:refs/heads/{candidate.branch}",
         )
         descriptor, body_name = tempfile.mkstemp(prefix="draft-body-", dir=self.private_root)

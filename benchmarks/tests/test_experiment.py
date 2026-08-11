@@ -80,25 +80,58 @@ def transition(
     source: ExperimentState,
     target: ExperimentState,
     second: int,
+    lease_owner_id: str = "director-phase3",
+    lease_stage_attempt_id: str = "lease-phase3",
 ) -> ExperimentEvent:
+    payload: dict[str, object] = {"from_state": source.value, "to_state": target.value}
+    if target in {
+        ExperimentState.BUILDING,
+        ExperimentState.DETERMINISTIC_VALIDATION,
+        ExperimentState.PAIRED_EVALUATION,
+        ExperimentState.HOLDOUT_VALIDATION,
+        ExperimentState.REVIEW_COMPLETE,
+        ExperimentState.PR_OPEN,
+        ExperimentState.MERGED,
+        ExperimentState.SOAKING,
+        ExperimentState.ACCEPTED,
+    }:
+        payload["_lease"] = {
+            "owner_id": lease_owner_id,
+            "stage_attempt_id": lease_stage_attempt_id,
+        }
     return ExperimentEvent.create(
         experiment_id="exp-context-recovery-001",
         stage_attempt_id=attempt,
         event_type=EventType.STATE_TRANSITIONED,
         occurred_at=f"2026-08-10T12:00:{second:02d}Z",
-        payload={"from_state": source.value, "to_state": target.value},
+        payload=payload,
     )
 
 
 def role_event(
     *, attempt: str, role: ReviewRole, verdict: ReviewVerdict, second: int
 ) -> ExperimentEvent:
+    payload: dict[str, object] = {
+        "artifact_digest": "b" * 64,
+        "role": role.value,
+        "verdict": verdict.value,
+    }
+    if role in {
+        ReviewRole.CORRECTNESS,
+        ReviewRole.SECURITY,
+        ReviewRole.MAINTAINABILITY,
+        ReviewRole.BENCHMARK_INTEGRITY,
+    }:
+        payload["_lease"] = {
+            "owner_id": "director-1",
+            "stage_attempt_id": "lease-build-1",
+        }
     return ExperimentEvent.create(
         experiment_id="exp-context-recovery-001",
         stage_attempt_id=attempt,
         event_type=EventType.ROLE_RECORDED,
         occurred_at=f"2026-08-10T12:00:{second:02d}Z",
-        payload={"artifact_digest": "b" * 64, "role": role.value, "verdict": verdict.value},
+        payload=payload,
     )
 
 
@@ -228,6 +261,10 @@ def phase3_build_events() -> tuple[ExperimentEvent, ...]:
 def candidate_event(
     *, attempt: str, event_type: EventType, second: int, payload: dict[str, object]
 ) -> ExperimentEvent:
+    payload = {
+        **payload,
+        "_lease": {"owner_id": "director-phase3", "stage_attempt_id": "lease-phase3"},
+    }
     return ExperimentEvent.create(
         experiment_id=manifest().experiment_id,
         stage_attempt_id=attempt,
@@ -235,6 +272,35 @@ def candidate_event(
         occurred_at=f"2026-08-10T12:01:{second:02d}Z",
         payload=payload,
     )
+
+
+@pytest.mark.parametrize(
+    "authorization",
+    [
+        None,
+        {"owner_id": "director-other", "stage_attempt_id": "lease-phase3"},
+        {"owner_id": "director-phase3", "stage_attempt_id": "lease-other"},
+    ],
+)
+def test_mutable_transition_requires_the_active_lease_authorization(
+    authorization: dict[str, str] | None,
+) -> None:
+    payload: dict[str, object] = {
+        "from_state": ExperimentState.PROPOSAL_REVIEW.value,
+        "to_state": ExperimentState.BUILDING.value,
+    }
+    if authorization is not None:
+        payload["_lease"] = authorization
+    build = ExperimentEvent.create(
+        experiment_id=manifest().experiment_id,
+        stage_attempt_id="stage-build-wrong-owner",
+        event_type=EventType.STATE_TRANSITIONED,
+        occurred_at="2026-08-10T12:00:07Z",
+        payload=payload,
+    )
+
+    with pytest.raises(GraphContractError, match="lease_capability_invalid"):
+        reduce_events(manifest(), (*phase3_build_events()[:-1], build))
 
 
 def test_manifest_is_canonical_immutable_and_change_sensitive() -> None:
@@ -419,6 +485,8 @@ def test_build_transition_requires_proposal_quorum_and_an_active_lease() -> None
         source=ExperimentState.PROPOSAL_REVIEW,
         target=ExperimentState.BUILDING,
         second=8,
+        lease_owner_id="director-1",
+        lease_stage_attempt_id="lease-build-1",
     )
     with pytest.raises(GraphContractError, match="proposal_quorum_unsatisfied"):
         reduce_events(manifest(), (*events, build))
@@ -511,24 +579,32 @@ def test_candidate_review_quorum_requires_three_approvals_and_no_hard_finding() 
             source=ExperimentState.PROPOSAL_REVIEW,
             target=ExperimentState.BUILDING,
             second=7,
+            lease_owner_id="director-1",
+            lease_stage_attempt_id="lease-build-1",
         ),
         transition(
             attempt="stage-deterministic-1",
             source=ExperimentState.BUILDING,
             target=ExperimentState.DETERMINISTIC_VALIDATION,
             second=8,
+            lease_owner_id="director-1",
+            lease_stage_attempt_id="lease-build-1",
         ),
         transition(
             attempt="stage-paired-1",
             source=ExperimentState.DETERMINISTIC_VALIDATION,
             target=ExperimentState.PAIRED_EVALUATION,
             second=9,
+            lease_owner_id="director-1",
+            lease_stage_attempt_id="lease-build-1",
         ),
         transition(
             attempt="stage-holdout-1",
             source=ExperimentState.PAIRED_EVALUATION,
             target=ExperimentState.HOLDOUT_VALIDATION,
             second=10,
+            lease_owner_id="director-1",
+            lease_stage_attempt_id="lease-build-1",
         ),
     )
     reviews = (
@@ -556,6 +632,8 @@ def test_candidate_review_quorum_requires_three_approvals_and_no_hard_finding() 
         source=ExperimentState.HOLDOUT_VALIDATION,
         target=ExperimentState.REVIEW_COMPLETE,
         second=14,
+        lease_owner_id="director-1",
+        lease_stage_attempt_id="lease-build-1",
     )
     projection = reduce_events(manifest(), (*proposal, *reviews, review_complete))
     assert projection.state is ExperimentState.REVIEW_COMPLETE
@@ -625,12 +703,16 @@ def test_events_before_preregistration_and_expired_mutable_stage_progress_fail_c
         source=ExperimentState.PROPOSAL_REVIEW,
         target=ExperimentState.BUILDING,
         second=7,
+        lease_owner_id="director-1",
+        lease_stage_attempt_id="lease-build-1",
     )
     deterministic = transition(
         attempt="stage-deterministic-1",
         source=ExperimentState.BUILDING,
         target=ExperimentState.DETERMINISTIC_VALIDATION,
         second=9,
+        lease_owner_id="director-1",
+        lease_stage_attempt_id="lease-build-1",
     )
     with pytest.raises(GraphContractError, match="mutable_lease_required"):
         reduce_events(manifest(), (*reviewed, lease, build, deterministic))
@@ -838,7 +920,21 @@ def test_phase3_review_identity_quorum_and_draft_are_bound_to_one_candidate() ->
         second=12,
         payload=draft.to_canonical_dict(),
     )
-    completed = reduce_events(manifest(), (*events, draft_event))
+    with pytest.raises(GraphContractError, match="draft_pr_authorization_required"):
+        reduce_events(manifest(), (*events, draft_event))
+    request_event = candidate_event(
+        attempt="draft-pr-request-phase3",
+        event_type=EventType.DRAFT_PR_REQUESTED,
+        second=12,
+        payload={
+            "base_branch": "main",
+            "candidate_commit": sealed_candidate().candidate_commit,
+            "expected_remote_url": "https://github.com/StephenBickel/carl-agent.git",
+            "head_branch": sealed_candidate().branch,
+            "repository": "StephenBickel/carl-agent",
+        },
+    )
+    completed = reduce_events(manifest(), (*events, request_event, draft_event))
     decision = evaluate_phase3(manifest(), completed)
     assert completed.state is ExperimentState.PAIRED_EVALUATION
     assert completed.draft_pull_request == draft
@@ -854,7 +950,7 @@ def test_phase3_review_identity_quorum_and_draft_are_bound_to_one_candidate() ->
             "candidate_commit": sealed_candidate().candidate_commit,
         },
     )
-    disposed = reduce_events(manifest(), (*events, draft_event, disposed_event))
+    disposed = reduce_events(manifest(), (*events, request_event, draft_event, disposed_event))
     assert disposed.workspace_disposed is True
     assert evaluate_phase3(manifest(), disposed).next_action == (
         "await_phase4_protected_validation"
@@ -865,6 +961,7 @@ def test_phase3_review_identity_quorum_and_draft_are_bound_to_one_candidate() ->
             manifest(),
             (
                 *events,
+                request_event,
                 draft_event,
                 disposed_event,
                 candidate_event(
@@ -941,11 +1038,17 @@ def test_phase3_draft_requires_three_approvals_and_no_hard_finding() -> None:
         head_branch=sealed_candidate().branch,
         candidate_commit=sealed_candidate().candidate_commit,
     )
-    draft_event = candidate_event(
-        attempt="draft-too-early",
-        event_type=EventType.DRAFT_PR_RECORDED,
+    request_event = candidate_event(
+        attempt="draft-request-too-early",
+        event_type=EventType.DRAFT_PR_REQUESTED,
         second=4,
-        payload=draft.to_canonical_dict(),
+        payload={
+            "base_branch": draft.base_branch,
+            "candidate_commit": draft.candidate_commit,
+            "expected_remote_url": "https://github.com/StephenBickel/carl-agent.git",
+            "head_branch": draft.head_branch,
+            "repository": draft.repository,
+        },
     )
     with pytest.raises(GraphContractError, match="candidate_attestation_quorum_unsatisfied"):
         reduce_events(
@@ -957,6 +1060,6 @@ def test_phase3_draft_requires_three_approvals_and_no_hard_finding() -> None:
                 deterministic,
                 paired_transition,
                 evidence_event,
-                draft_event,
+                request_event,
             ),
         )

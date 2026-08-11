@@ -23,6 +23,8 @@ def run_scripted(result: Path, *extra: str) -> int:
             "1",
             "--seed",
             "17",
+            "--subject-commit",
+            "1" * 40,
             "--public-result",
             os.fspath(result),
             *extra,
@@ -49,6 +51,7 @@ def test_scripted_run_writes_only_sanitized_scorecard(tmp_path: Path) -> None:
     assert value["passed_trials"] == 3
     assert value["valid_trials"] == 3
     assert value["invalid_trials"] == 0
+    assert value["subject_commit"] == "1" * 40
     assert [track["track"] for track in value["tracks"]] == [
         "coding",
         "safety",
@@ -114,6 +117,8 @@ def test_live_adapters_require_explicit_paths_model_and_effort(tmp_path: Path) -
         "1",
         "--seed",
         "1",
+        "--subject-commit",
+        "1" * 40,
         "--public-result",
         os.fspath(destination),
     ]

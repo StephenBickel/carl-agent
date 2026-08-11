@@ -62,6 +62,7 @@ def summarize_run(
         schema_version=1,
         run_id=manifest.run_id,
         run_digest=digest,
+        subject_commit=manifest.subject_commit,
         valid_trials=len(valid),
         invalid_trials=len(included) - len(valid),
         passed_trials=passed,
@@ -164,8 +165,7 @@ def _bootstrap_interval(clusters: tuple[tuple[int, ...], ...], seed: int) -> tup
     for _ in range(BOOTSTRAP_RESAMPLES):
         selected = tuple(generator.choice(clusters) for _ in range(cluster_count))
         samples.append(
-            sum(sum(cluster) for cluster in selected)
-            / sum(len(cluster) for cluster in selected)
+            sum(sum(cluster) for cluster in selected) / sum(len(cluster) for cluster in selected)
         )
     samples.sort()
     return samples[499], samples[9_499]

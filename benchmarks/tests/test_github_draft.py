@@ -104,6 +104,13 @@ def _fixture(tmp_path: Path):
         review_packets=tuple(packets),
         candidate_attestations=tuple(reviews),
         draft_pull_request=None,
+        draft_pull_request_request={
+            "base_branch": "main",
+            "candidate_commit": candidate.candidate_commit,
+            "expected_remote_url": os.fspath(tmp_path / "origin.git"),
+            "head_branch": candidate.branch,
+            "repository": "StephenBickel/carl-agent",
+        },
     )
     fake_gh = tmp_path / "private" / "fake-gh"
     shutil.copy2(Path(__file__).parent / "fakes" / "fake-gh.py", fake_gh)
@@ -213,3 +220,37 @@ def test_gateway_never_executes_repository_push_hooks(tmp_path: Path) -> None:
     gateway.open_or_reconcile(selected, projection)
 
     assert not marker.exists()
+
+
+def test_gateway_revalidates_fetch_and_push_destinations_before_publication(
+    tmp_path: Path,
+) -> None:
+    gateway, selected, projection, state, log, repository = _fixture(tmp_path)
+    redirected = tmp_path / "redirected.git"
+    _run("git", "init", "--bare", os.fspath(redirected), cwd=tmp_path)
+    _run(
+        "git",
+        "remote",
+        "set-url",
+        "--push",
+        "origin",
+        os.fspath(redirected),
+        cwd=repository,
+    )
+
+    with pytest.raises(DraftPrGatewayError, match="candidate_remote_mismatch"):
+        gateway.open_or_reconcile(selected, projection)
+
+    assert not state.exists()
+    invocations = [json.loads(line) for line in log.read_text().splitlines()]
+    assert not any(arguments[:2] == ["pr", "create"] for arguments in invocations)
+    assert (
+        _run(
+            "git",
+            "ls-remote",
+            os.fspath(redirected),
+            f"refs/heads/{projection.candidate.branch}",
+            cwd=repository,
+        )
+        == ""
+    )

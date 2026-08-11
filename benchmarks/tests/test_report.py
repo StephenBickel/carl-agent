@@ -58,10 +58,13 @@ def trial(
     )
 
 
-def manifest(run: str, trials: tuple[TrialResult, ...]) -> RunManifest:
+def manifest(
+    run: str, trials: tuple[TrialResult, ...], *, subject_commit: str = "0" * 40
+) -> RunManifest:
     return RunManifest(
         schema_version=1,
         run_id=f"run-{run}",
+        subject_commit=subject_commit,
         league="same-model",
         model="gpt-test",
         effort="low",

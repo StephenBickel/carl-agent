@@ -123,6 +123,7 @@ def scorecard_from_public(value: Any) -> Scorecard:
             "run_digest",
             "run_id",
             "schema_version",
+            "subject_commit",
             "tracks",
             "trials",
             "valid_trials",
@@ -148,6 +149,7 @@ def scorecard_from_public(value: Any) -> Scorecard:
             schema_version=value["schema_version"],
             run_id=value["run_id"],
             run_digest=value["run_digest"],
+            subject_commit=value["subject_commit"],
             valid_trials=value["valid_trials"],
             invalid_trials=value["invalid_trials"],
             passed_trials=value["passed_trials"],
@@ -195,6 +197,10 @@ def bind_paired_evidence(
         raise CandidateEvidenceError("candidate_manifest_mismatch")
     if not isinstance(baseline, Scorecard) or not isinstance(candidate_scorecard, Scorecard):
         raise CandidateEvidenceError("invalid_scorecard")
+    if baseline.subject_commit != manifest.parent_commit:
+        raise CandidateEvidenceError("baseline_scorecard_commit_mismatch")
+    if candidate_scorecard.subject_commit != candidate.candidate_commit:
+        raise CandidateEvidenceError("candidate_scorecard_commit_mismatch")
     if not isinstance(store, PrivateArtifactStore):
         raise CandidateEvidenceError("invalid_artifact_store")
     try:

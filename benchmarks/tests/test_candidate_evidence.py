@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -50,8 +51,18 @@ def _scorecards(*, candidate_passes: bool, attempts: int = 3):
         for index in range(1, attempts + 1)
     )
     return (
-        summarize_run(run_manifest("baseline", baseline_trials), baseline_trials),
-        summarize_run(run_manifest("candidate", candidate_trials), candidate_trials),
+        summarize_run(
+            run_manifest("baseline", baseline_trials, subject_commit=manifest().parent_commit),
+            baseline_trials,
+        ),
+        summarize_run(
+            run_manifest(
+                "candidate",
+                candidate_trials,
+                subject_commit=sealed_candidate().candidate_commit,
+            ),
+            candidate_trials,
+        ),
     )
 
 
@@ -169,6 +180,33 @@ def test_bind_paired_evidence_rejects_losers_and_insufficient_pairs(
     tmp_path: Path, candidate_passes: bool, attempts: int, code: str
 ) -> None:
     baseline, candidate = _scorecards(candidate_passes=candidate_passes, attempts=attempts)
+    with pytest.raises(CandidateEvidenceError, match=code):
+        bind_paired_evidence(
+            manifest(),
+            sealed_candidate(),
+            baseline,
+            candidate,
+            comparison_seed=77,
+            store=_store(tmp_path),
+        )
+
+
+@pytest.mark.parametrize(
+    ("scorecard", "code"),
+    [
+        ("baseline", "baseline_scorecard_commit_mismatch"),
+        ("candidate", "candidate_scorecard_commit_mismatch"),
+    ],
+)
+def test_bind_paired_evidence_rejects_scorecards_from_other_commits(
+    tmp_path: Path, scorecard: str, code: str
+) -> None:
+    baseline, candidate = _scorecards(candidate_passes=True)
+    if scorecard == "baseline":
+        baseline = replace(baseline, subject_commit="e" * 40)
+    else:
+        candidate = replace(candidate, subject_commit="e" * 40)
+
     with pytest.raises(CandidateEvidenceError, match=code):
         bind_paired_evidence(
             manifest(),

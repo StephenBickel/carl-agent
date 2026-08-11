@@ -70,6 +70,10 @@ def _common(
         "origin",
         "--expected-remote-url",
         os.fspath(remote_url),
+        "--lease-owner-id",
+        "director-cli",
+        "--lease-stage-attempt-id",
+        "lease-cli",
     ]
 
 
@@ -124,6 +128,8 @@ def test_candidate_cli_runs_prepare_seal_evidence_review_and_draft_without_claim
             source=ExperimentState.PROPOSAL_REVIEW,
             target=ExperimentState.BUILDING,
             second=7,
+            lease_owner_id="director-cli",
+            lease_stage_attempt_id="lease-cli",
         ),
     ):
         _record(ledger, private, event)
@@ -197,17 +203,23 @@ def test_candidate_cli_runs_prepare_seal_evidence_review_and_draft_without_claim
             source=ExperimentState.BUILDING,
             target=ExperimentState.DETERMINISTIC_VALIDATION,
             second=10,
+            lease_owner_id="director-cli",
+            lease_stage_attempt_id="lease-cli",
         ),
         transition(
             attempt="stage-paired-cli",
             source=ExperimentState.DETERMINISTIC_VALIDATION,
             target=ExperimentState.PAIRED_EVALUATION,
             second=11,
+            lease_owner_id="director-cli",
+            lease_stage_attempt_id="lease-cli",
         ),
     ):
         _record(ledger, private, event)
 
     baseline, candidate_scorecard = _scorecards(candidate_passes=True)
+    baseline = replace(baseline, subject_commit=selected.parent_commit)
+    candidate_scorecard = replace(candidate_scorecard, subject_commit=sealed["candidate_commit"])
     baseline_path = tmp_path / "baseline.json"
     candidate_path = tmp_path / "candidate.json"
     _write_json(baseline_path, baseline.to_public_dict())

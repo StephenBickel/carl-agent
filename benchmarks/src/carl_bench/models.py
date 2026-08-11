@@ -10,6 +10,7 @@ from typing import Any, ClassVar
 
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
 _DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+_COMMIT_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 _CODE_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 _TRACKS = frozenset({"coding", "workflow", "safety"})
 
@@ -24,6 +25,11 @@ def _bounded_string(name: str, value: str, maximum: int) -> None:
 def _digest(name: str, value: str) -> None:
     if not isinstance(value, str) or not _DIGEST_RE.fullmatch(value):
         raise ValueError(f"{name} must be a lowercase SHA-256 digest")
+
+
+def _commit(name: str, value: str) -> None:
+    if not isinstance(value, str) or not _COMMIT_RE.fullmatch(value):
+        raise ValueError(f"{name} must be a lowercase full commit ID")
 
 
 def _non_negative(name: str, value: int, maximum: int = 86_400_000) -> None:
@@ -331,6 +337,7 @@ class TrialResult:
 class RunManifest:
     schema_version: int
     run_id: str
+    subject_commit: str
     league: str
     model: str | None
     effort: str | None
@@ -342,6 +349,7 @@ class RunManifest:
         if self.schema_version != 1:
             raise ValueError("schema_version must be 1")
         _bounded_string("run_id", self.run_id, 128)
+        _commit("subject_commit", self.subject_commit)
         if self.league not in {"plumbing", "same-model", "native-product"}:
             raise ValueError("league is unsupported")
         if self.model is not None:
@@ -364,6 +372,7 @@ class RunManifest:
             "schema_version": self.schema_version,
             "seed": self.seed,
             "started_at": self.started_at,
+            "subject_commit": self.subject_commit,
             "trials": [trial.to_public_dict() for trial in self.trials],
         }
 
@@ -406,6 +415,7 @@ class Scorecard:
     schema_version: int
     run_id: str
     run_digest: str
+    subject_commit: str
     valid_trials: int
     invalid_trials: int
     passed_trials: int
@@ -425,6 +435,7 @@ class Scorecard:
             raise ValueError("schema_version must be 1")
         _bounded_string("run_id", self.run_id, 128)
         _digest("run_digest", self.run_digest)
+        _commit("subject_commit", self.subject_commit)
         for name in ("valid_trials", "invalid_trials", "passed_trials", "failed_trials"):
             _non_negative(name, getattr(self, name), 1_000_000)
         if not math.isfinite(self.pass_rate) or not 0.0 <= self.pass_rate <= 1.0:
@@ -484,6 +495,7 @@ class Scorecard:
             "run_digest": self.run_digest,
             "run_id": self.run_id,
             "schema_version": self.schema_version,
+            "subject_commit": self.subject_commit,
             "tracks": [track.to_public_dict() for track in self.tracks],
             "trials": [trial.to_public_dict() for trial in self.trials],
             "valid_trials": self.valid_trials,

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 import stat
@@ -78,6 +79,7 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--task", action="append", default=[], help="exact task ID to include")
     run.add_argument("--attempts", required=True, type=int)
     run.add_argument("--seed", required=True, type=int)
+    run.add_argument("--subject-commit", required=True)
     run.add_argument("--public-result", required=True, type=Path)
     run.add_argument("--league", choices=("plumbing", "same-model", "native-product"))
     run.add_argument("--model")
@@ -148,6 +150,8 @@ def _parser() -> argparse.ArgumentParser:
         add_candidate_context(command)
         command.add_argument("--stage-attempt-id", required=True)
         command.add_argument("--occurred-at", required=True)
+        command.add_argument("--lease-owner-id", required=True)
+        command.add_argument("--lease-stage-attempt-id", required=True)
 
     prepare = candidate_commands.add_parser("prepare", help="prepare an isolated worktree")
     add_mutation(prepare)
@@ -312,6 +316,7 @@ async def _run_command(args: argparse.Namespace) -> int:
     manifest = RunManifest(
         schema_version=1,
         run_id=f"run-{args.adapter}-{uuid.uuid4().hex}",
+        subject_commit=args.subject_commit,
         league=league,
         model=model,
         effort=effort,
@@ -572,16 +577,29 @@ def _append_candidate_event(
     occurred_at: str,
     event_type: EventType,
     payload: dict[str, Any],
+    lease_owner_id: str,
+    lease_stage_attempt_id: str,
 ) -> None:
+    authorized_payload = {
+        **payload,
+        "_lease": {
+            "owner_id": lease_owner_id,
+            "stage_attempt_id": lease_stage_attempt_id,
+        },
+    }
     ledger.append(
         ExperimentEvent.create(
             experiment_id=experiment_id,
             stage_attempt_id=stage_attempt_id,
             event_type=event_type,
             occurred_at=occurred_at,
-            payload=payload,
+            payload=authorized_payload,
         )
     )
+
+
+def _candidate_event_payload(event: ExperimentEvent) -> dict[str, Any]:
+    return {key: value for key, value in event.payload.items() if key != "_lease"}
 
 
 def _candidate_status_dict(
@@ -646,9 +664,11 @@ def _candidate_command(args: argparse.Namespace) -> int:
                 occurred_at=args.occurred_at,
                 event_type=EventType.WORKSPACE_PREPARED,
                 payload=prepared.to_canonical_dict(),
+                lease_owner_id=args.lease_owner_id,
+                lease_stage_attempt_id=args.lease_stage_attempt_id,
             )
         else:
-            prepared = PreparedCandidate.from_canonical_dict(existing.payload)
+            prepared = PreparedCandidate.from_canonical_dict(_candidate_event_payload(existing))
         _write_private_json(
             args.private_result,
             {
@@ -678,9 +698,11 @@ def _candidate_command(args: argparse.Namespace) -> int:
                 occurred_at=args.occurred_at,
                 event_type=EventType.CANDIDATE_SEALED,
                 payload=sealed.to_canonical_dict(),
+                lease_owner_id=args.lease_owner_id,
+                lease_stage_attempt_id=args.lease_stage_attempt_id,
             )
         else:
-            sealed = SealedCandidate.from_canonical_dict(existing.payload)
+            sealed = SealedCandidate.from_canonical_dict(_candidate_event_payload(existing))
             if manager.artifact_store.read(sealed.report_artifact) != report:
                 raise ValueError("candidate report conflicts with sealed evidence")
         write_public_json(
@@ -720,9 +742,11 @@ def _candidate_command(args: argparse.Namespace) -> int:
                 occurred_at=args.occurred_at,
                 event_type=EventType.PAIRED_EVIDENCE_RECORDED,
                 payload=paired.to_canonical_dict(),
+                lease_owner_id=args.lease_owner_id,
+                lease_stage_attempt_id=args.lease_stage_attempt_id,
             )
         else:
-            paired = PairedEvidence.from_canonical_dict(existing.payload)
+            paired = PairedEvidence.from_canonical_dict(_candidate_event_payload(existing))
         value = {
             "candidate_commit": paired.candidate_commit,
             "confidence_lower_basis_points": paired.confidence_lower_basis_points,
@@ -755,9 +779,11 @@ def _candidate_command(args: argparse.Namespace) -> int:
                 occurred_at=args.occurred_at,
                 event_type=EventType.REVIEW_PACKET_RECORDED,
                 payload=packet.to_canonical_dict(),
+                lease_owner_id=args.lease_owner_id,
+                lease_stage_attempt_id=args.lease_stage_attempt_id,
             )
         else:
-            packet = ReviewPacket.from_canonical_dict(existing.payload)
+            packet = ReviewPacket.from_canonical_dict(_candidate_event_payload(existing))
             if packet.role != args.role:
                 raise ValueError("review role conflicts with existing packet")
         _write_private_json(
@@ -793,9 +819,11 @@ def _candidate_command(args: argparse.Namespace) -> int:
                 occurred_at=args.occurred_at,
                 event_type=EventType.REVIEW_ATTESTED,
                 payload=attestation.to_canonical_dict(),
+                lease_owner_id=args.lease_owner_id,
+                lease_stage_attempt_id=args.lease_stage_attempt_id,
             )
         else:
-            attestation = ReviewAttestation.from_canonical_dict(existing.payload)
+            attestation = ReviewAttestation.from_canonical_dict(_candidate_event_payload(existing))
             if manager.artifact_store.read(attestation.report_artifact) != report:
                 raise ValueError("review report conflicts with existing attestation")
         value = {
@@ -829,13 +857,19 @@ def _candidate_command(args: argparse.Namespace) -> int:
                 stage_attempt_id=args.stage_attempt_id,
                 event_type=EventType.WORKSPACE_DISPOSED,
                 occurred_at=args.occurred_at,
-                payload=payload,
+                payload={
+                    **payload,
+                    "_lease": {
+                        "owner_id": args.lease_owner_id,
+                        "stage_attempt_id": args.lease_stage_attempt_id,
+                    },
+                },
             )
             reduce_events(manifest, (*ledger.events(args.experiment_id), event))
             manager.dispose(projection.prepared_candidate, projection.candidate)
             ledger.append(event)
         else:
-            payload = existing.payload
+            payload = _candidate_event_payload(existing)
         value = {
             "branch": payload["branch"],
             "candidate_commit": payload["candidate_commit"],
@@ -854,22 +888,62 @@ def _candidate_command(args: argparse.Namespace) -> int:
     existing = _existing_candidate_event(
         ledger, args.experiment_id, args.stage_attempt_id, EventType.DRAFT_PR_RECORDED
     )
-    if existing is None:
-        if len(args.gateway_env_name) != len(set(args.gateway_env_name)):
-            raise ValueError("duplicate gateway environment name")
-        if any(name not in os.environ for name in args.gateway_env_name):
-            raise ValueError("gateway environment is unavailable")
-        gateway = DraftPrGateway(
-            repository_root=args.repository,
-            repository_slug=args.repository_slug,
-            remote=args.remote,
-            expected_remote_url=args.expected_remote_url,
-            base_branch=args.base_branch,
-            gh_executable=args.gh_executable,
-            private_root=args.gateway_private_root,
-            command_env={name: os.environ[name] for name in args.gateway_env_name},
+    if len(args.gateway_env_name) != len(set(args.gateway_env_name)):
+        raise ValueError("duplicate gateway environment name")
+    if any(name not in os.environ for name in args.gateway_env_name):
+        raise ValueError("gateway environment is unavailable")
+    if projection.candidate is None:
+        raise ValueError("candidate has not been sealed")
+    request_payload = {
+        "base_branch": args.base_branch,
+        "candidate_commit": projection.candidate.candidate_commit,
+        "expected_remote_url": args.expected_remote_url,
+        "head_branch": projection.candidate.branch,
+        "repository": args.repository_slug,
+    }
+    request_attempt_id = (
+        "draft-request-" + hashlib.sha256(args.stage_attempt_id.encode("utf-8")).hexdigest()[:32]
+    )
+    request = _existing_candidate_event(
+        ledger,
+        args.experiment_id,
+        request_attempt_id,
+        EventType.DRAFT_PR_REQUESTED,
+    )
+    if request is None:
+        _append_candidate_event(
+            ledger,
+            experiment_id=args.experiment_id,
+            stage_attempt_id=request_attempt_id,
+            occurred_at=args.occurred_at,
+            event_type=EventType.DRAFT_PR_REQUESTED,
+            payload=request_payload,
+            lease_owner_id=args.lease_owner_id,
+            lease_stage_attempt_id=args.lease_stage_attempt_id,
         )
-        draft = gateway.open_or_reconcile(manifest, projection)
+    elif (
+        request.occurred_at != args.occurred_at
+        or _candidate_event_payload(request) != request_payload
+        or request.payload.get("_lease")
+        != {
+            "owner_id": args.lease_owner_id,
+            "stage_attempt_id": args.lease_stage_attempt_id,
+        }
+    ):
+        raise ValueError("draft request conflicts with existing authorization")
+    projection = ledger.projection(args.experiment_id)
+    gateway = DraftPrGateway(
+        repository_root=args.repository,
+        repository_slug=args.repository_slug,
+        remote=args.remote,
+        expected_remote_url=args.expected_remote_url,
+        base_branch=args.base_branch,
+        gh_executable=args.gh_executable,
+        private_root=args.gateway_private_root,
+        command_env={name: os.environ[name] for name in args.gateway_env_name},
+    )
+    draft = gateway.open_or_reconcile(manifest, projection)
+    if existing is None:
         _append_candidate_event(
             ledger,
             experiment_id=args.experiment_id,
@@ -877,9 +951,13 @@ def _candidate_command(args: argparse.Namespace) -> int:
             occurred_at=args.occurred_at,
             event_type=EventType.DRAFT_PR_RECORDED,
             payload=draft.to_canonical_dict(),
+            lease_owner_id=args.lease_owner_id,
+            lease_stage_attempt_id=args.lease_stage_attempt_id,
         )
     else:
-        draft = DraftPullRequest.from_canonical_dict(existing.payload)
+        recorded = DraftPullRequest.from_canonical_dict(_candidate_event_payload(existing))
+        if draft != recorded:
+            raise ValueError("live draft conflicts with recorded draft")
     write_public_json(
         _experiment_output(args.public_result, args.ledger),
         draft.to_canonical_dict(),

@@ -42,9 +42,11 @@ RESULTS="/absolute/private/path/to/results"
 MODEL="gpt-5.2-codex"
 EFFORT="high"
 SEED="41000"
+SUBJECT_COMMIT="$(git rev-parse HEAD)"
 
 uv run --project benchmarks --locked carl-bench run \
   --tasks "$TASKS" --adapter codex-cli --attempts 3 --seed "$SEED" \
+  --subject-commit "$SUBJECT_COMMIT" \
   --model "$MODEL" --effort "$EFFORT" \
   --codex-bin /absolute/path/to/codex \
   --codex-home /absolute/private/path/to/codex-home \
@@ -52,6 +54,7 @@ uv run --project benchmarks --locked carl-bench run \
 
 uv run --project benchmarks --locked carl-bench run \
   --tasks "$TASKS" --adapter carl-acp --attempts 3 --seed "$SEED" \
+  --subject-commit "$SUBJECT_COMMIT" \
   --model "$MODEL" --effort "$EFFORT" \
   --carl-bin "$(pwd)/target/release/carl" \
   --codex-bin /absolute/path/to/codex \
@@ -202,6 +205,8 @@ COMMON=(
   --artifacts "$CONTROL_ROOT/artifacts"
   --remote origin
   --expected-remote-url git@github.com:StephenBickel/carl-agent.git
+  --lease-owner-id director-exp-real-id
+  --lease-stage-attempt-id lease-exp-real-id-1
 )
 
 uv run --project benchmarks --locked carl-bench candidate prepare \
@@ -262,10 +267,13 @@ uv run --project benchmarks --locked carl-bench candidate open-draft-pr \
   --enable-github-draft
 ```
 
-The gateway pushes `<sealed-commit>:refs/heads/<derived-branch>` without force, creates or
-reconciles one open draft, and has no merge/auto-merge/ready/release operation. The builder never
-receives its environment. The experiment deliberately remains in `paired_evaluation` with next
-action `await_phase4_protected_validation`; a draft PR is not promotion evidence.
+Before any remote mutation, the controller durably records an exact draft-publication request
+bound to the repository, effective remote URL, base, branch, candidate commit, and active lease.
+The gateway revalidates both fetch and push destinations, pushes
+`<sealed-commit>:refs/heads/<derived-branch>` without force, creates or reconciles one open draft,
+and has no merge/auto-merge/ready/release operation. The builder never receives its environment.
+The experiment deliberately remains in `paired_evaluation` with next action
+`await_phase4_protected_validation`; a draft PR is not promotion evidence.
 
 After the draft is recorded, explicitly remove the candidate worktree while preserving its sealed
 branch and private evidence:

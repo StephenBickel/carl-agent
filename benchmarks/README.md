@@ -32,6 +32,7 @@ uv run --project benchmarks --locked carl-bench run \
   --adapter carl-acp \
   --attempts 3 \
   --seed 41000 \
+  --subject-commit "$(git rev-parse HEAD)" \
   --model gpt-5.2-codex \
   --effort high \
   --carl-bin /absolute/path/to/carl \
@@ -55,6 +56,7 @@ uv run --project benchmarks --locked carl-bench run \
   --adapter codex-cli \
   --attempts 3 \
   --seed 41000 \
+  --subject-commit "$(git rev-parse HEAD)" \
   --model gpt-5.2-codex \
   --effort high \
   --codex-bin /absolute/path/to/codex \
