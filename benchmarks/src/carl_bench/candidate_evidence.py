@@ -227,6 +227,20 @@ def bind_paired_evidence(
     comparison_seed: int,
     store: PrivateArtifactStore,
 ) -> PairedEvidence:
+    raise CandidateEvidenceError("isolated_signer_required")
+
+
+def _bind_paired_evidence_unreachable(
+    manifest: ExperimentManifest,
+    candidate: SealedCandidate,
+    baseline_attestation: Any,
+    candidate_attestation: Any,
+    *,
+    attestation_key: bytes,
+    comparison_seed: int,
+    store: PrivateArtifactStore,
+) -> PairedEvidence:
+    """Retain the draft implementation for the future isolated-signer phase."""
     if not isinstance(manifest, ExperimentManifest) or not isinstance(candidate, SealedCandidate):
         raise CandidateEvidenceError("invalid_paired_binding")
     if (
@@ -309,6 +323,15 @@ def issue_review_packet(
     projection: ExperimentProjection,
     role: ReviewRole,
 ) -> ReviewPacket:
+    raise CandidateEvidenceError("isolated_signer_required")
+
+
+def _issue_review_packet_unreachable(
+    manifest: ExperimentManifest,
+    projection: ExperimentProjection,
+    role: ReviewRole,
+) -> ReviewPacket:
+    """Retain the draft implementation for the future isolated-signer phase."""
     candidate, paired = _phase3_projection(manifest, projection)
     if role not in {
         ReviewRole.CORRECTNESS,
@@ -341,6 +364,21 @@ def record_review_attestation(
     report: bytes,
     store: PrivateArtifactStore,
 ) -> ReviewAttestation:
+    raise CandidateEvidenceError("isolated_signer_required")
+
+
+def _record_review_attestation_unreachable(
+    manifest: ExperimentManifest,
+    projection: ExperimentProjection,
+    packet: ReviewPacket,
+    *,
+    reviewer_id: str,
+    context_id: str,
+    verdict: str,
+    report: bytes,
+    store: PrivateArtifactStore,
+) -> ReviewAttestation:
+    """Retain the draft implementation for the future isolated-signer phase."""
     _phase3_projection(manifest, projection)
     if not isinstance(packet, ReviewPacket):
         raise CandidateEvidenceError("invalid_review_packet")
@@ -348,7 +386,7 @@ def record_review_attestation(
         role = ReviewRole(packet.role)
     except ValueError as error:
         raise CandidateEvidenceError("invalid_candidate_review_role") from error
-    if issue_review_packet(manifest, projection, role) != packet:
+    if _issue_review_packet_unreachable(manifest, projection, role) != packet:
         raise CandidateEvidenceError("review_packet_mismatch")
     if any(review.reviewer_id == reviewer_id for review in projection.candidate_attestations):
         raise CandidateEvidenceError("reviewer_identity_reused")

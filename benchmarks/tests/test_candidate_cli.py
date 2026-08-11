@@ -8,7 +8,6 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
-from test_candidate_evidence import ATTESTATION_KEY, _attestations
 from test_candidate_git import _check, _repository
 from test_experiment import (
     manifest,
@@ -217,19 +216,6 @@ def test_candidate_cli_runs_prepare_seal_evidence_review_and_draft_without_claim
     ):
         _record(ledger, private, event)
 
-    baseline, candidate_scorecard = _attestations(
-        candidate_passes=True,
-        baseline_subject=selected.parent_commit,
-        candidate_subject=sealed["candidate_commit"],
-    )
-    baseline_path = private / "baseline.attestation.json"
-    candidate_path = private / "candidate.attestation.json"
-    key_path = private / "attestation.key"
-    _write_json(baseline_path, baseline)
-    _write_json(candidate_path, candidate_scorecard)
-    key_path.write_bytes(ATTESTATION_KEY)
-    if os.name != "nt":
-        key_path.chmod(0o600)
     paired_result = tmp_path / "paired.json"
     assert (
         cli.main(
@@ -242,81 +228,70 @@ def test_candidate_cli_runs_prepare_seal_evidence_review_and_draft_without_claim
                 "--occurred-at",
                 "2026-08-10T12:01:03Z",
                 "--baseline-attestation",
-                os.fspath(baseline_path),
+                os.fspath(private / "missing-baseline.json"),
                 "--candidate-attestation",
-                os.fspath(candidate_path),
+                os.fspath(private / "missing-candidate.json"),
                 "--attestation-key",
-                os.fspath(key_path),
+                os.fspath(private / "missing-key"),
                 "--comparison-seed",
                 "77",
                 "--public-result",
                 os.fspath(paired_result),
             ]
         )
-        == 0
+        == 2
     )
-    assert json.loads(paired_result.read_text())["decision"] == "improvement"
+    assert not paired_result.exists()
 
-    for index, (role, verdict) in enumerate(
-        (
-            ("correctness", "approve"),
-            ("security", "approve"),
-            ("maintainability", "approve"),
-            ("benchmark_integrity", "reject"),
-        ),
-        start=1,
-    ):
-        packet_path = private / f"packet-{role}.json"
-        assert (
-            cli.main(
-                [
-                    "candidate",
-                    "review-packet",
-                    *common,
-                    "--stage-attempt-id",
-                    f"packet-cli-{index}",
-                    "--occurred-at",
-                    f"2026-08-10T12:02:0{index}Z",
-                    "--role",
-                    role,
-                    "--private-result",
-                    os.fspath(packet_path),
-                ]
-            )
-            == 0
+    packet_result = private / "disabled-packet.json"
+    assert (
+        cli.main(
+            [
+                "candidate",
+                "review-packet",
+                *common,
+                "--stage-attempt-id",
+                "packet-disabled",
+                "--occurred-at",
+                "2026-08-10T12:01:04Z",
+                "--role",
+                "security",
+                "--private-result",
+                os.fspath(packet_result),
+            ]
         )
-        review_path = private / f"review-{role}.txt"
-        review_path.write_text(f"private {role} analysis", encoding="utf-8")
-        if os.name != "nt":
-            review_path.chmod(0o600)
-        review_result = tmp_path / f"review-{role}.json"
-        assert (
-            cli.main(
-                [
-                    "candidate",
-                    "record-review",
-                    *common,
-                    "--stage-attempt-id",
-                    f"review-cli-{index}",
-                    "--occurred-at",
-                    f"2026-08-10T12:03:0{index}Z",
-                    "--packet",
-                    os.fspath(packet_path),
-                    "--reviewer-id",
-                    f"reviewer-cli-{index}",
-                    "--context-id",
-                    f"context-cli-{index}",
-                    "--verdict",
-                    verdict,
-                    "--report",
-                    os.fspath(review_path),
-                    "--public-result",
-                    os.fspath(review_result),
-                ]
-            )
-            == 0
+        == 2
+    )
+    assert not packet_result.exists()
+
+    review_result = tmp_path / "disabled-review.json"
+    assert (
+        cli.main(
+            [
+                "candidate",
+                "record-review",
+                *common,
+                "--stage-attempt-id",
+                "review-disabled",
+                "--occurred-at",
+                "2026-08-10T12:01:05Z",
+                "--packet",
+                os.fspath(private / "missing-packet.json"),
+                "--reviewer-id",
+                "reviewer-disabled",
+                "--context-id",
+                "context-disabled",
+                "--verdict",
+                "approve",
+                "--report",
+                os.fspath(private / "missing-report.txt"),
+                "--public-result",
+                os.fspath(review_result),
+            ]
         )
-        assert "private" not in review_result.read_text().casefold()
+        == 2
+    )
+    assert not review_result.exists()
 
     status_path = tmp_path / "candidate-status.json"
     assert (
@@ -336,8 +311,9 @@ def test_candidate_cli_runs_prepare_seal_evidence_review_and_draft_without_claim
     )
     before_draft = json.loads(status_path.read_text())
     assert before_draft["state"] == "paired_evaluation"
-    assert before_draft["next_action"] == "open_draft_pr"
-    assert before_draft["candidate_review_approvals"] == 3
+    assert before_draft["next_action"] == "await_isolated_signer"
+    assert before_draft["outcome"] == "blocked"
+    assert before_draft["reasons"] == ["experimental_publication_disabled"]
 
     fake_gh = private / "fake-gh"
     shutil.copy2(Path(__file__).parent / "fakes" / "fake-gh.py", fake_gh)
@@ -373,30 +349,10 @@ def test_candidate_cli_runs_prepare_seal_evidence_review_and_draft_without_claim
     ]
     assert cli.main(open_args) == 2
     assert not draft_result.exists()
-    assert cli.main([*open_args, "--enable-github-draft"]) == 0
-    draft = json.loads(draft_result.read_text())
-    assert draft["is_draft"] is True
-
-    dispose_result = tmp_path / "dispose.json"
+    assert cli.main([*open_args, "--enable-github-draft"]) == 2
+    assert not (private / "gh-log.jsonl").exists()
+    assert not (private / "gh-state.json").exists()
     assert workspace.is_dir()
-    assert (
-        cli.main(
-            [
-                "candidate",
-                "dispose",
-                *common,
-                "--stage-attempt-id",
-                "dispose-cli",
-                "--occurred-at",
-                "2026-08-10T12:04:02Z",
-                "--public-result",
-                os.fspath(dispose_result),
-            ]
-        )
-        == 0
-    )
-    assert not workspace.exists()
-    assert json.loads(dispose_result.read_text())["disposed"] is True
     branch_commit = subprocess.run(
         (
             "git",
@@ -410,27 +366,22 @@ def test_candidate_cli_runs_prepare_seal_evidence_review_and_draft_without_claim
         text=True,
     ).stdout.strip()
     assert branch_commit == sealed["candidate_commit"]
-
     assert (
-        cli.main(
-            [
-                "candidate",
-                "status",
-                "--ledger",
-                os.fspath(ledger),
-                "--experiment-id",
-                selected.experiment_id,
-                "--public-result",
-                os.fspath(status_path),
-            ]
-        )
-        == 0
+        subprocess.run(
+            (
+                "git",
+                "-C",
+                os.fspath(repository),
+                "ls-remote",
+                "origin",
+                f"refs/heads/{prepared['branch']}",
+            ),
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        == ""
     )
-    final = json.loads(status_path.read_text())
-    assert final["state"] == "paired_evaluation"
-    assert final["next_action"] == "await_phase4_protected_validation"
-    assert final["draft_pull_request_number"] == 17
-    assert final["workspace_disposed"] is True
     serialized = status_path.read_text().casefold()
     for forbidden in ("worktree", "private", "hypothesis", "stdout", "review report"):
         assert forbidden not in serialized

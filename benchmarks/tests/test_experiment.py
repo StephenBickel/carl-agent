@@ -7,11 +7,8 @@ import pytest
 from carl_bench.artifacts import ArtifactRef
 from carl_bench.candidate import (
     DeterministicCheckResult,
-    DraftPullRequest,
     PairedEvidence,
     PreparedCandidate,
-    ReviewAttestation,
-    ReviewPacket,
     SealedCandidate,
 )
 from carl_bench.experiment import (
@@ -779,7 +776,10 @@ def test_phase3_candidate_evidence_gates_build_and_cannot_claim_holdout_validati
     )
     projection = reduce_events(manifest(), events)
     assert projection.candidate == sealed_candidate()
-    assert evaluate_phase3(manifest(), projection).next_action == "bind_paired_evidence"
+    decision = evaluate_phase3(manifest(), projection)
+    assert decision.outcome == "blocked"
+    assert decision.next_action == "await_isolated_signer"
+    assert decision.reasons == ("experimental_publication_disabled",)
 
     evidence_event = candidate_event(
         attempt="paired-evidence-phase3",
@@ -787,9 +787,8 @@ def test_phase3_candidate_evidence_gates_build_and_cannot_claim_holdout_validati
         second=3,
         payload=paired_evidence().to_canonical_dict(),
     )
-    projection = reduce_events(manifest(), (*events, evidence_event))
-    assert projection.paired_evidence == paired_evidence()
-    assert evaluate_phase3(manifest(), projection).next_action == "issue_review_packets"
+    with pytest.raises(GraphContractError, match="isolated_signer_required"):
+        reduce_events(manifest(), (*events, evidence_event))
 
     holdout = transition(
         attempt="stage-holdout-phase3",
@@ -798,268 +797,4 @@ def test_phase3_candidate_evidence_gates_build_and_cannot_claim_holdout_validati
         second=12,
     )
     with pytest.raises(GraphContractError, match="phase4_protected_validation_required"):
-        reduce_events(manifest(), (*events, evidence_event, holdout))
-
-
-def test_phase3_review_identity_quorum_and_draft_are_bound_to_one_candidate() -> None:
-    prepared_event = candidate_event(
-        attempt="prepare-phase3",
-        event_type=EventType.WORKSPACE_PREPARED,
-        second=1,
-        payload=prepared_candidate().to_canonical_dict(),
-    )
-    sealed_event = candidate_event(
-        attempt="seal-phase3",
-        event_type=EventType.CANDIDATE_SEALED,
-        second=2,
-        payload=sealed_candidate().to_canonical_dict(),
-    )
-    deterministic = transition(
-        attempt="stage-deterministic-phase3",
-        source=ExperimentState.BUILDING,
-        target=ExperimentState.DETERMINISTIC_VALIDATION,
-        second=10,
-    )
-    paired_transition = transition(
-        attempt="stage-paired-phase3",
-        source=ExperimentState.DETERMINISTIC_VALIDATION,
-        target=ExperimentState.PAIRED_EVALUATION,
-        second=11,
-    )
-    evidence_event = candidate_event(
-        attempt="paired-evidence-phase3",
-        event_type=EventType.PAIRED_EVIDENCE_RECORDED,
-        second=3,
-        payload=paired_evidence().to_canonical_dict(),
-    )
-    events: tuple[ExperimentEvent, ...] = (
-        *phase3_build_events(),
-        prepared_event,
-        sealed_event,
-        deterministic,
-        paired_transition,
-        evidence_event,
-    )
-    packets: dict[str, ReviewPacket] = {}
-    for index, role in enumerate(
-        ("correctness", "security", "maintainability", "benchmark_integrity"), start=4
-    ):
-        packet = ReviewPacket(
-            schema_version=1,
-            experiment_id=manifest().experiment_id,
-            manifest_digest=manifest().digest,
-            candidate_commit=sealed_candidate().candidate_commit,
-            role=role,
-            diff_digest=sealed_candidate().diff_artifact.digest,
-            deterministic_evidence_digest=sealed_candidate().digest,
-            paired_evidence_digest=paired_evidence().digest,
-            review_contract_version="candidate-review-v1",
-        )
-        packets[role] = packet
-        events = (
-            *events,
-            candidate_event(
-                attempt=f"packet-{role}",
-                event_type=EventType.REVIEW_PACKET_RECORDED,
-                second=index,
-                payload=packet.to_canonical_dict(),
-            ),
-        )
-
-    projection = reduce_events(manifest(), events)
-    assert evaluate_phase3(manifest(), projection).next_action == "collect_candidate_reviews"
-
-    for index, (role, verdict) in enumerate(
-        (
-            ("correctness", "approve"),
-            ("security", "approve"),
-            ("maintainability", "approve"),
-            ("benchmark_integrity", "reject"),
-        ),
-        start=8,
-    ):
-        attestation = ReviewAttestation(
-            schema_version=1,
-            experiment_id=manifest().experiment_id,
-            manifest_digest=manifest().digest,
-            candidate_commit=sealed_candidate().candidate_commit,
-            role=role,
-            reviewer_id=f"reviewer-{role}",
-            context_id=f"context-{role}",
-            packet_digest=packets[role].digest,
-            verdict=verdict,
-            report_artifact=candidate_artifact("review_report", str(index)[-1]),
-        )
-        events = (
-            *events,
-            candidate_event(
-                attempt=f"attest-{role}",
-                event_type=EventType.REVIEW_ATTESTED,
-                second=index,
-                payload=attestation.to_canonical_dict(),
-            ),
-        )
-
-    projection = reduce_events(manifest(), events)
-    assert evaluate_phase3(manifest(), projection).next_action == "open_draft_pr"
-
-    draft = DraftPullRequest(
-        schema_version=1,
-        repository="StephenBickel/carl-agent",
-        number=99,
-        url="https://github.com/StephenBickel/carl-agent/pull/99",
-        state="OPEN",
-        is_draft=True,
-        base_branch="main",
-        head_branch=sealed_candidate().branch,
-        candidate_commit=sealed_candidate().candidate_commit,
-    )
-    draft_event = candidate_event(
-        attempt="draft-pr-phase3",
-        event_type=EventType.DRAFT_PR_RECORDED,
-        second=12,
-        payload=draft.to_canonical_dict(),
-    )
-    with pytest.raises(GraphContractError, match="draft_pr_authorization_required"):
-        reduce_events(manifest(), (*events, draft_event))
-    request_event = candidate_event(
-        attempt="draft-pr-request-phase3",
-        event_type=EventType.DRAFT_PR_REQUESTED,
-        second=12,
-        payload={
-            "base_branch": "main",
-            "candidate_commit": sealed_candidate().candidate_commit,
-            "expected_remote_url": "https://github.com/StephenBickel/carl-agent.git",
-            "head_branch": sealed_candidate().branch,
-            "repository": "StephenBickel/carl-agent",
-        },
-    )
-    completed = reduce_events(manifest(), (*events, request_event, draft_event))
-    decision = evaluate_phase3(manifest(), completed)
-    assert completed.state is ExperimentState.PAIRED_EVALUATION
-    assert completed.draft_pull_request == draft
-    assert decision.outcome == "draft_open"
-    assert decision.next_action == "await_phase4_protected_validation"
-
-    disposed_event = candidate_event(
-        attempt="dispose-workspace-phase3",
-        event_type=EventType.WORKSPACE_DISPOSED,
-        second=13,
-        payload={
-            "branch": sealed_candidate().branch,
-            "candidate_commit": sealed_candidate().candidate_commit,
-        },
-    )
-    disposed = reduce_events(manifest(), (*events, request_event, draft_event, disposed_event))
-    assert disposed.workspace_disposed is True
-    assert evaluate_phase3(manifest(), disposed).next_action == (
-        "await_phase4_protected_validation"
-    )
-
-    with pytest.raises(GraphContractError, match="workspace_already_disposed"):
-        reduce_events(
-            manifest(),
-            (
-                *events,
-                request_event,
-                draft_event,
-                disposed_event,
-                candidate_event(
-                    attempt="dispose-workspace-again-phase3",
-                    event_type=EventType.WORKSPACE_DISPOSED,
-                    second=14,
-                    payload=disposed_event.payload,
-                ),
-            ),
-        )
-
-    reused = ReviewAttestation(
-        schema_version=1,
-        experiment_id=manifest().experiment_id,
-        manifest_digest=manifest().digest,
-        candidate_commit=sealed_candidate().candidate_commit,
-        role="benchmark_integrity",
-        reviewer_id="reviewer-correctness",
-        context_id="new-context",
-        packet_digest=packets["benchmark_integrity"].digest,
-        verdict="approve",
-        report_artifact=candidate_artifact("review_report", "f"),
-    )
-    reuse_event = candidate_event(
-        attempt="attest-reused-reviewer",
-        event_type=EventType.REVIEW_ATTESTED,
-        second=13,
-        payload=reused.to_canonical_dict(),
-    )
-    with pytest.raises(GraphContractError, match="reviewer_identity_reused"):
-        reduce_events(manifest(), (*events[:-1], reuse_event))
-
-
-def test_phase3_draft_requires_three_approvals_and_no_hard_finding() -> None:
-    base_events = phase3_build_events()
-    prepared_event = candidate_event(
-        attempt="prepare-phase3",
-        event_type=EventType.WORKSPACE_PREPARED,
-        second=1,
-        payload=prepared_candidate().to_canonical_dict(),
-    )
-    sealed_event = candidate_event(
-        attempt="seal-phase3",
-        event_type=EventType.CANDIDATE_SEALED,
-        second=2,
-        payload=sealed_candidate().to_canonical_dict(),
-    )
-    deterministic = transition(
-        attempt="stage-deterministic-phase3",
-        source=ExperimentState.BUILDING,
-        target=ExperimentState.DETERMINISTIC_VALIDATION,
-        second=10,
-    )
-    paired_transition = transition(
-        attempt="stage-paired-phase3",
-        source=ExperimentState.DETERMINISTIC_VALIDATION,
-        target=ExperimentState.PAIRED_EVALUATION,
-        second=11,
-    )
-    evidence_event = candidate_event(
-        attempt="paired-evidence-phase3",
-        event_type=EventType.PAIRED_EVIDENCE_RECORDED,
-        second=3,
-        payload=paired_evidence().to_canonical_dict(),
-    )
-    draft = DraftPullRequest(
-        schema_version=1,
-        repository="StephenBickel/carl-agent",
-        number=100,
-        url="https://github.com/StephenBickel/carl-agent/pull/100",
-        state="OPEN",
-        is_draft=True,
-        base_branch="main",
-        head_branch=sealed_candidate().branch,
-        candidate_commit=sealed_candidate().candidate_commit,
-    )
-    request_event = candidate_event(
-        attempt="draft-request-too-early",
-        event_type=EventType.DRAFT_PR_REQUESTED,
-        second=4,
-        payload={
-            "base_branch": draft.base_branch,
-            "candidate_commit": draft.candidate_commit,
-            "expected_remote_url": "https://github.com/StephenBickel/carl-agent.git",
-            "head_branch": draft.head_branch,
-            "repository": draft.repository,
-        },
-    )
-    with pytest.raises(GraphContractError, match="candidate_attestation_quorum_unsatisfied"):
-        reduce_events(
-            manifest(),
-            (
-                *base_events,
-                prepared_event,
-                sealed_event,
-                deterministic,
-                paired_transition,
-                evidence_event,
-                request_event,
-            ),
-        )
+        reduce_events(manifest(), (*events, holdout))

@@ -68,6 +68,36 @@ def test_exact_stage_redelivery_is_a_noop_but_conflict_fails_closed(tmp_path: Pa
     assert ledger.event_count("exp-context-recovery-001") == 1
 
 
+@pytest.mark.parametrize(
+    "event_type",
+    (
+        EventType.PAIRED_EVIDENCE_RECORDED,
+        EventType.REVIEW_PACKET_RECORDED,
+        EventType.REVIEW_ATTESTED,
+        EventType.DRAFT_PR_REQUESTED,
+        EventType.DRAFT_PR_RECORDED,
+        EventType.WORKSPACE_DISPOSED,
+    ),
+)
+def test_raw_publication_event_injection_is_rejected_without_a_ledger_write(
+    tmp_path: Path, event_type: EventType
+) -> None:
+    ledger = ExperimentLedger(tmp_path / "ledger.sqlite3")
+    ledger.register_manifest(manifest())
+    forged = ExperimentEvent.create(
+        experiment_id=manifest().experiment_id,
+        stage_attempt_id=f"forged-{event_type.value}",
+        event_type=event_type,
+        occurred_at="2026-08-10T12:00:01Z",
+        payload={},
+    )
+
+    with pytest.raises(LedgerIntegrityError, match="isolated_signer_required"):
+        ledger.append(forged)
+
+    assert ledger.event_count(manifest().experiment_id) == 0
+
+
 def test_manifest_is_registered_once_and_conflicting_rewrite_is_rejected(tmp_path: Path) -> None:
     ledger = ExperimentLedger(tmp_path / "ledger.sqlite3")
     ledger.register_manifest(manifest())

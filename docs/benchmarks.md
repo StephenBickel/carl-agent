@@ -4,9 +4,10 @@ The benchmark lab, experiment graph, and isolated candidate workflow are the fir
 [improvement-factory design](superpowers/specs/2026-08-10-codex-carl-improvement-factory-design.md).
 They give Codex a reproducible way to test Carl and other harnesses on coding,
 workflow-automation, and safety tasks, preregister hypotheses, replay normalized decisions, and
-account for budgets. An approved experiment can produce a sealed candidate and an explicitly enabled
-draft PR. The promotion controller is not implemented: this control plane cannot claim protected
-validation, merge, auto-merge, release, deploy, or revert changes.
+account for budgets. An approved experiment can produce a sealed candidate. The promotion authority
+is not implemented: paired/review authority events and every publication operation are mechanically
+disabled, so this control plane cannot push a candidate, open a draft PR, claim protected validation,
+merge, auto-merge, release, deploy, or revert changes.
 
 The command reference and isolation details live in the
 [benchmark package guide](../benchmarks/README.md). This page defines the operator loop that Codex
@@ -160,10 +161,9 @@ recorded spend.
 Status and decision files expose only counts, states, stable reasons, and digests—not the hypothesis,
 role prose, artifact identities, lease owner, provider settings, or raw benchmark evidence.
 
-The intended Improvement Director cadence is one Codex automation tick every two hours. Scheduling
-is not installed by this repository; an operator may run the phase-three commands below manually or
-from a separately governed Codex automation. A missed tick is safe because ledger events, Git refs,
-and draft PRs reconcile by immutable experiment and candidate identities.
+The separately governed Codex automation may schedule the Improvement Director, but scheduling is
+not installed by this repository. A missed tick is safe because the ledger and sealed candidate refs
+reconcile by immutable experiment and candidate identities. Publication remains unavailable.
 
 ## Isolated candidate workflow
 
@@ -229,75 +229,25 @@ uv run --project benchmarks --locked carl-bench candidate seal \
   --public-result "$CONTROL_ROOT/candidate.json"
 ```
 
-Record the ordinary transitions to `deterministic_validation` and `paired_evaluation`. Create one
-controller-only attestation key outside the repository, then run `carl-bench run-attested` against
-separate clean baseline and candidate checkouts with the same task/config arguments. Use the
-experiment ID and the corresponding `baseline` or `candidate` role. The command derives `HEAD`,
-rechecks the sealed checkout after execution, reconstructs the scorecard from the canonical run
-manifest, and signs both digests plus the task/config identity. Then bind only those attestations:
+Record the ordinary transitions to `deterministic_validation` and `paired_evaluation`. Diagnostic
+`run`, `compare`, and `run-attested` executions may still measure the sealed candidate, but none of
+their output has promotion authority in this release.
 
-```bash
-uv run --project benchmarks --locked carl-bench candidate bind-comparison \
-  "${COMMON[@]}" \
-  --stage-attempt-id paired-exp-real-id-1 \
-  --occurred-at 2026-08-10T14:00:00Z \
-  --baseline-attestation "$CONTROL_ROOT/baseline.attestation.json" \
-  --candidate-attestation "$CONTROL_ROOT/candidate.attestation.json" \
-  --attestation-key "$CONTROL_ROOT/benchmark-attestation.key" \
-  --comparison-seed 41000 \
-  --public-result "$CONTROL_ROOT/paired.json"
-```
+### Publication boundary (disabled)
 
-Relabeled public scorecards, role swaps, scorecard swaps, arbitrary JSON, modified signed fields,
-and unknown keys are rejected. The Phase 3 HMAC signer is controller-local; do not give autonomous
-workers direct access to the controller CLI, ledger, or key. Cross-user or cross-machine operation
-requires moving signing behind a separate trust boundary, preferably with public-key signatures.
+`candidate status` stops at `await_isolated_signer`. The CLI and direct APIs reject
+`bind-comparison`, `open-draft-pr`, and publication-worktree disposal before reading attestations,
+keys, artifacts, or invoking Git/GitHub. The reducer independently rejects
+`PAIRED_EVIDENCE_RECORDED`, `REVIEW_PACKET_RECORDED`, `REVIEW_ATTESTED`, `DRAFT_PR_REQUESTED`,
+`DRAFT_PR_RECORDED`, and `WORKSPACE_DISPOSED`, including during legacy-ledger replay. Fabricated
+projections cannot make the draft gateway mutate a remote.
 
-Issue separate packets for `correctness`, `security`, `maintainability`, and
-`benchmark_integrity`. Run each reviewer in a read-only, independent Codex context, then call
-`record-review` with a unique reviewer ID, unique context ID, packet, verdict, and private report.
-All four roles must report; three approvals and no hard finding are required.
-
-`candidate status` reports only commit/evidence digests, counts, verdict totals, state, and next
-action. Once it says `open_draft_pr`, the operator may explicitly enable the narrow gateway:
-
-```bash
-uv run --project benchmarks --locked carl-bench candidate open-draft-pr \
-  "${COMMON[@]}" \
-  --stage-attempt-id draft-exp-real-id-1 \
-  --occurred-at 2026-08-10T15:00:00Z \
-  --repository-slug StephenBickel/carl-agent \
-  --base-branch main \
-  --gh-executable /absolute/path/to/gh \
-  --gateway-private-root "$CONTROL_ROOT/github" \
-  --gateway-env-name GH_TOKEN \
-  --gateway-env-name HOME \
-  --gateway-env-name SSH_AUTH_SOCK \
-  --public-result "$CONTROL_ROOT/draft.json" \
-  --enable-github-draft
-```
-
-Before any remote mutation, the controller durably records an exact draft-publication request
-bound to the repository, effective remote URL, base, branch, candidate commit, and active lease.
-The gateway revalidates both fetch and push destinations, pushes
-`<sealed-commit>:refs/heads/<derived-branch>` without force, creates or reconciles one open draft,
-and has no merge/auto-merge/ready/release operation. The builder never receives its environment.
-The experiment deliberately remains in `paired_evaluation` with next action
-`await_phase4_protected_validation`; a draft PR is not promotion evidence.
-
-After the draft is recorded, explicitly remove the candidate worktree while preserving its sealed
-branch and private evidence:
-
-```bash
-uv run --project benchmarks --locked carl-bench candidate dispose \
-  "${COMMON[@]}" \
-  --stage-attempt-id dispose-exp-real-id-1 \
-  --occurred-at 2026-08-10T15:01:00Z \
-  --public-result "$CONTROL_ROOT/disposed.json"
-```
-
-Cleanup is ledger-recorded and idempotent. It refuses a dirty worktree, a moved branch, a different
-commit, a missing draft record, or an expired lease; it never force-removes or deletes the branch.
+This boundary exists because the current HMAC prototype does not prove that the executed Carl binary
+was freshly built from the attested checkout, and a same-UID worker is not isolated from the signing
+key or lease identity. Enabling publication requires a separately isolated Ed25519 signer,
+public-key verification, an exact checkout-to-build-to-execution provenance chain, and authenticated
+lease ownership. Those controls must land with fresh adversarial tests before the disabled events or
+commands can be re-enabled.
 
 ## Budget and proposal handoff
 
@@ -310,6 +260,5 @@ After a paired diagnostic, register an experiment manifest before editing Carl. 
 baseline commit, task digests, model and effort, seed range, observed failure cluster, one causal
 hypothesis, files allowed to change, primary metric, non-regression metrics, budget, and a falsifying
 prediction. Then record the three independent proposal reviews. Two approvals and no hard objection
-allow the phase-three isolated builder to begin under the exclusive lease. A sealed candidate may
-reach a draft PR after paired evidence and local review, but protected validation and the
-deterministic promotion controller remain separate later gates.
+allow the isolated builder to begin under the exclusive lease. A sealed candidate remains local and
+awaits the isolated signer; protected validation and deterministic promotion are later gates.

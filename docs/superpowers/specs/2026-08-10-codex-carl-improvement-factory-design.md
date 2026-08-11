@@ -802,8 +802,9 @@ stronger model does not support a harness-superiority claim.
 ### Phase 3: isolated candidate generation
 
 - Enable Level A builders in disposable worktrees.
-- Run independent reviews and paired evaluation.
-- Open draft PRs but do not auto-merge.
+- Add isolated signing and exact build/executable provenance for paired evaluation and independent
+  reviews. Until those controls land, the foundation must stop at a sealed candidate.
+- Open draft PRs but do not auto-merge only after that publication gate is independently reviewed.
 - Prove crash recovery, holdout separation, and exact rollback drills.
 
 ### Phase 4: autonomous Level A promotion

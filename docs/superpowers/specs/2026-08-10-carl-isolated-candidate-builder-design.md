@@ -2,16 +2,15 @@
 
 ## Status and intent
 
-This document specifies phase three of the Codex-operated Carl Improvement Factory. It
-turns an approved dry-run experiment into one isolated candidate commit, binds deterministic
-and paired evidence to that commit, collects independent read-only reviews, and may publish
-the candidate as a draft pull request. It does not merge, enable auto-merge, deploy, run a
-protected holdout, or accept an experiment.
+This document specifies the phase-three design of the Codex-operated Carl Improvement Factory. The
+shipped foundation turns an approved dry-run experiment into one isolated candidate commit and
+binds deterministic evidence to it. Paired promotion evidence, promotion reviews, workspace
+disposal, and draft publication remain planned and are mechanically disabled pending an isolated
+signer and executable provenance.
 
 The user approved the phase-three direction after phase two was delivered and explicitly
 asked execution to continue without additional approval pauses. This design therefore
-resolves implementation details from the factory constitution and keeps every new external
-mutation below the already-approved draft-PR boundary.
+resolves implementation details from the factory constitution while keeping publication disabled.
 
 ## Goals
 
@@ -21,10 +20,9 @@ mutation below the already-approved draft-PR boundary.
 - Reject changes outside the manifest's target surface or inside its forbidden surface.
 - Run only preregistered deterministic checks resolved through a trusted command registry.
 - Seal one immutable candidate commit and content-addressed evidence bundle.
-- Bind an exact paired comparison and four role-specific review attestations to that commit.
-- Require three independent approvals and no hard finding before draft publication.
-- Make push and draft-PR creation idempotent, reconciled, and impossible before every local
-  phase-three gate passes.
+- Define the future contracts for paired comparison, role-specific reviews, and draft publication.
+- Fail closed until those contracts are backed by isolated signing, build provenance, and
+  authenticated lease ownership.
 
 ## Non-goals
 
@@ -50,25 +48,12 @@ The controller uses a prepare/edit/seal workflow.
 3. `candidate seal` reads the real Git index and filesystem, rejects special files and
    out-of-scope paths, runs trusted argv-based checks without a shell, stores bounded evidence,
    commits the candidate, and appends a candidate event to the ledger.
-4. The trusted controller runs baseline and candidate through `run-attested` from separate clean
-   checkouts. It derives each checkout commit and tree itself, reconstructs the scorecard from the
-   canonical run manifest, and emits a domain-separated HMAC bound to the experiment, role,
-   task/config identity, commit, manifest digest, and scorecard digest. `candidate bind-comparison`
-   verifies both attestations, requires baseline to equal the manifest parent and candidate to equal
-   the sealed commit, recomputes the comparison, stores the evidence, and appends one paired event.
-5. `candidate review-packet` emits one immutable, role-specific packet per reviewer. A reviewer
-   works read-only and returns a strict attestation bound to the packet and candidate commit.
-   Reviewer identities and context IDs must be unique across the four roles.
-6. `candidate record-review` stores the bounded private report and appends a normalized review
-   event. Three approvals and no hard finding are required.
-7. `candidate open-draft-pr` first appends a durable authorization bound to the active lease,
-   repository, effective remote URL, base, branch, and sealed commit. It then replays the ledger,
-   revalidates both fetch and push destinations, verifies the local branch still resolves to the
-   sealed commit, pushes that exact ref, and invokes a narrow GitHub gateway that can only inspect
-   or create a draft PR. It records the PR identity only after reconciliation confirms the head
-   commit and draft state. A crash between authorization, publication, and recording resumes by
-   reconciling the same immutable request. The experiment remains in `paired_evaluation`; a draft
-   is a review surface, not evidence that protected validation happened.
+4. `run-attested` can produce diagnostic HMAC-bound measurements from separate clean checkouts. It
+   does not prove that the invoked agent executable was freshly built from the named checkout and
+   does not isolate its key from same-UID workers, so it has no promotion authority.
+5. The future paired, review, publication, and disposal contracts are present for adversarial
+   testing, but their CLI entry points, direct APIs, and reducer events reject unconditionally.
+6. `candidate status` reports `await_isolated_signer`; no current state advertises publication.
 
 The graph remains the authority. Chat text, process exit success, a Git branch, and a GitHub PR
 are observations until normalized evidence is appended to the hash-chained ledger.
@@ -89,23 +74,21 @@ deterministic-check results, paired-evaluation bindings, review packets/attestat
 and public eligibility decisions. Every contract has exact keys, bounded fields, canonical JSON,
 and a stable digest.
 
-The experiment reducer gains normalized events for workspace preparation, candidate sealing,
-deterministic evidence, paired evidence, review packets/attestations, draft PR authorization, and
-draft PR publication. Mutable events carry the exact active lease owner and acquisition attempt.
-State transitions fail closed unless their required evidence is present:
+The experiment reducer defines normalized events for workspace preparation, candidate sealing,
+deterministic evidence, and the future promotion path. Mutable foundation events carry the exact
+active lease owner and acquisition attempt. State transitions fail closed unless their required
+evidence is present:
 
 - leaving `building` requires a sealed candidate at the manifest parent;
 - leaving `deterministic_validation` requires all preregistered checks to pass;
-- recording paired evidence requires the experiment to be in `paired_evaluation` and the
-  comparison to be bound to the sealed candidate;
-- phase-three review packets, attestations, and draft PR records are allowed only in
-  `paired_evaluation` after passing local evidence;
+- paired evidence, review packets/attestations, draft authorization/publication, and publication
+  workspace disposal are rejected with `experimental_publication_disabled`;
 - phase three cannot transition from `paired_evaluation` to `holdout_validation`. The protected
   validator introduced in phase four is the only component that may satisfy that edge.
 
-The existing phase-two event format remains readable. New events use exact payload contracts and
-stage-attempt idempotency. Candidate evidence cannot be replaced; a changed commit requires a child
-experiment.
+Existing ledgers are replayed through the same rule, so a legacy publication event fails closed.
+New foundation events use exact payload contracts and stage-attempt idempotency. Candidate evidence
+cannot be replaced; a changed commit requires a child experiment.
 
 ### Git workspace manager
 
@@ -136,48 +119,33 @@ candidate tree blocks sealing.
 
 ### Paired evaluation
 
-The existing `compare_runs` implementation remains the statistical authority. A phase-three
-binding names the experiment, manifest digest, baseline commit, candidate commit, verified baseline
-and candidate scorecard digests, comparison seed, and recomputed comparison digest. Binding accepts
-only controller-attested evidence; caller-authored public scorecard labels have no promotion
-authority. Only the exact `improvement` decision satisfies the local gate. Infrastructure-invalid
-or insufficient evidence does not pass. The binding is local promotion evidence, not a protected
-holdout scorecard. The HMAC boundary is limited to the manual, controller-only Phase 3 model; shared
-OS identities or cross-machine verification require an isolated signer and public-key verification.
+The existing `compare_runs` implementation remains a diagnostic statistical authority. The HMAC
+prototype binds fields in a completed diagnostic, but it cannot establish checkout-to-build-to-
+execution provenance or protect the key from same-UID workers. `bind_paired_evidence` and
+`candidate bind-comparison` therefore reject before reading keys, attestations, scorecards, or
+writing artifacts. Promotion binding requires an isolated asymmetric signer, public-key
+verification, an exact fresh build bound to the checkout, and authenticated lease ownership.
 
 ### Independent reviews
 
-Each role receives a different packet digest while sharing the candidate commit, diff digest,
-manifest digest, and evidence digests. The packet contains the role and review contract but no
-other reviewer's output. An attestation contains a unique bounded reviewer ID and unique context
-ID, one of `approve`, `reject`, or `hard_finding`, the packet digest, candidate commit, and a private
-report artifact digest. Duplicate identities, duplicate contexts, mismatched packets, stale
-commits, missing roles, and hard findings block the local draft-PR quorum. Phase four may require
-fresh promotion review after protected validation.
-
-Reviewers never edit the candidate worktree. The controller checks the candidate ref before and
-after review recording; drift invalidates the action.
+The contracts define separate role packets and unique reviewer/context identities for the future
+review topology. The reducer currently rejects packet and attestation events unconditionally, so
+these objects cannot create promotion authority. When enabled, reviewers must remain read-only and
+independent and the controller must verify candidate-ref stability around every recording.
 
 ### Draft PR gateway
 
-`github_draft.py` wraps an injected command runner for Git and GitHub CLI. Its public API supports
-only:
-
-- inspect an existing PR for the derived head branch;
-- push `<candidate-commit>:refs/heads/<derived-branch>` without force;
-- create a draft PR with a deterministic, sanitized title/body;
-- reconcile URL, number, draft status, state, head branch, and head commit.
-
-The module contains no merge, auto-merge, ready-for-review, release, or delete operation. Existing
-PRs are accepted only when every reconciled field matches. A conflict blocks instead of updating
-unknown state. The model-facing builder never receives the gateway or its environment.
+`github_draft.py` retains the narrow reconciliation implementation as defense-in-depth test surface,
+but its public `open_or_reconcile` entry point rejects before calling Git, GitHub CLI, or an injected
+runner. The candidate CLI independently rejects draft publication before constructing the gateway.
+The module contains no merge, auto-merge, ready-for-review, release, or delete operation.
 
 ## Public and private data
 
-Private artifacts may contain diffs, check output, implementation reports, review prose, and local
+Private foundation artifacts may contain diffs, check output, implementation reports, and local
 paths. They stay in the artifact store. Public output contains only stable identifiers, commit and
-artifact digests, changed-path count, check counts, aggregate comparison metrics already permitted
-by the benchmark lab, reviewer-role verdicts, and the draft PR URL/number after reconciliation.
+artifact digests, changed-path count, and check counts. Diagnostic benchmark output remains subject
+to the benchmark lab's public-data contract.
 
 Secrets, environment values, prompts, model responses, absolute paths, raw diffs, raw test output,
 and reviewer prose are forbidden from public JSON. Existing public-safety validation remains the
@@ -186,15 +154,11 @@ final serializer gate.
 ## Recovery and idempotency
 
 - Every mutation requires a unique stage-attempt ID.
-- Repeating the exact prepare, seal, evidence, review, push, or PR attempt returns the existing
-  result. Reusing an attempt ID for different canonical input is a conflict.
+- Repeating the exact prepare or seal attempt returns the existing result. Reusing an attempt ID for
+  different canonical input is a conflict.
 - Process failure before ledger append is reconciled from Git and GitHub state on retry.
 - A prepared but unsealed worktree remains blocked for inspection; it is not automatically erased.
-- A pushed branch without a PR is safe to retry. A matching draft PR is recorded rather than
-  duplicated.
-- Cleanup is explicit after draft reconciliation, refuses dirty or mismatched worktrees, preserves
-  the sealed branch, and records an idempotent disposal event.
-- A PR with a different head, non-draft state, base, or repository is a hard conflict.
+- Paired, review, publication, and disposal retries fail before artifacts or external mutation.
 - Expired mutable leases still require the phase-two explicit worker-not-live reconciliation.
 
 ## Test strategy
@@ -205,24 +169,23 @@ final serializer gate.
   exact-parent commits, drift detection, cleanup, and retry reconciliation.
 - Real subprocess fixtures exercise check success, timeout, output overflow, nonzero exit, and
   closed environment behavior.
-- Real fake `git`/`gh` executables exercise draft creation and reconciliation without network access;
-  their captured argv prove no force-push, merge, auto-merge, or ready operation is issued.
+- Real fake `git`/`gh` executables and redirecting remotes prove publication remains unreachable and
+  no runner, hook, push, PR, merge, auto-merge, or ready operation is issued.
 - Reducer and ledger tests prove evidence-gated transitions, replay stability, corruption detection,
   and exact idempotency.
-- CLI integration tests run prepare/edit/seal/evidence/review/draft/disposal flows against
-  temporary private stores and repositories while asserting public output contains no private
-  material.
+- CLI, direct-API, raw-ledger, replay, and fabricated-projection tests prove the foundation can
+  prepare/edit/seal while every authority and publication path fails closed without artifacts or
+  remote mutation.
 - Full Python, Ruff, benchmark smoke, Cargo formatting, tests, clippy, and GitHub CI remain required.
 
 ## Delivery boundary
 
-Phase three is complete when a fixture experiment can progress from approved proposal to
-`paired_evaluation` with a sealed candidate, passing deterministic and paired evidence, independent
-local review quorum, and a reconciled draft PR using fake external gateways, while every adversarial
-path fails closed. It remains in `paired_evaluation` awaiting phase-four protected validation.
+This foundation is complete when a fixture experiment can progress from approved proposal to
+`paired_evaluation` with a sealed candidate and passing deterministic evidence, then report
+`await_isolated_signer` while every authority and publication path fails closed. Publication is
+disabled unconditionally, not merely by configuration.
 
-The production GitHub path is shipped disabled by default and requires explicit trusted executable,
-repository, remote, base branch, and owner-private artifact/ledger paths. No scheduled task is
-created in this phase. Phase four must add a protected validator, constrained GitHub App identity,
-branch-rule verification, merge queue, soak, and automatic revert before autonomous promotion is
-honest.
+The next delivery must add an isolated Ed25519 signer, exact checkout/build/executable provenance,
+authenticated leases, and fresh adversarial review before re-enabling paired or review events. A
+later promotion phase must also add protected validation, constrained GitHub identity, branch-rule
+verification, merge queue, soak, and automatic revert before autonomous promotion is honest.

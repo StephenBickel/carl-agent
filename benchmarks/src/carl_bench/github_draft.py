@@ -388,6 +388,12 @@ class DraftPrGateway:
     def open_or_reconcile(
         self, manifest: ExperimentManifest, projection: ExperimentProjection
     ) -> DraftPullRequest:
+        raise DraftPrGatewayError("experimental_publication_disabled")
+
+    def _open_or_reconcile_unreachable(
+        self, manifest: ExperimentManifest, projection: ExperimentProjection
+    ) -> DraftPullRequest:
+        """Retain the draft implementation for the future isolated-signer phase."""
         self._verify_projection(manifest, projection)
         assert projection.candidate is not None
         candidate = projection.candidate

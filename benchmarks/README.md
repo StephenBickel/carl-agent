@@ -3,9 +3,10 @@
 This directory contains the first three executable layers of the Carl improvement factory. It runs the
 same portable coding, workflow-automation, and safety tasks against disposable workspaces and emits
 only bounded, sanitized scorecards, then records private experiment facts in a replayable dry-run
-graph. An approved experiment can now prepare and seal an isolated candidate, bind paired and review
-evidence, and explicitly open a draft PR. It does **not** run protected validation, merge, enable
-auto-merge, release, deploy, or accept changes.
+graph. An approved experiment can prepare and seal an isolated candidate. Experimental publication
+is mechanically disabled: this layer cannot bind promotion evidence, record promotion reviews, push
+a candidate, open a draft PR, dispose the publication workspace, merge, release, deploy, or accept
+changes.
 
 ## Offline validation
 
@@ -79,13 +80,13 @@ three valid pairs per task, a pass-rate gain of at least three percentage points
 bootstrap lower bound, and no track regression beyond two percentage points. Infrastructure-invalid
 trials are surfaced but excluded from pass-rate denominators.
 
-## Promotion attestations
+## Diagnostic attestation prototype
 
-The ordinary `run` and `compare` commands are diagnostic. Promotion must use `run-attested` from
-separate clean baseline and candidate checkouts. The trusted controller derives each checkout's
-`HEAD` and tree, constructs the scorecard from the completed run manifest, and writes a private,
-domain-separated HMAC attestation bound to the experiment, role, task/config identities, commit,
-manifest, and scorecard. The signing key and attestation outputs must remain outside both checkouts.
+The ordinary `run`, `compare`, and `run-attested` commands are diagnostic. `run-attested` derives a
+checkout's `HEAD` and tree, constructs the scorecard from the completed run manifest, and writes a
+private, domain-separated HMAC attestation bound to the experiment, role, task/config identities,
+commit, manifest, and scorecard. The signing key and attestation outputs must remain outside the
+checkout.
 
 Create the controller key once in an owner-private control root:
 
@@ -98,8 +99,10 @@ uv run --project benchmarks --locked carl-bench attestation-key init \
 Run `carl-bench run-attested` with `--checkout`, `--experiment-id`, `--role baseline` or
 `--role candidate`, `--attestation-key`, and `--private-attestation` in addition to the same adapter
 arguments used by `run`. Dirty checkouts, checkout changes during execution, missing/unknown keys,
-and noncanonical evidence fail closed. `candidate bind-comparison` accepts only these verified
-baseline and candidate attestations; public scorecard JSON cannot authorize promotion.
+and noncanonical evidence fail closed. This HMAC does not authorize promotion: the invoked agent
+executable is not yet proven to be a fresh build of the named checkout, and same-UID workers are not
+isolated from the key. `candidate bind-comparison` therefore fails before reading any key,
+attestation, or scorecard.
 
 ## Evidence and isolation limits
 
@@ -113,9 +116,9 @@ baseline and candidate attestations; public scorecard JSON cannot authorize prom
   and `PATH`. Harbor validation deliberately receives neither Carl nor Codex credentials.
 - Public tasks are useful for development and regression detection, but serious promotion decisions
   also need protected holdouts to reduce benchmark overfitting.
-- The Phase 3 HMAC key is a controller-local trust boundary. Before workers share the controller's
-  OS identity or attestations cross machines, move signing to a separate identity/service and use
-  public-key verification.
+- Promotion requires a separately isolated signer, public-key verification, an exact fresh build
+  bound to the checkout, and authenticated lease ownership. Until those controls exist, paired,
+  review, draft-publication, and workspace-disposal events are rejected by the reducer.
 
 ## Harbor parity
 
@@ -142,11 +145,11 @@ Start from [the public example manifest](examples/dry-run-manifest.json), but co
 private control directory and replace every example value. The full operator sequence and event
 boundary are in [the benchmark operator guide](../docs/benchmarks.md#dry-run-experiment-graph).
 
-Phase three adds the `carl-bench candidate` prepare/edit/seal protocol, paired-evidence binding,
-role-specific independent review packets, sanitized status, a draft-only GitHub gateway, and
-explicit conflict-safe candidate-worktree disposal. The Codex task performs the edit inside the
-prepared worktree; Carl installations do not mutate themselves. See the operator guide for the
-private check registry and command sequence.
+Phase three currently exposes only the `carl-bench candidate` prepare/edit/seal protocol and
+sanitized status. Status stops at `await_isolated_signer`; paired-evidence binding, review recording,
+draft publication, and publication-worktree disposal fail closed. The Codex task performs the edit
+inside the prepared worktree; Carl installations do not mutate themselves. See the operator guide
+for the private check registry and command sequence.
 
 This is deliberately not autonomous promotion yet. Protected holdouts, merge credentials,
 auto-merge, merge queue, soak, release, and rollback remain absent. A draft candidate stays in

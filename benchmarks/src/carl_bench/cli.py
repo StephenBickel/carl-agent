@@ -837,6 +837,15 @@ def _candidate_command(args: argparse.Namespace) -> int:
         print(f"candidate {args.experiment_id}: wrote status")
         return 0
 
+    if args.candidate_command in {
+        "bind-comparison",
+        "review-packet",
+        "record-review",
+        "open-draft-pr",
+        "dispose",
+    }:
+        raise ValueError("isolated_signer_required")
+
     manager = _candidate_manager(args)
     projection = ledger.projection(args.experiment_id)
     if args.candidate_command == "prepare":

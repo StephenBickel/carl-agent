@@ -136,6 +136,18 @@ class EventType(str, Enum):
     WORKSPACE_DISPOSED = "workspace_disposed"
 
 
+_ISOLATED_AUTHORITY_REQUIRED_EVENTS = frozenset(
+    {
+        EventType.PAIRED_EVIDENCE_RECORDED,
+        EventType.REVIEW_PACKET_RECORDED,
+        EventType.REVIEW_ATTESTED,
+        EventType.DRAFT_PR_REQUESTED,
+        EventType.DRAFT_PR_RECORDED,
+        EventType.WORKSPACE_DISPOSED,
+    }
+)
+
+
 class ReviewRole(str, Enum):
     CAUSAL = "causal"
     PRODUCT = "product"
@@ -869,6 +881,8 @@ def reduce_events(
     for event in events:
         if event.experiment_id != manifest.experiment_id:
             raise GraphContractError("event_experiment_mismatch")
+        if event.event_type in _ISOLATED_AUTHORITY_REQUIRED_EVENTS:
+            raise GraphContractError("isolated_signer_required")
         if _parse_utc(event.occurred_at) < _parse_utc(manifest.registered_at):
             raise GraphContractError("event_precedes_registration")
         if event.stage_attempt_id in seen_attempts:
@@ -1326,29 +1340,10 @@ def evaluate_phase3(
         outcome = "blocked"
         next_action = "none"
         reasons = ("phase3_state_not_supported",)
-    elif projection.paired_evidence is None:
-        next_action = "bind_paired_evidence"
-    elif projection.paired_evidence.decision != "improvement":
-        outcome = "blocked"
-        next_action = "record_candidate_rejection"
-        reasons = ("paired_improvement_required",)
-    elif len(projection.review_packets) < len(_CANDIDATE_ROLES):
-        next_action = "issue_review_packets"
-    elif len(projection.candidate_attestations) < len(_CANDIDATE_ROLES):
-        next_action = "collect_candidate_reviews"
-    elif any(review.verdict == "hard_finding" for review in projection.candidate_attestations):
-        outcome = "blocked"
-        next_action = "record_candidate_rejection"
-        reasons = ("candidate_hard_finding",)
-    elif sum(review.verdict == "approve" for review in projection.candidate_attestations) < 3:
-        outcome = "blocked"
-        next_action = "record_candidate_rejection"
-        reasons = ("candidate_approvals_below_three",)
-    elif projection.draft_pull_request is None:
-        next_action = "open_draft_pr"
     else:
-        outcome = "draft_open"
-        next_action = "await_phase4_protected_validation"
+        outcome = "blocked"
+        next_action = "await_isolated_signer"
+        reasons = ("experimental_publication_disabled",)
 
     return Phase3Decision(
         schema_version=1,

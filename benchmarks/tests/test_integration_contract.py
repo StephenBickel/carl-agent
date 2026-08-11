@@ -42,7 +42,7 @@ def test_benchmark_workflow_is_pinned_locked_offline_and_credential_free() -> No
         assert forbidden.casefold() not in source.casefold()
 
 
-def test_operator_documentation_links_resolve_and_describes_draft_only_boundary() -> None:
+def test_operator_documentation_links_resolve_and_describes_disabled_publication() -> None:
     source = OPERATOR_DOCS.read_text(encoding="utf-8")
     normalized = " ".join(source.casefold().split())
     links = re.findall(r"\[[^]]+\]\(([^)]+)\)", source)
@@ -50,17 +50,28 @@ def test_operator_documentation_links_resolve_and_describes_draft_only_boundary(
     assert local_links
     for link in local_links:
         assert (OPERATOR_DOCS.parent / link).resolve().exists(), link
-    assert "promotion controller is not implemented" in normalized
+    assert "promotion authority is not implemented" in normalized
     assert "dry-run experiment graph" in normalized
     assert "hash-chained sqlite ledger" in normalized
-    assert "every two hours" in normalized
     assert "scheduling is not installed" in normalized
-    assert "draft pr" in normalized
+    assert "publication boundary (disabled)" in normalized
+    assert "await_isolated_signer" in normalized
+    assert "isolated ed25519 signer" in normalized
+    assert "exact checkout-to-build-to-execution provenance chain" in normalized
     assert (
-        "cannot claim protected validation, merge, auto-merge, release, deploy, or revert"
+        "cannot push a candidate, open a draft pr, claim protected validation, merge, auto-merge, "
+        "release, deploy, or revert"
         in normalized
     )
-    assert "remains in `paired_evaluation`" in normalized
+    for disabled_event in (
+        "paired_evidence_recorded",
+        "review_packet_recorded",
+        "review_attested",
+        "draft_pr_requested",
+        "draft_pr_recorded",
+        "workspace_disposed",
+    ):
+        assert disabled_event in normalized
     assert "USD 25" in source
     assert "USD 150" in source
     assert "three" in normalized and "ten" in normalized

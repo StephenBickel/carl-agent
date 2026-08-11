@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import os
 import shutil
 from dataclasses import replace
@@ -15,7 +14,7 @@ from carl_bench.candidate import (
     ReviewAttestation,
     ReviewPacket,
 )
-from carl_bench.experiment import ExperimentProjection, ExperimentState
+from carl_bench.experiment import ExperimentProjection, ExperimentState, evaluate_phase3
 from carl_bench.github_draft import DraftPrGateway, DraftPrGatewayError
 
 
@@ -134,98 +133,14 @@ def _fixture(tmp_path: Path):
     return gateway, selected, projection, state, log, repository
 
 
-def test_gateway_pushes_exact_commit_creates_one_draft_and_reconciles_retry(
-    tmp_path: Path,
-) -> None:
-    gateway, selected, projection, _, log, repository = _fixture(tmp_path)
-
-    first = gateway.open_or_reconcile(selected, projection)
-    second = gateway.open_or_reconcile(selected, projection)
-
-    assert first == second
-    assert first.number == 17
-    assert first.is_draft is True
-    assert first.candidate_commit == projection.candidate.candidate_commit
-    remote_head = _run(
-        "git",
-        "ls-remote",
-        "origin",
-        f"refs/heads/{projection.candidate.branch}",
-        cwd=repository,
-    ).split()[0]
-    assert remote_head == projection.candidate.candidate_commit
-    invocations = [json.loads(line) for line in log.read_text().splitlines()]
-    assert sum(arguments[:2] == ["pr", "create"] for arguments in invocations) == 1
-    forbidden = {"merge", "--auto", "ready", "release", "delete", "--force", "-f"}
-    assert not any(forbidden.intersection(arguments) for arguments in invocations)
-
-
-@pytest.mark.parametrize(
-    ("field", "replacement", "code"),
-    [
-        ("isDraft", False, "pull_request_not_draft"),
-        ("state", "CLOSED", "pull_request_not_open"),
-        ("headRefOid", "f" * 40, "pull_request_candidate_mismatch"),
-        ("baseRefName", "other", "pull_request_base_mismatch"),
-    ],
-)
-def test_gateway_blocks_conflicting_existing_pull_requests(
-    tmp_path: Path, field: str, replacement: object, code: str
-) -> None:
-    gateway, selected, projection, state, _, _ = _fixture(tmp_path)
-    pull_request = {
-        "baseRefName": "main",
-        "headRefName": projection.candidate.branch,
-        "headRefOid": projection.candidate.candidate_commit,
-        "isDraft": True,
-        "number": 19,
-        "state": "OPEN",
-        "url": "https://github.com/StephenBickel/carl-agent/pull/19",
-    }
-    pull_request[field] = replacement
-    state.write_text(json.dumps({"pull_request": pull_request}), encoding="utf-8")
-
-    with pytest.raises(DraftPrGatewayError, match=code):
-        gateway.open_or_reconcile(selected, projection)
-
-
-def test_gateway_requires_full_local_review_quorum_and_exact_local_branch(tmp_path: Path) -> None:
-    gateway, selected, projection, _, _, repository = _fixture(tmp_path)
-    without_review = replace(
-        projection, candidate_attestations=projection.candidate_attestations[:2]
-    )
-    with pytest.raises(DraftPrGatewayError, match="candidate_attestation_quorum_unsatisfied"):
-        gateway.open_or_reconcile(selected, without_review)
-
-    _run(
-        "git",
-        "update-ref",
-        f"refs/heads/{projection.candidate.branch}",
-        selected.parent_commit,
-        cwd=repository,
-    )
-    with pytest.raises(DraftPrGatewayError, match="candidate_local_ref_mismatch"):
-        gateway.open_or_reconcile(selected, projection)
-
-
-def test_gateway_never_executes_repository_push_hooks(tmp_path: Path) -> None:
-    gateway, selected, projection, _, _, repository = _fixture(tmp_path)
-    marker = tmp_path / "push-hook-ran"
-    hooks = repository / ".git" / "hooks"
-    hooks.mkdir(exist_ok=True)
-    hook = hooks / "pre-push"
-    hook.write_text(f"#!/bin/sh\nprintf ran > '{marker}'\n", encoding="utf-8")
-    hook.chmod(0o700)
-
-    gateway.open_or_reconcile(selected, projection)
-
-    assert not marker.exists()
-
-
-def test_gateway_revalidates_fetch_and_push_destinations_before_publication(
+def test_gateway_rejects_even_fabricated_eligible_projection_before_git_or_github(
     tmp_path: Path,
 ) -> None:
     gateway, selected, projection, state, log, repository = _fixture(tmp_path)
+    decision = evaluate_phase3(selected, projection)
+    assert decision.outcome == "blocked"
+    assert decision.next_action == "await_isolated_signer"
+    assert decision.reasons == ("experimental_publication_disabled",)
     redirected = tmp_path / "redirected.git"
     _run("git", "init", "--bare", os.fspath(redirected), cwd=tmp_path)
     _run(
@@ -237,13 +152,19 @@ def test_gateway_revalidates_fetch_and_push_destinations_before_publication(
         os.fspath(redirected),
         cwd=repository,
     )
+    marker = tmp_path / "push-hook-ran"
+    hook = repository / ".git" / "hooks" / "pre-push"
+    hook.write_text(f"#!/bin/sh\nprintf ran > '{marker}'\n", encoding="utf-8")
+    hook.chmod(0o700)
 
-    with pytest.raises(DraftPrGatewayError, match="candidate_remote_mismatch"):
+    with pytest.raises(DraftPrGatewayError, match="experimental_publication_disabled"):
+        gateway.open_or_reconcile(selected, projection)
+    with pytest.raises(DraftPrGatewayError, match="experimental_publication_disabled"):
         gateway.open_or_reconcile(selected, projection)
 
     assert not state.exists()
-    invocations = [json.loads(line) for line in log.read_text().splitlines()]
-    assert not any(arguments[:2] == ["pr", "create"] for arguments in invocations)
+    assert not log.exists()
+    assert not marker.exists()
     assert (
         _run(
             "git",
