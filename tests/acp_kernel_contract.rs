@@ -3,6 +3,7 @@ use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use carl::acp::{
     BuzzContext, ConfigOutcome, ConfigSelection, Kernel, KernelPublisher, NewSessionRequest,
@@ -572,6 +573,112 @@ async fn malformed_foreign_events_fail_the_owner_without_replay_or_cross_session
             .iter()
             .any(|event| matches!(event.event, Event::AssistantTextDelta { .. }))
     );
+    kernel.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn foreign_backlog_overflow_fails_only_the_owner_once() -> TestResult {
+    let layout = Layout::new()?;
+    let owner_context = AgentContextId::parse("thr_overflow_owner")?;
+    let current_context = AgentContextId::parse("thr_overflow_current")?;
+    let owner_epoch = AgentEpochId::parse("turn_overflow_owner_1")?;
+    let current_epoch = AgentEpochId::parse("turn_overflow_current")?;
+    let owner_next_epoch = AgentEpochId::parse("turn_overflow_owner_2")?;
+    let mut provider_events = vec![
+        owned_item_started(&owner_context, &owner_epoch, "overflow-owner-item"),
+        AgentEvent::EffectRequested(owned_effect_request(
+            &owner_context,
+            &owner_epoch,
+            "overflow-owner-approval",
+            "overflow-owner-item",
+            AgentEffectKind::Command,
+        )?),
+    ];
+    provider_events.extend((0..257).map(|token_count| AgentEvent::UsageUpdated {
+        context_id: owner_context.clone(),
+        epoch_id: owner_epoch.clone(),
+        usage: AgentUsage {
+            last_total_tokens: token_count,
+            total_tokens: token_count,
+            model_context_window: Some(8_192),
+        },
+    }));
+    provider_events.extend([
+        owned_epoch_completed(&current_context, &current_epoch),
+        owned_epoch_completed(&owner_context, &owner_next_epoch),
+    ]);
+    let port = ScriptedPort::with_routing(
+        provider_events,
+        vec![owner_context, current_context],
+        vec![owner_epoch, current_epoch, owner_next_epoch],
+    );
+    let shared = Arc::clone(&port.shared);
+    let kernel = Kernel::start_with_ports(layout.runtime()?, Box::new(port), None).await?;
+    let owner = kernel
+        .new_session(new_session(&layout, Frontend::Acp, None)?)
+        .await?;
+    let current = kernel
+        .new_session(new_session(&layout, Frontend::Acp, None)?)
+        .await?;
+    let waiting = kernel
+        .prompt(
+            owner.id(),
+            Prompt::new(vec!["pause overflow owner".into()])?,
+        )
+        .await?;
+    let code = local_approval_code(&waiting)?;
+
+    let current_outcome = kernel
+        .prompt(current.id(), Prompt::new(vec!["run current".into()])?)
+        .await?;
+    assert_eq!(current_outcome.stop_reason, PromptStopReason::EndTurn);
+    let current_events = Store::open(&layout.database)?.read_events(current.id())?;
+    assert!(matches!(
+        current_events.last().map(|event| &event.event),
+        Some(Event::TurnCompleted)
+    ));
+    let owner_terminal_events = Store::open(&layout.database)?.read_events(owner.id())?;
+    assert!(matches!(
+        owner_terminal_events.last().map(|event| &event.event),
+        Some(Event::TurnInterrupted { reason }) if reason == "provider_backlog_overflow"
+    ));
+    assert_eq!(
+        shared.lock().unwrap().resolved_requests,
+        [("overflow-owner-approval".into(), EffectDecision::Deny)]
+    );
+
+    let owner_result = tokio::time::timeout(
+        Duration::from_secs(1),
+        kernel.prompt(owner.id(), Prompt::new(vec![format!("/approve {code}")])?),
+    )
+    .await
+    .map_err(|_| "overflow owner did not receive a terminal result")?;
+    let owner_error = owner_result.expect_err("overflow must terminally fail only its owner");
+    assert_eq!(
+        owner_error.code(),
+        carl::acp::KernelErrorCode::ProviderFailed
+    );
+
+    let owner_next = kernel
+        .prompt(
+            owner.id(),
+            Prompt::new(vec!["owner after overflow".into()])?,
+        )
+        .await?;
+    assert_eq!(owner_next.stop_reason, PromptStopReason::EndTurn);
+    let owner_events = Store::open(&layout.database)?.read_events(owner.id())?;
+    assert_eq!(
+        owner_events
+            .iter()
+            .filter(|event| matches!(event.event, Event::TurnInterrupted { .. }))
+            .count(),
+        1
+    );
+    assert!(matches!(
+        owner_events.last().map(|event| &event.event),
+        Some(Event::TurnCompleted)
+    ));
     kernel.shutdown().await?;
     Ok(())
 }

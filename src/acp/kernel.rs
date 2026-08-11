@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -274,6 +274,7 @@ impl Kernel {
                 sessions: HashMap::new(),
                 routed_events: HashMap::new(),
                 routed_event_count: 0,
+                routed_failures: HashSet::new(),
                 receiver,
             }
             .run(),
@@ -319,6 +320,7 @@ struct KernelActor {
     sessions: HashMap<SessionId, SessionState>,
     routed_events: HashMap<SessionId, VecDeque<AgentEvent>>,
     routed_event_count: usize,
+    routed_failures: HashSet<SessionId>,
     receiver: mpsc::Receiver<KernelCommand>,
 }
 
@@ -496,13 +498,22 @@ impl KernelActor {
         session_id: SessionId,
         prompt: Prompt,
     ) -> Result<PromptOutcome, KernelError> {
-        let state = self.sessions.get(&session_id).ok_or_else(unknown_session)?;
-        if prompt
-            .actor_id()
-            .is_some_and(|actor| actor != &state.actor_id)
-        {
+        let actor_mismatch = self
+            .sessions
+            .get(&session_id)
+            .ok_or_else(unknown_session)
+            .map(|state| {
+                prompt
+                    .actor_id()
+                    .is_some_and(|actor| actor != &state.actor_id)
+            })?;
+        if actor_mismatch {
             return Err(KernelError::from_code(KernelErrorCode::ApprovalUnavailable));
         }
+        if self.routed_failures.remove(&session_id) {
+            return Err(provider_error());
+        }
+        let state = self.sessions.get(&session_id).ok_or_else(unknown_session)?;
         if state.active.is_some() {
             if state
                 .active
@@ -595,9 +606,12 @@ impl KernelActor {
             enum Next {
                 Provider(Result<AgentEvent, AgentPortError>),
                 Routed(AgentEvent),
+                RoutedFailure,
                 Command(Option<KernelCommand>),
             }
-            let next = if let Some(event) = self.take_routed_event(session_id) {
+            let next = if self.routed_failures.remove(&session_id) {
+                Next::RoutedFailure
+            } else if let Some(event) = self.take_routed_event(session_id) {
                 Next::Routed(event)
             } else {
                 tokio::select! {
@@ -616,10 +630,7 @@ impl KernelActor {
                     };
                     match self.event_owner(&event) {
                         AgentEventOwner::Session(owner) if owner != session_id => {
-                            if let Err(error) = self.route_event(owner, event) {
-                                self.fail_active_turn(session_id, "provider_failed");
-                                return Err(error);
-                            }
+                            self.route_event(owner, event).await;
                             continue;
                         }
                         AgentEventOwner::Session(_) | AgentEventOwner::Global => {}
@@ -649,6 +660,10 @@ impl KernelActor {
                             return Err(error);
                         }
                     }
+                }
+                Next::RoutedFailure => {
+                    self.fail_active_turn(session_id, "provider_backlog_overflow");
+                    return Err(provider_error());
                 }
                 Next::Command(Some(command)) => match command {
                     KernelCommand::Cancel {
@@ -1679,16 +1694,45 @@ impl KernelActor {
         matches.next().is_none().then_some(owner)
     }
 
-    fn route_event(&mut self, session_id: SessionId, event: AgentEvent) -> Result<(), KernelError> {
-        let queue = self.routed_events.entry(session_id).or_default();
-        if self.routed_event_count >= ROUTED_EVENT_CAPACITY
-            || queue.len() >= ROUTED_EVENTS_PER_SESSION
-        {
-            return Err(provider_error());
+    async fn route_event(&mut self, session_id: SessionId, event: AgentEvent) {
+        if self.routed_failures.contains(&session_id) {
+            return;
         }
+        let queue_len = self.routed_events.get(&session_id).map_or(0, VecDeque::len);
+        if self.routed_event_count >= ROUTED_EVENT_CAPACITY
+            || queue_len >= ROUTED_EVENTS_PER_SESSION
+        {
+            if let Some(discarded) = self.routed_events.remove(&session_id) {
+                self.routed_event_count = self.routed_event_count.saturating_sub(discarded.len());
+            }
+            self.routed_failures.insert(session_id);
+            let cleanup = self.sessions.get(&session_id).and_then(|state| {
+                state.active.as_ref().map(|active| {
+                    (
+                        state.provider_context.clone(),
+                        active.provider_epoch_id.clone(),
+                        active
+                            .pending_approval
+                            .as_ref()
+                            .map(|pending| pending.request.request_id.clone()),
+                    )
+                })
+            });
+            self.fail_active_turn(session_id, "provider_backlog_overflow");
+            if let Some((context_id, epoch_id, pending_request_id)) = cleanup {
+                if let Some(request_id) = pending_request_id {
+                    let _ = self
+                        .agent
+                        .resolve_effect(&request_id, EffectDecision::Deny)
+                        .await;
+                }
+                let _ = self.agent.interrupt(&context_id, &epoch_id).await;
+            }
+            return;
+        }
+        let queue = self.routed_events.entry(session_id).or_default();
         queue.push_back(event);
         self.routed_event_count += 1;
-        Ok(())
     }
 
     fn take_routed_event(&mut self, session_id: SessionId) -> Option<AgentEvent> {
