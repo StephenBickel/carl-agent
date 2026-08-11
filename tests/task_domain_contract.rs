@@ -464,16 +464,24 @@ fn reducer_projects_a_complete_valid_lifecycle() {
     state = apply(
         Some(state),
         6,
-        TaskEvent::OperationTransitioned {
-            operation_id: operation_id(),
-            from: OperationStatus::Started,
-            to: OperationStatus::Succeeded,
-            evidence_sequences: vec![5, 6],
+        TaskEvent::ProgressAssessed {
+            fingerprint: "operation-result".into(),
+            stalled: false,
         },
     );
     state = apply(
         Some(state),
         7,
+        TaskEvent::OperationTransitioned {
+            operation_id: operation_id(),
+            from: OperationStatus::Started,
+            to: OperationStatus::Succeeded,
+            evidence_sequences: vec![6],
+        },
+    );
+    state = apply(
+        Some(state),
+        8,
         TaskEvent::EpochFinished {
             epoch_id: epoch_id(),
             report_digest: "sha256:epoch-report".into(),
@@ -481,7 +489,7 @@ fn reducer_projects_a_complete_valid_lifecycle() {
     );
     state = apply(
         Some(state),
-        8,
+        9,
         TaskEvent::CheckpointCommitted {
             checkpoint_id: checkpoint_id(),
             digest: "sha256:checkpoint".into(),
@@ -489,7 +497,7 @@ fn reducer_projects_a_complete_valid_lifecycle() {
     );
     state = apply(
         Some(state),
-        9,
+        10,
         TaskEvent::CompactionCompleted {
             generation: 1,
             checkpoint_id: checkpoint_id(),
@@ -500,21 +508,21 @@ fn reducer_projects_a_complete_valid_lifecycle() {
     );
     state = apply(
         Some(state),
-        10,
+        11,
         TaskEvent::ContractRevised {
             contract: contract(2, ClauseStatus::Satisfied),
         },
     );
     state = apply(
         Some(state),
-        11,
+        12,
         TaskEvent::StateTransitioned {
             from: TaskStatus::Active,
             to: TaskStatus::Completing,
             reason: "required evidence verified".into(),
         },
     );
-    state = apply(Some(state), 12, TaskEvent::Completed);
+    state = apply(Some(state), 13, TaskEvent::Completed);
 
     assert_eq!(state.status, TaskStatus::Completed);
     assert_eq!(state.active_epoch, None);
@@ -523,7 +531,7 @@ fn reducer_projects_a_complete_valid_lifecycle() {
         state.operation_status(operation_id()),
         Some(OperationStatus::Succeeded)
     );
-    assert_eq!(state.revision, 12);
+    assert_eq!(state.revision, 13);
 }
 
 #[test]
@@ -872,6 +880,25 @@ fn operation_transitions_require_epoch_ownership_and_terminal_evidence() {
     .unwrap_err();
     assert_eq!(future.code(), TaskReduceErrorCode::InvalidOperationEvidence);
 
+    let self_evidence = reduce_task(
+        Some(started.clone()),
+        &envelope(
+            6,
+            task_id(),
+            TaskEvent::OperationTransitioned {
+                operation_id: operation_id(),
+                from: OperationStatus::Started,
+                to: OperationStatus::Succeeded,
+                evidence_sequences: vec![6],
+            },
+        ),
+    )
+    .unwrap_err();
+    assert_eq!(
+        self_evidence.code(),
+        TaskReduceErrorCode::InvalidOperationEvidence
+    );
+
     let unrelated = reduce_task(
         Some(started.clone()),
         &envelope(
@@ -910,16 +937,24 @@ fn operation_transitions_require_epoch_ownership_and_terminal_evidence() {
     .unwrap_err();
     assert_eq!(ownership.code(), TaskReduceErrorCode::EpochMismatch);
 
-    let succeeded = reduce_task(
+    let prior_result = apply(
         Some(started),
+        6,
+        TaskEvent::ProgressAssessed {
+            fingerprint: "operation-result".into(),
+            stalled: false,
+        },
+    );
+    let succeeded = reduce_task(
+        Some(prior_result),
         &envelope(
-            6,
+            7,
             task_id(),
             TaskEvent::OperationTransitioned {
                 operation_id: operation_id(),
                 from: OperationStatus::Started,
                 to: OperationStatus::Succeeded,
-                evidence_sequences: vec![5, 6],
+                evidence_sequences: vec![6],
             },
         ),
     )
@@ -964,11 +999,15 @@ fn generated_prefix_replay_matches_incremental_reduction_or_error_code() {
                 to: OperationStatus::Started,
                 evidence_sequences: vec![5, 6],
             },
+            TaskEvent::ProgressAssessed {
+                fingerprint: "operation-result".into(),
+                stalled: false,
+            },
             TaskEvent::OperationTransitioned {
                 operation_id: operation_id(),
                 from: OperationStatus::Started,
                 to: terminal,
-                evidence_sequences: vec![6, 7],
+                evidence_sequences: vec![7],
             },
             TaskEvent::UsageObserved {
                 epoch_id: epoch_id(),
@@ -1035,17 +1074,25 @@ fn generated_prefix_replay_matches_incremental_reduction_or_error_code() {
             to: OperationStatus::Started,
             evidence_sequences: vec![4, 5],
         },
+        TaskEvent::ProgressAssessed {
+            fingerprint: "uncertain-result".into(),
+            stalled: false,
+        },
         TaskEvent::OperationTransitioned {
             operation_id: operation_id(),
             from: OperationStatus::Started,
             to: OperationStatus::Uncertain,
-            evidence_sequences: vec![5, 6],
+            evidence_sequences: vec![6],
+        },
+        TaskEvent::ProgressAssessed {
+            fingerprint: "reconciliation-result".into(),
+            stalled: false,
         },
         TaskEvent::OperationTransitioned {
             operation_id: operation_id(),
             from: OperationStatus::Uncertain,
             to: OperationStatus::Reconciled,
-            evidence_sequences: vec![6, 7],
+            evidence_sequences: vec![8],
         },
         TaskEvent::EpochFinished {
             epoch_id: epoch_id(),

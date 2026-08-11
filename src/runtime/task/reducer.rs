@@ -223,9 +223,10 @@ pub fn reduce_task(
                 .iter()
                 .any(|sequence| *sequence > envelope.sequence)
                 || (to.requires_terminal_evidence()
-                    && !evidence_sequences
-                        .iter()
-                        .any(|sequence| *sequence > last_transition_sequence))
+                    && (evidence_sequences.contains(&envelope.sequence)
+                        || !evidence_sequences
+                            .iter()
+                            .any(|sequence| *sequence > last_transition_sequence)))
             {
                 return Err(error(TaskReduceErrorCode::InvalidOperationEvidence));
             }
