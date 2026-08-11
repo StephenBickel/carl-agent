@@ -2,41 +2,58 @@
 
 ## Implementation
 
-- Added strict, serializable `EvaluationScenario`, `ScheduledSteering`,
-  `EvaluationMetrics`, and `EvaluationResult` contracts. Metrics cannot carry
-  assistant prose, raw tool output, credentials, or absolute workspace paths.
-- Added a real offline evaluation around `TaskEngine<ScriptedPort, RuntimeStore>`.
-  It copies the fixture below a fresh owner-private root, performs one planning
-  request and exactly 100 tool-bearing work epochs, and derives task-semantic
-  metrics from durable `TaskEvent` history plus the final canonical checkpoint.
+- Strict `EvaluationScenario`, `ScheduledSteering`, `EvaluationMetrics`, and
+  `EvaluationResult` contracts deny unknown fields and cannot carry assistant prose,
+  raw tool output, credentials, or absolute workspace paths.
+- The offline evaluation runs a real `TaskEngine<ScriptedPort, RuntimeStore>` below
+  a fresh owner-private root. It performs one planning request and exactly 100
+  tool-bearing work epochs. Metrics come from durable `TaskEvent` history, the final
+  canonical checkpoint, and sanitized evaluator-owned safety observations.
 - The uninterrupted baseline records one planning request and 100 Work requests.
   The restart run records one planning request, 95 Work requests, and five Recovery
   requests because each seventeenth checkpoint is reopened and
   `resume_context` returns `UnavailableContext`; the engine durably emits matching
   `ProviderContextLost` and replacement `ProviderContextBound` events.
-- Forced `UsageUpdated` pressure produces exactly 33 completed compactions. Live
-  task controls inject steering at work epochs 11 and 61. The identifier
-  `needle_7f3a91c2` originates in epoch 1 and remains in the final checkpoint.
-- `restart_after_events` is interpreted against durable task-event sequence
-  numbers. The standard thresholds 300, 900, and 1500 map to safe checkpoint cuts
-  after work epochs 19, 57, and 95. Together with provider-loss cuts and a dedicated
-  checkpoint cut at epoch 59, the candidate executes nine real RuntimeStore
-  reopen/reconciliation cycles.
+- Forced `UsageUpdated` pressure produces exactly 33 completed compactions. Live task
+  controls inject steering at work epochs 11 and 61. The provider emits
+  `needle_7f3a91c2` only in epoch 1. The engine carries it through every one of the 100
+  canonical checkpoints, and each provider replacement reconstructs the continuation
+  from the durable `ContextPackage` rather than evaluator-held progress.
+- `restart_after_events` now means exact, safely resumable durable envelope sequences.
+  The standard targets 25, 72, and 119 are observed in the candidate at the committed
+  boundaries after work epochs 1, 4, and 7. An unreachable, repeated, out-of-range, or
+  passed sequence fails closed; there is no rounding or fallback. Together with five
+  provider-loss cuts and the epoch-59 cut, the candidate executes nine real
+  `RuntimeStore` reopen/reconciliation cycles.
+- Safe cuts pin the live engine future, observe the exact committed envelope from an
+  independent connection, and drop the future and runtime. They do not convert an
+  injected storage error into a fake process restart. The unresolved-`Started` test
+  likewise drops a live future after one side effect, then proves startup marks it
+  uncertain, blocks, and never redispatches it.
 - The replay digest normalizes final status, clause states, effect class, semantic
   request digest, semantic applied/failed/cancelled/uncertain outcome, normalized
   evidence shape, required exact identifiers, and the sorted relative fixture
   manifest. It excludes UUIDs, timestamps, provider IDs, absolute paths, prose,
   diffs, and raw output. The uninterrupted and restarted 100-epoch runs produce the
   same digest.
-- Added a real unresolved-Started cut after effect dispatch. Runtime startup marks
-  it uncertain, reconciliation blocks deterministically, and the effect count stays
-  one; it is never forced to complete or replayed.
-- Added the bounded ten-case repository matrix with a fresh copied fixture per case.
-  Positive cases require completed clauses; cancellation, hostile instruction,
-  secret, out-of-scope, and ambiguous-effect cases require their exact expected safe
-  outcome instead of synthetic completion.
-- Added the exact locked evaluation command to the existing cross-platform CI test
-  job and structurally enforced that command in `workflow_contract`.
+- The exhaustive operation-lifecycle proof remains the existing real-engine
+  `every_required_engine_restart_cut_restarts_from_real_engine_state` matrix. It
+  covers TaskCreated through provider binding across 12 required cuts. Task 13 pins
+  that test and every cut name as an explicit release dependency; the 100-epoch
+  digest test owns committed safe-boundary schedules, not a duplicate lifecycle
+  simulator.
+- The ten repository cases now use a bounded reusable `MatrixPort` around real
+  `RuntimeStore`/`TaskEngine` runs (16 scripted work epochs total). Durable events and
+  checkpoints drive metrics. The cases exercise command failure and recovery,
+  multi-file mutation, actual recovery-strategy selection, provider loss and reopen,
+  cancellation/interrupt lifecycle, policy denial, out-of-scope validation, and a
+  possibly-applied ambiguous effect that remains blocked after reopen without replay.
+- Fixture admission accepts exactly `README.md`, `Cargo.toml`, `src/lib.rs`, and
+  `tests/contract.rs`; extra files and symlinks fail closed. CI structurally requires
+  the exact locked command, ungated and exactly once in `jobs.test`.
+- `Store::read_task_events_after` pages an exclusive task-local tail. Checkpoint
+  construction now reads only events after the previous checkpoint while preserving
+  canonical merge and authority behavior.
 
 ## RED / GREEN evidence
 
@@ -58,16 +75,21 @@
    The strict public contracts and release-gate implementation made the public
    contract GREEN.
 
-3. The first real 100-epoch run reached the engine but returned
-   `Error: Invariant`. Phase tracing isolated an invalid in-process SQLite fault:
-   returning a storage error at a pre-intent boundary correctly drove the live
-   engine's blocking error path, which is not equivalent to process death. The
-   success schedule now interrupts only after committed checkpoints; the separate
-   unresolved-Started fixture proves the unsafe fail-closed path. All temporary
-   diagnostics were removed.
+3. Exact-sequence RED proved that the former threshold mapper rounded an unreachable
+   event to a later checkpoint. The new mapper accepts only an exact
+   `Checkpointing -> Active` envelope, and the cooperative candidate observer proves
+   that the actual last durable sequence equals the configured target.
 
-4. The final main scenario is GREEN with exact metrics: 100 work epochs, 101
-   semantic provider requests, 100 tool intents, two required clauses, 33
+4. Single-emission RED cleared volatile progress at every reopen. Recovery initially
+   failed with `Error: Invariant`; durable journal reconstruction plus canonical
+   `ContextPackage` parsing made all checkpoints and replacements retain the needle.
+
+5. Matrix RED showed the old release matrix fabricated counters without running the
+   engine. The real 10-case matrix is GREEN in 1.00s and its out-of-scope and
+   ambiguous-effect assertions now depend on actual intent/resolve/reopen events.
+
+6. The final main scenario is GREEN with exact metrics: 100 work epochs, 101
+   durable provider requests, 100 tool intents, two required clauses, 33
    compactions, nine evaluator restarts, five provider replacements, and zero
    duplicates, lost identifiers, out-of-scope changes, orphans, or secret-policy
    violations.
@@ -76,10 +98,16 @@
 
 ```text
 cargo test --locked --test long_horizon_eval
-PASS: 4 passed, 0 failed; test body 49.35s (real 49.83s)
+PASS: 7 passed, 0 failed; test body 30.40s (real 30.68s)
+
+cargo test --locked --test epoch_engine_contract every_required_engine_restart_cut_restarts_from_real_engine_state -- --exact
+PASS: 1 passed, 0 failed; 1.37s
 
 cargo test --locked --test workflow_contract
-PASS: 38 passed, 0 failed; 0.01s
+PASS: 39 passed, 0 failed; 0.01s
+
+cargo test --locked --test task_storage_contract
+PASS: 21 passed, 0 failed; 3.51s
 
 cargo fmt --all -- --check
 PASS: exit 0
@@ -91,13 +119,13 @@ git diff --check
 PASS: exit 0
 ```
 
-The plan's under-ten-second target is not met on this host. A read-only performance
-audit found no evaluator sleeps, subprocesses, network calls, credentials, or
-timeouts. The stable cost comes from production's O(n^2) full-journal checkpoint
-replay and repeated startup authority scans. Optimizing that shared storage/runtime
-path belongs in a separately reviewed production task; this task preserves the
-strong uninterrupted-versus-restarted two-run proof. The root agent owns the Task
-13 full `cargo test --locked --all-features` milestone gate after independent review.
+The plan's under-ten-second target is not met on this host. The exact test improved
+from 49.35s to 30.40s by removing full-prefix reads from checkpoint construction
+without weakening the two real 100-epoch runs. No evaluator sleeps, subprocesses,
+network calls, credentials, or live providers are involved. Remaining cost includes
+full authoritative checkpoint validation and repeated startup reconciliation; this
+round intentionally did not weaken those checks. The root agent owns the Task 13 full
+`cargo test --locked --all-features` milestone gate after independent review.
 
 No Carl service/ACP process remained. `SECURITY.md`, migrations, `Cargo.lock`, and
 Task 14 files were not modified.
@@ -105,3 +133,4 @@ Task 14 files were not modified.
 ## Commit
 
 - `5d1b01b test: add deterministic long-horizon evaluations`
+- `3e4293d test: harden deterministic long-horizon evaluations`

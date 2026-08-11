@@ -1815,11 +1815,15 @@ checkpoint.
 
 `restart_after_events` means durable task-event sequence numbers, not provider-event
 counts. Reopen `RuntimeStore`, construct a fresh `TaskEngine`, call startup
-reconciliation, and continue from the durable checkpoint at each safe cut. Exercise
-every safely resumable operation lifecycle cut in the success digest. Cuts with an
-unresolved `Started` operation are intentionally unsafe: assert deterministic
-fail-closed reconciliation and never force them to complete. Use paused Tokio time;
-timestamps are excluded from the digest, so no injected production clock is needed.
+reconciliation, and continue from the durable checkpoint at each exact committed safe
+cut. The normalized 100-epoch success digest covers those committed process-death
+schedules. Exhaustive operation-lifecycle semantics remain owned by
+`tests/epoch_engine_contract.rs::every_required_engine_restart_cut_restarts_from_real_engine_state`;
+Task 13 must pin that real-engine matrix and all required cuts as a release dependency
+rather than duplicate it. Cuts with an unresolved `Started` operation are
+intentionally unsafe: assert deterministic fail-closed reconciliation and never force
+them to complete. Use paused Tokio time; timestamps are excluded from the digest, so
+no injected production clock is needed.
 
 - [ ] **Step 3: Add repository scenarios**
 

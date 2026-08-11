@@ -45,3 +45,4 @@ Task 12: fix round 4/5 (1 blocker addressed, 0 open; commits 5523ac0..fe2ad37; d
 Task 12: fix round 5/5 (1 blocker addressed, 0 open; commits 3e0b0bb..ab3b4c7; deterministic terminal handoff, service E2E, and strict locked gates passed)
 Task 12: complete (commits 1a5fe3a..0abe383, independent review clean; final cargo test --locked --all-features passed)
 Task 13: implementation complete (commit 5d1b01b; deterministic 100-epoch replay, unsafe-cut, repository matrix, workflow contract, and strict locked gates passed; independent review pending)
+Task 13: fix round 1/5 (7 findings addressed, 0 open; commit 3e4293d; exact cooperative cuts, durable needle reconstruction, real-engine matrix, exact fixture/CI contracts, tail-read optimization, focused lifecycle gate, and strict locked gates passed)
