@@ -471,6 +471,16 @@ pub struct TaskSnapshot {
     pub provider_context: Option<String>,
     pub revision: u64,
     operations: BTreeMap<OperationId, OperationSnapshot>,
+    #[serde(default)]
+    pending_recovery: Option<(EpochId, RecoveryStrategy, String)>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderRequestPurpose {
+    ContractPlanning,
+    Work,
+    Recovery,
 }
 
 impl TaskSnapshot {
@@ -491,6 +501,7 @@ impl TaskSnapshot {
             provider_context: None,
             revision: 1,
             operations: BTreeMap::new(),
+            pending_recovery: None,
         }
     }
 
@@ -531,6 +542,27 @@ impl TaskSnapshot {
                 operation.last_transition_sequence,
             )
         })
+    }
+
+    pub(crate) fn pending_recovery(&self) -> Option<&(EpochId, RecoveryStrategy, String)> {
+        self.pending_recovery.as_ref()
+    }
+
+    pub(crate) fn start_recovery(
+        &mut self,
+        epoch_id: EpochId,
+        strategy: RecoveryStrategy,
+        strategy_fingerprint: String,
+    ) -> bool {
+        if self.pending_recovery.is_some() {
+            return false;
+        }
+        self.pending_recovery = Some((epoch_id, strategy, strategy_fingerprint));
+        true
+    }
+
+    pub(crate) fn finish_recovery(&mut self) {
+        self.pending_recovery = None;
     }
 
     pub(crate) fn transition_operation(
@@ -579,6 +611,15 @@ impl TaskSnapshot {
             .values()
             .any(|operation| !operation.status.is_resolved())
     }
+
+    pub(crate) fn started_operation_ids(&self) -> Vec<OperationId> {
+        self.operations
+            .iter()
+            .filter_map(|(operation_id, operation)| {
+                (operation.status == OperationStatus::Started).then_some(*operation_id)
+            })
+            .collect()
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -612,6 +653,18 @@ pub enum TaskEvent {
         epoch_id: EpochId,
         #[serde(deserialize_with = "deserialize_event_identifier")]
         report_digest: String,
+    },
+    ProviderRequestRecorded {
+        epoch_id: EpochId,
+        purpose: ProviderRequestPurpose,
+        request_sequence: u64,
+        #[serde(deserialize_with = "deserialize_event_identifier")]
+        request_digest: String,
+    },
+    ProviderEpochBound {
+        epoch_id: EpochId,
+        #[serde(deserialize_with = "deserialize_event_identifier")]
+        provider_epoch_id: String,
     },
     OperationIntentRecorded {
         operation_id: OperationId,
@@ -648,7 +701,14 @@ pub enum TaskEvent {
         fingerprint: String,
         stalled: bool,
     },
+    RecoveryAttemptStarted {
+        epoch_id: EpochId,
+        strategy: RecoveryStrategy,
+        #[serde(deserialize_with = "deserialize_event_identifier")]
+        strategy_fingerprint: String,
+    },
     RecoveryAttemptRecorded {
+        epoch_id: EpochId,
         strategy: RecoveryStrategy,
         #[serde(deserialize_with = "deserialize_event_identifier")]
         strategy_fingerprint: String,
@@ -709,6 +769,12 @@ impl TaskEvent {
             Self::ContractRevised { contract } => contract.validate(),
             Self::EpochStarted { objective, .. } => validate_event_text(objective),
             Self::EpochFinished { report_digest, .. } => validate_event_identifier(report_digest),
+            Self::ProviderRequestRecorded { request_digest, .. } => {
+                validate_event_identifier(request_digest)
+            }
+            Self::ProviderEpochBound {
+                provider_epoch_id, ..
+            } => validate_event_identifier(provider_epoch_id),
             Self::OperationIntentRecorded {
                 item_id,
                 request_digest,
@@ -742,7 +808,12 @@ impl TaskEvent {
                 }
             },
             Self::ProgressAssessed { fingerprint, .. } => validate_event_identifier(fingerprint),
-            Self::RecoveryAttemptRecorded {
+            Self::RecoveryAttemptStarted {
+                strategy,
+                strategy_fingerprint,
+                ..
+            }
+            | Self::RecoveryAttemptRecorded {
                 strategy,
                 strategy_fingerprint,
                 ..

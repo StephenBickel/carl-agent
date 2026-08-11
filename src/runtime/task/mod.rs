@@ -36,6 +36,6 @@ pub(crate) use types::OperationEvidenceState;
 pub use types::{
     CheckpointId, ClauseStatus, CompletionClause, CompletionContract, ContextPackageId,
     EffectClass, EpochId, EvidenceRef, NormalizedOperationEvidence, OperationId, OperationStatus,
-    TaskBudget, TaskEvent, TaskId, TaskSnapshot, TaskStatus, TaskValidationError,
-    TaskValidationErrorCode, classify_effect,
+    ProviderRequestPurpose, TaskBudget, TaskEvent, TaskId, TaskSnapshot, TaskStatus,
+    TaskValidationError, TaskValidationErrorCode, classify_effect,
 };

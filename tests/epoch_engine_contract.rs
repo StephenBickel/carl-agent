@@ -11,19 +11,19 @@ use carl::events::SessionId;
 use carl::policy::Sha256Digest;
 use carl::runtime::agent_port::{
     AgentCapabilities, AgentContextId, AgentEffectKind, AgentEffectRequest, AgentEpochId,
-    AgentEvent, AgentFuture, AgentItem, AgentModel, AgentPort, AgentPortError, AgentPortErrorCode,
-    AgentProcess, AgentRequestId, EffectDecision, ResumeAgentContext, StartAgentContext,
-    StartAgentEpoch,
+    AgentErrorProvenance, AgentEvent, AgentFuture, AgentItem, AgentModel, AgentPort,
+    AgentPortError, AgentPortErrorCode, AgentProcess, AgentRequestId, EffectDecision,
+    ResumeAgentContext, StartAgentContext, StartAgentEpoch,
 };
 use carl::runtime::task::{
     CanonicalCheckpoint, CheckpointId, ClauseEvidence, ClauseStatus, CompletionClause,
     CompletionContract, DecisionRecord, EffectClass, EpochDisposition, EvidenceRef,
     ExactIdentifier, OperationCheckpoint, OperationEvidence, OperationId, OperationStatus,
-    ProcessCheckpoint, ProgressAssessment, ProviderCheckpoint, RecoveryAttempt,
-    RecoveryAttemptOutcome, RecoveryStrategy, ReportErrorCode, RepositoryCheckpoint, StartTask,
-    TaskBudget, TaskEngine, TaskEngineUpdate, TaskId, TaskStatus, WorkEvidence, assess_progress,
-    assess_progress_with_recovery_attempts, decide_completion, parse_epoch_report,
-    recovery_attempt_fingerprint,
+    ProcessCheckpoint, ProgressAssessment, ProviderCheckpoint, ProviderRequestPurpose,
+    RecoveryAttempt, RecoveryAttemptOutcome, RecoveryStrategy, ReportErrorCode,
+    RepositoryCheckpoint, StartTask, TaskBudget, TaskEngine, TaskEngineUpdate, TaskId, TaskStatus,
+    WorkEvidence, assess_progress, assess_progress_with_recovery_attempts, decide_completion,
+    parse_epoch_report, recovery_attempt_fingerprint,
 };
 use carl::storage::Store;
 use rusqlite::Connection;
@@ -81,6 +81,8 @@ struct EnginePortState {
     context_starts: usize,
     epoch_starts: Vec<StartAgentEpoch>,
     epoch_number: usize,
+    planning_attempts: usize,
+    work_number: usize,
     events: VecDeque<AgentEvent>,
     work: VecDeque<(WorkKind, &'static str, &'static str)>,
     latest_operation_id: Option<String>,
@@ -90,6 +92,27 @@ struct EnginePortState {
     replacements: usize,
     usage: Option<(u64, u64)>,
     ambiguous_event_failure: bool,
+    definitely_not_applied_event_failure: bool,
+    invalid_event_after_binding: bool,
+    binding_failure: Option<AgentErrorProvenance>,
+    resolve_failure: Option<AgentErrorProvenance>,
+    work_effect_kind: Option<AgentEffectKind>,
+    work_effect_summary: Option<String>,
+    work_start_failure: Option<AgentErrorProvenance>,
+    invalid_first_contract: bool,
+    large_invalid_planning_outputs: bool,
+    planning_usage: Option<(u64, u64)>,
+    compaction_failure_once: bool,
+    terminal_statuses: VecDeque<&'static str>,
+    additional_effects_in_epoch: usize,
+    current_item_id: Option<String>,
+    interrupts: usize,
+    pending_work_stream: bool,
+    pending_planning_stream: bool,
+    oversized_planning_stream: bool,
+    oversized_work_stream: bool,
+    planning_event_flood: bool,
+    oversized_diff_stream: bool,
 }
 
 impl EnginePort {
@@ -127,6 +150,8 @@ impl EnginePort {
                 context_starts: 0,
                 epoch_starts: Vec::new(),
                 epoch_number: 0,
+                planning_attempts: 0,
+                work_number: 0,
                 events: VecDeque::new(),
                 work: work.into(),
                 latest_operation_id: None,
@@ -136,8 +161,73 @@ impl EnginePort {
                 replacements: 0,
                 usage: None,
                 ambiguous_event_failure: false,
+                definitely_not_applied_event_failure: false,
+                invalid_event_after_binding: false,
+                binding_failure: None,
+                resolve_failure: None,
+                work_effect_kind: None,
+                work_effect_summary: None,
+                work_start_failure: None,
+                invalid_first_contract: false,
+                large_invalid_planning_outputs: false,
+                planning_usage: None,
+                compaction_failure_once: false,
+                terminal_statuses: VecDeque::new(),
+                additional_effects_in_epoch: 0,
+                current_item_id: None,
+                interrupts: 0,
+                pending_work_stream: false,
+                pending_planning_stream: false,
+                oversized_planning_stream: false,
+                oversized_work_stream: false,
+                planning_event_flood: false,
+                oversized_diff_stream: false,
             })),
         }
+    }
+
+    fn repaired_contract() -> Self {
+        let port = Self::small_edit();
+        port.state.lock().unwrap().invalid_first_contract = true;
+        port
+    }
+
+    fn repaired_contract_then_unavailable_work() -> Self {
+        let port = Self::new([]);
+        port.state.lock().unwrap().invalid_first_contract = true;
+        port
+    }
+
+    fn fallback_contract_under_estimated_pressure() -> Self {
+        let port = Self::small_edit();
+        port.state.lock().unwrap().large_invalid_planning_outputs = true;
+        port
+    }
+
+    fn planning_usage_under_context_pressure() -> Self {
+        let port = Self::small_edit();
+        port.state.lock().unwrap().planning_usage = Some((102_400, 128_000));
+        port
+    }
+
+    fn completion_checkpoint_then_compaction_failure() -> Self {
+        let port = Self::small_edit_under_context_pressure();
+        port.state.lock().unwrap().compaction_failure_once = true;
+        port
+    }
+
+    fn continuation_checkpoint_then_compaction_failure() -> Self {
+        let port = Self::new([(
+            WorkKind::Command,
+            "first epoch completed before crash",
+            "continue:Finish without repeating first epoch",
+        )]);
+        {
+            let mut state = port.state.lock().unwrap();
+            state.usage = Some((102_400, 128_000));
+            state.compaction_failure_once = true;
+        }
+        port
     }
 
     fn ambiguous_event_failure() -> Self {
@@ -146,9 +236,90 @@ impl EnginePort {
         port
     }
 
+    fn definitely_not_applied_event_failure() -> Self {
+        let port = Self::small_edit();
+        port.state
+            .lock()
+            .unwrap()
+            .definitely_not_applied_event_failure = true;
+        port
+    }
+
+    fn invalid_event_after_binding() -> Self {
+        let port = Self::small_edit();
+        port.state.lock().unwrap().invalid_event_after_binding = true;
+        port
+    }
+
+    fn binding_failure(provenance: AgentErrorProvenance) -> Self {
+        let port = Self::small_edit();
+        port.state.lock().unwrap().binding_failure = Some(provenance);
+        port
+    }
+
+    fn resolve_failure(provenance: AgentErrorProvenance) -> Self {
+        let port = Self::small_edit();
+        port.state.lock().unwrap().resolve_failure = Some(provenance);
+        port
+    }
+
+    fn unsupported_network_effect() -> Self {
+        let port = Self::small_edit();
+        port.state.lock().unwrap().work_effect_kind = Some(AgentEffectKind::Network);
+        port
+    }
+
+    fn work_start_failure(provenance: AgentErrorProvenance) -> Self {
+        let port = Self::small_edit();
+        port.state.lock().unwrap().work_start_failure = Some(provenance);
+        port
+    }
+
     fn small_edit_under_context_pressure() -> Self {
         let port = Self::small_edit();
         port.state.lock().unwrap().usage = Some((102_400, 128_000));
+        port
+    }
+
+    fn two_effects_in_one_epoch() -> Self {
+        let port = Self::small_edit();
+        port.state.lock().unwrap().additional_effects_in_epoch = 1;
+        port
+    }
+
+    fn pending_effect() -> Self {
+        let port = Self::small_edit();
+        port.state.lock().unwrap().pending_work_stream = true;
+        port
+    }
+
+    fn pending_planning() -> Self {
+        let port = Self::small_edit();
+        port.state.lock().unwrap().pending_planning_stream = true;
+        port
+    }
+
+    fn oversized_planning_stream() -> Self {
+        let port = Self::small_edit();
+        port.state.lock().unwrap().oversized_planning_stream = true;
+        port
+    }
+
+    fn oversized_work_stream() -> Self {
+        let port = Self::small_edit();
+        port.state.lock().unwrap().oversized_work_stream = true;
+        port
+    }
+
+    fn planning_event_flood() -> Self {
+        let port = Self::small_edit();
+        port.state.lock().unwrap().planning_event_flood = true;
+        port
+    }
+
+    fn oversized_diff_stream() -> Self {
+        let port = Self::small_edit();
+        port.state.lock().unwrap().oversized_diff_stream = true;
         port
     }
 
@@ -194,7 +365,12 @@ impl AgentPort for EnginePort {
     fn compact_context(&mut self, _context_id: &AgentContextId) -> AgentFuture<'_, ()> {
         let state = Arc::clone(&self.state);
         Box::pin(async move {
-            state.lock().unwrap().compactions += 1;
+            let mut state = state.lock().unwrap();
+            state.compactions += 1;
+            if state.compaction_failure_once {
+                state.compaction_failure_once = false;
+                return Err(AgentPortError::from_code(AgentPortErrorCode::Transport));
+            }
             Ok(())
         })
     }
@@ -217,39 +393,92 @@ impl AgentPort for EnginePort {
         let state = Arc::clone(&self.state);
         Box::pin(async move {
             let mut state = state.lock().unwrap();
+            let planning = request.permission_mode == PermissionMode::Plan;
             state.epoch_starts.push(request);
             state.epoch_number += 1;
             let epoch_number = state.epoch_number;
             let epoch_id = AgentEpochId::parse(format!("engine-epoch-{epoch_number}"))?;
             let context_id = AgentContextId::parse("engine-context")?;
+            if !planning && let Some(provenance) = state.work_start_failure.take() {
+                return Err(scripted_error(provenance));
+            }
             state.events.push_back(AgentEvent::EpochStarted {
                 context_id: context_id.clone(),
                 epoch_id: epoch_id.clone(),
             });
-            if epoch_number == 1 {
-                state.events.push_back(AgentEvent::AssistantDelta {
-                    context_id: context_id.clone(),
-                    epoch_id: epoch_id.clone(),
-                    text: "<carl-completion-contract>{\"version\":1,\"goal\":\"Complete the owner request\",\"constraints\":[],\"clauses\":[{\"id\":\"requested-outcome\",\"description\":\"The requested change is implemented\",\"required\":true,\"status\":\"pending\",\"evidence\":[]},{\"id\":\"explicit-verification\",\"description\":\"The change is explicitly verified\",\"required\":true,\"status\":\"pending\",\"evidence\":[]}]}</carl-completion-contract>".into(),
-                });
+            if planning {
+                state.planning_attempts += 1;
+                if state.pending_planning_stream {
+                    return Ok(epoch_id);
+                }
+                let planning_attempt = state.planning_attempts;
+                let text = if state.large_invalid_planning_outputs {
+                    "x".repeat(60 * 1024)
+                } else if state.invalid_first_contract && planning_attempt == 1 {
+                    "invalid contract".to_owned()
+                } else {
+                    "<carl-completion-contract>{\"version\":1,\"goal\":\"Complete the owner request\",\"constraints\":[],\"clauses\":[{\"id\":\"requested-outcome\",\"description\":\"The requested change is implemented\",\"required\":true,\"status\":\"pending\",\"evidence\":[]},{\"id\":\"explicit-verification\",\"description\":\"The change is explicitly verified\",\"required\":true,\"status\":\"pending\",\"evidence\":[]}]}</carl-completion-contract>".to_owned()
+                };
+                let planning_chunks = if state.oversized_planning_stream {
+                    vec!["x".repeat(40 * 1024), "y".repeat(40 * 1024)]
+                } else {
+                    vec![text]
+                };
+                if state.planning_event_flood {
+                    for event_number in 0..8_193 {
+                        state.events.push_back(AgentEvent::CompactionStarted {
+                            context_id: context_id.clone(),
+                            item_id: format!("compact-{event_number}"),
+                        });
+                    }
+                }
+                for text in planning_chunks {
+                    state.events.push_back(AgentEvent::AssistantDelta {
+                        context_id: context_id.clone(),
+                        epoch_id: epoch_id.clone(),
+                        text,
+                    });
+                }
+                if let Some((total_tokens, context_window)) = state.planning_usage.take() {
+                    state.events.push_back(AgentEvent::UsageUpdated {
+                        context_id: context_id.clone(),
+                        epoch_id: epoch_id.clone(),
+                        usage: carl::runtime::agent_port::AgentUsage {
+                            last_total_tokens: total_tokens,
+                            total_tokens,
+                            model_context_window: Some(context_window),
+                        },
+                    });
+                }
                 state.events.push_back(AgentEvent::EpochCompleted {
                     context_id,
                     epoch_id: epoch_id.clone(),
                     status: "completed".into(),
                 });
             } else {
+                state.work_number += 1;
+                let work_number = state.work_number;
                 let Some((kind, _, _)) = state.work.front().copied() else {
                     return Err(AgentPortError::definitely_not_applied(
                         AgentPortErrorCode::Transport,
                     ));
                 };
-                let item_id = format!("work-item-{}", epoch_number - 1);
+                let item_id = format!("work-item-{work_number}");
+                state.current_item_id = Some(item_id.clone());
                 let item = work_item(kind, &item_id, "inProgress");
                 state.events.push_back(AgentEvent::ItemStarted {
                     context_id: context_id.clone(),
                     epoch_id: epoch_id.clone(),
                     item,
                 });
+                let effect_kind = state.work_effect_kind.unwrap_or(match kind {
+                    WorkKind::Command => AgentEffectKind::Command,
+                    WorkKind::FileChange => AgentEffectKind::FileChange,
+                });
+                let effect_summary = state
+                    .work_effect_summary
+                    .clone()
+                    .unwrap_or_else(|| "bounded scripted work".into());
                 state
                     .events
                     .push_back(AgentEvent::EffectRequested(AgentEffectRequest {
@@ -257,11 +486,8 @@ impl AgentPort for EnginePort {
                         epoch_id: epoch_id.clone(),
                         request_id: AgentRequestId::parse(format!("request-{epoch_number}"))?,
                         item_id,
-                        kind: match kind {
-                            WorkKind::Command => AgentEffectKind::Command,
-                            WorkKind::FileChange => AgentEffectKind::FileChange,
-                        },
-                        summary: "bounded scripted work".into(),
+                        kind: effect_kind,
+                        summary: effect_summary,
                         request_digest: Sha256Digest::parse(format!("{:064x}", epoch_number))
                             .expect("fixed digest is valid"),
                     }));
@@ -278,9 +504,15 @@ impl AgentPort for EnginePort {
     ) -> AgentFuture<'_, ()> {
         let state = Arc::clone(&self.state);
         Box::pin(async move {
-            state.lock().unwrap().steers.push(text.clone());
+            let mut state = state.lock().unwrap();
+            if text.starts_with("carl-operation-id:")
+                && let Some(provenance) = state.binding_failure.take()
+            {
+                return Err(scripted_error(provenance));
+            }
+            state.steers.push(text.clone());
             if let Some(operation_id) = text.strip_prefix("carl-operation-id:") {
-                state.lock().unwrap().latest_operation_id = Some(operation_id.trim().to_owned());
+                state.latest_operation_id = Some(operation_id.trim().to_owned());
             }
             Ok(())
         })
@@ -291,25 +523,55 @@ impl AgentPort for EnginePort {
         _context_id: &AgentContextId,
         _epoch_id: &AgentEpochId,
     ) -> AgentFuture<'_, ()> {
-        Box::pin(async { Ok(()) })
+        let state = Arc::clone(&self.state);
+        Box::pin(async move {
+            state.lock().unwrap().interrupts += 1;
+            Ok(())
+        })
     }
 
     fn next_event(&mut self) -> AgentFuture<'_, AgentEvent> {
         let state = Arc::clone(&self.state);
         Box::pin(async move {
-            let mut state = state.lock().unwrap();
-            if let Some(event) = state.events.pop_front() {
-                return Ok(event);
+            let pending_work_stream = {
+                let mut state = state.lock().unwrap();
+                if let Some(event) = state.events.pop_front() {
+                    return Ok(event);
+                }
+                (state.pending_work_stream && state.latest_operation_id.is_some())
+                    || (state.pending_planning_stream && state.work_number == 0)
+            };
+            if pending_work_stream {
+                return std::future::pending().await;
             }
+            let mut state = state.lock().unwrap();
             if state.ambiguous_event_failure && state.latest_operation_id.is_some() {
                 state.ambiguous_event_failure = false;
                 return Err(AgentPortError::from_code(AgentPortErrorCode::Transport));
             }
-            let (kind, summary, disposition) = state.work.pop_front().expect("scripted event");
+            if state.definitely_not_applied_event_failure && state.latest_operation_id.is_some() {
+                state.definitely_not_applied_event_failure = false;
+                return Err(AgentPortError::definitely_not_applied(
+                    AgentPortErrorCode::Transport,
+                ));
+            }
+            if state.invalid_event_after_binding && state.latest_operation_id.is_some() {
+                state.invalid_event_after_binding = false;
+                return Ok(AgentEvent::AssistantDelta {
+                    context_id: AgentContextId::parse("engine-context")?,
+                    epoch_id: AgentEpochId::parse(format!("engine-epoch-{}", state.epoch_number))?,
+                    text: "x".repeat(1_048_577),
+                });
+            }
+            let (kind, summary, disposition) = state.work.front().copied().expect("scripted event");
             let epoch_number = state.epoch_number;
+            let work_number = state.work_number;
             let context_id = AgentContextId::parse("engine-context")?;
             let epoch_id = AgentEpochId::parse(format!("engine-epoch-{epoch_number}"))?;
-            let item_id = format!("work-item-{}", epoch_number - 1);
+            let item_id = state
+                .current_item_id
+                .clone()
+                .expect("the active work item is known");
             let operation_id = state
                 .latest_operation_id
                 .take()
@@ -319,6 +581,40 @@ impl AgentPort for EnginePort {
                 epoch_id: epoch_id.clone(),
                 item: work_item(kind, &item_id, "completed"),
             });
+            if state.additional_effects_in_epoch > 0 {
+                state.additional_effects_in_epoch -= 1;
+                let extra_number = state.additional_effects_in_epoch + 1;
+                let next_item_id = format!("work-item-{work_number}-extra-{extra_number}");
+                state.current_item_id = Some(next_item_id.clone());
+                state.events.push_back(AgentEvent::ItemStarted {
+                    context_id: context_id.clone(),
+                    epoch_id: epoch_id.clone(),
+                    item: work_item(kind, &next_item_id, "inProgress"),
+                });
+                state
+                    .events
+                    .push_back(AgentEvent::EffectRequested(AgentEffectRequest {
+                        context_id,
+                        epoch_id,
+                        request_id: AgentRequestId::parse(format!(
+                            "request-{epoch_number}-extra-{extra_number}"
+                        ))?,
+                        item_id: next_item_id,
+                        kind: match kind {
+                            WorkKind::Command => AgentEffectKind::Command,
+                            WorkKind::FileChange => AgentEffectKind::FileChange,
+                        },
+                        summary: "second bounded scripted work".into(),
+                        request_digest: Sha256Digest::parse(format!(
+                            "{:064x}",
+                            epoch_number * 100 + extra_number
+                        ))
+                        .expect("fixed digest is valid"),
+                    }));
+                return Ok(state.events.pop_front().expect("completion event queued"));
+            }
+            state.current_item_id = None;
+            state.work.pop_front();
             if let Some((total_tokens, context_window)) = state.usage.take() {
                 state.events.push_back(AgentEvent::UsageUpdated {
                     context_id: context_id.clone(),
@@ -329,6 +625,24 @@ impl AgentPort for EnginePort {
                         model_context_window: Some(context_window),
                     },
                 });
+            }
+            if state.oversized_work_stream {
+                for chunk in *b"abcd" {
+                    state.events.push_back(AgentEvent::AssistantDelta {
+                        context_id: context_id.clone(),
+                        epoch_id: epoch_id.clone(),
+                        text: char::from(chunk).to_string().repeat(80 * 1024),
+                    });
+                }
+            }
+            if state.oversized_diff_stream {
+                for chunk in *b"ab" {
+                    state.events.push_back(AgentEvent::DiffUpdated {
+                        context_id: context_id.clone(),
+                        epoch_id: epoch_id.clone(),
+                        diff: char::from(chunk).to_string().repeat(600 * 1024),
+                    });
+                }
             }
             let (disposition, next_objective, clauses) = if let Some(next) =
                 disposition.strip_prefix("continue:")
@@ -356,10 +670,11 @@ impl AgentPort for EnginePort {
                 epoch_id: epoch_id.clone(),
                 text: format!("<carl-epoch-report>{{\"schema_version\":1,\"disposition\":{disposition:?},\"summary\":{summary:?}{next_objective},\"clause_evidence\":[{clauses}],\"exact_identifiers\":[]}}</carl-epoch-report>"),
             });
+            let terminal_status = state.terminal_statuses.pop_front().unwrap_or("completed");
             state.events.push_back(AgentEvent::EpochCompleted {
                 context_id,
                 epoch_id,
-                status: "completed".into(),
+                status: terminal_status.into(),
             });
             Ok(state.events.pop_front().expect("completion event queued"))
         })
@@ -372,7 +687,11 @@ impl AgentPort for EnginePort {
     ) -> AgentFuture<'_, ()> {
         let state = Arc::clone(&self.state);
         Box::pin(async move {
-            state.lock().unwrap().resolved.push(decision);
+            let mut state = state.lock().unwrap();
+            state.resolved.push(decision);
+            if let Some(provenance) = state.resolve_failure.take() {
+                return Err(scripted_error(provenance));
+            }
             Ok(())
         })
     }
@@ -394,6 +713,17 @@ impl AgentPort for EnginePort {
 
     fn shutdown(&mut self) -> AgentFuture<'_, ()> {
         Box::pin(async { Ok(()) })
+    }
+}
+
+const fn scripted_error(provenance: AgentErrorProvenance) -> AgentPortError {
+    match provenance {
+        AgentErrorProvenance::DefinitelyNotApplied => {
+            AgentPortError::definitely_not_applied(AgentPortErrorCode::Transport)
+        }
+        AgentErrorProvenance::PossiblyApplied => {
+            AgentPortError::from_code(AgentPortErrorCode::Transport)
+        }
     }
 }
 
@@ -428,6 +758,228 @@ fn start_task(session_id: SessionId, workspace: &Path) -> TestResult<StartTask> 
     })
 }
 
+fn only_operation_status(store: &Store, task_id: TaskId) -> TestResult<OperationStatus> {
+    let operation_id = store
+        .read_task_events(task_id)?
+        .into_iter()
+        .find_map(|envelope| match envelope.event {
+            carl::events::Event::TaskLifecycle {
+                event: carl::runtime::task::TaskEvent::OperationIntentRecorded { operation_id, .. },
+                ..
+            } => Some(operation_id),
+            _ => None,
+        })
+        .expect("one operation intent is durable");
+    Ok(store
+        .get_task(task_id)?
+        .expect("task remains projected")
+        .snapshot
+        .operation_status(operation_id)
+        .expect("operation remains projected"))
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn task_and_context_binding_precede_the_first_planning_provider_request() -> TestResult {
+    let fixture = EngineFixture::new()?;
+    let store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let mut engine = TaskEngine::new(store, EnginePort::small_edit());
+
+    let snapshot = engine
+        .start(start_task(session.id, &fixture.workspace)?)
+        .await?;
+    let events = engine.store().read_task_events(snapshot.task_id)?;
+    let created = events
+        .iter()
+        .position(|envelope| {
+            matches!(
+                envelope.event,
+                carl::events::Event::TaskLifecycle {
+                    event: carl::runtime::task::TaskEvent::Created { .. },
+                    ..
+                }
+            )
+        })
+        .expect("task creation is durable");
+    let bound = events
+        .iter()
+        .position(|envelope| {
+            matches!(
+                envelope.event,
+                carl::events::Event::TaskLifecycle {
+                    event: carl::runtime::task::TaskEvent::ProviderContextBound { .. },
+                    ..
+                }
+            )
+        })
+        .expect("provider context binding is durable");
+    let planning_request = events
+        .iter()
+        .position(|envelope| {
+            matches!(
+                envelope.event,
+                carl::events::Event::TaskLifecycle {
+                    event: carl::runtime::task::TaskEvent::ProviderRequestRecorded {
+                        purpose: ProviderRequestPurpose::ContractPlanning,
+                        ..
+                    },
+                    ..
+                }
+            )
+        })
+        .expect("planning provider request is durable");
+
+    assert!(created < bound && bound < planning_request);
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn multiline_frontend_requests_create_a_valid_durable_fallback_contract() -> TestResult {
+    let fixture = EngineFixture::new()?;
+    let store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let mut engine = TaskEngine::new(store, EnginePort::small_edit());
+    let mut input = start_task(session.id, &fixture.workspace)?;
+    input.request = "Event ID: abc\nChannel: test\nContent: verify the repository".into();
+
+    let snapshot = engine.start(input).await?;
+
+    assert_eq!(snapshot.status, TaskStatus::Completed);
+    assert!(!snapshot.contract.goal.chars().any(char::is_control));
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn invalid_contract_repair_records_exactly_two_planning_provider_requests() -> TestResult {
+    let fixture = EngineFixture::new()?;
+    let store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let mut engine = TaskEngine::new(store, EnginePort::repaired_contract());
+
+    let snapshot = engine
+        .start(start_task(session.id, &fixture.workspace)?)
+        .await?;
+    let requests = engine
+        .store()
+        .read_task_events(snapshot.task_id)?
+        .into_iter()
+        .filter_map(|envelope| match envelope.event {
+            carl::events::Event::TaskLifecycle {
+                event:
+                    carl::runtime::task::TaskEvent::ProviderRequestRecorded {
+                        purpose,
+                        request_sequence,
+                        ..
+                    },
+                ..
+            } => Some((purpose, request_sequence)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        requests,
+        [
+            (ProviderRequestPurpose::ContractPlanning, 0),
+            (ProviderRequestPurpose::ContractPlanning, 1),
+            (ProviderRequestPurpose::Work, 2),
+        ]
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn restart_rehydrates_exact_planning_and_work_request_accounting() -> TestResult {
+    let fixture = EngineFixture::new()?;
+    let store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let mut first = TaskEngine::new(store, EnginePort::repaired_contract_then_unavailable_work());
+    let mut input = start_task(session.id, &fixture.workspace)?;
+    input.budget.max_provider_requests = Some(4);
+
+    assert_eq!(
+        first.start(input).await.unwrap_err().code(),
+        carl::runtime::task::TaskEngineErrorCode::Provider
+    );
+    let task_id = first.store().list_resumable_tasks()?[0].snapshot.task_id;
+    let (store, _) = first.into_parts();
+    let mut resumed = TaskEngine::new(store, EnginePort::resume_small_edit());
+
+    let snapshot = resumed.run(task_id).await?;
+
+    assert_eq!(snapshot.status, TaskStatus::Completed);
+    let sequences = resumed
+        .store()
+        .read_task_events(task_id)?
+        .into_iter()
+        .filter_map(|envelope| match envelope.event {
+            carl::events::Event::TaskLifecycle {
+                event:
+                    carl::runtime::task::TaskEvent::ProviderRequestRecorded {
+                        request_sequence, ..
+                    },
+                ..
+            } => Some(request_sequence),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(sequences, [0, 1, 2, 3]);
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn planning_usage_is_durable_and_triggers_context_compaction() -> TestResult {
+    let fixture = EngineFixture::new()?;
+    let store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let port = EnginePort::planning_usage_under_context_pressure();
+    let shared = port.shared();
+    let mut engine = TaskEngine::new(store, port);
+
+    let snapshot = engine
+        .start(start_task(session.id, &fixture.workspace)?)
+        .await?;
+
+    assert!(
+        engine
+            .store()
+            .read_task_events(snapshot.task_id)?
+            .iter()
+            .any(|envelope| matches!(
+                envelope.event,
+                carl::events::Event::TaskLifecycle {
+                    event: carl::runtime::task::TaskEvent::UsageObserved {
+                        total_tokens: 102_400,
+                        ..
+                    },
+                    ..
+                }
+            ))
+    );
+    assert_eq!(shared.lock().unwrap().compactions, 1);
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn missing_provider_usage_uses_conservative_planning_estimates_for_compaction() -> TestResult
+{
+    let fixture = EngineFixture::new()?;
+    let store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let port = EnginePort::fallback_contract_under_estimated_pressure();
+    let shared = port.shared();
+    let mut engine = TaskEngine::new(store, port);
+
+    let snapshot = engine
+        .start(start_task(session.id, &fixture.workspace)?)
+        .await?;
+
+    assert_eq!(snapshot.status, TaskStatus::Completed);
+    assert_eq!(shared.lock().unwrap().planning_attempts, 2);
+    assert_eq!(shared.lock().unwrap().compactions, 1);
+    Ok(())
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn one_owner_request_runs_three_durable_epochs_to_evidenced_completion() -> TestResult {
     let fixture = EngineFixture::new()?;
@@ -452,7 +1004,8 @@ async fn one_owner_request_runs_three_durable_epochs_to_evidenced_completion() -
     assert_eq!(
         connection.query_row("SELECT COUNT(*) FROM task_epochs", [], |row| row
             .get::<_, u64>(0))?,
-        3
+        4,
+        "one durable planning epoch plus three durable work epochs"
     );
     assert_eq!(
         connection.query_row("SELECT COUNT(*) FROM task_checkpoints", [], |row| row
@@ -547,6 +1100,234 @@ async fn exhausted_provider_budget_is_durably_blocked_before_work_dispatch() -> 
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn exhausted_wall_budget_blocks_before_the_first_provider_request() -> TestResult {
+    let fixture = EngineFixture::new()?;
+    let store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let port = EnginePort::small_edit();
+    let shared = port.shared();
+    let mut engine = TaskEngine::new(store, port);
+    let mut input = start_task(session.id, &fixture.workspace)?;
+    input.budget.max_wall_time_seconds = Some(0);
+
+    let error = engine.start(input).await.unwrap_err();
+
+    assert_eq!(
+        error.code(),
+        carl::runtime::task::TaskEngineErrorCode::Blocked
+    );
+    assert!(shared.lock().unwrap().epoch_starts.is_empty());
+    assert_eq!(
+        engine.store().list_resumable_tasks()?[0].snapshot.status,
+        TaskStatus::Blocked
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn hard_tool_budget_interrupts_the_current_stream_before_a_second_effect_dispatch()
+-> TestResult {
+    let fixture = EngineFixture::new()?;
+    let store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let port = EnginePort::two_effects_in_one_epoch();
+    let shared = port.shared();
+    let mut engine = TaskEngine::new(store, port);
+    let mut input = start_task(session.id, &fixture.workspace)?;
+    input.budget.max_tool_calls = Some(1);
+
+    let error = engine.start(input).await.unwrap_err();
+
+    assert_eq!(
+        error.code(),
+        carl::runtime::task::TaskEngineErrorCode::Blocked
+    );
+    let record = engine.store().list_resumable_tasks()?.remove(0);
+    assert_eq!(record.snapshot.status, TaskStatus::Blocked);
+    let state = shared.lock().unwrap();
+    assert_eq!(state.resolved, [EffectDecision::Allow]);
+    assert_eq!(state.interrupts, 1);
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn hard_wall_budget_interrupts_a_pending_effect_inside_the_provider_stream() -> TestResult {
+    let fixture = EngineFixture::new()?;
+    let store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let port = EnginePort::pending_effect();
+    let shared = port.shared();
+    let mut engine = TaskEngine::new(store, port);
+    let mut input = start_task(session.id, &fixture.workspace)?;
+    input.budget.max_wall_time_seconds = Some(1);
+
+    let error = tokio::time::timeout(std::time::Duration::from_secs(2), engine.start(input))
+        .await
+        .expect("hard wall budget must wake a pending provider read")
+        .unwrap_err();
+
+    assert_eq!(
+        error.code(),
+        carl::runtime::task::TaskEngineErrorCode::Blocked
+    );
+    let record = engine.store().list_resumable_tasks()?.remove(0);
+    assert_eq!(record.snapshot.status, TaskStatus::Blocked);
+    assert_eq!(
+        only_operation_status(engine.store(), record.snapshot.task_id)?,
+        OperationStatus::Uncertain
+    );
+    assert_eq!(shared.lock().unwrap().interrupts, 1);
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn hard_wall_budget_interrupts_a_pending_contract_planning_stream() -> TestResult {
+    let fixture = EngineFixture::new()?;
+    let store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let port = EnginePort::pending_planning();
+    let shared = port.shared();
+    let mut engine = TaskEngine::new(store, port);
+    let mut input = start_task(session.id, &fixture.workspace)?;
+    input.budget.max_wall_time_seconds = Some(1);
+
+    let error = tokio::time::timeout(std::time::Duration::from_secs(2), engine.start(input))
+        .await
+        .expect("hard wall budget must wake a pending planning read")
+        .unwrap_err();
+
+    assert_eq!(
+        error.code(),
+        carl::runtime::task::TaskEngineErrorCode::Blocked
+    );
+    assert_eq!(
+        engine.store().list_resumable_tasks()?[0].snapshot.status,
+        TaskStatus::Blocked
+    );
+    assert_eq!(shared.lock().unwrap().interrupts, 1);
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn aggregate_contract_planning_output_is_bounded_across_individually_valid_deltas()
+-> TestResult {
+    let fixture = EngineFixture::new()?;
+    let store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let port = EnginePort::oversized_planning_stream();
+    let shared = port.shared();
+    let mut engine = TaskEngine::new(store, port);
+
+    let error = engine
+        .start(start_task(session.id, &fixture.workspace)?)
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        error.code(),
+        carl::runtime::task::TaskEngineErrorCode::Blocked
+    );
+    assert_eq!(
+        engine.store().list_resumable_tasks()?[0].snapshot.status,
+        TaskStatus::Blocked
+    );
+    assert_eq!(shared.lock().unwrap().interrupts, 1);
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn aggregate_work_transcript_and_engine_updates_are_bounded_across_valid_deltas() -> TestResult
+{
+    let fixture = EngineFixture::new()?;
+    let store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let port = EnginePort::oversized_work_stream();
+    let shared = port.shared();
+    let mut engine = TaskEngine::new(store, port);
+
+    let error = engine
+        .start(start_task(session.id, &fixture.workspace)?)
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        error.code(),
+        carl::runtime::task::TaskEngineErrorCode::Blocked
+    );
+    assert_eq!(
+        engine.store().list_resumable_tasks()?[0].snapshot.status,
+        TaskStatus::Blocked
+    );
+    let updates = engine.take_updates();
+    let streamed_bytes = updates
+        .iter()
+        .filter_map(|update| match update {
+            TaskEngineUpdate::AgentMessageChunk(text) | TaskEngineUpdate::DiffUpdated(text) => {
+                Some(text.len())
+            }
+            _ => None,
+        })
+        .sum::<usize>();
+    assert!(streamed_bytes <= 256 * 1024);
+    assert!(updates.len() <= 4_096);
+    assert_eq!(shared.lock().unwrap().interrupts, 1);
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn aggregate_diff_updates_are_bounded_across_individually_valid_events() -> TestResult {
+    let fixture = EngineFixture::new()?;
+    let store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let port = EnginePort::oversized_diff_stream();
+    let shared = port.shared();
+    let mut engine = TaskEngine::new(store, port);
+
+    let error = engine
+        .start(start_task(session.id, &fixture.workspace)?)
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        error.code(),
+        carl::runtime::task::TaskEngineErrorCode::Blocked
+    );
+    assert_eq!(
+        engine.store().list_resumable_tasks()?[0].snapshot.status,
+        TaskStatus::Blocked
+    );
+    assert_eq!(shared.lock().unwrap().interrupts, 1);
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn provider_event_count_is_bounded_even_when_events_have_no_transcript_payload() -> TestResult
+{
+    let fixture = EngineFixture::new()?;
+    let store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let port = EnginePort::planning_event_flood();
+    let shared = port.shared();
+    let mut engine = TaskEngine::new(store, port);
+
+    let error = engine
+        .start(start_task(session.id, &fixture.workspace)?)
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        error.code(),
+        carl::runtime::task::TaskEngineErrorCode::Blocked
+    );
+    assert_eq!(
+        engine.store().list_resumable_tasks()?[0].snapshot.status,
+        TaskStatus::Blocked
+    );
+    assert_eq!(shared.lock().unwrap().interrupts, 1);
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn ambiguous_provider_failure_marks_started_operation_uncertain_and_blocks() -> TestResult {
     let fixture = EngineFixture::new()?;
     let store = Store::open(&fixture.database)?;
@@ -560,7 +1341,7 @@ async fn ambiguous_provider_failure_marks_started_operation_uncertain_and_blocks
 
     assert_eq!(
         error.code(),
-        carl::runtime::task::TaskEngineErrorCode::Provider
+        carl::runtime::task::TaskEngineErrorCode::Blocked
     );
     let record = engine.store().list_resumable_tasks()?.remove(0);
     assert_eq!(record.snapshot.status, TaskStatus::Blocked);
@@ -580,6 +1361,192 @@ async fn ambiguous_provider_failure_marks_started_operation_uncertain_and_blocks
         record.snapshot.operation_status(operation_id),
         Some(OperationStatus::Uncertain)
     );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn possibly_applied_effect_resolution_failure_is_uncertain_and_typed_blocked() -> TestResult {
+    let fixture = EngineFixture::new()?;
+    let store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let port = EnginePort::resolve_failure(AgentErrorProvenance::PossiblyApplied);
+    let mut engine = TaskEngine::new(store, port);
+
+    let error = engine
+        .start(start_task(session.id, &fixture.workspace)?)
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        error.code(),
+        carl::runtime::task::TaskEngineErrorCode::Blocked
+    );
+    let record = engine.store().list_resumable_tasks()?.remove(0);
+    assert_eq!(record.snapshot.status, TaskStatus::Blocked);
+    assert_eq!(
+        only_operation_status(engine.store(), record.snapshot.task_id)?,
+        OperationStatus::Uncertain
+    );
+    assert!(engine.take_updates().iter().any(|update| matches!(
+        update,
+        TaskEngineUpdate::TaskStatus {
+            status: TaskStatus::Blocked,
+            ..
+        }
+    )));
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn definitely_not_applied_effect_resolution_failure_closes_failed_and_blocks() -> TestResult {
+    let fixture = EngineFixture::new()?;
+    let store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let port = EnginePort::resolve_failure(AgentErrorProvenance::DefinitelyNotApplied);
+    let mut engine = TaskEngine::new(store, port);
+
+    let error = engine
+        .start(start_task(session.id, &fixture.workspace)?)
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        error.code(),
+        carl::runtime::task::TaskEngineErrorCode::Blocked
+    );
+    let record = engine.store().list_resumable_tasks()?.remove(0);
+    assert_eq!(record.snapshot.status, TaskStatus::Blocked);
+    assert_eq!(
+        only_operation_status(engine.store(), record.snapshot.task_id)?,
+        OperationStatus::Failed
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn definitely_not_applied_event_read_is_retried_without_replaying_the_effect() -> TestResult {
+    let fixture = EngineFixture::new()?;
+    let store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let port = EnginePort::definitely_not_applied_event_failure();
+    let shared = port.shared();
+    let mut engine = TaskEngine::new(store, port);
+
+    let snapshot = engine
+        .start(start_task(session.id, &fixture.workspace)?)
+        .await?;
+
+    assert_eq!(snapshot.status, TaskStatus::Completed);
+    assert_eq!(shared.lock().unwrap().resolved, [EffectDecision::Allow]);
+    assert_eq!(shared.lock().unwrap().epoch_starts.len(), 2);
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn invalid_provider_event_after_effect_binding_closes_uncertain_and_blocks() -> TestResult {
+    let fixture = EngineFixture::new()?;
+    let store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let mut engine = TaskEngine::new(store, EnginePort::invalid_event_after_binding());
+
+    let error = engine
+        .start(start_task(session.id, &fixture.workspace)?)
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        error.code(),
+        carl::runtime::task::TaskEngineErrorCode::Blocked
+    );
+    let record = engine.store().list_resumable_tasks()?.remove(0);
+    assert_eq!(record.snapshot.status, TaskStatus::Blocked);
+    assert_eq!(
+        only_operation_status(engine.store(), record.snapshot.task_id)?,
+        OperationStatus::Uncertain
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn definitely_not_applied_operation_binding_failure_closes_failed_and_blocks() -> TestResult {
+    let fixture = EngineFixture::new()?;
+    let store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let mut engine = TaskEngine::new(
+        store,
+        EnginePort::binding_failure(AgentErrorProvenance::DefinitelyNotApplied),
+    );
+
+    let error = engine
+        .start(start_task(session.id, &fixture.workspace)?)
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        error.code(),
+        carl::runtime::task::TaskEngineErrorCode::Blocked
+    );
+    let record = engine.store().list_resumable_tasks()?.remove(0);
+    assert_eq!(record.snapshot.status, TaskStatus::Blocked);
+    assert_eq!(
+        only_operation_status(engine.store(), record.snapshot.task_id)?,
+        OperationStatus::Failed
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn unsupported_network_effect_is_denied_before_durable_blocking() -> TestResult {
+    let fixture = EngineFixture::new()?;
+    let store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let port = EnginePort::unsupported_network_effect();
+    let shared = port.shared();
+    let mut engine = TaskEngine::new(store, port);
+
+    let error = engine
+        .start(start_task(session.id, &fixture.workspace)?)
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        error.code(),
+        carl::runtime::task::TaskEngineErrorCode::Blocked
+    );
+    assert_eq!(shared.lock().unwrap().resolved, [EffectDecision::Deny]);
+    let record = engine.store().list_resumable_tasks()?.remove(0);
+    assert_eq!(record.snapshot.status, TaskStatus::Blocked);
+    assert_eq!(
+        only_operation_status(engine.store(), record.snapshot.task_id)?,
+        OperationStatus::Failed
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn uncertain_work_dispatch_failure_returns_typed_blocked_update() -> TestResult {
+    let fixture = EngineFixture::new()?;
+    let store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let port = EnginePort::work_start_failure(AgentErrorProvenance::PossiblyApplied);
+    let mut engine = TaskEngine::new(store, port);
+
+    let error = engine
+        .start(start_task(session.id, &fixture.workspace)?)
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        error.code(),
+        carl::runtime::task::TaskEngineErrorCode::Blocked
+    );
+    assert!(engine.take_updates().iter().any(|update| matches!(
+        update,
+        TaskEngineUpdate::TaskStatus {
+            status: TaskStatus::Blocked,
+            ..
+        }
+    )));
     Ok(())
 }
 
@@ -607,35 +1574,59 @@ async fn recovery_attempt_outcomes_are_persisted_only_after_the_recovery_epoch_f
             "complete:requested-outcome,explicit-verification",
         ),
     ]);
+    port.state.lock().unwrap().terminal_statuses =
+        VecDeque::from(["completed", "completed", "failed", "completed"]);
     let mut engine = TaskEngine::new(store, port);
 
     let snapshot = engine
         .start(start_task(session.id, &fixture.workspace)?)
         .await?;
 
-    let attempts = engine
+    let events = engine
         .store()
         .read_task_events(snapshot.task_id)?
-        .into_iter()
-        .filter_map(|event| match event.event {
+        .into_iter();
+    let mut started = Vec::new();
+    let mut attempts = Vec::new();
+    for event in events {
+        match event.event {
+            carl::events::Event::TaskLifecycle {
+                event:
+                    carl::runtime::task::TaskEvent::RecoveryAttemptStarted {
+                        epoch_id,
+                        strategy,
+                        strategy_fingerprint,
+                    },
+                ..
+            } => started.push((epoch_id, strategy, strategy_fingerprint)),
             carl::events::Event::TaskLifecycle {
                 event:
                     carl::runtime::task::TaskEvent::RecoveryAttemptRecorded {
+                        epoch_id,
                         strategy,
                         strategy_fingerprint,
                         outcome,
                     },
                 ..
-            } => Some((strategy, strategy_fingerprint, outcome)),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
+            } => attempts.push((epoch_id, strategy, strategy_fingerprint, outcome)),
+            _ => {}
+        }
+    }
+    assert_eq!(started.len(), 2);
     assert_eq!(attempts.len(), 2);
-    assert_eq!(attempts[0].0, RecoveryStrategy::ReconstructFromEvidence);
-    assert_eq!(attempts[0].2, RecoveryAttemptOutcome::Failed);
-    assert_eq!(attempts[1].0, RecoveryStrategy::ReplaceApproach);
-    assert_eq!(attempts[1].2, RecoveryAttemptOutcome::Succeeded);
-    assert!(attempts.iter().all(|attempt| attempt.1.len() == 64));
+    assert_eq!(attempts[0].1, RecoveryStrategy::ReconstructFromEvidence);
+    assert_eq!(attempts[0].3, RecoveryAttemptOutcome::Failed);
+    assert_eq!(attempts[1].1, RecoveryStrategy::ReplaceApproach);
+    assert_eq!(attempts[1].3, RecoveryAttemptOutcome::Succeeded);
+    assert!(attempts.iter().all(|attempt| attempt.2.len() == 64));
+    assert_eq!(
+        started[0],
+        (attempts[0].0, attempts[0].1, attempts[0].2.clone())
+    );
+    assert_eq!(
+        started[1],
+        (attempts[1].0, attempts[1].1, attempts[1].2.clone())
+    );
     Ok(())
 }
 
@@ -736,6 +1727,205 @@ async fn context_pressure_compacts_only_after_the_checkpoint_is_committed() -> T
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn failed_checkpoint_transaction_recovers_as_blocked_without_repeating_completed_work()
+-> TestResult {
+    let fixture = EngineFixture::new()?;
+    let store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    Connection::open(&fixture.database)?.execute_batch(
+        "CREATE TRIGGER fail_task_checkpoint
+         BEFORE INSERT ON task_checkpoints
+         BEGIN SELECT RAISE(ABORT, 'injected checkpoint crash'); END;",
+    )?;
+    let mut first = TaskEngine::new(store, EnginePort::small_edit());
+
+    assert_eq!(
+        first
+            .start(start_task(session.id, &fixture.workspace)?)
+            .await
+            .unwrap_err()
+            .code(),
+        carl::runtime::task::TaskEngineErrorCode::Storage
+    );
+    let task_id = first.store().list_resumable_tasks()?[0].snapshot.task_id;
+    assert_eq!(
+        first.store().get_task(task_id)?.unwrap().snapshot.status,
+        TaskStatus::Checkpointing
+    );
+    Connection::open(&fixture.database)?.execute_batch("DROP TRIGGER fail_task_checkpoint;")?;
+    let (store, _) = first.into_parts();
+    let port = EnginePort::resume_small_edit();
+    let shared = port.shared();
+    let mut resumed = TaskEngine::new(store, port);
+
+    let error = resumed.run(task_id).await.unwrap_err();
+
+    assert_eq!(
+        error.code(),
+        carl::runtime::task::TaskEngineErrorCode::Blocked
+    );
+    assert_eq!(
+        resumed.store().get_task(task_id)?.unwrap().snapshot.status,
+        TaskStatus::Blocked
+    );
+    assert!(shared.lock().unwrap().epoch_starts.is_empty());
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn committed_completion_checkpoint_finishes_after_crash_without_another_provider_epoch()
+-> TestResult {
+    let fixture = EngineFixture::new()?;
+    let store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let mut first = TaskEngine::new(
+        store,
+        EnginePort::completion_checkpoint_then_compaction_failure(),
+    );
+
+    assert_eq!(
+        first
+            .start(start_task(session.id, &fixture.workspace)?)
+            .await
+            .unwrap_err()
+            .code(),
+        carl::runtime::task::TaskEngineErrorCode::Provider
+    );
+    let task_id = first.store().list_resumable_tasks()?[0].snapshot.task_id;
+    assert_eq!(
+        first.store().get_task(task_id)?.unwrap().snapshot.status,
+        TaskStatus::Checkpointing
+    );
+    let (store, _) = first.into_parts();
+    let port = EnginePort::resume_small_edit();
+    let shared = port.shared();
+    let mut resumed = TaskEngine::new(store, port);
+
+    let snapshot = resumed.run(task_id).await?;
+
+    assert_eq!(snapshot.status, TaskStatus::Completed);
+    assert!(shared.lock().unwrap().epoch_starts.is_empty());
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn committed_continuation_checkpoint_resumes_next_epoch_without_repeating_completed_work()
+-> TestResult {
+    let fixture = EngineFixture::new()?;
+    let store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let mut first = TaskEngine::new(
+        store,
+        EnginePort::continuation_checkpoint_then_compaction_failure(),
+    );
+
+    assert_eq!(
+        first
+            .start(start_task(session.id, &fixture.workspace)?)
+            .await
+            .unwrap_err()
+            .code(),
+        carl::runtime::task::TaskEngineErrorCode::Provider
+    );
+    let task_id = first.store().list_resumable_tasks()?[0].snapshot.task_id;
+    let (store, _) = first.into_parts();
+    let port = EnginePort::resume_small_edit();
+    let shared = port.shared();
+    let mut resumed = TaskEngine::new(store, port);
+
+    let snapshot = resumed.run(task_id).await?;
+
+    assert_eq!(snapshot.status, TaskStatus::Completed);
+    assert_eq!(shared.lock().unwrap().epoch_starts.len(), 1);
+    assert_eq!(
+        resumed
+            .store()
+            .read_task_events(task_id)?
+            .iter()
+            .filter(|envelope| matches!(
+                envelope.event,
+                carl::events::Event::TaskLifecycle {
+                    event: carl::runtime::task::TaskEvent::EpochStarted { .. },
+                    ..
+                }
+            ))
+            .count(),
+        3,
+        "planning, completed pre-crash work, and resumed work each start once"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn pending_recovery_attempt_rehydrates_with_the_exact_epoch_identity() -> TestResult {
+    let fixture = EngineFixture::new()?;
+    let store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let mut first = TaskEngine::new(
+        store,
+        EnginePort::continuation_checkpoint_then_compaction_failure(),
+    );
+
+    assert_eq!(
+        first
+            .start(start_task(session.id, &fixture.workspace)?)
+            .await
+            .unwrap_err()
+            .code(),
+        carl::runtime::task::TaskEngineErrorCode::Provider
+    );
+    let task_id = first.store().list_resumable_tasks()?[0].snapshot.task_id;
+    let (mut store, _) = first.into_parts();
+    let recovery_epoch_id = carl::runtime::task::EpochId::new();
+    let strategy = RecoveryStrategy::ReconstructFromEvidence;
+    let strategy_fingerprint = recovery_attempt_fingerprint(&digest(b"pending-recovery"), strategy);
+    let revision = store.get_task(task_id)?.unwrap().revision;
+    store
+        .append_task_event(
+            task_id,
+            revision,
+            carl::runtime::task::TaskEvent::RecoveryAttemptStarted {
+                epoch_id: recovery_epoch_id,
+                strategy,
+                strategy_fingerprint: strategy_fingerprint.clone(),
+            },
+            chrono::Utc::now(),
+        )?
+        .expect("the pending recovery event must append");
+    let port = EnginePort::resume_small_edit();
+    let shared = port.shared();
+    let mut resumed = TaskEngine::new(store, port);
+
+    let snapshot = resumed.run(task_id).await?;
+
+    assert_eq!(snapshot.status, TaskStatus::Completed);
+    assert_eq!(shared.lock().unwrap().epoch_starts.len(), 1);
+    let events = resumed.store().read_task_events(task_id)?;
+    assert!(events.iter().any(|envelope| matches!(
+        &envelope.event,
+        carl::events::Event::TaskLifecycle {
+            event: carl::runtime::task::TaskEvent::EpochStarted { epoch_id, .. },
+            ..
+        } if *epoch_id == recovery_epoch_id
+    )));
+    assert!(events.iter().any(|envelope| matches!(
+        &envelope.event,
+        carl::events::Event::TaskLifecycle {
+            event: carl::runtime::task::TaskEvent::RecoveryAttemptRecorded {
+                epoch_id,
+                strategy: recorded_strategy,
+                strategy_fingerprint: recorded_fingerprint,
+                outcome: RecoveryAttemptOutcome::Succeeded,
+            },
+            ..
+        } if *epoch_id == recovery_epoch_id
+            && *recorded_strategy == strategy
+            && recorded_fingerprint == &strategy_fingerprint
+    )));
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn a_new_engine_continues_a_safe_checkpoint_without_another_owner_prompt() -> TestResult {
     let fixture = EngineFixture::new()?;
     let store = Store::open(&fixture.database)?;
@@ -777,8 +1967,8 @@ async fn a_new_engine_continues_a_safe_checkpoint_without_another_owner_prompt()
                 }
             ))
             .count(),
-        3,
-        "the definitely-not-applied provider start is durably closed before restart"
+        4,
+        "planning, completed work, definitely-not-applied work, and resumed work are durable"
     );
     assert_eq!(snapshot.active_epoch, None);
     Ok(())

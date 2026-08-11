@@ -29,22 +29,25 @@ fn end_to_end() -> TestResult {
     let session = initialize_session(&mut client, &layout, 1, 2)?;
 
     client.send(&prompt_frame(10, &session, "approval scenario", 'a'))?;
+    let (first_approval, first_updates) = client.read_id_with_updates(10)?;
     assert_eq!(
-        client.read_id(10)?["result"]["stopReason"],
+        first_approval["result"]["stopReason"],
         "waiting_for_approval"
     );
-    let first_code = latest_approval_code(&layout)?;
+    let first_code = approval_code(&first_updates)?;
+    assert_eq!(first_code.len(), 10);
     client.send(&prompt_frame(
         11,
         &session,
         &format!("/approve {first_code}"),
         'c',
     ))?;
+    let (second_approval, second_updates) = client.read_id_with_updates(11)?;
     assert_eq!(
-        client.read_id(11)?["result"]["stopReason"],
+        second_approval["result"]["stopReason"],
         "waiting_for_approval"
     );
-    let second_code = latest_approval_code(&layout)?;
+    let second_code = approval_code(&second_updates)?;
     assert_ne!(first_code, second_code);
     client.send(&prompt_frame(
         12,
@@ -52,7 +55,7 @@ fn end_to_end() -> TestResult {
         &format!("/deny {second_code}"),
         'd',
     ))?;
-    assert_eq!(client.read_id(12)?["result"]["stopReason"], "end_turn");
+    assert_eq!(client.read_id(12)?["result"]["stopReason"], "failed");
     client.send(&prompt_frame(
         13,
         &session,
@@ -153,12 +156,11 @@ fn initialize_session(
         .to_owned())
 }
 
-fn latest_approval_code(layout: &Layout) -> TestResult<String> {
-    let records = layout.publisher_records()?;
-    let content = records
-        .last()
-        .and_then(|record| record["content"].as_str())
-        .ok_or("approval publication missing")?;
+fn approval_code(updates: &[serde_json::Value]) -> TestResult<String> {
+    let content = updates
+        .iter()
+        .find_map(|frame| frame["params"]["update"]["content"]["text"].as_str())
+        .ok_or("approval update missing")?;
     content
         .split("/approve ")
         .nth(1)

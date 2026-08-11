@@ -163,6 +163,9 @@ pub fn reduce_task(
     match event {
         TaskEvent::Created { .. } => unreachable!("creation handled before reduction"),
         TaskEvent::StateTransitioned { from, to, .. } => {
+            if *to == TaskStatus::Cancelled {
+                require_safe_boundary(&state)?;
+            }
             transition_status(&mut state, *from, *to)?;
         }
         TaskEvent::ContractRevised { contract } => {
@@ -180,6 +183,12 @@ pub fn reduce_task(
             }
             if state.status != TaskStatus::Active {
                 return Err(error(TaskReduceErrorCode::IllegalStatusTransition));
+            }
+            if state
+                .pending_recovery()
+                .is_some_and(|(pending_epoch, _, _)| pending_epoch != epoch_id)
+            {
+                return Err(error(TaskReduceErrorCode::EpochMismatch));
             }
             state.active_epoch = Some(*epoch_id);
         }
@@ -239,8 +248,40 @@ pub fn reduce_task(
         TaskEvent::UsageObserved { epoch_id, .. } => {
             require_active_epoch(&state, *epoch_id)?;
         }
+        TaskEvent::ProviderRequestRecorded { epoch_id, .. }
+        | TaskEvent::ProviderEpochBound { epoch_id, .. } => {
+            require_active_epoch(&state, *epoch_id)?;
+        }
+        TaskEvent::RecoveryAttemptStarted {
+            epoch_id,
+            strategy,
+            strategy_fingerprint,
+        } => {
+            if state.status != TaskStatus::Checkpointing
+                || !state.start_recovery(*epoch_id, *strategy, strategy_fingerprint.clone())
+            {
+                return Err(error(TaskReduceErrorCode::IllegalStatusTransition));
+            }
+        }
+        TaskEvent::RecoveryAttemptRecorded {
+            epoch_id,
+            strategy,
+            strategy_fingerprint,
+            ..
+        } => {
+            let matches_pending = state.pending_recovery().is_some_and(
+                |(pending_epoch, pending_strategy, pending_fingerprint)| {
+                    pending_epoch == epoch_id
+                        && pending_strategy == strategy
+                        && pending_fingerprint == strategy_fingerprint
+                },
+            );
+            if state.active_epoch.is_some() || !matches_pending {
+                return Err(error(TaskReduceErrorCode::EpochMismatch));
+            }
+            state.finish_recovery();
+        }
         TaskEvent::ProgressAssessed { .. }
-        | TaskEvent::RecoveryAttemptRecorded { .. }
         | TaskEvent::NormalizedOperationEvidenceRecorded { .. }
         | TaskEvent::CompactionRequested { .. }
         | TaskEvent::SteeringQueued { .. } => {}
@@ -346,7 +387,7 @@ const fn legal_status_edge(from: TaskStatus, to: TaskStatus) -> bool {
             TaskStatus::Active | TaskStatus::Cancelling | TaskStatus::Failed
         ) | (
             TaskStatus::Cancelling,
-            TaskStatus::Cancelled | TaskStatus::Failed
+            TaskStatus::Cancelled | TaskStatus::Blocked | TaskStatus::Failed
         ) | (
             TaskStatus::Completing,
             TaskStatus::Completed | TaskStatus::Active | TaskStatus::Failed

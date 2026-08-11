@@ -243,11 +243,18 @@ impl Client {
     }
 
     pub fn read_id(&self, expected: i64) -> TestResult<Value> {
+        self.read_id_with_updates(expected)
+            .map(|(response, _)| response)
+    }
+
+    pub fn read_id_with_updates(&self, expected: i64) -> TestResult<(Value, Vec<Value>)> {
+        let mut updates = Vec::new();
         for _ in 0..128 {
             let frame = self.read()?;
             if frame.get("id").and_then(Value::as_i64) == Some(expected) {
-                return Ok(frame);
+                return Ok((frame, updates));
             }
+            updates.push(frame);
         }
         Err("Carl response ID was not observed".into())
     }
@@ -442,6 +449,21 @@ fn app_server_fixture() -> i32 {
                 {
                     return 74;
                 }
+                if input.contains("Read-only contract planning")
+                    || input.contains("Repair the prior invalid contract")
+                {
+                    if agent_delta(
+                        thread_id,
+                        &turn_id,
+                        "<carl-completion-contract>{\"version\":1,\"goal\":\"Report repository verification\",\"constraints\":[],\"clauses\":[{\"id\":\"report\",\"description\":\"Report the observed verification\",\"required\":false,\"status\":\"pending\",\"evidence\":[]}]}</carl-completion-contract>",
+                    )
+                    .and_then(|()| turn_completed(thread_id, &turn_id))
+                    .is_err()
+                    {
+                        return 74;
+                    }
+                    continue;
+                }
                 if input.contains("wait for cancel") {
                     continue;
                 }
@@ -495,7 +517,11 @@ fn app_server_fixture() -> i32 {
                     });
                     continue;
                 }
-                if agent_delta(thread_id, &turn_id, "Repository verification complete.")
+                if agent_delta(
+                    thread_id,
+                    &turn_id,
+                    "Repository verification complete. <carl-epoch-report>{\"schema_version\":1,\"disposition\":\"complete\",\"summary\":\"Repository verification complete.\",\"clause_evidence\":[],\"exact_identifiers\":[]}</carl-epoch-report>",
+                )
                     .and_then(|()| turn_completed(thread_id, &turn_id))
                     .is_err()
                 {
@@ -522,29 +548,36 @@ fn app_server_fixture() -> i32 {
                         if accepted && fs::write(workspace.join("target.txt"), "fixed\n").is_err() {
                             return 73;
                         }
-                        if diff_update(&approval.thread_id, &approval.turn_id)
-                            .and_then(|()| {
-                                item_started(
-                                    &approval.thread_id,
-                                    &approval.turn_id,
-                                    "command-item",
-                                    "commandExecution",
-                                )
-                            })
-                            .and_then(|()| {
-                                approval_request(
-                                    "approval-command",
-                                    "item/commandExecution/requestApproval",
-                                    &approval.thread_id,
-                                    &approval.turn_id,
-                                    "command-item",
-                                    json!({
-                                        "command":"cargo test", "reason":"Verify the patch",
-                                        "cwd":null
-                                    }),
-                                )
-                            })
-                            .is_err()
+                        if item_completed(
+                            &approval.thread_id,
+                            &approval.turn_id,
+                            "file-item",
+                            "fileChange",
+                            accepted,
+                        )
+                        .and_then(|()| diff_update(&approval.thread_id, &approval.turn_id))
+                        .and_then(|()| {
+                            item_started(
+                                &approval.thread_id,
+                                &approval.turn_id,
+                                "command-item",
+                                "commandExecution",
+                            )
+                        })
+                        .and_then(|()| {
+                            approval_request(
+                                "approval-command",
+                                "item/commandExecution/requestApproval",
+                                &approval.thread_id,
+                                &approval.turn_id,
+                                "command-item",
+                                json!({
+                                    "command":"cargo test", "reason":"Verify the patch",
+                                    "cwd":null
+                                }),
+                            )
+                        })
+                        .is_err()
                         {
                             return 74;
                         }
@@ -578,12 +611,21 @@ fn app_server_fixture() -> i32 {
                             .and_then(|()| {
                                 append_line(&workspace.join(".fixture-actions"), "approved-command")
                             })
+                            .and_then(|()| {
+                                item_completed(
+                                    &approval.thread_id,
+                                    &approval.turn_id,
+                                    "bypass-item",
+                                    "commandExecution",
+                                    true,
+                                )
+                            })
                             .and_then(|()| diff_update(&approval.thread_id, &approval.turn_id))
                             .and_then(|()| {
                                 agent_delta(
                                     &approval.thread_id,
                                     &approval.turn_id,
-                                    "Bypass verification completed.",
+                                    "Bypass verification completed. <carl-epoch-report>{\"schema_version\":1,\"disposition\":\"complete\",\"summary\":\"Bypass verification completed.\",\"clause_evidence\":[],\"exact_identifiers\":[]}</carl-epoch-report>",
                                 )
                             })
                             .and_then(|()| turn_completed(&approval.thread_id, &approval.turn_id))
@@ -693,6 +735,34 @@ fn item_started(
     notify(json!({
         "method":"item/started", "params":{
             "threadId":thread_id,"turnId":turn_id,"startedAtMs":1,
+            "item":item
+        }
+    }))
+}
+
+fn item_completed(
+    thread_id: &str,
+    turn_id: &str,
+    item_id: &str,
+    item_type: &str,
+    succeeded: bool,
+) -> std::io::Result<()> {
+    let status = if succeeded { "completed" } else { "failed" };
+    let item = match item_type {
+        "commandExecution" => json!({
+            "type":"commandExecution","id":item_id,"command":"cargo test",
+            "cwd":"/workspace","status":status,"commandActions":[],
+            "exitCode":succeeded.then_some(0),"aggregatedOutput":"ok"
+        }),
+        "fileChange" => json!({
+            "type":"fileChange","id":item_id,"status":status,
+            "changes":[{"path":"target.txt","kind":"update"}]
+        }),
+        _ => return Err(std::io::Error::other("unsupported fixture item type")),
+    };
+    notify(json!({
+        "method":"item/completed", "params":{
+            "threadId":thread_id,"turnId":turn_id,"completedAtMs":3,
             "item":item
         }
     }))

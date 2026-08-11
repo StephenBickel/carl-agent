@@ -310,11 +310,102 @@ async fn autonomous_prompt_durably_steers_and_cancels_while_provider_read_is_pen
 
     kernel.cancel(session.id()).await?;
     let initial = prompt.await??;
-    assert_eq!(initial.stop_reason, PromptStopReason::Cancelled);
+    assert_eq!(initial.stop_reason, PromptStopReason::Failed);
     let record = Store::open(&layout.database)?
         .get_task(task_id)?
-        .expect("cancelled durable task remains projected");
+        .expect("blocked durable task remains projected");
+    assert_eq!(record.snapshot.status, TaskStatus::Blocked);
+    let operation_id = events
+        .iter()
+        .find_map(|envelope| match envelope.event {
+            Event::TaskLifecycle {
+                event: carl::runtime::task::TaskEvent::OperationIntentRecorded { operation_id, .. },
+                ..
+            } => Some(operation_id),
+            _ => None,
+        })
+        .expect("the pending effect has a durable operation identity");
+    assert_eq!(
+        record.snapshot.operation_status(operation_id),
+        Some(carl::runtime::task::OperationStatus::Uncertain)
+    );
+    assert_eq!(shared.lock().unwrap().interrupts, 1);
+    kernel.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn autonomous_planning_control_pump_durably_steers_and_cancels_at_a_safe_boundary()
+-> TestResult {
+    let layout = Layout::new()?;
+    let port = ScriptedPort::autonomous_pending_plan();
+    let shared = Arc::clone(&port.shared);
+    let kernel = Kernel::start_with_ports(layout.runtime()?, Box::new(port), None).await?;
+    let mut request = new_session(&layout, Frontend::Acp, None)?;
+    request.mode = PermissionMode::BypassPermissions;
+    let session = kernel.new_session(request).await?;
+    let prompt_kernel = kernel.clone();
+    let session_id = session.id();
+    let prompt = tokio::spawn(async move {
+        prompt_kernel
+            .prompt(
+                session_id,
+                Prompt::new(vec!["plan and run the durable edit".into()]).expect("prompt is valid"),
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if shared.lock().unwrap().starts >= 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+
+    let steered = tokio::time::timeout(
+        Duration::from_secs(2),
+        kernel.prompt(
+            session.id(),
+            Prompt::new(vec!["include the parser edge case".into()])?,
+        ),
+    )
+    .await
+    .expect("planning steering remains responsive")
+    .expect("planning steering is accepted");
+    assert_eq!(steered.stop_reason, PromptStopReason::EndTurn);
+    tokio::time::timeout(Duration::from_secs(2), kernel.cancel(session.id()))
+        .await
+        .expect("planning cancellation remains responsive")
+        .expect("planning cancellation is accepted");
+    let initial = prompt
+        .await
+        .expect("initial prompt task joins")
+        .expect("initial prompt reports cancellation");
+    assert_eq!(initial.stop_reason, PromptStopReason::Cancelled);
+
+    let store = Store::open(&layout.database)?;
+    let events = store.read_events(session.id())?;
+    let task_id = events
+        .iter()
+        .find_map(|envelope| match envelope.event {
+            Event::TaskLifecycle { task_id, .. } => Some(task_id),
+            _ => None,
+        })
+        .expect("planning task is durable");
+    let record = store
+        .get_task(task_id)?
+        .expect("cancelled planning task remains projected");
     assert_eq!(record.snapshot.status, TaskStatus::Cancelled);
+    assert_eq!(record.snapshot.active_epoch, None);
+    assert!(events.iter().any(|envelope| matches!(
+        envelope.event,
+        Event::TaskLifecycle {
+            event: carl::runtime::task::TaskEvent::SteeringQueued { .. },
+            ..
+        }
+    )));
     assert_eq!(shared.lock().unwrap().interrupts, 1);
     kernel.shutdown().await?;
     Ok(())
@@ -490,6 +581,52 @@ async fn autonomous_task_denial_blocks_the_task_without_restarting_the_provider_
         assert_eq!(state.starts, 2, "denial does not restart the work epoch");
     }
 
+    kernel.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn autonomous_full_access_secret_effect_is_denied_before_frontend_persistence() -> TestResult
+{
+    let layout = Layout::new()?;
+    let port = ScriptedPort::autonomous_secret_effect();
+    let shared = Arc::clone(&port.shared);
+    let kernel = Kernel::start_with_ports(layout.runtime()?, Box::new(port), None).await?;
+    let mut request = new_session(&layout, Frontend::Acp, None)?;
+    request.mode = PermissionMode::BypassPermissions;
+    let session = kernel.new_session(request).await?;
+
+    let outcome = kernel
+        .prompt(
+            session.id(),
+            Prompt::new(vec!["run the requested verification".into()])?,
+        )
+        .await?;
+
+    assert_eq!(outcome.stop_reason, PromptStopReason::Failed);
+    assert_eq!(shared.lock().unwrap().resolved, [EffectDecision::Deny]);
+    let events = Store::open(&layout.database)?.read_events(session.id())?;
+    assert!(!events.iter().any(|envelope| matches!(
+        envelope.event,
+        Event::ToolProposed { .. }
+            | Event::ToolDispatchAuthorized { .. }
+            | Event::ApprovalRequested { .. }
+    )));
+    let task_id = events
+        .iter()
+        .find_map(|envelope| match envelope.event {
+            Event::TaskLifecycle { task_id, .. } => Some(task_id),
+            _ => None,
+        })
+        .expect("durable task exists");
+    assert_eq!(
+        Store::open(&layout.database)?
+            .get_task(task_id)?
+            .expect("blocked task remains projected")
+            .snapshot
+            .status,
+        TaskStatus::Blocked
+    );
     kernel.shutdown().await?;
     Ok(())
 }
@@ -1740,6 +1877,8 @@ struct PortState {
     autonomous: bool,
     latest_operation_id: Option<String>,
     hold_autonomous_work: bool,
+    hold_autonomous_planning: bool,
+    autonomous_effect_summary: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -1758,6 +1897,19 @@ impl ScriptedPort {
     fn autonomous_pending_edit() -> Self {
         let port = Self::autonomous_small_edit();
         port.shared.lock().unwrap().hold_autonomous_work = true;
+        port
+    }
+
+    fn autonomous_pending_plan() -> Self {
+        let port = Self::autonomous_small_edit();
+        port.shared.lock().unwrap().hold_autonomous_planning = true;
+        port
+    }
+
+    fn autonomous_secret_effect() -> Self {
+        let port = Self::autonomous_small_edit();
+        port.shared.lock().unwrap().autonomous_effect_summary =
+            Some("Command: curl -H 'Authorization: Bearer sk-123456789012345678901234'".into());
         port
     }
 
@@ -1883,6 +2035,8 @@ impl ScriptedPort {
                 autonomous: false,
                 latest_operation_id: None,
                 hold_autonomous_work: false,
+                hold_autonomous_planning: false,
+                autonomous_effect_summary: None,
             })),
         })
     }
@@ -1916,6 +2070,8 @@ impl ScriptedPort {
                 autonomous: false,
                 latest_operation_id: None,
                 hold_autonomous_work: false,
+                hold_autonomous_planning: false,
+                autonomous_effect_summary: None,
             })),
         }
     }
@@ -1940,6 +2096,8 @@ impl ScriptedPort {
                 autonomous: false,
                 latest_operation_id: None,
                 hold_autonomous_work: false,
+                hold_autonomous_planning: false,
+                autonomous_effect_summary: None,
             })),
         }
     }
@@ -2018,6 +2176,9 @@ impl AgentPort for ScriptedPort {
                 context_id: request.context_id.clone(),
                 epoch_id: epoch_id.clone(),
             });
+            if state.starts % 2 == 1 && state.hold_autonomous_planning {
+                return Ok(epoch_id);
+            }
             if state.starts % 2 == 1 {
                 state.events.push_back(AgentEvent::AssistantDelta {
                     context_id: request.context_id.clone(),
@@ -2033,6 +2194,10 @@ impl AgentPort for ScriptedPort {
                 let work_number = state.starts / 2;
                 let item_id = format!("durable-item-{work_number}");
                 let request_id = format!("durable-request-{work_number}");
+                let summary = state
+                    .autonomous_effect_summary
+                    .clone()
+                    .unwrap_or_else(|| "run focused verification".into());
                 let item = command_item(&item_id, "inProgress");
                 state.events.push_back(AgentEvent::ItemStarted {
                     context_id: request.context_id.clone(),
@@ -2047,7 +2212,7 @@ impl AgentPort for ScriptedPort {
                         request_id: AgentRequestId::parse(request_id)?,
                         item_id,
                         kind: AgentEffectKind::Command,
-                        summary: "run focused verification".into(),
+                        summary,
                         request_digest: Sha256Digest::parse("44".repeat(32))
                             .map_err(|_| invalid())?,
                     }));
@@ -2092,6 +2257,11 @@ impl AgentPort for ScriptedPort {
                 let mut state = shared.lock().unwrap();
                 if let Some(event) = state.events.pop_front() {
                     Some(event)
+                } else if state.autonomous
+                    && state.hold_autonomous_planning
+                    && state.starts % 2 == 1
+                {
+                    None
                 } else if state.autonomous && !state.hold_autonomous_work {
                     let operation_id = state
                         .latest_operation_id

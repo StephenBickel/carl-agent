@@ -761,6 +761,25 @@ fn safe_boundaries_reject_active_epochs_and_unresolved_operations() {
         assert_eq!(error.code(), TaskReduceErrorCode::UnsafeBoundary);
     }
 
+    let cancelling = apply(Some(started.clone()), 6, TaskEvent::CancellationRequested);
+    let cancellation_error = reduce_task(
+        Some(cancelling),
+        &envelope(
+            7,
+            task_id(),
+            TaskEvent::StateTransitioned {
+                from: TaskStatus::Cancelling,
+                to: TaskStatus::Cancelled,
+                reason: "provider interrupted with work still in flight".into(),
+            },
+        ),
+    )
+    .unwrap_err();
+    assert_eq!(
+        cancellation_error.code(),
+        TaskReduceErrorCode::UnsafeBoundary
+    );
+
     let checkpointed = apply(
         Some(active.clone()),
         3,

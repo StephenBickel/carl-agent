@@ -808,11 +808,13 @@ impl KernelActor {
             });
         let mut pending = HashMap::<u64, PendingDurableReply>::new();
         let mut pending_permission = None::<TaskEnginePermissionNotice>;
+        let mut deferred_permission_publications = Vec::<String>::new();
         let mut next_acknowledgement = 0_u64;
         let mut receiver_open = true;
         let mut durable_shutdown = false;
         let result = {
-            let (engine, receiver) = (&mut self.engine, &mut self.receiver);
+            let (engine, receiver, sessions) =
+                (&mut self.engine, &mut self.receiver, &mut self.sessions);
             let engine = engine.as_mut().expect("kernel engine is actor-owned");
             let execution = async {
                 if let Some(task_id) = existing_task {
@@ -928,6 +930,33 @@ impl KernelActor {
                                     .map_err(|_| stopped_error())?;
                                 pending.insert(acknowledgement, PendingDurableReply::Prompt(reply));
                             }
+                            KernelCommand::AttachBuzzContext {
+                                session_id: target,
+                                context,
+                                reply,
+                            } if target == session_id => {
+                                let result = sessions
+                                    .get_mut(&session_id)
+                                    .ok_or_else(unknown_session)
+                                    .and_then(|state| {
+                                        let matches_binding = state.frontend == Frontend::Buzz
+                                            && state.buzz_context.as_ref().is_some_and(
+                                                |existing| {
+                                                    existing.channel_id() == context.channel_id()
+                                                        && existing.actor_hex()
+                                                            == context.actor_hex()
+                                                },
+                                            );
+                                        if !matches_binding {
+                                            return Err(KernelError::from_code(
+                                                KernelErrorCode::ApprovalUnavailable,
+                                            ));
+                                        }
+                                        state.buzz_context = Some(context);
+                                        Ok(())
+                                    });
+                                let _ = reply.send(result);
+                            }
                             KernelCommand::Steer {
                                 session_id: target,
                                 input,
@@ -1001,6 +1030,7 @@ impl KernelActor {
                             "Approval required: {}\nApprove with /approve {} or deny with /deny {}",
                             notice.summary, notice.display_code, notice.display_code
                         );
+                        deferred_permission_publications.push(publication.clone());
                         if let Some(reply) = current_reply.take() {
                             let _ = reply.send(Ok(PromptOutcome {
                                 stop_reason: PromptStopReason::WaitingForApproval,
@@ -1048,9 +1078,30 @@ impl KernelActor {
                 .map_err(map_agent_port)?;
             self.shutdown_requested = true;
         }
-        let updates = self
-            .engine_mut()
-            .take_updates()
+        let task_updates = self.engine_mut().take_updates();
+        for publication in deferred_permission_publications {
+            self.publish(session_id, turn_id, DeliveryKind::Message, &publication)
+                .await?;
+        }
+        for diff in task_updates.iter().filter_map(|update| match update {
+            TaskEngineUpdate::DiffUpdated(diff) => Some(diff.as_str()),
+            _ => None,
+        }) {
+            self.publish(session_id, turn_id, DeliveryKind::Diff, diff)
+                .await?;
+        }
+        let final_text = task_updates
+            .iter()
+            .filter_map(|update| match update {
+                TaskEngineUpdate::AgentMessageChunk(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        if !final_text.is_empty() {
+            self.publish(session_id, turn_id, DeliveryKind::Message, &final_text)
+                .await?;
+        }
+        let updates = task_updates
             .into_iter()
             .map(KernelUpdate::from)
             .collect::<Vec<_>>();
@@ -2516,7 +2567,14 @@ fn complete_durable_reply(reply: PendingDurableReply, result: Result<(), TaskEng
         PendingDurableReply::Cancel(reply) | PendingDurableReply::Shutdown(reply) => {
             let accepted = match result {
                 Ok(()) => Ok(()),
-                Err(error) if error.code() == TaskEngineErrorCode::Cancelled => Ok(()),
+                Err(error)
+                    if matches!(
+                        error.code(),
+                        TaskEngineErrorCode::Cancelled | TaskEngineErrorCode::Blocked
+                    ) =>
+                {
+                    Ok(())
+                }
                 Err(error) => Err(map_task_engine(error)),
             };
             let _ = reply.send(accepted);

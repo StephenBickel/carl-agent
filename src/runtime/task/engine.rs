@@ -11,11 +11,11 @@ use tokio::sync::mpsc;
 
 use crate::acp::{PermissionMode, PermissionProfile};
 use crate::delegates::{ModelId, ReasoningEffort};
-use crate::events::{SessionId, ToolCallId};
+use crate::events::{SessionId, ToolCallId, TurnId};
 use crate::policy::ActorId;
 use crate::runtime::agent_port::{
     AgentContextId, AgentEffectRequest, AgentEpochId, AgentErrorProvenance, AgentEvent, AgentItem,
-    AgentPort, AgentPortError, AgentPortErrorCode, ContextRecovery, EffectDecision,
+    AgentPort, AgentPortError, AgentPortErrorCode, AgentUsage, ContextRecovery, EffectDecision,
     ResumeAgentContext, StartAgentContext, StartAgentEpoch,
 };
 use crate::security::SecretFilter;
@@ -29,14 +29,20 @@ use super::{
     CompletionClause, CompletionContract, CompletionDecision, ContextBudget, ContextEngine,
     ContextInput, EpochId, EpochReport, EvidenceRef, ExactIdentifier, NormalizedOperationEvidence,
     OperationEvidence, OperationId, OperationStatus, ProcessCheckpoint, ProgressAssessment,
-    ProviderCheckpoint, RecoveryAttempt, RecoveryAttemptOutcome, RecoveryStrategy,
-    RepositoryCheckpoint, TaskBudget, TaskEvent, TaskId, TaskSnapshot, TaskStatus,
-    assess_progress_with_recovery_attempts, classify_effect, decide_completion, parse_epoch_report,
-    recovery_attempt_fingerprint,
+    ProviderCheckpoint, ProviderRequestPurpose, RecoveryAttempt, RecoveryAttemptOutcome,
+    RecoveryStrategy, RepositoryCheckpoint, TaskBudget, TaskEvent, TaskId, TaskSnapshot,
+    TaskStatus, assess_progress_with_recovery_attempts, classify_effect, decide_completion,
+    parse_epoch_report, recovery_attempt_fingerprint,
 };
 
 const MAX_REQUEST_BYTES: usize = 16 * 1024;
 const MAX_CONTRACT_OUTPUT_BYTES: usize = 64 * 1024;
+const MAX_EPOCH_TRANSCRIPT_BYTES: usize = 256 * 1024;
+const MAX_EPOCH_DIFF_BYTES: usize = 1024 * 1024;
+const MAX_EPOCH_PROVIDER_EVENTS: usize = 8_192;
+const MAX_ENGINE_UPDATES: usize = 4_096;
+const MAX_ENGINE_UPDATE_BYTES: usize = 2 * 1024 * 1024;
+const RESERVED_STATUS_UPDATE_BYTES: usize = 256;
 const DEFAULT_CONTEXT_WINDOW: u64 = 128_000;
 const CONTEXT_TRIGGER_PERCENT: u8 = 80;
 const CONTEXT_TARGET_PERCENT: u8 = 60;
@@ -202,14 +208,16 @@ struct RuntimeTask {
     previous_checkpoint: Option<CanonicalCheckpoint>,
     progress: Vec<ProgressAssessment>,
     recovery_attempts: Vec<RecoveryAttempt>,
-    pending_recovery: Option<(RecoveryStrategy, String)>,
+    pending_recovery: Option<PendingRecovery>,
     steering: VecDeque<String>,
     steering_sequence: u64,
     operation_evidence: Vec<OperationEvidence>,
     file_hashes: BTreeMap<String, String>,
     observed_total_tokens: Option<u64>,
     observed_context_window: Option<u64>,
+    estimated_tokens_since_usage: u64,
     completed_tools: u64,
+    started_tools: u64,
     provider_requests: u64,
 }
 
@@ -217,6 +225,17 @@ struct ActiveOperation {
     operation_id: OperationId,
     item: AgentItem,
     frontend_tool_call_id: Option<ToolCallId>,
+}
+
+struct PendingRecovery {
+    epoch_id: EpochId,
+    strategy: RecoveryStrategy,
+    strategy_fingerprint: String,
+}
+
+struct WorkEpochOutput {
+    transcript: String,
+    terminal_status: String,
 }
 
 pub trait TaskEngineStore: Send {
@@ -328,6 +347,18 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
         std::mem::take(&mut self.updates)
     }
 
+    fn can_accumulate_update(&self, additional_bytes: usize) -> bool {
+        self.updates.len() < MAX_ENGINE_UPDATES.saturating_sub(1)
+            && self
+                .updates
+                .iter()
+                .map(engine_update_size)
+                .sum::<usize>()
+                .saturating_add(additional_bytes)
+                .saturating_add(RESERVED_STATUS_UPDATE_BYTES)
+                <= MAX_ENGINE_UPDATE_BYTES
+    }
+
     pub(crate) fn install_controls(
         &mut self,
         controls: mpsc::Receiver<TaskEngineControl>,
@@ -363,13 +394,13 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
         context_id: AgentContextId,
     ) -> Result<TaskSnapshot, TaskEngineError> {
         validate_start(&input)?;
-        let contract = self.plan_contract(&input, &context_id).await?;
+        let contract = fallback_contract(&input.request);
         let created = self
             .store_mut()
             .create_task(NewTask {
                 session_id: input.session_id,
                 workspace: input.workspace.clone(),
-                contract,
+                contract: contract.clone(),
                 model: input.model.clone(),
                 effort: input.effort,
                 permission_mode: input.permission_mode,
@@ -396,30 +427,39 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                 context_id: context_id.as_str().to_owned(),
             },
         )?;
-        self.tasks.insert(
-            task_id,
-            RuntimeTask {
-                workspace: input.workspace,
-                request: input.request.clone(),
-                model: input.model,
-                effort: input.effort,
-                permission_mode: input.permission_mode,
-                context_id,
-                next_objective: format!("Implement and explicitly verify: {}", input.request),
-                previous_checkpoint: None,
-                progress: Vec::new(),
-                recovery_attempts: Vec::new(),
-                pending_recovery: None,
-                steering: VecDeque::new(),
-                steering_sequence: 0,
-                operation_evidence: Vec::new(),
-                file_hashes: BTreeMap::new(),
-                observed_total_tokens: None,
-                observed_context_window: None,
-                completed_tools: 0,
-                provider_requests: 1,
-            },
-        );
+        let mut runtime = RuntimeTask {
+            workspace: input.workspace.clone(),
+            request: input.request.clone(),
+            model: input.model.clone(),
+            effort: input.effort,
+            permission_mode: input.permission_mode,
+            context_id,
+            next_objective: format!(
+                "Implement and explicitly verify: {}",
+                normalized_contract_goal(&input.request)
+            ),
+            previous_checkpoint: None,
+            progress: Vec::new(),
+            recovery_attempts: Vec::new(),
+            pending_recovery: None,
+            steering: VecDeque::new(),
+            steering_sequence: 0,
+            operation_evidence: Vec::new(),
+            file_hashes: BTreeMap::new(),
+            observed_total_tokens: None,
+            observed_context_window: None,
+            estimated_tokens_since_usage: 0,
+            completed_tools: 0,
+            started_tools: 0,
+            provider_requests: 0,
+        };
+        let planned = self.plan_contract(task_id, &mut runtime, &input).await;
+        self.tasks.insert(task_id, runtime);
+        let mut planned = planned?;
+        if planned != contract {
+            planned.version = contract.version.saturating_add(1);
+            self.append(task_id, TaskEvent::ContractRevised { contract: planned })?;
+        }
         self.run(task_id).await
     }
 
@@ -443,9 +483,83 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
             self.tasks.insert(task_id, runtime);
         }
         let mut runtime = self.tasks.remove(&task_id).ok_or_else(invalid_task)?;
-        let result = self.run_loop(task_id, &mut runtime).await;
+        let recovered = if record.snapshot.status == TaskStatus::Checkpointing {
+            self.recover_checkpointing(task_id, &runtime)?
+        } else {
+            None
+        };
+        let result = if let Some(result) = recovered {
+            result
+        } else {
+            self.run_loop(task_id, &mut runtime).await
+        };
         self.tasks.insert(task_id, runtime);
         result
+    }
+
+    fn recover_checkpointing(
+        &mut self,
+        task_id: TaskId,
+        runtime: &RuntimeTask,
+    ) -> Result<Option<Result<TaskSnapshot, TaskEngineError>>, TaskEngineError> {
+        let Some(checkpoint) = runtime.previous_checkpoint.as_ref() else {
+            self.block_task(
+                task_id,
+                "checkpoint transaction did not commit; completed work will not be repeated",
+            )?;
+            return Ok(Some(Err(error(TaskEngineErrorCode::Blocked))));
+        };
+        let latest_finished_sequence = self
+            .store()
+            .read_task_events(task_id)
+            .map_err(storage_error)?
+            .iter()
+            .filter_map(|envelope| match envelope.event {
+                crate::events::Event::TaskLifecycle {
+                    event: TaskEvent::EpochFinished { .. },
+                    ..
+                } => Some(envelope.sequence),
+                _ => None,
+            })
+            .max()
+            .ok_or_else(invalid_task)?;
+        if checkpoint.source_sequence_end < latest_finished_sequence {
+            self.block_task(
+                task_id,
+                "latest completed epoch is not covered by an atomic checkpoint",
+            )?;
+            return Ok(Some(Err(error(TaskEngineErrorCode::Blocked))));
+        }
+        self.append(
+            task_id,
+            TaskEvent::StateTransitioned {
+                from: TaskStatus::Checkpointing,
+                to: TaskStatus::Active,
+                reason: "recovered atomically committed checkpoint".to_owned(),
+            },
+        )?;
+        if checkpoint.contract.required_clauses_satisfied() {
+            self.append(
+                task_id,
+                TaskEvent::StateTransitioned {
+                    from: TaskStatus::Active,
+                    to: TaskStatus::Completing,
+                    reason: "recovered checkpoint has complete durable evidence".to_owned(),
+                },
+            )?;
+            let completed = self.append(task_id, TaskEvent::Completed)?;
+            self.updates.push(TaskEngineUpdate::TaskStatus {
+                task_id,
+                status: completed.snapshot.status,
+            });
+            Ok(Some(Ok(completed.snapshot)))
+        } else {
+            self.updates.push(TaskEngineUpdate::TaskStatus {
+                task_id,
+                status: TaskStatus::Active,
+            });
+            Ok(None)
+        }
     }
 
     pub async fn steer(&mut self, task_id: TaskId, text: String) -> Result<(), TaskEngineError> {
@@ -480,31 +594,41 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
         if record.snapshot.status.is_terminal() {
             return Err(invalid_task());
         }
-        let cancelling = self.append(task_id, TaskEvent::CancellationRequested)?;
-        if let Some(runtime) = self.tasks.get(&task_id)
-            && let Some(epoch_id) = active_provider_epoch(self.store(), task_id)?
+        let logical_epoch_id = record.snapshot.active_epoch;
+        let started_operation_ids = record.snapshot.started_operation_ids();
+        let provider_epoch_id = active_provider_epoch(self.store(), task_id)?;
+        let context_id = self
+            .tasks
+            .get(&task_id)
+            .map(|runtime| runtime.context_id.clone())
+            .or_else(|| {
+                record
+                    .snapshot
+                    .provider_context
+                    .as_deref()
+                    .and_then(|context_id| AgentContextId::parse(context_id).ok())
+            });
+        match self
+            .cancel_active_epoch(
+                task_id,
+                logical_epoch_id,
+                context_id.as_ref(),
+                provider_epoch_id.as_ref(),
+                &started_operation_ids,
+                None,
+            )
+            .await
         {
-            let _ = self.port.interrupt(&runtime.context_id, &epoch_id).await;
+            Err(error) if error.code() == TaskEngineErrorCode::Cancelled => Ok(()),
+            result => result,
         }
-        let cancelled = self.append(
-            task_id,
-            TaskEvent::StateTransitioned {
-                from: cancelling.snapshot.status,
-                to: TaskStatus::Cancelled,
-                reason: "owner cancellation completed".to_owned(),
-            },
-        )?;
-        self.updates.push(TaskEngineUpdate::TaskStatus {
-            task_id,
-            status: cancelled.snapshot.status,
-        });
-        Ok(())
     }
 
     async fn plan_contract(
         &mut self,
+        task_id: TaskId,
+        runtime: &mut RuntimeTask,
         input: &StartTask,
-        context_id: &AgentContextId,
     ) -> Result<CompletionContract, TaskEngineError> {
         let initial = format!(
             "Read-only contract planning. Derive a bounded CompletionContract for this owner request without asking the owner to restate it. Return exactly one {CONTRACT_OPEN} JSON object {CONTRACT_CLOSE}. Request: {}",
@@ -513,8 +637,10 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
         let repair = format!(
             "Repair the prior invalid contract. Return exactly one valid {CONTRACT_OPEN} JSON object {CONTRACT_CLOSE}; no trailing prose."
         );
-        for prompt in [initial, repair] {
-            let output = self.run_planning_epoch(input, context_id, prompt).await?;
+        for (attempt, prompt) in [initial, repair].into_iter().enumerate() {
+            let output = self
+                .run_planning_epoch(task_id, runtime, input, prompt, attempt)
+                .await?;
             if let Ok(contract) = parse_contract(&output) {
                 return Ok(contract);
             }
@@ -524,54 +650,248 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
 
     async fn run_planning_epoch(
         &mut self,
+        task_id: TaskId,
+        runtime: &mut RuntimeTask,
         input: &StartTask,
-        context_id: &AgentContextId,
         prompt: String,
+        attempt: usize,
     ) -> Result<String, TaskEngineError> {
-        let epoch_id = self
-            .port
-            .start_epoch(StartAgentEpoch {
-                context_id: context_id.clone(),
-                input: prompt,
-                model: input.model.clone(),
-                effort: input.effort,
-                permission_mode: PermissionMode::Plan,
-            })
-            .await
-            .map_err(provider_error)?;
+        let epoch_id = EpochId::new();
+        self.append(
+            task_id,
+            TaskEvent::EpochStarted {
+                epoch_id,
+                objective: format!("Derive completion contract attempt {}", attempt + 1),
+            },
+        )?;
+        self.updates.push(TaskEngineUpdate::EpochObjective {
+            task_id,
+            epoch_id,
+            objective: "Derive the bounded completion contract".to_owned(),
+        });
+        let provider_epoch_id = self
+            .start_provider_epoch(
+                task_id,
+                epoch_id,
+                ProviderRequestPurpose::ContractPlanning,
+                runtime,
+                StartAgentEpoch {
+                    context_id: runtime.context_id.clone(),
+                    input: prompt,
+                    model: input.model.clone(),
+                    effort: input.effort,
+                    permission_mode: PermissionMode::Plan,
+                },
+            )
+            .await?;
+        let record = self
+            .store()
+            .get_task(task_id)
+            .map_err(storage_error)?
+            .ok_or_else(invalid_task)?;
+        let hard_wall_remaining = remaining_wall_budget(&record);
+        let hard_wall_enabled = hard_wall_remaining.is_some();
+        let hard_wall_timer = tokio::time::sleep(hard_wall_remaining.unwrap_or_default());
+        tokio::pin!(hard_wall_timer);
         let mut output = String::new();
+        let mut usage_observed = false;
+        let mut provider_events = 0_usize;
         loop {
-            let event = self.port.next_event().await.map_err(provider_error)?;
+            enum Next {
+                Provider(Result<AgentEvent, AgentPortError>),
+                HardBudget,
+                Control(Option<TaskEngineControl>),
+            }
+            let controls_enabled = self.controls.is_some();
+            let next = {
+                let port = &mut self.port;
+                let controls = &mut self.controls;
+                tokio::select! {
+                    event = port.next_event() => Next::Provider(event),
+                    () = &mut hard_wall_timer, if hard_wall_enabled => Next::HardBudget,
+                    control = receive_control(controls), if controls_enabled => Next::Control(control),
+                }
+            };
+            let event = match next {
+                Next::Provider(event) => event.map_err(provider_error)?,
+                Next::Control(Some(control)) => {
+                    let acknowledgement = control_acknowledgement(&control);
+                    let result = self
+                        .apply_planning_control(
+                            task_id,
+                            epoch_id,
+                            runtime,
+                            &provider_epoch_id,
+                            control,
+                        )
+                        .await;
+                    self.acknowledge(acknowledgement, result.clone()).await;
+                    result?;
+                    continue;
+                }
+                Next::Control(None) => {
+                    self.controls = None;
+                    self.acknowledgements = None;
+                    continue;
+                }
+                Next::HardBudget => {
+                    self.interrupt_planning_and_block(
+                        task_id,
+                        epoch_id,
+                        runtime,
+                        &provider_epoch_id,
+                        "maximum task wall time exhausted during contract planning",
+                    )
+                    .await?;
+                    return Err(error(TaskEngineErrorCode::Blocked));
+                }
+            };
             event.validate().map_err(provider_error)?;
+            provider_events = provider_events.saturating_add(1);
+            if provider_events > MAX_EPOCH_PROVIDER_EVENTS {
+                self.interrupt_planning_and_block(
+                    task_id,
+                    epoch_id,
+                    runtime,
+                    &provider_epoch_id,
+                    "maximum provider events exhausted during contract planning",
+                )
+                .await?;
+                return Err(error(TaskEngineErrorCode::Blocked));
+            }
             match event {
-                AgentEvent::ContextStarted {
-                    context_id: observed,
-                } if observed == *context_id => {}
+                AgentEvent::ContextStarted { .. } => {}
                 AgentEvent::EpochStarted {
                     context_id: observed_context,
                     epoch_id: observed_epoch,
-                } if observed_context == *context_id && observed_epoch == epoch_id => {}
+                } if observed_context == runtime.context_id
+                    && observed_epoch == provider_epoch_id => {}
                 AgentEvent::AssistantDelta {
                     context_id: observed_context,
                     epoch_id: observed_epoch,
                     text,
-                } if observed_context == *context_id && observed_epoch == epoch_id => {
-                    output.push_str(&text);
-                    if output.len() > MAX_CONTRACT_OUTPUT_BYTES {
-                        return Err(error(TaskEngineErrorCode::Verification));
+                } if observed_context == runtime.context_id
+                    && observed_epoch == provider_epoch_id =>
+                {
+                    self.account_estimated_tokens(runtime, text.len())?;
+                    if output
+                        .len()
+                        .checked_add(text.len())
+                        .is_none_or(|size| size > MAX_CONTRACT_OUTPUT_BYTES)
+                    {
+                        self.interrupt_planning_and_block(
+                            task_id,
+                            epoch_id,
+                            runtime,
+                            &provider_epoch_id,
+                            "aggregate contract planning output exceeded its bound",
+                        )
+                        .await?;
+                        return Err(error(TaskEngineErrorCode::Blocked));
                     }
+                    output.push_str(&text);
                 }
+                AgentEvent::UsageUpdated {
+                    context_id: observed_context,
+                    epoch_id: observed_epoch,
+                    usage,
+                } if observed_context == runtime.context_id
+                    && observed_epoch == provider_epoch_id =>
+                {
+                    usage_observed = true;
+                    self.record_usage(task_id, epoch_id, runtime, usage)?;
+                }
+                AgentEvent::ItemStarted {
+                    context_id: observed_context,
+                    epoch_id: observed_epoch,
+                    item: AgentItem::Other { .. } | AgentItem::ContextCompaction { .. },
+                }
+                | AgentEvent::ItemCompleted {
+                    context_id: observed_context,
+                    epoch_id: observed_epoch,
+                    item: AgentItem::Other { .. } | AgentItem::ContextCompaction { .. },
+                } if observed_context == runtime.context_id
+                    && observed_epoch == provider_epoch_id => {}
+                AgentEvent::CompactionStarted { context_id, .. }
+                | AgentEvent::CompactionCompleted { context_id, .. }
+                    if context_id == runtime.context_id => {}
                 AgentEvent::EpochCompleted {
                     context_id: observed_context,
                     epoch_id: observed_epoch,
                     ..
-                } if observed_context == *context_id && observed_epoch == epoch_id => {
+                } if observed_context == runtime.context_id
+                    && observed_epoch == provider_epoch_id =>
+                {
+                    if !usage_observed {
+                        self.record_estimated_usage(task_id, epoch_id, runtime)?;
+                    }
+                    self.append(
+                        task_id,
+                        TaskEvent::EpochFinished {
+                            epoch_id,
+                            report_digest: sha256(output.as_bytes()),
+                        },
+                    )?;
                     return Ok(output);
                 }
                 AgentEvent::ProviderFailed { .. } => {
-                    return Err(error(TaskEngineErrorCode::Provider));
+                    self.block_task(task_id, "planning provider reported failure")?;
+                    return Err(error(TaskEngineErrorCode::Blocked));
                 }
                 _ => return Err(error(TaskEngineErrorCode::Provider)),
+            }
+        }
+    }
+
+    async fn interrupt_planning_and_block(
+        &mut self,
+        task_id: TaskId,
+        epoch_id: EpochId,
+        runtime: &RuntimeTask,
+        provider_epoch_id: &AgentEpochId,
+        reason: &str,
+    ) -> Result<(), TaskEngineError> {
+        let _ = self
+            .port
+            .interrupt(&runtime.context_id, provider_epoch_id)
+            .await;
+        self.append(
+            task_id,
+            TaskEvent::EpochFinished {
+                epoch_id,
+                report_digest: sha256(reason.as_bytes()),
+            },
+        )?;
+        self.block_task(task_id, reason)
+    }
+
+    async fn apply_planning_control(
+        &mut self,
+        task_id: TaskId,
+        epoch_id: EpochId,
+        runtime: &mut RuntimeTask,
+        provider_epoch_id: &AgentEpochId,
+        control: TaskEngineControl,
+    ) -> Result<(), TaskEngineError> {
+        match control {
+            TaskEngineControl::Cancel {
+                session_id,
+                turn_id,
+                ..
+            } => {
+                self.cancel_active_epoch(
+                    task_id,
+                    Some(epoch_id),
+                    Some(&runtime.context_id),
+                    Some(provider_epoch_id),
+                    &[],
+                    Some((session_id, turn_id)),
+                )
+                .await
+            }
+            control => {
+                self.apply_control(task_id, epoch_id, runtime, provider_epoch_id, &[], control)
+                    .await
             }
         }
     }
@@ -603,9 +923,16 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                 });
                 return Err(error(TaskEngineErrorCode::Blocked));
             }
+            if !self.can_accumulate_update(0) {
+                self.block_task(task_id, "accumulated engine updates exceeded their bound")?;
+                return Err(error(TaskEngineErrorCode::Blocked));
+            }
 
             let objective = recovery_objective(runtime);
-            let epoch_id = EpochId::new();
+            let epoch_id = runtime
+                .pending_recovery
+                .as_ref()
+                .map_or_else(EpochId::new, |pending| pending.epoch_id);
             self.append(
                 task_id,
                 TaskEvent::EpochStarted {
@@ -619,62 +946,65 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                 objective: objective.clone(),
             });
             let provider_input = self.assemble_epoch_context(task_id, runtime, &objective)?;
-            let provider_epoch_id = match self
-                .port
-                .start_epoch(StartAgentEpoch {
-                    context_id: runtime.context_id.clone(),
-                    input: provider_input,
-                    model: runtime.model.clone(),
-                    effort: runtime.effort,
-                    permission_mode: runtime.permission_mode,
-                })
-                .await
-            {
-                Ok(epoch_id) => epoch_id,
-                Err(port_error)
-                    if port_error.provenance() == AgentErrorProvenance::DefinitelyNotApplied =>
-                {
-                    self.append(
-                        task_id,
-                        TaskEvent::EpochFinished {
-                            epoch_id,
-                            report_digest: sha256(b"provider-epoch-definitely-not-applied"),
-                        },
-                    )?;
-                    return Err(provider_error(port_error));
-                }
-                Err(port_error) => {
-                    self.append(
-                        task_id,
-                        TaskEvent::Blocked {
-                            reason: "provider epoch dispatch is uncertain".to_owned(),
-                        },
-                    )?;
-                    return Err(provider_error(port_error));
-                }
+            let purpose = if runtime.pending_recovery.is_some() {
+                ProviderRequestPurpose::Recovery
+            } else {
+                ProviderRequestPurpose::Work
             };
-            runtime.provider_requests = runtime
-                .provider_requests
-                .checked_add(1)
-                .ok_or_else(invalid_task)?;
+            let provider_epoch_id = self
+                .start_provider_epoch(
+                    task_id,
+                    epoch_id,
+                    purpose,
+                    runtime,
+                    StartAgentEpoch {
+                        context_id: runtime.context_id.clone(),
+                        input: provider_input,
+                        model: runtime.model.clone(),
+                        effort: runtime.effort,
+                        permission_mode: runtime.permission_mode,
+                    },
+                )
+                .await?;
             for steering in runtime.steering.drain(..) {
                 self.port
                     .steer(&runtime.context_id, &provider_epoch_id, steering)
                     .await
                     .map_err(provider_error)?;
             }
-            let output = self
+            let epoch_output = self
                 .drain_work_epoch(task_id, epoch_id, &provider_epoch_id, runtime)
                 .await?;
-            let report = parse_epoch_report(&output)
+            let report = parse_epoch_report(&epoch_output.transcript)
                 .map_err(|_| error(TaskEngineErrorCode::Verification))?;
             self.append(
                 task_id,
                 TaskEvent::EpochFinished {
                     epoch_id,
-                    report_digest: sha256(output.as_bytes()),
+                    report_digest: sha256(epoch_output.transcript.as_bytes()),
                 },
             )?;
+            if let Some(pending) = runtime
+                .pending_recovery
+                .take()
+                .filter(|pending| pending.epoch_id == epoch_id)
+            {
+                let attempt = RecoveryAttempt {
+                    strategy: pending.strategy,
+                    strategy_fingerprint: pending.strategy_fingerprint,
+                    outcome: recovery_terminal_outcome(&epoch_output.terminal_status),
+                };
+                self.append(
+                    task_id,
+                    TaskEvent::RecoveryAttemptRecorded {
+                        epoch_id,
+                        strategy: attempt.strategy,
+                        strategy_fingerprint: attempt.strategy_fingerprint.clone(),
+                        outcome: attempt.outcome,
+                    },
+                )?;
+                runtime.recovery_attempts.push(attempt);
+            }
 
             let checkpoint_id = CheckpointId::new();
             let tentative = self.build_checkpoint(
@@ -708,40 +1038,13 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                 &report,
                 report_next_objective(&report, runtime),
             )?;
-            let mut assessment = assess_progress_with_recovery_attempts(
+            let assessment = assess_progress_with_recovery_attempts(
                 &checkpoint,
                 &report,
                 &runtime.progress,
                 &runtime.recovery_attempts,
             )
             .map_err(|_| error(TaskEngineErrorCode::Verification))?;
-            if let Some((strategy, fingerprint)) = runtime.pending_recovery.take() {
-                let attempt = RecoveryAttempt {
-                    strategy,
-                    strategy_fingerprint: fingerprint,
-                    outcome: if assessment.new_information {
-                        RecoveryAttemptOutcome::Succeeded
-                    } else {
-                        RecoveryAttemptOutcome::Failed
-                    },
-                };
-                self.append(
-                    task_id,
-                    TaskEvent::RecoveryAttemptRecorded {
-                        strategy: attempt.strategy,
-                        strategy_fingerprint: attempt.strategy_fingerprint.clone(),
-                        outcome: attempt.outcome,
-                    },
-                )?;
-                runtime.recovery_attempts.push(attempt);
-                assessment = assess_progress_with_recovery_attempts(
-                    &checkpoint,
-                    &report,
-                    &runtime.progress,
-                    &runtime.recovery_attempts,
-                )
-                .map_err(|_| error(TaskEngineErrorCode::Verification))?;
-            }
             self.append(
                 task_id,
                 TaskEvent::ProgressAssessed {
@@ -857,10 +1160,22 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                     if let Some(strategy) = assessment.recovery {
                         self.updates
                             .push(TaskEngineUpdate::RecoveryStrategy { task_id, strategy });
-                        runtime.pending_recovery = Some((
+                        let recovery_epoch_id = EpochId::new();
+                        let strategy_fingerprint =
+                            recovery_attempt_fingerprint(&assessment.fingerprint, strategy);
+                        self.append(
+                            task_id,
+                            TaskEvent::RecoveryAttemptStarted {
+                                epoch_id: recovery_epoch_id,
+                                strategy,
+                                strategy_fingerprint: strategy_fingerprint.clone(),
+                            },
+                        )?;
+                        runtime.pending_recovery = Some(PendingRecovery {
+                            epoch_id: recovery_epoch_id,
                             strategy,
-                            recovery_attempt_fingerprint(&assessment.fingerprint, strategy),
-                        ));
+                            strategy_fingerprint,
+                        });
                     }
                     let active = self.append(
                         task_id,
@@ -877,6 +1192,162 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                 }
             }
         }
+    }
+
+    async fn start_provider_epoch(
+        &mut self,
+        task_id: TaskId,
+        epoch_id: EpochId,
+        purpose: ProviderRequestPurpose,
+        runtime: &mut RuntimeTask,
+        request: StartAgentEpoch,
+    ) -> Result<AgentEpochId, TaskEngineError> {
+        let record = self
+            .store()
+            .get_task(task_id)
+            .map_err(storage_error)?
+            .ok_or_else(invalid_task)?;
+        if let Some(reason) = provider_dispatch_budget_reason(&record, runtime) {
+            self.append(
+                task_id,
+                TaskEvent::EpochFinished {
+                    epoch_id,
+                    report_digest: sha256(reason.as_bytes()),
+                },
+            )?;
+            self.block_task(task_id, reason)?;
+            return Err(error(TaskEngineErrorCode::Blocked));
+        }
+        self.account_estimated_tokens(runtime, request.input.len())?;
+        self.append(
+            task_id,
+            TaskEvent::ProviderRequestRecorded {
+                epoch_id,
+                purpose,
+                request_sequence: runtime.provider_requests,
+                request_digest: sha256(request.input.as_bytes()),
+            },
+        )?;
+        runtime.provider_requests = runtime
+            .provider_requests
+            .checked_add(1)
+            .ok_or_else(invalid_task)?;
+        match self.port.start_epoch(request).await {
+            Ok(provider_epoch_id) => {
+                self.append(
+                    task_id,
+                    TaskEvent::ProviderEpochBound {
+                        epoch_id,
+                        provider_epoch_id: provider_epoch_id.as_str().to_owned(),
+                    },
+                )?;
+                Ok(provider_epoch_id)
+            }
+            Err(port_error)
+                if port_error.provenance() == AgentErrorProvenance::DefinitelyNotApplied =>
+            {
+                self.append(
+                    task_id,
+                    TaskEvent::EpochFinished {
+                        epoch_id,
+                        report_digest: sha256(b"provider-epoch-definitely-not-applied"),
+                    },
+                )?;
+                Err(provider_error(port_error))
+            }
+            Err(_) => {
+                self.block_task(task_id, "provider epoch dispatch is uncertain")?;
+                Err(error(TaskEngineErrorCode::Blocked))
+            }
+        }
+    }
+
+    fn account_estimated_tokens(
+        &self,
+        runtime: &mut RuntimeTask,
+        byte_count: usize,
+    ) -> Result<(), TaskEngineError> {
+        let byte_count = u64::try_from(byte_count).map_err(|_| invalid_task())?;
+        let (estimated, actual) = context_engine(runtime)?
+            .account_tokens(byte_count, None)
+            .map_err(|_| error(TaskEngineErrorCode::Context))?;
+        debug_assert!(!actual);
+        runtime.estimated_tokens_since_usage = runtime
+            .estimated_tokens_since_usage
+            .checked_add(estimated)
+            .ok_or_else(invalid_task)?;
+        Ok(())
+    }
+
+    fn record_usage(
+        &mut self,
+        task_id: TaskId,
+        epoch_id: EpochId,
+        runtime: &mut RuntimeTask,
+        usage: AgentUsage,
+    ) -> Result<(), TaskEngineError> {
+        runtime.observed_total_tokens = Some(usage.total_tokens);
+        runtime.estimated_tokens_since_usage = 0;
+        if usage.model_context_window.is_some() {
+            runtime.observed_context_window = usage.model_context_window;
+        }
+        self.append(
+            task_id,
+            TaskEvent::UsageObserved {
+                epoch_id,
+                total_tokens: usage.total_tokens,
+                context_window: usage.model_context_window,
+            },
+        )?;
+        self.updates.push(TaskEngineUpdate::ContextUsage {
+            task_id,
+            total_tokens: usage.total_tokens,
+            context_window: usage.model_context_window,
+        });
+        Ok(())
+    }
+
+    fn record_estimated_usage(
+        &mut self,
+        task_id: TaskId,
+        epoch_id: EpochId,
+        runtime: &mut RuntimeTask,
+    ) -> Result<(), TaskEngineError> {
+        let total_tokens = runtime
+            .observed_total_tokens
+            .unwrap_or(0)
+            .checked_add(runtime.estimated_tokens_since_usage)
+            .ok_or_else(invalid_task)?;
+        runtime.observed_total_tokens = Some(total_tokens);
+        runtime.estimated_tokens_since_usage = 0;
+        self.append(
+            task_id,
+            TaskEvent::UsageObserved {
+                epoch_id,
+                total_tokens,
+                context_window: runtime.observed_context_window,
+            },
+        )?;
+        self.updates.push(TaskEngineUpdate::ContextUsage {
+            task_id,
+            total_tokens,
+            context_window: runtime.observed_context_window,
+        });
+        Ok(())
+    }
+
+    fn block_task(&mut self, task_id: TaskId, reason: &str) -> Result<(), TaskEngineError> {
+        let blocked = self.append(
+            task_id,
+            TaskEvent::Blocked {
+                reason: reason.to_owned(),
+            },
+        )?;
+        self.updates.push(TaskEngineUpdate::TaskStatus {
+            task_id,
+            status: blocked.snapshot.status,
+        });
+        Ok(())
     }
 
     fn assemble_epoch_context(
@@ -917,20 +1388,34 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
         epoch_id: EpochId,
         provider_epoch_id: &AgentEpochId,
         runtime: &mut RuntimeTask,
-    ) -> Result<String, TaskEngineError> {
+    ) -> Result<WorkEpochOutput, TaskEngineError> {
         let mut output = String::new();
         let mut items = HashMap::<String, AgentItem>::new();
         let mut operations = HashMap::<String, ActiveOperation>::new();
         let mut boundary_requested = false;
+        let mut usage_observed = false;
+        let mut definitely_not_applied_read_retries = 0_u8;
+        let mut provider_events = 0_usize;
+        let mut diff_bytes = 0_usize;
         let epoch_tool_start = runtime.completed_tools;
+        let record = self
+            .store()
+            .get_task(task_id)
+            .map_err(storage_error)?
+            .ok_or_else(invalid_task)?;
+        let hard_wall_remaining = remaining_wall_budget(&record);
+        let hard_wall_enabled = hard_wall_remaining.is_some();
+        let hard_wall_timer = tokio::time::sleep(hard_wall_remaining.unwrap_or_default());
+        tokio::pin!(hard_wall_timer);
         let timer = tokio::time::sleep(Duration::from_secs(
-            self.snapshot(task_id)?.budget.soft_epoch_seconds,
+            record.snapshot.budget.soft_epoch_seconds,
         ));
         tokio::pin!(timer);
         loop {
             enum Next {
                 Provider(Result<AgentEvent, AgentPortError>),
                 Boundary,
+                HardBudget,
                 Control(Option<TaskEngineControl>),
             }
             let controls_enabled = self.controls.is_some();
@@ -940,6 +1425,7 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                 tokio::select! {
                     event = port.next_event() => Next::Provider(event),
                     () = &mut timer, if !boundary_requested => Next::Boundary,
+                    () = &mut hard_wall_timer, if hard_wall_enabled => Next::HardBudget,
                     control = receive_control(controls), if controls_enabled => Next::Control(control),
                 }
             };
@@ -947,17 +1433,99 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                 Next::Provider(event) => {
                     let event = match event {
                         Ok(event) => event,
+                        Err(port_error)
+                            if port_error.provenance()
+                                == AgentErrorProvenance::DefinitelyNotApplied
+                                && definitely_not_applied_read_retries == 0 =>
+                        {
+                            definitely_not_applied_read_retries = 1;
+                            continue;
+                        }
                         Err(port_error) => {
                             self.block_uncertain_operations(
                                 task_id,
                                 &operations,
                                 "provider event delivery failed with an ambiguous operation outcome",
                             )?;
-                            return Err(provider_error(port_error));
+                            let _ = port_error;
+                            return Err(error(TaskEngineErrorCode::Blocked));
                         }
                     };
-                    event.validate().map_err(provider_error)?;
-                    if self
+                    definitely_not_applied_read_retries = 0;
+                    if event.validate().is_err() {
+                        self.block_uncertain_operations(
+                            task_id,
+                            &operations,
+                            "provider event validation failed after operation binding",
+                        )?;
+                        return Err(error(TaskEngineErrorCode::Blocked));
+                    }
+                    provider_events = provider_events.saturating_add(1);
+                    let transcript_exceeded = match &event {
+                        AgentEvent::AssistantDelta { text, .. } => output
+                            .len()
+                            .checked_add(text.len())
+                            .is_none_or(|size| size > MAX_EPOCH_TRANSCRIPT_BYTES),
+                        _ => false,
+                    };
+                    let next_diff_bytes = match &event {
+                        AgentEvent::DiffUpdated { diff, .. } => diff_bytes.checked_add(diff.len()),
+                        _ => Some(diff_bytes),
+                    };
+                    let event_update_bytes = match &event {
+                        AgentEvent::AssistantDelta { text, .. } => text.len().saturating_add(128),
+                        AgentEvent::DiffUpdated { diff, .. } => diff.len().saturating_add(128),
+                        AgentEvent::ItemStarted { item, .. }
+                        | AgentEvent::ItemCompleted { item, .. }
+                            if engine_tool_kind(item).is_some() =>
+                        {
+                            item.item_id().len().saturating_add(128)
+                        }
+                        _ => 0,
+                    };
+                    let stream_bound_reason = if provider_events > MAX_EPOCH_PROVIDER_EVENTS {
+                        Some("maximum provider events exhausted during work epoch")
+                    } else if transcript_exceeded {
+                        Some("aggregate work transcript exceeded its bound")
+                    } else if next_diff_bytes.is_none_or(|size| size > MAX_EPOCH_DIFF_BYTES) {
+                        Some("aggregate diff stream exceeded its bound")
+                    } else if !self.can_accumulate_update(event_update_bytes) {
+                        Some("accumulated engine updates exceeded their bound")
+                    } else {
+                        None
+                    };
+                    if let Some(reason) = stream_bound_reason {
+                        self.interrupt_and_block_epoch(
+                            task_id,
+                            epoch_id,
+                            runtime,
+                            provider_epoch_id,
+                            &operations,
+                            reason,
+                        )
+                        .await?;
+                        return Err(error(TaskEngineErrorCode::Blocked));
+                    }
+                    diff_bytes = next_diff_bytes.expect("diff byte bound was checked");
+                    if matches!(&event, AgentEvent::EffectRequested(_))
+                        && self
+                            .snapshot(task_id)?
+                            .budget
+                            .max_tool_calls
+                            .is_some_and(|maximum| runtime.started_tools >= maximum)
+                    {
+                        self.interrupt_and_block_epoch(
+                            task_id,
+                            epoch_id,
+                            runtime,
+                            provider_epoch_id,
+                            &operations,
+                            "maximum tool calls exhausted during provider stream",
+                        )
+                        .await?;
+                        return Err(error(TaskEngineErrorCode::Blocked));
+                    }
+                    if let Some(terminal_status) = self
                         .process_work_event(
                             task_id,
                             epoch_id,
@@ -967,13 +1535,20 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                             &mut items,
                             &mut operations,
                             &mut output,
+                            &mut usage_observed,
                         )
                         .await?
                     {
                         if !operations.is_empty() {
                             return Err(error(TaskEngineErrorCode::Verification));
                         }
-                        return Ok(output);
+                        if !usage_observed {
+                            self.record_estimated_usage(task_id, epoch_id, runtime)?;
+                        }
+                        return Ok(WorkEpochOutput {
+                            transcript: output,
+                            terminal_status,
+                        });
                     }
                     if !boundary_requested
                         && runtime.completed_tools.saturating_sub(epoch_tool_start)
@@ -989,6 +1564,18 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                     self.request_safe_boundary(task_id, runtime, provider_epoch_id)
                         .await?;
                 }
+                Next::HardBudget => {
+                    self.interrupt_and_block_epoch(
+                        task_id,
+                        epoch_id,
+                        runtime,
+                        provider_epoch_id,
+                        &operations,
+                        "maximum task wall time exhausted during provider stream",
+                    )
+                    .await?;
+                    return Err(error(TaskEngineErrorCode::Blocked));
+                }
                 Next::Control(Some(control)) => {
                     let acknowledgement = match &control {
                         TaskEngineControl::Steer {
@@ -1002,7 +1589,17 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                         } => *acknowledgement,
                     };
                     let result = self
-                        .apply_control(task_id, runtime, provider_epoch_id, control)
+                        .apply_control(
+                            task_id,
+                            epoch_id,
+                            runtime,
+                            provider_epoch_id,
+                            &operations
+                                .values()
+                                .map(|operation| operation.operation_id)
+                                .collect::<Vec<_>>(),
+                            control,
+                        )
                         .await;
                     self.acknowledge(acknowledgement, result.clone()).await;
                     result?;
@@ -1015,11 +1612,40 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
         }
     }
 
+    async fn interrupt_and_block_epoch(
+        &mut self,
+        task_id: TaskId,
+        epoch_id: EpochId,
+        runtime: &RuntimeTask,
+        provider_epoch_id: &AgentEpochId,
+        operations: &HashMap<String, ActiveOperation>,
+        reason: &str,
+    ) -> Result<(), TaskEngineError> {
+        let _ = self
+            .port
+            .interrupt(&runtime.context_id, provider_epoch_id)
+            .await;
+        if operations.is_empty() {
+            self.append(
+                task_id,
+                TaskEvent::EpochFinished {
+                    epoch_id,
+                    report_digest: sha256(reason.as_bytes()),
+                },
+            )?;
+            self.block_task(task_id, reason)
+        } else {
+            self.block_uncertain_operations(task_id, operations, reason)
+        }
+    }
+
     async fn apply_control(
         &mut self,
         task_id: TaskId,
+        logical_epoch_id: EpochId,
         runtime: &mut RuntimeTask,
         provider_epoch_id: &AgentEpochId,
+        active_operation_ids: &[OperationId],
         control: TaskEngineControl,
     ) -> Result<(), TaskEngineError> {
         match control {
@@ -1059,36 +1685,105 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                 turn_id,
                 ..
             } => {
-                let cancelling = self.append(task_id, TaskEvent::CancellationRequested)?;
-                self.port
-                    .interrupt(&runtime.context_id, provider_epoch_id)
-                    .await
-                    .map_err(provider_error)?;
-                let cancelled = self.append(
+                self.cancel_active_epoch(
                     task_id,
-                    TaskEvent::StateTransitioned {
-                        from: cancelling.snapshot.status,
-                        to: TaskStatus::Cancelled,
-                        reason: "owner cancellation completed".to_owned(),
-                    },
-                )?;
-                self.store_mut()
-                    .append(
-                        session_id,
-                        Some(turn_id),
-                        crate::events::Event::TurnInterrupted {
-                            reason: "cancelled".to_owned(),
-                        },
-                    )
-                    .map_err(storage_error)?;
-                self.updates.push(TaskEngineUpdate::TaskStatus {
-                    task_id,
-                    status: cancelled.snapshot.status,
-                });
-                Err(error(TaskEngineErrorCode::Cancelled))
+                    Some(logical_epoch_id),
+                    Some(&runtime.context_id),
+                    Some(provider_epoch_id),
+                    active_operation_ids,
+                    Some((session_id, turn_id)),
+                )
+                .await
             }
             TaskEngineControl::Approval { .. } => Err(error(TaskEngineErrorCode::Blocked)),
         }
+    }
+
+    async fn cancel_active_epoch(
+        &mut self,
+        task_id: TaskId,
+        logical_epoch_id: Option<EpochId>,
+        context_id: Option<&AgentContextId>,
+        provider_epoch_id: Option<&AgentEpochId>,
+        active_operation_ids: &[OperationId],
+        turn: Option<(SessionId, TurnId)>,
+    ) -> Result<(), TaskEngineError> {
+        let cancelling = self.append(task_id, TaskEvent::CancellationRequested)?;
+        if logical_epoch_id.is_some() {
+            let interrupt_result = match (context_id, provider_epoch_id) {
+                (Some(context_id), Some(provider_epoch_id)) => {
+                    self.port.interrupt(context_id, provider_epoch_id).await
+                }
+                _ => Err(AgentPortError::from_code(AgentPortErrorCode::Transport)),
+            };
+            if interrupt_result.is_err() {
+                if active_operation_ids.is_empty() {
+                    self.block_task(task_id, "provider interruption could not be confirmed")?;
+                } else {
+                    self.block_uncertain_operation_ids(
+                        task_id,
+                        active_operation_ids,
+                        "provider interruption failed with operations in flight",
+                    )?;
+                }
+                self.record_turn_interrupted(turn, "cancellation blocked")?;
+                return Err(error(TaskEngineErrorCode::Blocked));
+            }
+        }
+
+        if !active_operation_ids.is_empty() {
+            self.block_uncertain_operation_ids(
+                task_id,
+                active_operation_ids,
+                "provider was interrupted with operations in flight",
+            )?;
+            self.record_turn_interrupted(turn, "cancelled with uncertain operations")?;
+            return Err(error(TaskEngineErrorCode::Blocked));
+        }
+
+        if let Some(epoch_id) = logical_epoch_id {
+            self.append(
+                task_id,
+                TaskEvent::EpochFinished {
+                    epoch_id,
+                    report_digest: sha256(b"cancelled-at-safe-boundary"),
+                },
+            )?;
+        }
+        let cancelled = self.append(
+            task_id,
+            TaskEvent::StateTransitioned {
+                from: cancelling.snapshot.status,
+                to: TaskStatus::Cancelled,
+                reason: "owner cancellation completed at a safe boundary".to_owned(),
+            },
+        )?;
+        self.record_turn_interrupted(turn, "cancelled")?;
+        self.updates.push(TaskEngineUpdate::TaskStatus {
+            task_id,
+            status: cancelled.snapshot.status,
+        });
+        Err(error(TaskEngineErrorCode::Cancelled))
+    }
+
+    fn record_turn_interrupted(
+        &mut self,
+        turn: Option<(SessionId, TurnId)>,
+        reason: &str,
+    ) -> Result<(), TaskEngineError> {
+        let Some((session_id, turn_id)) = turn else {
+            return Ok(());
+        };
+        self.store_mut()
+            .append(
+                session_id,
+                Some(turn_id),
+                crate::events::Event::TurnInterrupted {
+                    reason: reason.to_owned(),
+                },
+            )
+            .map_err(storage_error)?;
+        Ok(())
     }
 
     async fn acknowledge(&mut self, acknowledgement: u64, result: Result<(), TaskEngineError>) {
@@ -1108,9 +1803,10 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
         items: &mut HashMap<String, AgentItem>,
         operations: &mut HashMap<String, ActiveOperation>,
         output: &mut String,
-    ) -> Result<bool, TaskEngineError> {
+        usage_observed: &mut bool,
+    ) -> Result<Option<String>, TaskEngineError> {
         match event {
-            AgentEvent::ContextStarted { context_id } if context_id == runtime.context_id => {}
+            AgentEvent::ContextStarted { .. } => {}
             AgentEvent::EpochStarted {
                 context_id,
                 epoch_id,
@@ -1162,6 +1858,10 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                         evidence_sequences: Vec::new(),
                     },
                 )?;
+                runtime.started_tools = runtime
+                    .started_tools
+                    .checked_add(1)
+                    .ok_or_else(invalid_task)?;
                 let frontend_tool_call_id =
                     self.frontend_context.as_ref().map(|_| ToolCallId::new());
                 operations.insert(
@@ -1172,16 +1872,31 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                         frontend_tool_call_id,
                     },
                 );
-                self.port
+                if let Err(port_error) = self
+                    .port
                     .steer(
                         &runtime.context_id,
                         provider_epoch_id,
                         format!("carl-operation-id: {operation_id}"),
                     )
                     .await
-                    .map_err(provider_error)?;
+                {
+                    let status = match port_error.provenance() {
+                        AgentErrorProvenance::DefinitelyNotApplied => OperationStatus::Failed,
+                        AgentErrorProvenance::PossiblyApplied => OperationStatus::Uncertain,
+                    };
+                    self.close_operation_with_evidence(
+                        task_id,
+                        operation_id,
+                        status,
+                        "provider operation binding failed",
+                    )?;
+                    self.block_task(task_id, "provider operation binding failed")?;
+                    return Err(error(TaskEngineErrorCode::Blocked));
+                }
                 self.resolve_effect(
                     task_id,
+                    epoch_id,
                     runtime,
                     request,
                     operation_id,
@@ -1257,6 +1972,7 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                 epoch_id,
                 text,
             } if context_id == runtime.context_id && epoch_id == *provider_epoch_id => {
+                self.account_estimated_tokens(runtime, text.len())?;
                 output.push_str(&text);
                 self.updates.push(TaskEngineUpdate::AgentMessageChunk(text));
             }
@@ -1265,6 +1981,7 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                 epoch_id,
                 diff,
             } if context_id == runtime.context_id && epoch_id == *provider_epoch_id => {
+                self.account_estimated_tokens(runtime, diff.len())?;
                 self.updates.push(TaskEngineUpdate::DiffUpdated(diff));
             }
             AgentEvent::UsageUpdated {
@@ -1272,30 +1989,15 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                 epoch_id: observed_epoch,
                 usage,
             } if context_id == runtime.context_id && observed_epoch == *provider_epoch_id => {
-                runtime.observed_total_tokens = Some(usage.total_tokens);
-                if usage.model_context_window.is_some() {
-                    runtime.observed_context_window = usage.model_context_window;
-                }
-                self.append(
-                    task_id,
-                    TaskEvent::UsageObserved {
-                        epoch_id,
-                        total_tokens: usage.total_tokens,
-                        context_window: usage.model_context_window,
-                    },
-                )?;
-                self.updates.push(TaskEngineUpdate::ContextUsage {
-                    task_id,
-                    total_tokens: usage.total_tokens,
-                    context_window: usage.model_context_window,
-                });
+                *usage_observed = true;
+                self.record_usage(task_id, epoch_id, runtime, usage)?;
             }
             AgentEvent::EpochCompleted {
                 context_id,
                 epoch_id,
-                ..
+                status,
             } if context_id == runtime.context_id && epoch_id == *provider_epoch_id => {
-                return Ok(true);
+                return Ok(Some(status));
             }
             AgentEvent::ProviderFailed { .. } => {
                 self.block_uncertain_operations(
@@ -1303,31 +2005,49 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                     operations,
                     "provider reported failure with an ambiguous operation outcome",
                 )?;
-                return Err(error(TaskEngineErrorCode::Provider));
+                return Err(error(TaskEngineErrorCode::Blocked));
             }
             AgentEvent::CompactionStarted { context_id, .. }
             | AgentEvent::CompactionCompleted { context_id, .. }
                 if context_id == runtime.context_id => {}
             _ => return Err(error(TaskEngineErrorCode::Provider)),
         }
-        Ok(false)
+        Ok(None)
     }
 
     async fn resolve_effect(
         &mut self,
         task_id: TaskId,
+        epoch_id: EpochId,
         runtime: &mut RuntimeTask,
         request: AgentEffectRequest,
         operation_id: OperationId,
         frontend_tool_call_id: Option<ToolCallId>,
     ) -> Result<(), TaskEngineError> {
-        let decision = match runtime.permission_mode.profile() {
-            PermissionProfile::FullAccess => EffectDecision::Allow,
-            PermissionProfile::Approval if self.frontend_context.is_some() => {
-                self.await_approval(task_id, runtime, &request, frontend_tool_call_id)
+        let supported = matches!(
+            request.kind,
+            crate::runtime::agent_port::AgentEffectKind::Command
+                | crate::runtime::agent_port::AgentEffectKind::FileChange
+        );
+        let summary_safe = SecretFilter.inspect(request.summary.as_bytes()).is_ok();
+        let decision = if !supported || !summary_safe {
+            EffectDecision::Deny
+        } else {
+            match runtime.permission_mode.profile() {
+                PermissionProfile::FullAccess => EffectDecision::Allow,
+                PermissionProfile::Approval if self.frontend_context.is_some() => {
+                    self.await_approval(
+                        task_id,
+                        epoch_id,
+                        runtime,
+                        &request,
+                        operation_id,
+                        frontend_tool_call_id,
+                    )
                     .await?
+                }
+                PermissionProfile::ReadOnly | PermissionProfile::Approval => EffectDecision::Deny,
             }
-            PermissionProfile::ReadOnly | PermissionProfile::Approval => EffectDecision::Deny,
         };
         if runtime.permission_mode.profile() == PermissionProfile::FullAccess
             && decision == EffectDecision::Allow
@@ -1339,7 +2059,7 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                 crate::runtime::agent_port::AgentEffectKind::FileChange => "edit",
                 crate::runtime::agent_port::AgentEffectKind::Network
                 | crate::runtime::agent_port::AgentEffectKind::External => {
-                    return Err(error(TaskEngineErrorCode::Blocked));
+                    unreachable!("unsupported effects are denied before automatic dispatch")
                 }
             };
             self.store_mut()
@@ -1370,58 +2090,27 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
             .resolve_effect(&request.request_id, decision)
             .await
         {
-            if port_error.provenance() == AgentErrorProvenance::PossiblyApplied {
-                let evidence =
-                    sha256(format!("effect-resolution:{:?}", port_error.code()).as_bytes());
-                self.append(
-                    task_id,
-                    TaskEvent::OperationEvidenceRecorded {
-                        operation_id,
-                        result_digest: evidence,
-                    },
-                )?;
-                let sequence = self.last_task_sequence(task_id)?;
-                self.append(
-                    task_id,
-                    TaskEvent::OperationTransitioned {
-                        operation_id,
-                        from: OperationStatus::Started,
-                        to: OperationStatus::Uncertain,
-                        evidence_sequences: vec![sequence],
-                    },
-                )?;
-            }
-            return Err(provider_error(port_error));
+            let status = match port_error.provenance() {
+                AgentErrorProvenance::DefinitelyNotApplied => OperationStatus::Failed,
+                AgentErrorProvenance::PossiblyApplied => OperationStatus::Uncertain,
+            };
+            self.close_operation_with_evidence(
+                task_id,
+                operation_id,
+                status,
+                "provider effect resolution failed",
+            )?;
+            self.block_task(task_id, "provider effect resolution failed")?;
+            return Err(error(TaskEngineErrorCode::Blocked));
         }
         if decision == EffectDecision::Deny {
-            let evidence = sha256(b"permission-denied");
-            self.append(
+            self.close_operation_with_evidence(
                 task_id,
-                TaskEvent::OperationEvidenceRecorded {
-                    operation_id,
-                    result_digest: evidence,
-                },
+                operation_id,
+                OperationStatus::Failed,
+                "permission-denied",
             )?;
-            let sequence = self.last_task_sequence(task_id)?;
-            self.append(
-                task_id,
-                TaskEvent::OperationTransitioned {
-                    operation_id,
-                    from: OperationStatus::Started,
-                    to: OperationStatus::Failed,
-                    evidence_sequences: vec![sequence],
-                },
-            )?;
-            let blocked = self.append(
-                task_id,
-                TaskEvent::Blocked {
-                    reason: "operation denied by permission policy".to_owned(),
-                },
-            )?;
-            self.updates.push(TaskEngineUpdate::TaskStatus {
-                task_id,
-                status: blocked.snapshot.status,
-            });
+            self.block_task(task_id, "operation denied by permission policy")?;
             return Err(error(TaskEngineErrorCode::Blocked));
         }
         Ok(())
@@ -1430,8 +2119,10 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
     async fn await_approval(
         &mut self,
         task_id: TaskId,
+        epoch_id: EpochId,
         runtime: &mut RuntimeTask,
         request: &AgentEffectRequest,
+        operation_id: OperationId,
         frontend_tool_call_id: Option<ToolCallId>,
     ) -> Result<EffectDecision, TaskEngineError> {
         let context = self.frontend_context.clone().ok_or_else(invalid_task)?;
@@ -1577,7 +2268,14 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                 }
                 TaskEngineControl::Cancel { .. } => {
                     let result = self
-                        .apply_control(task_id, runtime, &request.epoch_id, control)
+                        .apply_control(
+                            task_id,
+                            epoch_id,
+                            runtime,
+                            &request.epoch_id,
+                            &[operation_id],
+                            control,
+                        )
                         .await;
                     self.acknowledge(acknowledgement, result.clone()).await;
                     return result.map(|()| EffectDecision::Deny);
@@ -1600,11 +2298,20 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
             .values()
             .map(|operation| operation.operation_id)
             .collect::<Vec<_>>();
+        self.block_uncertain_operation_ids(task_id, &operation_ids, reason)
+    }
+
+    fn block_uncertain_operation_ids(
+        &mut self,
+        task_id: TaskId,
+        operation_ids: &[OperationId],
+        reason: &str,
+    ) -> Result<(), TaskEngineError> {
         for operation_id in operation_ids {
             self.append(
                 task_id,
                 TaskEvent::OperationEvidenceRecorded {
-                    operation_id,
+                    operation_id: *operation_id,
                     result_digest: sha256(reason.as_bytes()),
                 },
             )?;
@@ -1612,7 +2319,7 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
             self.append(
                 task_id,
                 TaskEvent::OperationTransitioned {
-                    operation_id,
+                    operation_id: *operation_id,
                     from: OperationStatus::Started,
                     to: OperationStatus::Uncertain,
                     evidence_sequences: vec![evidence_sequence],
@@ -1629,6 +2336,33 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
             task_id,
             status: blocked.snapshot.status,
         });
+        Ok(())
+    }
+
+    fn close_operation_with_evidence(
+        &mut self,
+        task_id: TaskId,
+        operation_id: OperationId,
+        status: OperationStatus,
+        reason: &str,
+    ) -> Result<(), TaskEngineError> {
+        self.append(
+            task_id,
+            TaskEvent::OperationEvidenceRecorded {
+                operation_id,
+                result_digest: sha256(reason.as_bytes()),
+            },
+        )?;
+        let evidence_sequence = self.last_task_sequence(task_id)?;
+        self.append(
+            task_id,
+            TaskEvent::OperationTransitioned {
+                operation_id,
+                from: OperationStatus::Started,
+                to: status,
+                evidence_sequences: vec![evidence_sequence],
+            },
+        )?;
         Ok(())
     }
 
@@ -1916,10 +2650,12 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
         let mut configuration = None;
         let mut progress = Vec::new();
         let mut recovery_attempts = Vec::new();
+        let mut pending_recovery = None;
         let mut operation_evidence = Vec::new();
         let mut steering_sequence = 0_u64;
         let mut completed_tools = 0_u64;
-        let mut provider_requests = 1_u64;
+        let mut started_tools = 0_u64;
+        let mut provider_requests = 0_u64;
         let mut observed_total_tokens = None;
         let mut observed_context_window = None;
         for envelope in &events {
@@ -1937,7 +2673,7 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                     configuration =
                         Some((workspace.clone(), model.clone(), *effort, *permission_mode));
                 }
-                TaskEvent::EpochStarted { .. } => {
+                TaskEvent::ProviderRequestRecorded { .. } => {
                     provider_requests = provider_requests.saturating_add(1);
                 }
                 TaskEvent::UsageObserved {
@@ -1966,21 +2702,50 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                     stall_count: u8::from(*stalled),
                     recovery: None,
                 }),
+                TaskEvent::RecoveryAttemptStarted {
+                    epoch_id,
+                    strategy,
+                    strategy_fingerprint,
+                } => {
+                    if pending_recovery.is_some() {
+                        return Err(error(TaskEngineErrorCode::Storage));
+                    }
+                    pending_recovery = Some(PendingRecovery {
+                        epoch_id: *epoch_id,
+                        strategy: *strategy,
+                        strategy_fingerprint: strategy_fingerprint.clone(),
+                    });
+                }
                 TaskEvent::RecoveryAttemptRecorded {
+                    epoch_id,
                     strategy,
                     strategy_fingerprint,
                     outcome,
-                } => recovery_attempts.push(RecoveryAttempt {
-                    strategy: *strategy,
-                    strategy_fingerprint: strategy_fingerprint.clone(),
-                    outcome: *outcome,
-                }),
+                } => {
+                    let matching = pending_recovery.as_ref().is_some_and(|pending| {
+                        pending.epoch_id == *epoch_id
+                            && pending.strategy == *strategy
+                            && pending.strategy_fingerprint == *strategy_fingerprint
+                    });
+                    if !matching {
+                        return Err(error(TaskEngineErrorCode::Storage));
+                    }
+                    pending_recovery = None;
+                    recovery_attempts.push(RecoveryAttempt {
+                        strategy: *strategy,
+                        strategy_fingerprint: strategy_fingerprint.clone(),
+                        outcome: *outcome,
+                    });
+                }
                 TaskEvent::NormalizedOperationEvidenceRecorded {
                     operation_id,
                     evidence,
                 } => {
                     operation_evidence.push(operation_evidence_from_event(*operation_id, evidence));
                     completed_tools = completed_tools.saturating_add(1);
+                }
+                TaskEvent::OperationIntentRecorded { .. } => {
+                    started_tools = started_tools.saturating_add(1);
                 }
                 TaskEvent::SteeringQueued {
                     steering_sequence: sequence,
@@ -2026,14 +2791,16 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
             previous_checkpoint,
             progress,
             recovery_attempts,
-            pending_recovery: None,
+            pending_recovery,
             steering: VecDeque::new(),
             steering_sequence,
             operation_evidence,
             file_hashes,
             observed_total_tokens,
             observed_context_window,
+            estimated_tokens_since_usage: 0,
             completed_tools,
+            started_tools,
             provider_requests,
         })
     }
@@ -2059,6 +2826,20 @@ async fn receive_control(
     match controls {
         Some(receiver) => receiver.recv().await,
         None => std::future::pending().await,
+    }
+}
+
+const fn control_acknowledgement(control: &TaskEngineControl) -> u64 {
+    match control {
+        TaskEngineControl::Steer {
+            acknowledgement, ..
+        }
+        | TaskEngineControl::Cancel {
+            acknowledgement, ..
+        }
+        | TaskEngineControl::Approval {
+            acknowledgement, ..
+        } => *acknowledgement,
     }
 }
 
@@ -2142,7 +2923,7 @@ fn parse_contract(output: &str) -> Result<CompletionContract, TaskEngineError> {
 fn fallback_contract(request: &str) -> CompletionContract {
     CompletionContract {
         version: 1,
-        goal: request.to_owned(),
+        goal: normalized_contract_goal(request),
         constraints: Vec::new(),
         clauses: vec![
             CompletionClause {
@@ -2164,6 +2945,25 @@ fn fallback_contract(request: &str) -> CompletionContract {
     }
 }
 
+fn normalized_contract_goal(request: &str) -> String {
+    let normalized = request
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    let normalized = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.is_empty() {
+        "Complete the owner request".to_owned()
+    } else {
+        normalized
+    }
+}
+
 fn report_next_objective<'a>(report: &'a EpochReport, runtime: &'a RuntimeTask) -> &'a str {
     report
         .next_objective
@@ -2174,13 +2974,25 @@ fn report_next_objective<'a>(report: &'a EpochReport, runtime: &'a RuntimeTask) 
 fn recovery_objective(runtime: &RuntimeTask) -> String {
     runtime.pending_recovery.as_ref().map_or_else(
         || runtime.next_objective.clone(),
-        |(strategy, _)| {
+        |pending| {
             format!(
                 "Use recovery strategy {strategy:?}: {}",
-                runtime.next_objective
+                runtime.next_objective,
+                strategy = pending.strategy,
             )
         },
     )
+}
+
+fn recovery_terminal_outcome(status: &str) -> RecoveryAttemptOutcome {
+    if ["completed", "success", "succeeded"]
+        .iter()
+        .any(|terminal| status.eq_ignore_ascii_case(terminal))
+    {
+        RecoveryAttemptOutcome::Succeeded
+    } else {
+        RecoveryAttemptOutcome::Failed
+    }
 }
 
 fn runtime_instructions() -> &'static str {
@@ -2212,9 +3024,40 @@ fn exhausted_budget_reason(record: &TaskRecord, runtime: &RuntimeTask) -> Option
         Some("maximum provider requests exhausted")
     } else if budget
         .max_tool_calls
-        .is_some_and(|maximum| runtime.completed_tools >= maximum)
+        .is_some_and(|maximum| runtime.started_tools >= maximum)
     {
         Some("maximum tool calls exhausted")
+    } else {
+        None
+    }
+}
+
+fn remaining_wall_budget(record: &TaskRecord) -> Option<Duration> {
+    let maximum = record.snapshot.budget.max_wall_time_seconds?;
+    let maximum = i64::try_from(maximum).unwrap_or(i64::MAX);
+    let deadline = record.created_at + TimeDelta::seconds(maximum);
+    deadline
+        .signed_duration_since(Utc::now())
+        .to_std()
+        .ok()
+        .or(Some(Duration::ZERO))
+}
+
+fn provider_dispatch_budget_reason(
+    record: &TaskRecord,
+    runtime: &RuntimeTask,
+) -> Option<&'static str> {
+    let budget = &record.snapshot.budget;
+    if budget.max_wall_time_seconds.is_some_and(|maximum| {
+        let elapsed = Utc::now().signed_duration_since(record.created_at);
+        elapsed.num_seconds() >= i64::try_from(maximum).unwrap_or(i64::MAX)
+    }) {
+        Some("maximum task wall time exhausted")
+    } else if budget
+        .max_provider_requests
+        .is_some_and(|maximum| runtime.provider_requests >= maximum)
+    {
+        Some("maximum provider requests exhausted")
     } else {
         None
     }
@@ -2409,17 +3252,68 @@ fn active_provider_epoch(
     store: &Store,
     task_id: TaskId,
 ) -> Result<Option<AgentEpochId>, TaskEngineError> {
-    let active = store
+    let active_epoch = store
         .get_task(task_id)
         .map_err(storage_error)?
         .and_then(|record| record.snapshot.active_epoch);
-    active
-        .map(|epoch_id| AgentEpochId::parse(epoch_id.to_string()).map_err(provider_error))
+    let Some(active_epoch) = active_epoch else {
+        return Ok(None);
+    };
+    store
+        .read_task_events(task_id)
+        .map_err(storage_error)?
+        .into_iter()
+        .rev()
+        .find_map(|envelope| match envelope.event {
+            crate::events::Event::TaskLifecycle {
+                event:
+                    TaskEvent::ProviderEpochBound {
+                        epoch_id,
+                        provider_epoch_id,
+                    },
+                ..
+            } if epoch_id == active_epoch => Some(provider_epoch_id),
+            _ => None,
+        })
+        .map(|provider_epoch_id| AgentEpochId::parse(provider_epoch_id).map_err(provider_error))
         .transpose()
 }
 
 fn sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
+}
+
+fn engine_update_size(update: &TaskEngineUpdate) -> usize {
+    let payload = match update {
+        TaskEngineUpdate::EpochObjective { objective, .. } => objective.len(),
+        TaskEngineUpdate::CheckpointCommitted { digest, .. } => digest.len(),
+        TaskEngineUpdate::CompletionClauses { clauses, .. } => clauses
+            .iter()
+            .map(|clause| {
+                clause.id.len()
+                    + clause.description.len()
+                    + clause
+                        .evidence
+                        .iter()
+                        .map(|evidence| evidence.artifact_digest.as_ref().map_or(0, String::len))
+                        .sum::<usize>()
+            })
+            .sum(),
+        TaskEngineUpdate::AgentMessageChunk(text) | TaskEngineUpdate::DiffUpdated(text) => {
+            text.len()
+        }
+        TaskEngineUpdate::ToolStarted { title, .. }
+        | TaskEngineUpdate::ToolCompleted { title, .. } => title.len(),
+        TaskEngineUpdate::PermissionRequired {
+            request_id,
+            summary,
+        } => request_id.len() + summary.len(),
+        TaskEngineUpdate::TaskStatus { .. }
+        | TaskEngineUpdate::ContextUsage { .. }
+        | TaskEngineUpdate::Compaction { .. }
+        | TaskEngineUpdate::RecoveryStrategy { .. } => 0,
+    };
+    payload.saturating_add(128)
 }
 
 const fn error(code: TaskEngineErrorCode) -> TaskEngineError {

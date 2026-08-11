@@ -6261,10 +6261,13 @@ fn apply_task_child_projection(
         TaskEvent::Created { .. }
         | TaskEvent::StateTransitioned { .. }
         | TaskEvent::ContractRevised { .. }
+        | TaskEvent::ProviderRequestRecorded { .. }
+        | TaskEvent::ProviderEpochBound { .. }
         | TaskEvent::UsageObserved { .. }
         | TaskEvent::OperationEvidenceRecorded { .. }
         | TaskEvent::NormalizedOperationEvidenceRecorded { .. }
         | TaskEvent::ProgressAssessed { .. }
+        | TaskEvent::RecoveryAttemptStarted { .. }
         | TaskEvent::RecoveryAttemptRecorded { .. }
         | TaskEvent::CompactionRequested { .. }
         | TaskEvent::ProviderContextBound { .. }

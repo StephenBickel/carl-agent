@@ -131,3 +131,117 @@ all-feature static gates were run.
 ## Concerns
 
 No known Task 9 correctness or integration gap remains.
+
+## Fix Round 1/5
+
+### Findings fixed
+
+- Contract planning is now part of the durable task lifecycle. Task/context binding
+  precedes the first provider request, planning and work requests are journaled
+  with exact purpose/sequence/digest and provider epoch identity, planning usage
+  counts toward context pressure, and restart reconstructs the exact accounting.
+- Provider provenance now drives fail-closed terminalization. Definitely-not-applied
+  reads receive one bounded retry; ambiguous failures after operation binding make
+  the operation `Uncertain`; binding and resolution failures become `Failed` or
+  `Uncertain` as provenance requires; every such path emits a typed `Blocked`
+  update. Unsupported network/external effects are denied before blocking.
+- Full-access effect content passes the secret filter before any frontend
+  persistence or dispatch authority is recorded.
+- Startup checkpoint recovery validates authoritative coverage before acting.
+  Missing or invalid coverage blocks without replay, a committed completion
+  checkpoint completes without another provider call, and a committed
+  continuation starts exactly one new epoch.
+- Recovery attempts now have a two-event durable lifecycle:
+  `RecoveryAttemptStarted` binds epoch, strategy, and fingerprint before dispatch;
+  `RecoveryAttemptRecorded` is appended only after the epoch reaches a terminal
+  status. Pending recovery rehydrates with the exact epoch identity and outcome.
+- Cancellation is safe-boundary aware. Operation-free planning/work cancellation
+  interrupts and durably finishes the epoch before `Cancelled`; cancellation with
+  a started operation records uncertain evidence and blocks. The reducer rejects
+  forged cancellation across an unsafe boundary, and ACP reports the resulting
+  terminal outcome truthfully.
+- Provider, tool, and wall-clock budgets are hard dispatch gates. Every provider
+  request and effect dispatch is checked immediately before the external action;
+  pending reads race the wall deadline; breaches interrupt the exact epoch and
+  either close an operation-free epoch safely or uncertainize active operations.
+- Per-epoch transcript, diff, provider-event, engine-update count, and aggregate
+  engine-update byte caps now apply across individually valid stream items.
+  Overflow interrupts and durably blocks rather than leaving an active task.
+- Durable ACP/Buzz integration now publishes deferred approval/task updates after
+  execution, keeps exact Buzz reply context while approval is pending, accepts
+  harmless context-start notifications without cross-context poisoning, and
+  normalizes multiline owner requests into a valid bounded contract goal while
+  retaining the original request for execution.
+- The storage CAS race test now opens both SQLite stores before spawning workers,
+  so a pre-barrier open cannot strand the coordinator under default parallel test
+  scheduling.
+
+### RED / GREEN evidence
+
+- The new planning/accounting regressions initially showed provider work before a
+  durable task/context binding, missing planning request/usage records, and restart
+  request-count drift. The focused epoch tests now prove exact ordering, two
+  bounded repair requests, conservative missing-usage accounting, and exact
+  restart reconstruction.
+- Provenance, secret, cancellation, and budget regressions initially left tasks
+  active, omitted typed blocked updates, or allowed dispatch after a hard boundary.
+  The focused epoch and ACP tests now cover every definitely-not-applied/possibly-
+  applied branch, secret rejection before persistence, safe and unsafe cancellation,
+  and provider/tool/wall breaches during planning and work.
+- Checkpoint/recovery regressions initially repeated completed work or lost pending
+  recovery identity. Five checkpoint scenarios and the recovery restart/outcome
+  scenarios now pass with zero replay where completion is already committed and
+  exactly one continuation epoch otherwise.
+- Aggregate streaming regressions initially accepted collections whose individual
+  events were valid but whose combined planning text, transcript, diff, event
+  count, or frontend update bytes exceeded the epoch cap. All five aggregate-bound
+  scenarios now interrupt and block.
+- The default-parallel full suite exposed the pre-existing open-before-barrier
+  scheduling hazard in `simultaneous_compare_and_transition_has_exactly_one_winner`.
+  After opening both stores before spawn, its isolated regression passed: **1
+  passed, 0 failed**.
+
+### Aborted diagnostic runs
+
+- An initial `cargo test --all-features` was manually interrupted with exit 130
+  after the storage race test remained beyond its 60-second warning; all targets
+  displayed before it had passed. The isolated test passed in 0.03 seconds,
+  confirming a scheduling-dependent barrier hazard rather than a CAS failure.
+- A second quiet default-parallel diagnostic encountered the same hazard and was
+  manually stopped before the race-test fix. A briefly started serial diagnostic
+  was also stopped on review direction and is not counted as verification.
+
+### Final verification
+
+All final gates below ran after the race-test and Task 9 source changes:
+
+```text
+cargo test --all-features --test subscription_run_storage_contract \
+  simultaneous_compare_and_transition_has_exactly_one_winner -- --exact
+PASS, exit 0: 1 passed, 0 failed
+
+cargo test --all-features
+PASS, exit 0: every unit, integration, contract, binary, and doc-test target
+passed with 0 failures under default parallel scheduling
+
+cargo fmt --all -- --check
+PASS, exit 0
+
+cargo clippy --all-targets --all-features -- -D warnings
+PASS, exit 0, no warnings
+
+git diff --check
+PASS, exit 0
+```
+
+### Fix-round self-review and concerns
+
+- Consequential operation dispatch still follows durable intent, `Started`, and
+  authority recording; no ambiguous action is replayed automatically.
+- Provider-owned prose never proves completion, checkpoint coverage, recovery
+  success, or cancellation safety; each decision uses Carl-owned durable state.
+- Bounded/redacted frontend surfaces retain no raw secret-bearing effect content.
+- No plan, design specification, or security policy was edited.
+- No Critical or Important Task 9 finding remains. Process-startup invocation of
+  durable task discovery/resumption remains the explicit Task 10 integration
+  boundary; Task 9's discovery and storage behavior is covered independently.
