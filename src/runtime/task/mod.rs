@@ -10,7 +10,7 @@ pub use checkpoint::{
 };
 pub use context::{
     CompactionDecision, ContextBudget, ContextEngine, ContextError, ContextInput, ContextLedger,
-    ContextLedgerEntry, ContextPackage, ContextSourceKind, ContextUnit,
+    ContextLedgerEntry, ContextPackage, ContextSourceKind, ContextTrust, ContextUnit,
 };
 pub use reducer::{TaskReduceError, TaskReduceErrorCode, reduce_task};
 pub use types::{

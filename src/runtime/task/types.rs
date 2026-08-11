@@ -488,6 +488,11 @@ pub enum TaskEvent {
         #[serde(deserialize_with = "deserialize_evidence_sequences")]
         evidence_sequences: Vec<u64>,
     },
+    OperationEvidenceRecorded {
+        operation_id: OperationId,
+        #[serde(deserialize_with = "deserialize_event_identifier")]
+        result_digest: String,
+    },
     UsageObserved {
         epoch_id: EpochId,
         total_tokens: u64,
@@ -564,6 +569,9 @@ impl TaskEvent {
             Self::OperationTransitioned {
                 evidence_sequences, ..
             } => validate_evidence_sequences(evidence_sequences),
+            Self::OperationEvidenceRecorded { result_digest, .. } => {
+                validate_event_identifier(result_digest)
+            }
             Self::ProgressAssessed { fingerprint, .. } => validate_event_identifier(fingerprint),
             Self::CheckpointCommitted { digest, .. } => validate_event_identifier(digest),
             Self::ProviderContextBound { context_id } => validate_event_identifier(context_id),

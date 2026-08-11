@@ -232,6 +232,17 @@ pub fn reduce_task(
             }
             state.set_operation_status(*operation_id, *to, envelope.sequence);
         }
+        TaskEvent::OperationEvidenceRecorded { operation_id, .. } => {
+            let (operation_epoch, status, last_transition_sequence) = state
+                .operation(*operation_id)
+                .ok_or_else(|| error(TaskReduceErrorCode::OperationIntentMissing))?;
+            if state.active_epoch != Some(operation_epoch) {
+                return Err(error(TaskReduceErrorCode::EpochMismatch));
+            }
+            if status != OperationStatus::Started || envelope.sequence <= last_transition_sequence {
+                return Err(error(TaskReduceErrorCode::InvalidOperationEvidence));
+            }
+        }
         TaskEvent::UsageObserved { epoch_id, .. } => {
             require_active_epoch(&state, *epoch_id)?;
         }

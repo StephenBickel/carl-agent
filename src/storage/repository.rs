@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -1637,6 +1637,7 @@ impl Store {
             return Ok(None);
         }
         validate_checkpoint_history(&transaction, &current, &input)?;
+        validate_checkpoint_authority(&transaction, &current, &input.checkpoint)?;
         validate_checkpoint_artifacts(&transaction, &input.checkpoint)?;
 
         let envelope = append_event_in_transaction(
@@ -5427,6 +5428,184 @@ fn validate_checkpoint_input(input: &NewCheckpoint) -> Result<(), CarlError> {
     Ok(())
 }
 
+fn validate_checkpoint_authority(
+    transaction: &Transaction<'_>,
+    current: &TaskRecord,
+    checkpoint: &CanonicalCheckpoint,
+) -> Result<(), CarlError> {
+    if current.snapshot.active_epoch.is_some() || current.snapshot.has_unresolved_operations() {
+        return Err(checkpoint_validation(
+            "checkpoint requires an authoritative safe boundary",
+        ));
+    }
+    if checkpoint.contract != current.snapshot.contract
+        || checkpoint.provider.context_id != current.snapshot.provider_context
+    {
+        return Err(checkpoint_validation(
+            "checkpoint contract or provider context does not match the task projection",
+        ));
+    }
+
+    let (provider, model, effort) = transaction
+        .query_row(
+            "SELECT provider, model, effort FROM agent_tasks WHERE id = ?1",
+            [checkpoint.task_id.to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .map_err(storage_error)?;
+    if checkpoint.provider.provider != provider
+        || checkpoint.provider.model != model
+        || checkpoint.provider.effort != effort
+    {
+        return Err(checkpoint_validation(
+            "checkpoint provider metadata does not match the task projection",
+        ));
+    }
+
+    let mut observed_total_tokens = None;
+    let mut observed_context_window = None;
+    let mut journal_operations = BTreeMap::new();
+    let mut after_sequence = None;
+    loop {
+        let page = read_task_event_page_from_connection(
+            transaction,
+            checkpoint.task_id,
+            after_sequence,
+            512,
+        )?;
+        if page.is_empty() {
+            break;
+        }
+        for envelope in &page {
+            let Event::TaskLifecycle { event, .. } = &envelope.event else {
+                return Err(storage_invariant(
+                    "task event page returned a non-task event",
+                ));
+            };
+            match event {
+                TaskEvent::UsageObserved {
+                    total_tokens,
+                    context_window,
+                    ..
+                } => {
+                    observed_total_tokens = Some(*total_tokens);
+                    if context_window.is_some() {
+                        observed_context_window = *context_window;
+                    }
+                }
+                TaskEvent::OperationIntentRecorded {
+                    operation_id,
+                    effect_class,
+                    request_digest,
+                    ..
+                } => {
+                    if journal_operations
+                        .insert(
+                            *operation_id,
+                            (
+                                OperationStatus::IntentRecorded,
+                                *effect_class,
+                                request_digest.clone(),
+                            ),
+                        )
+                        .is_some()
+                    {
+                        return Err(storage_invariant(
+                            "task journal contains a duplicate operation",
+                        ));
+                    }
+                }
+                TaskEvent::OperationTransitioned {
+                    operation_id,
+                    from,
+                    to,
+                    ..
+                } => {
+                    let operation = journal_operations.get_mut(operation_id).ok_or_else(|| {
+                        storage_invariant("task journal operation transition has no intent")
+                    })?;
+                    if operation.0 != *from {
+                        return Err(storage_invariant(
+                            "task journal operation transition disagrees with prior state",
+                        ));
+                    }
+                    operation.0 = *to;
+                }
+                _ => {}
+            }
+        }
+        after_sequence = page.last().map(|event| event.sequence);
+    }
+    if checkpoint.provider.observed_total_tokens != observed_total_tokens
+        || checkpoint.provider.observed_context_window != observed_context_window
+    {
+        return Err(checkpoint_validation(
+            "checkpoint usage metadata does not match the task journal",
+        ));
+    }
+
+    let mut checkpoint_operations = checkpoint
+        .operations
+        .iter()
+        .map(|operation| {
+            (
+                operation.operation_id,
+                operation.status,
+                operation.effect_class,
+                operation.request_digest.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    checkpoint_operations.sort_by_key(|operation| operation.0);
+    let authoritative_operations = journal_operations
+        .into_iter()
+        .map(|(operation_id, (status, effect_class, request_digest))| {
+            (operation_id, status, effect_class, request_digest)
+        })
+        .collect::<Vec<_>>();
+    if checkpoint_operations != authoritative_operations {
+        return Err(checkpoint_validation(
+            "checkpoint operations do not match the authoritative projection",
+        ));
+    }
+
+    let expected_generation = match current.snapshot.latest_checkpoint {
+        None => 0,
+        Some(checkpoint_id) => {
+            let json = transaction
+                .query_row(
+                    "SELECT checkpoint_json
+                     FROM task_checkpoints
+                     WHERE task_id = ?1 AND id = ?2",
+                    params![checkpoint.task_id.to_string(), checkpoint_id.to_string()],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .map_err(storage_error)?
+                .ok_or_else(|| {
+                    checkpoint_validation("previous checkpoint has no canonical payload")
+                })?;
+            let previous = serde_json::from_str::<CanonicalCheckpoint>(&json)
+                .map_err(|_| checkpoint_validation("previous canonical checkpoint is invalid"))?;
+            previous
+                .compaction_generation
+                .checked_add(1)
+                .ok_or_else(|| checkpoint_validation("checkpoint generation overflowed"))?
+        }
+    };
+    if checkpoint.compaction_generation != expected_generation {
+        return Err(checkpoint_validation(
+            "checkpoint generation does not match durable history",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_checkpoint_history(
     transaction: &Transaction<'_>,
     current: &TaskRecord,
@@ -5969,6 +6148,7 @@ fn apply_task_child_projection(
         | TaskEvent::StateTransitioned { .. }
         | TaskEvent::ContractRevised { .. }
         | TaskEvent::UsageObserved { .. }
+        | TaskEvent::OperationEvidenceRecorded { .. }
         | TaskEvent::ProgressAssessed { .. }
         | TaskEvent::CompactionRequested { .. }
         | TaskEvent::ProviderContextBound { .. }

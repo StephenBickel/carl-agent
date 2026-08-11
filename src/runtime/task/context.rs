@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -9,8 +11,10 @@ use super::checkpoint::{CanonicalCheckpoint, CheckpointError};
 use super::types::{CompletionContract, ContextPackageId, OperationId};
 
 const CONTEXT_PACKAGE_SCHEMA_VERSION: u16 = 1;
-const ESTIMATED_BYTES_PER_TOKEN: u64 = 4;
 const MAX_CONTEXT_SOURCE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_CONTEXT_PACKAGE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_CONTEXT_LEDGER_ENTRIES: usize = 4_096;
+const MAX_OMISSION_REASON_BYTES: usize = 256;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ContextBudget {
@@ -31,6 +35,13 @@ pub enum ContextSourceKind {
     RetrievedEvidence,
     EpochObjective,
     UntrustedContent,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextTrust {
+    Trusted,
+    Untrusted,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -88,11 +99,13 @@ pub enum ContextUnit {
         text: String,
     },
     ToolExchange {
+        trust: ContextTrust,
         operation_id: OperationId,
         request: String,
         result: String,
     },
     ArtifactReference {
+        trust: ContextTrust,
         digest: String,
         summary: String,
     },
@@ -130,8 +143,8 @@ impl ContextEngine {
         {
             return Err(ContextError::InvalidSource);
         }
-        let trigger_tokens = percent_tokens(budget.context_window, budget.trigger_percent)?;
-        let target_tokens = percent_tokens(budget.context_window, budget.target_percent)?;
+        let trigger_tokens = percent_tokens_ceil(budget.context_window, budget.trigger_percent)?;
+        let target_tokens = percent_tokens_floor(budget.context_window, budget.target_percent)?;
         Ok(Self {
             budget,
             trigger_tokens,
@@ -160,14 +173,24 @@ impl ContextEngine {
         if let Some(actual_tokens) = actual_tokens {
             return Ok((actual_tokens, true));
         }
-        let estimated = byte_count
-            .checked_add(ESTIMATED_BYTES_PER_TOKEN - 1)
-            .ok_or(ContextError::ArithmeticOverflow)?
-            / ESTIMATED_BYTES_PER_TOKEN;
-        Ok((estimated, false))
+        Ok((byte_count, false))
     }
 
     pub fn assemble(&self, input: ContextInput) -> Result<ContextPackage, ContextError> {
+        self.assemble_with_actual_tokens(input, &BTreeMap::new())
+    }
+
+    pub fn assemble_with_actual_tokens(
+        &self,
+        input: ContextInput,
+        actual_tokens: &BTreeMap<String, u64>,
+    ) -> Result<ContextPackage, ContextError> {
+        if actual_tokens
+            .keys()
+            .any(|digest| validate_digest(digest).is_err())
+        {
+            return Err(ContextError::InvalidSource);
+        }
         if input.contract != input.checkpoint.contract {
             return Err(ContextError::InvalidSource);
         }
@@ -213,6 +236,7 @@ impl ContextEngine {
             &objective,
             true,
             None,
+            actual_tokens,
         )?
         .token_count;
         let optional_limit = self
@@ -230,7 +254,7 @@ impl ContextEngine {
 
         let mut assembly = Assembly::default();
         for (kind, source) in mandatory {
-            assembly.include_mandatory(self, kind, source, optional_limit)?;
+            assembly.include_mandatory(self, kind, source, optional_limit, actual_tokens)?;
         }
         let recent_heading = assembly.include_optional(
             self,
@@ -238,16 +262,24 @@ impl ContextEngine {
             section("Recent Tail", ""),
             optional_limit,
             "post_compaction_budget",
+            actual_tokens,
         )?;
         for unit in recent_trusted {
             if recent_heading {
-                assembly.include_unit(self, ContextSourceKind::RecentTail, unit, optional_limit)?;
+                assembly.include_unit(
+                    self,
+                    ContextSourceKind::RecentTail,
+                    unit,
+                    optional_limit,
+                    actual_tokens,
+                )?;
             } else {
                 assembly.omit_unit(
                     self,
                     ContextSourceKind::RecentTail,
                     &unit,
                     "section_header_omitted",
+                    actual_tokens,
                 )?;
             }
         }
@@ -257,6 +289,7 @@ impl ContextEngine {
             section("Retrieved Evidence", ""),
             optional_limit,
             "post_compaction_budget",
+            actual_tokens,
         )?;
         for unit in retrieved_trusted {
             if retrieved_heading {
@@ -265,6 +298,7 @@ impl ContextEngine {
                     ContextSourceKind::RetrievedEvidence,
                     unit,
                     optional_limit,
+                    actual_tokens,
                 )?;
             } else {
                 assembly.omit_unit(
@@ -272,6 +306,7 @@ impl ContextEngine {
                     ContextSourceKind::RetrievedEvidence,
                     &unit,
                     "section_header_omitted",
+                    actual_tokens,
                 )?;
             }
         }
@@ -280,6 +315,7 @@ impl ContextEngine {
             ContextSourceKind::EpochObjective,
             objective,
             self.target_tokens,
+            actual_tokens,
         )?;
         let untrusted_heading = assembly.include_optional(
             self,
@@ -290,6 +326,7 @@ impl ContextEngine {
             ),
             self.target_tokens,
             "post_compaction_budget",
+            actual_tokens,
         )?;
         for unit in untrusted {
             if untrusted_heading {
@@ -298,6 +335,7 @@ impl ContextEngine {
                     ContextSourceKind::UntrustedContent,
                     unit,
                     self.target_tokens,
+                    actual_tokens,
                 )?;
             } else {
                 assembly.omit_unit(
@@ -305,6 +343,7 @@ impl ContextEngine {
                     ContextSourceKind::UntrustedContent,
                     &unit,
                     "section_header_omitted",
+                    actual_tokens,
                 )?;
             }
         }
@@ -324,7 +363,7 @@ impl ContextEngine {
             source_sequence_start: input.checkpoint.source_sequence_start,
             source_sequence_end: input.checkpoint.source_sequence_end,
         };
-        package.validate()?;
+        package.canonical_bytes()?;
         Ok(package)
     }
 }
@@ -355,8 +394,17 @@ impl ContextPackage {
     }
 
     pub fn canonical_bytes(&self) -> Result<Vec<u8>, ContextError> {
+        if self.rendered.len() >= MAX_CONTEXT_PACKAGE_BYTES
+            || self.ledger.len() > MAX_CONTEXT_LEDGER_ENTRIES
+        {
+            return Err(ContextError::InvalidSource);
+        }
+        let bytes = serde_json::to_vec(self).map_err(|_| ContextError::InvalidSource)?;
+        if bytes.len() > MAX_CONTEXT_PACKAGE_BYTES {
+            return Err(ContextError::InvalidSource);
+        }
         self.validate()?;
-        serde_json::to_vec(self).map_err(|_| ContextError::InvalidSource)
+        Ok(bytes)
     }
 
     pub fn digest(&self) -> Result<String, ContextError> {
@@ -372,21 +420,24 @@ impl ContextPackage {
             return Err(ContextError::InvalidSource);
         }
         validate_source(&self.rendered)?;
+        if self.ledger.len() > MAX_CONTEXT_LEDGER_ENTRIES {
+            return Err(ContextError::InvalidSource);
+        }
         let mut rendered_offset = 0_usize;
         for entry in &self.ledger {
             validate_digest(&entry.digest)?;
             if entry.included == entry.omission_reason.is_some() {
                 return Err(ContextError::InvalidSource);
             }
-            if !entry.actual_tokens {
-                let expected = entry
-                    .byte_count
-                    .checked_add(ESTIMATED_BYTES_PER_TOKEN - 1)
-                    .ok_or(ContextError::ArithmeticOverflow)?
-                    / ESTIMATED_BYTES_PER_TOKEN;
-                if entry.token_count != expected {
-                    return Err(ContextError::InvalidSource);
-                }
+            if entry.omission_reason.as_ref().is_some_and(|reason| {
+                reason.is_empty()
+                    || reason.len() > MAX_OMISSION_REASON_BYTES
+                    || reason.chars().any(char::is_control)
+            }) {
+                return Err(ContextError::InvalidSource);
+            }
+            if !entry.actual_tokens && entry.token_count != entry.byte_count {
+                return Err(ContextError::InvalidSource);
             }
             if entry.included {
                 let byte_count = usize::try_from(entry.byte_count)
@@ -427,8 +478,9 @@ impl Assembly {
         kind: ContextSourceKind,
         source: String,
         limit: u64,
+        actual_tokens: &BTreeMap<String, u64>,
     ) -> Result<(), ContextError> {
-        let entry = ledger_entry(engine, kind, &source, true, None)?;
+        let entry = ledger_entry(engine, kind, &source, true, None, actual_tokens)?;
         let next = self
             .total_tokens
             .checked_add(entry.token_count)
@@ -449,9 +501,10 @@ impl Assembly {
         source: String,
         limit: u64,
         omission_reason: &str,
+        actual_tokens: &BTreeMap<String, u64>,
     ) -> Result<bool, ContextError> {
         validate_source(&source)?;
-        let mut entry = ledger_entry(engine, kind, &source, true, None)?;
+        let mut entry = ledger_entry(engine, kind, &source, true, None, actual_tokens)?;
         let Some(next) = self.total_tokens.checked_add(entry.token_count) else {
             return Err(ContextError::ArithmeticOverflow);
         };
@@ -473,28 +526,23 @@ impl Assembly {
         kind: ContextSourceKind,
         unit: ContextUnit,
         limit: u64,
+        actual_tokens: &BTreeMap<String, u64>,
     ) -> Result<(), ContextError> {
         let rendered = render_unit(&unit)?;
-        if self.include_optional(engine, kind, rendered, limit, "post_compaction_budget")? {
+        if self.include_optional(
+            engine,
+            kind,
+            rendered,
+            limit,
+            "post_compaction_budget",
+            actual_tokens,
+        )? {
             return Ok(());
         }
-        let ContextUnit::ToolExchange {
-            operation_id,
-            request,
-            result,
-        } = unit
-        else {
-            return Ok(());
-        };
-        let omitted = self.ledger.last_mut().ok_or(ContextError::InvalidSource)?;
-        omitted.omission_reason = Some("replaced_by_artifact_reference".to_owned());
-        let reference = format!(
-            "tool_exchange_artifact_reference operation_id={} request_digest={} result_artifact_digest={}\n",
-            operation_id,
-            sha256(request.as_bytes()),
-            sha256(result.as_bytes()),
-        );
-        self.include_optional(engine, kind, reference, limit, "post_compaction_budget")?;
+        if matches!(unit, ContextUnit::ToolExchange { .. }) {
+            let omitted = self.ledger.last_mut().ok_or(ContextError::InvalidSource)?;
+            omitted.omission_reason = Some("atomic_tool_exchange_omitted".to_owned());
+        }
         Ok(())
     }
 
@@ -504,6 +552,7 @@ impl Assembly {
         kind: ContextSourceKind,
         unit: &ContextUnit,
         reason: &str,
+        actual_tokens: &BTreeMap<String, u64>,
     ) -> Result<(), ContextError> {
         let rendered = render_unit(unit)?;
         self.ledger.push(ledger_entry(
@@ -512,6 +561,7 @@ impl Assembly {
             &rendered,
             false,
             Some(reason.to_owned()),
+            actual_tokens,
         )?);
         Ok(())
     }
@@ -531,9 +581,22 @@ fn partition_units(
             } => untrusted.push(unit),
             ContextUnit::Text { kind, .. } if *kind == expected => trusted.push(unit),
             ContextUnit::Text { .. } => return Err(ContextError::InvalidSource),
-            ContextUnit::ToolExchange { .. } | ContextUnit::ArtifactReference { .. } => {
-                trusted.push(unit);
+            ContextUnit::ToolExchange {
+                trust: ContextTrust::Trusted,
+                ..
             }
+            | ContextUnit::ArtifactReference {
+                trust: ContextTrust::Trusted,
+                ..
+            } => trusted.push(unit),
+            ContextUnit::ToolExchange {
+                trust: ContextTrust::Untrusted,
+                ..
+            }
+            | ContextUnit::ArtifactReference {
+                trust: ContextTrust::Untrusted,
+                ..
+            } => untrusted.push(unit),
         }
     }
     Ok((trusted, untrusted))
@@ -546,10 +609,13 @@ fn render_unit(unit: &ContextUnit) -> Result<String, ContextError> {
             operation_id,
             request,
             result,
+            ..
         } => format!(
             "tool_exchange operation_id={operation_id}\nrequest:\n{request}\nresult:\n{result}\n"
         ),
-        ContextUnit::ArtifactReference { digest, summary } => {
+        ContextUnit::ArtifactReference {
+            digest, summary, ..
+        } => {
             validate_digest(digest)?;
             format!("artifact_reference digest={digest} summary={summary}\n")
         }
@@ -564,15 +630,18 @@ fn ledger_entry(
     source: &str,
     included: bool,
     omission_reason: Option<String>,
+    actual_tokens: &BTreeMap<String, u64>,
 ) -> Result<ContextLedgerEntry, ContextError> {
     let byte_count = u64::try_from(source.len()).map_err(|_| ContextError::ArithmeticOverflow)?;
-    let (token_count, actual_tokens) = engine.account_tokens(byte_count, None)?;
+    let digest = sha256(source.as_bytes());
+    let (token_count, actual_tokens) =
+        engine.account_tokens(byte_count, actual_tokens.get(&digest).copied())?;
     Ok(ContextLedgerEntry {
         kind,
         byte_count,
         token_count,
         actual_tokens,
-        digest: sha256(source.as_bytes()),
+        digest,
         included,
         omission_reason,
     })
@@ -596,9 +665,22 @@ fn validate_source(source: &str) -> Result<(), ContextError> {
         .map_err(|_| ContextError::SecretRejected)
 }
 
-fn percent_tokens(context_window: u64, percent: u8) -> Result<u64, ContextError> {
+fn percent_tokens_floor(context_window: u64, percent: u8) -> Result<u64, ContextError> {
     context_window
         .checked_mul(u64::from(percent))
+        .ok_or(ContextError::ArithmeticOverflow)
+        .map(|tokens| tokens / 100)
+}
+
+fn percent_tokens_ceil(context_window: u64, percent: u8) -> Result<u64, ContextError> {
+    let product = context_window
+        .checked_mul(u64::from(percent))
+        .ok_or(ContextError::ArithmeticOverflow)?;
+    if percent == 0 {
+        return Ok(0);
+    }
+    product
+        .checked_add(99)
         .ok_or(ContextError::ArithmeticOverflow)
         .map(|tokens| tokens / 100)
 }

@@ -10,10 +10,10 @@ use carl::events::{Event, EventEnvelope, EventId, SessionId};
 use carl::runtime::task::{
     CanonicalCheckpoint, CheckpointBuildInput, CheckpointError, CheckpointId, ClauseStatus,
     CompactionDecision, CompletionClause, CompletionContract, ContextBudget, ContextEngine,
-    ContextError, ContextInput, ContextSourceKind, ContextUnit, DecisionRecord, EffectClass,
-    EpochId, ExactIdentifier, OperationId, OperationStatus, ProviderCheckpoint,
-    RepositoryCheckpoint, TaskBudget, TaskEvent, TaskId, TaskSnapshot, TaskStatus, WorkEvidence,
-    reduce_task,
+    ContextError, ContextInput, ContextLedgerEntry, ContextSourceKind, ContextTrust, ContextUnit,
+    DecisionRecord, EffectClass, EpochId, ExactIdentifier, OperationId, OperationStatus,
+    ProcessCheckpoint, ProviderCheckpoint, RepositoryCheckpoint, TaskBudget, TaskEvent, TaskId,
+    TaskSnapshot, TaskStatus, WorkEvidence, reduce_task,
 };
 use carl::sidecar::DataRootLock;
 use carl::storage::{NewCheckpoint, NewTask, RuntimeStore, Store};
@@ -183,9 +183,9 @@ fn canonical_history() -> (TaskSnapshot, Vec<EventEnvelope>, OperationId) {
             session_id,
             task_id,
             6,
-            TaskEvent::ProgressAssessed {
-                fingerprint: digest(b"result"),
-                stalled: false,
+            TaskEvent::OperationEvidenceRecorded {
+                operation_id,
+                result_digest: digest(b"result"),
             },
         ),
         envelope(
@@ -286,9 +286,9 @@ fn checkpoint_bytes_are_canonical_across_event_insertion_orders() -> TestResult 
     assert!(!String::from_utf8(forward.canonical_bytes()?)?.contains("provider prose"));
 
     let mut ordered = forward.clone();
-    ordered.pending_approval_digests = vec!["approval-a".to_owned(), "approval-b".to_owned()];
+    ordered.pending_approval_digests = vec![digest(b"approval-a"), digest(b"approval-b")];
     let mut reordered = forward;
-    reordered.pending_approval_digests = vec!["approval-b".to_owned(), "approval-a".to_owned()];
+    reordered.pending_approval_digests = vec![digest(b"approval-b"), digest(b"approval-a")];
     assert_eq!(ordered.canonical_bytes()?, reordered.canonical_bytes()?);
     Ok(())
 }
@@ -334,6 +334,27 @@ fn checkpoint_validation_rejects_lost_ids_bad_operations_evidence_and_artifacts(
         CheckpointError::UnpairedOperation
     );
 
+    let mut nonexistent_result_evidence = build_input(snapshot.clone(), events.clone());
+    nonexistent_result_evidence.events.remove(5);
+    assert_eq!(
+        CanonicalCheckpoint::build(nonexistent_result_evidence).unwrap_err(),
+        CheckpointError::InvalidEvidenceRange
+    );
+
+    let mut other_operation_evidence = build_input(snapshot.clone(), events.clone());
+    let Event::TaskLifecycle {
+        event: TaskEvent::OperationEvidenceRecorded { operation_id, .. },
+        ..
+    } = &mut other_operation_evidence.events[5].event
+    else {
+        panic!("fixture operation evidence is missing");
+    };
+    *operation_id = OperationId::new();
+    assert_eq!(
+        CanonicalCheckpoint::build(other_operation_evidence).unwrap_err(),
+        CheckpointError::DanglingOperation
+    );
+
     let mut invented_provider_context = build_input(snapshot.clone(), events.clone());
     invented_provider_context.provider.context_id = Some("not-durably-bound".to_owned());
     assert_eq!(
@@ -368,6 +389,74 @@ fn checkpoint_validation_rejects_lost_ids_bad_operations_evidence_and_artifacts(
     );
 }
 
+#[test]
+fn every_checkpoint_digest_field_requires_lowercase_sha256() -> TestResult {
+    let (snapshot, events, operation_id) = canonical_history();
+    let mut valid = CanonicalCheckpoint::build(build_input(snapshot, events))?;
+    valid.running_processes = vec![ProcessCheckpoint {
+        process_id: "process-1".to_owned(),
+        item_id: "item-1".to_owned(),
+        command_digest: digest(b"command"),
+        cwd_digest: digest(b"cwd"),
+    }];
+    valid.pending_approval_digests = vec![digest(b"approval")];
+    valid.pending_steering_digests = vec![digest(b"steering")];
+    valid.uncertain_delivery_digests = vec![digest(b"delivery")];
+    valid.previous_digest = Some(digest(b"previous"));
+    valid.canonical_bytes()?;
+
+    let bad = "A".repeat(64);
+    let mut variants = Vec::new();
+    let mut checkpoint = valid.clone();
+    checkpoint.operations[0].request_digest = bad.clone();
+    variants.push(checkpoint);
+    let mut checkpoint = valid.clone();
+    checkpoint.repository.workspace_digest = bad.clone();
+    variants.push(checkpoint);
+    let mut checkpoint = valid.clone();
+    checkpoint.repository.git_status_digest = Some(bad.clone());
+    variants.push(checkpoint);
+    let mut checkpoint = valid.clone();
+    checkpoint.repository.diff_artifact_digest = Some(bad.clone());
+    variants.push(checkpoint);
+    let mut checkpoint = valid.clone();
+    checkpoint
+        .repository
+        .file_hashes
+        .insert("src/lib.rs".to_owned(), bad.clone());
+    variants.push(checkpoint);
+    let mut checkpoint = valid.clone();
+    checkpoint.running_processes[0].command_digest = bad.clone();
+    variants.push(checkpoint);
+    let mut checkpoint = valid.clone();
+    checkpoint.running_processes[0].cwd_digest = bad.clone();
+    variants.push(checkpoint);
+    let mut checkpoint = valid.clone();
+    checkpoint.pending_approval_digests[0] = bad.clone();
+    variants.push(checkpoint);
+    let mut checkpoint = valid.clone();
+    checkpoint.pending_steering_digests[0] = bad.clone();
+    variants.push(checkpoint);
+    let mut checkpoint = valid.clone();
+    checkpoint.uncertain_delivery_digests[0] = bad.clone();
+    variants.push(checkpoint);
+    let mut checkpoint = valid.clone();
+    checkpoint.previous_digest = Some(bad.clone());
+    variants.push(checkpoint);
+    let mut checkpoint = valid.clone();
+    checkpoint.completed_work[0].artifact_digests[0] = bad;
+    variants.push(checkpoint);
+
+    for checkpoint in variants {
+        assert_eq!(
+            checkpoint.canonical_bytes().unwrap_err(),
+            CheckpointError::InvalidArtifactDigest
+        );
+    }
+    assert_eq!(valid.operations[0].operation_id, operation_id);
+    Ok(())
+}
+
 fn context_input(checkpoint: CanonicalCheckpoint) -> ContextInput {
     ContextInput {
         runtime_instructions: "Follow Carl's stable runtime rules.".to_owned(),
@@ -386,6 +475,7 @@ fn context_input(checkpoint: CanonicalCheckpoint) -> ContextInput {
             },
         ],
         retrieved_evidence: vec![ContextUnit::ArtifactReference {
+            trust: ContextTrust::Untrusted,
             digest: digest(b"historical evidence"),
             summary: "historical verification".to_owned(),
         }],
@@ -409,7 +499,18 @@ fn context_budget_uses_exact_thresholds_actual_usage_and_checked_estimates() -> 
         CompactionDecision::ReplaceProviderContext
     );
     assert_eq!(engine.account_tokens(4_000, Some(17))?, (17, true));
-    assert_eq!(engine.account_tokens(4_000, None)?, (1_000, false));
+    assert_eq!(engine.account_tokens(4_000, None)?, (4_000, false));
+
+    let fractional = ContextEngine::new(ContextBudget {
+        context_window: 101,
+        trigger_percent: 80,
+        target_percent: 60,
+    })?;
+    assert_eq!(
+        fractional.decide(80),
+        CompactionDecision::PruneTransientOutput
+    );
+    assert_eq!(fractional.decide(81), CompactionDecision::Compact);
 
     assert_eq!(
         ContextEngine::new(ContextBudget {
@@ -419,6 +520,49 @@ fn context_budget_uses_exact_thresholds_actual_usage_and_checked_estimates() -> 
         })
         .unwrap_err(),
         ContextError::ArithmeticOverflow
+    );
+    Ok(())
+}
+
+#[test]
+fn package_assembly_records_actual_token_provenance_and_enforces_the_target() -> TestResult {
+    let (snapshot, events, _) = canonical_history();
+    let checkpoint = CanonicalCheckpoint::build(build_input(snapshot, events))?;
+    let generous = ContextEngine::new(ContextBudget {
+        context_window: 20_000,
+        trigger_percent: 80,
+        target_percent: 60,
+    })?;
+    let baseline = generous.assemble(context_input(checkpoint.clone()))?;
+    let actual = baseline
+        .ledger
+        .iter()
+        .map(|entry| (entry.digest.clone(), 1_u64))
+        .collect::<BTreeMap<_, _>>();
+    let constrained = ContextEngine::new(ContextBudget {
+        context_window: 200,
+        trigger_percent: 80,
+        target_percent: 60,
+    })?;
+    let package =
+        constrained.assemble_with_actual_tokens(context_input(checkpoint.clone()), &actual)?;
+    assert!(package.ledger.iter().all(|entry| entry.actual_tokens));
+    assert!(package.total_tokens()? <= 120);
+
+    let mut over_budget = actual;
+    let runtime_digest = baseline
+        .ledger
+        .iter()
+        .find(|entry| entry.kind == ContextSourceKind::RuntimeInstructions)
+        .expect("runtime ledger entry")
+        .digest
+        .clone();
+    over_budget.insert(runtime_digest, 121);
+    assert_eq!(
+        constrained
+            .assemble_with_actual_tokens(context_input(checkpoint), &over_budget)
+            .unwrap_err(),
+        ContextError::MandatorySourcesExceedBudget
     );
     Ok(())
 }
@@ -485,6 +629,7 @@ fn tool_request_and_result_are_pruned_as_one_atomic_unit() -> TestResult {
     let checkpoint = CanonicalCheckpoint::build(build_input(snapshot, events))?;
     let mut input = context_input(checkpoint);
     input.recent_tail = vec![ContextUnit::ToolExchange {
+        trust: ContextTrust::Trusted,
         operation_id,
         request: "request-marker".to_owned(),
         result: format!("result-marker {}", "x".repeat(40_000)),
@@ -499,15 +644,91 @@ fn tool_request_and_result_are_pruned_as_one_atomic_unit() -> TestResult {
     assert!(!package.rendered.contains("request-marker"));
     assert!(!package.rendered.contains("result-marker"));
     assert!(
-        package
+        !package
             .rendered
             .contains("tool_exchange_artifact_reference")
     );
-    assert!(package.rendered.contains(&operation_id.to_string()));
     assert!(package.ledger.iter().any(|entry| {
-        !entry.included
-            && entry.omission_reason.as_deref() == Some("replaced_by_artifact_reference")
+        !entry.included && entry.omission_reason.as_deref() == Some("atomic_tool_exchange_omitted")
     }));
+    Ok(())
+}
+
+#[test]
+fn explicit_untrusted_tool_exchange_stays_atomic_beneath_the_warning() -> TestResult {
+    let (snapshot, events, operation_id) = canonical_history();
+    let checkpoint = CanonicalCheckpoint::build(build_input(snapshot, events))?;
+    let mut input = context_input(checkpoint);
+    input.recent_tail = vec![ContextUnit::ToolExchange {
+        trust: ContextTrust::Untrusted,
+        operation_id,
+        request: "untrusted-request-marker".to_owned(),
+        result: "untrusted-result-marker".to_owned(),
+    }];
+    let engine = ContextEngine::new(ContextBudget {
+        context_window: 20_000,
+        trigger_percent: 80,
+        target_percent: 60,
+    })?;
+    let package = engine.assemble(input)?;
+    let warning = package.rendered.find("UNTRUSTED DATA").unwrap();
+    let request = package.rendered.find("untrusted-request-marker").unwrap();
+    let result = package.rendered.find("untrusted-result-marker").unwrap();
+    assert!(warning < request && request < result);
+    assert_eq!(
+        package
+            .rendered
+            .matches("tool_exchange operation_id=")
+            .count(),
+        1
+    );
+    Ok(())
+}
+
+#[test]
+fn package_metadata_and_total_serialized_bytes_are_bounded() -> TestResult {
+    let (snapshot, events, _) = canonical_history();
+    let checkpoint = CanonicalCheckpoint::build(build_input(snapshot, events))?;
+    let engine = ContextEngine::new(ContextBudget {
+        context_window: 20_000,
+        trigger_percent: 80,
+        target_percent: 60,
+    })?;
+    let package = engine.assemble(context_input(checkpoint))?;
+
+    let mut too_many_entries = package.clone();
+    let mut omitted = too_many_entries.ledger[0].clone();
+    omitted.included = false;
+    omitted.omission_reason = Some("bounded".to_owned());
+    too_many_entries.ledger = vec![omitted.clone(); 4_097];
+    assert_eq!(
+        too_many_entries.canonical_bytes().unwrap_err(),
+        ContextError::InvalidSource
+    );
+
+    let mut long_reason = package.clone();
+    omitted.omission_reason = Some("x".repeat(257));
+    long_reason.ledger.push(omitted);
+    assert_eq!(
+        long_reason.canonical_bytes().unwrap_err(),
+        ContextError::InvalidSource
+    );
+
+    let mut too_large = package;
+    too_large.rendered = " \n".repeat(4 * 1024 * 1024);
+    too_large.ledger = vec![ContextLedgerEntry {
+        kind: ContextSourceKind::RuntimeInstructions,
+        byte_count: u64::try_from(too_large.rendered.len())?,
+        token_count: u64::try_from(too_large.rendered.len())?,
+        actual_tokens: false,
+        digest: digest(too_large.rendered.as_bytes()),
+        included: true,
+        omission_reason: None,
+    }];
+    assert_eq!(
+        too_large.canonical_bytes().unwrap_err(),
+        ContextError::InvalidSource
+    );
     Ok(())
 }
 
@@ -539,7 +760,7 @@ fn optional_sources_cannot_crowd_out_the_mandatory_epoch_objective() -> TestResu
         })
         .collect();
     let engine = ContextEngine::new(ContextBudget {
-        context_window: 3_000,
+        context_window: 10_000,
         trigger_percent: 80,
         target_percent: 60,
     })?;
@@ -547,7 +768,7 @@ fn optional_sources_cannot_crowd_out_the_mandatory_epoch_objective() -> TestResu
 
     assert!(package.rendered.contains("## Epoch Objective"));
     assert!(package.rendered.contains("Finish the next bounded epoch."));
-    assert!(package.total_tokens()? <= 1_800);
+    assert!(package.total_tokens()? <= 6_000);
     Ok(())
 }
 
@@ -628,6 +849,153 @@ fn storage_checkpoint_input(
     input.repository.diff_artifact_digest = None;
     input.artifact_contents.clear();
     input
+}
+
+fn checkpoint_package(
+    checkpoint: &CanonicalCheckpoint,
+) -> Result<carl::runtime::task::ContextPackage, ContextError> {
+    ContextEngine::new(ContextBudget {
+        context_window: 20_000,
+        trigger_percent: 80,
+        target_percent: 60,
+    })?
+    .assemble(context_input(checkpoint.clone()))
+}
+
+#[test]
+fn checkpoint_commit_cannot_hide_authoritative_operations_or_an_active_epoch() -> TestResult {
+    let fixture = TemporaryTaskDatabase::new()?;
+    let mut store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let created = store.create_task(storage_task(session.id, &fixture.workspace))?;
+    let task_id = created.snapshot.task_id;
+    let epoch_id = EpochId::new();
+    let operation_id = OperationId::new();
+    let transitions = [
+        TaskEvent::StateTransitioned {
+            from: TaskStatus::Queued,
+            to: TaskStatus::Active,
+            reason: "start".to_owned(),
+        },
+        TaskEvent::EpochStarted {
+            epoch_id,
+            objective: "perform the operation".to_owned(),
+        },
+        TaskEvent::OperationIntentRecorded {
+            operation_id,
+            epoch_id,
+            item_id: "operation-item".to_owned(),
+            effect_class: EffectClass::IdempotentMutation,
+            request_digest: digest(b"storage request"),
+        },
+        TaskEvent::OperationTransitioned {
+            operation_id,
+            from: OperationStatus::IntentRecorded,
+            to: OperationStatus::Started,
+            evidence_sequences: Vec::new(),
+        },
+        TaskEvent::OperationEvidenceRecorded {
+            operation_id,
+            result_digest: digest(b"storage result"),
+        },
+        TaskEvent::OperationTransitioned {
+            operation_id,
+            from: OperationStatus::Started,
+            to: OperationStatus::Succeeded,
+            evidence_sequences: vec![6],
+        },
+        TaskEvent::EpochFinished {
+            epoch_id,
+            report_digest: digest(b"storage report"),
+        },
+    ];
+    let mut task = created;
+    for (index, event) in transitions.into_iter().enumerate() {
+        task = store
+            .append_task_event(task_id, task.revision, event, timestamp(index as u32 + 1))?
+            .expect("revision matches");
+    }
+    let events = store.read_task_events(task_id)?;
+    let authoritative = CanonicalCheckpoint::build(storage_checkpoint_input(&task, events))?;
+    let mut forged = authoritative.clone();
+    forged.operations.clear();
+    let package = checkpoint_package(&forged)?;
+    let before = store.read_task_events(task_id)?.len();
+    assert!(matches!(
+        store.commit_checkpoint(
+            NewCheckpoint {
+                task_id,
+                checkpoint_digest: forged.digest()?,
+                context_package_digest: package.digest()?,
+                checkpoint: forged,
+                context_package: package,
+                created_at: timestamp(9),
+            },
+            task.revision,
+        ),
+        Err(CarlError::Validation { .. })
+    ));
+    assert_eq!(store.read_task_events(task_id)?.len(), before);
+
+    let mut wrong_provider = authoritative.clone();
+    wrong_provider.provider.model = "invented-model".to_owned();
+    let mut wrong_generation = authoritative.clone();
+    wrong_generation.compaction_generation = 1;
+    let mut wrong_contract = authoritative;
+    wrong_contract.contract.goal = "invented contract".to_owned();
+    for forged in [wrong_provider, wrong_generation, wrong_contract] {
+        let package = checkpoint_package(&forged)?;
+        assert!(matches!(
+            store.commit_checkpoint(
+                NewCheckpoint {
+                    task_id,
+                    checkpoint_digest: forged.digest()?,
+                    context_package_digest: package.digest()?,
+                    checkpoint: forged,
+                    context_package: package,
+                    created_at: timestamp(9),
+                },
+                task.revision,
+            ),
+            Err(CarlError::Validation { .. })
+        ));
+    }
+    assert_eq!(store.read_task_events(task_id)?.len(), before);
+
+    let active = store
+        .append_task_event(
+            task_id,
+            task.revision,
+            TaskEvent::EpochStarted {
+                epoch_id: EpochId::new(),
+                objective: "unsafe checkpoint boundary".to_owned(),
+            },
+            timestamp(10),
+        )?
+        .expect("revision matches");
+    let mut forged = CanonicalCheckpoint::build(storage_checkpoint_input(
+        &task,
+        store.read_task_events(task_id)?[..before].to_vec(),
+    ))?;
+    forged.checkpoint_id = CheckpointId::new();
+    forged.source_sequence_end = active.revision;
+    let package = checkpoint_package(&forged)?;
+    assert!(matches!(
+        store.commit_checkpoint(
+            NewCheckpoint {
+                task_id,
+                checkpoint_digest: forged.digest()?,
+                context_package_digest: package.digest()?,
+                checkpoint: forged,
+                context_package: package,
+                created_at: timestamp(11),
+            },
+            active.revision,
+        ),
+        Err(CarlError::Validation { .. })
+    ));
+    assert_eq!(store.read_task_events(task_id)?.len(), before + 1);
+    Ok(())
 }
 
 #[test]

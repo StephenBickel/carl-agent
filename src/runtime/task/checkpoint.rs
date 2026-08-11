@@ -317,31 +317,43 @@ impl CanonicalCheckpoint {
             validate_nonempty(&identifier.kind)?;
             validate_nonempty(&identifier.value)?;
         }
+        let mut operation_ids = BTreeSet::new();
         for operation in &self.operations {
-            validate_nonempty(&operation.request_digest)?;
+            if !operation_ids.insert(operation.operation_id) {
+                return Err(CheckpointError::DuplicateOperation);
+            }
+            validate_digest(&operation.request_digest)?;
             if !operation.status.is_resolved() {
                 return Err(CheckpointError::UnpairedOperation);
             }
         }
-        validate_nonempty(&self.repository.workspace_digest)?;
+        validate_digest(&self.repository.workspace_digest)?;
+        if let Some(digest) = &self.repository.git_status_digest {
+            validate_digest(digest)?;
+        }
+        if let Some(digest) = &self.repository.diff_artifact_digest {
+            validate_digest(digest)?;
+        }
         for (path, digest) in &self.repository.file_hashes {
             validate_nonempty(path)?;
-            validate_nonempty(digest)?;
+            validate_digest(digest)?;
         }
         for process in &self.running_processes {
             validate_nonempty(&process.process_id)?;
             validate_nonempty(&process.item_id)?;
-            validate_nonempty(&process.command_digest)?;
-            validate_nonempty(&process.cwd_digest)?;
+            validate_digest(&process.command_digest)?;
+            validate_digest(&process.cwd_digest)?;
         }
         for value in self
             .pending_approval_digests
             .iter()
             .chain(&self.pending_steering_digests)
             .chain(&self.uncertain_delivery_digests)
-            .chain(&self.blockers)
         {
-            validate_nonempty(value)?;
+            validate_digest(value)?;
+        }
+        for blocker in &self.blockers {
+            validate_nonempty(blocker)?;
         }
         validate_nonempty(&self.next_objective)?;
         validate_nonempty(&self.provider.provider)?;
@@ -366,6 +378,9 @@ impl CanonicalCheckpoint {
                     self.source_sequence_end,
                 )?;
             }
+        }
+        if self.verification != verification_from_contract(&self.contract) {
+            return Err(CheckpointError::InvalidSource);
         }
         if let Some(digest) = &self.previous_digest {
             validate_digest(digest)?;
@@ -540,6 +555,7 @@ fn build_operations(
             .map(|operation| (operation.operation_id, operation))
             .collect()
     });
+    let mut operation_evidence = BTreeMap::new();
     for envelope in events {
         let Event::TaskLifecycle { event, .. } = &envelope.event else {
             return Err(CheckpointError::InvalidSource);
@@ -590,7 +606,30 @@ fn build_operations(
                 }) {
                     return Err(CheckpointError::InvalidEvidenceRange);
                 }
+                if to.requires_terminal_evidence()
+                    && evidence_sequences
+                        .iter()
+                        .any(|sequence| operation_evidence.get(sequence) != Some(operation_id))
+                {
+                    return Err(CheckpointError::InvalidEvidenceRange);
+                }
                 operation.status = *to;
+            }
+            TaskEvent::OperationEvidenceRecorded {
+                operation_id,
+                result_digest,
+            } => {
+                validate_digest(result_digest)?;
+                let operation = operations
+                    .get(operation_id)
+                    .ok_or(CheckpointError::DanglingOperation)?;
+                if operation.status != OperationStatus::Started
+                    || operation_evidence
+                        .insert(envelope.sequence, *operation_id)
+                        .is_some()
+                {
+                    return Err(CheckpointError::InvalidEvidenceRange);
+                }
             }
             _ => {}
         }
