@@ -1,3 +1,6 @@
+#[path = "support/private_dir.rs"]
+mod private_dir;
+
 use std::env;
 use std::error::Error;
 use std::ffi::{OsStr, OsString};
@@ -470,6 +473,7 @@ impl TestLayout {
         let workspace = root.join("workspace");
         let home = data.join("providers/codex");
         fs::create_dir_all(&data)?;
+        private_dir::make_owner_only_directory(&data)?;
         fs::create_dir_all(&workspace)?;
         Ok(Self {
             root,
