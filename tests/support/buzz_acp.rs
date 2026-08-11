@@ -150,8 +150,8 @@ fn make_windows_directory_owner_only(path: &Path) -> TestResult {
     use windows_sys::Win32::Security::{
         ACCESS_ALLOWED_ACE, ACL, ACL_REVISION, AddAccessAllowedAceEx, CONTAINER_INHERIT_ACE,
         DACL_SECURITY_INFORMATION, GetLengthSid, GetTokenInformation, InitializeAcl, IsValidSid,
-        OBJECT_INHERIT_ACE, PROTECTED_DACL_SECURITY_INFORMATION, TOKEN_QUERY, TOKEN_USER,
-        TokenUser,
+        OBJECT_INHERIT_ACE, OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+        TOKEN_QUERY, TOKEN_USER, TokenUser,
     };
     use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
@@ -239,8 +239,10 @@ fn make_windows_directory_owner_only(path: &Path) -> TestResult {
         SetNamedSecurityInfoW(
             wide_path.as_ptr(),
             SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-            ptr::null_mut(),
+            OWNER_SECURITY_INFORMATION
+                | DACL_SECURITY_INFORMATION
+                | PROTECTED_DACL_SECURITY_INFORMATION,
+            sid,
             ptr::null_mut(),
             acl_pointer,
             ptr::null_mut(),
