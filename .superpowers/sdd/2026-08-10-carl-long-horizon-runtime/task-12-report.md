@@ -272,3 +272,64 @@ no migration or `Cargo.lock` changed, and `SECURITY.md` was not modified.
 ### Fix commit
 
 - `1fa6d20 fix: enforce persistent service ownership boundaries`
+
+## Fix round 3/5
+
+The independent shutdown-ordering blocker is closed:
+
+- `shutdown_owner` queues `ShutdownProvider` before cancelling the active task, so
+  terminal intent is already visible when the active engine run exits.
+- The owner actor polls queued actor commands before any durable-task refill or
+  scheduled start. A successful `ShutdownProvider` clears scheduled work and
+  disables future refills.
+- The actor remains alive with the provider shut down and no runnable work, allowing
+  the owner `TaskEngine` control receiver to claim and complete the canonical
+  shutdown receipt before the service exits.
+- Existing cancel, steer, resume, configure, provider-error, channel-close, and
+  receipt-completion behavior remains on the same command handler.
+
+### RED / GREEN evidence
+
+The focused active-A/queued-B regression first failed exactly at the reported race:
+
+```text
+provider before=(1 context, 1 epoch)
+provider after=(2 contexts, 2 epochs, 0 shutdowns)
+shutdown receipt=pending
+pending receipts=1
+shutdown response=timeout
+```
+
+After command preemption and early shutdown-intent queueing, the same regression
+returns `Applied` promptly, B never creates or resumes a provider context and never
+starts an epoch, provider shutdown occurs exactly once, the shutdown receipt is
+completed with valid JSON, and zero pending receipts remain.
+
+### Verification
+
+```text
+cargo test --locked --test service_end_to_end \
+  shutdown_preempts_queued_work_and_completes_its_receipt
+PASS: 1 passed, 0 failed
+
+cargo test --locked --test service_end_to_end
+PASS: 20 passed, 0 failed
+
+cargo fmt --all -- --check
+PASS: exit 0
+
+cargo clippy --locked --all-targets --all-features -- -D warnings
+PASS: exit 0, no warnings
+
+git diff --check
+PASS: exit 0
+```
+
+This actor scheduling change is platform-neutral and does not touch the Windows
+named-pipe transport or security descriptor code. No Carl process remained after
+the process tests. No migration, `Cargo.lock`, or `SECURITY.md` changed, and no full
+all-features test run was performed.
+
+### Fix commit
+
+- `6cd31b7 fix: preempt queued work on service shutdown`
