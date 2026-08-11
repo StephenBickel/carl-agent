@@ -1,3 +1,6 @@
+#[path = "support/private_dir.rs"]
+mod private_dir;
+
 use std::error::Error;
 use std::ffi::{OsStr, OsString};
 use std::fs;
@@ -295,11 +298,7 @@ impl Layout {
         let workspace = root.join("workspace");
         fs::create_dir_all(&data)?;
         fs::create_dir_all(&workspace)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&data, fs::Permissions::from_mode(0o700))?;
-        }
+        private_dir::make_owner_only_directory(&data)?;
         Ok(Self {
             root,
             data,
