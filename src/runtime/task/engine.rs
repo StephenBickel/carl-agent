@@ -3224,6 +3224,13 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                                 .await;
                             return Err(control_error);
                         }
+                        if control_error.code() == TaskEngineErrorCode::Blocked
+                            && self.snapshot(task_id)?.status == TaskStatus::Blocked
+                        {
+                            self.acknowledge(acknowledgement, Err(control_error.clone()))
+                                .await;
+                            return Err(control_error);
+                        }
                         self.interrupt_and_block_epoch(
                             task_id,
                             epoch_id,
