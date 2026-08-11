@@ -42,3 +42,4 @@ Task 12: fix round 1/5 (all review findings addressed, 0 open; commits 1a5fe3a..
 Task 12: fix round 2/5 (5 blockers addressed, 0 open; commits 2d4d441..1fa6d20; focused suites and strict locked gates passed)
 Task 12: fix round 3/5 (1 blocker addressed, 0 open; commits 8413e61..6cd31b7; service E2E and strict locked gates passed)
 Task 12: fix round 4/5 (1 blocker addressed, 0 open; commits 5523ac0..fe2ad37; deterministic shutdown ordering, service E2E, and strict locked gates passed)
+Task 12: fix round 5/5 (1 blocker addressed, 0 open; commits 3e0b0bb..ab3b4c7; deterministic terminal handoff, service E2E, and strict locked gates passed)

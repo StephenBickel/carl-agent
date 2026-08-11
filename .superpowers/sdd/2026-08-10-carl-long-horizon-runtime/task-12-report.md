@@ -407,3 +407,87 @@ changed, and no full all-features test suite was run.
 ### Fix commit
 
 - `fe2ad37 fix: linearize service shutdown with task starts`
+
+## Fix round 5/5
+
+The final start-first cancellation handoff blocker is closed:
+
+- Shutdown still release-publishes terminal intent under the task-start mutex, but
+  it now quiesces the task observed by that publication before it sends
+  `ShutdownProvider`.
+- Canonical durable state plus the actor's active claim classifies the handoff as
+  already terminal, still active, or nonterminal idle. Terminal state is safely
+  quiesced; active state receives the normal owner control; paused, blocked, or
+  otherwise inactive nonterminal state is cancelled through the idle actor while
+  the provider remains alive.
+- An active-control completion race is followed by a canonical state reread. If
+  the task naturally became terminal, shutdown succeeds; if it handed off to idle,
+  the idle actor completes cancellation; a genuinely unresolved cancellation
+  error stops shutdown before any provider shutdown call.
+- The task first observed by shutdown is retained across a failed shutdown request,
+  so a retry can finish cancellation even after the actor clears its active claim.
+- Only after cancellation or terminal quiescence succeeds does the actor shut down
+  the provider. Successful provider shutdown still leaves the owner actor alive to
+  complete the canonical shutdown receipt, and durable queued tasks remain
+  untouched for a replacement owner.
+
+### RED / GREEN evidence
+
+The deterministic real-service harness uses the actual dispatcher, owner engine,
+active-task mutex, durable SQLite store, and provider port. It holds the actor mutex,
+polls shutdown through its durable receipt claim into the blocked publication,
+releases provider task B to complete, then advances publication so shutdown observes
+B while the actor clears the claim before cancellation continues. It uses mutex
+ordering and explicit polling only, with no sleep.
+
+Before the production reorder, the regression failed exactly at the reported
+handoff:
+
+```text
+outcome=Ok(Err(TaskServiceError { code: InvalidRequest }))
+provider=(shutdowns 1, operations-after-shutdown 0)
+shutdown receipt=pending
+pending receipts=1
+queued C status=queued
+```
+
+The transition table was also RED on missing `classify_shutdown_cancel` (`E0425`)
+and `ShutdownCancelRoute` (`E0433`). After the fix, the real handoff returns
+`Applied` promptly, provider shutdown occurs exactly once, zero provider operations
+occur afterward, the receipt is completed with valid JSON, and no receipts remain
+pending. C remains durably queued, and binding a replacement owner identifies C as
+its sole resumable initial task and prepares its provider context. The retained
+target retry and terminal/active/idle transition tests also pass.
+
+### Verification
+
+```text
+cargo test --locked --lib service::server::tests
+PASS: 10 passed, 0 failed
+
+cargo test --locked --test service_end_to_end \
+  shutdown_preempts_queued_work_and_completes_its_receipt
+PASS: 1 passed, 0 failed
+
+cargo test --locked --test service_end_to_end
+PASS: 20 passed, 0 failed
+
+cargo fmt --all -- --check
+PASS: exit 0
+
+cargo clippy --locked --all-targets --all-features -- -D warnings
+PASS: exit 0, no warnings
+
+git diff --check
+PASS: exit 0
+```
+
+The real private-endpoint handoff harness is explicitly Unix-gated; the ordering,
+transition, retry, and resume proofs are platform-neutral. Production changes do
+not touch Unix sockets, Windows named pipes, or Windows security descriptors, so no
+cross-build was needed. No Carl process remained, no migration, `Cargo.lock`, or
+`SECURITY.md` changed, and no full all-features test suite was run.
+
+### Fix commit
+
+- `ab3b4c7 fix: quiesce tasks before provider shutdown`
