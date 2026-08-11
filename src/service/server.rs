@@ -503,6 +503,7 @@ impl<T> Drop for AbortOnDrop<T> {
 #[derive(Default)]
 struct TaskActorState {
     active_task: tokio::sync::Mutex<Option<TaskId>>,
+    shutdown_target: Mutex<Option<TaskId>>,
     shutdown_requested: AtomicBool,
 }
 
@@ -519,7 +520,14 @@ impl TaskActorState {
     async fn publish_shutdown(&self) -> Option<TaskId> {
         let active_task = self.active_task.lock().await;
         self.shutdown_requested.store(true, Ordering::Release);
-        *active_task
+        let mut shutdown_target = self
+            .shutdown_target
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if shutdown_target.is_none() {
+            *shutdown_target = *active_task;
+        }
+        *shutdown_target
     }
 
     async fn clear_active(&self) {
@@ -1716,25 +1724,119 @@ async fn send_active_control(
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ShutdownCancelRoute {
+    Quiesced,
+    Active,
+    Idle,
+}
+
+fn classify_shutdown_cancel(
+    status: TaskStatus,
+    active_task: Option<TaskId>,
+    task_id: TaskId,
+) -> Result<ShutdownCancelRoute, TaskServiceError> {
+    if status.is_terminal() {
+        return Ok(ShutdownCancelRoute::Quiesced);
+    }
+    match active_task {
+        Some(active_task) if active_task == task_id => Ok(ShutdownCancelRoute::Active),
+        Some(_) => Err(service_error(TaskServiceErrorCode::Busy)),
+        None => Ok(ShutdownCancelRoute::Idle),
+    }
+}
+
+async fn shutdown_cancel_state(
+    shared: &ServiceShared,
+    task_id: TaskId,
+) -> Result<(ShutdownCancelRoute, crate::events::SessionId), TaskServiceError> {
+    let active_task = *shared.actor_state.active_task.lock().await;
+    let record = lock_store(&shared.read_store)?
+        .get_task(task_id)
+        .map_err(|_| service_error(TaskServiceErrorCode::Storage))?
+        .ok_or_else(|| service_error(TaskServiceErrorCode::InvalidRequest))?;
+    Ok((
+        classify_shutdown_cancel(record.snapshot.status, active_task, task_id)?,
+        record.snapshot.session_id,
+    ))
+}
+
+async fn send_idle_shutdown_cancel(
+    shared: &ServiceShared,
+    task_id: TaskId,
+    control_id: String,
+) -> Result<(), TaskServiceError> {
+    let (reply, response) = oneshot::channel();
+    shared
+        .actor_sender
+        .send(ActorCommand::Cancel {
+            task_id,
+            control_id,
+            reply,
+        })
+        .await
+        .map_err(|_| service_error(TaskServiceErrorCode::Stopped))?;
+    response
+        .await
+        .map_err(|_| service_error(TaskServiceErrorCode::Stopped))?
+}
+
+async fn quiesce_shutdown_task(
+    shared: &ServiceShared,
+    task_id: TaskId,
+) -> Result<(), TaskServiceError> {
+    let control_id = service_control_id(task_id, &format!("service-shutdown-{task_id}"), "cancel");
+    let (mut route, mut session_id) = shutdown_cancel_state(shared, task_id).await?;
+    loop {
+        match route {
+            ShutdownCancelRoute::Quiesced => return Ok(()),
+            ShutdownCancelRoute::Active => {
+                let result = send_active_control(
+                    shared,
+                    TaskEngineControl::Cancel {
+                        task_id,
+                        control_id: Some(control_id.clone()),
+                        session_id,
+                        turn_id: TurnId::new(),
+                        acknowledgement: next_ack(shared)?,
+                    },
+                )
+                .await;
+                tokio::task::yield_now().await;
+                (route, session_id) = shutdown_cancel_state(shared, task_id).await?;
+                match route {
+                    ShutdownCancelRoute::Quiesced | ShutdownCancelRoute::Idle => continue,
+                    ShutdownCancelRoute::Active => {
+                        return result
+                            .and_then(|()| Err(service_error(TaskServiceErrorCode::Engine)));
+                    }
+                }
+            }
+            ShutdownCancelRoute::Idle => {
+                let result = send_idle_shutdown_cancel(shared, task_id, control_id.clone()).await;
+                let (after_cancel, _) = shutdown_cancel_state(shared, task_id).await?;
+                if after_cancel == ShutdownCancelRoute::Quiesced {
+                    return Ok(());
+                }
+                return result.and_then(|()| Err(service_error(TaskServiceErrorCode::Engine)));
+            }
+        }
+    }
+}
+
 async fn shutdown_owner(shared: &ServiceShared) -> Result<(), TaskServiceError> {
     // Publishing under the task-claim mutex linearizes shutdown against every
     // provider start: shutdown either prevents the claim or observes what won.
     let active_task = shared.actor_state.publish_shutdown().await;
+    if let Some(task_id) = active_task {
+        quiesce_shutdown_task(shared, task_id).await?;
+    }
     let (reply, response) = oneshot::channel();
     shared
         .actor_sender
         .send(ActorCommand::ShutdownProvider { reply })
         .await
         .map_err(|_| service_error(TaskServiceErrorCode::Stopped))?;
-    if let Some(task_id) = active_task {
-        let request = ServiceRequest {
-            protocol_version: 1,
-            request_id: "service-shutdown".to_owned(),
-            idempotency_key: format!("service-shutdown-{task_id}"),
-            command: ServiceCommand::Cancel { task_id },
-        };
-        mutate_task(shared, task_id, &request, Mutation::Cancel).await?;
-    }
     response
         .await
         .map_err(|_| service_error(TaskServiceErrorCode::Stopped))?
@@ -1840,9 +1942,277 @@ const fn service_code(code: TaskServiceErrorCode) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::time::Duration;
+
+    #[cfg(unix)]
+    use crate::delegates::{ModelId, ReasoningEffort};
     use crate::events::SessionId;
+    #[cfg(unix)]
+    use crate::runtime::agent_port::{
+        AgentCapabilities, AgentContextId, AgentEffectKind, AgentEffectRequest, AgentEpochId,
+        AgentEvent, AgentFuture, AgentItem, AgentModel, AgentProcess, AgentRequestId,
+        ResumeAgentContext, StartAgentContext, StartAgentEpoch,
+    };
     use crate::runtime::task::OperationId;
+    #[cfg(unix)]
+    use crate::service::protocol::StartTaskCommand;
     use futures_util::poll;
+    #[cfg(unix)]
+    use rusqlite::Connection;
+    #[cfg(unix)]
+    use serde_json::json;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn terminal_handoff_cancels_before_provider_shutdown_and_preserves_queued_work() {
+        let layout = ShutdownTestLayout::new();
+        let port_state = Arc::new(Mutex::new(HandoffPortState {
+            workspace: layout.workspace.clone(),
+            ..HandoffPortState::default()
+        }));
+        let service = TaskService::bind(&layout.data, HandoffPort::new(Arc::clone(&port_state)))
+            .await
+            .unwrap();
+        let TaskService {
+            endpoint,
+            engine,
+            read_store,
+            initial_tasks,
+            controls,
+            acknowledgements,
+            mutation_gate,
+            live_updates,
+            live_update_receiver,
+            permission_receiver,
+            next_acknowledgement,
+            actor_state,
+            info,
+        } = service;
+        let (actor_sender, actor_receiver) = mpsc::channel(SERVICE_COMMAND_CAPACITY);
+        let actor_task = tokio::spawn(run_task_actor(
+            engine,
+            initial_tasks,
+            actor_receiver,
+            Arc::clone(&actor_state),
+        ));
+        let shared = Arc::new(ServiceShared {
+            read_store,
+            controls,
+            acknowledgements,
+            mutation_gate,
+            live_updates,
+            next_acknowledgement,
+            actor_state: Arc::clone(&actor_state),
+            actor_sender,
+            info,
+        });
+
+        let start = |suffix: &str| ServiceRequest {
+            protocol_version: 1,
+            request_id: format!("handoff-start-{suffix}"),
+            idempotency_key: format!("handoff-start-{suffix}-key"),
+            command: ServiceCommand::StartTask(StartTaskCommand {
+                external_session_id: format!("handoff-{suffix}-session"),
+                workspace: layout.workspace.clone(),
+                request: format!("handoff {suffix} task"),
+                model: ModelId::parse("gpt-test").unwrap(),
+                effort: ReasoningEffort::High,
+                permission_mode: PermissionMode::FullAccess,
+            }),
+        };
+        let ServiceResult::Accepted {
+            task_id: active_task,
+        } = dispatch_request(&shared, start("active")).await.unwrap()
+        else {
+            panic!("active handoff task was not accepted");
+        };
+        loop {
+            let active = lock_store(&shared.read_store)
+                .unwrap()
+                .get_task(active_task)
+                .unwrap()
+                .unwrap()
+                .snapshot;
+            let provider_ready = {
+                let state = port_state.lock().unwrap();
+                state.effect_count == 1 && state.operation_id.is_some()
+            };
+            if active.status == TaskStatus::Active
+                && active.active_epoch.is_some()
+                && provider_ready
+                && *actor_state.active_task.lock().await == Some(active_task)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let ServiceResult::Accepted {
+            task_id: queued_task,
+        } = dispatch_request(&shared, start("queued")).await.unwrap()
+        else {
+            panic!("queued handoff task was not accepted");
+        };
+        assert_eq!(
+            lock_store(&shared.read_store)
+                .unwrap()
+                .get_task(queued_task)
+                .unwrap()
+                .unwrap()
+                .snapshot
+                .status,
+            TaskStatus::Queued
+        );
+
+        let active_lock = actor_state.active_task.lock().await;
+        assert_eq!(*active_lock, Some(active_task));
+        let shutdown_request = ServiceRequest {
+            protocol_version: 1,
+            request_id: "handoff-shutdown".to_owned(),
+            idempotency_key: "handoff-shutdown-key".to_owned(),
+            command: ServiceCommand::Shutdown,
+        };
+        let mut shutdown = Box::pin(dispatch_request(&shared, shutdown_request));
+        assert!(poll!(&mut shutdown).is_pending());
+
+        let database = layout.data.join("carl.sqlite3");
+        loop {
+            let connection = Connection::open(&database).unwrap();
+            let claimed = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM service_command_receipts
+                     WHERE idempotency_key = 'handoff-shutdown-key' AND state = 'pending'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap();
+            if claimed == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(poll!(&mut shutdown).is_pending());
+        assert!(!actor_state.shutdown_requested());
+
+        port_state.lock().unwrap().release_completion = true;
+        loop {
+            let status = lock_store(&shared.read_store)
+                .unwrap()
+                .get_task(active_task)
+                .unwrap()
+                .unwrap()
+                .snapshot
+                .status;
+            if status == TaskStatus::Completed {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        tokio::task::yield_now().await;
+        drop(active_lock);
+        assert!(poll!(&mut shutdown).is_pending());
+        assert!(actor_state.shutdown_requested());
+
+        let outcome = tokio::time::timeout(Duration::from_secs(1), &mut shutdown).await;
+        drop(shutdown);
+        let provider = {
+            let state = port_state.lock().unwrap();
+            (state.shutdowns, state.operations_after_shutdown)
+        };
+        let connection = Connection::open(&database).unwrap();
+        let (receipt_state, result_json) = connection
+            .query_row(
+                "SELECT state, result_json FROM service_command_receipts
+                 WHERE idempotency_key = 'handoff-shutdown-key'",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .unwrap();
+        let pending = connection
+            .query_row(
+                "SELECT COUNT(*) FROM service_command_receipts WHERE state = 'pending'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        let queued_status = connection
+            .query_row(
+                "SELECT status FROM agent_tasks WHERE id = ?1",
+                [queued_task.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        drop(connection);
+
+        drop(shared);
+        drop(live_update_receiver);
+        drop(permission_receiver);
+        let actor_result = tokio::time::timeout(Duration::from_secs(1), actor_task)
+            .await
+            .expect("handoff actor did not stop")
+            .expect("handoff actor panicked");
+        assert!(actor_result.is_ok());
+        drop(endpoint);
+
+        let replacement_state = Arc::new(Mutex::new(HandoffPortState {
+            workspace: layout.workspace.clone(),
+            ..HandoffPortState::default()
+        }));
+        let replacement = TaskService::bind(
+            &layout.data,
+            HandoffPort::new(Arc::clone(&replacement_state)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(replacement.initial_tasks, vec![queued_task]);
+        assert_eq!(replacement_state.lock().unwrap().started_contexts, 1);
+        drop(replacement);
+
+        assert!(
+            matches!(outcome, Ok(Ok(ServiceResult::Applied))),
+            "terminal handoff failed: outcome={outcome:?}, provider={provider:?}, receipt={receipt_state}, pending={pending}, queued={queued_status}"
+        );
+        assert_eq!(provider, (1, 0));
+        assert_eq!(receipt_state, "completed");
+        assert!(
+            result_json
+                .as_deref()
+                .is_some_and(|result| serde_json::from_str::<serde_json::Value>(result).is_ok())
+        );
+        assert_eq!(pending, 0);
+        assert_eq!(queued_status, "queued");
+    }
+
+    #[test]
+    fn shutdown_cancellation_routes_terminal_active_and_inactive_transitions() {
+        let task_id = TaskId::new();
+        for status in [
+            TaskStatus::Cancelled,
+            TaskStatus::Completed,
+            TaskStatus::Failed,
+        ] {
+            assert_eq!(
+                classify_shutdown_cancel(status, Some(task_id), task_id).unwrap(),
+                ShutdownCancelRoute::Quiesced
+            );
+        }
+        assert_eq!(
+            classify_shutdown_cancel(TaskStatus::Active, Some(task_id), task_id).unwrap(),
+            ShutdownCancelRoute::Active
+        );
+        for status in [TaskStatus::Active, TaskStatus::Paused, TaskStatus::Blocked] {
+            assert_eq!(
+                classify_shutdown_cancel(status, None, task_id).unwrap(),
+                ShutdownCancelRoute::Idle
+            );
+        }
+        assert_eq!(
+            classify_shutdown_cancel(TaskStatus::Active, Some(TaskId::new()), task_id)
+                .unwrap_err()
+                .code(),
+            TaskServiceErrorCode::Busy
+        );
+    }
 
     #[tokio::test]
     async fn published_shutdown_wins_before_task_start_claim() {
@@ -1888,6 +2258,17 @@ mod tests {
 
         assert_eq!(error.code(), TaskServiceErrorCode::Stopped);
         assert!(scheduled.is_empty());
+    }
+
+    #[tokio::test]
+    async fn shutdown_retry_remembers_the_task_observed_before_handoff() {
+        let actor_state = TaskActorState::default();
+        let task_id = TaskId::new();
+        assert!(actor_state.claim_start(task_id).await);
+        assert_eq!(actor_state.publish_shutdown().await, Some(task_id));
+        actor_state.clear_active().await;
+
+        assert_eq!(actor_state.publish_shutdown().await, Some(task_id));
     }
 
     #[test]
@@ -2028,5 +2409,327 @@ mod tests {
         assert!(updates.is_empty());
         assert_eq!(cursor, Some(3));
         assert!(!overflowed);
+    }
+
+    #[cfg(unix)]
+    struct ShutdownTestLayout {
+        root: PathBuf,
+        data: PathBuf,
+        workspace: PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl ShutdownTestLayout {
+        fn new() -> Self {
+            let root = PathBuf::from("/tmp").join(format!(
+                "carl-shutdown-handoff-{}",
+                &uuid::Uuid::new_v4().simple().to_string()[..12]
+            ));
+            let data = root.join("data");
+            let workspace = root.join("workspace");
+            fs::create_dir_all(&data).unwrap();
+            fs::create_dir_all(&workspace).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                fs::set_permissions(&data, fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            Self {
+                root,
+                data: fs::canonicalize(data).unwrap(),
+                workspace: fs::canonicalize(workspace).unwrap(),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for ShutdownTestLayout {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[cfg(unix)]
+    struct HandoffPort {
+        state: Arc<Mutex<HandoffPortState>>,
+    }
+
+    #[cfg(unix)]
+    #[derive(Default)]
+    struct HandoffPortState {
+        workspace: PathBuf,
+        events: VecDeque<AgentEvent>,
+        active_context: Option<AgentContextId>,
+        active_epoch: Option<AgentEpochId>,
+        epoch: u64,
+        effect_count: u64,
+        operation_id: Option<String>,
+        release_completion: bool,
+        completion_emitted: bool,
+        started_contexts: u64,
+        shutdowns: u64,
+        provider_shutdown: bool,
+        operations_after_shutdown: u64,
+    }
+
+    #[cfg(unix)]
+    impl HandoffPort {
+        fn new(state: Arc<Mutex<HandoffPortState>>) -> Self {
+            Self { state }
+        }
+
+        fn note_operation(&self) {
+            let mut state = self.state.lock().unwrap();
+            if state.provider_shutdown {
+                state.operations_after_shutdown += 1;
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl AgentPort for HandoffPort {
+        fn supports_autonomous_tasks(&self) -> bool {
+            true
+        }
+
+        fn capabilities(&self) -> AgentCapabilities {
+            AgentCapabilities {
+                resume: true,
+                compact: true,
+                token_usage: false,
+                pre_dispatch_effects: true,
+                history_paging: false,
+                background_processes: false,
+            }
+        }
+
+        fn models(&mut self) -> AgentFuture<'_, Vec<AgentModel>> {
+            self.note_operation();
+            Box::pin(async {
+                Ok(vec![AgentModel {
+                    id: ModelId::parse("gpt-test").expect("test model is valid"),
+                    display_name: "GPT Test".to_owned(),
+                    supported_efforts: vec![ReasoningEffort::High],
+                    default_effort: ReasoningEffort::High,
+                }])
+            })
+        }
+
+        fn start_context(
+            &mut self,
+            _request: StartAgentContext,
+        ) -> AgentFuture<'_, AgentContextId> {
+            self.note_operation();
+            let state = Arc::clone(&self.state);
+            Box::pin(async move {
+                let mut state = state.lock().unwrap();
+                state.started_contexts += 1;
+                AgentContextId::parse(format!("handoff-context-{}", state.started_contexts))
+            })
+        }
+
+        fn resume_context(
+            &mut self,
+            request: ResumeAgentContext,
+        ) -> AgentFuture<'_, AgentContextId> {
+            self.note_operation();
+            Box::pin(async move { Ok(request.context_id) })
+        }
+
+        fn compact_context(&mut self, _context_id: &AgentContextId) -> AgentFuture<'_, ()> {
+            self.note_operation();
+            Box::pin(async { Ok(()) })
+        }
+
+        fn start_epoch(&mut self, request: StartAgentEpoch) -> AgentFuture<'_, AgentEpochId> {
+            self.note_operation();
+            let state = Arc::clone(&self.state);
+            Box::pin(async move {
+                let mut state = state.lock().unwrap();
+                state.epoch += 1;
+                let epoch_id = AgentEpochId::parse(format!("handoff-epoch-{}", state.epoch))?;
+                state.events.push_back(AgentEvent::EpochStarted {
+                    context_id: request.context_id.clone(),
+                    epoch_id: epoch_id.clone(),
+                });
+                if request.permission_mode == PermissionMode::Plan {
+                    state.events.push_back(AgentEvent::AssistantDelta {
+                        context_id: request.context_id.clone(),
+                        epoch_id: epoch_id.clone(),
+                        text: "<carl-completion-contract>{\"version\":1,\"goal\":\"Complete before shutdown cancellation\",\"constraints\":[],\"clauses\":[{\"id\":\"requested-outcome\",\"description\":\"Requested outcome\",\"required\":true,\"status\":\"pending\",\"evidence\":[]},{\"id\":\"explicit-verification\",\"description\":\"Explicit verification\",\"required\":true,\"status\":\"pending\",\"evidence\":[]}]}</carl-completion-contract>".to_owned(),
+                    });
+                    state.events.push_back(AgentEvent::EpochCompleted {
+                        context_id: request.context_id,
+                        epoch_id: epoch_id.clone(),
+                        status: "completed".to_owned(),
+                    });
+                } else {
+                    state.active_context = Some(request.context_id.clone());
+                    state.active_epoch = Some(epoch_id.clone());
+                    let item = AgentItem::Command {
+                        item_id: "handoff-effect".to_owned(),
+                        command: "finish-before-cancel".to_owned(),
+                        cwd: state.workspace.clone(),
+                        status: "inProgress".to_owned(),
+                        exit_code: None,
+                        aggregated_output: None,
+                        process_id: None,
+                    };
+                    state.events.push_back(AgentEvent::ItemStarted {
+                        context_id: request.context_id.clone(),
+                        epoch_id: epoch_id.clone(),
+                        item,
+                    });
+                    state
+                        .events
+                        .push_back(AgentEvent::EffectRequested(AgentEffectRequest {
+                            context_id: request.context_id,
+                            epoch_id: epoch_id.clone(),
+                            request_id: AgentRequestId::parse("handoff-effect-request")?,
+                            item_id: "handoff-effect".to_owned(),
+                            kind: AgentEffectKind::Command,
+                            summary: "finish before cancellation dispatch".to_owned(),
+                            request_digest: Sha256Digest::parse("5".repeat(64))
+                                .expect("literal digest is valid"),
+                        }));
+                }
+                Ok(epoch_id)
+            })
+        }
+
+        fn steer(
+            &mut self,
+            _context_id: &AgentContextId,
+            _epoch_id: &AgentEpochId,
+            text: String,
+        ) -> AgentFuture<'_, ()> {
+            self.note_operation();
+            let state = Arc::clone(&self.state);
+            Box::pin(async move {
+                if let Some(operation_id) = text.strip_prefix("carl-operation-id:") {
+                    state.lock().unwrap().operation_id = Some(operation_id.trim().to_owned());
+                }
+                Ok(())
+            })
+        }
+
+        fn interrupt(
+            &mut self,
+            _context_id: &AgentContextId,
+            _epoch_id: &AgentEpochId,
+        ) -> AgentFuture<'_, ()> {
+            self.note_operation();
+            Box::pin(async { Ok(()) })
+        }
+
+        fn next_event(&mut self) -> AgentFuture<'_, AgentEvent> {
+            self.note_operation();
+            let state = Arc::clone(&self.state);
+            Box::pin(async move {
+                loop {
+                    {
+                        let mut state = state.lock().unwrap();
+                        if let Some(event) = state.events.pop_front() {
+                            return Ok(event);
+                        }
+                        if state.release_completion
+                            && !state.completion_emitted
+                            && state.effect_count == 1
+                            && let Some(operation_id) = state.operation_id.clone()
+                        {
+                            state.completion_emitted = true;
+                            let context_id = state
+                                .active_context
+                                .clone()
+                                .expect("work context was installed");
+                            let epoch_id = state
+                                .active_epoch
+                                .clone()
+                                .expect("work epoch was installed");
+                            let workspace = state.workspace.clone();
+                            state.events.push_back(AgentEvent::ItemCompleted {
+                                context_id: context_id.clone(),
+                                epoch_id: epoch_id.clone(),
+                                item: AgentItem::Command {
+                                    item_id: "handoff-effect".to_owned(),
+                                    command: "finish-before-cancel".to_owned(),
+                                    cwd: workspace,
+                                    status: "completed".to_owned(),
+                                    exit_code: Some(0),
+                                    aggregated_output: Some("completed before cancel".to_owned()),
+                                    process_id: None,
+                                },
+                            });
+                            state.events.push_back(AgentEvent::AssistantDelta {
+                                context_id: context_id.clone(),
+                                epoch_id: epoch_id.clone(),
+                                text: format!(
+                                    "<carl-epoch-report>{}</carl-epoch-report>",
+                                    json!({
+                                        "schema_version": 1,
+                                        "disposition": "complete",
+                                        "summary": "completed naturally during shutdown handoff",
+                                        "clause_evidence": [
+                                            {"clause_id":"requested-outcome","operation_ids":[operation_id.clone()],"event_sequences":[],"artifact_digests":[]},
+                                            {"clause_id":"explicit-verification","operation_ids":[operation_id],"event_sequences":[],"artifact_digests":[]}
+                                        ],
+                                        "exact_identifiers": []
+                                    })
+                                ),
+                            });
+                            state.events.push_back(AgentEvent::EpochCompleted {
+                                context_id,
+                                epoch_id,
+                                status: "completed".to_owned(),
+                            });
+                            continue;
+                        }
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+        }
+
+        fn resolve_effect(
+            &mut self,
+            _request_id: &AgentRequestId,
+            decision: EffectDecision,
+        ) -> AgentFuture<'_, ()> {
+            self.note_operation();
+            let state = Arc::clone(&self.state);
+            Box::pin(async move {
+                if decision == EffectDecision::Allow {
+                    state.lock().unwrap().effect_count += 1;
+                }
+                Ok(())
+            })
+        }
+
+        fn list_background_processes(
+            &mut self,
+            _context_id: &AgentContextId,
+        ) -> AgentFuture<'_, Vec<AgentProcess>> {
+            self.note_operation();
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn terminate_background_process(
+            &mut self,
+            _context_id: &AgentContextId,
+            _process_id: &str,
+        ) -> AgentFuture<'_, bool> {
+            self.note_operation();
+            Box::pin(async { Ok(true) })
+        }
+
+        fn shutdown(&mut self) -> AgentFuture<'_, ()> {
+            let state = Arc::clone(&self.state);
+            Box::pin(async move {
+                let mut state = state.lock().unwrap();
+                state.shutdowns += 1;
+                state.provider_shutdown = true;
+                Ok(())
+            })
+        }
     }
 }
