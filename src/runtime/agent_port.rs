@@ -29,16 +29,34 @@ pub enum AgentPortErrorCode {
     Cancelled,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AgentErrorProvenance {
+    DefinitelyNotApplied,
+    PossiblyApplied,
+}
+
 #[derive(Clone, Eq, Error, PartialEq)]
 #[error("The agent provider request failed.")]
 pub struct AgentPortError {
     code: AgentPortErrorCode,
+    provenance: AgentErrorProvenance,
 }
 
 impl AgentPortError {
     #[must_use]
     pub const fn from_code(code: AgentPortErrorCode) -> Self {
-        Self { code }
+        Self {
+            code,
+            provenance: AgentErrorProvenance::PossiblyApplied,
+        }
+    }
+
+    #[must_use]
+    pub const fn definitely_not_applied(code: AgentPortErrorCode) -> Self {
+        Self {
+            code,
+            provenance: AgentErrorProvenance::DefinitelyNotApplied,
+        }
     }
 
     #[must_use]
@@ -50,6 +68,11 @@ impl AgentPortError {
     pub const fn code(&self) -> AgentPortErrorCode {
         self.code
     }
+
+    #[must_use]
+    pub const fn provenance(&self) -> AgentErrorProvenance {
+        self.provenance
+    }
 }
 
 impl fmt::Debug for AgentPortError {
@@ -57,6 +80,7 @@ impl fmt::Debug for AgentPortError {
         formatter
             .debug_struct("AgentPortError")
             .field("code", &self.code)
+            .field("provenance", &self.provenance)
             .finish()
     }
 }
@@ -572,12 +596,11 @@ pub trait AgentPort: Send {
     fn start_context(&mut self, request: StartAgentContext) -> AgentFuture<'_, AgentContextId>;
     fn resume_context(&mut self, request: ResumeAgentContext) -> AgentFuture<'_, AgentContextId>;
     fn compact_context(&mut self, context_id: &AgentContextId) -> AgentFuture<'_, ()>;
-    fn resume_or_replace_context(
-        &mut self,
+    fn resume_or_replace_context<'a>(
+        &'a mut self,
         request: ResumeAgentContext,
-        context_package: ContextPackage,
-        effort: ReasoningEffort,
-    ) -> AgentFuture<'_, ContextRecovery> {
+        context_package: &'a ContextPackage,
+    ) -> AgentFuture<'a, ContextRecovery> {
         Box::pin(async move {
             context_package
                 .canonical_bytes()
@@ -589,15 +612,14 @@ pub trait AgentPort: Send {
                     Err(_) => {}
                 }
             }
-            self.replace_context(request, context_package, effort).await
+            self.replace_context(request, context_package).await
         })
     }
-    fn compact_or_replace_context(
-        &mut self,
+    fn compact_or_replace_context<'a>(
+        &'a mut self,
         request: ResumeAgentContext,
-        context_package: ContextPackage,
-        effort: ReasoningEffort,
-    ) -> AgentFuture<'_, ContextRecovery> {
+        context_package: &'a ContextPackage,
+    ) -> AgentFuture<'a, ContextRecovery> {
         Box::pin(async move {
             context_package
                 .canonical_bytes()
@@ -609,15 +631,14 @@ pub trait AgentPort: Send {
                     Err(_) => {}
                 }
             }
-            self.replace_context(request, context_package, effort).await
+            self.replace_context(request, context_package).await
         })
     }
-    fn replace_context(
-        &mut self,
+    fn replace_context<'a>(
+        &'a mut self,
         request: ResumeAgentContext,
-        context_package: ContextPackage,
-        effort: ReasoningEffort,
-    ) -> AgentFuture<'_, ContextRecovery> {
+        context_package: &'a ContextPackage,
+    ) -> AgentFuture<'a, ContextRecovery> {
         Box::pin(async move {
             context_package
                 .canonical_bytes()
@@ -625,18 +646,10 @@ pub trait AgentPort: Send {
             let context_id = self
                 .start_context(StartAgentContext {
                     cwd: request.cwd,
-                    model: request.model.clone(),
+                    model: request.model,
                     permission_mode: request.permission_mode,
                 })
                 .await?;
-            self.start_epoch(StartAgentEpoch {
-                context_id: context_id.clone(),
-                input: context_package.rendered,
-                model: request.model,
-                effort,
-                permission_mode: request.permission_mode,
-            })
-            .await?;
             Ok(ContextRecovery::Replaced(context_id))
         })
     }
@@ -671,13 +684,8 @@ pub trait AgentPort: Send {
 }
 
 fn is_recoverable_lifecycle_error(error: &AgentPortError) -> bool {
-    matches!(
-        error.code(),
-        AgentPortErrorCode::Unsupported
-            | AgentPortErrorCode::InvalidResponse
-            | AgentPortErrorCode::UnavailableContext
-            | AgentPortErrorCode::Transport
-    )
+    error.code() == AgentPortErrorCode::Unsupported
+        || error.provenance() == AgentErrorProvenance::DefinitelyNotApplied
 }
 
 fn validate_bounded_string(value: &str, maximum_bytes: usize) -> Result<(), AgentPortError> {

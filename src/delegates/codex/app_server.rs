@@ -139,6 +139,7 @@ struct OutstandingApproval {
 
 pub struct CodexAppServer {
     sidecar: JsonlSidecar,
+    experimental_api_negotiated: bool,
     next_request_id: u64,
     models: Vec<CodexModel>,
     threads: HashMap<String, ThreadState>,
@@ -230,7 +231,7 @@ impl CodexAppServer {
                         "title": "Carl",
                         "version": env!("CARGO_PKG_VERSION")
                     },
-                    "capabilities": null
+                    "capabilities": {"experimentalApi":true}
                 }
             }))
             .await
@@ -243,6 +244,7 @@ impl CodexAppServer {
 
         Ok(Self {
             sidecar,
+            experimental_api_negotiated: true,
             next_request_id: 1,
             models: Vec::new(),
             threads: HashMap::new(),
@@ -871,12 +873,12 @@ impl CodexAppServer {
 impl AgentPort for CodexAppServer {
     fn capabilities(&self) -> AgentCapabilities {
         AgentCapabilities {
-            resume: true,
-            compact: true,
+            resume: self.experimental_api_negotiated,
+            compact: self.experimental_api_negotiated,
             token_usage: true,
             pre_dispatch_effects: true,
             history_paging: false,
-            background_processes: true,
+            background_processes: self.experimental_api_negotiated,
         }
     }
 
@@ -917,6 +919,11 @@ impl AgentPort for CodexAppServer {
 
     fn resume_context(&mut self, request: ResumeAgentContext) -> AgentFuture<'_, AgentContextId> {
         Box::pin(async move {
+            if !self.experimental_api_negotiated {
+                return Err(AgentPortError::definitely_not_applied(
+                    AgentPortErrorCode::Unsupported,
+                ));
+            }
             let thread_id = CodexAppServer::resume_thread(self, request)
                 .await
                 .map_err(map_agent_error)?;
@@ -927,6 +934,11 @@ impl AgentPort for CodexAppServer {
     fn compact_context(&mut self, context_id: &AgentContextId) -> AgentFuture<'_, ()> {
         let context_id = context_id.clone();
         Box::pin(async move {
+            if !self.experimental_api_negotiated {
+                return Err(AgentPortError::definitely_not_applied(
+                    AgentPortErrorCode::Unsupported,
+                ));
+            }
             let thread_id = CodexThreadId::parse(context_id.as_str()).map_err(map_agent_error)?;
             CodexAppServer::compact_thread(self, &thread_id)
                 .await
@@ -1042,6 +1054,11 @@ impl AgentPort for CodexAppServer {
     ) -> AgentFuture<'_, Vec<AgentProcess>> {
         let context_id = context_id.clone();
         Box::pin(async move {
+            if !self.experimental_api_negotiated {
+                return Err(AgentPortError::definitely_not_applied(
+                    AgentPortErrorCode::Unsupported,
+                ));
+            }
             let thread_id = CodexThreadId::parse(context_id.as_str()).map_err(map_agent_error)?;
             CodexAppServer::background_processes(self, &thread_id)
                 .await
@@ -1057,6 +1074,11 @@ impl AgentPort for CodexAppServer {
         let context_id = context_id.clone();
         let process_id = process_id.to_owned();
         Box::pin(async move {
+            if !self.experimental_api_negotiated {
+                return Err(AgentPortError::definitely_not_applied(
+                    AgentPortErrorCode::Unsupported,
+                ));
+            }
             let thread_id = CodexThreadId::parse(context_id.as_str()).map_err(map_agent_error)?;
             CodexAppServer::terminate_background(self, &thread_id, &process_id)
                 .await
@@ -1312,6 +1334,7 @@ fn validate_resumed_thread(
     )?;
     if object.get("cwd").and_then(Value::as_str) != expected_cwd.to_str()
         || object.get("model").and_then(Value::as_str) != Some(expected_model.as_str())
+        || object.get("modelProvider").and_then(Value::as_str) != Some("openai")
         || object.get("approvalPolicy").and_then(Value::as_str) != Some(expected_approval_policy)
         || object.get("approvalsReviewer").and_then(Value::as_str) != Some("user")
         || !resume_sandbox_matches(object.get("sandbox"), expected_sandbox)
@@ -1326,27 +1349,173 @@ fn validate_resumed_thread(
     }
     optional_response_string(object.get("itemsBackwardsCursor"), MAX_CURSOR_BYTES)?;
     optional_response_string(object.get("turnsBackwardsCursor"), MAX_CURSOR_BYTES)?;
+    validate_active_permission_profile(object.get("activePermissionProfile"), expected_sandbox)?;
+    validate_runtime_workspace_roots(object.get("runtimeWorkspaceRoots"), expected_cwd)?;
+    validate_instruction_sources(object.get("instructionSources"))?;
+    if object
+        .get("multiAgentMode")
+        .is_some_and(|value| value.as_str() != Some("explicitRequestOnly"))
+        || object.get("reasoningEffort").is_some_and(|value| {
+            !value.is_null()
+                && !value.as_str().is_some_and(|effort| {
+                    matches!(
+                        effort,
+                        "low" | "medium" | "high" | "xhigh" | "max" | "ultra"
+                    )
+                })
+        })
+    {
+        return Err(protocol_error());
+    }
+    optional_response_string(object.get("serviceTier"), MAX_CURSOR_BYTES)?;
     let thread = object
         .get("thread")
         .and_then(Value::as_object)
         .ok_or_else(protocol_error)?;
+    require_keys(
+        thread,
+        &[
+            "cliVersion",
+            "createdAt",
+            "cwd",
+            "ephemeral",
+            "id",
+            "modelProvider",
+            "preview",
+            "sessionId",
+            "source",
+            "status",
+            "turns",
+            "updatedAt",
+        ],
+        &[
+            "agentNickname",
+            "agentRole",
+            "canAcceptDirectInput",
+            "extra",
+            "forkedFromId",
+            "gitInfo",
+            "historyMode",
+            "isPinned",
+            "name",
+            "parentThreadId",
+            "path",
+            "recencyAt",
+            "threadSource",
+        ],
+    )?;
     let returned_id = CodexThreadId::from_value(thread.get("id").ok_or_else(protocol_error)?)?;
     let status = thread
         .get("status")
         .and_then(Value::as_object)
         .ok_or_else(protocol_error)?;
-    require_keys(status, &["type"], &["activeFlags"])?;
+    require_keys(status, &["type"], &[])?;
+    let turns = thread
+        .get("turns")
+        .and_then(Value::as_array)
+        .ok_or_else(protocol_error)?;
     if returned_id != *expected_thread_id
         || thread.get("cwd").and_then(Value::as_str) != expected_cwd.to_str()
+        || thread.get("modelProvider").and_then(Value::as_str) != Some("openai")
         || thread.get("ephemeral").and_then(Value::as_bool) != Some(false)
         || status.get("type").and_then(Value::as_str) != Some("idle")
-        || thread
-            .get("turns")
-            .is_some_and(|turns| turns.as_array().is_none_or(|turns| !turns.is_empty()))
+        || !turns.is_empty()
+        || thread.get("createdAt").and_then(Value::as_i64).is_none()
+        || thread.get("updatedAt").and_then(Value::as_i64).is_none()
+        || !thread
+            .get("cliVersion")
+            .and_then(Value::as_str)
+            .is_some_and(|value| valid_response_text(value, MAX_CURSOR_BYTES, false))
+        || !thread
+            .get("preview")
+            .and_then(Value::as_str)
+            .is_some_and(|value| valid_response_text(value, MAX_TEXT_BYTES, true))
+        || !thread
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .is_some_and(|value| valid_response_text(value, MAX_CURSOR_BYTES, false))
+        || !valid_thread_source(thread.get("source"))
     {
         return Err(protocol_error());
     }
     Ok(())
+}
+
+fn validate_active_permission_profile(
+    value: Option<&Value>,
+    expected_sandbox: &str,
+) -> Result<(), DelegateError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    if value.is_null() {
+        return Ok(());
+    }
+    let profile = value.as_object().ok_or_else(protocol_error)?;
+    require_keys(profile, &["id"], &["extends"])?;
+    let expected_id = match expected_sandbox {
+        "read-only" => ":read-only",
+        _ => return Err(protocol_error()),
+    };
+    if profile.get("id").and_then(Value::as_str) != Some(expected_id)
+        || profile.get("extends").is_some_and(|value| !value.is_null())
+    {
+        return Err(protocol_error());
+    }
+    Ok(())
+}
+
+fn validate_runtime_workspace_roots(
+    value: Option<&Value>,
+    expected_cwd: &Path,
+) -> Result<(), DelegateError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    let roots = value.as_array().ok_or_else(protocol_error)?;
+    if roots.len() > 16 {
+        return Err(protocol_error());
+    }
+    for root in roots {
+        let supplied = PathBuf::from(bounded_string(Some(root), MAX_TEXT_BYTES)?);
+        let canonical = fs::canonicalize(&supplied).map_err(|_| protocol_error())?;
+        if supplied != canonical || !canonical.is_dir() || !canonical.starts_with(expected_cwd) {
+            return Err(protocol_error());
+        }
+    }
+    Ok(())
+}
+
+fn validate_instruction_sources(value: Option<&Value>) -> Result<(), DelegateError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    let sources = value.as_array().ok_or_else(protocol_error)?;
+    if sources.len() > 64 {
+        return Err(protocol_error());
+    }
+    for source in sources {
+        bounded_string(Some(source), MAX_TEXT_BYTES)?;
+    }
+    Ok(())
+}
+
+fn valid_response_text(value: &str, maximum: usize, allow_empty: bool) -> bool {
+    (allow_empty || !value.is_empty()) && value.len() <= maximum && !value.as_bytes().contains(&0)
+}
+
+fn valid_thread_source(value: Option<&Value>) -> bool {
+    value.is_some_and(|value| {
+        value.as_str().is_some_and(|source| {
+            matches!(
+                source,
+                "cli" | "vscode" | "exec" | "appServer" | "unknown" | "subAgent"
+            )
+        }) || value
+            .get("custom")
+            .and_then(Value::as_str)
+            .is_some_and(|source| valid_response_text(source, MAX_CURSOR_BYTES, false))
+    })
 }
 
 fn parse_background_process(
@@ -1876,9 +2045,6 @@ fn resume_sandbox_matches(value: Option<&Value>, expected: &str) -> bool {
     let Some(value) = value else {
         return false;
     };
-    if value.as_str() == Some(expected) {
-        return true;
-    }
     let Some(object) = value.as_object() else {
         return false;
     };

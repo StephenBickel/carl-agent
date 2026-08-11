@@ -42,6 +42,10 @@ fn main() {
             handshake_and_thread,
         ),
         test(
+            "Codex experimental lifecycle capabilities require a successful negotiation",
+            experimental_capabilities_require_handshake,
+        ),
+        test(
             "Codex app-server normalizes events approvals steering and interrupt",
             lifecycle_and_approval,
         ),
@@ -186,6 +190,25 @@ fn native_lifecycle_controls_are_exact_and_correlated() -> Result<(), Box<dyn Er
     })
 }
 
+fn experimental_capabilities_require_handshake() -> Result<(), Box<dyn Error + Send + Sync>> {
+    run_async(async {
+        let layout = TestLayout::new()?;
+        fs::write(layout.root.join("reject-initialize"), b"reject")?;
+        let error = connect(&layout)
+            .await
+            .expect_err("a rejected experimental negotiation must not produce an adapter");
+        assert_eq!(error.to_string(), "The subscription delegate failed.");
+        let requests = read_requests(&layout)?;
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["method"], "initialize");
+        assert_eq!(
+            requests[0]["params"]["capabilities"],
+            json!({"experimentalApi":true})
+        );
+        Ok(())
+    })
+}
+
 fn lifecycle_controls_fail_closed() -> Result<(), Box<dyn Error + Send + Sync>> {
     run_async(async {
         for context in [
@@ -193,6 +216,12 @@ fn lifecycle_controls_fail_closed() -> Result<(), Box<dyn Error + Send + Sync>> 
             "thr_permission",
             "thr_workspace",
             "thr_active",
+            "thr_sandbox_string",
+            "thr_missing_turns",
+            "thr_model_provider",
+            "thr_thread_provider",
+            "thr_runtime_root",
+            "thr_profile",
             "thr_duplicate",
             "thr_outside",
             "thr_missing",
@@ -212,7 +241,16 @@ fn lifecycle_controls_fail_closed() -> Result<(), Box<dyn Error + Send + Sync>> 
                 .await;
             if matches!(
                 context,
-                "thr_mismatch" | "thr_permission" | "thr_workspace" | "thr_active"
+                "thr_mismatch"
+                    | "thr_permission"
+                    | "thr_workspace"
+                    | "thr_active"
+                    | "thr_sandbox_string"
+                    | "thr_missing_turns"
+                    | "thr_model_provider"
+                    | "thr_thread_provider"
+                    | "thr_runtime_root"
+                    | "thr_profile"
             ) {
                 let error = resumed.expect_err("a mismatched resume binding must be rejected");
                 assert_eq!(error.code(), AgentPortErrorCode::InvalidResponse);
@@ -324,6 +362,10 @@ fn handshake_and_thread() -> Result<(), Box<dyn Error + Send + Sync>> {
 
         let requests = read_requests(&layout)?;
         assert_eq!(requests[0]["method"], "initialize");
+        assert_eq!(
+            requests[0]["params"]["capabilities"],
+            json!({"experimentalApi":true})
+        );
         assert_eq!(requests[1]["method"], "initialized");
         assert_eq!(requests[2]["method"], "model/list");
         assert_eq!(requests[3]["params"]["cursor"], "page-2");
@@ -693,10 +735,23 @@ fn app_server_fixture() -> i32 {
                 }
                 continue;
             }
-            Some("initialize") => json!({
-                "userAgent":"carl/0.146.0 (fixture; arm64) unknown (carl; 0.1.0)", "codexHome":home,
-                "platformFamily":"unix", "platformOs":"fixture"
-            }),
+            Some("initialize") => {
+                if fixture_root(&home).join("reject-initialize").is_file() {
+                    if write_message(&json!({
+                        "id":id,
+                        "error":{"code":-32602,"message":"experimental API rejected"}
+                    }))
+                    .is_err()
+                    {
+                        return 74;
+                    }
+                    continue;
+                }
+                json!({
+                    "userAgent":"carl/0.146.0 (fixture; arm64) unknown (carl; 0.1.0)", "codexHome":home,
+                    "platformFamily":"unix", "platformOs":"fixture"
+                })
+            }
             Some("model/list") if request["params"]["cursor"].is_null() => json!({
                 "data":[model("gpt-5.6-codex", "GPT-5.6 Codex", ["medium", "high"])],
                 "nextCursor":"page-2"
@@ -748,18 +803,56 @@ fn app_server_fixture() -> i32 {
                 if requested_thread == "thr_active" {
                     thread["status"] = json!({"type":"active","activeFlags":[]});
                 }
+                if requested_thread == "thr_missing_turns" {
+                    thread
+                        .as_object_mut()
+                        .expect("thread fixture is an object")
+                        .remove("turns");
+                }
+                if requested_thread == "thr_thread_provider" {
+                    thread["modelProvider"] = json!("other-provider");
+                }
                 let network_access = requested_thread == "thr_permission";
                 let returned_cwd = if requested_thread == "thr_workspace" {
                     home.clone()
                 } else {
                     workspace_for(&home)
                 };
+                let sandbox = if requested_thread == "thr_sandbox_string" {
+                    json!("read-only")
+                } else {
+                    json!({"type":"readOnly","networkAccess":network_access})
+                };
+                let model_provider = if requested_thread == "thr_model_provider" {
+                    "other-provider"
+                } else {
+                    "openai"
+                };
+                let runtime_roots = if requested_thread == "thr_runtime_root" {
+                    json!([home.clone()])
+                } else {
+                    json!([workspace_for(&home)])
+                };
+                let active_profile = if requested_thread == "thr_profile" {
+                    json!({"id":":workspace","extends":null})
+                } else {
+                    Value::Null
+                };
                 json!({
-                    "thread":thread, "model":"gpt-5.6-codex", "modelProvider":"openai",
+                    "thread":thread, "model":"gpt-5.6-codex", "modelProvider":model_provider,
                     "cwd":returned_cwd,
                     "approvalPolicy":request["params"]["approvalPolicy"].clone(),
                     "approvalsReviewer":"user",
-                    "sandbox":{"type":"readOnly","networkAccess":network_access}
+                    "sandbox":sandbox,
+                    "activePermissionProfile":active_profile,
+                    "initialTurnsPage":null,
+                    "instructionSources":[],
+                    "itemsBackwardsCursor":null,
+                    "multiAgentMode":"explicitRequestOnly",
+                    "reasoningEffort":"high",
+                    "runtimeWorkspaceRoots":runtime_roots,
+                    "serviceTier":null,
+                    "turnsBackwardsCursor":null
                 })
             }
             Some("thread/compact/start") => {
@@ -974,8 +1067,16 @@ fn thread(home: &Path) -> Value {
         "path":null, "cwd":workspace_for(home),
         "cliVersion":"0.146.0", "source":"cli", "agentNickname":null,
         "agentRole":null, "gitInfo":null, "name":null, "turns":[],
-        "sessionId":null, "ephemeral":false
+        "sessionId":"session_123", "ephemeral":false
     })
+}
+
+fn fixture_root(home: &Path) -> PathBuf {
+    home.parent()
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+        .expect("fixture Codex home has a test root")
+        .to_path_buf()
 }
 
 fn workspace_for(home: &Path) -> PathBuf {

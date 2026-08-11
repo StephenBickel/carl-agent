@@ -7,9 +7,9 @@ use carl::delegates::{ModelId, ReasoningEffort};
 use carl::policy::Sha256Digest;
 use carl::runtime::agent_port::{
     AgentCapabilities, AgentContextId, AgentEffectKind, AgentEffectRequest, AgentEpochId,
-    AgentEvent, AgentFuture, AgentItem, AgentModel, AgentPort, AgentPortError, AgentPortErrorCode,
-    AgentProcess, AgentRequestId, AgentUsage, ContextRecovery, EffectDecision, ResumeAgentContext,
-    StartAgentContext, StartAgentEpoch,
+    AgentErrorProvenance, AgentEvent, AgentFuture, AgentItem, AgentModel, AgentPort,
+    AgentPortError, AgentPortErrorCode, AgentProcess, AgentRequestId, AgentUsage, ContextRecovery,
+    EffectDecision, ResumeAgentContext, StartAgentContext, StartAgentEpoch,
 };
 use carl::runtime::task::ContextPackage;
 use carl::storage::RuntimeStore;
@@ -275,7 +275,93 @@ fn codex_app_server_implements_the_neutral_port() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn provider_context_recovery_replaces_from_carl_canonical_context() -> TestResult {
-    let package: ContextPackage = serde_json::from_value(serde_json::json!({
+    let package = canonical_context_package()?;
+    let old_context = AgentContextId::parse("old-context")?;
+    let new_context = AgentContextId::parse("new-context")?;
+    let mut port = RecoveryPort {
+        capabilities: AgentCapabilities {
+            resume: false,
+            compact: false,
+            token_usage: false,
+            pre_dispatch_effects: true,
+            history_paging: false,
+            background_processes: false,
+        },
+        new_context: new_context.clone(),
+        resume_result: Err(AgentPortError::from_code(AgentPortErrorCode::Unsupported)),
+        compact_result: Err(AgentPortError::from_code(AgentPortErrorCode::Unsupported)),
+        started_contexts: 0,
+        epoch_inputs: Vec::new(),
+    };
+    let request = ResumeAgentContext {
+        context_id: old_context,
+        cwd: PathBuf::from("/workspace"),
+        model: ModelId::parse("model-123")?,
+        permission_mode: PermissionMode::Default,
+    };
+
+    assert_eq!(
+        port.resume_or_replace_context(request.clone(), &package)
+            .await?,
+        ContextRecovery::Replaced(new_context)
+    );
+    assert_eq!(port.started_contexts, 1);
+    assert!(port.epoch_inputs.is_empty());
+    let binding_persisted = true;
+    assert!(binding_persisted);
+    port.start_epoch(StartAgentEpoch {
+        context_id: AgentContextId::parse("new-context")?,
+        input: package.rendered.clone(),
+        model: request.model.clone(),
+        effort: ReasoningEffort::High,
+        permission_mode: request.permission_mode,
+    })
+    .await?;
+    assert_eq!(port.epoch_inputs, ["canonical Carl context"]);
+
+    let mut resume_port = RecoveryPort {
+        capabilities: AgentCapabilities {
+            resume: true,
+            ..port.capabilities
+        },
+        new_context: AgentContextId::parse("unused-context")?,
+        resume_result: AgentContextId::parse("resumed-context"),
+        compact_result: Err(AgentPortError::from_code(AgentPortErrorCode::Unsupported)),
+        started_contexts: 0,
+        epoch_inputs: Vec::new(),
+    };
+    assert_eq!(
+        resume_port
+            .resume_or_replace_context(request.clone(), &package)
+            .await?,
+        ContextRecovery::Resumed(AgentContextId::parse("resumed-context")?)
+    );
+    assert_eq!(resume_port.started_contexts, 0);
+
+    let mut compact_port = RecoveryPort {
+        capabilities: AgentCapabilities {
+            compact: true,
+            ..port.capabilities
+        },
+        new_context: AgentContextId::parse("unused-context")?,
+        resume_result: Err(AgentPortError::from_code(AgentPortErrorCode::Unsupported)),
+        compact_result: Ok(()),
+        started_contexts: 0,
+        epoch_inputs: Vec::new(),
+    };
+    let old_context = request.context_id.clone();
+    assert_eq!(
+        compact_port
+            .compact_or_replace_context(request, &package)
+            .await?,
+        ContextRecovery::Compacted(old_context)
+    );
+    assert_eq!(compact_port.started_contexts, 0);
+    Ok(())
+}
+
+fn canonical_context_package() -> TestResult<ContextPackage> {
+    Ok(serde_json::from_value(serde_json::json!({
         "schema_version":1,
         "package_id":"11111111-1111-4111-8111-111111111111",
         "checkpoint_id":"22222222-2222-4222-8222-222222222222",
@@ -291,10 +377,20 @@ async fn provider_context_recovery_replaces_from_carl_canonical_context() -> Tes
         }],
         "source_sequence_start":1,
         "source_sequence_end":1
-    }))?;
-    let old_context = AgentContextId::parse("old-context")?;
-    let new_context = AgentContextId::parse("new-context")?;
-    let mut port = RecoveryPort {
+    }))?)
+}
+
+fn recovery_request() -> TestResult<ResumeAgentContext> {
+    Ok(ResumeAgentContext {
+        context_id: AgentContextId::parse("old-context")?,
+        cwd: PathBuf::from("/workspace"),
+        model: ModelId::parse("model-123")?,
+        permission_mode: PermissionMode::Default,
+    })
+}
+
+fn recovery_port() -> RecoveryPort {
+    RecoveryPort {
         capabilities: AgentCapabilities {
             resume: false,
             compact: false,
@@ -303,65 +399,65 @@ async fn provider_context_recovery_replaces_from_carl_canonical_context() -> Tes
             history_paging: false,
             background_processes: false,
         },
-        new_context: new_context.clone(),
-        resume_succeeds: false,
-        compact_succeeds: false,
+        new_context: AgentContextId::parse("new-context")
+            .expect("literal recovery context identifier is valid"),
+        resume_result: Err(AgentPortError::from_code(AgentPortErrorCode::Unsupported)),
+        compact_result: Err(AgentPortError::from_code(AgentPortErrorCode::Unsupported)),
         started_contexts: 0,
         epoch_inputs: Vec::new(),
-    };
-    let request = ResumeAgentContext {
-        context_id: old_context,
-        cwd: PathBuf::from("/workspace"),
-        model: ModelId::parse("model-123")?,
-        permission_mode: PermissionMode::Default,
-    };
+    }
+}
 
+#[tokio::test(flavor = "current_thread")]
+async fn ambiguous_lifecycle_failures_never_create_a_replacement() -> TestResult {
+    let package = canonical_context_package()?;
+    for (operation, code) in [
+        ("resume", AgentPortErrorCode::InvalidResponse),
+        ("resume", AgentPortErrorCode::Transport),
+        ("compact", AgentPortErrorCode::InvalidResponse),
+        ("compact", AgentPortErrorCode::Transport),
+    ] {
+        let mut port = recovery_port();
+        port.capabilities.resume = operation == "resume";
+        port.capabilities.compact = operation == "compact";
+        if operation == "resume" {
+            port.resume_result = Err(AgentPortError::from_code(code));
+        } else {
+            port.compact_result = Err(AgentPortError::from_code(code));
+        }
+        let request = recovery_request()?;
+        let error = if operation == "resume" {
+            port.resume_or_replace_context(request, &package)
+                .await
+                .expect_err("an ambiguous resume failure must be returned")
+        } else {
+            port.compact_or_replace_context(request, &package)
+                .await
+                .expect_err("an ambiguous compact failure must be returned")
+        };
+        assert_eq!(error.code(), code);
+        assert_eq!(error.provenance(), AgentErrorProvenance::PossiblyApplied);
+        assert_eq!(port.started_contexts, 0);
+        assert!(port.epoch_inputs.is_empty());
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn definitely_not_applied_failure_can_prepare_a_replacement() -> TestResult {
+    let package = canonical_context_package()?;
+    let mut port = recovery_port();
+    port.capabilities.resume = true;
+    port.resume_result = Err(AgentPortError::definitely_not_applied(
+        AgentPortErrorCode::Transport,
+    ));
     assert_eq!(
-        port.resume_or_replace_context(request.clone(), package.clone(), ReasoningEffort::High)
+        port.resume_or_replace_context(recovery_request()?, &package)
             .await?,
-        ContextRecovery::Replaced(new_context)
+        ContextRecovery::Replaced(AgentContextId::parse("new-context")?)
     );
     assert_eq!(port.started_contexts, 1);
-    assert_eq!(port.epoch_inputs, ["canonical Carl context"]);
-
-    let mut resume_port = RecoveryPort {
-        capabilities: AgentCapabilities {
-            resume: true,
-            ..port.capabilities
-        },
-        new_context: AgentContextId::parse("unused-context")?,
-        resume_succeeds: true,
-        compact_succeeds: false,
-        started_contexts: 0,
-        epoch_inputs: Vec::new(),
-    };
-    assert_eq!(
-        resume_port
-            .resume_or_replace_context(request.clone(), package.clone(), ReasoningEffort::High)
-            .await?,
-        ContextRecovery::Resumed(AgentContextId::parse("resumed-context")?)
-    );
-    assert_eq!(resume_port.started_contexts, 0);
-
-    let mut compact_port = RecoveryPort {
-        capabilities: AgentCapabilities {
-            compact: true,
-            ..port.capabilities
-        },
-        new_context: AgentContextId::parse("unused-context")?,
-        resume_succeeds: false,
-        compact_succeeds: true,
-        started_contexts: 0,
-        epoch_inputs: Vec::new(),
-    };
-    let old_context = request.context_id.clone();
-    assert_eq!(
-        compact_port
-            .compact_or_replace_context(request, package, ReasoningEffort::High)
-            .await?,
-        ContextRecovery::Compacted(old_context)
-    );
-    assert_eq!(compact_port.started_contexts, 0);
+    assert!(port.epoch_inputs.is_empty());
     Ok(())
 }
 
@@ -392,8 +488,8 @@ struct FakePort {
 struct RecoveryPort {
     capabilities: AgentCapabilities,
     new_context: AgentContextId,
-    resume_succeeds: bool,
-    compact_succeeds: bool,
+    resume_result: Result<AgentContextId, AgentPortError>,
+    compact_result: Result<(), AgentPortError>,
     started_contexts: usize,
     epoch_inputs: Vec<String>,
 }
@@ -414,25 +510,13 @@ impl AgentPort for RecoveryPort {
     }
 
     fn resume_context(&mut self, _request: ResumeAgentContext) -> AgentFuture<'_, AgentContextId> {
-        let succeeds = self.resume_succeeds;
-        Box::pin(async move {
-            if succeeds {
-                AgentContextId::parse("resumed-context")
-            } else {
-                Err(AgentPortError::from_code(AgentPortErrorCode::Unsupported))
-            }
-        })
+        let result = self.resume_result.clone();
+        Box::pin(async move { result })
     }
 
     fn compact_context(&mut self, _context_id: &AgentContextId) -> AgentFuture<'_, ()> {
-        let succeeds = self.compact_succeeds;
-        Box::pin(async move {
-            if succeeds {
-                Ok(())
-            } else {
-                Err(AgentPortError::from_code(AgentPortErrorCode::Unsupported))
-            }
-        })
+        let result = self.compact_result.clone();
+        Box::pin(async move { result })
     }
 
     fn start_epoch(&mut self, request: StartAgentEpoch) -> AgentFuture<'_, AgentEpochId> {
