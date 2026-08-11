@@ -189,3 +189,86 @@ process-level tests, and `SECURITY.md` was not changed.
 ### Fix commit
 
 - `6cf7453 fix: harden persistent task service`
+
+## Fix round 2/5
+
+The second review round closed all five remaining blockers:
+
+- Buzz steering now requires one fresh, exact structural owner metadata block.
+  Missing, malformed, foreign actor/channel, group-shaped, ambiguous, and replayed
+  metadata all fail before a task control marker or provider steer is emitted.
+- Every service owner instance publishes a UUID live generation. Service and ACP
+  cursors are accepted only with their matching generation; reconnecting to a
+  replacement owner resets a stale numeric cursor and delivers replacement
+  assistant output, diff, and approval exactly once.
+- Timed-out live subscribers are removed immediately. A paused-time 10,000-poll
+  stress regression leaves zero subscriber senders and still delivers the next
+  publication to a real waiter.
+- Windows named pipes now use the actual current-user SID, a protected DACL, and
+  exactly one non-inherited allow ACE with the exact generic read/write mask. The
+  client verifies the server process SID, descriptor owner, DACL protection, ACE
+  count/type/flags/mask, and ACE SID. The host security-shape matrix rejects foreign
+  owners and SIDs, unprotected or inherited ACLs, extra/deny ACEs, and insufficient
+  or excessive masks.
+- The runtime peer SQLite connection is read-only from connection creation via
+  `SQLITE_OPEN_READ_ONLY`, then additionally uses `query_only`; it performs only
+  read validations. Durable mutation receipt claim/completion now runs through the
+  owner `TaskEngine` actor, and ordinary and trusted approval mutation receipts are
+  asserted canonical, completed, JSON-valid, replay-stable, and never pending.
+
+### RED / GREEN and debugging evidence
+
+- The strict Buzz matrix was RED because missing metadata fell back to generic
+  steering; removing that fallback made the full admission matrix GREEN with zero
+  mutation delta on every rejection.
+- The live-generation protocol, service page, ACP binding, and real owner-restart
+  regressions were RED before generation ownership existed. The real restart test
+  now crosses a nonzero old cursor and verifies assistant, diff, and approval once
+  through both ACP and the service API, then completes truthfully after approval.
+- The subscriber stress regression was RED with 10,000 retained senders and GREEN
+  with explicit subscriber IDs and unregister-on-return.
+- The peer-store regression was RED when a peer could claim a receipt. It is GREEN
+  with a read-only SQLite open, and all successful service mutation paths retain
+  their durable canonical receipts through the owner writer.
+- Systematic debugging of the three-epoch reconnect timeout found a test-ordering
+  race: the fixture released its final epoch after writing the prompt but before
+  provider steer acknowledgement. The new owner-actor receipt round trip exposed
+  that invalid timing assumption, so the task could finish and reject the steer.
+  Boundary tracing showed Active status followed by a rejected steer and terminal
+  fake-provider state. Holding release until the provider observed the steer made
+  the request apply; the final regression uses that condition instead of a sleep.
+  All temporary diagnostic logging was removed.
+
+### Verification
+
+```text
+cargo test --locked --lib \
+  --test service_protocol_contract --test service_end_to_end \
+  --test buzz_end_to_end --test acp_server_contract \
+  --test buzz_acp_contract --test storage_contract \
+  --test task_storage_contract
+PASS: 144 passed, 0 failed
+
+cargo fmt --all -- --check
+PASS: exit 0
+
+cargo clippy --locked --all-targets --all-features -- -D warnings
+PASS: exit 0, no warnings
+
+git diff --check
+PASS: exit 0
+```
+
+After the final peer read-only refinement, the peer mutation, ordinary service
+mutation receipt, and Buzz approval receipt regressions all passed again, followed
+by the strict formatting, clippy, and diff gates.
+
+The installed `x86_64-pc-windows-gnu` target reached `libsqlite3-sys` and stopped
+because `x86_64-w64-mingw32-gcc` is not installed. This is the expected external C
+toolchain limitation; no Windows Rust diagnostic was reported before it. The host
+Windows descriptor/ACE validation matrix passed. No Carl service process remained,
+no migration or `Cargo.lock` changed, and `SECURITY.md` was not modified.
+
+### Fix commit
+
+- `1fa6d20 fix: enforce persistent service ownership boundaries`
