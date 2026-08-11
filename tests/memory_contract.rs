@@ -616,7 +616,7 @@ fn legacy_active_memory_migrates_and_forgotten_content_is_purged() -> TestResult
     let connection = Connection::open(database.path())?;
     let migrations: u64 =
         connection.query_row("SELECT COUNT(*) FROM migrations", [], |row| row.get(0))?;
-    assert_eq!(migrations, 10);
+    assert_eq!(migrations, 12);
     Ok(())
 }
 
