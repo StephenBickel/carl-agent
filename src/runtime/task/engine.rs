@@ -191,7 +191,6 @@ pub(crate) enum TaskEngineControl {
         model: ModelId,
         effort: ReasoningEffort,
         permission_mode: PermissionMode,
-        tightening: bool,
         acknowledgement: u64,
     },
     Approval {
@@ -2604,13 +2603,8 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                     return Err(error(TaskEngineErrorCode::Blocked));
                 }
                 Next::Control(Some(control)) => {
-                    let tightening_configuration = matches!(
-                        &control,
-                        TaskEngineControl::Configure {
-                            tightening: true,
-                            ..
-                        }
-                    );
+                    let tightening_configuration =
+                        configuration_tightens(&control, runtime.effective_permission_mode);
                     let acknowledgement = match &control {
                         TaskEngineControl::Steer {
                             acknowledgement, ..
@@ -2846,16 +2840,13 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                 model,
                 effort,
                 permission_mode,
-                tightening,
                 ..
             } => {
-                if control_task_id != task_id
-                    || tightening
-                        != (permission_strength(permission_mode)
-                            < permission_strength(runtime.effective_permission_mode))
-                {
+                if control_task_id != task_id {
                     return Err(invalid_task());
                 }
+                let tightening = permission_strength(permission_mode)
+                    < permission_strength(runtime.effective_permission_mode);
                 self.queue_configuration(
                     task_id,
                     runtime,
@@ -3754,7 +3745,9 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                     self.acknowledge(acknowledgement, Err(error(TaskEngineErrorCode::Blocked)))
                         .await;
                 }
-                control @ TaskEngineControl::Configure { tightening, .. } => {
+                control @ TaskEngineControl::Configure { .. } => {
+                    let tightening =
+                        configuration_tightens(&control, runtime.effective_permission_mode);
                     let configured = self
                         .apply_control(
                             task_id,
@@ -4389,6 +4382,19 @@ const fn permission_strength(mode: PermissionMode) -> u8 {
         PermissionProfile::Approval => 1,
         PermissionProfile::FullAccess => 2,
     }
+}
+
+fn configuration_tightens(
+    control: &TaskEngineControl,
+    effective_permission_mode: PermissionMode,
+) -> bool {
+    matches!(
+        control,
+        TaskEngineControl::Configure {
+            permission_mode,
+            ..
+        } if permission_strength(*permission_mode) < permission_strength(effective_permission_mode)
+    )
 }
 
 async fn receive_control(

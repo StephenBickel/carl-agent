@@ -209,3 +209,90 @@ root agent after clean review and was not run in this fix round.
   epoch table. Migrations 1–9 and `SECURITY.md` remain byte-for-byte unchanged.
 - No task-control path holds the admission-store mutex across an async provider or
   engine operation. No Important or Critical finding remains open from this round.
+
+## Fix Round 2/5
+
+### Findings fixed
+
+- The frontend no longer supplies a `tightening` claim with autonomous
+  configuration controls. `TaskEngine` alone compares each requested permission
+  with the runtime's journal-rehydrated effective ceiling before it queues the
+  event or interrupts the provider. An active Plan task can therefore queue
+  FullAccess and then supersede it with Default: the durable state remains active
+  Plan, effective Plan, pending Default until the boundary, where Default—not the
+  stale FullAccess request—is promoted and dispatched.
+- Configuration delivery acknowledgements now synchronize the session's pending
+  configuration from `task_configuration_state`, including failure and channel
+  rejection paths. A failed journal append clears the tentative session change;
+  an acknowledgement that races with boundary application adopts the exact
+  projected active configuration. Pending state is applied to the session only
+  after outstanding control acknowledgements have been reconciled.
+- `Store::open` now folds `Created`, `ConfigurationQueued`,
+  `ConfigurationApplied`, and `ControlRequested` events while it performs the
+  existing authoritative task replay. It compares the exact active/effective/
+  pending configuration, queue/application sequences, and ordered marker set with
+  the child tables. Missing, stale, or extra child state is rejected
+  deterministically instead of being trusted by rehydration or receipt recovery.
+
+### RED / GREEN evidence
+
+1. The real Buzz ACP supersession regression began with Plan, accepted queued
+   FullAccess, then received `-32602` for Default because the kernel compared
+   against its tentative FullAccess while the engine compared against durable
+   effective Plan. It now accepts both requests, records `(Plan, Plan, Default)`
+   before the boundary, performs zero interrupts, dispatches Default with the
+   workspace-write policy, and projects `(Default, Default, none)` afterward.
+2. A SQLite trigger rejected the `ConfigurationQueued` event after the session had
+   tentatively selected FullAccess. RED persisted `bypassPermissions` in the
+   frontend session while the task journal remained Plan. GREEN returns an error,
+   finishes the blocked task without promoting the rejected choice, and leaves
+   both session and task configuration exactly Plan with no pending value.
+3. Two configuration-corruption regressions changed a queued Plan projection to
+   stale FullAccess or deleted the row. Both initially reopened successfully; both
+   now return typed storage errors naming the missing or disagreeing configuration
+   projection.
+4. Deleting a durable cancel marker initially allowed `Store::open` to succeed.
+   Startup now compares the complete marker table with `ControlRequested` journal
+   events and rejects the missing marker, so receipt recovery cannot repeat the
+   action from silently corrupted child state.
+
+### Verification
+
+```text
+cargo test --locked --test task_storage_contract \
+  --test storage_contract --test acp_storage_contract
+PASS: 49 passed, 0 failed
+
+cargo test --locked --test buzz_end_to_end --test acp_server_contract
+PASS: 9 passed, 0 failed
+
+cargo test --locked --test epoch_engine_contract -- \
+  queued_permission_tightening_survives_each_interrupt_restart_cut \
+  --exact --nocapture
+PASS: 1 passed, 0 failed
+
+cargo clippy --locked --all-targets --all-features -- -D warnings
+PASS: exit 0, no warnings
+
+cargo fmt --all -- --check
+PASS: exit 0
+
+git diff --check
+PASS: exit 0
+```
+
+No `cargo test --all-features` command was run; the final milestone remains
+reserved for the root agent after clean review.
+
+### Fix-round self-review
+
+- Supersession can only reduce authority relative to the durable effective ceiling;
+  a tentative loosening never becomes the baseline for an unnecessary interrupt.
+- Session reconciliation performs no async work while holding the peer-store mutex.
+  It accepts the projection as authoritative only after normal `Store::open`
+  journal validation has established its integrity.
+- Child validation reuses the existing paged journal traversal and configuration
+  loader. It adds no migration rewrite or rebuild path, so migration compatibility
+  and startup failure semantics remain explicit and deterministic.
+- Migrations 1–10, `SECURITY.md`, and the broader task lifecycle reducer were not
+  modified. Both review blockers are closed with no deferred finding.

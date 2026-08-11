@@ -587,10 +587,11 @@ enum PendingDurableReply {
     Cancel(oneshot::Sender<Result<(), KernelError>>),
     Shutdown(oneshot::Sender<Result<(), KernelError>>),
     Approval,
-    Config(
-        oneshot::Sender<Result<ConfigOutcome, KernelError>>,
-        ConfigOutcome,
-    ),
+    Config {
+        reply: oneshot::Sender<Result<ConfigOutcome, KernelError>>,
+        outcome: ConfigOutcome,
+        task_id: TaskId,
+    },
 }
 
 enum AgentEventOwner {
@@ -1420,16 +1421,6 @@ impl KernelActor {
                                 selection,
                                 reply,
                             } if target == session_id => {
-                                let prior = sessions
-                                    .get(&session_id)
-                                    .and_then(|state| {
-                                        state
-                                            .pending_configuration
-                                            .as_ref()
-                                            .or_else(|| Some(state.public.configuration()))
-                                    })
-                                    .map(SessionConfiguration::mode)
-                                    .ok_or_else(unknown_session)?;
                                 let result = sessions
                                     .get_mut(&session_id)
                                     .ok_or_else(unknown_session)
@@ -1442,7 +1433,7 @@ impl KernelActor {
                                 };
                                 let task_id =
                                     locked_active_durable_task_id(admission_store, session_id)?;
-                                control_sender
+                                if control_sender
                                     .send(TaskEngineControl::Configure {
                                         task_id,
                                         control_id: task_configuration_identity(
@@ -1453,18 +1444,27 @@ impl KernelActor {
                                         model: configuration.model().clone(),
                                         effort: configuration.effort(),
                                         permission_mode: configuration.mode(),
-                                        tightening: permission_strength(configuration.mode())
-                                            < permission_strength(prior),
                                         acknowledgement,
                                     })
                                     .await
-                                    .map_err(|_| stopped_error())?;
+                                    .is_err()
+                                {
+                                    synchronize_session_configuration_from_projection(
+                                        admission_store,
+                                        sessions,
+                                        session_id,
+                                        task_id,
+                                    )?;
+                                    let _ = reply.send(Err(stopped_error()));
+                                    continue;
+                                }
                                 pending.insert(
                                     acknowledgement,
-                                    PendingDurableReply::Config(
+                                    PendingDurableReply::Config {
                                         reply,
-                                        ConfigOutcome::Applied(configuration.clone()),
-                                    ),
+                                        outcome: ConfigOutcome::Applied(configuration.clone()),
+                                        task_id,
+                                    },
                                 );
                             }
                             KernelCommand::Steer {
@@ -1643,6 +1643,18 @@ impl KernelActor {
                                     }
                                 }
                             } else {
+                                if let PendingDurableReply::Config { task_id, .. } = &reply
+                                    && let Err(error) =
+                                        synchronize_session_configuration_from_projection(
+                                            admission_store,
+                                            sessions,
+                                            session_id,
+                                            *task_id,
+                                        )
+                                {
+                                    fail_durable_reply(reply, error);
+                                    continue;
+                                }
                                 complete_durable_reply(reply, result);
                             }
                         }
@@ -1672,7 +1684,6 @@ impl KernelActor {
                 }
             }
         };
-        self.apply_pending_configuration(session_id)?;
         while let Ok((acknowledgement, result)) = acknowledgement_receiver.try_recv() {
             if let Some(reply) = pending.remove(&acknowledgement) {
                 if matches!(reply, PendingDurableReply::Approval) {
@@ -1685,15 +1696,38 @@ impl KernelActor {
                         }
                     }
                 } else {
+                    if let PendingDurableReply::Config { task_id, .. } = &reply
+                        && let Err(error) = synchronize_session_configuration_from_projection(
+                            &self.admission_store,
+                            &mut self.sessions,
+                            session_id,
+                            *task_id,
+                        )
+                    {
+                        fail_durable_reply(reply, error);
+                        continue;
+                    }
                     complete_durable_reply(reply, result);
                 }
             }
         }
         for (_, reply) in pending {
             if !matches!(reply, PendingDurableReply::Approval) {
+                if let PendingDurableReply::Config { task_id, .. } = &reply
+                    && let Err(error) = synchronize_session_configuration_from_projection(
+                        &self.admission_store,
+                        &mut self.sessions,
+                        session_id,
+                        *task_id,
+                    )
+                {
+                    fail_durable_reply(reply, error);
+                    continue;
+                }
                 fail_durable_reply(reply, session_busy());
             }
         }
+        self.apply_pending_configuration(session_id)?;
         if durable_shutdown {
             self.engine_mut()
                 .port_mut()
@@ -3465,6 +3499,45 @@ fn locked_active_durable_task_id(
     active_durable_task_id(&store, session_id)
 }
 
+fn synchronize_session_configuration_from_projection(
+    store: &Mutex<Store>,
+    sessions: &mut HashMap<SessionId, SessionState>,
+    session_id: SessionId,
+    task_id: TaskId,
+) -> Result<(), KernelError> {
+    let configuration = store
+        .lock()
+        .map_err(|_| provider_error())?
+        .get_task_configuration(task_id)
+        .map_err(map_storage)?
+        .ok_or_else(invalid_input)?;
+    let state = sessions.get_mut(&session_id).ok_or_else(unknown_session)?;
+    let catalog = state.public.configuration().catalog().clone();
+    let projected_active = SessionConfiguration::new(
+        catalog.clone(),
+        configuration.active_model,
+        configuration.active_effort,
+        configuration.active_permission_mode,
+    )
+    .map_err(|_| provider_error())?;
+    let projected_pending = match (
+        configuration.pending_model,
+        configuration.pending_effort,
+        configuration.pending_permission_mode,
+    ) {
+        (Some(model), Some(effort), Some(permission_mode)) => Some(
+            SessionConfiguration::new(catalog, model, effort, permission_mode)
+                .map_err(|_| provider_error())?,
+        ),
+        (None, None, None) => None,
+        _ => return Err(provider_error()),
+    };
+    state.pending_configuration = projected_pending.or_else(|| {
+        (state.public.configuration() != &projected_active).then_some(projected_active)
+    });
+    Ok(())
+}
+
 fn task_views(
     store: &Store,
     sessions: &HashMap<SessionId, SessionState>,
@@ -3551,7 +3624,7 @@ fn complete_durable_reply(reply: PendingDurableReply, result: Result<(), TaskEng
             let _ = reply.send(accepted);
         }
         PendingDurableReply::Approval => {}
-        PendingDurableReply::Config(reply, outcome) => {
+        PendingDurableReply::Config { reply, outcome, .. } => {
             let _ = reply.send(result.map(|()| outcome).map_err(map_task_engine));
         }
     }
@@ -3568,7 +3641,7 @@ fn fail_durable_reply(reply: PendingDurableReply, error: KernelError) {
             let _ = reply.send(Err(error));
         }
         PendingDurableReply::Approval => {}
-        PendingDurableReply::Config(reply, _) => {
+        PendingDurableReply::Config { reply, .. } => {
             let _ = reply.send(Err(error));
         }
     }

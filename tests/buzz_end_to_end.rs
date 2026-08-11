@@ -40,6 +40,20 @@ fn main() {
                         .map_err(|error| Failed::from(error.to_string()))
                 },
             ),
+            Trial::test(
+                "configuration supersession derives authority from durable effective state",
+                || {
+                    durable_configuration_supersession()
+                        .map_err(|error| Failed::from(error.to_string()))
+                },
+            ),
+            Trial::test(
+                "rejected configuration delivery preserves journal-owned session state",
+                || {
+                    rejected_configuration_delivery_rolls_back_session()
+                        .map_err(|error| Failed::from(error.to_string()))
+                },
+            ),
         ],
     )
     .exit();
@@ -396,6 +410,133 @@ fn durable_configuration_boundaries() -> TestResult {
     assert_eq!(active_operation.started_operation_count()?, 0);
     assert_eq!(active_operation.operation_status_count("uncertain")?, 1);
     assert_eq!(active_operation.permission_tightening_interrupt_count()?, 1);
+    let _ = client.finish()?;
+    Ok(())
+}
+
+fn durable_configuration_supersession() -> TestResult {
+    let layout = Layout::new("durable-config-supersession")?;
+    layout.trust_owner()?;
+    let mut client = Client::spawn(&layout, false)?;
+    let session = initialize_session(&mut client, &layout, 31, 32)?;
+    client.send(&prompt_frame(33, &session, "/permissions readOnly", 'f'))?;
+    assert_eq!(client.read_id(33)?["result"]["stopReason"], "end_turn");
+    client.send(&prompt_frame(34, &session, "wait for cancel", 'a'))?;
+    layout.wait_for_provider_method("turn/start", 2)?;
+    let task_id = layout.latest_task_id()?;
+
+    for (id, value) in [(35, "fullAccess"), (36, "default")] {
+        client.send(&json!({
+            "jsonrpc":"2.0","id":id,"method":"session/set_config_option","params":{
+                "sessionId":session,"configId":"mode","value":value
+            }
+        }))?;
+        let response = client.read_id(id)?;
+        assert!(
+            response["result"]["configOptions"].is_array(),
+            "configuration {value} was rejected: {response}"
+        );
+    }
+    assert_eq!(
+        task_configuration_modes(&layout, &task_id)?,
+        (
+            "plan".to_owned(),
+            "plan".to_owned(),
+            Some("default".to_owned()),
+        ),
+        "the superseding pending configuration must retain the Plan authority ceiling"
+    );
+    assert_eq!(layout.provider_method_count("turn/interrupt")?, 0);
+
+    client.send(&json!({
+        "jsonrpc":"2.0","id":37,"method":"_session/steering","params":{
+            "sessionId":session,
+            "prompt":[{"type":"text","text":"boundary configuration"}]
+        }
+    }))?;
+    assert_eq!(client.read_id(37)?["result"]["outcome"], "injected");
+    layout.wait_for_provider_method("turn/start", 3)?;
+    let dispatched = layout
+        .provider_requests()?
+        .into_iter()
+        .rev()
+        .find(|request| request["method"] == "turn/start")
+        .ok_or("superseding epoch was not dispatched")?;
+    assert_eq!(dispatched["params"]["approvalPolicy"], "on-request");
+    assert_eq!(
+        dispatched["params"]["sandboxPolicy"]["type"],
+        "workspaceWrite"
+    );
+    assert_eq!(
+        task_configuration_modes(&layout, &task_id)?,
+        ("default".to_owned(), "default".to_owned(), None),
+        "the superseding Default configuration, never stale FullAccess, must apply"
+    );
+    assert_eq!(layout.provider_method_count("turn/interrupt")?, 0);
+    client.send(&json!({
+        "jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":session}
+    }))?;
+    assert_eq!(client.read_id(34)?["result"]["stopReason"], "cancelled");
+    let _ = client.finish()?;
+    Ok(())
+}
+
+fn task_configuration_modes(
+    layout: &Layout,
+    task_id: &str,
+) -> TestResult<(String, String, Option<String>)> {
+    Ok(
+        Connection::open(layout.data.join("carl.sqlite3"))?.query_row(
+            "SELECT active_permission_mode, effective_permission_mode, pending_permission_mode
+         FROM task_configuration_state WHERE task_id = ?1",
+            [task_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?,
+    )
+}
+
+fn rejected_configuration_delivery_rolls_back_session() -> TestResult {
+    let layout = Layout::new("durable-config-rejected-delivery")?;
+    layout.trust_owner()?;
+    let mut client = Client::spawn(&layout, false)?;
+    let session = initialize_session(&mut client, &layout, 41, 42)?;
+    client.send(&prompt_frame(43, &session, "/permissions readOnly", 'b'))?;
+    assert_eq!(client.read_id(43)?["result"]["stopReason"], "end_turn");
+    client.send(&prompt_frame(44, &session, "wait for cancel", 'c'))?;
+    layout.wait_for_provider_method("turn/start", 2)?;
+    let task_id = layout.latest_task_id()?;
+    let connection = Connection::open(layout.data.join("carl.sqlite3"))?;
+    connection.execute_batch(
+        "CREATE TRIGGER reject_configuration_queue
+         BEFORE INSERT ON events
+         WHEN json_extract(NEW.event_json, '$.event.task_event') = 'configuration_queued'
+         BEGIN SELECT RAISE(ABORT, 'injected configuration delivery rejection'); END;",
+    )?;
+    drop(connection);
+
+    client.send(&json!({
+        "jsonrpc":"2.0","id":45,"method":"session/set_config_option","params":{
+            "sessionId":session,"configId":"mode","value":"fullAccess"
+        }
+    }))?;
+    assert!(client.read_id(45)?["error"].is_object());
+    assert_eq!(client.read_id(44)?["result"]["stopReason"], "failed");
+    let connection = Connection::open(layout.data.join("carl.sqlite3"))?;
+    assert_eq!(
+        connection.query_row(
+            "SELECT permission_mode FROM frontend_sessions WHERE external_session_id = ?1",
+            [&session],
+            |row| row.get::<_, String>(0),
+        )?,
+        "plan",
+        "a rejected delivery must not escape into session configuration"
+    );
+    assert_eq!(
+        task_configuration_modes(&layout, &task_id)?,
+        ("plan".to_owned(), "plan".to_owned(), None),
+        "the rejected configuration must be absent from the task journal projection"
+    );
+    drop(connection);
     let _ = client.finish()?;
     Ok(())
 }

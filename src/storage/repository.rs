@@ -347,6 +347,8 @@ pub struct TaskConfigurationRecord {
     pub pending_model: Option<ModelId>,
     pub pending_effort: Option<ReasoningEffort>,
     pub pending_permission_mode: Option<PermissionMode>,
+    pub queued_sequence: Option<u64>,
+    pub applied_sequence: Option<u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2268,71 +2270,7 @@ impl Store {
         &self,
         task_id: TaskId,
     ) -> Result<Option<TaskConfigurationRecord>, CarlError> {
-        self.connection
-            .query_row(
-                "SELECT active_model, active_effort, active_permission_mode,
-                        effective_permission_mode, pending_control_id, pending_model,
-                        pending_effort, pending_permission_mode
-                 FROM task_configuration_state WHERE task_id = ?1",
-                [task_id.to_string()],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, Option<String>>(4)?,
-                        row.get::<_, Option<String>>(5)?,
-                        row.get::<_, Option<String>>(6)?,
-                        row.get::<_, Option<String>>(7)?,
-                    ))
-                },
-            )
-            .optional()
-            .map_err(storage_error)?
-            .map(
-                |(
-                    active_model,
-                    active_effort,
-                    active_permission_mode,
-                    effective_permission_mode,
-                    pending_control_id,
-                    pending_model,
-                    pending_effort,
-                    pending_permission_mode,
-                )| {
-                    Ok(TaskConfigurationRecord {
-                        active_model: ModelId::parse(active_model)?,
-                        active_effort: parse_reasoning_effort(&active_effort)?,
-                        active_permission_mode: active_permission_mode.parse().map_err(|_| {
-                            invalid_stored_value("task permission mode", &active_permission_mode)
-                        })?,
-                        effective_permission_mode: effective_permission_mode.parse().map_err(
-                            |_| {
-                                invalid_stored_value(
-                                    "effective task permission mode",
-                                    &effective_permission_mode,
-                                )
-                            },
-                        )?,
-                        pending_control_id,
-                        pending_model: pending_model.map(ModelId::parse).transpose()?,
-                        pending_effort: pending_effort
-                            .as_deref()
-                            .map(parse_reasoning_effort)
-                            .transpose()?,
-                        pending_permission_mode: pending_permission_mode
-                            .as_deref()
-                            .map(|mode| {
-                                mode.parse().map_err(|_| {
-                                    invalid_stored_value("pending task permission mode", mode)
-                                })
-                            })
-                            .transpose()?,
-                    })
-                },
-            )
-            .transpose()
+        load_task_configuration_record(&self.connection, task_id)
     }
 
     pub fn task_has_control_marker(
@@ -7285,6 +7223,86 @@ fn load_task_record(
     .transpose()
 }
 
+fn load_task_configuration_record(
+    connection: &Connection,
+    task_id: TaskId,
+) -> Result<Option<TaskConfigurationRecord>, CarlError> {
+    connection
+        .query_row(
+            "SELECT active_model, active_effort, active_permission_mode,
+                    effective_permission_mode, pending_control_id, pending_model,
+                    pending_effort, pending_permission_mode, queued_sequence,
+                    applied_sequence
+             FROM task_configuration_state WHERE task_id = ?1",
+            [task_id.to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<i64>>(8)?,
+                    row.get::<_, Option<i64>>(9)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(storage_error)?
+        .map(
+            |(
+                active_model,
+                active_effort,
+                active_permission_mode,
+                effective_permission_mode,
+                pending_control_id,
+                pending_model,
+                pending_effort,
+                pending_permission_mode,
+                queued_sequence,
+                applied_sequence,
+            )| {
+                Ok(TaskConfigurationRecord {
+                    active_model: ModelId::parse(active_model)?,
+                    active_effort: parse_reasoning_effort(&active_effort)?,
+                    active_permission_mode: active_permission_mode.parse().map_err(|_| {
+                        invalid_stored_value("task permission mode", &active_permission_mode)
+                    })?,
+                    effective_permission_mode: effective_permission_mode.parse().map_err(|_| {
+                        invalid_stored_value(
+                            "effective task permission mode",
+                            &effective_permission_mode,
+                        )
+                    })?,
+                    pending_control_id,
+                    pending_model: pending_model.map(ModelId::parse).transpose()?,
+                    pending_effort: pending_effort
+                        .as_deref()
+                        .map(parse_reasoning_effort)
+                        .transpose()?,
+                    pending_permission_mode: pending_permission_mode
+                        .as_deref()
+                        .map(|mode| {
+                            mode.parse().map_err(|_| {
+                                invalid_stored_value("pending task permission mode", mode)
+                            })
+                        })
+                        .transpose()?,
+                    queued_sequence: queued_sequence
+                        .map(|value| stored_u64(value, "task configuration queued sequence"))
+                        .transpose()?,
+                    applied_sequence: applied_sequence
+                        .map(|value| stored_u64(value, "task configuration applied sequence"))
+                        .transpose()?,
+                })
+            },
+        )
+        .transpose()
+}
+
 fn read_task_event_page_from_connection(
     connection: &Connection,
     task_id: TaskId,
@@ -7441,6 +7459,8 @@ fn validate_task_projection_from_journal(
     let projection = load_task_record(connection, task_id)?
         .ok_or_else(|| storage_invariant("task journal has no matching task projection"))?;
     let mut replayed = None;
+    let mut configuration = None;
+    let mut control_markers = Vec::new();
     let mut after_sequence = None;
     loop {
         let page = read_task_event_page_from_connection(connection, task_id, after_sequence, 512)?;
@@ -7449,6 +7469,7 @@ fn validate_task_projection_from_journal(
         }
         after_sequence = page.last().map(|event| event.sequence);
         for envelope in page {
+            replay_task_child_projections(&mut configuration, &mut control_markers, &envelope)?;
             replayed = Some(reduce_task(replayed, &envelope).map_err(task_replay_error)?);
         }
     }
@@ -7464,7 +7485,153 @@ fn validate_task_projection_from_journal(
             "task projection disagrees with journal replay",
         ));
     }
+    let expected_configuration =
+        configuration.ok_or_else(|| storage_invariant("task configuration journal is missing"))?;
+    let Some(stored_configuration) = load_task_configuration_record(connection, task_id)? else {
+        return Err(storage_invariant(
+            "task configuration projection is missing",
+        ));
+    };
+    if stored_configuration != expected_configuration {
+        return Err(storage_invariant(
+            "task configuration projection disagrees with journal replay",
+        ));
+    }
+    let stored_control_markers = load_task_control_marker_projections(connection, task_id)?;
+    if stored_control_markers != control_markers {
+        return Err(storage_invariant(
+            "task control marker projection disagrees with journal replay",
+        ));
+    }
     Ok(projection)
+}
+
+fn replay_task_child_projections(
+    configuration: &mut Option<TaskConfigurationRecord>,
+    control_markers: &mut Vec<(String, TaskControlKind, u64)>,
+    envelope: &EventEnvelope,
+) -> Result<(), CarlError> {
+    let Event::TaskLifecycle { event, .. } = &envelope.event else {
+        return Err(storage_invariant(
+            "task journal contains a non-task lifecycle event",
+        ));
+    };
+    match event {
+        TaskEvent::Created {
+            model,
+            effort,
+            permission_mode,
+            ..
+        } => {
+            if configuration.is_some() {
+                return Err(storage_invariant(
+                    "task configuration journal contains duplicate creation",
+                ));
+            }
+            *configuration = Some(TaskConfigurationRecord {
+                active_model: model.clone(),
+                active_effort: *effort,
+                active_permission_mode: *permission_mode,
+                effective_permission_mode: *permission_mode,
+                pending_control_id: None,
+                pending_model: None,
+                pending_effort: None,
+                pending_permission_mode: None,
+                queued_sequence: None,
+                applied_sequence: None,
+            });
+        }
+        TaskEvent::ConfigurationQueued {
+            control_id,
+            model,
+            effort,
+            permission_mode,
+        } => {
+            let configuration = configuration.as_mut().ok_or_else(|| {
+                storage_invariant("task configuration was queued before task creation")
+            })?;
+            if permission_strength(*permission_mode)
+                < permission_strength(configuration.effective_permission_mode)
+            {
+                configuration.effective_permission_mode = *permission_mode;
+            }
+            configuration.pending_control_id = Some(control_id.clone());
+            configuration.pending_model = Some(model.clone());
+            configuration.pending_effort = Some(*effort);
+            configuration.pending_permission_mode = Some(*permission_mode);
+            configuration.queued_sequence = Some(envelope.sequence);
+        }
+        TaskEvent::ConfigurationApplied { control_id } => {
+            let configuration = configuration.as_mut().ok_or_else(|| {
+                storage_invariant("task configuration was applied before task creation")
+            })?;
+            if configuration.pending_control_id.as_deref() != Some(control_id) {
+                return Err(storage_invariant(
+                    "applied task configuration control identity disagrees with its queue",
+                ));
+            }
+            configuration.active_model = configuration
+                .pending_model
+                .take()
+                .ok_or_else(|| storage_invariant("queued task model is missing"))?;
+            configuration.active_effort = configuration
+                .pending_effort
+                .take()
+                .ok_or_else(|| storage_invariant("queued task effort is missing"))?;
+            configuration.active_permission_mode = configuration
+                .pending_permission_mode
+                .take()
+                .ok_or_else(|| storage_invariant("queued task permission is missing"))?;
+            configuration.effective_permission_mode = configuration.active_permission_mode;
+            configuration.pending_control_id = None;
+            configuration.queued_sequence = None;
+            configuration.applied_sequence = Some(envelope.sequence);
+        }
+        TaskEvent::ControlRequested { control_id, kind } => {
+            if control_markers
+                .iter()
+                .any(|(existing, _, _)| existing == control_id)
+            {
+                return Err(storage_invariant(
+                    "task control marker identity is duplicated in the journal",
+                ));
+            }
+            control_markers.push((control_id.clone(), *kind, envelope.sequence));
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn load_task_control_marker_projections(
+    connection: &Connection,
+    task_id: TaskId,
+) -> Result<Vec<(String, TaskControlKind, u64)>, CarlError> {
+    connection
+        .prepare(
+            "SELECT control_id, kind, event_sequence
+             FROM task_control_markers
+             WHERE task_id = ?1
+             ORDER BY event_sequence ASC",
+        )
+        .map_err(storage_error)?
+        .query_map([task_id.to_string()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })
+        .map_err(storage_error)?
+        .map(|row| {
+            let (control_id, kind, sequence) = row.map_err(storage_error)?;
+            Ok((
+                control_id,
+                parse_task_control_kind(&kind)?,
+                stored_u64(sequence, "task control marker event sequence")?,
+            ))
+        })
+        .collect()
 }
 
 const fn task_status_str(status: TaskStatus) -> &'static str {
@@ -7492,6 +7659,14 @@ const fn task_control_kind_str(kind: TaskControlKind) -> &'static str {
     match kind {
         TaskControlKind::Resume => "resume",
         TaskControlKind::Cancel => "cancel",
+    }
+}
+
+fn parse_task_control_kind(value: &str) -> Result<TaskControlKind, CarlError> {
+    match value {
+        "resume" => Ok(TaskControlKind::Resume),
+        "cancel" => Ok(TaskControlKind::Cancel),
+        _ => Err(invalid_stored_value("task control marker kind", value)),
     }
 }
 

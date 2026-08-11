@@ -9,7 +9,7 @@ use carl::policy::{Frontend, Sha256Digest};
 use carl::runtime::task::{
     CheckpointId, ClauseStatus, CompletionClause, CompletionContract, ContextPackageId,
     EffectClass, EpochId, EpochInterruptReason, OperationId, OperationStatus, TaskBudget,
-    TaskControlKind, TaskEvent, TaskSnapshot, TaskStatus, reduce_task,
+    TaskControlKind, TaskEvent, TaskId, TaskSnapshot, TaskStatus, reduce_task,
 };
 use carl::sidecar::DataRootLock;
 use carl::storage::{
@@ -367,6 +367,108 @@ fn task_control_receipts_survive_both_crash_windows_without_key_rebinding()
         "method or payload reuse must never rebind an idempotency key"
     );
     Ok(())
+}
+
+#[test]
+fn startup_rejects_a_stale_task_configuration_projection() -> Result<(), Box<dyn Error>> {
+    let (fixture, _) = queued_plan_configuration_fixture()?;
+    Connection::open(&fixture.database)?.execute(
+        "UPDATE task_configuration_state
+         SET pending_permission_mode = 'fullAccess', effective_permission_mode = 'fullAccess'",
+        [],
+    )?;
+
+    let error = match Store::open(&fixture.database) {
+        Ok(_) => panic!("a stale task configuration projection must not be trusted"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        CarlError::Storage { ref detail }
+            if detail.contains("task configuration projection disagrees")
+    ));
+    Ok(())
+}
+
+#[test]
+fn startup_rejects_a_missing_task_configuration_projection() -> Result<(), Box<dyn Error>> {
+    let (fixture, task_id) = queued_plan_configuration_fixture()?;
+    Connection::open(&fixture.database)?.execute(
+        "DELETE FROM task_configuration_state WHERE task_id = ?1",
+        [task_id.to_string()],
+    )?;
+
+    let error = match Store::open(&fixture.database) {
+        Ok(_) => panic!("a missing task configuration projection must not be trusted"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        CarlError::Storage { ref detail }
+            if detail.contains("task configuration projection is missing")
+    ));
+    Ok(())
+}
+
+#[test]
+fn startup_rejects_a_missing_task_control_marker_projection() -> Result<(), Box<dyn Error>> {
+    let fixture = TemporaryTaskDatabase::new()?;
+    let mut store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let created = store.create_task(new_task(session.id, &fixture.workspace))?;
+    let task_id = created.snapshot.task_id;
+    store
+        .append_task_event(
+            task_id,
+            created.revision,
+            TaskEvent::ControlRequested {
+                control_id: "c".repeat(64),
+                kind: TaskControlKind::Cancel,
+            },
+            timestamp(1),
+        )?
+        .expect("control marker setup appends");
+    drop(store);
+    Connection::open(&fixture.database)?.execute(
+        "DELETE FROM task_control_markers WHERE task_id = ?1",
+        [task_id.to_string()],
+    )?;
+
+    let error = match Store::open(&fixture.database) {
+        Ok(_) => panic!("a missing task control marker projection must not be trusted"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        CarlError::Storage { ref detail }
+            if detail.contains("task control marker projection disagrees")
+    ));
+    Ok(())
+}
+
+fn queued_plan_configuration_fixture() -> Result<(TemporaryTaskDatabase, TaskId), Box<dyn Error>> {
+    let fixture = TemporaryTaskDatabase::new()?;
+    let mut store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let mut input = new_task(session.id, &fixture.workspace);
+    input.permission_mode = PermissionMode::FullAccess;
+    let created = store.create_task(input)?;
+    let task_id = created.snapshot.task_id;
+    store
+        .append_task_event(
+            task_id,
+            created.revision,
+            TaskEvent::ConfigurationQueued {
+                control_id: "d".repeat(64),
+                model: ModelId::parse("gpt-5.6")?,
+                effort: ReasoningEffort::High,
+                permission_mode: PermissionMode::Plan,
+            },
+            timestamp(1),
+        )?
+        .expect("queued Plan configuration setup appends");
+    drop(store);
+    Ok((fixture, task_id))
 }
 
 #[test]
