@@ -181,10 +181,12 @@ Start with [CONTRIBUTING.md](CONTRIBUTING.md). Security reports follow
 
 The [benchmark lab](docs/benchmarks.md) now provides reproducible coding,
 workflow-automation, and safety tasks, same-model Carl/Codex comparisons, and an owner-private
-append-only dry-run experiment graph. These are the first two layers
+append-only experiment graph. The phase-three operator can prepare and seal a disposable candidate,
+bind paired and independent-review evidence, and explicitly open a draft PR. These are the first
+three layers
 of the approved [improvement-factory design](docs/superpowers/specs/2026-08-10-codex-carl-improvement-factory-design.md),
-but they do not build, autonomously promote, or merge changes. Protected validation, isolated
-candidate generation, and the deterministic promotion controller remain separate gates.
+but they do not run protected validation, autonomously promote, or merge changes. The deterministic
+promotion controller, protected runner, merge queue, soak, and rollback remain separate gates.
 
 ## Roadmap
 

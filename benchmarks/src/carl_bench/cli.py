@@ -5,8 +5,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import stat
 import sys
+import tempfile
 import uuid
 from collections.abc import Sequence
 from datetime import UTC, datetime
@@ -17,15 +19,34 @@ from carl_bench.adapters.base import AgentAdapter
 from carl_bench.adapters.carl_acp import CarlAcpAdapter
 from carl_bench.adapters.codex_cli import CodexCliAdapter
 from carl_bench.adapters.scripted import ScriptedAdapter
-from carl_bench.candidate_evidence import scorecard_from_public
+from carl_bench.artifacts import MAX_ARTIFACT_BYTES, PrivateArtifactStore
+from carl_bench.candidate import (
+    DraftPullRequest,
+    PairedEvidence,
+    PreparedCandidate,
+    ReviewAttestation,
+    ReviewPacket,
+    SealedCandidate,
+)
+from carl_bench.candidate_evidence import (
+    bind_paired_evidence,
+    issue_review_packet,
+    record_review_attestation,
+    scorecard_from_public,
+)
+from carl_bench.candidate_git import CandidateGitManager, TrustedCheckRegistry
 from carl_bench.canonical import canonical_json_bytes
 from carl_bench.experiment import (
     EventType,
     ExperimentEvent,
     ExperimentManifest,
+    ExperimentState,
+    ReviewRole,
     ReviewVerdict,
     evaluate_dry_run,
+    evaluate_phase3,
 )
+from carl_bench.github_draft import DraftPrGateway
 from carl_bench.ledger import ExperimentLedger
 from carl_bench.models import RunManifest, TrialResult
 from carl_bench.report import compare_runs, summarize_run
@@ -107,6 +128,85 @@ def _parser() -> argparse.ArgumentParser:
     budget.add_argument("--at", required=True)
     budget.add_argument("--active-live-workers", required=True, type=int)
     budget.add_argument("--public-result", required=True, type=Path)
+
+    candidate = commands.add_parser(
+        "candidate", help="operate the isolated phase-three candidate workflow"
+    )
+    candidate_commands = candidate.add_subparsers(dest="candidate_command", required=True)
+
+    def add_candidate_context(command: argparse.ArgumentParser) -> None:
+        command.add_argument("--ledger", required=True, type=Path)
+        command.add_argument("--experiment-id", required=True)
+        command.add_argument("--repository", required=True, type=Path)
+        command.add_argument("--worktree-root", required=True, type=Path)
+        command.add_argument("--artifacts", required=True, type=Path)
+        command.add_argument("--remote", required=True)
+        command.add_argument("--expected-remote-url", required=True)
+
+    def add_mutation(command: argparse.ArgumentParser) -> None:
+        add_candidate_context(command)
+        command.add_argument("--stage-attempt-id", required=True)
+        command.add_argument("--occurred-at", required=True)
+
+    prepare = candidate_commands.add_parser("prepare", help="prepare an isolated worktree")
+    add_mutation(prepare)
+    prepare.add_argument("--private-result", required=True, type=Path)
+
+    seal = candidate_commands.add_parser("seal", help="validate and seal one candidate commit")
+    add_mutation(seal)
+    seal.add_argument("--check-registry", required=True, type=Path)
+    seal.add_argument("--report", required=True, type=Path)
+    seal.add_argument("--public-result", required=True, type=Path)
+
+    bind = candidate_commands.add_parser(
+        "bind-comparison", help="bind an exact paired benchmark improvement"
+    )
+    add_mutation(bind)
+    bind.add_argument("--baseline", required=True, type=Path)
+    bind.add_argument("--candidate-scorecard", required=True, type=Path)
+    bind.add_argument("--comparison-seed", required=True, type=int)
+    bind.add_argument("--public-result", required=True, type=Path)
+
+    packet = candidate_commands.add_parser(
+        "review-packet", help="issue one role-specific private review packet"
+    )
+    add_mutation(packet)
+    packet.add_argument(
+        "--role",
+        required=True,
+        choices=("correctness", "security", "maintainability", "benchmark_integrity"),
+    )
+    packet.add_argument("--private-result", required=True, type=Path)
+
+    review = candidate_commands.add_parser(
+        "record-review", help="record one independent review attestation"
+    )
+    add_mutation(review)
+    review.add_argument("--packet", required=True, type=Path)
+    review.add_argument("--reviewer-id", required=True)
+    review.add_argument("--context-id", required=True)
+    review.add_argument("--verdict", required=True, choices=("approve", "reject", "hard_finding"))
+    review.add_argument("--report", required=True, type=Path)
+    review.add_argument("--public-result", required=True, type=Path)
+
+    candidate_status = candidate_commands.add_parser(
+        "status", help="emit sanitized phase-three status"
+    )
+    candidate_status.add_argument("--ledger", required=True, type=Path)
+    candidate_status.add_argument("--experiment-id", required=True)
+    candidate_status.add_argument("--public-result", required=True, type=Path)
+
+    draft = candidate_commands.add_parser(
+        "open-draft-pr", help="push the sealed commit and open or reconcile a draft PR"
+    )
+    add_mutation(draft)
+    draft.add_argument("--repository-slug", required=True)
+    draft.add_argument("--base-branch", required=True)
+    draft.add_argument("--gh-executable", required=True, type=Path)
+    draft.add_argument("--gateway-private-root", required=True, type=Path)
+    draft.add_argument("--gateway-env-name", action="append", default=[])
+    draft.add_argument("--enable-github-draft", action="store_true")
+    draft.add_argument("--public-result", required=True, type=Path)
     return parser
 
 
@@ -381,6 +481,370 @@ def _experiment_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def _read_private_bytes(path: Path, *, maximum: int = MAX_ARTIFACT_BYTES) -> bytes:
+    source = _anchored(path)
+    try:
+        metadata = source.lstat()
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+            or metadata.st_size > maximum
+            or (os.name != "nt" and stat.S_IMODE(metadata.st_mode) & 0o077)
+        ):
+            raise ValueError("private input is unsafe")
+        return source.read_bytes()
+    except OSError as error:
+        raise ValueError("private input is invalid") from error
+
+
+def _write_private_json(destination: Path, value: Any, *forbidden_roots: Path) -> None:
+    target = _anchored(destination)
+    if any(_inside(target, _anchored(root)) for root in forbidden_roots):
+        raise ValueError("private result path is unsafe")
+    try:
+        existing = target.lstat()
+    except FileNotFoundError:
+        existing = None
+    except OSError as error:
+        raise ValueError("private result path is unsafe") from error
+    if existing is not None and (
+        not stat.S_ISREG(existing.st_mode) or stat.S_ISLNK(existing.st_mode)
+    ):
+        raise ValueError("private result path is unsafe")
+    payload = canonical_json_bytes(value) + b"\n"
+    target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if target.parent.is_symlink() or not target.parent.is_dir():
+        raise ValueError("private result path is unsafe")
+    if os.name != "nt":
+        target.parent.chmod(0o700)
+    descriptor, name = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
+    temporary = Path(name)
+    try:
+        if os.name != "nt":
+            os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, target)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _candidate_manager(args: argparse.Namespace) -> CandidateGitManager:
+    store = PrivateArtifactStore(_anchored(args.artifacts), _anchored(args.repository))
+    return CandidateGitManager(
+        repository_root=_anchored(args.repository),
+        worktree_root=_anchored(args.worktree_root),
+        artifact_store=store,
+        remote=args.remote,
+        expected_remote_url=args.expected_remote_url,
+    )
+
+
+def _existing_candidate_event(
+    ledger: ExperimentLedger,
+    experiment_id: str,
+    stage_attempt_id: str,
+    expected_type: EventType,
+) -> ExperimentEvent | None:
+    for event in ledger.events(experiment_id):
+        if event.stage_attempt_id != stage_attempt_id:
+            continue
+        if event.event_type is not expected_type:
+            raise ValueError("stage attempt conflicts with an existing event")
+        return event
+    return None
+
+
+def _append_candidate_event(
+    ledger: ExperimentLedger,
+    *,
+    experiment_id: str,
+    stage_attempt_id: str,
+    occurred_at: str,
+    event_type: EventType,
+    payload: dict[str, Any],
+) -> None:
+    ledger.append(
+        ExperimentEvent.create(
+            experiment_id=experiment_id,
+            stage_attempt_id=stage_attempt_id,
+            event_type=event_type,
+            occurred_at=occurred_at,
+            payload=payload,
+        )
+    )
+
+
+def _candidate_status_dict(
+    manifest: ExperimentManifest, ledger: ExperimentLedger
+) -> dict[str, Any]:
+    projection = ledger.projection(manifest.experiment_id)
+    decision = evaluate_phase3(manifest, projection)
+    candidate = projection.candidate
+    paired = projection.paired_evidence
+    draft = projection.draft_pull_request
+    return {
+        "candidate_commit": candidate.candidate_commit if candidate is not None else None,
+        "candidate_digest": candidate.digest if candidate is not None else None,
+        "candidate_review_approvals": sum(
+            review.verdict == "approve" for review in projection.candidate_attestations
+        ),
+        "candidate_review_hard_findings": sum(
+            review.verdict == "hard_finding" for review in projection.candidate_attestations
+        ),
+        "candidate_review_packets": len(projection.review_packets),
+        "candidate_reviews": len(projection.candidate_attestations),
+        "deterministic_check_count": len(candidate.checks) if candidate is not None else 0,
+        "draft_pull_request_number": draft.number if draft is not None else None,
+        "draft_pull_request_url": draft.url if draft is not None else None,
+        "experiment_id": manifest.experiment_id,
+        "manifest_digest": manifest.digest,
+        "next_action": decision.next_action,
+        "outcome": decision.outcome,
+        "paired_decision": paired.decision if paired is not None else None,
+        "paired_evidence_digest": paired.digest if paired is not None else None,
+        "projection_digest": projection.digest,
+        "reasons": list(decision.reasons),
+        "schema_version": 1,
+        "state": projection.state.value,
+    }
+
+
+def _candidate_command(args: argparse.Namespace) -> int:
+    ledger = _private_ledger(args.ledger)
+    manifest = ledger.load_manifest(args.experiment_id)
+    if args.candidate_command == "status":
+        destination = _experiment_output(args.public_result, args.ledger)
+        write_public_json(destination, _candidate_status_dict(manifest, ledger), REPOSITORY_ROOT)
+        print(f"candidate {args.experiment_id}: wrote status")
+        return 0
+
+    manager = _candidate_manager(args)
+    projection = ledger.projection(args.experiment_id)
+    if args.candidate_command == "prepare":
+        existing = _existing_candidate_event(
+            ledger, args.experiment_id, args.stage_attempt_id, EventType.WORKSPACE_PREPARED
+        )
+        if existing is None:
+            if projection.state is not ExperimentState.BUILDING or projection.lease is None:
+                raise ValueError("candidate preparation is not eligible")
+            prepared = manager.prepare(manifest, stage_attempt_id=args.stage_attempt_id)
+            _append_candidate_event(
+                ledger,
+                experiment_id=args.experiment_id,
+                stage_attempt_id=args.stage_attempt_id,
+                occurred_at=args.occurred_at,
+                event_type=EventType.WORKSPACE_PREPARED,
+                payload=prepared.to_canonical_dict(),
+            )
+        else:
+            prepared = PreparedCandidate.from_canonical_dict(existing.payload)
+        _write_private_json(
+            args.private_result,
+            {
+                **prepared.to_canonical_dict(),
+                "worktree": os.fspath(manager.worktree_path(prepared)),
+            },
+            REPOSITORY_ROOT,
+            args.repository,
+        )
+        print(f"candidate {args.experiment_id}: prepared {prepared.branch}")
+        return 0
+
+    if args.candidate_command == "seal":
+        existing = _existing_candidate_event(
+            ledger, args.experiment_id, args.stage_attempt_id, EventType.CANDIDATE_SEALED
+        )
+        report = _read_private_bytes(args.report)
+        if existing is None:
+            if projection.prepared_candidate is None:
+                raise ValueError("candidate has not been prepared")
+            registry = TrustedCheckRegistry.load(args.check_registry)
+            sealed = manager.seal(manifest, projection.prepared_candidate, registry, report=report)
+            _append_candidate_event(
+                ledger,
+                experiment_id=args.experiment_id,
+                stage_attempt_id=args.stage_attempt_id,
+                occurred_at=args.occurred_at,
+                event_type=EventType.CANDIDATE_SEALED,
+                payload=sealed.to_canonical_dict(),
+            )
+        else:
+            sealed = SealedCandidate.from_canonical_dict(existing.payload)
+            if manager.artifact_store.read(sealed.report_artifact) != report:
+                raise ValueError("candidate report conflicts with sealed evidence")
+        write_public_json(
+            _experiment_output(args.public_result, args.ledger),
+            sealed.to_public_dict(),
+            REPOSITORY_ROOT,
+        )
+        print(f"candidate {args.experiment_id}: sealed {sealed.candidate_commit}")
+        return 0
+
+    if args.candidate_command == "bind-comparison":
+        existing = _existing_candidate_event(
+            ledger,
+            args.experiment_id,
+            args.stage_attempt_id,
+            EventType.PAIRED_EVIDENCE_RECORDED,
+        )
+        if existing is None:
+            if projection.candidate is None:
+                raise ValueError("candidate has not been sealed")
+            baseline = scorecard_from_public(_read_public_object(args.baseline))
+            candidate_scorecard = scorecard_from_public(
+                _read_public_object(args.candidate_scorecard)
+            )
+            paired = bind_paired_evidence(
+                manifest,
+                projection.candidate,
+                baseline,
+                candidate_scorecard,
+                comparison_seed=args.comparison_seed,
+                store=manager.artifact_store,
+            )
+            _append_candidate_event(
+                ledger,
+                experiment_id=args.experiment_id,
+                stage_attempt_id=args.stage_attempt_id,
+                occurred_at=args.occurred_at,
+                event_type=EventType.PAIRED_EVIDENCE_RECORDED,
+                payload=paired.to_canonical_dict(),
+            )
+        else:
+            paired = PairedEvidence.from_canonical_dict(existing.payload)
+        value = {
+            "candidate_commit": paired.candidate_commit,
+            "confidence_lower_basis_points": paired.confidence_lower_basis_points,
+            "decision": paired.decision,
+            "experiment_id": paired.experiment_id,
+            "paired_evidence_digest": paired.digest,
+            "paired_trials": paired.paired_trials,
+            "pass_rate_delta_basis_points": paired.pass_rate_delta_basis_points,
+            "schema_version": 1,
+        }
+        write_public_json(
+            _experiment_output(args.public_result, args.ledger), value, REPOSITORY_ROOT
+        )
+        print(f"candidate {args.experiment_id}: bound paired evidence")
+        return 0
+
+    if args.candidate_command == "review-packet":
+        existing = _existing_candidate_event(
+            ledger,
+            args.experiment_id,
+            args.stage_attempt_id,
+            EventType.REVIEW_PACKET_RECORDED,
+        )
+        if existing is None:
+            packet = issue_review_packet(manifest, projection, ReviewRole(args.role))
+            _append_candidate_event(
+                ledger,
+                experiment_id=args.experiment_id,
+                stage_attempt_id=args.stage_attempt_id,
+                occurred_at=args.occurred_at,
+                event_type=EventType.REVIEW_PACKET_RECORDED,
+                payload=packet.to_canonical_dict(),
+            )
+        else:
+            packet = ReviewPacket.from_canonical_dict(existing.payload)
+            if packet.role != args.role:
+                raise ValueError("review role conflicts with existing packet")
+        _write_private_json(
+            args.private_result,
+            packet.to_canonical_dict(),
+            REPOSITORY_ROOT,
+            args.repository,
+        )
+        print(f"candidate {args.experiment_id}: issued {packet.role} packet")
+        return 0
+
+    if args.candidate_command == "record-review":
+        existing = _existing_candidate_event(
+            ledger, args.experiment_id, args.stage_attempt_id, EventType.REVIEW_ATTESTED
+        )
+        report = _read_private_bytes(args.report)
+        if existing is None:
+            packet = ReviewPacket.from_canonical_dict(_read_control_object(args.packet))
+            attestation = record_review_attestation(
+                manifest,
+                projection,
+                packet,
+                reviewer_id=args.reviewer_id,
+                context_id=args.context_id,
+                verdict=args.verdict,
+                report=report,
+                store=manager.artifact_store,
+            )
+            _append_candidate_event(
+                ledger,
+                experiment_id=args.experiment_id,
+                stage_attempt_id=args.stage_attempt_id,
+                occurred_at=args.occurred_at,
+                event_type=EventType.REVIEW_ATTESTED,
+                payload=attestation.to_canonical_dict(),
+            )
+        else:
+            attestation = ReviewAttestation.from_canonical_dict(existing.payload)
+            if manager.artifact_store.read(attestation.report_artifact) != report:
+                raise ValueError("review report conflicts with existing attestation")
+        value = {
+            "attestation_digest": attestation.digest,
+            "candidate_commit": attestation.candidate_commit,
+            "experiment_id": attestation.experiment_id,
+            "report_digest": attestation.report_artifact.digest,
+            "role": attestation.role,
+            "schema_version": 1,
+            "verdict": attestation.verdict,
+        }
+        write_public_json(
+            _experiment_output(args.public_result, args.ledger), value, REPOSITORY_ROOT
+        )
+        print(f"candidate {args.experiment_id}: recorded {attestation.role} review")
+        return 0
+
+    if not args.enable_github_draft:
+        raise ValueError("GitHub draft mutation is disabled")
+    existing = _existing_candidate_event(
+        ledger, args.experiment_id, args.stage_attempt_id, EventType.DRAFT_PR_RECORDED
+    )
+    if existing is None:
+        if len(args.gateway_env_name) != len(set(args.gateway_env_name)):
+            raise ValueError("duplicate gateway environment name")
+        if any(name not in os.environ for name in args.gateway_env_name):
+            raise ValueError("gateway environment is unavailable")
+        gateway = DraftPrGateway(
+            repository_root=args.repository,
+            repository_slug=args.repository_slug,
+            remote=args.remote,
+            expected_remote_url=args.expected_remote_url,
+            base_branch=args.base_branch,
+            gh_executable=args.gh_executable,
+            private_root=args.gateway_private_root,
+            command_env={name: os.environ[name] for name in args.gateway_env_name},
+        )
+        draft = gateway.open_or_reconcile(manifest, projection)
+        _append_candidate_event(
+            ledger,
+            experiment_id=args.experiment_id,
+            stage_attempt_id=args.stage_attempt_id,
+            occurred_at=args.occurred_at,
+            event_type=EventType.DRAFT_PR_RECORDED,
+            payload=draft.to_canonical_dict(),
+        )
+    else:
+        draft = DraftPullRequest.from_canonical_dict(existing.payload)
+    write_public_json(
+        _experiment_output(args.public_result, args.ledger),
+        draft.to_canonical_dict(),
+        REPOSITORY_ROOT,
+    )
+    print(f"candidate {args.experiment_id}: draft PR {draft.number}")
+    return 0
+
+
 def _compare_command(args: argparse.Namespace) -> int:
     destination = _safe_result_path(args.public_result, ())
     baseline_path = _anchored(args.baseline)
@@ -414,6 +878,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _compare_command(args)
         if args.command == "experiment":
             return _experiment_command(args)
+        if args.command == "candidate":
+            return _candidate_command(args)
         return asyncio.run(_run_command(args))
     except (KeyboardInterrupt, asyncio.CancelledError):
         return 130

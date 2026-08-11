@@ -394,8 +394,9 @@ def test_proposal_quorum_requires_two_approvals_and_no_hard_objection() -> None:
         ),
     )
     approved = evaluate_dry_run(manifest(), reduce_events(manifest(), approved_events))
-    assert approved.outcome == "simulated_build_eligible"
-    assert approved.reasons == ("phase3_builder_not_enabled",)
+    assert approved.outcome == "advance"
+    assert approved.next_action == "acquire_candidate_lease"
+    assert approved.reasons == ()
 
     objected_events = (
         *approved_events,
@@ -646,12 +647,16 @@ def test_events_before_preregistration_and_expired_mutable_stage_progress_fail_c
 
 
 def test_phase3_candidate_evidence_gates_build_and_cannot_claim_holdout_validation() -> None:
+    building_projection = reduce_events(manifest(), phase3_build_events())
+    assert evaluate_dry_run(manifest(), building_projection).next_action == "prepare_candidate"
     prepared_event = candidate_event(
         attempt="prepare-phase3",
         event_type=EventType.WORKSPACE_PREPARED,
         second=1,
         payload=prepared_candidate().to_canonical_dict(),
     )
+    prepared_projection = reduce_events(manifest(), (*phase3_build_events(), prepared_event))
+    assert evaluate_dry_run(manifest(), prepared_projection).next_action == "seal_candidate"
     deterministic = transition(
         attempt="stage-deterministic-phase3",
         source=ExperimentState.BUILDING,

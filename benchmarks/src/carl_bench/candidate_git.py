@@ -446,23 +446,32 @@ class CandidateGitManager:
     def _changed_paths(self, workspace: Path) -> tuple[str, ...]:
         _, tracked = _git(workspace, "diff", "--name-only", "-z", "HEAD", "--")
         _, untracked = _git(workspace, "ls-files", "--others", "--exclude-standard", "-z", "--")
+        return self._decode_paths(tracked, untracked)
+
+    def _paths_between(self, workspace: Path, parent: str, candidate: str) -> tuple[str, ...]:
+        _, output = _git(workspace, "diff", "--name-only", "-z", parent, candidate, "--")
+        return self._decode_paths(output)
+
+    @staticmethod
+    def _decode_paths(*outputs: bytes) -> tuple[str, ...]:
         values: set[str] = set()
-        for raw in (*tracked.split(b"\0"), *untracked.split(b"\0")):
-            if not raw:
-                continue
-            try:
-                value = raw.decode("utf-8")
-            except UnicodeDecodeError as error:
-                raise CandidateGitError("candidate_path_invalid") from error
-            parts = value.split("/")
-            if (
-                not value
-                or "\\" in value
-                or PurePosixPath(value).is_absolute()
-                or any(part in {"", ".", ".."} for part in parts)
-            ):
-                raise CandidateGitError("candidate_path_invalid")
-            values.add(value)
+        for output in outputs:
+            for raw in output.split(b"\0"):
+                if not raw:
+                    continue
+                try:
+                    value = raw.decode("utf-8")
+                except UnicodeDecodeError as error:
+                    raise CandidateGitError("candidate_path_invalid") from error
+                parts = value.split("/")
+                if (
+                    not value
+                    or "\\" in value
+                    or PurePosixPath(value).is_absolute()
+                    or any(part in {"", ".", ".."} for part in parts)
+                ):
+                    raise CandidateGitError("candidate_path_invalid")
+                values.add(value)
         return tuple(sorted(values, key=str.encode))
 
     @staticmethod
@@ -527,12 +536,23 @@ class CandidateGitManager:
         workspace = self.worktree_path(prepared)
         _, branch_output = _git(workspace, "branch", "--show-current")
         _, head_output = _git(workspace, "rev-parse", "HEAD")
-        if (
-            _decode_line(branch_output, "candidate_worktree_drift") != prepared.branch
-            or _decode_line(head_output, "candidate_worktree_drift") != manifest.parent_commit
-        ):
+        if _decode_line(branch_output, "candidate_worktree_drift") != prepared.branch:
             raise CandidateGitError("candidate_worktree_drift")
-        before = self._changed_paths(workspace)
+        head = _decode_line(head_output, "candidate_worktree_drift")
+        reconciling_commit = head != manifest.parent_commit
+        _, initial_status = _git(workspace, "status", "--porcelain=v1", "-z")
+        if reconciling_commit:
+            _, existing_parents_output = _git(workspace, "rev-list", "--parents", "-n", "1", "HEAD")
+            existing_parents = _decode_line(
+                existing_parents_output, "candidate_parent_mismatch"
+            ).split()
+            if existing_parents != [head, manifest.parent_commit]:
+                raise CandidateGitError("candidate_parent_mismatch")
+            if initial_status:
+                raise CandidateGitError("candidate_worktree_drift")
+            before = self._paths_between(workspace, manifest.parent_commit, head)
+        else:
+            before = self._changed_paths(workspace)
         self._validate_paths(manifest, workspace, before)
         checks: list[DeterministicCheckResult] = []
         for spec in registry.select(tuple(sorted(manifest.deterministic_checks, key=str.encode))):
@@ -546,8 +566,8 @@ class CandidateGitManager:
                 raise CandidateGitError("deterministic_check_timed_out")
             if status == "failed":
                 raise CandidateGitError("deterministic_check_failed")
-            after = self._changed_paths(workspace)
-            if after != before:
+            _, after_status = _git(workspace, "status", "--porcelain=v1", "-z")
+            if after_status != initial_status:
                 raise CandidateGitError("deterministic_check_changed_candidate")
             checks.append(
                 DeterministicCheckResult(
@@ -558,20 +578,25 @@ class CandidateGitManager:
                     output_artifact=output_ref,
                 )
             )
-        _git(workspace, "add", "--all")
-        _, staged_output = _git(workspace, "diff", "--cached", "--name-only", "-z", "HEAD", "--")
-        try:
-            staged = tuple(
-                sorted(
-                    (item.decode("utf-8") for item in staged_output.split(b"\0") if item),
-                    key=str.encode,
-                )
+        if reconciling_commit:
+            candidate_commit = head
+            _, diff = _git(
+                workspace,
+                "diff",
+                "--binary",
+                manifest.parent_commit,
+                candidate_commit,
+                "--",
             )
-        except UnicodeDecodeError as error:
-            raise CandidateGitError("candidate_path_invalid") from error
-        if staged != before:
-            raise CandidateGitError("candidate_staged_paths_mismatch")
-        _, diff = _git(workspace, "diff", "--cached", "--binary", "HEAD", "--")
+        else:
+            _git(workspace, "add", "--all")
+            _, staged_output = _git(
+                workspace, "diff", "--cached", "--name-only", "-z", "HEAD", "--"
+            )
+            staged = self._decode_paths(staged_output)
+            if staged != before:
+                raise CandidateGitError("candidate_staged_paths_mismatch")
+            _, diff = _git(workspace, "diff", "--cached", "--binary", "HEAD", "--")
         diff_ref = self.artifact_store.put(
             evidence_kind="candidate_diff", media_type="text/x-diff", content=diff
         )
@@ -585,18 +610,19 @@ class CandidateGitManager:
             media_type="application/json",
             content=canonical_json_bytes({"paths": list(before), "schema_version": 1}),
         )
-        _git(
-            workspace,
-            "-c",
-            "user.name=Carl Improvement Factory",
-            "-c",
-            "user.email=carl-improvement@invalid",
-            "commit",
-            "-m",
-            f"experiment({manifest.experiment_id}): seal candidate",
-        )
-        _, candidate_output = _git(workspace, "rev-parse", "HEAD")
-        candidate_commit = _decode_line(candidate_output, "candidate_commit_invalid")
+        if not reconciling_commit:
+            _git(
+                workspace,
+                "-c",
+                "user.name=Carl Improvement Factory",
+                "-c",
+                "user.email=carl-improvement@invalid",
+                "commit",
+                "-m",
+                f"experiment({manifest.experiment_id}): seal candidate",
+            )
+            _, candidate_output = _git(workspace, "rev-parse", "HEAD")
+            candidate_commit = _decode_line(candidate_output, "candidate_commit_invalid")
         _, parents_output = _git(workspace, "rev-list", "--parents", "-n", "1", "HEAD")
         parents = _decode_line(parents_output, "candidate_parent_mismatch").split()
         if parents != [candidate_commit, manifest.parent_commit]:

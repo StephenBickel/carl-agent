@@ -1,10 +1,11 @@
 # Carl benchmark lab
 
-This directory contains the first two executable layers of the Carl improvement factory. It runs the
+This directory contains the first three executable layers of the Carl improvement factory. It runs the
 same portable coding, workflow-automation, and safety tasks against disposable workspaces and emits
 only bounded, sanitized scorecards, then records private experiment facts in a replayable dry-run
-graph. It does **not** build, autonomously merge, or publish changes; comparisons and simulated
-decisions are evidence for later isolated-builder and promotion-controller phases.
+graph. An approved experiment can now prepare and seal an isolated candidate, bind paired and review
+evidence, and explicitly open a draft PR. It does **not** run protected validation, merge, enable
+auto-merge, release, deploy, or accept changes.
 
 ## Offline validation
 
@@ -114,7 +115,11 @@ Start from [the public example manifest](examples/dry-run-manifest.json), but co
 private control directory and replace every example value. The full operator sequence and event
 boundary are in [the benchmark operator guide](../docs/benchmarks.md#dry-run-experiment-graph).
 
-This is deliberately not the recursive mutation loop yet. It has no builder adapter, protected
-holdout input, GitHub credential, PR operation, merge operation, or rollback operation. A future
-Codex director can call this interface every two hours in proposal-only mode after this branch is
-integrated; candidate generation remains gated on phase three.
+Phase three adds the `carl-bench candidate` prepare/edit/seal protocol, paired-evidence binding,
+role-specific independent review packets, sanitized status, and a draft-only GitHub gateway. The
+Codex task performs the edit inside the prepared worktree; Carl installations do not mutate
+themselves. See the operator guide for the private check registry and command sequence.
+
+This is deliberately not autonomous promotion yet. Protected holdouts, merge credentials,
+auto-merge, merge queue, soak, release, and rollback remain absent. A draft candidate stays in
+`paired_evaluation` until a later protected validator supplies evidence that the builder cannot see.

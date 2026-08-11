@@ -172,6 +172,39 @@ def test_seal_runs_registered_checks_in_closed_environment_and_commits_allowed_c
     assert b"value.txt" in manager.artifact_store.read(candidate.diff_artifact)
 
 
+def test_seal_reconciles_an_exact_parent_commit_created_before_ledger_append(
+    tmp_path: Path,
+) -> None:
+    manager, _, parent = _manager(tmp_path)
+    selected = replace(manifest(), parent_commit=parent, deterministic_checks=("pass",))
+    prepared = manager.prepare(selected, stage_attempt_id="prepare-reconcile")
+    worktree = manager.worktree_path(prepared)
+    (worktree / "src" / "runtime" / "task" / "value.txt").write_text(
+        "candidate committed before append\n", encoding="utf-8"
+    )
+    _run("git", "add", "--all", cwd=worktree)
+    _run("git", "commit", "-m", "candidate before controller receipt", cwd=worktree)
+    existing_commit = _run("git", "rev-parse", "HEAD", cwd=worktree)
+    registry = _registry(
+        tmp_path / "private" / "checks-reconcile.json",
+        [_check("pass", "raise SystemExit(0)")],
+    )
+
+    candidate = manager.seal(
+        selected,
+        prepared,
+        registry,
+        report=b'{"summary":"reconciled after commit"}',
+    )
+
+    assert candidate.candidate_commit == existing_commit
+    assert candidate.parent_commit == parent
+    assert candidate.changed_path_count == 1
+    assert b"candidate committed before append" in manager.artifact_store.read(
+        candidate.diff_artifact
+    )
+
+
 @pytest.mark.parametrize(
     ("mutation", "code"),
     [

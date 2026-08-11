@@ -1123,22 +1123,50 @@ def evaluate_dry_run(
     elif projection.state is ExperimentState.PROPOSAL_REVIEW:
         approved, reasons = _proposal_quorum(projection.proposal_reviews)
         if approved:
-            outcome = "simulated_build_eligible"
-            next_action = "phase3_builder_not_enabled"
-            reasons = ("phase3_builder_not_enabled",)
+            outcome = "advance"
+            next_action = (
+                "acquire_candidate_lease"
+                if projection.lease is None
+                else "record_building_transition"
+            )
+            reasons = ()
         else:
             outcome = "blocked"
             next_action = "collect_proposal_reviews"
+    elif projection.state is ExperimentState.BUILDING:
+        outcome = "advance"
+        if projection.prepared_candidate is None:
+            next_action = "prepare_candidate"
+        elif projection.candidate is None:
+            next_action = "seal_candidate"
+        else:
+            next_action = "record_deterministic_validation"
+        reasons = ()
+    elif projection.state is ExperimentState.DETERMINISTIC_VALIDATION:
+        if projection.candidate is None:
+            outcome = "blocked"
+            next_action = "seal_candidate"
+            reasons = ("sealed_candidate_required",)
+        else:
+            outcome = "advance"
+            next_action = "record_paired_evaluation"
+            reasons = ()
+    elif projection.state is ExperimentState.PAIRED_EVALUATION:
+        phase3 = evaluate_phase3(manifest, projection)
+        next_action = phase3.next_action
+        if phase3.outcome == "advance":
+            outcome = "advance"
+            reasons = ()
+        else:
+            outcome = "blocked"
+            reasons = phase3.reasons or (phase3.next_action,)
     else:
         next_by_state = {
             ExperimentState.QUEUED: "start_baseline",
             ExperimentState.BASELINING: "record_baseline_diagnosis",
             ExperimentState.DIAGNOSING: "author_hypothesis",
-            ExperimentState.BUILDING: "phase3_builder_not_enabled",
-            ExperimentState.DETERMINISTIC_VALIDATION: "phase3_validation_not_enabled",
-            ExperimentState.PAIRED_EVALUATION: "phase3_evaluation_not_enabled",
-            ExperimentState.HOLDOUT_VALIDATION: "phase3_holdout_not_enabled",
-            ExperimentState.REVIEW_COMPLETE: "phase3_pr_not_enabled",
+            ExperimentState.HOLDOUT_VALIDATION: "phase4_holdout_not_enabled",
+            ExperimentState.REVIEW_COMPLETE: "phase4_promotion_not_enabled",
             ExperimentState.PR_OPEN: "phase4_merge_not_enabled",
             ExperimentState.MERGED: "phase4_soak_not_enabled",
             ExperimentState.SOAKING: "phase4_acceptance_not_enabled",

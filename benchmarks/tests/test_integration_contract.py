@@ -42,7 +42,7 @@ def test_benchmark_workflow_is_pinned_locked_offline_and_credential_free() -> No
         assert forbidden.casefold() not in source.casefold()
 
 
-def test_operator_documentation_links_resolve_and_describes_manual_only_boundary() -> None:
+def test_operator_documentation_links_resolve_and_describes_draft_only_boundary() -> None:
     source = OPERATOR_DOCS.read_text(encoding="utf-8")
     normalized = " ".join(source.casefold().split())
     links = re.findall(r"\[[^]]+\]\(([^)]+)\)", source)
@@ -50,13 +50,17 @@ def test_operator_documentation_links_resolve_and_describes_manual_only_boundary
     assert local_links
     for link in local_links:
         assert (OPERATOR_DOCS.parent / link).resolve().exists(), link
-    assert "advisory" in normalized
     assert "promotion controller is not implemented" in normalized
     assert "dry-run experiment graph" in normalized
     assert "hash-chained sqlite ledger" in normalized
     assert "every two hours" in normalized
-    assert "manual and read-only" in normalized
-    assert "does not build carl or open, merge, or revert pull requests" in normalized
+    assert "scheduling is not installed" in normalized
+    assert "draft pr" in normalized
+    assert (
+        "cannot claim protected validation, merge, auto-merge, release, deploy, or revert"
+        in normalized
+    )
+    assert "remains in `paired_evaluation`" in normalized
     assert "USD 25" in source
     assert "USD 150" in source
     assert "three" in normalized and "ten" in normalized
@@ -67,8 +71,8 @@ def test_root_readme_links_the_lab_without_claiming_autonomous_promotion() -> No
     assert "[benchmark lab](docs/benchmarks.md)" in source
     assert "[improvement-factory design](" in source
     section = source.split("## Benchmark lab", 1)[1].split("\n## ", 1)[0]
-    assert "do not build, autonomously promote, or merge" in section
-    assert "append-only dry-run experiment graph" in section
+    assert "do not run protected validation, autonomously promote, or merge" in section
+    assert "append-only experiment graph" in section
 
 
 def test_public_dry_run_manifest_example_satisfies_the_strict_contract() -> None:

@@ -1,11 +1,12 @@
 # Operating the Carl benchmark lab
 
-The benchmark lab and dry-run experiment graph are the first executable parts of the approved
+The benchmark lab, experiment graph, and isolated candidate workflow are the first executable parts of the approved
 [improvement-factory design](superpowers/specs/2026-08-10-codex-carl-improvement-factory-design.md).
 They give Codex a reproducible way to test Carl and other harnesses on coding,
 workflow-automation, and safety tasks, preregister hypotheses, replay normalized decisions, and
-account for budgets. The current comparison output is advisory: the promotion controller is not
-implemented, and this control plane does not build Carl or open, merge, or revert pull requests.
+account for budgets. An approved experiment can produce a sealed candidate and an explicitly enabled
+draft PR. The promotion controller is not implemented: this control plane cannot claim protected
+validation, merge, auto-merge, release, deploy, or revert changes.
 
 The command reference and isolation details live in the
 [benchmark package guide](../benchmarks/README.md). This page defines the operator loop that Codex
@@ -156,11 +157,113 @@ recorded spend.
 Status and decision files expose only counts, states, stable reasons, and digests—not the hypothesis,
 role prose, artifact identities, lease owner, provider settings, or raw benchmark evidence.
 
-The intended Improvement Director cadence is one Codex automation tick every two hours. It remains
-manual and read-only with respect to Carl and GitHub in this phase: each tick may inspect scorecards,
-author a private proposal, record normalized review facts, and emit a simulated next action. Do not
-schedule candidate builds until phase three adds disposable worktrees, independent review
-execution, protected validation, and crash/rollback drills.
+The intended Improvement Director cadence is one Codex automation tick every two hours. Scheduling
+is not installed by this repository; an operator may run the phase-three commands below manually or
+from a separately governed Codex automation. A missed tick is safe because ledger events, Git refs,
+and draft PRs reconcile by immutable experiment and candidate identities.
+
+## Isolated candidate workflow
+
+Phase three is a prepare/edit/seal handoff. The controller creates a derived branch and disposable
+worktree at the manifest's exact parent. The active Codex task edits only the returned worktree.
+Deterministic code then rejects changes outside `target_surface`, inside `forbidden_surface`, or
+through symlinks and special files; runs every preregistered check; stores private evidence; and
+creates one exact-parent candidate commit.
+
+All control paths below must be absolute, outside the Carl repository, and owner-private. The check
+registry is trusted operator input, not model output. It maps manifest IDs to an absolute regular
+executable and fixed argv; no shell string is accepted:
+
+```json
+{
+  "checks": [
+    {
+      "argv": ["test", "--locked"],
+      "check_id": "cargo-test",
+      "environment": ["CARGO_HOME", "PATH", "RUSTUP_HOME"],
+      "executable": "/absolute/path/to/cargo",
+      "timeout_seconds": 1800,
+      "working_directory": "."
+    }
+  ],
+  "schema_version": 1
+}
+```
+
+After proposal quorum, acquire the phase-two lease and transition the experiment to `building`.
+Then prepare the candidate:
+
+```bash
+COMMON=(
+  --ledger "$CONTROL_ROOT/experiments.sqlite3"
+  --experiment-id exp-real-id
+  --repository /absolute/path/to/carl
+  --worktree-root "$CONTROL_ROOT/worktrees"
+  --artifacts "$CONTROL_ROOT/artifacts"
+  --remote origin
+  --expected-remote-url git@github.com:StephenBickel/carl-agent.git
+)
+
+uv run --project benchmarks --locked carl-bench candidate prepare \
+  "${COMMON[@]}" \
+  --stage-attempt-id prepare-exp-real-id-1 \
+  --occurred-at 2026-08-10T12:01:01Z \
+  --private-result "$CONTROL_ROOT/prepared.json"
+```
+
+The private result contains the worktree path and immutable builder request. Run the Codex builder
+in that worktree, write a bounded private implementation report, and seal:
+
+```bash
+uv run --project benchmarks --locked carl-bench candidate seal \
+  "${COMMON[@]}" \
+  --stage-attempt-id seal-exp-real-id-1 \
+  --occurred-at 2026-08-10T12:20:00Z \
+  --check-registry "$CONTROL_ROOT/checks.json" \
+  --report "$CONTROL_ROOT/implementation-report.json" \
+  --public-result "$CONTROL_ROOT/candidate.json"
+```
+
+Record the ordinary transitions to `deterministic_validation` and `paired_evaluation`, run the
+exact baseline and candidate scorecards, then bind the recomputed comparison:
+
+```bash
+uv run --project benchmarks --locked carl-bench candidate bind-comparison \
+  "${COMMON[@]}" \
+  --stage-attempt-id paired-exp-real-id-1 \
+  --occurred-at 2026-08-10T14:00:00Z \
+  --baseline "$CONTROL_ROOT/baseline.json" \
+  --candidate-scorecard "$CONTROL_ROOT/candidate-scorecard.json" \
+  --comparison-seed 41000 \
+  --public-result "$CONTROL_ROOT/paired.json"
+```
+
+Issue separate packets for `correctness`, `security`, `maintainability`, and
+`benchmark_integrity`. Run each reviewer in a read-only, independent Codex context, then call
+`record-review` with a unique reviewer ID, unique context ID, packet, verdict, and private report.
+All four roles must report; three approvals and no hard finding are required.
+
+`candidate status` reports only commit/evidence digests, counts, verdict totals, state, and next
+action. Once it says `open_draft_pr`, the operator may explicitly enable the narrow gateway:
+
+```bash
+uv run --project benchmarks --locked carl-bench candidate open-draft-pr \
+  "${COMMON[@]}" \
+  --stage-attempt-id draft-exp-real-id-1 \
+  --occurred-at 2026-08-10T15:00:00Z \
+  --repository-slug StephenBickel/carl-agent \
+  --base-branch main \
+  --gh-executable /absolute/path/to/gh \
+  --gateway-private-root "$CONTROL_ROOT/github" \
+  --gateway-env-name GH_TOKEN \
+  --public-result "$CONTROL_ROOT/draft.json" \
+  --enable-github-draft
+```
+
+The gateway pushes `<sealed-commit>:refs/heads/<derived-branch>` without force, creates or
+reconciles one open draft, and has no merge/auto-merge/ready/release operation. The builder never
+receives its environment. The experiment deliberately remains in `paired_evaluation` with next
+action `await_phase4_protected_validation`; a draft PR is not promotion evidence.
 
 ## Budget and proposal handoff
 
@@ -173,6 +276,6 @@ After a paired diagnostic, register an experiment manifest before editing Carl. 
 baseline commit, task digests, model and effort, seed range, observed failure cluster, one causal
 hypothesis, files allowed to change, primary metric, non-regression metrics, budget, and a falsifying
 prediction. Then record the three independent proposal reviews. Two approvals and no hard objection
-produce only `simulated_build_eligible`; this phase has no builder authority. The next layer is
-isolated candidate generation and independent review, followed by protected validation and the
-deterministic promotion controller as a separate later gate.
+allow the phase-three isolated builder to begin under the exclusive lease. A sealed candidate may
+reach a draft PR after paired evidence and local review, but protected validation and the
+deterministic promotion controller remain separate later gates.
