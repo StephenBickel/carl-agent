@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::de::Error as _;
+use serde::ser::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use std::fmt;
@@ -371,6 +372,11 @@ impl Serialize for Event {
     where
         S: Serializer,
     {
+        if let Self::TaskLifecycle { event, .. } = self {
+            event
+                .validate()
+                .map_err(|_| S::Error::custom("invalid task event metadata"))?;
+        }
         VersionedEventRef {
             schema_version: EVENT_SCHEMA_VERSION,
             payload: EventRef::from(self),

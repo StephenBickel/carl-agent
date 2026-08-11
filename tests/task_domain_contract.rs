@@ -93,6 +93,75 @@ fn apply(state: Option<TaskSnapshot>, sequence: u64, event: TaskEvent) -> TaskSn
     reduce_task(state, &envelope(sequence, task_id(), event)).unwrap()
 }
 
+fn reduce_events(events: &[TaskEvent]) -> Result<TaskSnapshot, TaskReduceErrorCode> {
+    events
+        .iter()
+        .cloned()
+        .enumerate()
+        .try_fold(None, |state, (index, event)| {
+            reduce_task(state, &envelope(index as u64 + 1, task_id(), event))
+                .map(Some)
+                .map_err(|error| error.code())
+        })
+        .map(Option::unwrap)
+}
+
+fn assert_every_replay_split_matches(events: &[TaskEvent]) {
+    for prefix_len in 1..=events.len() {
+        let expected = reduce_events(&events[..prefix_len]).unwrap();
+        for split in 0..=prefix_len {
+            let intermediate = if split == 0 {
+                None
+            } else {
+                Some(reduce_events(&events[..split]).unwrap())
+            };
+            let actual = events[split..prefix_len]
+                .iter()
+                .cloned()
+                .enumerate()
+                .try_fold(intermediate, |state, (offset, event)| {
+                    reduce_task(
+                        state,
+                        &envelope((split + offset + 1) as u64, task_id(), event),
+                    )
+                    .map(Some)
+                })
+                .map(Option::unwrap)
+                .unwrap();
+            assert_eq!(actual, expected, "prefix {prefix_len}, split {split}");
+        }
+    }
+}
+
+fn assert_invalid_replay_splits(events: &[TaskEvent], expected: TaskReduceErrorCode) {
+    assert_eq!(reduce_events(events).unwrap_err(), expected);
+    for split in 1..events.len() {
+        let intermediate = Some(reduce_events(&events[..split]).unwrap());
+        let error = events[split..]
+            .iter()
+            .cloned()
+            .enumerate()
+            .try_fold(intermediate, |state, (offset, event)| {
+                reduce_task(
+                    state,
+                    &envelope((split + offset + 1) as u64, task_id(), event),
+                )
+                .map(Some)
+            })
+            .unwrap_err();
+        assert_eq!(error.code(), expected, "split {split}");
+    }
+}
+
+fn lifecycle_json(task_event: serde_json::Value) -> serde_json::Value {
+    json!({
+        "schema_version": 4,
+        "type": "task_lifecycle",
+        "task_id": task_id(),
+        "event": task_event,
+    })
+}
+
 #[test]
 fn task_ids_round_trip_as_uuids_without_debug_disclosure() {
     let cases = [
@@ -284,6 +353,68 @@ fn task_lifecycle_is_a_v4_only_round_trip_event() {
     }))
     .unwrap_err();
     assert!(legacy_error.to_string().contains("unknown variant"));
+}
+
+#[test]
+fn task_event_metadata_is_bounded_on_decode_and_journal_encode() {
+    let invalid_events = [
+        lifecycle_json(json!({
+            "task_event": "epoch_started",
+            "epoch_id": epoch_id(),
+            "objective": "x".repeat(16 * 1024 + 1),
+        })),
+        lifecycle_json(json!({
+            "task_event": "state_transitioned",
+            "from": "queued",
+            "to": "active",
+            "reason": "line one\nline two",
+        })),
+        lifecycle_json(json!({
+            "task_event": "operation_intent_recorded",
+            "operation_id": operation_id(),
+            "epoch_id": epoch_id(),
+            "item_id": "i".repeat(129),
+            "effect_class": "idempotent_mutation",
+            "request_digest": "sha256:request",
+        })),
+        lifecycle_json(json!({
+            "task_event": "epoch_finished",
+            "epoch_id": epoch_id(),
+            "report_digest": "d".repeat(129),
+        })),
+        lifecycle_json(json!({
+            "task_event": "created",
+            "session_id": session_id(),
+            "workspace": "relative/workspace",
+            "contract": contract(1, ClauseStatus::Pending),
+            "budget": TaskBudget::default(),
+            "model": "gpt-5.6-sol",
+            "effort": "high",
+            "permission_mode": "bypassPermissions",
+        })),
+        lifecycle_json(json!({
+            "task_event": "operation_transitioned",
+            "operation_id": operation_id(),
+            "from": "started",
+            "to": "succeeded",
+            "evidence_sequences": (1..=257).collect::<Vec<u64>>(),
+        })),
+    ];
+
+    for invalid in invalid_events {
+        assert!(
+            serde_json::from_value::<Event>(invalid).is_err(),
+            "accepted unbounded task event metadata"
+        );
+    }
+
+    let invalid_programmatic_event = Event::TaskLifecycle {
+        task_id: task_id(),
+        event: TaskEvent::ProviderContextBound {
+            context_id: "c".repeat(129),
+        },
+    };
+    assert!(serde_json::to_value(invalid_programmatic_event).is_err());
 }
 
 #[test]
@@ -568,8 +699,118 @@ fn reducer_rejects_each_required_invalid_transition_with_stable_codes() {
 }
 
 #[test]
-fn generated_prefix_replay_matches_incremental_reduction_or_error_code() {
-    let valid = vec![
+fn safe_boundaries_reject_active_epochs_and_unresolved_operations() {
+    let active = apply(
+        Some(apply(None, 1, created())),
+        2,
+        TaskEvent::StateTransitioned {
+            from: TaskStatus::Queued,
+            to: TaskStatus::Active,
+            reason: "start".into(),
+        },
+    );
+    let epoch = apply(
+        Some(active.clone()),
+        3,
+        TaskEvent::EpochStarted {
+            epoch_id: epoch_id(),
+            objective: "safe boundary".into(),
+        },
+    );
+    let intent = apply(
+        Some(epoch.clone()),
+        4,
+        TaskEvent::OperationIntentRecorded {
+            operation_id: operation_id(),
+            epoch_id: epoch_id(),
+            item_id: "operation".into(),
+            effect_class: EffectClass::IdempotentMutation,
+            request_digest: "sha256:request".into(),
+        },
+    );
+    let started = apply(
+        Some(intent),
+        5,
+        TaskEvent::OperationTransitioned {
+            operation_id: operation_id(),
+            from: OperationStatus::IntentRecorded,
+            to: OperationStatus::Started,
+            evidence_sequences: vec![4, 5],
+        },
+    );
+
+    for event in [
+        TaskEvent::EpochFinished {
+            epoch_id: epoch_id(),
+            report_digest: "sha256:report".into(),
+        },
+        TaskEvent::CheckpointCommitted {
+            checkpoint_id: checkpoint_id(),
+            digest: "sha256:checkpoint".into(),
+        },
+    ] {
+        let error = reduce_task(Some(started.clone()), &envelope(6, task_id(), event)).unwrap_err();
+        assert_eq!(error.code(), TaskReduceErrorCode::UnsafeBoundary);
+    }
+
+    let checkpointed = apply(
+        Some(active.clone()),
+        3,
+        TaskEvent::CheckpointCommitted {
+            checkpoint_id: checkpoint_id(),
+            digest: "sha256:checkpoint".into(),
+        },
+    );
+    let compacting_epoch = apply(
+        Some(checkpointed),
+        4,
+        TaskEvent::EpochStarted {
+            epoch_id: epoch_id(),
+            objective: "unsafe compaction".into(),
+        },
+    );
+    let compaction_error = reduce_task(
+        Some(compacting_epoch),
+        &envelope(
+            5,
+            task_id(),
+            TaskEvent::CompactionCompleted {
+                generation: 1,
+                checkpoint_id: checkpoint_id(),
+                context_package_id: ContextPackageId::new(),
+            },
+        ),
+    )
+    .unwrap_err();
+    assert_eq!(compaction_error.code(), TaskReduceErrorCode::UnsafeBoundary);
+
+    let satisfied = apply(
+        Some(epoch),
+        4,
+        TaskEvent::ContractRevised {
+            contract: contract(2, ClauseStatus::Satisfied),
+        },
+    );
+    let completing = apply(
+        Some(satisfied),
+        5,
+        TaskEvent::StateTransitioned {
+            from: TaskStatus::Active,
+            to: TaskStatus::Completing,
+            reason: "premature".into(),
+        },
+    );
+    let completion_error = reduce_task(
+        Some(completing),
+        &envelope(6, task_id(), TaskEvent::Completed),
+    )
+    .unwrap_err();
+    assert_eq!(completion_error.code(), TaskReduceErrorCode::UnsafeBoundary);
+}
+
+#[test]
+fn operation_transitions_require_epoch_ownership_and_terminal_evidence() {
+    let events = vec![
         created(),
         TaskEvent::StateTransitioned {
             from: TaskStatus::Queued,
@@ -578,82 +819,305 @@ fn generated_prefix_replay_matches_incremental_reduction_or_error_code() {
         },
         TaskEvent::EpochStarted {
             epoch_id: epoch_id(),
-            objective: "bounded replay".into(),
+            objective: "evidence binding".into(),
         },
-        TaskEvent::UsageObserved {
+        TaskEvent::OperationIntentRecorded {
+            operation_id: operation_id(),
             epoch_id: epoch_id(),
-            total_tokens: 100,
-            context_window: Some(1_000),
+            item_id: "operation".into(),
+            effect_class: EffectClass::IdempotentMutation,
+            request_digest: "sha256:request".into(),
+        },
+        TaskEvent::OperationTransitioned {
+            operation_id: operation_id(),
+            from: OperationStatus::IntentRecorded,
+            to: OperationStatus::Started,
+            evidence_sequences: vec![4, 5],
+        },
+    ];
+    let started = reduce_events(&events).unwrap();
+
+    let missing = reduce_task(
+        Some(started.clone()),
+        &envelope(
+            6,
+            task_id(),
+            TaskEvent::OperationTransitioned {
+                operation_id: operation_id(),
+                from: OperationStatus::Started,
+                to: OperationStatus::Succeeded,
+                evidence_sequences: vec![],
+            },
+        ),
+    )
+    .unwrap_err();
+    assert_eq!(
+        missing.code(),
+        TaskReduceErrorCode::OperationEvidenceMissing
+    );
+
+    let future = reduce_task(
+        Some(started.clone()),
+        &envelope(
+            6,
+            task_id(),
+            TaskEvent::OperationTransitioned {
+                operation_id: operation_id(),
+                from: OperationStatus::Started,
+                to: OperationStatus::Succeeded,
+                evidence_sequences: vec![7],
+            },
+        ),
+    )
+    .unwrap_err();
+    assert_eq!(future.code(), TaskReduceErrorCode::InvalidOperationEvidence);
+
+    let unrelated = reduce_task(
+        Some(started.clone()),
+        &envelope(
+            6,
+            task_id(),
+            TaskEvent::OperationTransitioned {
+                operation_id: operation_id(),
+                from: OperationStatus::Started,
+                to: OperationStatus::Succeeded,
+                evidence_sequences: vec![1],
+            },
+        ),
+    )
+    .unwrap_err();
+    assert_eq!(
+        unrelated.code(),
+        TaskReduceErrorCode::InvalidOperationEvidence
+    );
+
+    let mut mismatched_json = serde_json::to_value(&started).unwrap();
+    mismatched_json["active_epoch"] = serde_json::to_value(EpochId::new()).unwrap();
+    let mismatched = serde_json::from_value::<TaskSnapshot>(mismatched_json).unwrap();
+    let ownership = reduce_task(
+        Some(mismatched),
+        &envelope(
+            6,
+            task_id(),
+            TaskEvent::OperationTransitioned {
+                operation_id: operation_id(),
+                from: OperationStatus::Started,
+                to: OperationStatus::Succeeded,
+                evidence_sequences: vec![5, 6],
+            },
+        ),
+    )
+    .unwrap_err();
+    assert_eq!(ownership.code(), TaskReduceErrorCode::EpochMismatch);
+
+    let succeeded = reduce_task(
+        Some(started),
+        &envelope(
+            6,
+            task_id(),
+            TaskEvent::OperationTransitioned {
+                operation_id: operation_id(),
+                from: OperationStatus::Started,
+                to: OperationStatus::Succeeded,
+                evidence_sequences: vec![5, 6],
+            },
+        ),
+    )
+    .unwrap();
+    assert_eq!(
+        succeeded.operation_status(operation_id()),
+        Some(OperationStatus::Succeeded)
+    );
+}
+
+#[test]
+fn generated_prefix_replay_matches_incremental_reduction_or_error_code() {
+    for terminal in [
+        OperationStatus::Succeeded,
+        OperationStatus::Failed,
+        OperationStatus::Cancelled,
+    ] {
+        let events = vec![
+            created(),
+            TaskEvent::StateTransitioned {
+                from: TaskStatus::Queued,
+                to: TaskStatus::Active,
+                reason: "start".into(),
+            },
+            TaskEvent::ProviderContextBound {
+                context_id: "provider-context".into(),
+            },
+            TaskEvent::EpochStarted {
+                epoch_id: epoch_id(),
+                objective: "bounded replay".into(),
+            },
+            TaskEvent::OperationIntentRecorded {
+                operation_id: operation_id(),
+                epoch_id: epoch_id(),
+                item_id: "operation".into(),
+                effect_class: EffectClass::IdempotentMutation,
+                request_digest: "sha256:request".into(),
+            },
+            TaskEvent::OperationTransitioned {
+                operation_id: operation_id(),
+                from: OperationStatus::IntentRecorded,
+                to: OperationStatus::Started,
+                evidence_sequences: vec![5, 6],
+            },
+            TaskEvent::OperationTransitioned {
+                operation_id: operation_id(),
+                from: OperationStatus::Started,
+                to: terminal,
+                evidence_sequences: vec![6, 7],
+            },
+            TaskEvent::UsageObserved {
+                epoch_id: epoch_id(),
+                total_tokens: 100,
+                context_window: Some(1_000),
+            },
+            TaskEvent::EpochFinished {
+                epoch_id: epoch_id(),
+                report_digest: "sha256:report".into(),
+            },
+            TaskEvent::CheckpointCommitted {
+                checkpoint_id: checkpoint_id(),
+                digest: "sha256:checkpoint".into(),
+            },
+            TaskEvent::CompactionRequested {
+                generation: 1,
+                reason: "context pressure".into(),
+            },
+            TaskEvent::CompactionCompleted {
+                generation: 1,
+                checkpoint_id: checkpoint_id(),
+                context_package_id: ContextPackageId::from_uuid(uuid(
+                    "66666666-6666-4666-8666-666666666666",
+                )),
+            },
+            TaskEvent::ProviderContextLost {
+                context_id: "provider-context".into(),
+                reason: "replacement".into(),
+            },
+            TaskEvent::ContractRevised {
+                contract: contract(2, ClauseStatus::Satisfied),
+            },
+            TaskEvent::StateTransitioned {
+                from: TaskStatus::Active,
+                to: TaskStatus::Completing,
+                reason: "verified".into(),
+            },
+            TaskEvent::Completed,
+        ];
+        assert_every_replay_split_matches(&events);
+    }
+
+    let reconciled = vec![
+        created(),
+        TaskEvent::StateTransitioned {
+            from: TaskStatus::Queued,
+            to: TaskStatus::Active,
+            reason: "start".into(),
+        },
+        TaskEvent::EpochStarted {
+            epoch_id: epoch_id(),
+            objective: "reconcile".into(),
+        },
+        TaskEvent::OperationIntentRecorded {
+            operation_id: operation_id(),
+            epoch_id: epoch_id(),
+            item_id: "operation".into(),
+            effect_class: EffectClass::AmbiguousConsequential,
+            request_digest: "sha256:request".into(),
+        },
+        TaskEvent::OperationTransitioned {
+            operation_id: operation_id(),
+            from: OperationStatus::IntentRecorded,
+            to: OperationStatus::Started,
+            evidence_sequences: vec![4, 5],
+        },
+        TaskEvent::OperationTransitioned {
+            operation_id: operation_id(),
+            from: OperationStatus::Started,
+            to: OperationStatus::Uncertain,
+            evidence_sequences: vec![5, 6],
+        },
+        TaskEvent::OperationTransitioned {
+            operation_id: operation_id(),
+            from: OperationStatus::Uncertain,
+            to: OperationStatus::Reconciled,
+            evidence_sequences: vec![6, 7],
         },
         TaskEvent::EpochFinished {
             epoch_id: epoch_id(),
             report_digest: "sha256:report".into(),
         },
-        TaskEvent::ContractRevised {
-            contract: contract(2, ClauseStatus::Satisfied),
+    ];
+    assert_every_replay_split_matches(&reconciled);
+
+    let cancellation_and_blocker = vec![
+        created(),
+        TaskEvent::StateTransitioned {
+            from: TaskStatus::Queued,
+            to: TaskStatus::Active,
+            reason: "start".into(),
+        },
+        TaskEvent::Blocked {
+            reason: "external dependency".into(),
         },
         TaskEvent::StateTransitioned {
-            from: TaskStatus::Active,
-            to: TaskStatus::Completing,
-            reason: "verified".into(),
+            from: TaskStatus::Blocked,
+            to: TaskStatus::Active,
+            reason: "dependency resolved".into(),
         },
-        TaskEvent::Completed,
+        TaskEvent::CancellationRequested,
+        TaskEvent::StateTransitioned {
+            from: TaskStatus::Cancelling,
+            to: TaskStatus::Cancelled,
+            reason: "cancelled safely".into(),
+        },
     ];
+    assert_every_replay_split_matches(&cancellation_and_blocker);
 
-    let envelopes: Vec<_> = valid
-        .into_iter()
-        .enumerate()
-        .map(|(index, event)| envelope(index as u64 + 1, task_id(), event))
-        .collect();
-
-    for prefix_len in 1..=envelopes.len() {
-        let replayed = envelopes[..prefix_len]
-            .iter()
-            .try_fold(None, |state, event| reduce_task(state, event).map(Some))
-            .map(Option::unwrap);
-
-        let split = prefix_len / 2;
-        let intermediate = envelopes[..split]
-            .iter()
-            .try_fold(None, |state, event| reduce_task(state, event).map(Some))
-            .unwrap();
-        let incremental = envelopes[split..prefix_len]
-            .iter()
-            .try_fold(intermediate.clone(), |state, event| {
-                reduce_task(state, event).map(Some)
-            })
-            .map(Option::unwrap);
-
-        assert_eq!(replayed, incremental);
-    }
-
-    for invalid_tail in [
-        TaskEvent::EpochStarted {
-            epoch_id: EpochId::new(),
-            objective: "late epoch".into(),
+    let invalid_missing_evidence = vec![
+        created(),
+        TaskEvent::StateTransitioned {
+            from: TaskStatus::Queued,
+            to: TaskStatus::Active,
+            reason: "start".into(),
         },
-        TaskEvent::ContractRevised {
-            contract: contract(1, ClauseStatus::Pending),
+        TaskEvent::EpochStarted {
+            epoch_id: epoch_id(),
+            objective: "invalid evidence".into(),
+        },
+        TaskEvent::OperationIntentRecorded {
+            operation_id: operation_id(),
+            epoch_id: epoch_id(),
+            item_id: "operation".into(),
+            effect_class: EffectClass::IdempotentMutation,
+            request_digest: "sha256:request".into(),
         },
         TaskEvent::OperationTransitioned {
-            operation_id: OperationId::new(),
+            operation_id: operation_id(),
+            from: OperationStatus::IntentRecorded,
+            to: OperationStatus::Started,
+            evidence_sequences: vec![4, 5],
+        },
+        TaskEvent::OperationTransitioned {
+            operation_id: operation_id(),
             from: OperationStatus::Started,
             to: OperationStatus::Succeeded,
             evidence_sequences: vec![],
         },
-    ] {
-        let base = &envelopes[..3];
-        let invalid = envelope(4, task_id(), invalid_tail);
-        let replay_error = base
-            .iter()
-            .chain(std::iter::once(&invalid))
-            .try_fold(None, |state, event| reduce_task(state, event).map(Some))
-            .unwrap_err();
-        let intermediate = base
-            .iter()
-            .try_fold(None, |state, event| reduce_task(state, event).map(Some))
-            .unwrap();
-        let incremental_error = reduce_task(intermediate, &invalid).unwrap_err();
-        assert_eq!(replay_error.code(), incremental_error.code());
-    }
+    ];
+    assert_invalid_replay_splits(
+        &invalid_missing_evidence,
+        TaskReduceErrorCode::OperationEvidenceMissing,
+    );
+
+    let mut invalid_boundary = invalid_missing_evidence[..5].to_vec();
+    invalid_boundary.push(TaskEvent::EpochFinished {
+        epoch_id: epoch_id(),
+        report_digest: "sha256:report".into(),
+    });
+    assert_invalid_replay_splits(&invalid_boundary, TaskReduceErrorCode::UnsafeBoundary);
 }

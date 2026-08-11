@@ -3,7 +3,7 @@ use thiserror::Error;
 
 use crate::events::{Event, EventEnvelope};
 
-use super::types::{OperationStatus, TaskEvent, TaskSnapshot, TaskStatus};
+use super::types::{OperationStatus, TaskEvent, TaskSnapshot, TaskStatus, TaskValidationErrorCode};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Error, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -36,6 +36,14 @@ pub enum TaskReduceErrorCode {
     OperationIntentMissing,
     #[error("operation transition is illegal")]
     IllegalOperationTransition,
+    #[error("operation terminal evidence is missing")]
+    OperationEvidenceMissing,
+    #[error("operation evidence is invalid")]
+    InvalidOperationEvidence,
+    #[error("task boundary is unsafe")]
+    UnsafeBoundary,
+    #[error("task event metadata is invalid")]
+    InvalidEventMetadata,
     #[error("checkpoint is missing")]
     CheckpointMissing,
     #[error("provider context does not match")]
@@ -64,6 +72,10 @@ impl TaskReduceErrorCode {
             Self::OperationAlreadyExists => "operation_already_exists",
             Self::OperationIntentMissing => "operation_intent_missing",
             Self::IllegalOperationTransition => "illegal_operation_transition",
+            Self::OperationEvidenceMissing => "operation_evidence_missing",
+            Self::InvalidOperationEvidence => "invalid_operation_evidence",
+            Self::UnsafeBoundary => "unsafe_boundary",
+            Self::InvalidEventMetadata => "invalid_event_metadata",
             Self::CheckpointMissing => "checkpoint_missing",
             Self::ProviderContextMismatch => "provider_context_mismatch",
             Self::RequiredClauseUnsatisfied => "required_clause_unsatisfied",
@@ -107,6 +119,13 @@ pub fn reduce_task(
         else {
             return Err(error(TaskReduceErrorCode::TaskNotCreated));
         };
+        event.validate().map_err(|validation| {
+            if validation.code() == TaskValidationErrorCode::InvalidWorkspace {
+                error(TaskReduceErrorCode::InvalidEventMetadata)
+            } else {
+                error(TaskReduceErrorCode::InvalidContract)
+            }
+        })?;
         if *session_id != envelope.session_id {
             return Err(error(TaskReduceErrorCode::SessionMismatch));
         }
@@ -132,6 +151,11 @@ pub fn reduce_task(
     }
     if matches!(event, TaskEvent::Created { .. }) {
         return Err(error(TaskReduceErrorCode::TaskAlreadyCreated));
+    }
+    if !matches!(event, TaskEvent::ContractRevised { .. }) {
+        event
+            .validate()
+            .map_err(|_| error(TaskReduceErrorCode::InvalidEventMetadata))?;
     }
 
     match event {
@@ -159,6 +183,9 @@ pub fn reduce_task(
         }
         TaskEvent::EpochFinished { epoch_id, .. } => {
             require_active_epoch(&state, *epoch_id)?;
+            if state.has_unresolved_operations() {
+                return Err(error(TaskReduceErrorCode::UnsafeBoundary));
+            }
             state.active_epoch = None;
         }
         TaskEvent::OperationIntentRecorded {
@@ -167,7 +194,10 @@ pub fn reduce_task(
             ..
         } => {
             require_active_epoch(&state, *epoch_id)?;
-            if state.insert_operation(*operation_id, *epoch_id).is_some() {
+            if state
+                .insert_operation(*operation_id, *epoch_id, envelope.sequence)
+                .is_some()
+            {
                 return Err(error(TaskReduceErrorCode::OperationAlreadyExists));
             }
         }
@@ -175,15 +205,31 @@ pub fn reduce_task(
             operation_id,
             from,
             to,
-            ..
+            evidence_sequences,
         } => {
-            let status = state
-                .operation_mut(*operation_id)
+            let (operation_epoch, status, last_transition_sequence) = state
+                .operation(*operation_id)
                 .ok_or_else(|| error(TaskReduceErrorCode::OperationIntentMissing))?;
-            if *status != *from || !legal_operation_edge(*from, *to) {
+            if state.active_epoch != Some(operation_epoch) {
+                return Err(error(TaskReduceErrorCode::EpochMismatch));
+            }
+            if status != *from || !legal_operation_edge(*from, *to) {
                 return Err(error(TaskReduceErrorCode::IllegalOperationTransition));
             }
-            *status = *to;
+            if to.requires_terminal_evidence() && evidence_sequences.is_empty() {
+                return Err(error(TaskReduceErrorCode::OperationEvidenceMissing));
+            }
+            if evidence_sequences
+                .iter()
+                .any(|sequence| *sequence > envelope.sequence)
+                || (to.requires_terminal_evidence()
+                    && !evidence_sequences
+                        .iter()
+                        .any(|sequence| *sequence > last_transition_sequence))
+            {
+                return Err(error(TaskReduceErrorCode::InvalidOperationEvidence));
+            }
+            state.set_operation_status(*operation_id, *to, envelope.sequence);
         }
         TaskEvent::UsageObserved { epoch_id, .. } => {
             require_active_epoch(&state, *epoch_id)?;
@@ -192,9 +238,11 @@ pub fn reduce_task(
         | TaskEvent::CompactionRequested { .. }
         | TaskEvent::SteeringQueued { .. } => {}
         TaskEvent::CheckpointCommitted { checkpoint_id, .. } => {
+            require_safe_boundary(&state)?;
             state.latest_checkpoint = Some(*checkpoint_id);
         }
         TaskEvent::CompactionCompleted { checkpoint_id, .. } => {
+            require_safe_boundary(&state)?;
             if state.latest_checkpoint != Some(*checkpoint_id) {
                 return Err(error(TaskReduceErrorCode::CheckpointMissing));
             }
@@ -217,6 +265,7 @@ pub fn reduce_task(
             transition_status(&mut state, from, TaskStatus::Blocked)?;
         }
         TaskEvent::Completed => {
+            require_safe_boundary(&state)?;
             if !state.contract.required_clauses_satisfied() {
                 return Err(error(TaskReduceErrorCode::RequiredClauseUnsatisfied));
             }
@@ -230,6 +279,13 @@ pub fn reduce_task(
         .checked_add(1)
         .ok_or_else(|| error(TaskReduceErrorCode::RevisionOverflow))?;
     Ok(state)
+}
+
+fn require_safe_boundary(state: &TaskSnapshot) -> Result<(), TaskReduceError> {
+    if state.active_epoch.is_some() || state.has_unresolved_operations() {
+        return Err(error(TaskReduceErrorCode::UnsafeBoundary));
+    }
+    Ok(())
 }
 
 fn require_active_epoch(

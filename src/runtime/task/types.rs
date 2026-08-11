@@ -1,9 +1,9 @@
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-use serde::de::Error as _;
+use serde::de::{Error as _, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
@@ -16,6 +16,9 @@ use crate::runtime::agent_port::{AgentEffectKind, AgentEffectRequest, AgentItem}
 const MAX_CONTRACT_TEXT_BYTES: usize = 16 * 1024;
 const MAX_CLAUSES: usize = 64;
 const MAX_CONSTRAINTS: usize = 128;
+const MAX_TASK_EVENT_TEXT_BYTES: usize = 16 * 1024;
+const MAX_TASK_EVENT_IDENTIFIER_BYTES: usize = 128;
+const MAX_TASK_EVENT_EVIDENCE_SEQUENCES: usize = 256;
 const DEFAULT_SOFT_EPOCH_SECONDS: u64 = 15 * 60;
 const DEFAULT_SOFT_EPOCH_TOOL_CALLS: u32 = 40;
 
@@ -217,6 +220,14 @@ pub enum TaskValidationErrorCode {
     TextTooLong,
     #[error("completion contract text contains control characters")]
     ControlCharacter,
+    #[error("task event field is empty")]
+    EmptyEventField,
+    #[error("task workspace is invalid")]
+    InvalidWorkspace,
+    #[error("task event contains too many evidence sequences")]
+    TooManyEvidenceSequences,
+    #[error("task event evidence sequence is invalid")]
+    InvalidEvidenceSequence,
 }
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
@@ -284,6 +295,21 @@ pub enum OperationStatus {
     Reconciled,
 }
 
+impl OperationStatus {
+    #[must_use]
+    pub const fn is_resolved(self) -> bool {
+        matches!(
+            self,
+            Self::Succeeded | Self::Failed | Self::Cancelled | Self::Reconciled
+        )
+    }
+
+    #[must_use]
+    pub const fn requires_terminal_evidence(self) -> bool {
+        !matches!(self, Self::IntentRecorded | Self::Started)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EffectClass {
@@ -317,6 +343,7 @@ impl Default for TaskBudget {
 struct OperationSnapshot {
     epoch_id: EpochId,
     status: OperationStatus,
+    last_transition_sequence: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -365,6 +392,7 @@ impl TaskSnapshot {
         &mut self,
         operation_id: OperationId,
         epoch_id: EpochId,
+        sequence: u64,
     ) -> Option<OperationStatus> {
         self.operations
             .insert(
@@ -372,18 +400,43 @@ impl TaskSnapshot {
                 OperationSnapshot {
                     epoch_id,
                     status: OperationStatus::IntentRecorded,
+                    last_transition_sequence: sequence,
                 },
             )
             .map(|operation| operation.status)
     }
 
-    pub(crate) fn operation_mut(
+    pub(crate) fn operation(
+        &self,
+        operation_id: OperationId,
+    ) -> Option<(EpochId, OperationStatus, u64)> {
+        self.operations.get(&operation_id).map(|operation| {
+            (
+                operation.epoch_id,
+                operation.status,
+                operation.last_transition_sequence,
+            )
+        })
+    }
+
+    pub(crate) fn set_operation_status(
         &mut self,
         operation_id: OperationId,
-    ) -> Option<&mut OperationStatus> {
-        self.operations
+        status: OperationStatus,
+        sequence: u64,
+    ) {
+        let operation = self
+            .operations
             .get_mut(&operation_id)
-            .map(|operation| &mut operation.status)
+            .expect("operation existence checked before transition");
+        operation.status = status;
+        operation.last_transition_sequence = sequence;
+    }
+
+    pub(crate) fn has_unresolved_operations(&self) -> bool {
+        self.operations
+            .values()
+            .any(|operation| !operation.status.is_resolved())
     }
 }
 
@@ -392,6 +445,7 @@ impl TaskSnapshot {
 pub enum TaskEvent {
     Created {
         session_id: SessionId,
+        #[serde(deserialize_with = "deserialize_workspace")]
         workspace: PathBuf,
         contract: CompletionContract,
         budget: TaskBudget,
@@ -402,6 +456,7 @@ pub enum TaskEvent {
     StateTransitioned {
         from: TaskStatus,
         to: TaskStatus,
+        #[serde(deserialize_with = "deserialize_event_text")]
         reason: String,
     },
     ContractRevised {
@@ -409,23 +464,28 @@ pub enum TaskEvent {
     },
     EpochStarted {
         epoch_id: EpochId,
+        #[serde(deserialize_with = "deserialize_event_text")]
         objective: String,
     },
     EpochFinished {
         epoch_id: EpochId,
+        #[serde(deserialize_with = "deserialize_event_identifier")]
         report_digest: String,
     },
     OperationIntentRecorded {
         operation_id: OperationId,
         epoch_id: EpochId,
+        #[serde(deserialize_with = "deserialize_event_identifier")]
         item_id: String,
         effect_class: EffectClass,
+        #[serde(deserialize_with = "deserialize_event_identifier")]
         request_digest: String,
     },
     OperationTransitioned {
         operation_id: OperationId,
         from: OperationStatus,
         to: OperationStatus,
+        #[serde(deserialize_with = "deserialize_evidence_sequences")]
         evidence_sequences: Vec<u64>,
     },
     UsageObserved {
@@ -434,15 +494,18 @@ pub enum TaskEvent {
         context_window: Option<u64>,
     },
     ProgressAssessed {
+        #[serde(deserialize_with = "deserialize_event_identifier")]
         fingerprint: String,
         stalled: bool,
     },
     CheckpointCommitted {
         checkpoint_id: CheckpointId,
+        #[serde(deserialize_with = "deserialize_event_identifier")]
         digest: String,
     },
     CompactionRequested {
         generation: u32,
+        #[serde(deserialize_with = "deserialize_event_text")]
         reason: String,
     },
     CompactionCompleted {
@@ -451,21 +514,198 @@ pub enum TaskEvent {
         context_package_id: ContextPackageId,
     },
     ProviderContextBound {
+        #[serde(deserialize_with = "deserialize_event_identifier")]
         context_id: String,
     },
     ProviderContextLost {
+        #[serde(deserialize_with = "deserialize_event_identifier")]
         context_id: String,
+        #[serde(deserialize_with = "deserialize_event_text")]
         reason: String,
     },
     SteeringQueued {
         steering_sequence: u64,
+        #[serde(deserialize_with = "deserialize_event_identifier")]
         text_digest: String,
     },
     CancellationRequested,
     Blocked {
+        #[serde(deserialize_with = "deserialize_event_text")]
         reason: String,
     },
     Completed,
+}
+
+impl TaskEvent {
+    pub fn validate(&self) -> Result<(), TaskValidationError> {
+        match self {
+            Self::Created {
+                workspace,
+                contract,
+                ..
+            } => {
+                validate_workspace(workspace)?;
+                contract.validate()
+            }
+            Self::StateTransitioned { reason, .. }
+            | Self::CompactionRequested { reason, .. }
+            | Self::Blocked { reason } => validate_event_text(reason),
+            Self::ContractRevised { contract } => contract.validate(),
+            Self::EpochStarted { objective, .. } => validate_event_text(objective),
+            Self::EpochFinished { report_digest, .. } => validate_event_identifier(report_digest),
+            Self::OperationIntentRecorded {
+                item_id,
+                request_digest,
+                ..
+            } => {
+                validate_event_identifier(item_id)?;
+                validate_event_identifier(request_digest)
+            }
+            Self::OperationTransitioned {
+                evidence_sequences, ..
+            } => validate_evidence_sequences(evidence_sequences),
+            Self::ProgressAssessed { fingerprint, .. } => validate_event_identifier(fingerprint),
+            Self::CheckpointCommitted { digest, .. } => validate_event_identifier(digest),
+            Self::ProviderContextBound { context_id } => validate_event_identifier(context_id),
+            Self::ProviderContextLost { context_id, reason } => {
+                validate_event_identifier(context_id)?;
+                validate_event_text(reason)
+            }
+            Self::SteeringQueued { text_digest, .. } => validate_event_identifier(text_digest),
+            Self::UsageObserved { .. }
+            | Self::CompactionCompleted { .. }
+            | Self::CancellationRequested
+            | Self::Completed => Ok(()),
+        }
+    }
+}
+
+fn validate_event_text(value: &str) -> Result<(), TaskValidationError> {
+    validate_event_string(value, MAX_TASK_EVENT_TEXT_BYTES)
+}
+
+fn validate_event_identifier(value: &str) -> Result<(), TaskValidationError> {
+    validate_event_string(value, MAX_TASK_EVENT_IDENTIFIER_BYTES)
+}
+
+fn validate_event_string(value: &str, max_bytes: usize) -> Result<(), TaskValidationError> {
+    if value.trim().is_empty() {
+        return Err(TaskValidationError::from_code(
+            TaskValidationErrorCode::EmptyEventField,
+        ));
+    }
+    if value.len() > max_bytes {
+        return Err(TaskValidationError::from_code(
+            TaskValidationErrorCode::TextTooLong,
+        ));
+    }
+    if value.chars().any(char::is_control) {
+        return Err(TaskValidationError::from_code(
+            TaskValidationErrorCode::ControlCharacter,
+        ));
+    }
+    Ok(())
+}
+
+fn validate_workspace(workspace: &Path) -> Result<(), TaskValidationError> {
+    let Some(workspace_text) = workspace.to_str() else {
+        return Err(TaskValidationError::from_code(
+            TaskValidationErrorCode::InvalidWorkspace,
+        ));
+    };
+    if !workspace.has_root()
+        || workspace_text.len() > MAX_TASK_EVENT_TEXT_BYTES
+        || workspace_text.chars().any(char::is_control)
+    {
+        return Err(TaskValidationError::from_code(
+            TaskValidationErrorCode::InvalidWorkspace,
+        ));
+    }
+    Ok(())
+}
+
+fn validate_evidence_sequences(sequences: &[u64]) -> Result<(), TaskValidationError> {
+    if sequences.len() > MAX_TASK_EVENT_EVIDENCE_SEQUENCES {
+        return Err(TaskValidationError::from_code(
+            TaskValidationErrorCode::TooManyEvidenceSequences,
+        ));
+    }
+    if sequences.first() == Some(&0) || sequences.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err(TaskValidationError::from_code(
+            TaskValidationErrorCode::InvalidEvidenceSequence,
+        ));
+    }
+    Ok(())
+}
+
+fn deserialize_event_text<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    validate_event_text(&value).map_err(|_| D::Error::custom("invalid task event text"))?;
+    Ok(value)
+}
+
+fn deserialize_event_identifier<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    validate_event_identifier(&value)
+        .map_err(|_| D::Error::custom("invalid task event identifier"))?;
+    Ok(value)
+}
+
+fn deserialize_workspace<'de, D>(deserializer: D) -> Result<PathBuf, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = PathBuf::deserialize(deserializer)?;
+    validate_workspace(&value).map_err(|_| D::Error::custom("invalid task workspace"))?;
+    Ok(value)
+}
+
+fn deserialize_evidence_sequences<'de, D>(deserializer: D) -> Result<Vec<u64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserializer.deserialize_seq(EvidenceSequencesVisitor)
+}
+
+struct EvidenceSequencesVisitor;
+
+impl<'de> Visitor<'de> for EvidenceSequencesVisitor {
+    type Value = Vec<u64>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a bounded ordered list of task evidence sequences")
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let capacity = sequence
+            .size_hint()
+            .unwrap_or(0)
+            .min(MAX_TASK_EVENT_EVIDENCE_SEQUENCES);
+        let mut values = Vec::with_capacity(capacity);
+        while let Some(value) = sequence.next_element::<u64>()? {
+            if values.len() == MAX_TASK_EVENT_EVIDENCE_SEQUENCES {
+                return Err(A::Error::custom(
+                    "task event contains too many evidence sequences",
+                ));
+            }
+            if value == 0 || values.last().is_some_and(|previous| *previous >= value) {
+                return Err(A::Error::custom(
+                    "task event evidence sequences are not strictly ordered",
+                ));
+            }
+            values.push(value);
+        }
+        Ok(values)
+    }
 }
 
 #[must_use]
