@@ -11,6 +11,7 @@ use uuid::Uuid;
 use crate::acp::PermissionMode;
 use crate::delegates::{ModelId, ReasoningEffort};
 use crate::events::SessionId;
+use crate::policy::Sha256Digest;
 use crate::runtime::agent_port::{AgentEffectKind, AgentEffectRequest, AgentItem};
 
 use super::progress::{RecoveryAttemptOutcome, RecoveryStrategy};
@@ -456,6 +457,8 @@ struct OperationSnapshot {
     status: OperationStatus,
     last_transition_sequence: u64,
     #[serde(default)]
+    postcondition_digest: Option<Sha256Digest>,
+    #[serde(default)]
     evidence: OperationEvidenceState,
 }
 
@@ -525,6 +528,7 @@ impl TaskSnapshot {
                     epoch_id,
                     status: OperationStatus::IntentRecorded,
                     last_transition_sequence: sequence,
+                    postcondition_digest: None,
                     evidence: OperationEvidenceState::default(),
                 },
             )
@@ -542,6 +546,23 @@ impl TaskSnapshot {
                 operation.last_transition_sequence,
             )
         })
+    }
+
+    pub(crate) fn bind_operation_postcondition(
+        &mut self,
+        operation_id: OperationId,
+        postcondition_digest: Sha256Digest,
+    ) -> bool {
+        let Some(operation) = self.operations.get_mut(&operation_id) else {
+            return false;
+        };
+        if operation.status != OperationStatus::IntentRecorded
+            || operation.postcondition_digest.is_some()
+        {
+            return false;
+        }
+        operation.postcondition_digest = Some(postcondition_digest);
+        true
     }
 
     pub(crate) fn pending_recovery(&self) -> Option<&(EpochId, RecoveryStrategy, String)> {
@@ -684,6 +705,10 @@ pub enum TaskEvent {
         #[serde(deserialize_with = "deserialize_event_identifier")]
         request_digest: String,
     },
+    OperationPostconditionBound {
+        operation_id: OperationId,
+        postcondition_digest: Sha256Digest,
+    },
     OperationTransitioned {
         operation_id: OperationId,
         from: OperationStatus,
@@ -753,6 +778,13 @@ pub enum TaskEvent {
         #[serde(deserialize_with = "deserialize_event_identifier")]
         text_digest: String,
     },
+    BackgroundProcessTerminationRecorded {
+        #[serde(deserialize_with = "deserialize_event_identifier")]
+        process_id: String,
+        #[serde(deserialize_with = "deserialize_event_identifier")]
+        item_id: String,
+        terminated: bool,
+    },
     CancellationRequested,
     Blocked {
         #[serde(deserialize_with = "deserialize_event_text")]
@@ -792,6 +824,7 @@ impl TaskEvent {
                 validate_event_identifier(item_id)?;
                 validate_event_identifier(request_digest)
             }
+            Self::OperationPostconditionBound { .. } => Ok(()),
             Self::OperationTransitioned {
                 evidence_sequences, ..
             } => validate_evidence_sequences(evidence_sequences),
@@ -843,6 +876,14 @@ impl TaskEvent {
                 validate_event_text(reason)
             }
             Self::SteeringQueued { text_digest, .. } => validate_event_identifier(text_digest),
+            Self::BackgroundProcessTerminationRecorded {
+                process_id,
+                item_id,
+                ..
+            } => {
+                validate_event_identifier(process_id)?;
+                validate_event_identifier(item_id)
+            }
             Self::UsageObserved { .. }
             | Self::CompactionCompleted { .. }
             | Self::CancellationRequested

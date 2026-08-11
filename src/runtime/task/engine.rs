@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use chrono::{TimeDelta, Utc};
@@ -12,11 +12,11 @@ use tokio::sync::mpsc;
 use crate::acp::{PermissionMode, PermissionProfile};
 use crate::delegates::{ModelId, ReasoningEffort};
 use crate::events::{SessionId, ToolCallId, TurnId};
-use crate::policy::ActorId;
+use crate::policy::{ActorId, Sha256Digest};
 use crate::runtime::agent_port::{
     AgentContextId, AgentEffectRequest, AgentEpochId, AgentErrorProvenance, AgentEvent, AgentItem,
-    AgentPort, AgentPortError, AgentPortErrorCode, AgentUsage, ContextRecovery, EffectDecision,
-    ResumeAgentContext, StartAgentContext, StartAgentEpoch,
+    AgentPort, AgentPortError, AgentPortErrorCode, AgentProcess, AgentUsage, ContextRecovery,
+    EffectDecision, ResumeAgentContext, StartAgentContext, StartAgentEpoch,
 };
 use crate::security::SecretFilter;
 use crate::storage::{
@@ -209,6 +209,10 @@ struct RuntimeTask {
     progress: Vec<ProgressAssessment>,
     recovery_attempts: Vec<RecoveryAttempt>,
     pending_recovery: Option<PendingRecovery>,
+    fresh_context_diagnosis: bool,
+    provider_replacement_needed: bool,
+    running_processes: Vec<AgentProcess>,
+    provider_ready: bool,
     steering: VecDeque<String>,
     steering_sequence: u64,
     operation_evidence: Vec<OperationEvidence>,
@@ -374,6 +378,81 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
         self.frontend_context = Some(context);
     }
 
+    pub async fn reconcile_startup(&mut self) -> Result<Vec<TaskId>, TaskEngineError> {
+        let task_ids = self
+            .store()
+            .list_resumable_tasks()
+            .map_err(storage_error)?
+            .into_iter()
+            .map(|record| record.snapshot.task_id)
+            .collect::<Vec<_>>();
+        let mut prepared = Vec::new();
+        for task_id in task_ids {
+            match self.prepare_startup_task(task_id).await {
+                Ok(true) => prepared.push(task_id),
+                Ok(false) => {}
+                Err(error)
+                    if matches!(
+                        error.code(),
+                        TaskEngineErrorCode::Blocked | TaskEngineErrorCode::Cancelled
+                    ) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(prepared)
+    }
+
+    async fn prepare_startup_task(&mut self, task_id: TaskId) -> Result<bool, TaskEngineError> {
+        let mut record = self
+            .store()
+            .get_task(task_id)
+            .map_err(storage_error)?
+            .ok_or_else(invalid_task)?;
+        if record.snapshot.status.is_terminal()
+            || matches!(
+                record.snapshot.status,
+                TaskStatus::Blocked | TaskStatus::Cancelling
+            )
+        {
+            return Ok(false);
+        }
+        let mut provider_ready = false;
+        if record.snapshot.status == TaskStatus::Queued {
+            self.activate_queued_task(task_id).await?;
+            provider_ready = true;
+            record = self
+                .store()
+                .get_task(task_id)
+                .map_err(storage_error)?
+                .ok_or_else(invalid_task)?;
+        }
+        if record.snapshot.active_epoch.is_some() {
+            if self.reconcile_abandoned_epoch(task_id).await? {
+                return Ok(false);
+            }
+            record = self
+                .store()
+                .get_task(task_id)
+                .map_err(storage_error)?
+                .ok_or_else(invalid_task)?;
+        }
+        let mut runtime = self.rehydrate_runtime(task_id, &record.snapshot)?;
+        runtime.provider_ready = provider_ready;
+        if record.snapshot.status == TaskStatus::Checkpointing
+            && let Some(result) = self.recover_checkpointing(task_id, &runtime)?
+        {
+            return match result {
+                Ok(_) => Ok(false),
+                Err(error) => Err(error),
+            };
+        }
+        if !runtime.provider_ready {
+            self.resume_provider_context(task_id, &mut runtime).await?;
+        }
+        self.tasks.insert(task_id, runtime);
+        Ok(true)
+    }
+
     pub async fn start(&mut self, input: StartTask) -> Result<TaskSnapshot, TaskEngineError> {
         validate_start(&input)?;
         let context_id = self
@@ -442,6 +521,10 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
             progress: Vec::new(),
             recovery_attempts: Vec::new(),
             pending_recovery: None,
+            fresh_context_diagnosis: false,
+            provider_replacement_needed: false,
+            running_processes: Vec::new(),
+            provider_ready: true,
             steering: VecDeque::new(),
             steering_sequence: 0,
             operation_evidence: Vec::new(),
@@ -464,7 +547,7 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
     }
 
     pub async fn run(&mut self, task_id: TaskId) -> Result<TaskSnapshot, TaskEngineError> {
-        let record = self
+        let mut record = self
             .store()
             .get_task(task_id)
             .map_err(storage_error)?
@@ -478,8 +561,29 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
         if record.snapshot.status == TaskStatus::Blocked {
             return Err(error(TaskEngineErrorCode::Blocked));
         }
+        let mut provider_ready = false;
+        if record.snapshot.status == TaskStatus::Queued {
+            self.activate_queued_task(task_id).await?;
+            provider_ready = true;
+            record = self
+                .store()
+                .get_task(task_id)
+                .map_err(storage_error)?
+                .ok_or_else(invalid_task)?;
+        }
+        if record.snapshot.active_epoch.is_some() {
+            if self.reconcile_abandoned_epoch(task_id).await? {
+                return Err(error(TaskEngineErrorCode::Blocked));
+            }
+            record = self
+                .store()
+                .get_task(task_id)
+                .map_err(storage_error)?
+                .ok_or_else(invalid_task)?;
+        }
         if !self.tasks.contains_key(&task_id) {
-            let runtime = self.rehydrate_runtime(task_id, &record.snapshot)?;
+            let mut runtime = self.rehydrate_runtime(task_id, &record.snapshot)?;
+            runtime.provider_ready = provider_ready;
             self.tasks.insert(task_id, runtime);
         }
         let mut runtime = self.tasks.remove(&task_id).ok_or_else(invalid_task)?;
@@ -491,10 +595,411 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
         let result = if let Some(result) = recovered {
             result
         } else {
-            self.run_loop(task_id, &mut runtime).await
+            if runtime.provider_ready {
+                self.run_loop(task_id, &mut runtime).await
+            } else {
+                match self.resume_provider_context(task_id, &mut runtime).await {
+                    Ok(()) => self.run_loop(task_id, &mut runtime).await,
+                    Err(error) => Err(error),
+                }
+            }
         };
         self.tasks.insert(task_id, runtime);
         result
+    }
+
+    async fn activate_queued_task(&mut self, task_id: TaskId) -> Result<(), TaskEngineError> {
+        let configuration = self
+            .store()
+            .read_task_events(task_id)
+            .map_err(storage_error)?
+            .into_iter()
+            .find_map(|envelope| match envelope.event {
+                crate::events::Event::TaskLifecycle {
+                    event:
+                        TaskEvent::Created {
+                            workspace,
+                            model,
+                            permission_mode,
+                            ..
+                        },
+                    ..
+                } => Some((workspace, model, permission_mode)),
+                _ => None,
+            })
+            .ok_or_else(invalid_task)?;
+        let context_id = self
+            .port
+            .start_context(StartAgentContext {
+                cwd: configuration.0,
+                model: configuration.1,
+                permission_mode: configuration.2,
+            })
+            .await
+            .map_err(provider_error)?;
+        self.append(
+            task_id,
+            TaskEvent::StateTransitioned {
+                from: TaskStatus::Queued,
+                to: TaskStatus::Active,
+                reason: "startup activated a durable queued task".to_owned(),
+            },
+        )?;
+        self.append(
+            task_id,
+            TaskEvent::ProviderContextBound {
+                context_id: context_id.as_str().to_owned(),
+            },
+        )?;
+        Ok(())
+    }
+
+    async fn resume_provider_context(
+        &mut self,
+        task_id: TaskId,
+        runtime: &mut RuntimeTask,
+    ) -> Result<(), TaskEngineError> {
+        let request = ResumeAgentContext {
+            context_id: runtime.context_id.clone(),
+            cwd: runtime.workspace.clone(),
+            model: runtime.model.clone(),
+            permission_mode: runtime.permission_mode,
+        };
+        if runtime.provider_replacement_needed {
+            let context_package = self.assemble_recovery_context_package(task_id, runtime)?;
+            let ContextRecovery::Replaced(context_id) = self
+                .port
+                .replace_context(request, &context_package)
+                .await
+                .map_err(provider_error)?
+            else {
+                return Err(error(TaskEngineErrorCode::Provider));
+            };
+            self.append(
+                task_id,
+                TaskEvent::ProviderContextBound {
+                    context_id: context_id.as_str().to_owned(),
+                },
+            )?;
+            runtime.context_id = context_id;
+            runtime.provider_replacement_needed = false;
+            runtime.fresh_context_diagnosis = true;
+            self.updates.push(TaskEngineUpdate::RecoveryStrategy {
+                task_id,
+                strategy: RecoveryStrategy::FreshContextDiagnosis,
+            });
+            self.reconcile_background_processes(task_id, runtime)
+                .await?;
+            runtime.provider_ready = true;
+            return Ok(());
+        }
+        match self.port.resume_context(request.clone()).await {
+            Ok(context_id) => {
+                runtime.context_id = context_id;
+                self.reconcile_background_processes(task_id, runtime)
+                    .await?;
+                runtime.provider_ready = true;
+                Ok(())
+            }
+            Err(port_error) if port_error.code() == AgentPortErrorCode::UnavailableContext => {
+                let context_package = self.assemble_recovery_context_package(task_id, runtime)?;
+                self.append(
+                    task_id,
+                    TaskEvent::ProviderContextLost {
+                        context_id: request.context_id.as_str().to_owned(),
+                        reason: "provider reported the durable context unavailable".to_owned(),
+                    },
+                )?;
+                let ContextRecovery::Replaced(context_id) = self
+                    .port
+                    .replace_context(request, &context_package)
+                    .await
+                    .map_err(provider_error)?
+                else {
+                    return Err(error(TaskEngineErrorCode::Provider));
+                };
+                self.append(
+                    task_id,
+                    TaskEvent::ProviderContextBound {
+                        context_id: context_id.as_str().to_owned(),
+                    },
+                )?;
+                runtime.context_id = context_id;
+                runtime.provider_replacement_needed = false;
+                runtime.fresh_context_diagnosis = true;
+                self.updates.push(TaskEngineUpdate::RecoveryStrategy {
+                    task_id,
+                    strategy: RecoveryStrategy::FreshContextDiagnosis,
+                });
+                self.reconcile_background_processes(task_id, runtime)
+                    .await?;
+                runtime.provider_ready = true;
+                Ok(())
+            }
+            Err(port_error) => Err(provider_error(port_error)),
+        }
+    }
+
+    async fn reconcile_background_processes(
+        &mut self,
+        task_id: TaskId,
+        runtime: &mut RuntimeTask,
+    ) -> Result<(), TaskEngineError> {
+        let expected = runtime
+            .previous_checkpoint
+            .as_ref()
+            .map_or_else(Vec::new, |checkpoint| checkpoint.running_processes.clone());
+        if expected.is_empty() {
+            runtime.running_processes.clear();
+            return Ok(());
+        }
+        if !self.port.capabilities().background_processes {
+            self.block_task(
+                task_id,
+                &format!(
+                    "background process reconciliation is uncertain: {}",
+                    expected[0].process_id
+                ),
+            )?;
+            return Err(error(TaskEngineErrorCode::Blocked));
+        }
+        let observed = self
+            .port
+            .list_background_processes(&runtime.context_id)
+            .await
+            .map_err(provider_error)?;
+        if observed.iter().any(|process| process.validate().is_err()) {
+            self.block_task(task_id, "provider returned an invalid background process")?;
+            return Err(error(TaskEngineErrorCode::Blocked));
+        }
+        let mut recovered = Vec::with_capacity(expected.len());
+        for checkpoint in &expected {
+            let matches = observed
+                .iter()
+                .filter(|process| {
+                    process.process_id == checkpoint.process_id
+                        && process.item_id == checkpoint.item_id
+                        && sha256(process.command.as_bytes()) == checkpoint.command_digest
+                        && sha256(process.cwd.as_os_str().as_encoded_bytes())
+                            == checkpoint.cwd_digest
+                })
+                .collect::<Vec<_>>();
+            if matches.len() != 1 {
+                self.block_task(
+                    task_id,
+                    &format!(
+                        "background process reconciliation is uncertain: {}",
+                        checkpoint.process_id
+                    ),
+                )?;
+                return Err(error(TaskEngineErrorCode::Blocked));
+            }
+            recovered.push((*matches[0]).clone());
+        }
+        runtime.running_processes = recovered;
+        Ok(())
+    }
+
+    async fn reconcile_abandoned_epoch(
+        &mut self,
+        task_id: TaskId,
+    ) -> Result<bool, TaskEngineError> {
+        let snapshot = self.snapshot(task_id)?;
+        let epoch_id = snapshot.active_epoch.ok_or_else(invalid_task)?;
+        let mut operations = BTreeMap::new();
+        let mut workspace = None;
+        for envelope in self
+            .store()
+            .read_task_events(task_id)
+            .map_err(storage_error)?
+        {
+            let crate::events::Event::TaskLifecycle { event, .. } = envelope.event else {
+                return Err(error(TaskEngineErrorCode::Storage));
+            };
+            match event {
+                TaskEvent::Created {
+                    workspace: created_workspace,
+                    ..
+                } => workspace = Some(created_workspace),
+                TaskEvent::OperationIntentRecorded {
+                    operation_id,
+                    effect_class,
+                    item_id,
+                    ..
+                } => {
+                    operations.insert(operation_id, (effect_class, item_id, None));
+                }
+                TaskEvent::OperationPostconditionBound {
+                    operation_id,
+                    postcondition_digest,
+                } => {
+                    let Some((_, _, bound)) = operations.get_mut(&operation_id) else {
+                        return Err(error(TaskEngineErrorCode::Storage));
+                    };
+                    if bound.replace(postcondition_digest).is_some() {
+                        return Err(error(TaskEngineErrorCode::Storage));
+                    }
+                }
+                _ => {}
+            }
+        }
+        let workspace = workspace.ok_or_else(invalid_task)?;
+        let mut uncertain = Vec::new();
+        for (operation_id, (effect_class, item_id, postcondition_digest)) in operations {
+            let Some(status) = self.snapshot(task_id)?.operation_status(operation_id) else {
+                return Err(error(TaskEngineErrorCode::Storage));
+            };
+            match status {
+                OperationStatus::IntentRecorded => {
+                    self.append(
+                        task_id,
+                        TaskEvent::OperationTransitioned {
+                            operation_id,
+                            from: OperationStatus::IntentRecorded,
+                            to: OperationStatus::Started,
+                            evidence_sequences: Vec::new(),
+                        },
+                    )?;
+                    self.close_operation_with_evidence(
+                        task_id,
+                        operation_id,
+                        OperationStatus::Failed,
+                        "restart proved that the recorded intent was not dispatched",
+                    )?;
+                    continue;
+                }
+                OperationStatus::Started => {
+                    self.close_operation_with_evidence(
+                        task_id,
+                        operation_id,
+                        OperationStatus::Uncertain,
+                        "restart abandoned an active operation",
+                    )?;
+                }
+                OperationStatus::Uncertain => {}
+                OperationStatus::Succeeded
+                | OperationStatus::Failed
+                | OperationStatus::Cancelled
+                | OperationStatus::Reconciled => continue,
+            }
+            match effect_class {
+                super::EffectClass::Observation => {
+                    self.reconcile_observation(task_id, operation_id)?;
+                }
+                super::EffectClass::IdempotentMutation => {
+                    if !self
+                        .reconcile_idempotent_postcondition(
+                            task_id,
+                            operation_id,
+                            &workspace,
+                            &item_id,
+                            postcondition_digest.as_ref(),
+                        )
+                        .await?
+                    {
+                        uncertain.push(operation_id);
+                    }
+                }
+                super::EffectClass::AmbiguousConsequential => uncertain.push(operation_id),
+            }
+        }
+        self.append(
+            task_id,
+            TaskEvent::EpochFinished {
+                epoch_id,
+                report_digest: sha256(b"restart-reconciled-abandoned-epoch"),
+            },
+        )?;
+        if uncertain.is_empty() {
+            return Ok(false);
+        }
+        let exact_ids = uncertain
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        self.block_task(
+            task_id,
+            &format!("restart blocked uncertain operations: {exact_ids}"),
+        )?;
+        Ok(true)
+    }
+
+    async fn reconcile_idempotent_postcondition(
+        &mut self,
+        task_id: TaskId,
+        operation_id: OperationId,
+        workspace: &Path,
+        item_id: &str,
+        postcondition_digest: Option<&Sha256Digest>,
+    ) -> Result<bool, TaskEngineError> {
+        let Some(postcondition_digest) = postcondition_digest else {
+            self.append(
+                task_id,
+                TaskEvent::OperationEvidenceRecorded {
+                    operation_id,
+                    result_digest: sha256(b"restart-postcondition-not-bound"),
+                },
+            )?;
+            return Ok(false);
+        };
+        let expected = *postcondition_digest;
+        let observed = self
+            .port
+            .inspect_effect_postcondition(workspace, item_id, &expected)
+            .await
+            .ok()
+            .flatten();
+        let result_digest = observed.map_or_else(
+            || sha256(b"restart-postcondition-inspection-unavailable"),
+            |digest| digest.to_string(),
+        );
+        self.append(
+            task_id,
+            TaskEvent::OperationEvidenceRecorded {
+                operation_id,
+                result_digest,
+            },
+        )?;
+        let evidence_sequence = self.last_task_sequence(task_id)?;
+        if observed != Some(expected) {
+            return Ok(false);
+        }
+        self.append(
+            task_id,
+            TaskEvent::OperationTransitioned {
+                operation_id,
+                from: OperationStatus::Uncertain,
+                to: OperationStatus::Reconciled,
+                evidence_sequences: vec![evidence_sequence],
+            },
+        )?;
+        Ok(true)
+    }
+
+    fn reconcile_observation(
+        &mut self,
+        task_id: TaskId,
+        operation_id: OperationId,
+    ) -> Result<(), TaskEngineError> {
+        self.append(
+            task_id,
+            TaskEvent::OperationEvidenceRecorded {
+                operation_id,
+                result_digest: sha256(b"restart-observation-may-use-a-new-operation-id"),
+            },
+        )?;
+        let evidence_sequence = self.last_task_sequence(task_id)?;
+        self.append(
+            task_id,
+            TaskEvent::OperationTransitioned {
+                operation_id,
+                from: OperationStatus::Uncertain,
+                to: OperationStatus::Reconciled,
+                evidence_sequences: vec![evidence_sequence],
+            },
+        )?;
+        Ok(())
     }
 
     fn recover_checkpointing(
@@ -593,6 +1098,53 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
         }
         if record.snapshot.status.is_terminal() {
             return Err(invalid_task());
+        }
+        if !self.tasks.contains_key(&task_id) {
+            let mut runtime = self.rehydrate_runtime(task_id, &record.snapshot)?;
+            let recovery = self.resume_provider_context(task_id, &mut runtime).await;
+            self.tasks.insert(task_id, runtime);
+            recovery?;
+        }
+        let processes = self
+            .tasks
+            .get(&task_id)
+            .ok_or_else(invalid_task)?
+            .running_processes
+            .clone();
+        for process in processes {
+            let terminated = self
+                .port
+                .terminate_background_process(
+                    &self
+                        .tasks
+                        .get(&task_id)
+                        .ok_or_else(invalid_task)?
+                        .context_id,
+                    &process.process_id,
+                )
+                .await
+                .map_err(provider_error)?;
+            self.append(
+                task_id,
+                TaskEvent::BackgroundProcessTerminationRecorded {
+                    process_id: process.process_id.clone(),
+                    item_id: process.item_id.clone(),
+                    terminated,
+                },
+            )?;
+            if !terminated {
+                self.block_task(
+                    task_id,
+                    &format!(
+                        "background process cleanup was not confirmed: {}",
+                        process.process_id
+                    ),
+                )?;
+                return Err(error(TaskEngineErrorCode::Blocked));
+            }
+        }
+        if let Some(runtime) = self.tasks.get_mut(&task_id) {
+            runtime.running_processes.clear();
         }
         let logical_epoch_id = record.snapshot.active_epoch;
         let started_operation_ids = record.snapshot.started_operation_ids();
@@ -1005,7 +1557,7 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                 objective: objective.clone(),
             });
             let provider_input = self.assemble_epoch_context(task_id, runtime, &objective)?;
-            let purpose = if runtime.pending_recovery.is_some() {
+            let purpose = if runtime.pending_recovery.is_some() || runtime.fresh_context_diagnosis {
                 ProviderRequestPurpose::Recovery
             } else {
                 ProviderRequestPurpose::Work
@@ -1081,6 +1633,7 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                     report_digest: sha256(epoch_output.transcript.as_bytes()),
                 },
             )?;
+            runtime.fresh_context_diagnosis = false;
             if let Some(pending) = runtime
                 .pending_recovery
                 .take()
@@ -1526,6 +2079,41 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
             })
             .map_err(|_| error(TaskEngineErrorCode::Context))?;
         Ok(package.rendered)
+    }
+
+    fn assemble_recovery_context_package(
+        &self,
+        task_id: TaskId,
+        runtime: &RuntimeTask,
+    ) -> Result<super::ContextPackage, TaskEngineError> {
+        let checkpoint = match &runtime.previous_checkpoint {
+            Some(checkpoint) => checkpoint.clone(),
+            None => {
+                let objective = recovery_objective(runtime);
+                let report = EpochReport {
+                    schema_version: 1,
+                    disposition: super::EpochDisposition::Continue,
+                    summary: "Provider context recovery has not run yet".to_owned(),
+                    next_objective: Some(objective.clone()),
+                    clause_evidence: Vec::new(),
+                    exact_identifiers: Vec::new(),
+                };
+                self.build_checkpoint(task_id, runtime, CheckpointId::new(), &report, &objective)?
+            }
+        };
+        context_engine(runtime)?
+            .assemble(ContextInput {
+                runtime_instructions: runtime_instructions().to_owned(),
+                owner_instructions: runtime.request.clone(),
+                project_instructions:
+                    "Use the trusted project instructions present in the workspace.".to_owned(),
+                contract: checkpoint.contract.clone(),
+                checkpoint,
+                recent_tail: Vec::new(),
+                retrieved_evidence: Vec::new(),
+                epoch_objective: "Fresh provider context diagnosis".to_owned(),
+            })
+            .map_err(|_| error(TaskEngineErrorCode::Context))
     }
 
     async fn drain_work_epoch(
@@ -2120,16 +2708,26 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                     return Err(error(TaskEngineErrorCode::Provider));
                 }
                 let operation_id = OperationId::new();
+                let effect_class = classify_effect(&request, &item);
                 self.append(
                     task_id,
                     TaskEvent::OperationIntentRecorded {
                         operation_id,
                         epoch_id,
                         item_id: request.item_id.clone(),
-                        effect_class: classify_effect(&request, &item),
+                        effect_class,
                         request_digest: request.request_digest.to_string(),
                     },
                 )?;
+                if effect_class == super::EffectClass::IdempotentMutation {
+                    self.append(
+                        task_id,
+                        TaskEvent::OperationPostconditionBound {
+                            operation_id,
+                            postcondition_digest: file_change_postcondition_digest(&item)?,
+                        },
+                    )?;
+                }
                 self.append(
                     task_id,
                     TaskEvent::OperationTransitioned {
@@ -3086,6 +3684,9 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
         let mut provider_requests = 0_u64;
         let mut observed_total_tokens = None;
         let mut observed_context_window = None;
+        let mut last_provider_context = None;
+        let mut replacement_pending = false;
+        let mut replacement_bound_sequence = None;
         for envelope in &events {
             let crate::events::Event::TaskLifecycle { event, .. } = &envelope.event else {
                 return Err(error(TaskEngineErrorCode::Storage));
@@ -3103,6 +3704,24 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                 }
                 TaskEvent::ProviderRequestRecorded { .. } => {
                     provider_requests = provider_requests.saturating_add(1);
+                }
+                TaskEvent::ProviderContextLost { context_id, .. } => {
+                    last_provider_context = Some(context_id.clone());
+                    replacement_pending = true;
+                    replacement_bound_sequence = None;
+                }
+                TaskEvent::ProviderContextBound { context_id } => {
+                    last_provider_context = Some(context_id.clone());
+                    if replacement_pending {
+                        replacement_bound_sequence = Some(envelope.sequence);
+                    }
+                }
+                TaskEvent::EpochFinished { .. }
+                    if replacement_bound_sequence
+                        .is_some_and(|sequence| envelope.sequence > sequence) =>
+                {
+                    replacement_pending = false;
+                    replacement_bound_sequence = None;
                 }
                 TaskEvent::UsageObserved {
                     total_tokens,
@@ -3203,9 +3822,12 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
             .map_or_else(BTreeMap::new, |checkpoint| {
                 checkpoint.repository.file_hashes.clone()
             });
+        let provider_replacement_needed = snapshot.provider_context.is_none();
         let context_id = snapshot
             .provider_context
-            .as_deref()
+            .as_ref()
+            .or(last_provider_context.as_ref())
+            .map(String::as_str)
             .ok_or_else(invalid_task)
             .and_then(|context| AgentContextId::parse(context).map_err(provider_error))?;
         Ok(RuntimeTask {
@@ -3220,6 +3842,10 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
             progress,
             recovery_attempts,
             pending_recovery,
+            fresh_context_diagnosis: replacement_pending,
+            provider_replacement_needed,
+            running_processes: Vec::new(),
+            provider_ready: false,
             steering: VecDeque::new(),
             steering_sequence,
             operation_evidence,
@@ -3400,6 +4026,12 @@ fn report_next_objective<'a>(report: &'a EpochReport, runtime: &'a RuntimeTask) 
 }
 
 fn recovery_objective(runtime: &RuntimeTask) -> String {
+    if runtime.fresh_context_diagnosis {
+        return format!(
+            "Fresh provider context diagnosis: inspect Carl's durable evidence before continuing: {}",
+            runtime.next_objective
+        );
+    }
     runtime.pending_recovery.as_ref().map_or_else(
         || runtime.next_objective.clone(),
         |pending| {
@@ -3538,6 +4170,15 @@ fn retain_normalized_evidence(
         AgentItem::ContextCompaction { .. } | AgentItem::Other { .. } => {}
     }
     Ok(())
+}
+
+fn file_change_postcondition_digest(item: &AgentItem) -> Result<Sha256Digest, TaskEngineError> {
+    let AgentItem::FileChange { changes, .. } = item else {
+        return Err(error(TaskEngineErrorCode::Verification));
+    };
+    serde_json::to_vec(changes)
+        .map(|bytes| Sha256Digest::from_bytes(Sha256::digest(bytes).into()))
+        .map_err(|_| error(TaskEngineErrorCode::Verification))
 }
 
 fn normalize_operation_evidence(

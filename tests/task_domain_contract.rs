@@ -1412,3 +1412,40 @@ fn generated_prefix_replay_matches_incremental_reduction_or_error_code() {
     });
     assert_invalid_replay_splits(&invalid_boundary, TaskReduceErrorCode::UnsafeBoundary);
 }
+
+#[test]
+fn background_process_termination_result_is_typed_bounded_and_replay_stable() {
+    let termination = TaskEvent::BackgroundProcessTerminationRecorded {
+        process_id: "process-123".to_owned(),
+        item_id: "verification-item".to_owned(),
+        terminated: true,
+    };
+    let encoded = serde_json::to_value(Event::TaskLifecycle {
+        task_id: task_id(),
+        event: termination.clone(),
+    })
+    .unwrap();
+    assert_eq!(
+        encoded["event"]["task_event"],
+        "background_process_termination_recorded"
+    );
+    assert_eq!(encoded["event"]["process_id"], "process-123");
+    assert_eq!(encoded["event"]["item_id"], "verification-item");
+    assert_eq!(encoded["event"]["terminated"], true);
+    assert_every_replay_split_matches(&[created(), termination]);
+
+    for invalid in [
+        TaskEvent::BackgroundProcessTerminationRecorded {
+            process_id: String::new(),
+            item_id: "verification-item".to_owned(),
+            terminated: true,
+        },
+        TaskEvent::BackgroundProcessTerminationRecorded {
+            process_id: "process-123".to_owned(),
+            item_id: "x".repeat(129),
+            terminated: false,
+        },
+    ] {
+        assert!(invalid.validate().is_err());
+    }
+}

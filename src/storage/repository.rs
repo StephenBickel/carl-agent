@@ -1759,6 +1759,54 @@ impl Store {
         Ok(records)
     }
 
+    fn reconcile_abandoned_task_operations(
+        &mut self,
+        startup_at: DateTime<Utc>,
+    ) -> Result<(), CarlError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage_error)?;
+        let mut records = Vec::new();
+        visit_authoritative_task_records(&transaction, |record| {
+            if !record.snapshot.status.is_terminal() {
+                records.push(record);
+            }
+            Ok(())
+        })?;
+        let result_digest = format!(
+            "{:x}",
+            Sha256::digest(b"carl-startup-abandoned-operation-v1")
+        );
+        for mut record in records {
+            for operation_id in record.snapshot.started_operation_ids() {
+                let (updated, evidence_sequence) = append_task_event_in_transaction(
+                    &transaction,
+                    record,
+                    TaskEvent::OperationEvidenceRecorded {
+                        operation_id,
+                        result_digest: result_digest.clone(),
+                    },
+                    startup_at,
+                )?;
+                record = updated;
+                let (updated, _) = append_task_event_in_transaction(
+                    &transaction,
+                    record,
+                    TaskEvent::OperationTransitioned {
+                        operation_id,
+                        from: OperationStatus::Started,
+                        to: OperationStatus::Uncertain,
+                        evidence_sequences: vec![evidence_sequence],
+                    },
+                    startup_at,
+                )?;
+                record = updated;
+            }
+        }
+        transaction.commit().map_err(storage_error)
+    }
+
     pub fn read_task_events(&self, task_id: TaskId) -> Result<Vec<EventEnvelope>, CarlError> {
         let mut events = Vec::new();
         let mut after_sequence = None;
@@ -3521,6 +3569,7 @@ impl RuntimeStore {
             ));
         }
         reconcile_runtime_artifacts(&mut store, &artifacts)?;
+        store.reconcile_abandoned_task_operations(startup_at)?;
         let startup_recoveries = store
             .interrupt_abandoned_subscription_runs(startup_at)?
             .into_iter()
@@ -6266,17 +6315,48 @@ fn apply_task_child_projection(
         | TaskEvent::UsageObserved { .. }
         | TaskEvent::OperationEvidenceRecorded { .. }
         | TaskEvent::NormalizedOperationEvidenceRecorded { .. }
+        | TaskEvent::OperationPostconditionBound { .. }
         | TaskEvent::ProgressAssessed { .. }
         | TaskEvent::RecoveryAttemptStarted { .. }
         | TaskEvent::RecoveryAttemptRecorded { .. }
         | TaskEvent::CompactionRequested { .. }
         | TaskEvent::ProviderContextBound { .. }
         | TaskEvent::ProviderContextLost { .. }
+        | TaskEvent::BackgroundProcessTerminationRecorded { .. }
         | TaskEvent::CancellationRequested
         | TaskEvent::Blocked { .. }
         | TaskEvent::Completed => {}
     }
     Ok(())
+}
+
+fn append_task_event_in_transaction(
+    transaction: &Transaction<'_>,
+    current: TaskRecord,
+    event: TaskEvent,
+    at: DateTime<Utc>,
+) -> Result<(TaskRecord, u64), CarlError> {
+    let task_id = current.snapshot.task_id;
+    let envelope = append_event_in_transaction(
+        transaction,
+        current.snapshot.session_id,
+        None,
+        Event::TaskLifecycle { task_id, event },
+        at,
+    )?;
+    let sequence = envelope.sequence;
+    let snapshot = reduce_task(Some(current.snapshot), &envelope).map_err(task_reduce_error)?;
+    apply_task_child_projection(transaction, task_id, &envelope, &snapshot)?;
+    update_task_projection(transaction, &snapshot, at)?;
+    Ok((
+        TaskRecord {
+            revision: snapshot.revision,
+            snapshot,
+            created_at: current.created_at,
+            updated_at: at,
+        },
+        sequence,
+    ))
 }
 
 fn require_projection_change(changed: usize, detail: &str) -> Result<(), CarlError> {

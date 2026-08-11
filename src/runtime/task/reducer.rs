@@ -212,6 +212,20 @@ pub fn reduce_task(
                 return Err(error(TaskReduceErrorCode::OperationAlreadyExists));
             }
         }
+        TaskEvent::OperationPostconditionBound {
+            operation_id,
+            postcondition_digest,
+        } => {
+            let (operation_epoch, _, _) = state
+                .operation(*operation_id)
+                .ok_or_else(|| error(TaskReduceErrorCode::OperationIntentMissing))?;
+            if state.active_epoch != Some(operation_epoch) {
+                return Err(error(TaskReduceErrorCode::EpochMismatch));
+            }
+            if !state.bind_operation_postcondition(*operation_id, *postcondition_digest) {
+                return Err(error(TaskReduceErrorCode::OperationAlreadyExists));
+            }
+        }
         TaskEvent::OperationTransitioned {
             operation_id,
             from,
@@ -284,6 +298,7 @@ pub fn reduce_task(
         TaskEvent::ProgressAssessed { .. }
         | TaskEvent::NormalizedOperationEvidenceRecorded { .. }
         | TaskEvent::CompactionRequested { .. }
+        | TaskEvent::BackgroundProcessTerminationRecorded { .. }
         | TaskEvent::SteeringQueued { .. } => {}
         TaskEvent::CheckpointCommitted { checkpoint_id, .. } => {
             require_safe_boundary(&state)?;

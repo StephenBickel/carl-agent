@@ -348,9 +348,11 @@ impl Kernel {
             catalog: Arc::clone(&catalog),
         };
         let durable_tasks = agent.supports_autonomous_tasks();
+        let mut engine = TaskEngine::new_runtime(store, agent);
+        engine.reconcile_startup().await.map_err(map_task_engine)?;
         tokio::spawn(
             KernelActor {
-                engine: Some(TaskEngine::new_runtime(store, agent)),
+                engine: Some(engine),
                 durable_tasks,
                 publisher,
                 catalog,

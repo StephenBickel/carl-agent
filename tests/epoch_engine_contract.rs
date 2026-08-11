@@ -26,7 +26,8 @@ use carl::runtime::task::{
     WorkEvidence, assess_progress, assess_progress_with_recovery_attempts, decide_completion,
     parse_epoch_report, recovery_attempt_fingerprint,
 };
-use carl::storage::Store;
+use carl::sidecar::DataRootLock;
+use carl::storage::{NewTask, RuntimeStore, Store};
 use rusqlite::Connection;
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -54,12 +55,25 @@ impl EngineFixture {
         let workspace = root.join("workspace");
         let database = root.join("carl.sqlite3");
         fs::create_dir_all(&workspace)?;
+        make_owner_only(&root)?;
         Ok(Self {
             root,
             workspace,
             database,
         })
     }
+}
+
+#[cfg(unix)]
+fn make_owner_only(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+}
+
+#[cfg(windows)]
+fn make_owner_only(_path: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 impl Drop for EngineFixture {
@@ -134,6 +148,17 @@ struct EnginePortState {
     invalid_work_report: bool,
     post_usage_diff_bytes: usize,
     pending_resolve: bool,
+    durable_effect_count: u64,
+    resume_attempts: Vec<String>,
+    resume_unavailable: bool,
+    active_context_id: String,
+    background_capable: bool,
+    background_processes: Vec<AgentProcess>,
+    background_lists: usize,
+    termination_result: bool,
+    terminations: Vec<String>,
+    postcondition_matches: Option<bool>,
+    postcondition_inspections: Vec<(PathBuf, String, String)>,
 }
 
 impl EnginePort {
@@ -210,6 +235,17 @@ impl EnginePort {
                 invalid_work_report: false,
                 post_usage_diff_bytes: 0,
                 pending_resolve: false,
+                durable_effect_count: 0,
+                resume_attempts: Vec::new(),
+                resume_unavailable: false,
+                active_context_id: "engine-context".to_owned(),
+                background_capable: false,
+                background_processes: Vec::new(),
+                background_lists: 0,
+                termination_result: false,
+                terminations: Vec::new(),
+                postcondition_matches: None,
+                postcondition_inspections: Vec::new(),
             })),
         }
     }
@@ -321,6 +357,22 @@ impl EnginePort {
         port
     }
 
+    fn pending_effect_with_postcondition(matches: bool) -> Self {
+        let port = Self::pending_effect();
+        port.state.lock().unwrap().postcondition_matches = Some(matches);
+        port
+    }
+
+    fn pending_ambiguous_effect() -> Self {
+        let port = Self::new([(
+            WorkKind::Command,
+            "external effect applied before disconnect",
+            "complete:requested-outcome,explicit-verification",
+        )]);
+        port.state.lock().unwrap().pending_work_stream = true;
+        port
+    }
+
     fn pending_planning() -> Self {
         let port = Self::small_edit();
         port.state.lock().unwrap().pending_planning_stream = true;
@@ -402,6 +454,28 @@ impl EnginePort {
         port
     }
 
+    fn unavailable_context_then_small_edit() -> Self {
+        let port = Self::resume_small_edit();
+        port.state.lock().unwrap().resume_unavailable = true;
+        port
+    }
+
+    fn resume_with_background_process(process: AgentProcess, termination_result: bool) -> Self {
+        let port = Self::resume_small_edit();
+        let mut state = port.state.lock().unwrap();
+        state.background_capable = true;
+        state.background_processes = vec![process];
+        state.termination_result = termination_result;
+        drop(state);
+        port
+    }
+
+    fn resume_with_missing_background_process() -> Self {
+        let port = Self::resume_small_edit();
+        port.state.lock().unwrap().background_capable = true;
+        port
+    }
+
     fn resume_with_work_start_failure(provenance: AgentErrorProvenance) -> Self {
         let port = Self::resume_small_edit();
         port.state.lock().unwrap().work_start_failure = Some(provenance);
@@ -421,7 +495,7 @@ impl AgentPort for EnginePort {
             token_usage: true,
             pre_dispatch_effects: true,
             history_paging: false,
-            background_processes: false,
+            background_processes: self.state.lock().unwrap().background_capable,
         }
     }
 
@@ -438,7 +512,19 @@ impl AgentPort for EnginePort {
     }
 
     fn resume_context(&mut self, request: ResumeAgentContext) -> AgentFuture<'_, AgentContextId> {
-        Box::pin(async move { Ok(request.context_id) })
+        let state = Arc::clone(&self.state);
+        Box::pin(async move {
+            let mut state = state.lock().unwrap();
+            state
+                .resume_attempts
+                .push(request.context_id.as_str().to_owned());
+            if state.resume_unavailable {
+                state.resume_unavailable = false;
+                return Err(AgentPortError::unavailable_context());
+            }
+            state.active_context_id = request.context_id.as_str().to_owned();
+            Ok(request.context_id)
+        })
     }
 
     fn compact_context(&mut self, _context_id: &AgentContextId) -> AgentFuture<'_, ()> {
@@ -462,8 +548,10 @@ impl AgentPort for EnginePort {
         let state = Arc::clone(&self.state);
         Box::pin(async move {
             state.lock().unwrap().replacements += 1;
+            let context_id = AgentContextId::parse("replacement-context")?;
+            state.lock().unwrap().active_context_id = context_id.as_str().to_owned();
             Ok(carl::runtime::agent_port::ContextRecovery::Replaced(
-                AgentContextId::parse("replacement-context")?,
+                context_id,
             ))
         })
     }
@@ -473,11 +561,12 @@ impl AgentPort for EnginePort {
         Box::pin(async move {
             let mut state = state.lock().unwrap();
             let planning = request.permission_mode == PermissionMode::Plan;
+            let context_id = request.context_id.clone();
+            state.active_context_id = context_id.as_str().to_owned();
             state.epoch_starts.push(request);
             state.epoch_number += 1;
             let epoch_number = state.epoch_number;
             let epoch_id = AgentEpochId::parse(format!("engine-epoch-{epoch_number}"))?;
-            let context_id = AgentContextId::parse("engine-context")?;
             if !planning && let Some(provenance) = state.work_start_failure.take() {
                 return Err(scripted_error(provenance));
             }
@@ -663,7 +752,7 @@ impl AgentPort for EnginePort {
             if state.latest_operation_id.is_some()
                 && let Some(fault) = state.work_fault.take()
             {
-                let context_id = AgentContextId::parse("engine-context")?;
+                let context_id = AgentContextId::parse(state.active_context_id.clone())?;
                 let epoch_id = AgentEpochId::parse(format!("engine-epoch-{}", state.epoch_number))?;
                 return match fault {
                     WorkFault::DuplicateItemStarted => Ok(AgentEvent::ItemStarted {
@@ -698,7 +787,7 @@ impl AgentPort for EnginePort {
             if state.invalid_event_after_binding && state.latest_operation_id.is_some() {
                 state.invalid_event_after_binding = false;
                 return Ok(AgentEvent::AssistantDelta {
-                    context_id: AgentContextId::parse("engine-context")?,
+                    context_id: AgentContextId::parse(state.active_context_id.clone())?,
                     epoch_id: AgentEpochId::parse(format!("engine-epoch-{}", state.epoch_number))?,
                     text: "x".repeat(1_048_577),
                 });
@@ -706,7 +795,7 @@ impl AgentPort for EnginePort {
             let (kind, summary, disposition) = state.work.front().copied().expect("scripted event");
             let epoch_number = state.epoch_number;
             let work_number = state.work_number;
-            let context_id = AgentContextId::parse("engine-context")?;
+            let context_id = AgentContextId::parse(state.active_context_id.clone())?;
             let epoch_id = AgentEpochId::parse(format!("engine-epoch-{epoch_number}"))?;
             let item_id = state
                 .current_item_id
@@ -845,6 +934,9 @@ impl AgentPort for EnginePort {
             let (failure, pending) = {
                 let mut state = state.lock().unwrap();
                 state.resolved.push(decision);
+                if decision == EffectDecision::Allow {
+                    state.durable_effect_count = state.durable_effect_count.saturating_add(1);
+                }
                 (state.resolve_failure.take(), state.pending_resolve)
             };
             if let Some(provenance) = failure {
@@ -857,19 +949,55 @@ impl AgentPort for EnginePort {
         })
     }
 
+    fn inspect_effect_postcondition<'a>(
+        &'a mut self,
+        cwd: &'a Path,
+        item_id: &'a str,
+        expected_digest: &'a Sha256Digest,
+    ) -> AgentFuture<'a, Option<Sha256Digest>> {
+        let state = Arc::clone(&self.state);
+        let cwd = cwd.to_owned();
+        let item_id = item_id.to_owned();
+        let expected_digest = *expected_digest;
+        Box::pin(async move {
+            let mut state = state.lock().unwrap();
+            state
+                .postcondition_inspections
+                .push((cwd, item_id, expected_digest.to_string()));
+            Ok(state.postcondition_matches.map(|matches| {
+                if matches {
+                    expected_digest
+                } else {
+                    Sha256Digest::parse("f".repeat(64)).expect("fixed digest is valid")
+                }
+            }))
+        })
+    }
+
     fn list_background_processes(
         &mut self,
         _context_id: &AgentContextId,
     ) -> AgentFuture<'_, Vec<AgentProcess>> {
-        Box::pin(async { Ok(Vec::new()) })
+        let state = Arc::clone(&self.state);
+        Box::pin(async move {
+            let mut state = state.lock().unwrap();
+            state.background_lists += 1;
+            Ok(state.background_processes.clone())
+        })
     }
 
     fn terminate_background_process(
         &mut self,
         _context_id: &AgentContextId,
-        _process_id: &str,
+        process_id: &str,
     ) -> AgentFuture<'_, bool> {
-        Box::pin(async { Ok(false) })
+        let state = Arc::clone(&self.state);
+        let process_id = process_id.to_owned();
+        Box::pin(async move {
+            let mut state = state.lock().unwrap();
+            state.terminations.push(process_id);
+            Ok(state.termination_result)
+        })
     }
 
     fn shutdown(&mut self) -> AgentFuture<'_, ()> {
@@ -963,6 +1091,36 @@ fn operation_statuses(store: &Store, task_id: TaskId) -> TestResult<Vec<Operatio
                 .expect("operation remains projected")
         })
         .collect())
+}
+
+fn install_running_process_checkpoint(
+    store: &Store,
+    database: &Path,
+    task_id: TaskId,
+    process: &AgentProcess,
+) -> TestResult {
+    let mut checkpoint = store
+        .get_latest_task_checkpoint(task_id)?
+        .expect("the restart fixture has a committed checkpoint");
+    checkpoint.running_processes = vec![ProcessCheckpoint {
+        process_id: process.process_id.clone(),
+        item_id: process.item_id.clone(),
+        command_digest: digest(process.command.as_bytes()),
+        cwd_digest: digest(process.cwd.as_os_str().as_encoded_bytes()),
+    }];
+    let checkpoint_json = String::from_utf8(checkpoint.canonical_bytes()?)?;
+    let checkpoint_digest = checkpoint.digest()?;
+    Connection::open(database)?.execute(
+        "UPDATE task_checkpoints SET checkpoint_json = ?2, digest = ?3
+         WHERE task_id = ?1 AND id = ?4",
+        rusqlite::params![
+            task_id.to_string(),
+            checkpoint_json,
+            checkpoint_digest,
+            checkpoint.checkpoint_id.to_string(),
+        ],
+    )?;
+    Ok(())
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -2276,6 +2434,419 @@ async fn committed_continuation_checkpoint_resumes_next_epoch_without_repeating_
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn restart_resumes_the_bound_provider_context_before_dispatching_the_next_epoch() -> TestResult
+{
+    let fixture = EngineFixture::new()?;
+    let store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let mut first = TaskEngine::new(
+        store,
+        EnginePort::continuation_checkpoint_then_compaction_failure(),
+    );
+    assert_eq!(
+        first
+            .start(start_task(session.id, &fixture.workspace)?)
+            .await
+            .unwrap_err()
+            .code(),
+        carl::runtime::task::TaskEngineErrorCode::Provider
+    );
+    let task_id = first.store().list_resumable_tasks()?[0].snapshot.task_id;
+    let (store, _) = first.into_parts();
+    let port = EnginePort::resume_small_edit();
+    let shared = port.shared();
+    let mut restarted = TaskEngine::new(store, port);
+
+    let snapshot = restarted.run(task_id).await?;
+
+    assert_eq!(snapshot.status, TaskStatus::Completed);
+    let state = shared.lock().unwrap();
+    assert_eq!(state.resume_attempts, ["engine-context"]);
+    assert_eq!(state.epoch_starts.len(), 1);
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn unavailable_provider_context_is_journaled_then_replaced_for_fresh_diagnosis() -> TestResult
+{
+    let fixture = EngineFixture::new()?;
+    let store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let mut first = TaskEngine::new(
+        store,
+        EnginePort::continuation_checkpoint_then_compaction_failure(),
+    );
+    assert_eq!(
+        first
+            .start(start_task(session.id, &fixture.workspace)?)
+            .await
+            .unwrap_err()
+            .code(),
+        carl::runtime::task::TaskEngineErrorCode::Provider
+    );
+    let task_id = first.store().list_resumable_tasks()?[0].snapshot.task_id;
+    let (store, _) = first.into_parts();
+    let port = EnginePort::unavailable_context_then_small_edit();
+    let shared = port.shared();
+    let mut restarted = TaskEngine::new(store, port);
+
+    let snapshot = restarted.run(task_id).await?;
+
+    assert_eq!(snapshot.status, TaskStatus::Completed);
+    let events = restarted.store().read_task_events(task_id)?;
+    let lost = events
+        .iter()
+        .position(|envelope| {
+            matches!(
+                &envelope.event,
+                carl::events::Event::TaskLifecycle {
+                    event: carl::runtime::task::TaskEvent::ProviderContextLost {
+                        context_id,
+                        ..
+                    },
+                    ..
+                } if context_id == "engine-context"
+            )
+        })
+        .expect("the unavailable old context is retained as lost history");
+    let rebound = events
+        .iter()
+        .rposition(|envelope| {
+            matches!(
+                &envelope.event,
+                carl::events::Event::TaskLifecycle {
+                    event: carl::runtime::task::TaskEvent::ProviderContextBound { context_id },
+                    ..
+                } if context_id == "replacement-context"
+            )
+        })
+        .expect("the replacement context is durably bound");
+    assert!(lost < rebound);
+    let state = shared.lock().unwrap();
+    assert_eq!(state.resume_attempts, ["engine-context"]);
+    assert_eq!(state.replacements, 1);
+    assert!(
+        state.epoch_starts[0]
+            .input
+            .contains("Fresh provider context diagnosis")
+    );
+    drop(state);
+    assert!(restarted.take_updates().iter().any(|update| matches!(
+        update,
+        TaskEngineUpdate::RecoveryStrategy {
+            strategy: RecoveryStrategy::FreshContextDiagnosis,
+            ..
+        }
+    )));
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn restart_after_provider_context_lost_starts_one_replacement_without_resuming_the_old_id()
+-> TestResult {
+    let fixture = EngineFixture::new()?;
+    let store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let mut first = TaskEngine::new(
+        store,
+        EnginePort::continuation_checkpoint_then_compaction_failure(),
+    );
+    assert!(
+        first
+            .start(start_task(session.id, &fixture.workspace)?)
+            .await
+            .is_err()
+    );
+    let task_id = first.store().list_resumable_tasks()?[0].snapshot.task_id;
+    let (mut store, _) = first.into_parts();
+    let revision = store.get_task(task_id)?.unwrap().revision;
+    store
+        .append_task_event(
+            task_id,
+            revision,
+            carl::runtime::task::TaskEvent::ProviderContextLost {
+                context_id: "engine-context".to_owned(),
+                reason: "injected crash after provider replacement started".to_owned(),
+            },
+            chrono::Utc::now(),
+        )?
+        .expect("provider loss is durable");
+    let port = EnginePort::resume_small_edit();
+    let shared = port.shared();
+    let mut restarted = TaskEngine::new(store, port);
+
+    let snapshot = restarted.run(task_id).await?;
+
+    assert_eq!(snapshot.status, TaskStatus::Completed);
+    let state = shared.lock().unwrap();
+    assert!(state.resume_attempts.is_empty());
+    assert_eq!(state.replacements, 1);
+    assert!(
+        state.epoch_starts[0]
+            .input
+            .contains("Fresh provider context diagnosis")
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn restart_after_replacement_binding_retains_fresh_context_diagnosis() -> TestResult {
+    let fixture = EngineFixture::new()?;
+    let store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let mut first = TaskEngine::new(
+        store,
+        EnginePort::continuation_checkpoint_then_compaction_failure(),
+    );
+    assert!(
+        first
+            .start(start_task(session.id, &fixture.workspace)?)
+            .await
+            .is_err()
+    );
+    let task_id = first.store().list_resumable_tasks()?[0].snapshot.task_id;
+    let (mut store, _) = first.into_parts();
+    for event in [
+        carl::runtime::task::TaskEvent::ProviderContextLost {
+            context_id: "engine-context".to_owned(),
+            reason: "injected unavailable provider context".to_owned(),
+        },
+        carl::runtime::task::TaskEvent::ProviderContextBound {
+            context_id: "replacement-context".to_owned(),
+        },
+    ] {
+        let revision = store.get_task(task_id)?.unwrap().revision;
+        store
+            .append_task_event(task_id, revision, event, chrono::Utc::now())?
+            .expect("provider replacement cut appends");
+    }
+    let port = EnginePort::resume_small_edit();
+    let shared = port.shared();
+    let mut restarted = TaskEngine::new(store, port);
+
+    let snapshot = restarted.run(task_id).await?;
+
+    assert_eq!(snapshot.status, TaskStatus::Completed);
+    let state = shared.lock().unwrap();
+    assert_eq!(state.resume_attempts, ["replacement-context"]);
+    assert_eq!(state.replacements, 0);
+    assert!(
+        state.epoch_starts[0]
+            .input
+            .contains("Fresh provider context diagnosis")
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn resumed_context_restores_only_an_exact_background_process_identity() -> TestResult {
+    let fixture = EngineFixture::new()?;
+    let store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let mut first = TaskEngine::new(
+        store,
+        EnginePort::continuation_checkpoint_then_compaction_failure(),
+    );
+    assert!(
+        first
+            .start(start_task(session.id, &fixture.workspace)?)
+            .await
+            .is_err()
+    );
+    let task_id = first.store().list_resumable_tasks()?[0].snapshot.task_id;
+    let process = AgentProcess {
+        process_id: "process-123".to_owned(),
+        item_id: "verification-item".to_owned(),
+        command: "cargo test --workspace".to_owned(),
+        cwd: fixture.workspace.clone(),
+        os_pid: Some(123),
+    };
+    install_running_process_checkpoint(first.store(), &fixture.database, task_id, &process)?;
+    let (store, _) = first.into_parts();
+    let port = EnginePort::resume_with_background_process(process, true);
+    let shared = port.shared();
+    let mut restarted = TaskEngine::new(store, port);
+
+    let snapshot = restarted.run(task_id).await?;
+
+    assert_eq!(snapshot.status, TaskStatus::Completed);
+    let state = shared.lock().unwrap();
+    assert_eq!(state.background_lists, 1);
+    assert!(state.terminations.is_empty());
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn missing_background_process_blocks_before_any_new_provider_epoch() -> TestResult {
+    let fixture = EngineFixture::new()?;
+    let store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let mut first = TaskEngine::new(
+        store,
+        EnginePort::continuation_checkpoint_then_compaction_failure(),
+    );
+    assert!(
+        first
+            .start(start_task(session.id, &fixture.workspace)?)
+            .await
+            .is_err()
+    );
+    let task_id = first.store().list_resumable_tasks()?[0].snapshot.task_id;
+    let process = AgentProcess {
+        process_id: "process-missing".to_owned(),
+        item_id: "verification-item".to_owned(),
+        command: "cargo test --workspace".to_owned(),
+        cwd: fixture.workspace.clone(),
+        os_pid: Some(123),
+    };
+    install_running_process_checkpoint(first.store(), &fixture.database, task_id, &process)?;
+    let (store, _) = first.into_parts();
+    let port = EnginePort::resume_with_missing_background_process();
+    let shared = port.shared();
+    let mut restarted = TaskEngine::new(store, port);
+
+    assert_eq!(
+        restarted.run(task_id).await.unwrap_err().code(),
+        carl::runtime::task::TaskEngineErrorCode::Blocked
+    );
+    let state = shared.lock().unwrap();
+    assert_eq!(state.background_lists, 1);
+    assert!(state.epoch_starts.is_empty());
+    drop(state);
+    assert!(
+        restarted
+            .store()
+            .read_task_events(task_id)?
+            .iter()
+            .any(|event| {
+                matches!(
+                    &event.event,
+                    carl::events::Event::TaskLifecycle {
+                        event: carl::runtime::task::TaskEvent::Blocked { reason },
+                        ..
+                    } if reason.contains("process-missing")
+                )
+            })
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn background_process_cancellation_journals_the_true_termination_result() -> TestResult {
+    let fixture = EngineFixture::new()?;
+    let store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let mut first = TaskEngine::new(
+        store,
+        EnginePort::continuation_checkpoint_then_compaction_failure(),
+    );
+    assert!(
+        first
+            .start(start_task(session.id, &fixture.workspace)?)
+            .await
+            .is_err()
+    );
+    let task_id = first.store().list_resumable_tasks()?[0].snapshot.task_id;
+    let process = AgentProcess {
+        process_id: "process-cancel".to_owned(),
+        item_id: "verification-item".to_owned(),
+        command: "cargo test --workspace".to_owned(),
+        cwd: fixture.workspace.clone(),
+        os_pid: Some(123),
+    };
+    install_running_process_checkpoint(first.store(), &fixture.database, task_id, &process)?;
+    let (store, _) = first.into_parts();
+    let port = EnginePort::resume_with_background_process(process, true);
+    let shared = port.shared();
+    let mut restarted = TaskEngine::new(store, port);
+
+    restarted.cancel(task_id).await?;
+
+    assert_eq!(
+        restarted
+            .store()
+            .get_task(task_id)?
+            .unwrap()
+            .snapshot
+            .status,
+        TaskStatus::Cancelled
+    );
+    assert_eq!(shared.lock().unwrap().terminations, ["process-cancel"]);
+    assert!(restarted.store().read_task_events(task_id)?.iter().any(|event| {
+        matches!(
+            &event.event,
+            carl::events::Event::TaskLifecycle {
+                event: carl::runtime::task::TaskEvent::BackgroundProcessTerminationRecorded {
+                    process_id,
+                    item_id,
+                    terminated: true,
+                },
+                ..
+            } if process_id == "process-cancel" && item_id == "verification-item"
+        )
+    }));
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn failed_background_termination_is_journaled_false_and_cleanup_stays_blocked() -> TestResult
+{
+    let fixture = EngineFixture::new()?;
+    let store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let mut first = TaskEngine::new(
+        store,
+        EnginePort::continuation_checkpoint_then_compaction_failure(),
+    );
+    assert!(
+        first
+            .start(start_task(session.id, &fixture.workspace)?)
+            .await
+            .is_err()
+    );
+    let task_id = first.store().list_resumable_tasks()?[0].snapshot.task_id;
+    let process = AgentProcess {
+        process_id: "process-still-running".to_owned(),
+        item_id: "verification-item".to_owned(),
+        command: "cargo test --workspace".to_owned(),
+        cwd: fixture.workspace.clone(),
+        os_pid: Some(123),
+    };
+    install_running_process_checkpoint(first.store(), &fixture.database, task_id, &process)?;
+    let (store, _) = first.into_parts();
+    let port = EnginePort::resume_with_background_process(process, false);
+    let mut restarted = TaskEngine::new(store, port);
+
+    assert_eq!(
+        restarted.cancel(task_id).await.unwrap_err().code(),
+        carl::runtime::task::TaskEngineErrorCode::Blocked
+    );
+    assert_eq!(
+        restarted
+            .store()
+            .get_task(task_id)?
+            .unwrap()
+            .snapshot
+            .status,
+        TaskStatus::Blocked
+    );
+    assert!(restarted.store().read_task_events(task_id)?.iter().any(|event| {
+        matches!(
+            &event.event,
+            carl::events::Event::TaskLifecycle {
+                event: carl::runtime::task::TaskEvent::BackgroundProcessTerminationRecorded {
+                    process_id,
+                    item_id,
+                    terminated: false,
+                },
+                ..
+            } if process_id == "process-still-running" && item_id == "verification-item"
+        )
+    }));
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn pending_recovery_attempt_rehydrates_with_the_exact_epoch_identity() -> TestResult {
     let fixture = EngineFixture::new()?;
     let store = Store::open(&fixture.database)?;
@@ -2561,6 +3132,343 @@ async fn a_new_engine_continues_a_safe_checkpoint_without_another_owner_prompt()
         "planning, completed work, definitely-not-applied work, and resumed work are durable"
     );
     assert_eq!(snapshot.active_epoch, None);
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn restart_never_replays_an_ambiguous_effect_with_an_uncertain_durable_outcome() -> TestResult
+{
+    let fixture = EngineFixture::new()?;
+    let store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let port = EnginePort::pending_ambiguous_effect();
+    let shared = port.shared();
+    let mut first = TaskEngine::new(store, port);
+
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(50),
+            first.start(start_task(session.id, &fixture.workspace)?)
+        )
+        .await
+        .is_err(),
+        "the fake disconnects after applying the ambiguous effect"
+    );
+    assert_eq!(shared.lock().unwrap().durable_effect_count, 1);
+    let task_id = first.store().list_resumable_tasks()?[0].snapshot.task_id;
+    let operation_id = first
+        .store()
+        .read_task_events(task_id)?
+        .into_iter()
+        .find_map(|envelope| match envelope.event {
+            carl::events::Event::TaskLifecycle {
+                event:
+                    carl::runtime::task::TaskEvent::OperationIntentRecorded {
+                        operation_id,
+                        effect_class: EffectClass::AmbiguousConsequential,
+                        ..
+                    },
+                ..
+            } => Some(operation_id),
+            _ => None,
+        })
+        .expect("the ambiguous operation ID is durable");
+    let (store, port) = first.into_parts();
+    drop(store);
+
+    let runtime = RuntimeStore::open(DataRootLock::acquire(&fixture.root)?, chrono::Utc::now())?;
+    assert_eq!(
+        runtime
+            .get_task(task_id)?
+            .unwrap()
+            .snapshot
+            .operation_status(operation_id),
+        Some(OperationStatus::Uncertain)
+    );
+    let mut restarted = TaskEngine::new_runtime(runtime, port);
+
+    assert_eq!(
+        restarted.run(task_id).await.unwrap_err().code(),
+        carl::runtime::task::TaskEngineErrorCode::Blocked
+    );
+    assert_eq!(shared.lock().unwrap().durable_effect_count, 1);
+    assert!(
+        restarted
+            .store()
+            .read_task_events(task_id)?
+            .iter()
+            .any(|envelope| matches!(
+                &envelope.event,
+                carl::events::Event::TaskLifecycle {
+                    event: carl::runtime::task::TaskEvent::Blocked { reason },
+                    ..
+                } if reason.contains(&operation_id.to_string())
+            )),
+        "the blocker identifies the exact uncertain operation"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn restart_requires_postcondition_proof_before_retrying_an_idempotent_mutation() -> TestResult
+{
+    let fixture = EngineFixture::new()?;
+    let store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let port = EnginePort::pending_effect();
+    let shared = port.shared();
+    let mut first = TaskEngine::new(store, port);
+
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(50),
+            first.start(start_task(session.id, &fixture.workspace)?)
+        )
+        .await
+        .is_err(),
+        "the fake disconnects after applying the idempotent mutation"
+    );
+    let task_id = first.store().list_resumable_tasks()?[0].snapshot.task_id;
+    let operation_id = first
+        .store()
+        .read_task_events(task_id)?
+        .into_iter()
+        .find_map(|envelope| match envelope.event {
+            carl::events::Event::TaskLifecycle {
+                event:
+                    carl::runtime::task::TaskEvent::OperationIntentRecorded {
+                        operation_id,
+                        effect_class: EffectClass::IdempotentMutation,
+                        ..
+                    },
+                ..
+            } => Some(operation_id),
+            _ => None,
+        })
+        .expect("the idempotent operation ID is durable");
+    let (store, port) = first.into_parts();
+    drop(store);
+
+    let runtime = RuntimeStore::open(DataRootLock::acquire(&fixture.root)?, chrono::Utc::now())?;
+    let mut restarted = TaskEngine::new_runtime(runtime, port);
+
+    assert_eq!(
+        restarted.run(task_id).await.unwrap_err().code(),
+        carl::runtime::task::TaskEngineErrorCode::Blocked
+    );
+    assert_eq!(shared.lock().unwrap().durable_effect_count, 1);
+    assert!(
+        restarted
+            .store()
+            .read_task_events(task_id)?
+            .iter()
+            .any(|envelope| matches!(
+                &envelope.event,
+                carl::events::Event::TaskLifecycle {
+                    event: carl::runtime::task::TaskEvent::Blocked { reason },
+                    ..
+                } if reason.contains(&operation_id.to_string())
+            )),
+        "without postcondition evidence, the exact operation stays blocked"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn startup_reconciles_a_matching_bound_postcondition_without_redispatch() -> TestResult {
+    let fixture = EngineFixture::new()?;
+    let store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let port = EnginePort::pending_effect_with_postcondition(true);
+    let shared = port.shared();
+    let mut first = TaskEngine::new(store, port);
+
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(50),
+            first.start(start_task(session.id, &fixture.workspace)?)
+        )
+        .await
+        .is_err()
+    );
+    let task_id = first.store().list_resumable_tasks()?[0].snapshot.task_id;
+    let (operation_id, expected_digest) = first
+        .store()
+        .read_task_events(task_id)?
+        .into_iter()
+        .find_map(|envelope| match envelope.event {
+            carl::events::Event::TaskLifecycle {
+                event:
+                    carl::runtime::task::TaskEvent::OperationPostconditionBound {
+                        operation_id,
+                        postcondition_digest,
+                    },
+                ..
+            } => Some((operation_id, postcondition_digest)),
+            _ => None,
+        })
+        .expect("the exact postcondition is bound before dispatch");
+    let epoch_starts_before = shared.lock().unwrap().epoch_starts.len();
+    let (store, port) = first.into_parts();
+    drop(store);
+    let runtime = RuntimeStore::open(DataRootLock::acquire(&fixture.root)?, chrono::Utc::now())?;
+    let mut restarted = TaskEngine::new_runtime(runtime, Box::new(port));
+
+    assert_eq!(restarted.reconcile_startup().await?, [task_id]);
+    let snapshot = restarted.store().get_task(task_id)?.unwrap().snapshot;
+    assert_eq!(
+        snapshot.operation_status(operation_id),
+        Some(OperationStatus::Reconciled)
+    );
+    let state = shared.lock().unwrap();
+    assert_eq!(state.durable_effect_count, 1);
+    assert_eq!(state.epoch_starts.len(), epoch_starts_before);
+    assert_eq!(
+        state.postcondition_inspections,
+        [(
+            fs::canonicalize(&fixture.workspace)?,
+            "work-item-1".to_owned(),
+            expected_digest.to_string()
+        )]
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn startup_blocks_a_mismatched_bound_postcondition_without_redispatch() -> TestResult {
+    let fixture = EngineFixture::new()?;
+    let store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let port = EnginePort::pending_effect_with_postcondition(false);
+    let shared = port.shared();
+    let mut first = TaskEngine::new(store, port);
+
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(50),
+            first.start(start_task(session.id, &fixture.workspace)?)
+        )
+        .await
+        .is_err()
+    );
+    let task_id = first.store().list_resumable_tasks()?[0].snapshot.task_id;
+    let operation_id =
+        first
+            .store()
+            .read_task_events(task_id)?
+            .into_iter()
+            .find_map(|envelope| match envelope.event {
+                carl::events::Event::TaskLifecycle {
+                    event:
+                        carl::runtime::task::TaskEvent::OperationPostconditionBound {
+                            operation_id, ..
+                        },
+                    ..
+                } => Some(operation_id),
+                _ => None,
+            })
+            .expect("the postcondition binding is durable");
+    let epoch_starts_before = shared.lock().unwrap().epoch_starts.len();
+    let (store, port) = first.into_parts();
+    drop(store);
+    let runtime = RuntimeStore::open(DataRootLock::acquire(&fixture.root)?, chrono::Utc::now())?;
+    let mut restarted = TaskEngine::new_runtime(runtime, port);
+
+    assert!(restarted.reconcile_startup().await?.is_empty());
+    let snapshot = restarted.store().get_task(task_id)?.unwrap().snapshot;
+    assert_eq!(snapshot.status, TaskStatus::Blocked);
+    assert_eq!(
+        snapshot.operation_status(operation_id),
+        Some(OperationStatus::Uncertain)
+    );
+    let state = shared.lock().unwrap();
+    assert_eq!(state.durable_effect_count, 1);
+    assert_eq!(state.epoch_starts.len(), epoch_starts_before);
+    assert_eq!(state.postcondition_inspections.len(), 1);
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn restart_after_task_creation_activates_and_binds_a_new_context_once() -> TestResult {
+    let fixture = EngineFixture::new()?;
+    let mut store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let created = store.create_task(NewTask {
+        session_id: session.id,
+        workspace: fixture.workspace.clone(),
+        contract: CompletionContract {
+            version: 1,
+            goal: "Finish the durable task after startup".to_owned(),
+            constraints: Vec::new(),
+            clauses: vec![
+                CompletionClause {
+                    id: "requested-outcome".to_owned(),
+                    description: "The requested outcome is implemented".to_owned(),
+                    required: true,
+                    status: ClauseStatus::Pending,
+                    evidence: Vec::new(),
+                },
+                CompletionClause {
+                    id: "explicit-verification".to_owned(),
+                    description: "The outcome is verified".to_owned(),
+                    required: true,
+                    status: ClauseStatus::Pending,
+                    evidence: Vec::new(),
+                },
+            ],
+        },
+        model: ModelId::parse("gpt-5.6-codex")?,
+        effort: ReasoningEffort::High,
+        permission_mode: PermissionMode::BypassPermissions,
+        budget: TaskBudget::default(),
+        created_at: chrono::Utc::now(),
+    })?;
+    let task_id = created.snapshot.task_id;
+    let port = EnginePort::resume_small_edit();
+    let shared = port.shared();
+    let mut restarted = TaskEngine::new(store, port);
+
+    let snapshot = restarted.run(task_id).await?;
+
+    assert_eq!(snapshot.status, TaskStatus::Completed);
+    let state = shared.lock().unwrap();
+    assert_eq!(state.context_starts, 1);
+    assert!(state.resume_attempts.is_empty());
+    assert_eq!(state.epoch_starts.len(), 1);
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn startup_reconciliation_prepares_resumable_tasks_without_dispatching_work() -> TestResult {
+    let fixture = EngineFixture::new()?;
+    let store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let mut first = TaskEngine::new(
+        store,
+        EnginePort::continuation_checkpoint_then_compaction_failure(),
+    );
+    assert!(
+        first
+            .start(start_task(session.id, &fixture.workspace)?)
+            .await
+            .is_err()
+    );
+    let task_id = first.store().list_resumable_tasks()?[0].snapshot.task_id;
+    let (store, _) = first.into_parts();
+    let port = EnginePort::resume_small_edit();
+    let shared = port.shared();
+    let mut restarted = TaskEngine::new(store, port);
+
+    assert_eq!(restarted.reconcile_startup().await?, [task_id]);
+    {
+        let state = shared.lock().unwrap();
+        assert_eq!(state.resume_attempts, ["engine-context"]);
+        assert!(state.epoch_starts.is_empty());
+    }
+
+    let snapshot = restarted.run(task_id).await?;
+    assert_eq!(snapshot.status, TaskStatus::Completed);
+    assert_eq!(shared.lock().unwrap().resume_attempts, ["engine-context"]);
     Ok(())
 }
 
