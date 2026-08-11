@@ -1,6 +1,8 @@
-use std::fs;
 use std::io;
 use std::path::Path;
+
+#[cfg(unix)]
+use std::fs;
 
 pub fn make_owner_only_directory(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
