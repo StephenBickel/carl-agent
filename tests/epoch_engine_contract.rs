@@ -4,6 +4,7 @@ use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use carl::acp::PermissionMode;
 use carl::delegates::{ModelId, ReasoningEffort};
@@ -129,6 +130,8 @@ struct EnginePortState {
     planning_fault: Option<PlanningFault>,
     work_fault: Option<WorkFault>,
     soft_boundary_failure: Option<AgentErrorProvenance>,
+    soft_boundary_unsupported: bool,
+    invalid_work_report: bool,
     post_usage_diff_bytes: usize,
     pending_resolve: bool,
 }
@@ -203,6 +206,8 @@ impl EnginePort {
                 planning_fault: None,
                 work_fault: None,
                 soft_boundary_failure: None,
+                soft_boundary_unsupported: false,
+                invalid_work_report: false,
                 post_usage_diff_bytes: 0,
                 pending_resolve: false,
             })),
@@ -361,6 +366,18 @@ impl EnginePort {
     fn soft_boundary_failure(provenance: AgentErrorProvenance) -> Self {
         let port = Self::small_edit();
         port.state.lock().unwrap().soft_boundary_failure = Some(provenance);
+        port
+    }
+
+    fn pending_effect_with_unsupported_soft_boundary() -> Self {
+        let port = Self::pending_effect();
+        port.state.lock().unwrap().soft_boundary_unsupported = true;
+        port
+    }
+
+    fn malformed_terminal_work_report() -> Self {
+        let port = Self::small_edit();
+        port.state.lock().unwrap().invalid_work_report = true;
         port
     }
 
@@ -601,6 +618,10 @@ impl AgentPort for EnginePort {
             {
                 return Err(scripted_error(provenance));
             }
+            if text.starts_with("Carl soft epoch boundary") && state.soft_boundary_unsupported {
+                state.soft_boundary_unsupported = false;
+                return Err(AgentPortError::from_code(AgentPortErrorCode::Unsupported));
+            }
             state.steers.push(text.clone());
             if let Some(operation_id) = text.strip_prefix("carl-operation-id:") {
                 state.latest_operation_id = Some(operation_id.trim().to_owned());
@@ -792,10 +813,17 @@ impl AgentPort for EnginePort {
                     .join(",");
                 ("complete", String::new(), clauses)
             };
+            let report = if state.invalid_work_report {
+                "malformed terminal report".to_owned()
+            } else {
+                format!(
+                    "<carl-epoch-report>{{\"schema_version\":1,\"disposition\":{disposition:?},\"summary\":{summary:?}{next_objective},\"clause_evidence\":[{clauses}],\"exact_identifiers\":[]}}</carl-epoch-report>"
+                )
+            };
             state.events.push_back(AgentEvent::AssistantDelta {
                 context_id: context_id.clone(),
                 epoch_id: epoch_id.clone(),
-                text: format!("<carl-epoch-report>{{\"schema_version\":1,\"disposition\":{disposition:?},\"summary\":{summary:?}{next_objective},\"clause_evidence\":[{clauses}],\"exact_identifiers\":[]}}</carl-epoch-report>"),
+                text: report,
             });
             let terminal_status = state.terminal_statuses.pop_front().unwrap_or("completed");
             state.events.push_back(AgentEvent::EpochCompleted {
@@ -1852,6 +1880,96 @@ async fn uncertain_work_dispatch_failure_returns_typed_blocked_update() -> TestR
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn malformed_terminal_work_report_closes_the_epoch_and_blocks_restart() -> TestResult {
+    let fixture = EngineFixture::new()?;
+    let store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let mut engine = TaskEngine::new(store, EnginePort::malformed_terminal_work_report());
+
+    let error = engine
+        .start(start_task(session.id, &fixture.workspace)?)
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        error.code(),
+        carl::runtime::task::TaskEngineErrorCode::Blocked
+    );
+    let record = engine.store().list_resumable_tasks()?.remove(0);
+    assert_eq!(record.snapshot.status, TaskStatus::Blocked);
+    assert_eq!(record.snapshot.active_epoch, None);
+    assert!(
+        operation_statuses(engine.store(), record.snapshot.task_id)?
+            .iter()
+            .all(|status| *status != OperationStatus::Started)
+    );
+    assert!(engine.take_updates().iter().any(|update| matches!(
+        update,
+        TaskEngineUpdate::TaskStatus {
+            status: TaskStatus::Blocked,
+            ..
+        }
+    )));
+
+    let task_id = record.snapshot.task_id;
+    let (store, _) = engine.into_parts();
+    let mut restarted = TaskEngine::new(store, EnginePort::resume_small_edit());
+    assert_eq!(
+        restarted.run(task_id).await.unwrap_err().code(),
+        carl::runtime::task::TaskEngineErrorCode::Blocked
+    );
+    assert_eq!(
+        restarted
+            .store()
+            .get_task(task_id)?
+            .unwrap()
+            .snapshot
+            .active_epoch,
+        None
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn unsupported_soft_boundary_interrupt_closes_started_work_and_returns_blocked() -> TestResult
+{
+    let fixture = EngineFixture::new()?;
+    let store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let port = EnginePort::pending_effect_with_unsupported_soft_boundary();
+    let shared = port.shared();
+    let mut engine = TaskEngine::new(store, port);
+    let mut input = start_task(session.id, &fixture.workspace)?;
+    input.budget.soft_epoch_seconds = 1;
+
+    let error = tokio::time::timeout(Duration::from_secs(3), engine.start(input))
+        .await
+        .expect("unsupported boundary steering must not strand the interrupted epoch")
+        .unwrap_err();
+
+    assert_eq!(
+        error.code(),
+        carl::runtime::task::TaskEngineErrorCode::Blocked
+    );
+    let record = engine.store().list_resumable_tasks()?.remove(0);
+    assert_eq!(record.snapshot.status, TaskStatus::Blocked);
+    assert_eq!(record.snapshot.active_epoch, None);
+    assert_eq!(
+        only_operation_status(engine.store(), record.snapshot.task_id)?,
+        OperationStatus::Uncertain
+    );
+    assert_eq!(shared.lock().unwrap().interrupts, 1);
+    assert!(engine.take_updates().iter().any(|update| matches!(
+        update,
+        TaskEngineUpdate::TaskStatus {
+            status: TaskStatus::Blocked,
+            ..
+        }
+    )));
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn recovery_attempt_outcomes_are_persisted_only_after_the_recovery_epoch_finishes()
 -> TestResult {
     let fixture = EngineFixture::new()?;
@@ -2310,6 +2428,90 @@ async fn definitely_not_applied_recovery_start_is_recorded_failed_and_restart_sa
     let snapshot = restarted.store().get_task(task_id)?.unwrap().snapshot;
     assert_eq!(snapshot.status, TaskStatus::Blocked);
     assert_eq!(snapshot.active_epoch, None);
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn possibly_applied_recovery_start_remains_pending_and_cannot_be_retried_after_restart()
+-> TestResult {
+    let fixture = EngineFixture::new()?;
+    let store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let mut first = TaskEngine::new(
+        store,
+        EnginePort::continuation_checkpoint_then_compaction_failure(),
+    );
+    assert_eq!(
+        first
+            .start(start_task(session.id, &fixture.workspace)?)
+            .await
+            .unwrap_err()
+            .code(),
+        carl::runtime::task::TaskEngineErrorCode::Provider
+    );
+    let task_id = first.store().list_resumable_tasks()?[0].snapshot.task_id;
+    let (mut store, _) = first.into_parts();
+    let recovery_epoch_id = carl::runtime::task::EpochId::new();
+    let strategy = RecoveryStrategy::ReconstructFromEvidence;
+    let strategy_fingerprint = recovery_attempt_fingerprint(&digest(b"uncertain-start"), strategy);
+    let revision = store.get_task(task_id)?.unwrap().revision;
+    store
+        .append_task_event(
+            task_id,
+            revision,
+            carl::runtime::task::TaskEvent::RecoveryAttemptStarted {
+                epoch_id: recovery_epoch_id,
+                strategy,
+                strategy_fingerprint: strategy_fingerprint.clone(),
+            },
+            chrono::Utc::now(),
+        )?
+        .expect("the pending recovery event must append");
+    let mut uncertain = TaskEngine::new(
+        store,
+        EnginePort::resume_with_work_start_failure(AgentErrorProvenance::PossiblyApplied),
+    );
+
+    let error = uncertain.run(task_id).await.unwrap_err();
+
+    assert_eq!(
+        error.code(),
+        carl::runtime::task::TaskEngineErrorCode::Blocked
+    );
+    let events = uncertain.store().read_task_events(task_id)?;
+    assert_eq!(
+        events
+            .iter()
+            .filter(|envelope| matches!(
+                &envelope.event,
+                carl::events::Event::TaskLifecycle {
+                    event: carl::runtime::task::TaskEvent::EpochStarted { epoch_id, .. },
+                    ..
+                } if *epoch_id == recovery_epoch_id
+            ))
+            .count(),
+        1
+    );
+    assert!(events.iter().all(|envelope| !matches!(
+        &envelope.event,
+        carl::events::Event::TaskLifecycle {
+            event: carl::runtime::task::TaskEvent::RecoveryAttemptRecorded { epoch_id, .. },
+            ..
+        } if *epoch_id == recovery_epoch_id
+    )));
+    let (store, _) = uncertain.into_parts();
+    let restart_port = EnginePort::resume_small_edit();
+    let shared = restart_port.shared();
+    let mut restarted = TaskEngine::new(store, restart_port);
+
+    assert_eq!(
+        restarted.run(task_id).await.unwrap_err().code(),
+        carl::runtime::task::TaskEngineErrorCode::Blocked
+    );
+    let snapshot = restarted.store().get_task(task_id)?.unwrap().snapshot;
+    assert_eq!(snapshot.status, TaskStatus::Blocked);
+    assert_eq!(snapshot.active_epoch, None);
+    assert_eq!(shared.lock().unwrap().epoch_starts.len(), 0);
     Ok(())
 }
 

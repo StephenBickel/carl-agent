@@ -25,3 +25,4 @@ Task 8: minor (deferred): public EpochReport and OperationEvidence constructors 
 Task 8: fix round 1/5 (4 addressed, 0 open; commits 8a946ca..8d0a7b4)
 Task 8: complete (commits b59fd4f..8d0a7b4, review clean)
 Task 9: fix round 1/5 (6 addressed, 5 open; commits 03a22f1..8e500f5)
+Task 9: fix round 2/5 (3 addressed, 4 open; commits 8e500f5..933a113)

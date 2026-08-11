@@ -407,6 +407,55 @@ async fn approval_control_channel_closure_safely_blocks_before_dispatch() -> Tes
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn invalid_approval_acknowledges_the_same_typed_blocked_outcome_as_the_task() -> TestResult {
+    let fixture = Fixture::new()?;
+    let store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let mut engine = TaskEngine::new(store, ApprovalPort::approval());
+    let turn_id = install_frontend(&mut engine, session.id, fixture.workspace.clone());
+    let (control_sender, control_receiver) = mpsc::channel(1);
+    let (acknowledgement_sender, mut acknowledgement_receiver) = mpsc::channel(1);
+    let (permission_sender, mut permission_receiver) = mpsc::channel(1);
+    engine.install_controls(control_receiver, acknowledgement_sender, permission_sender);
+    let invalid_approval = tokio::spawn(async move {
+        permission_receiver
+            .recv()
+            .await
+            .expect("approval notice remains deliverable");
+        control_sender
+            .send(TaskEngineControl::Approval {
+                display_code: "invalid-approval-code".to_owned(),
+                decision: EffectDecision::Allow,
+                session_id: session.id,
+                turn_id,
+                acknowledgement: 7,
+            })
+            .await
+            .expect("invalid approval remains deliverable");
+    });
+
+    let error = engine
+        .start(input(session.id, &fixture, None))
+        .await
+        .unwrap_err();
+    invalid_approval.await?;
+    let (acknowledgement, acknowledged) = acknowledgement_receiver
+        .recv()
+        .await
+        .expect("approval receives one acknowledgement");
+
+    assert_eq!(error.code(), TaskEngineErrorCode::Blocked);
+    assert_eq!(acknowledgement, 7);
+    assert_eq!(
+        acknowledged.unwrap_err().code(),
+        TaskEngineErrorCode::Blocked
+    );
+    assert_safely_blocked(&mut engine)?;
+    assert!(engine.port.decisions.is_empty());
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn planning_approval_control_closes_the_epoch_with_typed_blocked() -> TestResult {
     let fixture = Fixture::new()?;
     let store = Store::open(&fixture.database)?;

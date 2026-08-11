@@ -1048,8 +1048,32 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
             let epoch_output = self
                 .drain_work_epoch(task_id, epoch_id, &provider_epoch_id, runtime)
                 .await?;
-            let report = parse_epoch_report(&epoch_output.transcript)
-                .map_err(|_| error(TaskEngineErrorCode::Verification))?;
+            let report = match parse_epoch_report(&epoch_output.transcript) {
+                Ok(report) => report,
+                Err(_) => {
+                    let reason = "provider returned a malformed terminal epoch report";
+                    let snapshot = self.snapshot(task_id)?;
+                    for operation_id in snapshot.started_operation_ids() {
+                        self.close_operation_with_evidence(
+                            task_id,
+                            operation_id,
+                            OperationStatus::Uncertain,
+                            reason,
+                        )?;
+                    }
+                    if self.snapshot(task_id)?.active_epoch == Some(epoch_id) {
+                        self.append(
+                            task_id,
+                            TaskEvent::EpochFinished {
+                                epoch_id,
+                                report_digest: sha256(epoch_output.transcript.as_bytes()),
+                            },
+                        )?;
+                    }
+                    self.block_task(task_id, reason)?;
+                    return Err(error(TaskEngineErrorCode::Blocked));
+                }
+            };
             self.append(
                 task_id,
                 TaskEvent::EpochFinished {
@@ -1349,13 +1373,6 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                         report_digest: sha256(b"provider-epoch-dispatch-uncertain"),
                     },
                 )?;
-                if runtime
-                    .pending_recovery
-                    .as_ref()
-                    .is_some_and(|pending| pending.epoch_id == epoch_id)
-                {
-                    self.record_pending_recovery_failure(task_id, epoch_id, runtime)?;
-                }
                 self.block_task(task_id, "provider epoch dispatch is uncertain")?;
                 Err(error(TaskEngineErrorCode::Blocked))
             }
@@ -2665,15 +2682,17 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                         self.acknowledge(acknowledgement, blocked.clone()).await;
                         blocked?;
                     }
-                    self.acknowledge(acknowledgement, result.clone()).await;
-                    if let Err(result_error) = result {
+                    if result.is_err() {
                         self.fail_before_effect_dispatch(
                             task_id,
                             operation_id,
                             "approval validation failed before effect dispatch",
                         )?;
-                        return Err(result_error);
+                        let blocked = Err(error(TaskEngineErrorCode::Blocked));
+                        self.acknowledge(acknowledgement, blocked.clone()).await;
+                        return blocked.map(|()| decision);
                     }
+                    self.acknowledge(acknowledgement, Ok(())).await;
                     return Ok(decision);
                 }
                 TaskEngineControl::Cancel { .. } => {
@@ -2802,23 +2821,14 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                 text_digest: sha256(SAFE_BOUNDARY_MESSAGE.as_bytes()),
             },
         )?;
-        match self
-            .port
+        self.port
             .steer(
                 &runtime.context_id,
                 provider_epoch_id,
                 SAFE_BOUNDARY_MESSAGE.to_owned(),
             )
             .await
-        {
-            Ok(()) => Ok(()),
-            Err(error) if error.code() == AgentPortErrorCode::Unsupported => self
-                .port
-                .interrupt(&runtime.context_id, provider_epoch_id)
-                .await
-                .map_err(provider_error),
-            Err(error) => Err(provider_error(error)),
-        }
+            .map_err(provider_error)
     }
 
     fn apply_clause_evidence(

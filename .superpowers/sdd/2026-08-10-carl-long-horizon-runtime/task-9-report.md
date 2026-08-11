@@ -382,3 +382,111 @@ PASS, exit 0
 - No plan, design specification, or security policy was edited. No Important
   residual from this round remains; process-startup discovery/resumption stays the
   explicit Task 10 boundary.
+
+## Fix Round 3/5
+
+### Findings fixed
+
+- A terminal provider stream with a malformed `<carl-epoch-report>` no longer
+  returns raw `Verification` while leaving the logical epoch active. The engine
+  reconciles any remaining `Started` operation as `Uncertain`, finishes the exact
+  epoch, durably blocks, emits `TaskStatus::Blocked`, and returns typed `Blocked`.
+- `Unsupported` soft-boundary steering is now treated as a rejected boundary
+  request. The caller performs the single provider interrupt, closes in-flight
+  work as `Uncertain`, finishes the epoch, durably blocks, and returns typed
+  `Blocked` instead of accepting the interrupt as successful steering.
+- A possibly-applied recovery epoch start no longer records the Carl-selected
+  strategy as definitely `Failed`. Its durable `RecoveryAttemptStarted` remains
+  pending under a blocked task after the uncertain epoch is finished; restart
+  performs no provider dispatch and cannot reuse the epoch identity. The
+  definitely-not-applied branch still records the terminal `Failed` outcome.
+- An invalid or expired remote approval that is normalized into durable task
+  blocking now acknowledges the same typed `Blocked` result. The control caller,
+  task projection, task update stream, and frontend-bound journal therefore agree
+  instead of exposing `InvalidTask` or `Storage` after the task is blocked.
+
+### RED evidence
+
+1. Malformed terminal work report:
+
+   `cargo test --test epoch_engine_contract malformed_terminal_work_report_closes_the_epoch_and_blocks_restart -- --exact --nocapture`
+
+   **FAIL, exit 101:** the engine returned `Verification` instead of `Blocked` and
+   had not executed the asserted safe terminal/restart path.
+
+2. Unsupported soft-boundary capability with one started operation:
+
+   `cargo test --test epoch_engine_contract unsupported_soft_boundary_interrupt_closes_started_work_and_returns_blocked -- --exact --nocapture`
+
+   **FAIL, exit 101:** the three-second guard elapsed because the successful
+   fallback interrupt was returned as `Ok` and the engine resumed waiting on the
+   stranded provider stream.
+
+3. Possibly-applied recovery start provenance:
+
+   `cargo test --test epoch_engine_contract possibly_applied_recovery_start_remains_pending_and_cannot_be_retried_after_restart -- --exact --nocapture`
+
+   **FAIL, exit 101:** the event journal contained a terminal
+   `RecoveryAttemptRecorded { outcome: Failed }` for an uncertain dispatch.
+
+4. Approval acknowledgement consistency:
+
+   `cargo test --lib 'runtime::task::engine::tests::invalid_approval_acknowledges_the_same_typed_blocked_outcome_as_the_task' -- --exact --nocapture`
+
+   **FAIL, exit 101:** the acknowledgement exposed `Storage` while the task result
+   and durable projection were `Blocked`.
+
+### GREEN evidence
+
+- Each of the four exact commands above passed independently: **1 passed, 0
+  failed** for each regression.
+- The protected definitely-not-applied recovery behavior passed independently:
+
+  `cargo test --test epoch_engine_contract definitely_not_applied_recovery_start_is_recorded_failed_and_restart_safe -- --exact --nocapture`
+
+  **PASS, exit 0: 1 passed, 0 failed.**
+- All internal approval/control engine regressions passed:
+
+  `cargo test --lib 'runtime::task::engine::tests::' -- --nocapture`
+
+  **PASS, exit 0: 5 passed, 0 failed, 47 filtered.**
+- Focused cross-cutting compatibility passed:
+
+  `cargo test --test epoch_engine_contract --test acp_kernel_contract --test task_domain_contract`
+
+  **PASS, exit 0: ACP kernel 32 passed; epoch engine 56 passed; task domain 14
+  passed; 0 failures.**
+
+### Static gates
+
+- The first format check reported only mechanical wrapping in new test code.
+  `cargo fmt --all` applied it, after which the complete static command passed:
+
+```text
+cargo fmt --all -- --check
+PASS, exit 0
+
+cargo clippy --all-targets --all-features -- -D warnings
+PASS, exit 0, no warnings
+
+git diff --check
+PASS, exit 0
+```
+
+Per round direction, no full-suite command was run. The root task will run the one
+final default-parallel all-features gate only after independent review is clean.
+
+### Fix-round self-review and concerns
+
+- A malformed terminal report cannot prove checkpoint or completion claims; the
+  durable outcome is therefore blocked with no active epoch and no started work.
+- The unsupported-boundary path issues exactly one interrupt and never treats an
+  interrupt acknowledgement as acceptance of the requested steering capability.
+- Possibly-applied recovery dispatch remains explicitly unresolved rather than
+  consuming the strategy as a proven failure. Because the task is durably blocked,
+  restart cannot dispatch or reuse that recovery epoch.
+- Approval acknowledgement normalization happens only on the same failure path
+  that durably closes the pre-dispatch operation and blocks the task. Successful
+  approvals retain their existing acknowledgement behavior.
+- No plan, design specification, security policy, or Task 10 startup boundary was
+  changed.
