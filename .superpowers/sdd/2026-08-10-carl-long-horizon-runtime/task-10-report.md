@@ -267,3 +267,66 @@ Task 10: fix round 1/5 (5 addressed, 1 open; commits bbe3edf..10bcb81)
 
 The full `cargo test --all-features` suite was not run; it remains reserved for the
 root clean re-review.
+
+## Fix Round 3/5
+
+### Final-gate integration failure
+
+The root final gate reached only the Buzz end-to-end contract before failing:
+
+```text
+cargo test --all-features --test buzz_end_to_end -- --nocapture
+FAIL: expected waiting_for_approval, observed failed (0 passed, 1 failed)
+```
+
+The sanitized ACP updates showed the edit tool enter `pending`, followed by the
+assistant delta and then a `blocked` task status; no approval prompt was emitted.
+The durable journal located the first invalid boundary exactly: the file operation
+committed intent and started events, then terminal evidence, `failed`, and `blocked`
+with `file mutation paths are not trustworthy`.
+
+The Task 1 Buzz app-server fixture emitted its `item/started` file-change notification
+with an empty `changes` array, even though its matching completed notification
+declared `target.txt`. This became invalid when Task 10 began safely requiring a
+bounded provider-declared path set before dispatch and rechecking that exact set at
+completion. The pinned Codex app-server contract already models the real shape by
+including the same changes in both notifications.
+
+### Correction and regression
+
+No production approval, startup reconciliation, or filesystem-proof behavior was
+relaxed. The Buzz fixture now builds both started and completed file-change items
+through one shared payload builder whose bounded relative path is `target.txt`.
+The existing end-to-end contract was the integration RED and now reaches both
+approval waits again. A focused fixture-consistency contract was also added; its RED
+failed to compile because the shared builder did not exist, and its GREEN proves the
+started and completed change sets are identical and nonempty.
+
+Verification performed without rerunning the full suite:
+
+```text
+cargo test --all-features --test buzz_acp_contract \
+  --test buzz_adapter_contract --test buzz_end_to_end --test buzz_mcp_contract \
+  -- --nocapture
+PASS: 10 passed, 0 failed
+
+cargo test --test epoch_engine_contract postcondition -- --nocapture
+PASS: 7 passed, 0 failed
+
+cargo test --test epoch_engine_contract \
+  every_required_engine_restart_cut_restarts_from_real_engine_state \
+  -- --exact --nocapture
+PASS: 1 passed, 0 failed
+
+cargo test --test task_domain_contract --test task_storage_contract
+PASS: 31 passed, 0 failed
+```
+
+Current ledger line included with this round:
+
+```text
+Task 10: fix round 2/5 (1 addressed, 1 open; commits 10bcb81..bed1309)
+```
+
+The full `cargo test --all-features` suite was deliberately not rerun; the root agent
+will run it after clean review.

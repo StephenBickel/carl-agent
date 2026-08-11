@@ -727,9 +727,7 @@ fn item_started(
             "type":"commandExecution","id":item_id,"command":"cargo test",
             "cwd":"/workspace","status":"inProgress","commandActions":[]
         }),
-        "fileChange" => json!({
-            "type":"fileChange","id":item_id,"status":"inProgress","changes":[]
-        }),
+        "fileChange" => file_change_fixture_item(item_id, "inProgress"),
         _ => return Err(std::io::Error::other("unsupported fixture item type")),
     };
     notify(json!({
@@ -754,10 +752,7 @@ fn item_completed(
             "cwd":"/workspace","status":status,"commandActions":[],
             "exitCode":succeeded.then_some(0),"aggregatedOutput":"ok"
         }),
-        "fileChange" => json!({
-            "type":"fileChange","id":item_id,"status":status,
-            "changes":[{"path":"target.txt","kind":"update"}]
-        }),
+        "fileChange" => file_change_fixture_item(item_id, status),
         _ => return Err(std::io::Error::other("unsupported fixture item type")),
     };
     notify(json!({
@@ -766,6 +761,13 @@ fn item_completed(
             "item":item
         }
     }))
+}
+
+pub fn file_change_fixture_item(item_id: &str, status: &str) -> Value {
+    json!({
+        "type":"fileChange","id":item_id,"status":status,
+        "changes":[{"path":"target.txt","kind":"update"}]
+    })
 }
 
 fn agent_delta(thread_id: &str, turn_id: &str, text: &str) -> std::io::Result<()> {

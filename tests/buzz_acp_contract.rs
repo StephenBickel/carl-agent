@@ -21,6 +21,10 @@ fn main() {
                 fixture_hashes,
             ),
             trial(
+                "file change fixture declares stable paths before and after approval",
+                file_change_fixture_paths_are_stable,
+            ),
+            trial(
                 "real Carl process conforms at the Buzz ACP boundary",
                 process_boundary_conforms,
             ),
@@ -33,6 +37,16 @@ fn trial(name: &'static str, test: fn() -> TestResult) -> Trial {
     Trial::test(name, move || {
         test().map_err(|error| Failed::from(error.to_string()))
     })
+}
+
+fn file_change_fixture_paths_are_stable() -> TestResult {
+    let started = support::file_change_fixture_item("file-item", "inProgress");
+    let completed = support::file_change_fixture_item("file-item", "completed");
+    let expected = json!([{"path":"target.txt","kind":"update"}]);
+
+    assert_eq!(started["changes"], expected);
+    assert_eq!(completed["changes"], started["changes"]);
+    Ok(())
 }
 
 fn fixture_hashes() -> TestResult {
