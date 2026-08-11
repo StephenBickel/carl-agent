@@ -76,6 +76,8 @@ impl Layout {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&data, fs::Permissions::from_mode(0o700))?;
         }
+        #[cfg(windows)]
+        make_windows_directory_owner_only(&data)?;
         let root = fs::canonicalize(requested_root)?;
         let data = root.join("data");
         let workspace = root.join("workspace");
@@ -135,6 +137,119 @@ impl Drop for Layout {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.root);
     }
+}
+
+#[cfg(windows)]
+fn make_windows_directory_owner_only(path: &Path) -> TestResult {
+    use std::mem::size_of;
+    use std::os::windows::ffi::OsStrExt;
+    use std::ptr;
+
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::Security::Authorization::{SE_FILE_OBJECT, SetNamedSecurityInfoW};
+    use windows_sys::Win32::Security::{
+        ACCESS_ALLOWED_ACE, ACL, ACL_REVISION, AddAccessAllowedAceEx, CONTAINER_INHERIT_ACE,
+        DACL_SECURITY_INFORMATION, GetLengthSid, GetTokenInformation, InitializeAcl, IsValidSid,
+        OBJECT_INHERIT_ACE, PROTECTED_DACL_SECURITY_INFORMATION, TOKEN_QUERY, TOKEN_USER,
+        TokenUser,
+    };
+    use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    struct ProcessToken(HANDLE);
+
+    impl Drop for ProcessToken {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                // SAFETY: OpenProcessToken returned this owned handle and it is closed once.
+                let _ = unsafe { CloseHandle(self.0) };
+            }
+        }
+    }
+
+    let mut token = ptr::null_mut();
+    // SAFETY: token points to writable handle storage.
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0
+        || token.is_null()
+    {
+        return Err("could not open the Windows process token".into());
+    }
+    let token = ProcessToken(token);
+    let mut required = 0_u32;
+    // SAFETY: the first call intentionally queries the required byte count.
+    let _ = unsafe { GetTokenInformation(token.0, TokenUser, ptr::null_mut(), 0, &mut required) };
+    if required < u32::try_from(size_of::<TOKEN_USER>())? {
+        return Err("Windows did not report a usable token user".into());
+    }
+    let word = size_of::<usize>();
+    let words = usize::try_from(required)?.div_ceil(word);
+    let mut user_storage = vec![0_usize; words];
+    // SAFETY: user_storage is aligned and large enough for the reported TOKEN_USER bytes.
+    if unsafe {
+        GetTokenInformation(
+            token.0,
+            TokenUser,
+            user_storage.as_mut_ptr().cast(),
+            required,
+            &mut required,
+        )
+    } == 0
+    {
+        return Err("could not query the Windows token user".into());
+    }
+    // SAFETY: the successful query initialized TOKEN_USER at the buffer start.
+    let sid = unsafe { (*(user_storage.as_ptr().cast::<TOKEN_USER>())).User.Sid };
+    // SAFETY: sid points inside the live, successfully initialized token buffer.
+    if unsafe { IsValidSid(sid) } == 0 {
+        return Err("Windows returned an invalid token SID".into());
+    }
+    // SAFETY: IsValidSid succeeded and the token buffer remains live.
+    let sid_bytes = usize::try_from(unsafe { GetLengthSid(sid) })?;
+    let acl_bytes = size_of::<ACL>()
+        .checked_add(size_of::<ACCESS_ALLOWED_ACE>())
+        .and_then(|bytes| bytes.checked_sub(size_of::<u32>()))
+        .and_then(|bytes| bytes.checked_add(sid_bytes))
+        .ok_or("Windows ACL size overflow")?;
+    let mut acl = vec![0_usize; acl_bytes.div_ceil(word)];
+    let acl_pointer = acl.as_mut_ptr().cast::<ACL>();
+    // SAFETY: acl is aligned writable storage of acl_bytes bytes.
+    if unsafe { InitializeAcl(acl_pointer, u32::try_from(acl_bytes)?, ACL_REVISION) } == 0 {
+        return Err("could not initialize the Windows ACL".into());
+    }
+    // SAFETY: the initialized ACL has room for this ACE and sid remains live.
+    if unsafe {
+        AddAccessAllowedAceEx(
+            acl_pointer,
+            ACL_REVISION,
+            OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE,
+            FILE_ALL_ACCESS,
+            sid,
+        )
+    } == 0
+    {
+        return Err("could not add the Windows owner ACL entry".into());
+    }
+    let wide_path = path
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    // SAFETY: wide_path is NUL-terminated; the ACL and SID storage remain live.
+    let result = unsafe {
+        SetNamedSecurityInfoW(
+            wide_path.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            acl_pointer,
+            ptr::null_mut(),
+        )
+    };
+    if result != 0 {
+        return Err(format!("could not protect the Windows data directory: {result}").into());
+    }
+    Ok(())
 }
 
 pub struct Client {
