@@ -1,17 +1,35 @@
 use std::collections::BTreeSet;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::{CanonicalCheckpoint, ClauseStatus, EpochReport, ReportError, ReportErrorCode};
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+const MAX_RECOVERY_ATTEMPTS: usize = 64;
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RecoveryStrategy {
     ReconstructFromEvidence,
     ReplaceApproach,
     FreshContextDiagnosis,
     MinimizeReproduction,
     DeclareBlocked,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryAttemptOutcome {
+    Succeeded,
+    Failed,
+}
+
+/// A durable, terminal result for one Carl-selected recovery strategy.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RecoveryAttempt {
+    pub strategy: RecoveryStrategy,
+    pub strategy_fingerprint: String,
+    pub outcome: RecoveryAttemptOutcome,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -29,6 +47,17 @@ pub fn assess_progress(
     report: &EpochReport,
     history: &[ProgressAssessment],
 ) -> Result<ProgressAssessment, ReportError> {
+    assess_progress_with_recovery_attempts(checkpoint, report, history, &[])
+}
+
+/// Computes progress with bounded durable outcomes for strategies Carl actually attempted.
+pub fn assess_progress_with_recovery_attempts(
+    checkpoint: &CanonicalCheckpoint,
+    report: &EpochReport,
+    history: &[ProgressAssessment],
+    recovery_attempts: &[RecoveryAttempt],
+) -> Result<ProgressAssessment, ReportError> {
+    validate_recovery_attempts(recovery_attempts)?;
     let next_objective = report
         .next_objective
         .as_deref()
@@ -56,12 +85,11 @@ pub fn assess_progress(
             .iter()
             .rev()
             .take_while(|assessment| assessment.fingerprint == fingerprint)
-            .filter(|assessment| assessment.recovery.is_some())
             .count()
-            .saturating_add(1)
             .min(u8::MAX as usize) as u8
     };
-    let recovery = (!new_information).then(|| select_recovery(checkpoint, &fingerprint, history));
+    let recovery = (has_missing_authority(checkpoint) || !new_information)
+        .then(|| select_recovery(checkpoint, &fingerprint, recovery_attempts));
     Ok(ProgressAssessment {
         fingerprint,
         new_information,
@@ -74,39 +102,71 @@ pub fn assess_progress(
 fn select_recovery(
     checkpoint: &CanonicalCheckpoint,
     fingerprint: &str,
-    history: &[ProgressAssessment],
+    recovery_attempts: &[RecoveryAttempt],
 ) -> RecoveryStrategy {
-    if checkpoint
-        .blockers
-        .iter()
-        .any(|blocker| blocker == "missing_authority")
-    {
+    if has_missing_authority(checkpoint) {
         return RecoveryStrategy::DeclareBlocked;
     }
-    let failed = history
+    let failed = recovery_attempts
         .iter()
-        .filter(|assessment| assessment.fingerprint == fingerprint)
-        .filter_map(|assessment| assessment.recovery)
+        .filter(|attempt| attempt.outcome == RecoveryAttemptOutcome::Failed)
+        .filter(|attempt| {
+            attempt.strategy != RecoveryStrategy::DeclareBlocked
+                && attempt.strategy_fingerprint
+                    == recovery_attempt_fingerprint(fingerprint, attempt.strategy)
+        })
+        .map(|attempt| attempt.strategy)
         .collect::<BTreeSet<_>>();
     if failed.len() >= 3 {
         return RecoveryStrategy::DeclareBlocked;
     }
-    if failed.len() == 2 {
-        return if checkpoint.provider.context_id.is_some() {
-            RecoveryStrategy::FreshContextDiagnosis
-        } else {
-            RecoveryStrategy::MinimizeReproduction
-        };
-    }
     [
         RecoveryStrategy::ReconstructFromEvidence,
         RecoveryStrategy::ReplaceApproach,
-        RecoveryStrategy::FreshContextDiagnosis,
         RecoveryStrategy::MinimizeReproduction,
+        RecoveryStrategy::FreshContextDiagnosis,
     ]
     .into_iter()
     .find(|strategy| !failed.contains(strategy))
     .unwrap_or(RecoveryStrategy::DeclareBlocked)
+}
+
+/// Derives the strategy-specific identity that binds an attempted recovery to a stalled state.
+#[must_use]
+pub fn recovery_attempt_fingerprint(
+    progress_fingerprint: &str,
+    strategy: RecoveryStrategy,
+) -> String {
+    #[derive(Serialize)]
+    struct RecoveryFingerprint<'a> {
+        progress_fingerprint: &'a str,
+        strategy: RecoveryStrategy,
+    }
+    let encoded = serde_json::to_vec(&RecoveryFingerprint {
+        progress_fingerprint,
+        strategy,
+    })
+    .expect("a fixed recovery fingerprint serialization cannot fail");
+    format!("{:x}", Sha256::digest(encoded))
+}
+
+fn has_missing_authority(checkpoint: &CanonicalCheckpoint) -> bool {
+    checkpoint
+        .blockers
+        .iter()
+        .any(|blocker| blocker == "missing_authority")
+}
+
+fn validate_recovery_attempts(attempts: &[RecoveryAttempt]) -> Result<(), ReportError> {
+    if attempts.len() > MAX_RECOVERY_ATTEMPTS
+        || attempts.iter().any(|attempt| {
+            attempt.strategy == RecoveryStrategy::DeclareBlocked
+                || !is_fingerprint(&attempt.strategy_fingerprint)
+        })
+    {
+        return Err(ReportError::new(ReportErrorCode::InvalidProgressInput));
+    }
+    Ok(())
 }
 
 fn fingerprint(
@@ -115,29 +175,57 @@ fn fingerprint(
     next_objective: &str,
 ) -> Result<String, ReportError> {
     #[derive(Serialize)]
+    struct VerificationOutcome<'a> {
+        clause_id: &'a str,
+        status: Option<ClauseStatus>,
+        evidence: Vec<(u64, Option<&'a String>, Option<super::OperationId>)>,
+    }
+
+    #[derive(Serialize)]
     struct Fingerprint<'a> {
-        changed_file_digests: Vec<&'a String>,
-        verification_outcomes: Vec<(&'a String, ClauseStatus, usize)>,
+        changed_files: Vec<(&'a String, &'a String)>,
+        verification_outcomes: Vec<VerificationOutcome<'a>>,
         failure_signatures: Vec<String>,
         resolved_clause_ids: &'a [String],
         decision_ids: Vec<&'a String>,
         next_objective: &'a str,
     }
 
-    let changed_file_digests = checkpoint
-        .repository
-        .file_hashes
-        .values()
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect();
-    let mut verification_outcomes = checkpoint
+    let changed_files = checkpoint.repository.file_hashes.iter().collect();
+    let statuses = checkpoint
         .contract
         .clauses
         .iter()
-        .map(|clause| (&clause.id, clause.status, clause.evidence.len()))
+        .map(|clause| (clause.id.as_str(), clause.status))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut verification_outcomes = checkpoint
+        .verification
+        .iter()
+        .map(|outcome| {
+            let mut evidence = outcome
+                .evidence
+                .iter()
+                .map(|item| {
+                    (
+                        item.event_sequence,
+                        item.artifact_digest.as_ref(),
+                        item.operation_id,
+                    )
+                })
+                .collect::<Vec<_>>();
+            evidence.sort();
+            VerificationOutcome {
+                clause_id: &outcome.clause_id,
+                status: statuses.get(outcome.clause_id.as_str()).copied(),
+                evidence,
+            }
+        })
         .collect::<Vec<_>>();
-    verification_outcomes.sort_by(|left, right| left.0.cmp(right.0));
+    verification_outcomes.sort_by(|left, right| {
+        left.clause_id
+            .cmp(right.clause_id)
+            .then_with(|| left.evidence.cmp(&right.evidence))
+    });
     let failure_signatures = checkpoint
         .blockers
         .iter()
@@ -171,7 +259,7 @@ fn fingerprint(
         .into_iter()
         .collect();
     let encoded = serde_json::to_vec(&Fingerprint {
-        changed_file_digests,
+        changed_files,
         verification_outcomes,
         failure_signatures,
         resolved_clause_ids,
@@ -180,4 +268,11 @@ fn fingerprint(
     })
     .map_err(|_| ReportError::new(ReportErrorCode::InvalidReport))?;
     Ok(format!("{:x}", Sha256::digest(encoded)))
+}
+
+fn is_fingerprint(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }

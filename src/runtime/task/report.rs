@@ -86,6 +86,8 @@ pub enum ReportErrorCode {
     UnknownOperation,
     #[error("epoch report does not provide sufficient Carl-owned evidence")]
     InsufficientEvidence,
+    #[error("epoch progress input is invalid")]
+    InvalidProgressInput,
 }
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]

@@ -3,11 +3,12 @@ use std::error::Error;
 
 use carl::runtime::task::{
     CanonicalCheckpoint, CheckpointId, ClauseEvidence, ClauseStatus, CompletionClause,
-    CompletionContract, DecisionRecord, EffectClass, EpochDisposition, ExactIdentifier,
-    OperationCheckpoint, OperationEvidence, OperationId, OperationStatus, ProcessCheckpoint,
-    ProgressAssessment, ProviderCheckpoint, RecoveryStrategy, ReportErrorCode,
-    RepositoryCheckpoint, TaskId, WorkEvidence, assess_progress, decide_completion,
-    parse_epoch_report,
+    CompletionContract, DecisionRecord, EffectClass, EpochDisposition, EvidenceRef,
+    ExactIdentifier, OperationCheckpoint, OperationEvidence, OperationId, OperationStatus,
+    ProcessCheckpoint, ProgressAssessment, ProviderCheckpoint, RecoveryAttempt,
+    RecoveryAttemptOutcome, RecoveryStrategy, ReportErrorCode, RepositoryCheckpoint, TaskId,
+    WorkEvidence, assess_progress, assess_progress_with_recovery_attempts, decide_completion,
+    parse_epoch_report, recovery_attempt_fingerprint,
 };
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -308,37 +309,180 @@ fn fingerprints_verification_outcomes_in_canonical_order() -> TestResult {
 }
 
 #[test]
+fn fingerprints_exact_canonical_verification_evidence() -> TestResult {
+    let operation_id = OperationId::from_uuid(uuid("33333333-3333-4333-8333-333333333333"));
+    let mut first = checkpoint(operation_id, digest(b"diff"));
+    let mut second = first.clone();
+    first.verification[0].evidence = vec![EvidenceRef {
+        event_sequence: 7,
+        artifact_digest: Some(digest(b"artifact-one")),
+        operation_id: Some(operation_id),
+    }];
+    second.verification[0].evidence = vec![EvidenceRef {
+        event_sequence: 7,
+        artifact_digest: Some(digest(b"artifact-two")),
+        operation_id: Some(operation_id),
+    }];
+    let report = parse_epoch_report(&report("continue", ""))?;
+    assert_ne!(
+        assess_progress(&first, &report, &[])?.fingerprint,
+        assess_progress(&second, &report, &[])?.fingerprint
+    );
+    Ok(())
+}
+
+#[test]
+fn fingerprints_changed_files_with_identity_and_multiplicity() -> TestResult {
+    let operation_id = OperationId::from_uuid(uuid("33333333-3333-4333-8333-333333333333"));
+    let mut first = checkpoint(operation_id, digest(b"diff"));
+    let mut second = first.clone();
+    let file_digest = digest(b"same file contents");
+    first
+        .repository
+        .file_hashes
+        .insert("src/first.rs".to_owned(), file_digest.clone());
+    first
+        .repository
+        .file_hashes
+        .insert("src/second.rs".to_owned(), file_digest.clone());
+    second
+        .repository
+        .file_hashes
+        .insert("src/renamed.rs".to_owned(), file_digest);
+    let report = parse_epoch_report(&report("continue", ""))?;
+    assert_ne!(
+        assess_progress(&first, &report, &[])?.fingerprint,
+        assess_progress(&second, &report, &[])?.fingerprint
+    );
+    Ok(())
+}
+
+#[test]
 fn stalls_only_block_after_three_distinct_recovery_strategies_failed() -> TestResult {
     let operation_id = OperationId::from_uuid(uuid("33333333-3333-4333-8333-333333333333"));
     let checkpoint = checkpoint(operation_id, digest(b"diff"));
     let report = parse_epoch_report(&report("continue", ""))?;
     let baseline = assess_progress(&checkpoint, &report, &[])?;
     let mut history: Vec<ProgressAssessment> = vec![baseline.clone()];
+    let mut attempts = Vec::new();
     for expected in [
         RecoveryStrategy::ReconstructFromEvidence,
         RecoveryStrategy::ReplaceApproach,
-        RecoveryStrategy::FreshContextDiagnosis,
+        RecoveryStrategy::MinimizeReproduction,
     ] {
-        let assessment = assess_progress(&checkpoint, &report, &history)?;
+        let assessment =
+            assess_progress_with_recovery_attempts(&checkpoint, &report, &history, &attempts)?;
         assert_eq!(assessment.recovery, Some(expected));
+        attempts.push(RecoveryAttempt {
+            strategy: expected,
+            strategy_fingerprint: recovery_attempt_fingerprint(&assessment.fingerprint, expected),
+            outcome: RecoveryAttemptOutcome::Failed,
+        });
         history.push(assessment);
     }
-    let blocked = assess_progress(&checkpoint, &report, &history)?;
+    let blocked =
+        assess_progress_with_recovery_attempts(&checkpoint, &report, &history, &attempts)?;
     assert_eq!(blocked.recovery, Some(RecoveryStrategy::DeclareBlocked));
     assert_eq!(blocked.stall_count, 4);
     Ok(())
 }
 
 #[test]
-fn missing_provider_context_prefers_a_minimal_reproduction_over_context_diagnosis() -> TestResult {
+fn recovery_recommendations_are_not_failed_recovery_attempts() -> TestResult {
     let operation_id = OperationId::from_uuid(uuid("33333333-3333-4333-8333-333333333333"));
-    let mut checkpoint = checkpoint(operation_id, digest(b"diff"));
-    checkpoint.provider.context_id = None;
+    let checkpoint = checkpoint(operation_id, digest(b"diff"));
     let report = parse_epoch_report(&report("continue", ""))?;
     let baseline = assess_progress(&checkpoint, &report, &[])?;
-    let first = assess_progress(&checkpoint, &report, std::slice::from_ref(&baseline))?;
-    let second = assess_progress(&checkpoint, &report, &[baseline.clone(), first.clone()])?;
-    let third = assess_progress(&checkpoint, &report, &[baseline, first, second])?;
-    assert_eq!(third.recovery, Some(RecoveryStrategy::MinimizeReproduction));
+    let history = [
+        ProgressAssessment {
+            recovery: Some(RecoveryStrategy::ReconstructFromEvidence),
+            ..baseline.clone()
+        },
+        ProgressAssessment {
+            recovery: Some(RecoveryStrategy::ReplaceApproach),
+            ..baseline.clone()
+        },
+        ProgressAssessment {
+            recovery: Some(RecoveryStrategy::FreshContextDiagnosis),
+            ..baseline
+        },
+    ];
+    assert_eq!(
+        assess_progress(&checkpoint, &report, &history)?.recovery,
+        Some(RecoveryStrategy::ReconstructFromEvidence)
+    );
+    Ok(())
+}
+
+#[test]
+fn only_three_distinct_terminal_failed_recovery_attempts_can_block() -> TestResult {
+    let operation_id = OperationId::from_uuid(uuid("33333333-3333-4333-8333-333333333333"));
+    let checkpoint = checkpoint(operation_id, digest(b"diff"));
+    let report = parse_epoch_report(&report("continue", ""))?;
+    let baseline = assess_progress(&checkpoint, &report, &[])?;
+    let attempts = [
+        RecoveryAttempt {
+            strategy: RecoveryStrategy::ReconstructFromEvidence,
+            strategy_fingerprint: recovery_attempt_fingerprint(
+                &baseline.fingerprint,
+                RecoveryStrategy::ReconstructFromEvidence,
+            ),
+            outcome: RecoveryAttemptOutcome::Failed,
+        },
+        RecoveryAttempt {
+            strategy: RecoveryStrategy::ReplaceApproach,
+            strategy_fingerprint: recovery_attempt_fingerprint(
+                &baseline.fingerprint,
+                RecoveryStrategy::ReplaceApproach,
+            ),
+            outcome: RecoveryAttemptOutcome::Failed,
+        },
+        RecoveryAttempt {
+            strategy: RecoveryStrategy::MinimizeReproduction,
+            strategy_fingerprint: recovery_attempt_fingerprint(
+                &baseline.fingerprint,
+                RecoveryStrategy::MinimizeReproduction,
+            ),
+            outcome: RecoveryAttemptOutcome::Failed,
+        },
+    ];
+    assert_eq!(
+        assess_progress_with_recovery_attempts(&checkpoint, &report, &[baseline], &attempts)?
+            .recovery,
+        Some(RecoveryStrategy::DeclareBlocked)
+    );
+    Ok(())
+}
+
+#[test]
+fn missing_authority_blocks_without_a_prior_stall() -> TestResult {
+    let operation_id = OperationId::from_uuid(uuid("33333333-3333-4333-8333-333333333333"));
+    let mut checkpoint = checkpoint(operation_id, digest(b"diff"));
+    checkpoint.blockers.push("missing_authority".to_owned());
+    let report = parse_epoch_report(&report("continue", ""))?;
+    assert_eq!(
+        assess_progress(&checkpoint, &report, &[])?.recovery,
+        Some(RecoveryStrategy::DeclareBlocked)
+    );
+    Ok(())
+}
+
+#[test]
+fn recovery_selection_is_independent_of_provider_metadata() -> TestResult {
+    let operation_id = OperationId::from_uuid(uuid("33333333-3333-4333-8333-333333333333"));
+    let mut first = checkpoint(operation_id, digest(b"diff"));
+    let mut second = first.clone();
+    first.provider.context_id = None;
+    second.provider.provider = "different-provider".to_owned();
+    second.provider.model = "different-model".to_owned();
+    second.provider.context_id = Some("different-context".to_owned());
+    let report = parse_epoch_report(&report("continue", ""))?;
+    let first_baseline = assess_progress(&first, &report, &[])?;
+    let second_baseline = assess_progress(&second, &report, &[])?;
+    assert_eq!(first_baseline.fingerprint, second_baseline.fingerprint);
+    assert_eq!(
+        assess_progress(&first, &report, std::slice::from_ref(&first_baseline))?.recovery,
+        assess_progress(&second, &report, std::slice::from_ref(&second_baseline))?.recovery
+    );
     Ok(())
 }

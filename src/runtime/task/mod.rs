@@ -14,7 +14,10 @@ pub use context::{
     CompactionDecision, ContextBudget, ContextEngine, ContextError, ContextInput, ContextLedger,
     ContextLedgerEntry, ContextPackage, ContextSourceKind, ContextTrust, ContextUnit,
 };
-pub use progress::{ProgressAssessment, RecoveryStrategy, assess_progress};
+pub use progress::{
+    ProgressAssessment, RecoveryAttempt, RecoveryAttemptOutcome, RecoveryStrategy, assess_progress,
+    assess_progress_with_recovery_attempts, recovery_attempt_fingerprint,
+};
 pub use reducer::{TaskReduceError, TaskReduceErrorCode, reduce_task};
 pub use report::{
     CompletionDecision, EpochDisposition, EpochReport, OperationEvidence, ReportError,
