@@ -753,6 +753,12 @@ async fn run_task_actor<P: AgentPort + 'static>(
     let mut scheduled = initial_tasks.into_iter().collect::<VecDeque<_>>();
     let mut provider_shutdown = false;
     loop {
+        // Owner commands, especially shutdown, preempt every future refill/start.
+        if let Ok(command) = commands.try_recv() {
+            handle_actor_command(&mut engine, &mut scheduled, &mut provider_shutdown, command)
+                .await;
+            continue;
+        }
         if scheduled.is_empty() && !provider_shutdown {
             scheduled.extend(
                 engine
@@ -792,77 +798,102 @@ async fn run_task_actor<P: AgentPort + 'static>(
                     }
                     return Ok(());
                 };
-                match command {
-                    ActorCommand::Cancel { task_id, control_id, reply } => {
-                        let result = engine
-                            .cancel_controlled(task_id, Some(&control_id))
-                            .await;
-                        let _ = reply.send(map_control_result(result));
-                    }
-                    ActorCommand::Steer { task_id, text, control_id, reply } => {
-                        let result = engine
-                            .steer_controlled(task_id, text, Some(&control_id))
-                            .await
-                            .map_err(map_engine);
-                        let _ = reply.send(result);
-                    }
-                    ActorCommand::Resume { task_id, control_id, reply } => {
-                        let result = engine
-                            .store()
-                            .get_task(task_id)
-                            .map_err(|_| service_error(TaskServiceErrorCode::Storage))
-                            .and_then(|record| record.ok_or_else(|| service_error(TaskServiceErrorCode::InvalidRequest)))
-                            .and_then(|record| {
-                                if record.snapshot.status.is_terminal() {
-                                    Err(service_error(TaskServiceErrorCode::InvalidRequest))
-                                } else {
-                                    engine
-                                        .mark_control_requested(task_id, &control_id, TaskControlKind::Resume)
-                                        .map_err(map_engine)
-                                }
-                            });
-                        if result.is_ok() {
-                            scheduled.push_back(task_id);
-                        }
-                        let _ = reply.send(result);
-                    }
-                    ActorCommand::Configure {
-                        task_id,
-                        control_id,
-                        model,
-                        effort,
-                        permission_mode,
-                        reply,
-                    } => {
-                        let result = engine
-                            .configure_controlled(
-                                task_id,
-                                control_id,
-                                model,
-                                effort,
-                                permission_mode,
-                            )
-                            .map_err(map_engine);
-                        let _ = reply.send(result);
-                    }
-                    ActorCommand::ShutdownProvider { reply } => {
-                        let result = if provider_shutdown {
-                            Ok(())
-                        } else {
-                            engine
-                                .port_mut()
-                                .shutdown()
-                                .await
-                                .map_err(|_| service_error(TaskServiceErrorCode::Engine))
-                        };
-                        provider_shutdown |= result.is_ok();
-                        let _ = reply.send(result);
-                    }
-                }
-                let _ = engine.take_updates();
+                handle_actor_command(
+                    &mut engine,
+                    &mut scheduled,
+                    &mut provider_shutdown,
+                    command,
+                )
+                .await;
             }
         }
     }
+}
+
+async fn handle_actor_command<P: AgentPort>(
+    engine: &mut TaskEngine<P, RuntimeStore>,
+    scheduled: &mut VecDeque<TaskId>,
+    provider_shutdown: &mut bool,
+    command: ActorCommand,
+) {
+    match command {
+        ActorCommand::Cancel {
+            task_id,
+            control_id,
+            reply,
+        } => {
+            let result = engine.cancel_controlled(task_id, Some(&control_id)).await;
+            let _ = reply.send(map_control_result(result));
+        }
+        ActorCommand::Steer {
+            task_id,
+            text,
+            control_id,
+            reply,
+        } => {
+            let result = engine
+                .steer_controlled(task_id, text, Some(&control_id))
+                .await
+                .map_err(map_engine);
+            let _ = reply.send(result);
+        }
+        ActorCommand::Resume {
+            task_id,
+            control_id,
+            reply,
+        } => {
+            let result = engine
+                .store()
+                .get_task(task_id)
+                .map_err(|_| service_error(TaskServiceErrorCode::Storage))
+                .and_then(|record| {
+                    record.ok_or_else(|| service_error(TaskServiceErrorCode::InvalidRequest))
+                })
+                .and_then(|record| {
+                    if record.snapshot.status.is_terminal() {
+                        Err(service_error(TaskServiceErrorCode::InvalidRequest))
+                    } else {
+                        engine
+                            .mark_control_requested(task_id, &control_id, TaskControlKind::Resume)
+                            .map_err(map_engine)
+                    }
+                });
+            if result.is_ok() {
+                scheduled.push_back(task_id);
+            }
+            let _ = reply.send(result);
+        }
+        ActorCommand::Configure {
+            task_id,
+            control_id,
+            model,
+            effort,
+            permission_mode,
+            reply,
+        } => {
+            let result = engine
+                .configure_controlled(task_id, control_id, model, effort, permission_mode)
+                .map_err(map_engine);
+            let _ = reply.send(result);
+        }
+        ActorCommand::ShutdownProvider { reply } => {
+            let result = if *provider_shutdown {
+                Ok(())
+            } else {
+                engine
+                    .port_mut()
+                    .shutdown()
+                    .await
+                    .map_err(|_| service_error(TaskServiceErrorCode::Engine))
+            };
+            if result.is_ok() {
+                *provider_shutdown = true;
+                scheduled.clear();
+            }
+            let _ = reply.send(result);
+        }
+    }
+    let _ = engine.take_updates();
 }
 
 async fn handle_connection(
@@ -1614,6 +1645,14 @@ async fn send_active_control(
 }
 
 async fn shutdown_owner(shared: &ServiceShared) -> Result<(), TaskServiceError> {
+    // Queue terminal intent before cancellation lets the actor observe shutdown as
+    // soon as the active run exits, before it can refill another durable task.
+    let (reply, response) = oneshot::channel();
+    shared
+        .actor_sender
+        .send(ActorCommand::ShutdownProvider { reply })
+        .await
+        .map_err(|_| service_error(TaskServiceErrorCode::Stopped))?;
     let active_task = *shared.active_task.lock().await;
     if let Some(task_id) = active_task {
         let request = ServiceRequest {
@@ -1624,12 +1663,6 @@ async fn shutdown_owner(shared: &ServiceShared) -> Result<(), TaskServiceError> 
         };
         mutate_task(shared, task_id, &request, Mutation::Cancel).await?;
     }
-    let (reply, response) = oneshot::channel();
-    shared
-        .actor_sender
-        .send(ActorCommand::ShutdownProvider { reply })
-        .await
-        .map_err(|_| service_error(TaskServiceErrorCode::Stopped))?;
     response
         .await
         .map_err(|_| service_error(TaskServiceErrorCode::Stopped))?

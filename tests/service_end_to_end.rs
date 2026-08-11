@@ -250,6 +250,163 @@ async fn client_eof_does_not_cancel_owner_task_and_controls_are_idempotent() -> 
 
 #[cfg(unix)]
 #[tokio::test(flavor = "current_thread")]
+async fn shutdown_preempts_queued_work_and_completes_its_receipt() -> TestResult {
+    let layout = Layout::new()?;
+    let port = PendingPort::new();
+    let state = Arc::clone(&port.state);
+    let service = TaskService::bind(&layout.data, port).await?;
+    let running = tokio::spawn(service.serve(CancellationToken::new()));
+    let mut client = TaskServiceClient::connect(&layout.data).await?;
+    let start = |session: &str, request: &str| StartTaskCommand {
+        external_session_id: session.to_owned(),
+        workspace: layout.workspace.clone(),
+        request: request.to_owned(),
+        model: ModelId::parse("gpt-test").expect("test model is valid"),
+        effort: ReasoningEffort::High,
+        permission_mode: PermissionMode::FullAccess,
+    };
+    let ServiceResult::Accepted {
+        task_id: active_task,
+    } = client
+        .request(ServiceRequest {
+            protocol_version: 1,
+            request_id: "preempt-start-active".to_owned(),
+            idempotency_key: "preempt-start-active-key".to_owned(),
+            command: ServiceCommand::StartTask(start(
+                "preempt-active-session",
+                "remain active until owner shutdown",
+            )),
+        })
+        .await?
+    else {
+        return Err("active shutdown task was not accepted".into());
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let ServiceResult::Snapshot(snapshot) = client
+                .request(ServiceRequest {
+                    protocol_version: 1,
+                    request_id: format!("preempt-active-status-{}", Uuid::new_v4()),
+                    idempotency_key: format!("preempt-active-status-key-{}", Uuid::new_v4()),
+                    command: ServiceCommand::Status {
+                        task_id: active_task,
+                    },
+                })
+                .await
+                .expect("active shutdown status succeeds")
+            else {
+                continue;
+            };
+            if snapshot.status == TaskStatus::Active && snapshot.active_epoch.is_some() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    let ServiceResult::Accepted {
+        task_id: queued_task,
+    } = client
+        .request(ServiceRequest {
+            protocol_version: 1,
+            request_id: "preempt-start-queued".to_owned(),
+            idempotency_key: "preempt-start-queued-key".to_owned(),
+            command: ServiceCommand::StartTask(start(
+                "preempt-queued-session",
+                "must never reach the provider after owner shutdown",
+            )),
+        })
+        .await?
+    else {
+        return Err("queued shutdown task was not accepted".into());
+    };
+    let ServiceResult::Snapshot(queued) = client
+        .request(ServiceRequest {
+            protocol_version: 1,
+            request_id: "preempt-queued-status".to_owned(),
+            idempotency_key: "preempt-queued-status-key".to_owned(),
+            command: ServiceCommand::Status {
+                task_id: queued_task,
+            },
+        })
+        .await?
+    else {
+        return Err("queued shutdown status missing".into());
+    };
+    assert_eq!(queued.status, TaskStatus::Queued);
+    let provider_before = {
+        let state = state.lock().unwrap();
+        (state.started_contexts, state.resumed_contexts, state.epoch)
+    };
+    assert_eq!(provider_before.0 + provider_before.1, 1);
+
+    let shutdown = tokio::time::timeout(
+        Duration::from_secs(1),
+        client.request(ServiceRequest {
+            protocol_version: 1,
+            request_id: "preempt-shutdown".to_owned(),
+            idempotency_key: "preempt-shutdown-key".to_owned(),
+            command: ServiceCommand::Shutdown,
+        }),
+    )
+    .await;
+    let shutdown_applied = match shutdown {
+        Ok(Ok(ServiceResult::Applied)) => true,
+        Ok(Ok(other)) => return Err(format!("unexpected shutdown response: {other:?}").into()),
+        Ok(Err(error)) => return Err(format!("shutdown was rejected: {error:?}").into()),
+        Err(_) => false,
+    };
+    drop(client);
+    if shutdown_applied {
+        tokio::time::timeout(Duration::from_secs(5), running).await???;
+    } else {
+        running.abort();
+        let _ = running.await;
+    }
+
+    let provider_after = {
+        let state = state.lock().unwrap();
+        (
+            state.started_contexts,
+            state.resumed_contexts,
+            state.epoch,
+            state.shutdowns,
+        )
+    };
+    let connection = Connection::open(layout.data.join("carl.sqlite3"))?;
+    let (receipt_state, result_json) = connection.query_row(
+        "SELECT state, result_json FROM service_command_receipts
+         WHERE idempotency_key = 'preempt-shutdown-key'",
+        [],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+    )?;
+    let pending = connection.query_row(
+        "SELECT COUNT(*) FROM service_command_receipts WHERE state = 'pending'",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    assert!(
+        shutdown_applied,
+        "shutdown did not preempt queued work: provider before={provider_before:?}, after={provider_after:?}, receipt={receipt_state}, pending={pending}"
+    );
+    assert_eq!(
+        (provider_after.0, provider_after.1, provider_after.2),
+        provider_before,
+        "queued task reached the provider during shutdown"
+    );
+    assert_eq!(provider_after.3, 1, "provider shutdown was not exact");
+    assert_eq!(receipt_state, "completed");
+    assert!(
+        result_json
+            .as_deref()
+            .is_some_and(|result| serde_json::from_str::<serde_json::Value>(result).is_ok())
+    );
+    assert_eq!(pending, 0);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
 async fn read_polling_does_not_exhaust_process_or_connection_mutation_capacity() -> TestResult {
     let layout = Layout::new()?;
     let port = PendingPort::new();
