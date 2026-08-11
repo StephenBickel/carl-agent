@@ -28,7 +28,9 @@
 - Carl may declare a stall only after three materially distinct recovery strategies fail.
 - A successful terminal task requires evidence for every required completion clause.
 - Preserve compatibility with event schema versions 1–3 and migrations 1–7.
-- Run `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test --all-features` after every Rust task.
+- After every Rust task, run its focused behavior/compatibility tests plus `cargo fmt --all -- --check` and `cargo clippy --all-targets --all-features -- -D warnings`.
+- Run `cargo test --all-features` at the integration gates after Tasks 6, 10, 12, 13, and 15, and once more before merge if the final gate is not already at the branch head.
+- Also run `cargo test --all-features` after any reviewed fix that changes shared kernel/provider routing, the event schema, or database migrations, or when a reviewer identifies a concrete cross-cutting regression risk.
 - Do not edit `SECURITY.md` until the exact diff has been previewed and approved under the repository security-policy process.
 
 ---
