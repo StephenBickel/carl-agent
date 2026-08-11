@@ -49,7 +49,7 @@ fn migration_six_binds_and_recovers_frontend_sessions() -> Result<(), Box<dyn Er
     assert_eq!(
         connection.query_row("SELECT COUNT(*) FROM migrations", [], |row| row
             .get::<_, u64>(0))?,
-        10
+        12
     );
     for table in [
         "frontend_sessions",
@@ -60,6 +60,9 @@ fn migration_six_binds_and_recovers_frontend_sessions() -> Result<(), Box<dyn Er
         "task_control_receipts",
         "task_configuration_state",
         "task_control_markers",
+        "service_task_receipts",
+        "service_command_receipts",
+        "service_configuration_controls",
     ] {
         assert_eq!(
             connection.query_row(
@@ -271,7 +274,7 @@ fn canonical_full_access_storage_and_trusted_owner_channel_fill_are_exact()
 }
 
 #[test]
-fn migration_six_database_upgrades_through_eight_and_reopens() -> Result<(), Box<dyn Error>> {
+fn migration_six_database_upgrades_through_current_and_reopens() -> Result<(), Box<dyn Error>> {
     let layout = TestLayout::new()?;
     drop(Store::open(&layout.database)?);
     let connection = Connection::open(&layout.database)?;
@@ -279,6 +282,9 @@ fn migration_six_database_upgrades_through_eight_and_reopens() -> Result<(), Box
         "DROP TABLE task_control_markers;
          DROP TABLE task_configuration_state;
          DROP TABLE task_control_receipts;
+         DROP TABLE service_configuration_controls;
+         DROP TABLE service_command_receipts;
+         DROP TABLE service_task_receipts;
          DROP TABLE trusted_frontend_events;
          DROP TABLE trusted_frontend_owners;
          DROP TABLE task_epoch_interruptions;
