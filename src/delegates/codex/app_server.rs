@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::fmt;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use semver::VersionReq;
 use serde_json::{Map, Value, json};
@@ -30,6 +30,8 @@ const CREDENTIAL_FILENAME: &str = "auth.json";
 const MAX_CREDENTIAL_FILE_BYTES: u64 = 1024 * 1024;
 const MAX_MODELS: usize = 64;
 const MAX_MODEL_PAGES: usize = 16;
+const MAX_BACKGROUND_PROCESSES: usize = 64;
+const MAX_BACKGROUND_PROCESS_PAGES: usize = 16;
 const MAX_TEXT_BYTES: usize = 256 * 1_024;
 const MAX_CURSOR_BYTES: usize = 128;
 const MAX_EFFECT_SUMMARY_BYTES: usize = 32 * 1_024;
@@ -118,9 +120,15 @@ pub struct StartTurn {
 
 #[derive(Clone, Debug)]
 struct ThreadState {
-    _cwd: PathBuf,
+    cwd: PathBuf,
     mode: PermissionMode,
     active_turn: Option<CodexTurnId>,
+    compaction: Option<CompactionState>,
+}
+
+#[derive(Clone, Debug)]
+struct CompactionState {
+    item_id: Option<String>,
 }
 
 #[derive(Clone)]
@@ -353,12 +361,85 @@ impl CodexAppServer {
         self.threads.insert(
             thread_id.as_str().to_owned(),
             ThreadState {
-                _cwd: cwd,
+                cwd,
                 mode: request.mode,
                 active_turn: None,
+                compaction: None,
             },
         );
         Ok(thread_id)
+    }
+
+    async fn resume_thread(
+        &mut self,
+        request: ResumeAgentContext,
+    ) -> Result<CodexThreadId, DelegateError> {
+        let cwd = canonical_directory(request.cwd)?;
+        self.require_model(&request.model, None)?;
+        if self.threads.contains_key(request.context_id.as_str()) {
+            return Err(protocol_error());
+        }
+        let thread_id = CodexThreadId::parse(request.context_id.as_str())?;
+        let (approval_policy, _) = thread_mode(request.permission_mode);
+        let sandbox = "read-only";
+        let result = self
+            .request(
+                "thread/resume",
+                json!({
+                    "threadId": thread_id.as_str(),
+                    "cwd": cwd,
+                    "model": request.model.as_str(),
+                    "approvalPolicy": approval_policy,
+                    "sandbox": sandbox,
+                    "excludeTurns": true
+                }),
+            )
+            .await?;
+        validate_resumed_thread(
+            &result,
+            &thread_id,
+            &cwd,
+            &request.model,
+            approval_policy,
+            sandbox,
+        )?;
+        self.threads.insert(
+            thread_id.as_str().to_owned(),
+            ThreadState {
+                cwd,
+                mode: request.permission_mode,
+                active_turn: None,
+                compaction: None,
+            },
+        );
+        Ok(thread_id)
+    }
+
+    async fn compact_thread(&mut self, thread_id: &CodexThreadId) -> Result<(), DelegateError> {
+        let state = self
+            .threads
+            .get(thread_id.as_str())
+            .ok_or_else(protocol_error)?;
+        if state.active_turn.is_some() {
+            return Err(protocol_error());
+        }
+        if state.compaction.is_some() {
+            return Ok(());
+        }
+        let result = self
+            .request(
+                "thread/compact/start",
+                json!({"threadId":thread_id.as_str()}),
+            )
+            .await?;
+        let object = result.as_object().ok_or_else(protocol_error)?;
+        require_keys(object, &[], &[])?;
+        let state = self
+            .threads
+            .get_mut(thread_id.as_str())
+            .ok_or_else(protocol_error)?;
+        state.compaction = Some(CompactionState { item_id: None });
+        Ok(())
     }
 
     pub async fn start_turn(&mut self, request: StartTurn) -> Result<CodexTurnId, DelegateError> {
@@ -367,7 +448,7 @@ impl CodexAppServer {
             .threads
             .get(request.thread_id.as_str())
             .ok_or_else(protocol_error)?;
-        if state.active_turn.is_some() {
+        if state.active_turn.is_some() || state.compaction.is_some() {
             return Err(protocol_error());
         }
         if let Some(model) = request.model.as_ref() {
@@ -452,6 +533,83 @@ impl CodexAppServer {
             .ok_or_else(protocol_error)?;
         state.active_turn = None;
         Ok(())
+    }
+
+    async fn background_processes(
+        &mut self,
+        thread_id: &CodexThreadId,
+    ) -> Result<Vec<AgentProcess>, DelegateError> {
+        let workspace = self
+            .threads
+            .get(thread_id.as_str())
+            .ok_or_else(protocol_error)?
+            .cwd
+            .clone();
+        let mut processes = Vec::new();
+        let mut process_ids = HashSet::new();
+        let mut cursor: Option<String> = None;
+        let mut seen_cursors = HashSet::new();
+        for _ in 0..MAX_BACKGROUND_PROCESS_PAGES {
+            let result = self
+                .request(
+                    "thread/backgroundTerminals/list",
+                    json!({
+                        "threadId":thread_id.as_str(),
+                        "cursor":cursor,
+                        "limit":MAX_BACKGROUND_PROCESSES
+                    }),
+                )
+                .await?;
+            let object = result.as_object().ok_or_else(protocol_error)?;
+            require_keys(object, &["data"], &["nextCursor"])?;
+            let page = object
+                .get("data")
+                .and_then(Value::as_array)
+                .ok_or_else(protocol_error)?;
+            if page.len() > MAX_BACKGROUND_PROCESSES
+                || processes.len().saturating_add(page.len()) > MAX_BACKGROUND_PROCESSES
+            {
+                return Err(protocol_error());
+            }
+            for value in page {
+                let process = parse_background_process(value, &workspace)?;
+                if !process_ids.insert(process.process_id.clone()) {
+                    return Err(protocol_error());
+                }
+                processes.push(process);
+            }
+            cursor = optional_response_string(object.get("nextCursor"), MAX_CURSOR_BYTES)?;
+            let Some(next) = cursor.as_ref() else {
+                return Ok(processes);
+            };
+            if !seen_cursors.insert(next.clone()) {
+                return Err(protocol_error());
+            }
+        }
+        Err(protocol_error())
+    }
+
+    async fn terminate_background(
+        &mut self,
+        thread_id: &CodexThreadId,
+        process_id: &str,
+    ) -> Result<bool, DelegateError> {
+        if !self.threads.contains_key(thread_id.as_str()) {
+            return Err(protocol_error());
+        }
+        validate_text_bound(process_id, MAX_CURSOR_BYTES)?;
+        let result = self
+            .request(
+                "thread/backgroundTerminals/terminate",
+                json!({"threadId":thread_id.as_str(),"processId":process_id}),
+            )
+            .await?;
+        let object = result.as_object().ok_or_else(protocol_error)?;
+        require_keys(object, &["terminated"], &[])?;
+        object
+            .get("terminated")
+            .and_then(Value::as_bool)
+            .ok_or_else(protocol_error)
     }
 
     pub async fn next_event(&mut self) -> Result<CodexEvent, DelegateError> {
@@ -620,7 +778,43 @@ impl CodexAppServer {
         Ok(())
     }
 
-    fn validate_event_binding(&self, event: &CodexEvent) -> Result<(), DelegateError> {
+    fn validate_event_binding(&mut self, event: &CodexEvent) -> Result<(), DelegateError> {
+        if let CodexEvent::ItemStarted {
+            thread_id,
+            item: CodexItem::ContextCompaction { item_id },
+            ..
+        } = event
+            && let Some(compaction) = self
+                .threads
+                .get_mut(thread_id.as_str())
+                .ok_or_else(protocol_error)?
+                .compaction
+                .as_mut()
+        {
+            if compaction.item_id.is_some() {
+                return Err(protocol_error());
+            }
+            compaction.item_id = Some(item_id.clone());
+            return Ok(());
+        }
+        if let CodexEvent::ItemCompleted {
+            thread_id,
+            item: CodexItem::ContextCompaction { item_id },
+            ..
+        } = event
+        {
+            let state = self
+                .threads
+                .get_mut(thread_id.as_str())
+                .ok_or_else(protocol_error)?;
+            if let Some(compaction) = state.compaction.as_ref() {
+                if compaction.item_id.as_deref() != Some(item_id) {
+                    return Err(protocol_error());
+                }
+                state.compaction = None;
+                return Ok(());
+            }
+        }
         let (thread, turn) = match event {
             CodexEvent::ThreadStarted { thread_id } => {
                 return if self.threads.contains_key(thread_id.as_str()) {
@@ -677,12 +871,12 @@ impl CodexAppServer {
 impl AgentPort for CodexAppServer {
     fn capabilities(&self) -> AgentCapabilities {
         AgentCapabilities {
-            resume: false,
-            compact: false,
+            resume: true,
+            compact: true,
             token_usage: true,
             pre_dispatch_effects: true,
             history_paging: false,
-            background_processes: false,
+            background_processes: true,
         }
     }
 
@@ -721,16 +915,36 @@ impl AgentPort for CodexAppServer {
         })
     }
 
-    fn resume_context(&mut self, _request: ResumeAgentContext) -> AgentFuture<'_, AgentContextId> {
-        Box::pin(async { Err(AgentPortError::from_code(AgentPortErrorCode::Unsupported)) })
+    fn resume_context(&mut self, request: ResumeAgentContext) -> AgentFuture<'_, AgentContextId> {
+        Box::pin(async move {
+            let thread_id = CodexAppServer::resume_thread(self, request)
+                .await
+                .map_err(map_agent_error)?;
+            AgentContextId::parse(thread_id.as_str())
+        })
     }
 
-    fn compact_context(&mut self, _context_id: &AgentContextId) -> AgentFuture<'_, ()> {
-        Box::pin(async { Err(AgentPortError::from_code(AgentPortErrorCode::Unsupported)) })
+    fn compact_context(&mut self, context_id: &AgentContextId) -> AgentFuture<'_, ()> {
+        let context_id = context_id.clone();
+        Box::pin(async move {
+            let thread_id = CodexThreadId::parse(context_id.as_str()).map_err(map_agent_error)?;
+            CodexAppServer::compact_thread(self, &thread_id)
+                .await
+                .map_err(map_agent_error)
+        })
     }
 
     fn start_epoch(&mut self, request: StartAgentEpoch) -> AgentFuture<'_, AgentEpochId> {
         Box::pin(async move {
+            if self
+                .threads
+                .get(request.context_id.as_str())
+                .is_some_and(|state| state.compaction.is_some())
+            {
+                return Err(AgentPortError::from_code(
+                    AgentPortErrorCode::InvalidRequest,
+                ));
+            }
             let turn_id = CodexAppServer::start_turn(
                 self,
                 StartTurn {
@@ -824,17 +1038,30 @@ impl AgentPort for CodexAppServer {
 
     fn list_background_processes(
         &mut self,
-        _context_id: &AgentContextId,
+        context_id: &AgentContextId,
     ) -> AgentFuture<'_, Vec<AgentProcess>> {
-        Box::pin(async { Err(AgentPortError::from_code(AgentPortErrorCode::Unsupported)) })
+        let context_id = context_id.clone();
+        Box::pin(async move {
+            let thread_id = CodexThreadId::parse(context_id.as_str()).map_err(map_agent_error)?;
+            CodexAppServer::background_processes(self, &thread_id)
+                .await
+                .map_err(map_agent_error)
+        })
     }
 
     fn terminate_background_process(
         &mut self,
-        _context_id: &AgentContextId,
-        _process_id: &str,
+        context_id: &AgentContextId,
+        process_id: &str,
     ) -> AgentFuture<'_, bool> {
-        Box::pin(async { Err(AgentPortError::from_code(AgentPortErrorCode::Unsupported)) })
+        let context_id = context_id.clone();
+        let process_id = process_id.to_owned();
+        Box::pin(async move {
+            let thread_id = CodexThreadId::parse(context_id.as_str()).map_err(map_agent_error)?;
+            CodexAppServer::terminate_background(self, &thread_id, &process_id)
+                .await
+                .map_err(map_agent_error)
+        })
     }
 
     fn shutdown(&mut self) -> AgentFuture<'_, ()> {
@@ -1049,6 +1276,125 @@ enum Incoming {
 struct ParsedModel {
     model: CodexModel,
     hidden: bool,
+}
+
+fn validate_resumed_thread(
+    result: &Value,
+    expected_thread_id: &CodexThreadId,
+    expected_cwd: &Path,
+    expected_model: &ModelId,
+    expected_approval_policy: &str,
+    expected_sandbox: &str,
+) -> Result<(), DelegateError> {
+    let object = result.as_object().ok_or_else(protocol_error)?;
+    require_keys(
+        object,
+        &[
+            "thread",
+            "model",
+            "modelProvider",
+            "cwd",
+            "approvalPolicy",
+            "approvalsReviewer",
+            "sandbox",
+        ],
+        &[
+            "activePermissionProfile",
+            "initialTurnsPage",
+            "instructionSources",
+            "itemsBackwardsCursor",
+            "multiAgentMode",
+            "reasoningEffort",
+            "runtimeWorkspaceRoots",
+            "serviceTier",
+            "turnsBackwardsCursor",
+        ],
+    )?;
+    if object.get("cwd").and_then(Value::as_str) != expected_cwd.to_str()
+        || object.get("model").and_then(Value::as_str) != Some(expected_model.as_str())
+        || object.get("approvalPolicy").and_then(Value::as_str) != Some(expected_approval_policy)
+        || object.get("approvalsReviewer").and_then(Value::as_str) != Some("user")
+        || !resume_sandbox_matches(object.get("sandbox"), expected_sandbox)
+    {
+        return Err(protocol_error());
+    }
+    if object
+        .get("initialTurnsPage")
+        .is_some_and(|value| !value.is_null())
+    {
+        return Err(protocol_error());
+    }
+    optional_response_string(object.get("itemsBackwardsCursor"), MAX_CURSOR_BYTES)?;
+    optional_response_string(object.get("turnsBackwardsCursor"), MAX_CURSOR_BYTES)?;
+    let thread = object
+        .get("thread")
+        .and_then(Value::as_object)
+        .ok_or_else(protocol_error)?;
+    let returned_id = CodexThreadId::from_value(thread.get("id").ok_or_else(protocol_error)?)?;
+    let status = thread
+        .get("status")
+        .and_then(Value::as_object)
+        .ok_or_else(protocol_error)?;
+    require_keys(status, &["type"], &["activeFlags"])?;
+    if returned_id != *expected_thread_id
+        || thread.get("cwd").and_then(Value::as_str) != expected_cwd.to_str()
+        || thread.get("ephemeral").and_then(Value::as_bool) != Some(false)
+        || status.get("type").and_then(Value::as_str) != Some("idle")
+        || thread
+            .get("turns")
+            .is_some_and(|turns| turns.as_array().is_none_or(|turns| !turns.is_empty()))
+    {
+        return Err(protocol_error());
+    }
+    Ok(())
+}
+
+fn parse_background_process(
+    value: &Value,
+    workspace: &Path,
+) -> Result<AgentProcess, DelegateError> {
+    let object = value.as_object().ok_or_else(protocol_error)?;
+    require_keys(
+        object,
+        &["processId", "itemId", "command", "cwd"],
+        &["cpuPercent", "osPid", "rssKb"],
+    )?;
+    let process_id = bounded_string(object.get("processId"), MAX_CURSOR_BYTES)?;
+    let item_id = bounded_string(object.get("itemId"), MAX_CURSOR_BYTES)?;
+    let command = bounded_string(object.get("command"), MAX_TEXT_BYTES)?;
+    let supplied_cwd = PathBuf::from(bounded_string(object.get("cwd"), MAX_TEXT_BYTES)?);
+    let cwd = fs::canonicalize(&supplied_cwd).map_err(|_| protocol_error())?;
+    if supplied_cwd != cwd || !cwd.is_dir() || !cwd.starts_with(workspace) {
+        return Err(protocol_error());
+    }
+    let os_pid = match object.get("osPid") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(
+            u32::try_from(value.as_u64().ok_or_else(protocol_error)?)
+                .map_err(|_| protocol_error())?,
+        ),
+    };
+    if let Some(value) = object.get("cpuPercent")
+        && !value.is_null()
+        && !value
+            .as_f64()
+            .is_some_and(|cpu| cpu.is_finite() && cpu >= 0.0)
+    {
+        return Err(protocol_error());
+    }
+    if let Some(value) = object.get("rssKb")
+        && !value.is_null()
+        && value.as_u64().is_none()
+    {
+        return Err(protocol_error());
+    }
+    Ok(AgentProcess {
+        process_id,
+        item_id,
+        command,
+        cwd,
+        os_pid,
+    })
 }
 
 fn parse_model(value: &Value) -> Result<ParsedModel, DelegateError> {
@@ -1410,6 +1756,13 @@ fn validate_text(value: &str) -> Result<(), DelegateError> {
     Ok(())
 }
 
+fn validate_text_bound(value: &str, maximum: usize) -> Result<(), DelegateError> {
+    if value.is_empty() || value.len() > maximum || value.as_bytes().contains(&0) {
+        return Err(DelegateError::new(DelegateErrorCode::Configuration));
+    }
+    Ok(())
+}
+
 fn bounded_string(value: Option<&Value>, maximum: usize) -> Result<String, DelegateError> {
     let value = value.and_then(Value::as_str).ok_or_else(protocol_error)?;
     if value.is_empty() || value.len() > maximum || value.as_bytes().contains(&0) {
@@ -1426,6 +1779,16 @@ fn optional_bounded_string(
         Some(Value::Null) => Ok(None),
         Some(value) => bounded_string(Some(value), maximum).map(Some),
         None => Err(protocol_error()),
+    }
+}
+
+fn optional_response_string(
+    value: Option<&Value>,
+    maximum: usize,
+) -> Result<Option<String>, DelegateError> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => bounded_string(Some(value), maximum).map(Some),
     }
 }
 
@@ -1507,6 +1870,38 @@ fn sandbox_matches(value: Option<&Value>, expected: &str) -> bool {
                     _ => return false,
                 })
     })
+}
+
+fn resume_sandbox_matches(value: Option<&Value>, expected: &str) -> bool {
+    let Some(value) = value else {
+        return false;
+    };
+    if value.as_str() == Some(expected) {
+        return true;
+    }
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    let expected_type = match expected {
+        "read-only" => "readOnly",
+        "workspace-write" => "workspaceWrite",
+        "danger-full-access" => "dangerFullAccess",
+        _ => return false,
+    };
+    if object.get("type").and_then(Value::as_str) != Some(expected_type) {
+        return false;
+    }
+    match expected {
+        "read-only" => {
+            require_keys(object, &["type"], &["networkAccess"]).is_ok()
+                && object
+                    .get("networkAccess")
+                    .is_none_or(|network| network.as_bool() == Some(false))
+        }
+        "danger-full-access" => require_keys(object, &["type"], &[]).is_ok(),
+        "workspace-write" => false,
+        _ => false,
+    }
 }
 
 fn protocol_error() -> DelegateError {

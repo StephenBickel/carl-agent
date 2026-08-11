@@ -8,6 +8,7 @@ use thiserror::Error;
 use crate::acp::PermissionMode;
 use crate::delegates::{ModelId, ReasoningEffort};
 use crate::policy::Sha256Digest;
+use crate::runtime::task::ContextPackage;
 
 const MAX_AGENT_ID_BYTES: usize = 128;
 const MAX_AGENT_TEXT_BYTES: usize = 1_048_576;
@@ -139,6 +140,13 @@ pub struct ResumeAgentContext {
     pub cwd: PathBuf,
     pub model: ModelId,
     pub permission_mode: PermissionMode,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ContextRecovery {
+    Resumed(AgentContextId),
+    Compacted(AgentContextId),
+    Replaced(AgentContextId),
 }
 
 impl fmt::Debug for ResumeAgentContext {
@@ -564,6 +572,74 @@ pub trait AgentPort: Send {
     fn start_context(&mut self, request: StartAgentContext) -> AgentFuture<'_, AgentContextId>;
     fn resume_context(&mut self, request: ResumeAgentContext) -> AgentFuture<'_, AgentContextId>;
     fn compact_context(&mut self, context_id: &AgentContextId) -> AgentFuture<'_, ()>;
+    fn resume_or_replace_context(
+        &mut self,
+        request: ResumeAgentContext,
+        context_package: ContextPackage,
+        effort: ReasoningEffort,
+    ) -> AgentFuture<'_, ContextRecovery> {
+        Box::pin(async move {
+            context_package
+                .canonical_bytes()
+                .map_err(|_| AgentPortError::from_code(AgentPortErrorCode::InvalidRequest))?;
+            if self.capabilities().resume {
+                match self.resume_context(request.clone()).await {
+                    Ok(context_id) => return Ok(ContextRecovery::Resumed(context_id)),
+                    Err(error) if !is_recoverable_lifecycle_error(&error) => return Err(error),
+                    Err(_) => {}
+                }
+            }
+            self.replace_context(request, context_package, effort).await
+        })
+    }
+    fn compact_or_replace_context(
+        &mut self,
+        request: ResumeAgentContext,
+        context_package: ContextPackage,
+        effort: ReasoningEffort,
+    ) -> AgentFuture<'_, ContextRecovery> {
+        Box::pin(async move {
+            context_package
+                .canonical_bytes()
+                .map_err(|_| AgentPortError::from_code(AgentPortErrorCode::InvalidRequest))?;
+            if self.capabilities().compact {
+                match self.compact_context(&request.context_id).await {
+                    Ok(()) => return Ok(ContextRecovery::Compacted(request.context_id)),
+                    Err(error) if !is_recoverable_lifecycle_error(&error) => return Err(error),
+                    Err(_) => {}
+                }
+            }
+            self.replace_context(request, context_package, effort).await
+        })
+    }
+    fn replace_context(
+        &mut self,
+        request: ResumeAgentContext,
+        context_package: ContextPackage,
+        effort: ReasoningEffort,
+    ) -> AgentFuture<'_, ContextRecovery> {
+        Box::pin(async move {
+            context_package
+                .canonical_bytes()
+                .map_err(|_| AgentPortError::from_code(AgentPortErrorCode::InvalidRequest))?;
+            let context_id = self
+                .start_context(StartAgentContext {
+                    cwd: request.cwd,
+                    model: request.model.clone(),
+                    permission_mode: request.permission_mode,
+                })
+                .await?;
+            self.start_epoch(StartAgentEpoch {
+                context_id: context_id.clone(),
+                input: context_package.rendered,
+                model: request.model,
+                effort,
+                permission_mode: request.permission_mode,
+            })
+            .await?;
+            Ok(ContextRecovery::Replaced(context_id))
+        })
+    }
     fn start_epoch(&mut self, request: StartAgentEpoch) -> AgentFuture<'_, AgentEpochId>;
     fn steer(
         &mut self,
@@ -592,6 +668,16 @@ pub trait AgentPort: Send {
         process_id: &str,
     ) -> AgentFuture<'_, bool>;
     fn shutdown(&mut self) -> AgentFuture<'_, ()>;
+}
+
+fn is_recoverable_lifecycle_error(error: &AgentPortError) -> bool {
+    matches!(
+        error.code(),
+        AgentPortErrorCode::Unsupported
+            | AgentPortErrorCode::InvalidResponse
+            | AgentPortErrorCode::UnavailableContext
+            | AgentPortErrorCode::Transport
+    )
 }
 
 fn validate_bounded_string(value: &str, maximum_bytes: usize) -> Result<(), AgentPortError> {

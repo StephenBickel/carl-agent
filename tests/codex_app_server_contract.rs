@@ -15,7 +15,7 @@ use carl::delegates::codex::{
 };
 use carl::delegates::{ModelId, ReasoningEffort};
 use carl::runtime::agent_port::{
-    AgentContextId, AgentPort, AgentPortErrorCode, ResumeAgentContext,
+    AgentContextId, AgentEvent, AgentPort, AgentPortErrorCode, ResumeAgentContext, StartAgentEpoch,
 };
 use carl::sidecar::{
     ExecutableTrustDecision, ProviderEnvironmentProfile, ProviderHome, SidecarCommand,
@@ -58,47 +58,174 @@ fn main() {
             normalized_item_diagnostics_are_redacted,
         ),
         test(
-            "Codex native resume and compact stay unsupported without binding proof",
-            unsupported_native_lifecycle_capabilities_are_truthful,
+            "Codex native lifecycle controls use exact requests and correlated barriers",
+            native_lifecycle_controls_are_exact_and_correlated,
+        ),
+        test(
+            "Codex lifecycle controls reject mismatched bindings and hostile process pages",
+            lifecycle_controls_fail_closed,
         ),
     ];
     libtest_mimic::run(&Arguments::from_args(), trials).exit();
 }
 
-fn unsupported_native_lifecycle_capabilities_are_truthful()
--> Result<(), Box<dyn Error + Send + Sync>> {
+fn native_lifecycle_controls_are_exact_and_correlated() -> Result<(), Box<dyn Error + Send + Sync>>
+{
     run_async(async {
         let layout = TestLayout::new()?;
         let mut server = connect(&layout).await?;
+        server.models().await?;
         let capabilities = server.capabilities();
-        assert!(!capabilities.resume);
-        assert!(!capabilities.compact);
+        assert!(capabilities.resume);
+        assert!(capabilities.compact);
+        assert!(capabilities.background_processes);
         assert!(capabilities.token_usage);
         assert!(capabilities.pre_dispatch_effects);
 
         let context_id = AgentContextId::parse("thr_123")?;
-        let resume_error = server
-            .resume_context(ResumeAgentContext {
+        assert_eq!(
+            server
+                .resume_context(ResumeAgentContext {
+                    context_id: context_id.clone(),
+                    cwd: layout.workspace.clone(),
+                    model: ModelId::parse("gpt-5.6-codex")?,
+                    permission_mode: PermissionMode::Default,
+                })
+                .await
+                .map_err(|error| format!("resume failed: {error:?}"))?,
+            context_id
+        );
+        server
+            .compact_context(&context_id)
+            .await
+            .map_err(|error| format!("compact failed: {error:?}"))?;
+        server.compact_context(&context_id).await?;
+        let blocked = server
+            .start_epoch(StartAgentEpoch {
                 context_id: context_id.clone(),
-                cwd: layout.workspace.clone(),
+                input: "must wait for compaction".into(),
                 model: ModelId::parse("gpt-5.6-codex")?,
+                effort: ReasoningEffort::High,
                 permission_mode: PermissionMode::Default,
             })
             .await
-            .expect_err("unproved resume support must fail before provider dispatch");
-        assert_eq!(resume_error.code(), AgentPortErrorCode::Unsupported);
-        let compact_error = server
-            .compact_context(&context_id)
+            .expect_err("an epoch must not cross the compaction barrier");
+        assert_eq!(blocked.code(), AgentPortErrorCode::InvalidRequest);
+        assert!(matches!(
+            AgentPort::next_event(&mut server).await?,
+            AgentEvent::CompactionStarted { context_id: seen, item_id }
+                if seen == context_id && item_id == "compact_native"
+        ));
+        assert!(matches!(
+            AgentPort::next_event(&mut server).await?,
+            AgentEvent::CompactionCompleted { context_id: seen, item_id }
+                if seen == context_id && item_id == "compact_native"
+        ));
+
+        let processes = server
+            .list_background_processes(&context_id)
             .await
-            .expect_err("unproved compact support must fail before provider dispatch");
-        assert_eq!(compact_error.code(), AgentPortErrorCode::Unsupported);
-        assert!(read_requests(&layout)?.iter().all(|request| {
-            !matches!(
-                request["method"].as_str(),
-                Some("thread/resume" | "thread/compact/start")
-            )
-        }));
+            .map_err(|error| format!("background list failed: {error:?}"))?;
+        assert_eq!(processes.len(), 2);
+        assert_eq!(processes[0].process_id, "proc_123");
+        assert_eq!(processes[1].process_id, "proc_456");
+        assert!(
+            server
+                .terminate_background_process(&context_id, "proc_123")
+                .await?
+        );
+
+        let requests = read_requests(&layout)?;
+        let resume = requests
+            .iter()
+            .find(|request| request["method"] == "thread/resume")
+            .expect("resume request is dispatched");
+        assert_eq!(
+            resume["params"],
+            json!({
+                "threadId":"thr_123",
+                "cwd":layout.workspace,
+                "model":"gpt-5.6-codex",
+                "approvalPolicy":"on-request",
+                "sandbox":"read-only",
+                "excludeTurns":true
+            })
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request["method"] == "thread/compact/start")
+                .count(),
+            1
+        );
+        let compact = requests
+            .iter()
+            .find(|request| request["method"] == "thread/compact/start")
+            .unwrap();
+        assert_eq!(compact["params"], json!({"threadId":"thr_123"}));
+        let background = requests
+            .iter()
+            .filter(|request| request["method"] == "thread/backgroundTerminals/list")
+            .collect::<Vec<_>>();
+        assert_eq!(background.len(), 2);
+        assert_eq!(
+            background[0]["params"],
+            json!({"threadId":"thr_123","cursor":null,"limit":64})
+        );
+        assert_eq!(background[1]["params"]["cursor"], "background-page-2");
+        let terminate = requests
+            .iter()
+            .find(|request| request["method"] == "thread/backgroundTerminals/terminate")
+            .unwrap();
+        assert_eq!(
+            terminate["params"],
+            json!({"threadId":"thr_123","processId":"proc_123"})
+        );
         server.cancel().await?;
+        Ok(())
+    })
+}
+
+fn lifecycle_controls_fail_closed() -> Result<(), Box<dyn Error + Send + Sync>> {
+    run_async(async {
+        for context in [
+            "thr_mismatch",
+            "thr_permission",
+            "thr_workspace",
+            "thr_active",
+            "thr_duplicate",
+            "thr_outside",
+            "thr_missing",
+            "thr_cursor",
+        ] {
+            let layout = TestLayout::new()?;
+            let mut server = connect(&layout).await?;
+            server.models().await?;
+            let context_id = AgentContextId::parse(context)?;
+            let resumed = server
+                .resume_context(ResumeAgentContext {
+                    context_id: context_id.clone(),
+                    cwd: layout.workspace.clone(),
+                    model: ModelId::parse("gpt-5.6-codex")?,
+                    permission_mode: PermissionMode::Default,
+                })
+                .await;
+            if matches!(
+                context,
+                "thr_mismatch" | "thr_permission" | "thr_workspace" | "thr_active"
+            ) {
+                let error = resumed.expect_err("a mismatched resume binding must be rejected");
+                assert_eq!(error.code(), AgentPortErrorCode::InvalidResponse);
+            } else {
+                assert_eq!(resumed?, context_id);
+                let error = server
+                    .list_background_processes(&context_id)
+                    .await
+                    .expect_err("hostile background terminal pages must fail closed");
+                assert_eq!(error.code(), AgentPortErrorCode::InvalidResponse);
+            }
+            server.cancel().await?;
+        }
         Ok(())
     })
 }
@@ -609,6 +736,105 @@ fn app_server_fixture() -> i32 {
                 }
                 continue;
             }
+            Some("thread/resume") => {
+                let requested_thread = request["params"]["threadId"].as_str().unwrap_or_default();
+                let returned_thread = if requested_thread == "thr_mismatch" {
+                    "thr_other"
+                } else {
+                    requested_thread
+                };
+                let mut thread = thread(&home);
+                thread["id"] = json!(returned_thread);
+                if requested_thread == "thr_active" {
+                    thread["status"] = json!({"type":"active","activeFlags":[]});
+                }
+                let network_access = requested_thread == "thr_permission";
+                let returned_cwd = if requested_thread == "thr_workspace" {
+                    home.clone()
+                } else {
+                    workspace_for(&home)
+                };
+                json!({
+                    "thread":thread, "model":"gpt-5.6-codex", "modelProvider":"openai",
+                    "cwd":returned_cwd,
+                    "approvalPolicy":request["params"]["approvalPolicy"].clone(),
+                    "approvalsReviewer":"user",
+                    "sandbox":{"type":"readOnly","networkAccess":network_access}
+                })
+            }
+            Some("thread/compact/start") => {
+                if write_message(&json!({"id":id,"result":{}})).is_err()
+                    || write_message(&json!({
+                        "method":"item/started",
+                        "params":{
+                            "threadId":"thr_123","turnId":"turn_compact","startedAtMs":8,
+                            "item":{"type":"contextCompaction","id":"compact_native"}
+                        },
+                        "emittedAtMs":8
+                    }))
+                    .is_err()
+                    || write_message(&json!({
+                        "method":"item/completed",
+                        "params":{
+                            "threadId":"thr_123","turnId":"turn_compact","completedAtMs":9,
+                            "item":{"type":"contextCompaction","id":"compact_native"}
+                        },
+                        "emittedAtMs":9
+                    }))
+                    .is_err()
+                {
+                    return 74;
+                }
+                continue;
+            }
+            Some("thread/backgroundTerminals/list") if request["params"]["cursor"].is_null() => {
+                match request["params"]["threadId"].as_str() {
+                    Some("thr_duplicate") => json!({
+                        "data":[
+                            {"processId":"duplicate","itemId":"item_1","command":"one","cwd":workspace_for(&home)},
+                            {"processId":"duplicate","itemId":"item_2","command":"two","cwd":workspace_for(&home)}
+                        ],
+                        "nextCursor":null
+                    }),
+                    Some("thr_outside") => json!({
+                        "data":[{
+                            "processId":"outside","itemId":"item_1","command":"pwd",
+                            "cwd":home
+                        }],
+                        "nextCursor":null
+                    }),
+                    Some("thr_missing") => json!({
+                        "data":[{
+                            "processId":"missing","itemId":"item_1","command":"pwd",
+                            "cwd":workspace_for(&home).join("missing")
+                        }],
+                        "nextCursor":null
+                    }),
+                    Some("thr_cursor") => {
+                        json!({"data":[],"nextCursor":"repeated-background-cursor"})
+                    }
+                    _ => json!({
+                        "data":[{
+                            "processId":"proc_123","itemId":"item_123","command":"cargo test",
+                            "cwd":workspace_for(&home),"osPid":42,"cpuPercent":12.5,"rssKb":4096
+                        }],
+                        "nextCursor":"background-page-2"
+                    }),
+                }
+            }
+            Some("thread/backgroundTerminals/list") => {
+                if request["params"]["threadId"] == "thr_cursor" {
+                    json!({"data":[],"nextCursor":"repeated-background-cursor"})
+                } else {
+                    json!({
+                        "data":[{
+                            "processId":"proc_456","itemId":"item_456","command":"cargo clippy",
+                            "cwd":workspace_for(&home),"osPid":null
+                        }]
+                    })
+                }
+            }
+            Some("thread/backgroundTerminals/terminate") => json!({"terminated":true}),
             Some("turn/start") => {
                 let result = json!({"turn":{"id":"turn_123","items":[],"status":"inProgress"}});
                 if write_message(&json!({"id":id,"result":result})).is_err() {

@@ -8,9 +8,10 @@ use carl::policy::Sha256Digest;
 use carl::runtime::agent_port::{
     AgentCapabilities, AgentContextId, AgentEffectKind, AgentEffectRequest, AgentEpochId,
     AgentEvent, AgentFuture, AgentItem, AgentModel, AgentPort, AgentPortError, AgentPortErrorCode,
-    AgentProcess, AgentRequestId, AgentUsage, EffectDecision, ResumeAgentContext,
+    AgentProcess, AgentRequestId, AgentUsage, ContextRecovery, EffectDecision, ResumeAgentContext,
     StartAgentContext, StartAgentEpoch,
 };
+use carl::runtime::task::ContextPackage;
 use carl::storage::RuntimeStore;
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -272,6 +273,98 @@ fn codex_app_server_implements_the_neutral_port() {
     assert_agent_port::<CodexAppServer>();
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn provider_context_recovery_replaces_from_carl_canonical_context() -> TestResult {
+    let package: ContextPackage = serde_json::from_value(serde_json::json!({
+        "schema_version":1,
+        "package_id":"11111111-1111-4111-8111-111111111111",
+        "checkpoint_id":"22222222-2222-4222-8222-222222222222",
+        "rendered":"canonical Carl context",
+        "ledger":[{
+            "kind":"runtime_instructions",
+            "digest":"f6e8ec27daeac7dda23a1d1966890819fb9bd839705ae5e549f7382ab473487e",
+            "byte_count":22,
+            "token_count":22,
+            "actual_tokens":false,
+            "included":true,
+            "omission_reason":null
+        }],
+        "source_sequence_start":1,
+        "source_sequence_end":1
+    }))?;
+    let old_context = AgentContextId::parse("old-context")?;
+    let new_context = AgentContextId::parse("new-context")?;
+    let mut port = RecoveryPort {
+        capabilities: AgentCapabilities {
+            resume: false,
+            compact: false,
+            token_usage: false,
+            pre_dispatch_effects: true,
+            history_paging: false,
+            background_processes: false,
+        },
+        new_context: new_context.clone(),
+        resume_succeeds: false,
+        compact_succeeds: false,
+        started_contexts: 0,
+        epoch_inputs: Vec::new(),
+    };
+    let request = ResumeAgentContext {
+        context_id: old_context,
+        cwd: PathBuf::from("/workspace"),
+        model: ModelId::parse("model-123")?,
+        permission_mode: PermissionMode::Default,
+    };
+
+    assert_eq!(
+        port.resume_or_replace_context(request.clone(), package.clone(), ReasoningEffort::High)
+            .await?,
+        ContextRecovery::Replaced(new_context)
+    );
+    assert_eq!(port.started_contexts, 1);
+    assert_eq!(port.epoch_inputs, ["canonical Carl context"]);
+
+    let mut resume_port = RecoveryPort {
+        capabilities: AgentCapabilities {
+            resume: true,
+            ..port.capabilities
+        },
+        new_context: AgentContextId::parse("unused-context")?,
+        resume_succeeds: true,
+        compact_succeeds: false,
+        started_contexts: 0,
+        epoch_inputs: Vec::new(),
+    };
+    assert_eq!(
+        resume_port
+            .resume_or_replace_context(request.clone(), package.clone(), ReasoningEffort::High)
+            .await?,
+        ContextRecovery::Resumed(AgentContextId::parse("resumed-context")?)
+    );
+    assert_eq!(resume_port.started_contexts, 0);
+
+    let mut compact_port = RecoveryPort {
+        capabilities: AgentCapabilities {
+            compact: true,
+            ..port.capabilities
+        },
+        new_context: AgentContextId::parse("unused-context")?,
+        resume_succeeds: false,
+        compact_succeeds: true,
+        started_contexts: 0,
+        epoch_inputs: Vec::new(),
+    };
+    let old_context = request.context_id.clone();
+    assert_eq!(
+        compact_port
+            .compact_or_replace_context(request, package, ReasoningEffort::High)
+            .await?,
+        ContextRecovery::Compacted(old_context)
+    );
+    assert_eq!(compact_port.started_contexts, 0);
+    Ok(())
+}
+
 #[allow(dead_code)]
 fn kernel_accepts_only_the_neutral_port(
     store: RuntimeStore,
@@ -294,6 +387,106 @@ struct FakePort {
     events: VecDeque<AgentEvent>,
     resolved: Vec<EffectDecision>,
     shutdown: bool,
+}
+
+struct RecoveryPort {
+    capabilities: AgentCapabilities,
+    new_context: AgentContextId,
+    resume_succeeds: bool,
+    compact_succeeds: bool,
+    started_contexts: usize,
+    epoch_inputs: Vec<String>,
+}
+
+impl AgentPort for RecoveryPort {
+    fn capabilities(&self) -> AgentCapabilities {
+        self.capabilities
+    }
+
+    fn models(&mut self) -> AgentFuture<'_, Vec<AgentModel>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    fn start_context(&mut self, _request: StartAgentContext) -> AgentFuture<'_, AgentContextId> {
+        self.started_contexts += 1;
+        let context_id = self.new_context.clone();
+        Box::pin(async move { Ok(context_id) })
+    }
+
+    fn resume_context(&mut self, _request: ResumeAgentContext) -> AgentFuture<'_, AgentContextId> {
+        let succeeds = self.resume_succeeds;
+        Box::pin(async move {
+            if succeeds {
+                AgentContextId::parse("resumed-context")
+            } else {
+                Err(AgentPortError::from_code(AgentPortErrorCode::Unsupported))
+            }
+        })
+    }
+
+    fn compact_context(&mut self, _context_id: &AgentContextId) -> AgentFuture<'_, ()> {
+        let succeeds = self.compact_succeeds;
+        Box::pin(async move {
+            if succeeds {
+                Ok(())
+            } else {
+                Err(AgentPortError::from_code(AgentPortErrorCode::Unsupported))
+            }
+        })
+    }
+
+    fn start_epoch(&mut self, request: StartAgentEpoch) -> AgentFuture<'_, AgentEpochId> {
+        self.epoch_inputs.push(request.input);
+        Box::pin(async { AgentEpochId::parse("replacement-epoch") })
+    }
+
+    fn steer(
+        &mut self,
+        _context_id: &AgentContextId,
+        _epoch_id: &AgentEpochId,
+        _text: String,
+    ) -> AgentFuture<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn interrupt(
+        &mut self,
+        _context_id: &AgentContextId,
+        _epoch_id: &AgentEpochId,
+    ) -> AgentFuture<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn next_event(&mut self) -> AgentFuture<'_, AgentEvent> {
+        Box::pin(async { Err(AgentPortError::unavailable_context()) })
+    }
+
+    fn resolve_effect(
+        &mut self,
+        _request_id: &AgentRequestId,
+        _decision: EffectDecision,
+    ) -> AgentFuture<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn list_background_processes(
+        &mut self,
+        _context_id: &AgentContextId,
+    ) -> AgentFuture<'_, Vec<AgentProcess>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    fn terminate_background_process(
+        &mut self,
+        _context_id: &AgentContextId,
+        _process_id: &str,
+    ) -> AgentFuture<'_, bool> {
+        Box::pin(async { Ok(false) })
+    }
+
+    fn shutdown(&mut self) -> AgentFuture<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 impl AgentPort for FakePort {
