@@ -745,7 +745,7 @@ impl Store {
             });
         }
         schema::migrate(&mut connection)?;
-        validate_resumable_task_projections(&connection)?;
+        validate_task_projection_completeness(&connection)?;
         checkpoint_for_secure_deletion(&connection)?;
 
         Ok(Self { connection })
@@ -1591,25 +1591,19 @@ impl Store {
     }
 
     pub fn list_resumable_tasks(&self) -> Result<Vec<TaskRecord>, CarlError> {
-        let ids = self
-            .connection
-            .prepare(
-                "SELECT id FROM agent_tasks
-                 WHERE status NOT IN ('cancelled', 'completed', 'failed')
-                 ORDER BY updated_at ASC, id ASC",
-            )
-            .map_err(storage_error)?
-            .query_map([], |row| row.get::<_, String>(0))
-            .map_err(storage_error)?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(storage_error)?;
-        ids.into_iter()
-            .map(|id| {
-                let task_id = parse_id("task ID", &id)?;
-                load_task_record(&self.connection, task_id)?
-                    .ok_or_else(|| storage_invariant("listed task projection disappeared"))
-            })
-            .collect()
+        let mut records = Vec::new();
+        visit_authoritative_task_records(&self.connection, |record| {
+            if !record.snapshot.status.is_terminal() {
+                records.push(record);
+            }
+            Ok(())
+        })?;
+        records.sort_by(|left, right| {
+            left.updated_at
+                .cmp(&right.updated_at)
+                .then_with(|| left.snapshot.task_id.cmp(&right.snapshot.task_id))
+        });
+        Ok(records)
     }
 
     pub fn read_task_events(&self, task_id: TaskId) -> Result<Vec<EventEnvelope>, CarlError> {
@@ -5640,18 +5634,31 @@ fn read_task_event_page_from_connection(
         None => 0,
     };
     let task_id_text = task_id.to_string();
-    let Some(session_id) = connection
-        .query_row(
-            "SELECT session_id FROM agent_tasks WHERE id = ?1",
-            [&task_id_text],
-            |row| row.get::<_, String>(0),
+    let session_ids = connection
+        .prepare(
+            "SELECT DISTINCT session_id
+             FROM events
+             WHERE json_extract(event_json, '$.type') = 'task_lifecycle'
+               AND json_extract(event_json, '$.task_id') = ?1
+             ORDER BY session_id ASC
+             LIMIT 2",
         )
-        .optional()
         .map_err(storage_error)?
-    else {
-        return Ok(Vec::new());
+        .query_map([&task_id_text], |row| row.get::<_, String>(0))
+        .map_err(storage_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(storage_error)?;
+    let [session_id] = session_ids.as_slice() else {
+        if session_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        return Err(storage_invariant(
+            "task journal identifier appears in multiple sessions",
+        ));
     };
-    let session_id: SessionId = parse_id("task session ID", &session_id)?;
+    let session_id: SessionId = session_id
+        .parse()
+        .map_err(|_| storage_invariant("task journal contains an invalid session identifier"))?;
     let rows = connection
         .prepare(
             "SELECT id, turn_id, sequence, timestamp, schema_version, event_json
@@ -5690,49 +5697,105 @@ fn read_task_event_page_from_connection(
         .collect()
 }
 
-fn validate_resumable_task_projections(connection: &Connection) -> Result<(), CarlError> {
-    let ids = connection
-        .prepare(
-            "SELECT id FROM agent_tasks
-             WHERE status NOT IN ('cancelled', 'completed', 'failed')
-             ORDER BY id ASC",
-        )
-        .map_err(storage_error)?
-        .query_map([], |row| row.get::<_, String>(0))
-        .map_err(storage_error)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(storage_error)?;
-    for id in ids {
-        let task_id = parse_id("task ID", &id)?;
-        let projection = load_task_record(connection, task_id)?
-            .ok_or_else(|| storage_invariant("resumable task projection disappeared"))?;
-        let mut replayed = None;
-        let mut after_sequence = None;
-        loop {
-            let page =
-                read_task_event_page_from_connection(connection, task_id, after_sequence, 512)?;
-            if page.is_empty() {
-                break;
-            }
-            after_sequence = page.last().map(|event| event.sequence);
-            for envelope in page {
-                replayed = Some(reduce_task(replayed, &envelope).map_err(task_replay_error)?);
-            }
+fn validate_task_projection_completeness(connection: &Connection) -> Result<(), CarlError> {
+    visit_authoritative_task_records(connection, |_| Ok(()))
+}
+
+fn visit_authoritative_task_records(
+    connection: &Connection,
+    mut visitor: impl FnMut(TaskRecord) -> Result<(), CarlError>,
+) -> Result<(), CarlError> {
+    let mut after_task_id = None;
+    loop {
+        let task_ids = read_journal_task_id_page(connection, after_task_id.as_deref())?;
+        if task_ids.is_empty() {
+            break;
         }
-        let replayed = replayed
-            .ok_or_else(|| storage_invariant("resumable task projection has no journal events"))?;
-        if replayed.revision != projection.revision
-            || replayed.status != projection.snapshot.status
-            || replayed.active_epoch != projection.snapshot.active_epoch
-            || replayed.latest_checkpoint != projection.snapshot.latest_checkpoint
-            || replayed != projection.snapshot
-        {
-            return Err(storage_invariant(
-                "task projection disagrees with journal replay",
-            ));
+        after_task_id = task_ids.last().cloned();
+        for stored_task_id in task_ids {
+            let task_id = stored_task_id.parse::<TaskId>().map_err(|_| {
+                storage_invariant("task journal contains an invalid task identifier")
+            })?;
+            visitor(validate_task_projection_from_journal(connection, task_id)?)?;
         }
     }
+
+    let orphan_projection = connection
+        .query_row(
+            "SELECT 1
+             FROM agent_tasks AS task
+             WHERE NOT EXISTS (
+                SELECT 1
+                FROM events AS event
+                WHERE json_extract(event.event_json, '$.type') = 'task_lifecycle'
+                  AND json_extract(event.event_json, '$.task_id') = task.id
+             )
+             LIMIT 1",
+            [],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(storage_error)?;
+    if orphan_projection.is_some() {
+        return Err(storage_invariant(
+            "task projection has no authoritative journal",
+        ));
+    }
     Ok(())
+}
+
+fn read_journal_task_id_page(
+    connection: &Connection,
+    after_task_id: Option<&str>,
+) -> Result<Vec<String>, CarlError> {
+    connection
+        .prepare(
+            "SELECT json_extract(event_json, '$.task_id') AS task_id
+             FROM events
+             WHERE json_extract(event_json, '$.type') = 'task_lifecycle'
+               AND (?1 IS NULL OR json_extract(event_json, '$.task_id') > ?1)
+             GROUP BY json_extract(event_json, '$.task_id')
+             ORDER BY json_extract(event_json, '$.task_id') ASC
+             LIMIT 512",
+        )
+        .map_err(storage_error)?
+        .query_map([after_task_id], |row| row.get::<_, String>(0))
+        .map_err(storage_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| storage_invariant("task journal contains invalid task metadata"))
+}
+
+fn validate_task_projection_from_journal(
+    connection: &Connection,
+    task_id: TaskId,
+) -> Result<TaskRecord, CarlError> {
+    let projection = load_task_record(connection, task_id)?
+        .ok_or_else(|| storage_invariant("task journal has no matching task projection"))?;
+    let mut replayed = None;
+    let mut after_sequence = None;
+    loop {
+        let page = read_task_event_page_from_connection(connection, task_id, after_sequence, 512)?;
+        if page.is_empty() {
+            break;
+        }
+        after_sequence = page.last().map(|event| event.sequence);
+        for envelope in page {
+            replayed = Some(reduce_task(replayed, &envelope).map_err(task_replay_error)?);
+        }
+    }
+    let replayed = replayed
+        .ok_or_else(|| storage_invariant("task projection has no authoritative journal"))?;
+    if replayed.revision != projection.revision
+        || replayed.status != projection.snapshot.status
+        || replayed.active_epoch != projection.snapshot.active_epoch
+        || replayed.latest_checkpoint != projection.snapshot.latest_checkpoint
+        || replayed != projection.snapshot
+    {
+        return Err(storage_invariant(
+            "task projection disagrees with journal replay",
+        ));
+    }
+    Ok(projection)
 }
 
 const fn task_status_str(status: TaskStatus) -> &'static str {

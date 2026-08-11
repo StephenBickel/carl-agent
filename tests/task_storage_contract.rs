@@ -391,3 +391,104 @@ fn startup_rejects_a_resumable_projection_that_disagrees_with_replay() -> Result
     ));
     Ok(())
 }
+
+#[test]
+fn startup_rejects_a_journal_task_hidden_by_a_terminal_projection_status()
+-> Result<(), Box<dyn Error>> {
+    let fixture = TemporaryTaskDatabase::new()?;
+    let mut store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let task = store.create_task(new_task(session.id, &fixture.workspace))?;
+
+    let connection = Connection::open(&fixture.database)?;
+    connection.execute(
+        "UPDATE agent_tasks SET status = 'completed' WHERE id = ?1",
+        [task.snapshot.task_id.to_string()],
+    )?;
+    drop(connection);
+
+    let list_error = store
+        .list_resumable_tasks()
+        .expect_err("terminal status must not hide a resumable journal task from listing");
+    assert!(matches!(list_error, CarlError::Storage { .. }));
+    drop(store);
+
+    let error = match Store::open(&fixture.database) {
+        Ok(_) => panic!("terminal status must not hide a resumable journal task"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        CarlError::Storage { ref detail }
+            if detail.contains("task projection") && !detail.contains(&task.snapshot.task_id.to_string())
+    ));
+    Ok(())
+}
+
+#[test]
+fn startup_rejects_a_journal_task_with_a_missing_projection() -> Result<(), Box<dyn Error>> {
+    let fixture = TemporaryTaskDatabase::new()?;
+    let mut store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let task = store.create_task(new_task(session.id, &fixture.workspace))?;
+
+    let connection = Connection::open(&fixture.database)?;
+    connection.execute(
+        "DELETE FROM agent_tasks WHERE id = ?1",
+        [task.snapshot.task_id.to_string()],
+    )?;
+    drop(connection);
+
+    let list_error = store
+        .list_resumable_tasks()
+        .expect_err("missing projection must not hide an authoritative journal task");
+    assert!(matches!(list_error, CarlError::Storage { .. }));
+    drop(store);
+
+    let error = match Store::open(&fixture.database) {
+        Ok(_) => panic!("authoritative journal task must have a projection"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        CarlError::Storage { ref detail }
+            if detail.contains("task projection") && !detail.contains(&task.snapshot.task_id.to_string())
+    ));
+    Ok(())
+}
+
+#[test]
+fn startup_discovery_checks_tasks_beyond_the_first_candidate_page() -> Result<(), Box<dyn Error>> {
+    let fixture = TemporaryTaskDatabase::new()?;
+    let mut store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let mut task_ids = Vec::with_capacity(513);
+    for _ in 0..513 {
+        task_ids.push(
+            store
+                .create_task(new_task(session.id, &fixture.workspace))?
+                .snapshot
+                .task_id,
+        );
+    }
+    drop(store);
+
+    let last_candidate = task_ids.into_iter().max().expect("tasks were created");
+    let connection = Connection::open(&fixture.database)?;
+    connection.execute(
+        "UPDATE agent_tasks SET status = 'completed' WHERE id = ?1",
+        [last_candidate.to_string()],
+    )?;
+    drop(connection);
+
+    let error = match Store::open(&fixture.database) {
+        Ok(_) => panic!("startup must validate journal task candidate pages after the first"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        CarlError::Storage { ref detail }
+            if detail.contains("task projection") && !detail.contains(&last_candidate.to_string())
+    ));
+    Ok(())
+}
