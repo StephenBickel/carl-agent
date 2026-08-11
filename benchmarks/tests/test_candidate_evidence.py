@@ -33,6 +33,9 @@ from carl_bench.experiment import (
     reduce_events,
 )
 from carl_bench.report import summarize_run
+from carl_bench.run_attestation import attest_run
+
+ATTESTATION_KEY = bytes(range(32))
 
 
 def _store(tmp_path: Path) -> PrivateArtifactStore:
@@ -41,7 +44,13 @@ def _store(tmp_path: Path) -> PrivateArtifactStore:
     return PrivateArtifactStore(tmp_path / "private" / "artifacts", repository)
 
 
-def _scorecards(*, candidate_passes: bool, attempts: int = 3):
+def _run_evidence(
+    *,
+    candidate_passes: bool,
+    attempts: int = 3,
+    baseline_subject: str | None = None,
+    candidate_subject: str | None = None,
+):
     baseline_trials = tuple(
         trial(run="baseline", track="coding", attempt=index, passed=False)
         for index in range(1, attempts + 1)
@@ -50,19 +59,76 @@ def _scorecards(*, candidate_passes: bool, attempts: int = 3):
         trial(run="candidate", track="coding", attempt=index, passed=candidate_passes)
         for index in range(1, attempts + 1)
     )
-    return (
-        summarize_run(
-            run_manifest("baseline", baseline_trials, subject_commit=manifest().parent_commit),
+    baseline_manifest = replace(
+        run_manifest(
+            "baseline",
             baseline_trials,
+            subject_commit=baseline_subject or manifest().parent_commit,
         ),
-        summarize_run(
-            run_manifest(
-                "candidate",
-                candidate_trials,
-                subject_commit=sealed_candidate().candidate_commit,
-            ),
+        seed=101,
+    )
+    candidate_manifest = replace(
+        run_manifest(
+            "candidate",
             candidate_trials,
+            subject_commit=candidate_subject or sealed_candidate().candidate_commit,
         ),
+        seed=101,
+    )
+    return (
+        baseline_manifest,
+        summarize_run(baseline_manifest, baseline_trials),
+        candidate_manifest,
+        summarize_run(candidate_manifest, candidate_trials),
+    )
+
+
+def _scorecards(*, candidate_passes: bool, attempts: int = 3):
+    _, baseline, _, candidate = _run_evidence(candidate_passes=candidate_passes, attempts=attempts)
+    return baseline, candidate
+
+
+def _attestations(
+    *,
+    candidate_passes: bool,
+    attempts: int = 3,
+    baseline_subject: str | None = None,
+    candidate_subject: str | None = None,
+):
+    baseline_manifest, baseline, candidate_manifest, candidate = _run_evidence(
+        candidate_passes=candidate_passes,
+        attempts=attempts,
+        baseline_subject=baseline_subject,
+        candidate_subject=candidate_subject,
+    )
+    identity = (
+        {
+            "digest": baseline.trials[0].task_digest,
+            "task_id": baseline.trials[0].task_id,
+            "track": baseline.trials[0].track,
+        },
+    )
+    return (
+        attest_run(
+            experiment_id=manifest().experiment_id,
+            role="baseline",
+            checkout_tree_digest="a" * 40,
+            manifest=baseline_manifest,
+            scorecard=baseline,
+            task_identities=identity,
+            attempts=attempts,
+            key=ATTESTATION_KEY,
+        ).to_canonical_dict(),
+        attest_run(
+            experiment_id=manifest().experiment_id,
+            role="candidate",
+            checkout_tree_digest="b" * 40,
+            manifest=candidate_manifest,
+            scorecard=candidate,
+            task_identities=identity,
+            attempts=attempts,
+            key=ATTESTATION_KEY,
+        ).to_canonical_dict(),
     )
 
 
@@ -147,13 +213,15 @@ def test_bind_paired_evidence_recomputes_improvement_and_stores_exact_public_inp
     tmp_path: Path,
 ) -> None:
     baseline, candidate = _scorecards(candidate_passes=True)
+    baseline_attestation, candidate_attestation = _attestations(candidate_passes=True)
     store = _store(tmp_path)
 
     evidence = bind_paired_evidence(
         manifest(),
         sealed_candidate(),
-        baseline,
-        candidate,
+        baseline_attestation,
+        candidate_attestation,
+        attestation_key=ATTESTATION_KEY,
         comparison_seed=77,
         store=store,
     )
@@ -179,13 +247,14 @@ def test_bind_paired_evidence_recomputes_improvement_and_stores_exact_public_inp
 def test_bind_paired_evidence_rejects_losers_and_insufficient_pairs(
     tmp_path: Path, candidate_passes: bool, attempts: int, code: str
 ) -> None:
-    baseline, candidate = _scorecards(candidate_passes=candidate_passes, attempts=attempts)
+    baseline, candidate = _attestations(candidate_passes=candidate_passes, attempts=attempts)
     with pytest.raises(CandidateEvidenceError, match=code):
         bind_paired_evidence(
             manifest(),
             sealed_candidate(),
             baseline,
             candidate,
+            attestation_key=ATTESTATION_KEY,
             comparison_seed=77,
             store=_store(tmp_path),
         )
@@ -194,18 +263,20 @@ def test_bind_paired_evidence_rejects_losers_and_insufficient_pairs(
 @pytest.mark.parametrize(
     ("scorecard", "code"),
     [
-        ("baseline", "baseline_scorecard_commit_mismatch"),
-        ("candidate", "candidate_scorecard_commit_mismatch"),
+        ("baseline", "baseline_attestation_invalid"),
+        ("candidate", "candidate_attestation_invalid"),
     ],
 )
 def test_bind_paired_evidence_rejects_scorecards_from_other_commits(
     tmp_path: Path, scorecard: str, code: str
 ) -> None:
-    baseline, candidate = _scorecards(candidate_passes=True)
-    if scorecard == "baseline":
-        baseline = replace(baseline, subject_commit="e" * 40)
-    else:
-        candidate = replace(candidate, subject_commit="e" * 40)
+    baseline_subject = "e" * 40 if scorecard == "baseline" else None
+    candidate_subject = "e" * 40 if scorecard == "candidate" else None
+    baseline, candidate = _attestations(
+        candidate_passes=True,
+        baseline_subject=baseline_subject,
+        candidate_subject=candidate_subject,
+    )
 
     with pytest.raises(CandidateEvidenceError, match=code):
         bind_paired_evidence(
@@ -213,6 +284,7 @@ def test_bind_paired_evidence_rejects_scorecards_from_other_commits(
             sealed_candidate(),
             baseline,
             candidate,
+            attestation_key=ATTESTATION_KEY,
             comparison_seed=77,
             store=_store(tmp_path),
         )

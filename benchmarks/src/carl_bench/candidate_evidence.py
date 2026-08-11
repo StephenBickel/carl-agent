@@ -22,11 +22,13 @@ from carl_bench.experiment import (
 from carl_bench.models import (
     FailureClass,
     OutcomeStatus,
+    RunManifest,
     Scorecard,
     TrackScorecard,
     TrialResult,
 )
 from carl_bench.report import compare_runs
+from carl_bench.run_attestation import RunAttestationError, verify_attested_scorecard
 
 
 class CandidateEvidenceError(ValueError):
@@ -170,6 +172,43 @@ def scorecard_from_public(value: Any) -> Scorecard:
         raise CandidateEvidenceError("scorecard_invalid") from error
 
 
+def run_manifest_from_public(value: Any) -> RunManifest:
+    if not isinstance(value, dict):
+        raise CandidateEvidenceError("run_manifest_invalid")
+    _exact_keys(
+        value,
+        {
+            "effort",
+            "league",
+            "model",
+            "run_id",
+            "schema_version",
+            "seed",
+            "started_at",
+            "subject_commit",
+            "trials",
+        },
+    )
+    if not isinstance(value["trials"], list):
+        raise CandidateEvidenceError("run_manifest_trials_invalid")
+    try:
+        return RunManifest(
+            schema_version=value["schema_version"],
+            run_id=value["run_id"],
+            subject_commit=value["subject_commit"],
+            league=value["league"],
+            model=value["model"],
+            effort=value["effort"],
+            started_at=value["started_at"],
+            seed=value["seed"],
+            trials=tuple(_trial_from_public(trial) for trial in value["trials"]),
+        )
+    except (TypeError, ValueError) as error:
+        if isinstance(error, CandidateEvidenceError):
+            raise
+        raise CandidateEvidenceError("run_manifest_invalid") from error
+
+
 def _scorecard_digest(scorecard: Scorecard) -> str:
     return hashlib.sha256(canonical_json_bytes(scorecard.to_public_dict())).hexdigest()
 
@@ -181,9 +220,10 @@ def _basis_points(value: float) -> int:
 def bind_paired_evidence(
     manifest: ExperimentManifest,
     candidate: SealedCandidate,
-    baseline: Scorecard,
-    candidate_scorecard: Scorecard,
+    baseline_attestation: Any,
+    candidate_attestation: Any,
     *,
+    attestation_key: bytes,
     comparison_seed: int,
     store: PrivateArtifactStore,
 ) -> PairedEvidence:
@@ -195,12 +235,26 @@ def bind_paired_evidence(
         or candidate.parent_commit != manifest.parent_commit
     ):
         raise CandidateEvidenceError("candidate_manifest_mismatch")
-    if not isinstance(baseline, Scorecard) or not isinstance(candidate_scorecard, Scorecard):
-        raise CandidateEvidenceError("invalid_scorecard")
-    if baseline.subject_commit != manifest.parent_commit:
-        raise CandidateEvidenceError("baseline_scorecard_commit_mismatch")
-    if candidate_scorecard.subject_commit != candidate.candidate_commit:
-        raise CandidateEvidenceError("candidate_scorecard_commit_mismatch")
+    try:
+        baseline = verify_attested_scorecard(
+            baseline_attestation,
+            key=attestation_key,
+            expected_experiment_id=manifest.experiment_id,
+            expected_role="baseline",
+            expected_subject_commit=manifest.parent_commit,
+        )
+    except RunAttestationError as error:
+        raise CandidateEvidenceError("baseline_attestation_invalid") from error
+    try:
+        candidate_scorecard = verify_attested_scorecard(
+            candidate_attestation,
+            key=attestation_key,
+            expected_experiment_id=manifest.experiment_id,
+            expected_role="candidate",
+            expected_subject_commit=candidate.candidate_commit,
+        )
+    except RunAttestationError as error:
+        raise CandidateEvidenceError("candidate_attestation_invalid") from error
     if not isinstance(store, PrivateArtifactStore):
         raise CandidateEvidenceError("invalid_artifact_store")
     try:

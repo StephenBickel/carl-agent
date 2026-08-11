@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -60,6 +62,97 @@ def test_scripted_run_writes_only_sanitized_scorecard(tmp_path: Path) -> None:
     serialized = destination.read_text(encoding="utf-8").casefold()
     for forbidden in ("instruction", "prompt", "stdout", "stderr", "response", "secret"):
         assert forbidden not in serialized
+
+
+def test_attested_run_derives_clean_checkout_commit_and_refuses_dirty_checkout(
+    tmp_path: Path,
+) -> None:
+    checkout = tmp_path / "checkout"
+    tasks = checkout / "benchmarks" / "tasks" / "dev"
+    shutil.copytree(TASK_ROOT, tasks)
+    subprocess.run(("git", "init", "-q", os.fspath(checkout)), check=True)
+    subprocess.run(("git", "-C", os.fspath(checkout), "add", "."), check=True)
+    subprocess.run(
+        (
+            "git",
+            "-C",
+            os.fspath(checkout),
+            "-c",
+            "user.name=Carl Test",
+            "-c",
+            "user.email=carl@example.invalid",
+            "commit",
+            "-qm",
+            "fixture",
+        ),
+        check=True,
+    )
+    commit = subprocess.run(
+        ("git", "-C", os.fspath(checkout), "rev-parse", "HEAD"),
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    private = tmp_path / "private"
+    key = private / "attestation.key"
+    assert (
+        cli.main(
+            [
+                "attestation-key",
+                "init",
+                "--private-key",
+                os.fspath(key),
+                "--repository",
+                os.fspath(checkout),
+            ]
+        )
+        == 0
+    )
+    public = tmp_path / "scorecard.json"
+    attestation = private / "baseline.attestation.json"
+    command = [
+        "run-attested",
+        "--checkout",
+        os.fspath(checkout),
+        "--tasks",
+        os.fspath(tasks),
+        "--adapter",
+        "scripted",
+        "--attempts",
+        "1",
+        "--seed",
+        "17",
+        "--experiment-id",
+        "experiment-cli-1",
+        "--role",
+        "baseline",
+        "--attestation-key",
+        os.fspath(key),
+        "--private-attestation",
+        os.fspath(attestation),
+        "--public-result",
+        os.fspath(public),
+    ]
+    assert cli.main(command) == 0
+    assert json.loads(public.read_text())["subject_commit"] == commit
+    private_value = json.loads(attestation.read_text())
+    assert private_value["payload"]["subject_commit"] == commit
+    assert private_value["payload"]["role"] == "baseline"
+    assert private_value["mac"]
+
+    (checkout / "dirty.txt").write_text("unsealed", encoding="utf-8")
+    refused = tmp_path / "refused.json"
+    refused_attestation = private / "refused.attestation.json"
+    dirty_command = [
+        refused_attestation.as_posix() if item == attestation.as_posix() else item
+        for item in command
+    ]
+    dirty_command = [
+        refused.as_posix() if item == public.as_posix() else item for item in dirty_command
+    ]
+    assert cli.main(dirty_command) == 2
+    assert not refused.exists()
+    assert not refused_attestation.exists()
 
 
 def test_task_selection_is_sorted_and_unknown_selectors_fail_closed(tmp_path: Path) -> None:

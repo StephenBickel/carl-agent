@@ -229,19 +229,29 @@ uv run --project benchmarks --locked carl-bench candidate seal \
   --public-result "$CONTROL_ROOT/candidate.json"
 ```
 
-Record the ordinary transitions to `deterministic_validation` and `paired_evaluation`, run the
-exact baseline and candidate scorecards, then bind the recomputed comparison:
+Record the ordinary transitions to `deterministic_validation` and `paired_evaluation`. Create one
+controller-only attestation key outside the repository, then run `carl-bench run-attested` against
+separate clean baseline and candidate checkouts with the same task/config arguments. Use the
+experiment ID and the corresponding `baseline` or `candidate` role. The command derives `HEAD`,
+rechecks the sealed checkout after execution, reconstructs the scorecard from the canonical run
+manifest, and signs both digests plus the task/config identity. Then bind only those attestations:
 
 ```bash
 uv run --project benchmarks --locked carl-bench candidate bind-comparison \
   "${COMMON[@]}" \
   --stage-attempt-id paired-exp-real-id-1 \
   --occurred-at 2026-08-10T14:00:00Z \
-  --baseline "$CONTROL_ROOT/baseline.json" \
-  --candidate-scorecard "$CONTROL_ROOT/candidate-scorecard.json" \
+  --baseline-attestation "$CONTROL_ROOT/baseline.attestation.json" \
+  --candidate-attestation "$CONTROL_ROOT/candidate.attestation.json" \
+  --attestation-key "$CONTROL_ROOT/benchmark-attestation.key" \
   --comparison-seed 41000 \
   --public-result "$CONTROL_ROOT/paired.json"
 ```
+
+Relabeled public scorecards, role swaps, scorecard swaps, arbitrary JSON, modified signed fields,
+and unknown keys are rejected. The Phase 3 HMAC signer is controller-local; do not give autonomous
+workers direct access to the controller CLI, ledger, or key. Cross-user or cross-machine operation
+requires moving signing behind a separate trust boundary, preferably with public-key signatures.
 
 Issue separate packets for `correctness`, `security`, `maintainability`, and
 `benchmark_integrity`. Run each reviewer in a read-only, independent Codex context, then call

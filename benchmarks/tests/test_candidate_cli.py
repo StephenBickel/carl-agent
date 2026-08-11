@@ -8,7 +8,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
-from test_candidate_evidence import _scorecards
+from test_candidate_evidence import ATTESTATION_KEY, _attestations
 from test_candidate_git import _check, _repository
 from test_experiment import (
     manifest,
@@ -217,13 +217,19 @@ def test_candidate_cli_runs_prepare_seal_evidence_review_and_draft_without_claim
     ):
         _record(ledger, private, event)
 
-    baseline, candidate_scorecard = _scorecards(candidate_passes=True)
-    baseline = replace(baseline, subject_commit=selected.parent_commit)
-    candidate_scorecard = replace(candidate_scorecard, subject_commit=sealed["candidate_commit"])
-    baseline_path = tmp_path / "baseline.json"
-    candidate_path = tmp_path / "candidate.json"
-    _write_json(baseline_path, baseline.to_public_dict())
-    _write_json(candidate_path, candidate_scorecard.to_public_dict())
+    baseline, candidate_scorecard = _attestations(
+        candidate_passes=True,
+        baseline_subject=selected.parent_commit,
+        candidate_subject=sealed["candidate_commit"],
+    )
+    baseline_path = private / "baseline.attestation.json"
+    candidate_path = private / "candidate.attestation.json"
+    key_path = private / "attestation.key"
+    _write_json(baseline_path, baseline)
+    _write_json(candidate_path, candidate_scorecard)
+    key_path.write_bytes(ATTESTATION_KEY)
+    if os.name != "nt":
+        key_path.chmod(0o600)
     paired_result = tmp_path / "paired.json"
     assert (
         cli.main(
@@ -235,10 +241,12 @@ def test_candidate_cli_runs_prepare_seal_evidence_review_and_draft_without_claim
                 "paired-cli",
                 "--occurred-at",
                 "2026-08-10T12:01:03Z",
-                "--baseline",
+                "--baseline-attestation",
                 os.fspath(baseline_path),
-                "--candidate-scorecard",
+                "--candidate-attestation",
                 os.fspath(candidate_path),
+                "--attestation-key",
+                os.fspath(key_path),
                 "--comparison-seed",
                 "77",
                 "--public-result",

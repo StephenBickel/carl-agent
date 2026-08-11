@@ -50,11 +50,12 @@ The controller uses a prepare/edit/seal workflow.
 3. `candidate seal` reads the real Git index and filesystem, rejects special files and
    out-of-scope paths, runs trusted argv-based checks without a shell, stores bounded evidence,
    commits the candidate, and appends a candidate event to the ledger.
-4. The benchmark operator runs baseline and candidate through the existing benchmark lab. Each
-   scorecard carries the exact subject commit inside its run digest. `candidate bind-comparison`
-   recomputes the public comparison, requires the baseline subject to equal the manifest parent
-   and the candidate subject to equal the sealed commit, stores the evidence, and appends one
-   paired-evaluation event.
+4. The trusted controller runs baseline and candidate through `run-attested` from separate clean
+   checkouts. It derives each checkout commit and tree itself, reconstructs the scorecard from the
+   canonical run manifest, and emits a domain-separated HMAC bound to the experiment, role,
+   task/config identity, commit, manifest digest, and scorecard digest. `candidate bind-comparison`
+   verifies both attestations, requires baseline to equal the manifest parent and candidate to equal
+   the sealed commit, recomputes the comparison, stores the evidence, and appends one paired event.
 5. `candidate review-packet` emits one immutable, role-specific packet per reviewer. A reviewer
    works read-only and returns a strict attestation bound to the packet and candidate commit.
    Reviewer identities and context IDs must be unique across the four roles.
@@ -136,10 +137,13 @@ candidate tree blocks sealing.
 ### Paired evaluation
 
 The existing `compare_runs` implementation remains the statistical authority. A phase-three
-binding names the experiment, manifest digest, baseline commit, candidate commit, baseline and
-candidate scorecard digests, comparison seed, and recomputed comparison digest. Only the exact
-`improvement` decision satisfies the local gate. Infrastructure-invalid or insufficient evidence
-does not pass. The binding is diagnostic promotion evidence, not a protected scorecard.
+binding names the experiment, manifest digest, baseline commit, candidate commit, verified baseline
+and candidate scorecard digests, comparison seed, and recomputed comparison digest. Binding accepts
+only controller-attested evidence; caller-authored public scorecard labels have no promotion
+authority. Only the exact `improvement` decision satisfies the local gate. Infrastructure-invalid
+or insufficient evidence does not pass. The binding is local promotion evidence, not a protected
+holdout scorecard. The HMAC boundary is limited to the manual, controller-only Phase 3 model; shared
+OS identities or cross-machine verification require an isolated signer and public-key verification.
 
 ### Independent reviews
 

@@ -79,6 +79,28 @@ three valid pairs per task, a pass-rate gain of at least three percentage points
 bootstrap lower bound, and no track regression beyond two percentage points. Infrastructure-invalid
 trials are surfaced but excluded from pass-rate denominators.
 
+## Promotion attestations
+
+The ordinary `run` and `compare` commands are diagnostic. Promotion must use `run-attested` from
+separate clean baseline and candidate checkouts. The trusted controller derives each checkout's
+`HEAD` and tree, constructs the scorecard from the completed run manifest, and writes a private,
+domain-separated HMAC attestation bound to the experiment, role, task/config identities, commit,
+manifest, and scorecard. The signing key and attestation outputs must remain outside both checkouts.
+
+Create the controller key once in an owner-private control root:
+
+```bash
+uv run --project benchmarks --locked carl-bench attestation-key init \
+  --private-key /absolute/private/control/benchmark-attestation.key \
+  --repository /absolute/path/to/carl-agent
+```
+
+Run `carl-bench run-attested` with `--checkout`, `--experiment-id`, `--role baseline` or
+`--role candidate`, `--attestation-key`, and `--private-attestation` in addition to the same adapter
+arguments used by `run`. Dirty checkouts, checkout changes during execution, missing/unknown keys,
+and noncanonical evidence fail closed. `candidate bind-comparison` accepts only these verified
+baseline and candidate attestations; public scorecard JSON cannot authorize promotion.
+
 ## Evidence and isolation limits
 
 - Every attempt gets a new private temporary workspace. Task sources are hashed before and after,
@@ -91,6 +113,9 @@ trials are surfaced but excluded from pass-rate denominators.
   and `PATH`. Harbor validation deliberately receives neither Carl nor Codex credentials.
 - Public tasks are useful for development and regression detection, but serious promotion decisions
   also need protected holdouts to reduce benchmark overfitting.
+- The Phase 3 HMAC key is a controller-local trust boundary. Before workers share the controller's
+  OS identity or attestations cross machines, move signing to a separate identity/service and use
+  public-key verification.
 
 ## Harbor parity
 

@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import stat
+import subprocess
 import sys
 import tempfile
 import uuid
@@ -50,8 +51,9 @@ from carl_bench.experiment import (
 )
 from carl_bench.github_draft import DraftPrGateway
 from carl_bench.ledger import ExperimentLedger
-from carl_bench.models import RunManifest, TrialResult
+from carl_bench.models import RunManifest, Scorecard, TrialResult
 from carl_bench.report import compare_runs, summarize_run
+from carl_bench.run_attestation import attest_run
 from carl_bench.runner import BenchmarkRunner
 from carl_bench.sanitize import PublicSafetyError, assert_public_safe, write_public_json
 from carl_bench.tasks import BenchmarkTask, TaskContractError, discover_tasks
@@ -93,6 +95,45 @@ def _parser() -> argparse.ArgumentParser:
         default="default",
         choices=("plan", "default", "acceptEdits", "dontAsk"),
     )
+
+    run_attested = commands.add_parser(
+        "run-attested", help="run and attest promotion evidence from a clean checkout"
+    )
+    run_attested.add_argument("--checkout", required=True, type=Path)
+    run_attested.add_argument("--tasks", required=True, type=Path)
+    run_attested.add_argument(
+        "--adapter", required=True, choices=("scripted", "carl-acp", "codex-cli")
+    )
+    run_attested.add_argument(
+        "--task", action="append", default=[], help="exact task ID to include"
+    )
+    run_attested.add_argument("--attempts", required=True, type=int)
+    run_attested.add_argument("--seed", required=True, type=int)
+    run_attested.add_argument("--experiment-id", required=True)
+    run_attested.add_argument("--role", required=True, choices=("baseline", "candidate"))
+    run_attested.add_argument("--attestation-key", required=True, type=Path)
+    run_attested.add_argument("--private-attestation", required=True, type=Path)
+    run_attested.add_argument("--public-result", required=True, type=Path)
+    run_attested.add_argument("--league", choices=("plumbing", "same-model", "native-product"))
+    run_attested.add_argument("--model")
+    run_attested.add_argument("--effort", choices=("minimal", "low", "medium", "high", "xhigh"))
+    run_attested.add_argument("--carl-bin", type=Path)
+    run_attested.add_argument("--carl-data-dir", type=Path)
+    run_attested.add_argument("--codex-bin", type=Path)
+    run_attested.add_argument("--codex-home", type=Path)
+    run_attested.add_argument(
+        "--permission-mode",
+        default="default",
+        choices=("plan", "default", "acceptEdits", "dontAsk"),
+    )
+
+    attestation_key = commands.add_parser(
+        "attestation-key", help="manage the controller-only benchmark attestation key"
+    )
+    key_commands = attestation_key.add_subparsers(dest="key_command", required=True)
+    key_init = key_commands.add_parser("init", help="create a new owner-private signing key")
+    key_init.add_argument("--private-key", required=True, type=Path)
+    key_init.add_argument("--repository", required=True, type=Path)
 
     compare = commands.add_parser("compare", help="compare exact paired public scorecards")
     compare.add_argument("--baseline", required=True, type=Path)
@@ -167,8 +208,9 @@ def _parser() -> argparse.ArgumentParser:
         "bind-comparison", help="bind an exact paired benchmark improvement"
     )
     add_mutation(bind)
-    bind.add_argument("--baseline", required=True, type=Path)
-    bind.add_argument("--candidate-scorecard", required=True, type=Path)
+    bind.add_argument("--baseline-attestation", required=True, type=Path)
+    bind.add_argument("--candidate-attestation", required=True, type=Path)
+    bind.add_argument("--attestation-key", required=True, type=Path)
     bind.add_argument("--comparison-seed", required=True, type=int)
     bind.add_argument("--public-result", required=True, type=Path)
 
@@ -288,7 +330,9 @@ def _adapter(args: argparse.Namespace) -> tuple[AgentAdapter, str, str | None, s
     return adapter, selected_league, args.model, args.effort
 
 
-async def _run_command(args: argparse.Namespace) -> int:
+async def _execute_run(
+    args: argparse.Namespace, *, subject_commit: str
+) -> tuple[RunManifest, Scorecard, tuple[BenchmarkTask, ...], int]:
     if not 1 <= args.attempts <= 10:
         raise ValueError("attempts must be between 1 and 10")
     if isinstance(args.seed, bool) or not 0 <= args.seed < (1 << 63):
@@ -296,7 +340,6 @@ async def _run_command(args: argparse.Namespace) -> int:
     if args.seed + args.attempts - 1 >= (1 << 63):
         raise ValueError("attempt seeds exceed the supported range")
     task_root = _anchored(args.tasks)
-    destination = _safe_result_path(args.public_result, (task_root,))
     tasks = _select_tasks(task_root, args.task)
     if not tasks:
         raise ValueError("no benchmark tasks selected")
@@ -316,7 +359,7 @@ async def _run_command(args: argparse.Namespace) -> int:
     manifest = RunManifest(
         schema_version=1,
         run_id=f"run-{args.adapter}-{uuid.uuid4().hex}",
-        subject_commit=args.subject_commit,
+        subject_commit=subject_commit,
         league=league,
         model=model,
         effort=effort,
@@ -325,16 +368,29 @@ async def _run_command(args: argparse.Namespace) -> int:
         trials=tuple(trials),
     )
     scorecard = summarize_run(manifest, trials)
-    write_public_json(destination, scorecard.to_public_dict(), REPOSITORY_ROOT)
+    if scorecard.invalid_trials:
+        status = 4
+    elif scorecard.failed_trials:
+        status = 3
+    else:
+        status = 0
+    return manifest, scorecard, tasks, status
+
+
+def _print_run_result(scorecard: Scorecard) -> None:
     print(
         f"run {scorecard.run_id}: {scorecard.passed_trials}/{scorecard.valid_trials} "
         f"passed; {scorecard.invalid_trials} invalid"
     )
-    if scorecard.invalid_trials:
-        return 4
-    if scorecard.failed_trials:
-        return 3
-    return 0
+
+
+async def _run_command(args: argparse.Namespace) -> int:
+    task_root = _anchored(args.tasks)
+    destination = _safe_result_path(args.public_result, (task_root,))
+    _, scorecard, _, status = await _execute_run(args, subject_commit=args.subject_commit)
+    write_public_json(destination, scorecard.to_public_dict(), REPOSITORY_ROOT)
+    _print_run_result(scorecard)
+    return status
 
 
 def _object_without_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -502,11 +558,25 @@ def _read_private_bytes(path: Path, *, maximum: int = MAX_ARTIFACT_BYTES) -> byt
             or stat.S_ISLNK(metadata.st_mode)
             or metadata.st_size > maximum
             or (os.name != "nt" and stat.S_IMODE(metadata.st_mode) & 0o077)
+            or (os.name != "nt" and hasattr(os, "getuid") and metadata.st_uid != os.getuid())
         ):
             raise ValueError("private input is unsafe")
         return source.read_bytes()
     except OSError as error:
         raise ValueError("private input is invalid") from error
+
+
+def _read_private_object(path: Path, *, maximum: int = MAX_CONTROL_INPUT_BYTES) -> dict[str, Any]:
+    try:
+        value = json.loads(
+            _read_private_bytes(path, maximum=maximum).decode("utf-8"),
+            object_pairs_hook=_object_without_duplicates,
+        )
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError("private JSON input is invalid") from error
+    if not isinstance(value, dict):
+        raise ValueError("private JSON input must be an object")
+    return value
 
 
 def _write_private_json(destination: Path, value: Any, *forbidden_roots: Path) -> None:
@@ -541,6 +611,126 @@ def _write_private_json(destination: Path, value: Any, *forbidden_roots: Path) -
         os.replace(temporary, target)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def _init_attestation_key(args: argparse.Namespace) -> int:
+    destination = _anchored(args.private_key)
+    repository = _anchored(args.repository)
+    if _inside(destination, repository):
+        raise ValueError("attestation key must remain outside the repository")
+    destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if destination.parent.is_symlink() or not destination.parent.is_dir():
+        raise ValueError("attestation key parent is unsafe")
+    if os.name != "nt":
+        destination.parent.chmod(0o700)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(destination, flags, 0o600)
+    except OSError as error:
+        raise ValueError("attestation key cannot be created") from error
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(os.urandom(32))
+            stream.flush()
+            os.fsync(stream.fileno())
+    except Exception:
+        destination.unlink(missing_ok=True)
+        raise
+    print("created controller-only benchmark attestation key")
+    return 0
+
+
+def _load_attestation_key(path: Path, checkout: Path) -> bytes:
+    source = _anchored(path)
+    if _inside(source, _anchored(checkout)):
+        raise ValueError("attestation key must remain outside the benchmark checkout")
+    key = _read_private_bytes(source, maximum=64)
+    if not 32 <= len(key) <= 64:
+        raise ValueError("attestation key is invalid")
+    return key
+
+
+def _git_checkout_output(checkout: Path, *arguments: str) -> bytes:
+    environment = {
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+        "LANG": "C",
+        "LC_ALL": "C",
+        "PATH": os.environ.get("PATH", ""),
+    }
+    try:
+        result = subprocess.run(
+            ("git", "-C", os.fspath(checkout), *arguments),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=30,
+            env=environment,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise ValueError("benchmark checkout is unavailable") from error
+    if result.returncode != 0 or len(result.stdout) > MAX_CONTROL_INPUT_BYTES:
+        raise ValueError("benchmark checkout is invalid")
+    return result.stdout
+
+
+def _clean_checkout_snapshot(checkout: Path) -> tuple[str, str]:
+    root = _anchored(checkout)
+    top = Path(
+        os.fsdecode(_git_checkout_output(root, "rev-parse", "--show-toplevel")).strip()
+    ).resolve(strict=True)
+    if top != root.resolve(strict=True):
+        raise ValueError("benchmark checkout must be the exact Git worktree root")
+    status = _git_checkout_output(root, "status", "--porcelain=v1", "-z", "--untracked-files=all")
+    if status:
+        raise ValueError("benchmark checkout must be clean and sealed")
+    commit = os.fsdecode(
+        _git_checkout_output(root, "rev-parse", "--verify", "HEAD^{commit}")
+    ).strip()
+    tree = os.fsdecode(_git_checkout_output(root, "rev-parse", "--verify", "HEAD^{tree}")).strip()
+    return commit, tree
+
+
+async def _run_attested_command(args: argparse.Namespace) -> int:
+    checkout = _anchored(args.checkout)
+    task_root = _anchored(args.tasks)
+    if not _inside(task_root, checkout):
+        raise ValueError("attested benchmark tasks must come from the exact checkout")
+    public_result = _safe_result_path(args.public_result, (task_root, checkout))
+    private_attestation = _anchored(args.private_attestation)
+    if _inside(private_attestation, checkout):
+        raise ValueError("run attestation must remain outside the benchmark checkout")
+    before = _clean_checkout_snapshot(checkout)
+    manifest, scorecard, tasks, status = await _execute_run(args, subject_commit=before[0])
+    after = _clean_checkout_snapshot(checkout)
+    if after != before:
+        raise ValueError("benchmark checkout changed during the attested run")
+    key = _load_attestation_key(args.attestation_key, checkout)
+    task_identities = tuple(
+        {
+            "digest": task.identity.digest,
+            "task_id": task.identity.task_id,
+            "track": task.identity.track,
+        }
+        for task in tasks
+    )
+    attestation = attest_run(
+        experiment_id=args.experiment_id,
+        role=args.role,
+        checkout_tree_digest=before[1],
+        manifest=manifest,
+        scorecard=scorecard,
+        task_identities=task_identities,
+        attempts=args.attempts,
+        key=key,
+    )
+    _write_private_json(private_attestation, attestation.to_canonical_dict(), checkout)
+    write_public_json(public_result, scorecard.to_public_dict(), REPOSITORY_ROOT)
+    _print_run_result(scorecard)
+    return status
 
 
 def _candidate_manager(args: argparse.Namespace) -> CandidateGitManager:
@@ -723,15 +913,19 @@ def _candidate_command(args: argparse.Namespace) -> int:
         if existing is None:
             if projection.candidate is None:
                 raise ValueError("candidate has not been sealed")
-            baseline = scorecard_from_public(_read_public_object(args.baseline))
-            candidate_scorecard = scorecard_from_public(
-                _read_public_object(args.candidate_scorecard)
+            baseline_attestation = _read_private_object(
+                args.baseline_attestation, maximum=MAX_SCORECARD_BYTES
             )
+            candidate_attestation = _read_private_object(
+                args.candidate_attestation, maximum=MAX_SCORECARD_BYTES
+            )
+            attestation_key = _load_attestation_key(args.attestation_key, args.repository)
             paired = bind_paired_evidence(
                 manifest,
                 projection.candidate,
-                baseline,
-                candidate_scorecard,
+                baseline_attestation,
+                candidate_attestation,
+                attestation_key=attestation_key,
                 comparison_seed=args.comparison_seed,
                 store=manager.artifact_store,
             )
@@ -1002,6 +1196,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _experiment_command(args)
         if args.command == "candidate":
             return _candidate_command(args)
+        if args.command == "attestation-key":
+            return _init_attestation_key(args)
+        if args.command == "run-attested":
+            return asyncio.run(_run_attested_command(args))
         return asyncio.run(_run_command(args))
     except (KeyboardInterrupt, asyncio.CancelledError):
         return 130
