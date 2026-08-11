@@ -30,6 +30,8 @@ async fn fake_port_exercises_the_provider_neutral_lifecycle() -> TestResult {
                 context_id: context_id.clone(),
             },
             AgentEvent::EffectRequested(AgentEffectRequest {
+                context_id: context_id.clone(),
+                epoch_id: epoch_id.clone(),
                 request_id: request_id.clone(),
                 item_id: "item-123".into(),
                 kind: AgentEffectKind::Command,
@@ -158,6 +160,7 @@ fn neutral_payload_bounds_reject_untrusted_adapter_values() -> TestResult {
 
     for event in [
         AgentEvent::ItemStarted {
+            context_id: context_id.clone(),
             epoch_id: epoch_id.clone(),
             item: AgentItem::Other {
                 item_id: oversized_id.clone(),
@@ -165,6 +168,7 @@ fn neutral_payload_bounds_reject_untrusted_adapter_values() -> TestResult {
             },
         },
         AgentEvent::ItemStarted {
+            context_id: context_id.clone(),
             epoch_id: epoch_id.clone(),
             item: AgentItem::Command {
                 item_id: "command-bounds".into(),
@@ -177,6 +181,8 @@ fn neutral_payload_bounds_reject_untrusted_adapter_values() -> TestResult {
             },
         },
         AgentEvent::EffectRequested(AgentEffectRequest {
+            context_id: context_id.clone(),
+            epoch_id: epoch_id.clone(),
             request_id: request_id.clone(),
             item_id: oversized_id.clone(),
             kind: AgentEffectKind::Command,
@@ -184,6 +190,8 @@ fn neutral_payload_bounds_reject_untrusted_adapter_values() -> TestResult {
             request_digest: digest,
         }),
         AgentEvent::EffectRequested(AgentEffectRequest {
+            context_id: context_id.clone(),
+            epoch_id: epoch_id.clone(),
             request_id,
             item_id: "effect-bounds".into(),
             kind: AgentEffectKind::Command,
@@ -222,6 +230,7 @@ fn agent_event_diagnostics_redact_text_diffs_and_item_ids() -> TestResult {
         format!(
             "{:?}",
             AgentEvent::AssistantDelta {
+                context_id: context_id.clone(),
                 epoch_id: epoch_id.clone(),
                 text: "assistant-secret-bf92".into(),
             }
@@ -229,6 +238,7 @@ fn agent_event_diagnostics_redact_text_diffs_and_item_ids() -> TestResult {
         format!(
             "{:?}",
             AgentEvent::DiffUpdated {
+                context_id: context_id.clone(),
                 epoch_id,
                 diff: "diff-secret-bf92".into(),
             }
@@ -405,6 +415,7 @@ fn normalized_event_surface_is_provider_neutral(
             epoch_id: epoch_id.clone(),
         },
         AgentEvent::ItemStarted {
+            context_id: context_id.clone(),
             epoch_id: epoch_id.clone(),
             item: AgentItem::Other {
                 item_id: "other-1".into(),
@@ -412,14 +423,17 @@ fn normalized_event_surface_is_provider_neutral(
             },
         },
         AgentEvent::AssistantDelta {
+            context_id: context_id.clone(),
             epoch_id: epoch_id.clone(),
             text: "Working".into(),
         },
         AgentEvent::DiffUpdated {
+            context_id: context_id.clone(),
             epoch_id: epoch_id.clone(),
             diff: "@@ -1 +1 @@".into(),
         },
         AgentEvent::UsageUpdated {
+            context_id: context_id.clone(),
             epoch_id: epoch_id.clone(),
             usage: AgentUsage {
                 last_total_tokens: 3,
@@ -428,6 +442,8 @@ fn normalized_event_surface_is_provider_neutral(
             },
         },
         AgentEvent::EffectRequested(AgentEffectRequest {
+            context_id: context_id.clone(),
+            epoch_id: epoch_id.clone(),
             request_id,
             item_id: "command-1".into(),
             kind: AgentEffectKind::Command,
@@ -435,6 +451,7 @@ fn normalized_event_surface_is_provider_neutral(
             request_digest: digest,
         }),
         AgentEvent::ItemCompleted {
+            context_id: context_id.clone(),
             epoch_id: epoch_id.clone(),
             item: AgentItem::FileChange {
                 item_id: "file-1".into(),
@@ -451,14 +468,16 @@ fn normalized_event_surface_is_provider_neutral(
             item_id: "compact-1".into(),
         },
         AgentEvent::EpochCompleted {
+            context_id: context_id.clone(),
             epoch_id: epoch_id.clone(),
             status: "completed".into(),
         },
         AgentEvent::ProviderFailed {
-            context_id: Some(context_id),
+            context_id: Some(context_id.clone()),
             epoch_id: Some(epoch_id.clone()),
         },
         AgentEvent::ItemStarted {
+            context_id,
             epoch_id,
             item: AgentItem::Command {
                 item_id: "command-1".into(),

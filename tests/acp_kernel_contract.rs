@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use carl::acp::{
     BuzzContext, ConfigOutcome, ConfigSelection, Kernel, KernelPublisher, NewSessionRequest,
-    PermissionMode, PermissionProfile, Prompt, PromptStopReason, PublicationFailure,
+    PermissionMode, PermissionProfile, Prompt, PromptOutcome, PromptStopReason, PublicationFailure,
 };
 use carl::delegates::codex::CodexAppServer;
 use carl::delegates::{ModelId, ReasoningEffort};
@@ -93,6 +93,7 @@ async fn unknown_agent_items_are_not_reported_as_successful_tools() -> TestResul
     let layout = Layout::new()?;
     let port = ScriptedPort::with_events([
         AgentEvent::ItemStarted {
+            context_id: context()?,
             epoch_id: epoch()?,
             item: AgentItem::Other {
                 item_id: "future-item".into(),
@@ -100,6 +101,7 @@ async fn unknown_agent_items_are_not_reported_as_successful_tools() -> TestResul
             },
         },
         AgentEvent::ItemCompleted {
+            context_id: context()?,
             epoch_id: epoch()?,
             item: AgentItem::Other {
                 item_id: "future-item".into(),
@@ -107,6 +109,7 @@ async fn unknown_agent_items_are_not_reported_as_successful_tools() -> TestResul
             },
         },
         AgentEvent::EpochCompleted {
+            context_id: context()?,
             epoch_id: epoch()?,
             status: "completed".into(),
         },
@@ -157,6 +160,7 @@ async fn cross_bound_agent_events_are_quarantined_before_mutating_the_active_tur
         (
             "item start",
             AgentEvent::ItemStarted {
+                context_id: expected_context.clone(),
                 epoch_id: other_epoch.clone(),
                 item: AgentItem::Other {
                     item_id: "item-start".into(),
@@ -167,6 +171,7 @@ async fn cross_bound_agent_events_are_quarantined_before_mutating_the_active_tur
         (
             "assistant delta",
             AgentEvent::AssistantDelta {
+                context_id: expected_context.clone(),
                 epoch_id: other_epoch.clone(),
                 text: "stale text".into(),
             },
@@ -174,6 +179,7 @@ async fn cross_bound_agent_events_are_quarantined_before_mutating_the_active_tur
         (
             "item completion",
             AgentEvent::ItemCompleted {
+                context_id: expected_context.clone(),
                 epoch_id: other_epoch.clone(),
                 item: AgentItem::Other {
                     item_id: "item-complete".into(),
@@ -184,6 +190,7 @@ async fn cross_bound_agent_events_are_quarantined_before_mutating_the_active_tur
         (
             "usage",
             AgentEvent::UsageUpdated {
+                context_id: expected_context.clone(),
                 epoch_id: other_epoch.clone(),
                 usage: AgentUsage {
                     last_total_tokens: 3,
@@ -195,6 +202,7 @@ async fn cross_bound_agent_events_are_quarantined_before_mutating_the_active_tur
         (
             "diff",
             AgentEvent::DiffUpdated {
+                context_id: expected_context.clone(),
                 epoch_id: other_epoch.clone(),
                 diff: "@@ stale @@".into(),
             },
@@ -202,6 +210,7 @@ async fn cross_bound_agent_events_are_quarantined_before_mutating_the_active_tur
         (
             "epoch completion",
             AgentEvent::EpochCompleted {
+                context_id: expected_context.clone(),
                 epoch_id: other_epoch.clone(),
                 status: "completed".into(),
             },
@@ -251,6 +260,7 @@ async fn cross_bound_agent_events_are_quarantined_before_mutating_the_active_tur
         let port = ScriptedPort::with_events([
             event,
             AgentEvent::EpochCompleted {
+                context_id: expected_context.clone(),
                 epoch_id: expected_epoch.clone(),
                 status: "completed".into(),
             },
@@ -294,6 +304,7 @@ async fn unbounded_agent_events_fail_before_mutating_the_active_turn() -> TestRe
     let layout = Layout::new()?;
     let port = ScriptedPort::with_events([
         AgentEvent::ItemStarted {
+            context_id: context()?,
             epoch_id: epoch()?,
             item: AgentItem::Other {
                 item_id: "i".repeat(129),
@@ -301,6 +312,7 @@ async fn unbounded_agent_events_fail_before_mutating_the_active_turn() -> TestRe
             },
         },
         AgentEvent::EpochCompleted {
+            context_id: context()?,
             epoch_id: epoch()?,
             status: "completed".into(),
         },
@@ -329,14 +341,252 @@ async fn unbounded_agent_events_fail_before_mutating_the_active_turn() -> TestRe
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn foreign_events_are_delivered_once_and_in_order_to_the_owning_session() -> TestResult {
+    let layout = Layout::new()?;
+    let owner_context = AgentContextId::parse("thr_owner")?;
+    let current_context = AgentContextId::parse("thr_current")?;
+    let owner_epoch = AgentEpochId::parse("turn_owner_1")?;
+    let current_epoch = AgentEpochId::parse("turn_current")?;
+    let owner_next_epoch = AgentEpochId::parse("turn_owner_2")?;
+    let port = ScriptedPort::with_routing(
+        vec![
+            owned_item_started(&owner_context, &owner_epoch, "owner-item"),
+            AgentEvent::EffectRequested(owned_effect_request(
+                &owner_context,
+                &owner_epoch,
+                "owner-approval",
+                "owner-item",
+                AgentEffectKind::Command,
+            )?),
+            AgentEvent::AssistantDelta {
+                context_id: owner_context.clone(),
+                epoch_id: owner_epoch.clone(),
+                text: "owner-only output".into(),
+            },
+            owned_epoch_completed(&current_context, &current_epoch),
+            owned_epoch_completed(&owner_context, &owner_epoch),
+            owned_epoch_completed(&owner_context, &owner_next_epoch),
+        ],
+        vec![owner_context, current_context],
+        vec![owner_epoch, current_epoch, owner_next_epoch],
+    );
+    let kernel = Kernel::start_with_ports(layout.runtime()?, Box::new(port), None).await?;
+    let owner = kernel
+        .new_session(new_session(&layout, Frontend::Acp, None)?)
+        .await?;
+    let current = kernel
+        .new_session(new_session(&layout, Frontend::Acp, None)?)
+        .await?;
+
+    let waiting = kernel
+        .prompt(owner.id(), Prompt::new(vec!["pause owner".into()])?)
+        .await?;
+    let code = local_approval_code(&waiting)?;
+    let current_outcome = kernel
+        .prompt(current.id(), Prompt::new(vec!["run current".into()])?)
+        .await?;
+    assert_eq!(current_outcome.stop_reason, PromptStopReason::EndTurn);
+    assert!(current_outcome.updates.iter().all(|update| !matches!(
+        update,
+        carl::acp::KernelUpdate::AgentMessageChunk(text) if text == "owner-only output"
+    )));
+
+    let owner_outcome = kernel
+        .prompt(owner.id(), Prompt::new(vec![format!("/approve {code}")])?)
+        .await?;
+    assert_eq!(owner_outcome.stop_reason, PromptStopReason::EndTurn);
+    assert_eq!(
+        owner_outcome
+            .updates
+            .iter()
+            .filter(|update| matches!(
+                update,
+                carl::acp::KernelUpdate::AgentMessageChunk(text)
+                    if text == "owner-only output"
+            ))
+            .count(),
+        1
+    );
+
+    let replay_check = kernel
+        .prompt(owner.id(), Prompt::new(vec!["next owner turn".into()])?)
+        .await?;
+    assert_eq!(replay_check.stop_reason, PromptStopReason::EndTurn);
+    assert!(replay_check.updates.iter().all(|update| !matches!(
+        update,
+        carl::acp::KernelUpdate::AgentMessageChunk(text) if text == "owner-only output"
+    )));
+    let events = Store::open(&layout.database)?.read_events(owner.id())?;
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(
+                &event.event,
+                Event::AssistantTextDelta { text } if text == "owner-only output"
+            ))
+            .count(),
+        1
+    );
+    kernel.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn foreign_effect_requests_are_resolved_only_while_the_owner_is_driving() -> TestResult {
+    let layout = Layout::new()?;
+    let owner_context = AgentContextId::parse("thr_effect_owner")?;
+    let current_context = AgentContextId::parse("thr_effect_current")?;
+    let owner_epoch = AgentEpochId::parse("turn_effect_owner")?;
+    let current_epoch = AgentEpochId::parse("turn_effect_current")?;
+    let port = ScriptedPort::with_routing(
+        vec![
+            owned_item_started(&owner_context, &owner_epoch, "effect-owner-item"),
+            AgentEvent::EffectRequested(owned_effect_request(
+                &owner_context,
+                &owner_epoch,
+                "initial-owner-approval",
+                "effect-owner-item",
+                AgentEffectKind::Command,
+            )?),
+            AgentEvent::EffectRequested(owned_effect_request(
+                &owner_context,
+                &owner_epoch,
+                "foreign-network",
+                "network-owner-item",
+                AgentEffectKind::Network,
+            )?),
+            owned_epoch_completed(&current_context, &current_epoch),
+        ],
+        vec![owner_context, current_context],
+        vec![owner_epoch, current_epoch],
+    );
+    let shared = Arc::clone(&port.shared);
+    let kernel = Kernel::start_with_ports(layout.runtime()?, Box::new(port), None).await?;
+    let owner = kernel
+        .new_session(new_session(&layout, Frontend::Acp, None)?)
+        .await?;
+    let current = kernel
+        .new_session(new_session(&layout, Frontend::Acp, None)?)
+        .await?;
+    let waiting = kernel
+        .prompt(owner.id(), Prompt::new(vec!["pause effect owner".into()])?)
+        .await?;
+    let code = local_approval_code(&waiting)?;
+
+    let current_outcome = kernel
+        .prompt(current.id(), Prompt::new(vec!["run current".into()])?)
+        .await?;
+    assert_eq!(current_outcome.stop_reason, PromptStopReason::EndTurn);
+    assert!(shared.lock().unwrap().resolved_requests.is_empty());
+
+    let owner_error = kernel
+        .prompt(owner.id(), Prompt::new(vec![format!("/approve {code}")])?)
+        .await
+        .expect_err("the owner must terminally deny its unsupported effect");
+    assert_eq!(
+        owner_error.code(),
+        carl::acp::KernelErrorCode::ProviderFailed
+    );
+    assert_eq!(
+        shared.lock().unwrap().resolved_requests,
+        [
+            ("initial-owner-approval".into(), EffectDecision::Allow),
+            ("foreign-network".into(), EffectDecision::Deny),
+        ]
+    );
+    kernel.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn malformed_foreign_events_fail_the_owner_without_replay_or_cross_session_failure()
+-> TestResult {
+    let layout = Layout::new()?;
+    let owner_context = AgentContextId::parse("thr_malformed_owner")?;
+    let current_context = AgentContextId::parse("thr_malformed_current")?;
+    let owner_epoch = AgentEpochId::parse("turn_malformed_owner_1")?;
+    let stale_owner_epoch = AgentEpochId::parse("turn_malformed_owner_stale")?;
+    let current_epoch = AgentEpochId::parse("turn_malformed_current")?;
+    let owner_next_epoch = AgentEpochId::parse("turn_malformed_owner_2")?;
+    let port = ScriptedPort::with_routing(
+        vec![
+            owned_item_started(&owner_context, &owner_epoch, "malformed-owner-item"),
+            AgentEvent::EffectRequested(owned_effect_request(
+                &owner_context,
+                &owner_epoch,
+                "malformed-owner-approval",
+                "malformed-owner-item",
+                AgentEffectKind::Command,
+            )?),
+            AgentEvent::AssistantDelta {
+                context_id: owner_context.clone(),
+                epoch_id: stale_owner_epoch,
+                text: "s".repeat(1_048_577),
+            },
+            AgentEvent::AssistantDelta {
+                context_id: owner_context.clone(),
+                epoch_id: owner_epoch.clone(),
+                text: "x".repeat(1_048_577),
+            },
+            owned_epoch_completed(&current_context, &current_epoch),
+            owned_epoch_completed(&owner_context, &owner_next_epoch),
+        ],
+        vec![owner_context, current_context],
+        vec![owner_epoch, current_epoch, owner_next_epoch],
+    );
+    let kernel = Kernel::start_with_ports(layout.runtime()?, Box::new(port), None).await?;
+    let owner = kernel
+        .new_session(new_session(&layout, Frontend::Acp, None)?)
+        .await?;
+    let current = kernel
+        .new_session(new_session(&layout, Frontend::Acp, None)?)
+        .await?;
+    let waiting = kernel
+        .prompt(
+            owner.id(),
+            Prompt::new(vec!["pause malformed owner".into()])?,
+        )
+        .await?;
+    let code = local_approval_code(&waiting)?;
+
+    let current_outcome = kernel
+        .prompt(current.id(), Prompt::new(vec!["run current".into()])?)
+        .await?;
+    assert_eq!(current_outcome.stop_reason, PromptStopReason::EndTurn);
+    let owner_error = kernel
+        .prompt(owner.id(), Prompt::new(vec![format!("/approve {code}")])?)
+        .await
+        .expect_err("the malformed event must fail only its owner");
+    assert_eq!(
+        owner_error.code(),
+        carl::acp::KernelErrorCode::ProviderFailed
+    );
+
+    let owner_next = kernel
+        .prompt(owner.id(), Prompt::new(vec!["owner recovers".into()])?)
+        .await?;
+    assert_eq!(owner_next.stop_reason, PromptStopReason::EndTurn);
+    let owner_events = Store::open(&layout.database)?.read_events(owner.id())?;
+    assert!(
+        !owner_events
+            .iter()
+            .any(|event| matches!(event.event, Event::AssistantTextDelta { .. }))
+    );
+    kernel.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn orphaned_known_tool_completion_fails_without_a_completion_journal() -> TestResult {
     let layout = Layout::new()?;
     let port = ScriptedPort::with_events([
         AgentEvent::ItemCompleted {
+            context_id: context()?,
             epoch_id: epoch()?,
             item: command_item("orphan-command", "completed"),
         },
         AgentEvent::EpochCompleted {
+            context_id: context()?,
             epoch_id: epoch()?,
             status: "completed".into(),
         },
@@ -365,14 +615,17 @@ async fn known_tool_completion_kind_mismatch_fails_without_a_completion_journal(
     let layout = Layout::new()?;
     let port = ScriptedPort::with_events([
         AgentEvent::ItemStarted {
+            context_id: context()?,
             epoch_id: epoch()?,
             item: command_item("changed-kind", "inProgress"),
         },
         AgentEvent::ItemCompleted {
+            context_id: context()?,
             epoch_id: epoch()?,
             item: file_change_item("changed-kind", "completed"),
         },
         AgentEvent::EpochCompleted {
+            context_id: context()?,
             epoch_id: epoch()?,
             status: "completed".into(),
         },
@@ -401,18 +654,22 @@ async fn duplicate_known_tool_completion_fails_without_a_second_completion_journ
     let layout = Layout::new()?;
     let port = ScriptedPort::with_events([
         AgentEvent::ItemStarted {
+            context_id: context()?,
             epoch_id: epoch()?,
             item: command_item("duplicate-command", "inProgress"),
         },
         AgentEvent::ItemCompleted {
+            context_id: context()?,
             epoch_id: epoch()?,
             item: command_item("duplicate-command", "completed"),
         },
         AgentEvent::ItemCompleted {
+            context_id: context()?,
             epoch_id: epoch()?,
             item: command_item("duplicate-command", "completed"),
         },
         AgentEvent::EpochCompleted {
+            context_id: context()?,
             epoch_id: epoch()?,
             status: "completed".into(),
         },
@@ -445,14 +702,17 @@ async fn failed_and_declined_tool_statuses_are_durable() -> TestResult {
         let item_id = format!("command-{terminal_status}");
         let port = ScriptedPort::with_events([
             AgentEvent::ItemStarted {
+                context_id: context()?,
                 epoch_id: epoch()?,
                 item: command_item(&item_id, "inProgress"),
             },
             AgentEvent::ItemCompleted {
+                context_id: context()?,
                 epoch_id: epoch()?,
                 item: command_item(&item_id, terminal_status),
             },
             AgentEvent::EpochCompleted {
+                context_id: context()?,
                 epoch_id: epoch()?,
                 status: "completed".into(),
             },
@@ -910,6 +1170,9 @@ struct PortState {
     events: VecDeque<AgentEvent>,
     continuation: VecDeque<AgentEvent>,
     resolved: Vec<EffectDecision>,
+    resolved_requests: Vec<(String, EffectDecision)>,
+    context_ids: VecDeque<AgentContextId>,
+    epoch_ids: VecDeque<AgentEpochId>,
     allowed_effects: usize,
     starts: usize,
     steers: Vec<String>,
@@ -930,14 +1193,17 @@ impl ScriptedPort {
                 epoch_id: epoch()?,
             },
             AgentEvent::AssistantDelta {
+                context_id: context()?,
                 epoch_id: epoch()?,
                 text: "Working".into(),
             },
             AgentEvent::AssistantDelta {
+                context_id: context()?,
                 epoch_id: epoch()?,
                 text: "Fixed and verified.".into(),
             },
             AgentEvent::EpochCompleted {
+                context_id: context()?,
                 epoch_id: epoch()?,
                 status: "completed".into(),
             },
@@ -952,6 +1218,7 @@ impl ScriptedPort {
         )?;
         let port = Self::with_events([
             AgentEvent::ItemStarted {
+                context_id: context()?,
                 epoch_id: epoch()?,
                 item: command_item("item_123", "inProgress"),
             },
@@ -959,10 +1226,12 @@ impl ScriptedPort {
         ]);
         port.shared.lock().unwrap().continuation = VecDeque::from([
             AgentEvent::AssistantDelta {
+                context_id: context()?,
                 epoch_id: epoch()?,
                 text: "Tests passed.".into(),
             },
             AgentEvent::EpochCompleted {
+                context_id: context()?,
                 epoch_id: epoch()?,
                 status: "completed".into(),
             },
@@ -979,6 +1248,7 @@ impl ScriptedPort {
         let request_digest = approval.request_digest.to_string();
         let port = Self::with_events([
             AgentEvent::ItemStarted {
+                context_id: context()?,
                 epoch_id: epoch()?,
                 item: command_item("item_auto", "inProgress"),
             },
@@ -986,10 +1256,12 @@ impl ScriptedPort {
         ]);
         port.shared.lock().unwrap().continuation = VecDeque::from([
             AgentEvent::ItemCompleted {
+                context_id: context()?,
                 epoch_id: epoch()?,
                 item: command_item("item_auto", "completed"),
             },
             AgentEvent::EpochCompleted {
+                context_id: context()?,
                 epoch_id: epoch()?,
                 status: "completed".into(),
             },
@@ -1009,10 +1281,12 @@ impl ScriptedPort {
             }
             InvalidApprovalCase::Completed => vec![
                 AgentEvent::ItemStarted {
+                    context_id: context()?,
                     epoch_id: epoch()?,
                     item: command_item("item_invalid", "inProgress"),
                 },
                 AgentEvent::ItemCompleted {
+                    context_id: context()?,
                     epoch_id: epoch()?,
                     item: command_item("item_invalid", "completed"),
                 },
@@ -1024,6 +1298,9 @@ impl ScriptedPort {
                 events: events.into(),
                 continuation: VecDeque::new(),
                 resolved: Vec::new(),
+                resolved_requests: Vec::new(),
+                context_ids: VecDeque::new(),
+                epoch_ids: VecDeque::new(),
                 allowed_effects: 0,
                 starts: 0,
                 steers: Vec::new(),
@@ -1051,6 +1328,30 @@ impl ScriptedPort {
                 events: events.into(),
                 continuation: VecDeque::new(),
                 resolved: Vec::new(),
+                resolved_requests: Vec::new(),
+                context_ids: VecDeque::new(),
+                epoch_ids: VecDeque::new(),
+                allowed_effects: 0,
+                starts: 0,
+                steers: Vec::new(),
+                interrupts: 0,
+            })),
+        }
+    }
+
+    fn with_routing(
+        events: Vec<AgentEvent>,
+        context_ids: Vec<AgentContextId>,
+        epoch_ids: Vec<AgentEpochId>,
+    ) -> Self {
+        Self {
+            shared: Arc::new(Mutex::new(PortState {
+                events: events.into(),
+                continuation: VecDeque::new(),
+                resolved: Vec::new(),
+                resolved_requests: Vec::new(),
+                context_ids: context_ids.into(),
+                epoch_ids: epoch_ids.into(),
                 allowed_effects: 0,
                 starts: 0,
                 steers: Vec::new(),
@@ -1104,7 +1405,8 @@ impl AgentPort for ScriptedPort {
     }
 
     fn start_context(&mut self, _request: StartAgentContext) -> AgentFuture<'_, AgentContextId> {
-        Box::pin(async { context() })
+        let context_id = self.shared.lock().unwrap().context_ids.pop_front();
+        Box::pin(async move { context_id.map_or_else(context, Ok) })
     }
 
     fn resume_context(&mut self, request: ResumeAgentContext) -> AgentFuture<'_, AgentContextId> {
@@ -1118,8 +1420,9 @@ impl AgentPort for ScriptedPort {
     fn start_epoch(&mut self, _request: StartAgentEpoch) -> AgentFuture<'_, AgentEpochId> {
         let shared = Arc::clone(&self.shared);
         Box::pin(async move {
-            shared.lock().unwrap().starts += 1;
-            epoch()
+            let mut state = shared.lock().unwrap();
+            state.starts += 1;
+            state.epoch_ids.pop_front().map_or_else(epoch, Ok)
         })
     }
 
@@ -1160,13 +1463,15 @@ impl AgentPort for ScriptedPort {
 
     fn resolve_effect(
         &mut self,
-        _request_id: &AgentRequestId,
+        request_id: &AgentRequestId,
         decision: EffectDecision,
     ) -> AgentFuture<'_, ()> {
         let shared = Arc::clone(&self.shared);
+        let request_id = request_id.as_str().to_owned();
         Box::pin(async move {
             let mut state = shared.lock().unwrap();
             state.resolved.push(decision);
+            state.resolved_requests.push((request_id, decision));
             if decision == EffectDecision::Allow {
                 state.allowed_effects += 1;
             }
@@ -1300,12 +1605,69 @@ fn effect_request_with_kind(
     summary: &str,
 ) -> TestResult<AgentEffectRequest> {
     Ok(AgentEffectRequest {
+        context_id: context()?,
+        epoch_id: epoch()?,
         request_id: AgentRequestId::parse(request_id)?,
         item_id: item_id.into(),
         kind,
         summary: summary.into(),
         request_digest: Sha256Digest::parse("11".repeat(32))?,
     })
+}
+
+fn owned_effect_request(
+    context_id: &AgentContextId,
+    epoch_id: &AgentEpochId,
+    request_id: &str,
+    item_id: &str,
+    kind: AgentEffectKind,
+) -> TestResult<AgentEffectRequest> {
+    Ok(AgentEffectRequest {
+        context_id: context_id.clone(),
+        epoch_id: epoch_id.clone(),
+        request_id: AgentRequestId::parse(request_id)?,
+        item_id: item_id.into(),
+        kind,
+        summary: "owner-scoped effect".into(),
+        request_digest: Sha256Digest::parse("33".repeat(32))?,
+    })
+}
+
+fn owned_item_started(
+    context_id: &AgentContextId,
+    epoch_id: &AgentEpochId,
+    item_id: &str,
+) -> AgentEvent {
+    AgentEvent::ItemStarted {
+        context_id: context_id.clone(),
+        epoch_id: epoch_id.clone(),
+        item: command_item(item_id, "inProgress"),
+    }
+}
+
+fn owned_epoch_completed(context_id: &AgentContextId, epoch_id: &AgentEpochId) -> AgentEvent {
+    AgentEvent::EpochCompleted {
+        context_id: context_id.clone(),
+        epoch_id: epoch_id.clone(),
+        status: "completed".into(),
+    }
+}
+
+fn local_approval_code(outcome: &PromptOutcome) -> TestResult<String> {
+    let message = outcome
+        .updates
+        .iter()
+        .find_map(|update| match update {
+            carl::acp::KernelUpdate::AgentMessageChunk(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .ok_or("local approval command was not surfaced")?;
+    message
+        .split("/approve ")
+        .nth(1)
+        .and_then(|suffix| suffix.split_whitespace().next())
+        .map(str::to_owned)
+        .ok_or_else(|| "approval code missing".into())
 }
 
 fn invalid() -> AgentPortError {

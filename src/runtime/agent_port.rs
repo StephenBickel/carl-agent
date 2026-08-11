@@ -313,6 +313,8 @@ pub enum EffectDecision {
 
 #[derive(Clone)]
 pub struct AgentEffectRequest {
+    pub context_id: AgentContextId,
+    pub epoch_id: AgentEpochId,
     pub request_id: AgentRequestId,
     pub item_id: String,
     pub kind: AgentEffectKind,
@@ -324,6 +326,8 @@ impl fmt::Debug for AgentEffectRequest {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("AgentEffectRequest")
+            .field("context_id", &self.context_id)
+            .field("epoch_id", &self.epoch_id)
             .field("request_id", &self.request_id)
             .field("item_id", &"<redacted>")
             .field("kind", &self.kind)
@@ -357,23 +361,28 @@ pub enum AgentEvent {
         epoch_id: AgentEpochId,
     },
     ItemStarted {
+        context_id: AgentContextId,
         epoch_id: AgentEpochId,
         item: AgentItem,
     },
     AssistantDelta {
+        context_id: AgentContextId,
         epoch_id: AgentEpochId,
         text: String,
     },
     DiffUpdated {
+        context_id: AgentContextId,
         epoch_id: AgentEpochId,
         diff: String,
     },
     UsageUpdated {
+        context_id: AgentContextId,
         epoch_id: AgentEpochId,
         usage: AgentUsage,
     },
     EffectRequested(AgentEffectRequest),
     ItemCompleted {
+        context_id: AgentContextId,
         epoch_id: AgentEpochId,
         item: AgentItem,
     },
@@ -386,6 +395,7 @@ pub enum AgentEvent {
         item_id: String,
     },
     EpochCompleted {
+        context_id: AgentContextId,
         epoch_id: AgentEpochId,
         status: String,
     },
@@ -431,23 +441,43 @@ impl fmt::Debug for AgentEvent {
                 .field("context_id", context_id)
                 .field("epoch_id", epoch_id)
                 .finish(),
-            Self::ItemStarted { epoch_id, item } => formatter
+            Self::ItemStarted {
+                context_id,
+                epoch_id,
+                item,
+            } => formatter
                 .debug_struct("AgentEvent::ItemStarted")
+                .field("context_id", context_id)
                 .field("epoch_id", epoch_id)
                 .field("item", item)
                 .finish(),
-            Self::AssistantDelta { epoch_id, .. } => formatter
+            Self::AssistantDelta {
+                context_id,
+                epoch_id,
+                ..
+            } => formatter
                 .debug_struct("AgentEvent::AssistantDelta")
+                .field("context_id", context_id)
                 .field("epoch_id", epoch_id)
                 .field("text", &"<redacted>")
                 .finish(),
-            Self::DiffUpdated { epoch_id, .. } => formatter
+            Self::DiffUpdated {
+                context_id,
+                epoch_id,
+                ..
+            } => formatter
                 .debug_struct("AgentEvent::DiffUpdated")
+                .field("context_id", context_id)
                 .field("epoch_id", epoch_id)
                 .field("diff", &"<redacted>")
                 .finish(),
-            Self::UsageUpdated { epoch_id, usage } => formatter
+            Self::UsageUpdated {
+                context_id,
+                epoch_id,
+                usage,
+            } => formatter
                 .debug_struct("AgentEvent::UsageUpdated")
+                .field("context_id", context_id)
                 .field("epoch_id", epoch_id)
                 .field("usage", usage)
                 .finish(),
@@ -455,8 +485,13 @@ impl fmt::Debug for AgentEvent {
                 .debug_tuple("AgentEvent::EffectRequested")
                 .field(request)
                 .finish(),
-            Self::ItemCompleted { epoch_id, item } => formatter
+            Self::ItemCompleted {
+                context_id,
+                epoch_id,
+                item,
+            } => formatter
                 .debug_struct("AgentEvent::ItemCompleted")
+                .field("context_id", context_id)
                 .field("epoch_id", epoch_id)
                 .field("item", item)
                 .finish(),
@@ -471,9 +506,12 @@ impl fmt::Debug for AgentEvent {
                 .field("item_id", &"<redacted>")
                 .finish(),
             Self::EpochCompleted {
-                epoch_id, status, ..
+                context_id,
+                epoch_id,
+                status,
             } => formatter
                 .debug_struct("AgentEvent::EpochCompleted")
+                .field("context_id", context_id)
                 .field("epoch_id", epoch_id)
                 .field("status", status)
                 .finish(),

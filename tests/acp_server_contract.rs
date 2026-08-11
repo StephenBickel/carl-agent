@@ -251,14 +251,17 @@ impl FakePort {
                 epoch_id: epoch()?,
             },
             AgentEvent::AssistantDelta {
+                context_id: context()?,
                 epoch_id: epoch()?,
                 text: "Working".into(),
             },
             AgentEvent::AssistantDelta {
+                context_id: context()?,
                 epoch_id: epoch()?,
                 text: "Done".into(),
             },
             AgentEvent::EpochCompleted {
+                context_id: context()?,
                 epoch_id: epoch()?,
                 status: "completed".into(),
             },

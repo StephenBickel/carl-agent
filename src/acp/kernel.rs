@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -33,6 +33,8 @@ use crate::storage::{
 };
 
 const COMMAND_CAPACITY: usize = 64;
+const ROUTED_EVENT_CAPACITY: usize = 1_024;
+const ROUTED_EVENTS_PER_SESSION: usize = 256;
 const APPROVAL_LIFETIME: TimeDelta = TimeDelta::minutes(15);
 const MAX_FINAL_MESSAGE_BYTES: usize = 256 * 1_024;
 
@@ -270,6 +272,8 @@ impl Kernel {
                 publisher,
                 catalog,
                 sessions: HashMap::new(),
+                routed_events: HashMap::new(),
+                routed_event_count: 0,
                 receiver,
             }
             .run(),
@@ -313,7 +317,15 @@ struct KernelActor {
     publisher: Option<Box<dyn KernelPublisher>>,
     catalog: Arc<ModelCatalog>,
     sessions: HashMap<SessionId, SessionState>,
+    routed_events: HashMap<SessionId, VecDeque<AgentEvent>>,
+    routed_event_count: usize,
     receiver: mpsc::Receiver<KernelCommand>,
+}
+
+enum AgentEventOwner {
+    Global,
+    Session(SessionId),
+    Unowned,
 }
 
 impl KernelActor {
@@ -582,11 +594,16 @@ impl KernelActor {
         loop {
             enum Next {
                 Provider(Result<AgentEvent, AgentPortError>),
+                Routed(AgentEvent),
                 Command(Option<KernelCommand>),
             }
-            let next = tokio::select! {
-                event = self.agent.next_event() => Next::Provider(event),
-                command = self.receiver.recv() => Next::Command(command),
+            let next = if let Some(event) = self.take_routed_event(session_id) {
+                Next::Routed(event)
+            } else {
+                tokio::select! {
+                    event = self.agent.next_event() => Next::Provider(event),
+                    command = self.receiver.recv() => Next::Command(command),
+                }
             };
             match next {
                 Next::Provider(event) => {
@@ -597,6 +614,30 @@ impl KernelActor {
                             return Err(map_agent_port(error));
                         }
                     };
+                    match self.event_owner(&event) {
+                        AgentEventOwner::Session(owner) if owner != session_id => {
+                            if let Err(error) = self.route_event(owner, event) {
+                                self.fail_active_turn(session_id, "provider_failed");
+                                return Err(error);
+                            }
+                            continue;
+                        }
+                        AgentEventOwner::Session(_) | AgentEventOwner::Global => {}
+                        AgentEventOwner::Unowned => continue,
+                    }
+                    match self
+                        .process_provider_event(session_id, event, &mut updates)
+                        .await
+                    {
+                        Ok(Some(outcome)) => return Ok(outcome),
+                        Ok(None) => {}
+                        Err(error) => {
+                            self.fail_active_turn(session_id, "turn_failed");
+                            return Err(error);
+                        }
+                    }
+                }
+                Next::Routed(event) => {
                     match self
                         .process_provider_event(session_id, event, &mut updates)
                         .await
@@ -654,10 +695,10 @@ impl KernelActor {
         event: AgentEvent,
         updates: &mut Vec<KernelUpdate>,
     ) -> Result<Option<PromptOutcome>, KernelError> {
-        event.validate().map_err(map_agent_port)?;
         if !self.active_event_matches(session_id, &event)? {
             return Ok(None);
         }
+        event.validate().map_err(map_agent_port)?;
         let turn_id = self.active_turn(session_id)?.local_turn_id;
         match event {
             AgentEvent::ContextStarted { context_id } => {
@@ -1549,13 +1590,39 @@ impl KernelActor {
                 context_id,
                 epoch_id,
             } => context_matches(context_id) && epoch_matches(epoch_id),
-            AgentEvent::ItemStarted { epoch_id, .. }
-            | AgentEvent::AssistantDelta { epoch_id, .. }
-            | AgentEvent::DiffUpdated { epoch_id, .. }
-            | AgentEvent::UsageUpdated { epoch_id, .. }
-            | AgentEvent::ItemCompleted { epoch_id, .. }
-            | AgentEvent::EpochCompleted { epoch_id, .. } => epoch_matches(epoch_id),
-            AgentEvent::EffectRequested(_) => true,
+            AgentEvent::ItemStarted {
+                context_id,
+                epoch_id,
+                ..
+            }
+            | AgentEvent::AssistantDelta {
+                context_id,
+                epoch_id,
+                ..
+            }
+            | AgentEvent::DiffUpdated {
+                context_id,
+                epoch_id,
+                ..
+            }
+            | AgentEvent::UsageUpdated {
+                context_id,
+                epoch_id,
+                ..
+            }
+            | AgentEvent::ItemCompleted {
+                context_id,
+                epoch_id,
+                ..
+            }
+            | AgentEvent::EpochCompleted {
+                context_id,
+                epoch_id,
+                ..
+            } => context_matches(context_id) && epoch_matches(epoch_id),
+            AgentEvent::EffectRequested(request) => {
+                context_matches(&request.context_id) && epoch_matches(&request.epoch_id)
+            }
             AgentEvent::CompactionStarted { context_id, .. }
             | AgentEvent::CompactionCompleted { context_id, .. } => context_matches(context_id),
             AgentEvent::ProviderFailed {
@@ -1570,6 +1637,68 @@ impl KernelActor {
             },
         };
         Ok(valid)
+    }
+
+    fn event_owner(&self, event: &AgentEvent) -> AgentEventOwner {
+        let context_id = match event {
+            AgentEvent::ContextStarted { context_id }
+            | AgentEvent::EpochStarted { context_id, .. }
+            | AgentEvent::ItemStarted { context_id, .. }
+            | AgentEvent::AssistantDelta { context_id, .. }
+            | AgentEvent::DiffUpdated { context_id, .. }
+            | AgentEvent::UsageUpdated { context_id, .. }
+            | AgentEvent::ItemCompleted { context_id, .. }
+            | AgentEvent::CompactionStarted { context_id, .. }
+            | AgentEvent::CompactionCompleted { context_id, .. }
+            | AgentEvent::EpochCompleted { context_id, .. } => Some(context_id),
+            AgentEvent::EffectRequested(request) => Some(&request.context_id),
+            AgentEvent::ProviderFailed {
+                context_id: Some(context_id),
+                ..
+            } => Some(context_id),
+            AgentEvent::ProviderFailed {
+                context_id: None,
+                epoch_id: None,
+            } => return AgentEventOwner::Global,
+            AgentEvent::ProviderFailed {
+                context_id: None, ..
+            } => return AgentEventOwner::Unowned,
+        };
+        context_id
+            .and_then(|context_id| self.session_for_context(context_id))
+            .map_or(AgentEventOwner::Unowned, AgentEventOwner::Session)
+    }
+
+    fn session_for_context(&self, context_id: &AgentContextId) -> Option<SessionId> {
+        let mut matches = self
+            .sessions
+            .iter()
+            .filter(|(_, state)| &state.provider_context == context_id)
+            .map(|(session_id, _)| *session_id);
+        let owner = matches.next()?;
+        matches.next().is_none().then_some(owner)
+    }
+
+    fn route_event(&mut self, session_id: SessionId, event: AgentEvent) -> Result<(), KernelError> {
+        let queue = self.routed_events.entry(session_id).or_default();
+        if self.routed_event_count >= ROUTED_EVENT_CAPACITY
+            || queue.len() >= ROUTED_EVENTS_PER_SESSION
+        {
+            return Err(provider_error());
+        }
+        queue.push_back(event);
+        self.routed_event_count += 1;
+        Ok(())
+    }
+
+    fn take_routed_event(&mut self, session_id: SessionId) -> Option<AgentEvent> {
+        let queue = self.routed_events.get_mut(&session_id)?;
+        let event = queue.pop_front()?;
+        self.routed_event_count = self.routed_event_count.saturating_sub(1);
+        if queue.is_empty() {
+            self.routed_events.remove(&session_id);
+        }
+        Some(event)
     }
 
     async fn deny_unsupported_effect(

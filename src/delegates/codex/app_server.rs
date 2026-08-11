@@ -856,7 +856,13 @@ fn translate_codex_event(event: CodexEvent) -> Result<AgentEvent, AgentPortError
             turn_id,
             item,
         } => translate_item_event(thread_id, turn_id, item, false),
-        CodexEvent::AgentMessageDelta { turn_id, text, .. } => Ok(AgentEvent::AssistantDelta {
+        CodexEvent::AgentMessageDelta {
+            thread_id,
+            turn_id,
+            text,
+            ..
+        } => Ok(AgentEvent::AssistantDelta {
+            context_id: AgentContextId::parse(thread_id.as_str())?,
             epoch_id: AgentEpochId::parse(turn_id.as_str())?,
             text,
         }),
@@ -865,7 +871,12 @@ fn translate_codex_event(event: CodexEvent) -> Result<AgentEvent, AgentPortError
             turn_id,
             item,
         } => translate_item_event(thread_id, turn_id, item, true),
-        CodexEvent::TokenUsageUpdated { turn_id, usage, .. } => Ok(AgentEvent::UsageUpdated {
+        CodexEvent::TokenUsageUpdated {
+            thread_id,
+            turn_id,
+            usage,
+        } => Ok(AgentEvent::UsageUpdated {
+            context_id: AgentContextId::parse(thread_id.as_str())?,
             epoch_id: AgentEpochId::parse(turn_id.as_str())?,
             usage: AgentUsage {
                 last_total_tokens: usage.last_total_tokens,
@@ -873,13 +884,21 @@ fn translate_codex_event(event: CodexEvent) -> Result<AgentEvent, AgentPortError
                 model_context_window: usage.model_context_window,
             },
         }),
-        CodexEvent::DiffUpdated { turn_id, diff, .. } => Ok(AgentEvent::DiffUpdated {
+        CodexEvent::DiffUpdated {
+            thread_id,
+            turn_id,
+            diff,
+        } => Ok(AgentEvent::DiffUpdated {
+            context_id: AgentContextId::parse(thread_id.as_str())?,
             epoch_id: AgentEpochId::parse(turn_id.as_str())?,
             diff,
         }),
         CodexEvent::TurnCompleted {
-            turn_id, status, ..
+            thread_id,
+            turn_id,
+            status,
         } => Ok(AgentEvent::EpochCompleted {
+            context_id: AgentContextId::parse(thread_id.as_str())?,
             epoch_id: AgentEpochId::parse(turn_id.as_str())?,
             status,
         }),
@@ -898,6 +917,8 @@ fn translate_codex_event(event: CodexEvent) -> Result<AgentEvent, AgentPortError
             };
             let summary = effect_summary(&approval, kind)?;
             Ok(AgentEvent::EffectRequested(AgentEffectRequest {
+                context_id: AgentContextId::parse(approval.thread_id().as_str())?,
+                epoch_id: AgentEpochId::parse(approval.turn_id().as_str())?,
                 request_id: AgentRequestId::parse(approval.provider_request_id())?,
                 item_id: approval.item_id().to_owned(),
                 kind,
@@ -928,12 +949,21 @@ fn translate_item_event(
             }
         });
     }
+    let context_id = AgentContextId::parse(thread_id.as_str())?;
     let epoch_id = AgentEpochId::parse(turn_id.as_str())?;
     let item = translate_codex_item(item);
     Ok(if completed {
-        AgentEvent::ItemCompleted { epoch_id, item }
+        AgentEvent::ItemCompleted {
+            context_id,
+            epoch_id,
+            item,
+        }
     } else {
-        AgentEvent::ItemStarted { epoch_id, item }
+        AgentEvent::ItemStarted {
+            context_id,
+            epoch_id,
+            item,
+        }
     })
 }
 
