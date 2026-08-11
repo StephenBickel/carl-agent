@@ -3,7 +3,7 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use chrono::Utc;
@@ -321,7 +321,7 @@ pub struct TaskService<P: AgentPort + 'static> {
     live_update_receiver: mpsc::Receiver<(TaskId, TaskEngineUpdate)>,
     permission_receiver: mpsc::Receiver<crate::runtime::task::TaskEnginePermissionNotice>,
     next_acknowledgement: Arc<AtomicU64>,
-    active_task: Arc<tokio::sync::Mutex<Option<TaskId>>>,
+    actor_state: Arc<TaskActorState>,
     info: ServiceInfo,
 }
 
@@ -376,7 +376,7 @@ impl<P: AgentPort + 'static> TaskService<P> {
             live_update_receiver,
             permission_receiver,
             next_acknowledgement: Arc::new(AtomicU64::new(1)),
-            active_task: Arc::new(tokio::sync::Mutex::new(None)),
+            actor_state: Arc::new(TaskActorState::default()),
             info,
         })
     }
@@ -394,16 +394,16 @@ impl<P: AgentPort + 'static> TaskService<P> {
             mut live_update_receiver,
             mut permission_receiver,
             next_acknowledgement,
-            active_task,
+            actor_state,
             info,
         } = self;
         let (actor_sender, actor_receiver) = mpsc::channel(SERVICE_COMMAND_CAPACITY);
-        let actor_active = Arc::clone(&active_task);
+        let actor_lifecycle = Arc::clone(&actor_state);
         let mut actor_task = AbortOnDrop::new(tokio::spawn(run_task_actor(
             engine,
             initial_tasks,
             actor_receiver,
-            actor_active,
+            actor_lifecycle,
         )));
         let shared = Arc::new(ServiceShared {
             read_store,
@@ -412,7 +412,7 @@ impl<P: AgentPort + 'static> TaskService<P> {
             mutation_gate,
             live_updates: Arc::clone(&live_updates),
             next_acknowledgement,
-            active_task,
+            actor_state,
             actor_sender,
             info,
         });
@@ -500,6 +500,37 @@ impl<T> Drop for AbortOnDrop<T> {
     }
 }
 
+#[derive(Default)]
+struct TaskActorState {
+    active_task: tokio::sync::Mutex<Option<TaskId>>,
+    shutdown_requested: AtomicBool,
+}
+
+impl TaskActorState {
+    async fn claim_start(&self, task_id: TaskId) -> bool {
+        let mut active_task = self.active_task.lock().await;
+        if self.shutdown_requested.load(Ordering::Acquire) {
+            return false;
+        }
+        *active_task = Some(task_id);
+        true
+    }
+
+    async fn publish_shutdown(&self) -> Option<TaskId> {
+        let active_task = self.active_task.lock().await;
+        self.shutdown_requested.store(true, Ordering::Release);
+        *active_task
+    }
+
+    async fn clear_active(&self) {
+        *self.active_task.lock().await = None;
+    }
+
+    fn shutdown_requested(&self) -> bool {
+        self.shutdown_requested.load(Ordering::Acquire)
+    }
+}
+
 struct ServiceShared {
     read_store: Arc<Mutex<Store>>,
     controls: mpsc::Sender<TaskEngineControl>,
@@ -507,7 +538,7 @@ struct ServiceShared {
     mutation_gate: Arc<tokio::sync::Mutex<()>>,
     live_updates: Arc<LiveUpdateHub>,
     next_acknowledgement: Arc<AtomicU64>,
-    active_task: Arc<tokio::sync::Mutex<Option<TaskId>>>,
+    actor_state: Arc<TaskActorState>,
     actor_sender: mpsc::Sender<ActorCommand>,
     info: ServiceInfo,
 }
@@ -748,18 +779,24 @@ async fn run_task_actor<P: AgentPort + 'static>(
     mut engine: TaskEngine<P, RuntimeStore>,
     initial_tasks: Vec<TaskId>,
     mut commands: mpsc::Receiver<ActorCommand>,
-    active_task: Arc<tokio::sync::Mutex<Option<TaskId>>>,
+    actor_state: Arc<TaskActorState>,
 ) -> Result<(), TaskServiceError> {
     let mut scheduled = initial_tasks.into_iter().collect::<VecDeque<_>>();
     let mut provider_shutdown = false;
     loop {
         // Owner commands, especially shutdown, preempt every future refill/start.
         if let Ok(command) = commands.try_recv() {
-            handle_actor_command(&mut engine, &mut scheduled, &mut provider_shutdown, command)
-                .await;
+            handle_actor_command(
+                &mut engine,
+                &mut scheduled,
+                &mut provider_shutdown,
+                &actor_state,
+                command,
+            )
+            .await;
             continue;
         }
-        if scheduled.is_empty() && !provider_shutdown {
+        if scheduled.is_empty() && !provider_shutdown && !actor_state.shutdown_requested() {
             scheduled.extend(
                 engine
                     .store()
@@ -770,14 +807,21 @@ async fn run_task_actor<P: AgentPort + 'static>(
                     .map(|record| record.snapshot.task_id),
             );
         }
-        if let Some(task_id) = scheduled.pop_front() {
-            *active_task.lock().await = Some(task_id);
+        if !provider_shutdown
+            && !actor_state.shutdown_requested()
+            && let Some(task_id) = scheduled.front().copied()
+            && actor_state.claim_start(task_id).await
+        {
+            let claimed = scheduled
+                .pop_front()
+                .expect("the actor start claim preserves the scheduled front");
+            debug_assert_eq!(claimed, task_id);
             engine
                 .install_owner_frontend_context(task_id)
                 .map_err(map_engine)?;
             let _ = engine.run(task_id).await;
             let _ = engine.take_updates();
-            *active_task.lock().await = None;
+            actor_state.clear_active().await;
             continue;
         }
         tokio::select! {
@@ -802,6 +846,7 @@ async fn run_task_actor<P: AgentPort + 'static>(
                     &mut engine,
                     &mut scheduled,
                     &mut provider_shutdown,
+                    &actor_state,
                     command,
                 )
                 .await;
@@ -814,6 +859,7 @@ async fn handle_actor_command<P: AgentPort>(
     engine: &mut TaskEngine<P, RuntimeStore>,
     scheduled: &mut VecDeque<TaskId>,
     provider_shutdown: &mut bool,
+    actor_state: &TaskActorState,
     command: ActorCommand,
 ) {
     match command {
@@ -842,24 +888,32 @@ async fn handle_actor_command<P: AgentPort>(
             control_id,
             reply,
         } => {
-            let result = engine
-                .store()
-                .get_task(task_id)
-                .map_err(|_| service_error(TaskServiceErrorCode::Storage))
-                .and_then(|record| {
-                    record.ok_or_else(|| service_error(TaskServiceErrorCode::InvalidRequest))
-                })
-                .and_then(|record| {
-                    if record.snapshot.status.is_terminal() {
-                        Err(service_error(TaskServiceErrorCode::InvalidRequest))
-                    } else {
-                        engine
-                            .mark_control_requested(task_id, &control_id, TaskControlKind::Resume)
-                            .map_err(map_engine)
-                    }
-                });
+            let mut result = if *provider_shutdown || actor_state.shutdown_requested() {
+                Err(service_error(TaskServiceErrorCode::Stopped))
+            } else {
+                engine
+                    .store()
+                    .get_task(task_id)
+                    .map_err(|_| service_error(TaskServiceErrorCode::Storage))
+                    .and_then(|record| {
+                        record.ok_or_else(|| service_error(TaskServiceErrorCode::InvalidRequest))
+                    })
+                    .and_then(|record| {
+                        if record.snapshot.status.is_terminal() {
+                            Err(service_error(TaskServiceErrorCode::InvalidRequest))
+                        } else {
+                            engine
+                                .mark_control_requested(
+                                    task_id,
+                                    &control_id,
+                                    TaskControlKind::Resume,
+                                )
+                                .map_err(map_engine)
+                        }
+                    })
+            };
             if result.is_ok() {
-                scheduled.push_back(task_id);
+                result = enqueue_resumed_task(actor_state, *provider_shutdown, scheduled, task_id);
             }
             let _ = reply.send(result);
         }
@@ -894,6 +948,19 @@ async fn handle_actor_command<P: AgentPort>(
         }
     }
     let _ = engine.take_updates();
+}
+
+fn enqueue_resumed_task(
+    actor_state: &TaskActorState,
+    provider_shutdown: bool,
+    scheduled: &mut VecDeque<TaskId>,
+    task_id: TaskId,
+) -> Result<(), TaskServiceError> {
+    if provider_shutdown || actor_state.shutdown_requested() {
+        return Err(service_error(TaskServiceErrorCode::Stopped));
+    }
+    scheduled.push_back(task_id);
+    Ok(())
 }
 
 async fn handle_connection(
@@ -969,6 +1036,11 @@ async fn dispatch_request(
         return execute_command(shared, &request, false).await;
     }
     let _gate = shared.mutation_gate.lock().await;
+    if shared.actor_state.shutdown_requested()
+        && !matches!(request.command, ServiceCommand::Shutdown)
+    {
+        return Err(service_error(TaskServiceErrorCode::Stopped));
+    }
     let digest = command_digest(&request.command)
         .map_err(|_| service_error(TaskServiceErrorCode::InvalidRequest))?;
     let receipt = ServiceCommandReceiptInput {
@@ -1350,7 +1422,7 @@ async fn execute_command(
                     && binding.session_id == *session_id
                     && task.snapshot.session_id == *session_id
             };
-            if !binding_valid || *shared.active_task.lock().await != Some(*task_id) {
+            if !binding_valid || *shared.actor_state.active_task.lock().await != Some(*task_id) {
                 return Err(service_error(TaskServiceErrorCode::InvalidRequest));
             }
             send_active_control(
@@ -1488,7 +1560,7 @@ async fn mutate_task(
         Mutation::Configure { .. } => "configure",
     };
     let control_id = service_control_id(task_id, &request.idempotency_key, method);
-    let active = *shared.active_task.lock().await;
+    let active = *shared.actor_state.active_task.lock().await;
     if active == Some(task_id) {
         let record = lock_store(&shared.read_store)?
             .get_task(task_id)
@@ -1645,15 +1717,15 @@ async fn send_active_control(
 }
 
 async fn shutdown_owner(shared: &ServiceShared) -> Result<(), TaskServiceError> {
-    // Queue terminal intent before cancellation lets the actor observe shutdown as
-    // soon as the active run exits, before it can refill another durable task.
+    // Publishing under the task-claim mutex linearizes shutdown against every
+    // provider start: shutdown either prevents the claim or observes what won.
+    let active_task = shared.actor_state.publish_shutdown().await;
     let (reply, response) = oneshot::channel();
     shared
         .actor_sender
         .send(ActorCommand::ShutdownProvider { reply })
         .await
         .map_err(|_| service_error(TaskServiceErrorCode::Stopped))?;
-    let active_task = *shared.active_task.lock().await;
     if let Some(task_id) = active_task {
         let request = ServiceRequest {
             protocol_version: 1,
@@ -1770,6 +1842,53 @@ mod tests {
     use super::*;
     use crate::events::SessionId;
     use crate::runtime::task::OperationId;
+    use futures_util::poll;
+
+    #[tokio::test]
+    async fn published_shutdown_wins_before_task_start_claim() {
+        let actor_state = TaskActorState::default();
+        let task_id = TaskId::new();
+        let active_lock = actor_state.active_task.lock().await;
+        let mut shutdown = Box::pin(actor_state.publish_shutdown());
+        let mut claim = Box::pin(actor_state.claim_start(task_id));
+        assert!(poll!(&mut shutdown).is_pending());
+        assert!(poll!(&mut claim).is_pending());
+        drop(active_lock);
+
+        assert_eq!(shutdown.await, None);
+        assert!(!claim.await);
+        assert_eq!(*actor_state.active_task.lock().await, None);
+    }
+
+    #[tokio::test]
+    async fn task_start_claim_wins_before_shutdown_publication() {
+        let actor_state = TaskActorState::default();
+        let task_id = TaskId::new();
+        let active_lock = actor_state.active_task.lock().await;
+        let mut claim = Box::pin(actor_state.claim_start(task_id));
+        let mut shutdown = Box::pin(actor_state.publish_shutdown());
+        assert!(poll!(&mut claim).is_pending());
+        assert!(poll!(&mut shutdown).is_pending());
+        drop(active_lock);
+
+        assert!(claim.await);
+        assert_eq!(shutdown.await, Some(task_id));
+        assert_eq!(*actor_state.active_task.lock().await, Some(task_id));
+    }
+
+    #[tokio::test]
+    async fn published_shutdown_rejects_resume_without_enqueuing() {
+        let actor_state = TaskActorState::default();
+        actor_state.publish_shutdown().await;
+        let mut scheduled = VecDeque::new();
+        let task_id = TaskId::new();
+
+        let error = enqueue_resumed_task(&actor_state, false, &mut scheduled, task_id)
+            .expect_err("resume after shutdown must be rejected");
+
+        assert_eq!(error.code(), TaskServiceErrorCode::Stopped);
+        assert!(scheduled.is_empty());
+    }
 
     #[test]
     fn source_queue_loss_forces_one_snapshot_fallback() {
