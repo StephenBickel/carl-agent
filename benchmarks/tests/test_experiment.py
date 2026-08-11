@@ -4,6 +4,16 @@ from dataclasses import replace
 
 import pytest
 
+from carl_bench.artifacts import ArtifactRef
+from carl_bench.candidate import (
+    DeterministicCheckResult,
+    DraftPullRequest,
+    PairedEvidence,
+    PreparedCandidate,
+    ReviewAttestation,
+    ReviewPacket,
+    SealedCandidate,
+)
 from carl_bench.experiment import (
     BudgetLimits,
     EventType,
@@ -15,6 +25,7 @@ from carl_bench.experiment import (
     ReviewRole,
     ReviewVerdict,
     evaluate_dry_run,
+    evaluate_phase3,
     reduce_events,
 )
 
@@ -111,6 +122,118 @@ def proposal_state_events() -> tuple[ExperimentEvent, ...]:
             target=ExperimentState.PROPOSAL_REVIEW,
             second=3,
         ),
+    )
+
+
+def candidate_artifact(kind: str, marker: str) -> ArtifactRef:
+    return ArtifactRef(
+        schema_version=1,
+        digest=marker * 64,
+        byte_size=7,
+        media_type="application/json",
+        evidence_kind=kind,
+    )
+
+
+def prepared_candidate() -> PreparedCandidate:
+    return PreparedCandidate(
+        schema_version=1,
+        experiment_id=manifest().experiment_id,
+        manifest_digest=manifest().digest,
+        parent_commit=manifest().parent_commit,
+        branch="codex/experiment-exp-context-recovery-001-0123456789",
+        request_artifact=candidate_artifact("builder_request", "c"),
+    )
+
+
+def sealed_candidate() -> SealedCandidate:
+    return SealedCandidate(
+        schema_version=1,
+        experiment_id=manifest().experiment_id,
+        manifest_digest=manifest().digest,
+        parent_commit=manifest().parent_commit,
+        candidate_commit="d" * 40,
+        branch=prepared_candidate().branch,
+        diff_artifact=candidate_artifact("candidate_diff", "e"),
+        report_artifact=candidate_artifact("implementation_report", "f"),
+        changed_paths_artifact=candidate_artifact("changed_paths", "1"),
+        changed_path_count=1,
+        checks=(
+            DeterministicCheckResult(
+                check_id="cargo-test",
+                status="passed",
+                exit_code=0,
+                elapsed_ms=100,
+                output_artifact=candidate_artifact("check_output", "2"),
+            ),
+            DeterministicCheckResult(
+                check_id="restart-replay",
+                status="passed",
+                exit_code=0,
+                elapsed_ms=50,
+                output_artifact=candidate_artifact("check_output", "3"),
+            ),
+        ),
+    )
+
+
+def paired_evidence() -> PairedEvidence:
+    return PairedEvidence(
+        schema_version=1,
+        experiment_id=manifest().experiment_id,
+        manifest_digest=manifest().digest,
+        parent_commit=manifest().parent_commit,
+        candidate_commit=sealed_candidate().candidate_commit,
+        baseline_scorecard_digest="4" * 64,
+        candidate_scorecard_digest="5" * 64,
+        comparison_artifact=candidate_artifact("paired_comparison", "6"),
+        decision="improvement",
+        paired_trials=12,
+        pass_rate_delta_basis_points=500,
+        confidence_lower_basis_points=100,
+    )
+
+
+def phase3_build_events() -> tuple[ExperimentEvent, ...]:
+    return (
+        *proposal_state_events(),
+        role_event(
+            attempt="review-causal-phase3",
+            role=ReviewRole.CAUSAL,
+            verdict=ReviewVerdict.APPROVE,
+            second=4,
+        ),
+        role_event(
+            attempt="review-product-phase3",
+            role=ReviewRole.PRODUCT,
+            verdict=ReviewVerdict.APPROVE,
+            second=5,
+        ),
+        ExperimentEvent.create(
+            experiment_id=manifest().experiment_id,
+            stage_attempt_id="lease-phase3",
+            event_type=EventType.LEASE_ACQUIRED,
+            occurred_at="2026-08-10T12:00:06Z",
+            payload={"expires_at": "2026-08-10T18:00:06Z", "owner_id": "director-phase3"},
+        ),
+        transition(
+            attempt="stage-build-phase3",
+            source=ExperimentState.PROPOSAL_REVIEW,
+            target=ExperimentState.BUILDING,
+            second=7,
+        ),
+    )
+
+
+def candidate_event(
+    *, attempt: str, event_type: EventType, second: int, payload: dict[str, object]
+) -> ExperimentEvent:
+    return ExperimentEvent.create(
+        experiment_id=manifest().experiment_id,
+        stage_attempt_id=attempt,
+        event_type=event_type,
+        occurred_at=f"2026-08-10T12:01:{second:02d}Z",
+        payload=payload,
     )
 
 
@@ -520,3 +643,274 @@ def test_events_before_preregistration_and_expired_mutable_stage_progress_fail_c
     )
     with pytest.raises(GraphContractError, match="mutable_stage_still_active"):
         reduce_events(manifest(), (*reviewed, lease, build, release))
+
+
+def test_phase3_candidate_evidence_gates_build_and_cannot_claim_holdout_validation() -> None:
+    prepared_event = candidate_event(
+        attempt="prepare-phase3",
+        event_type=EventType.WORKSPACE_PREPARED,
+        second=1,
+        payload=prepared_candidate().to_canonical_dict(),
+    )
+    deterministic = transition(
+        attempt="stage-deterministic-phase3",
+        source=ExperimentState.BUILDING,
+        target=ExperimentState.DETERMINISTIC_VALIDATION,
+        second=10,
+    )
+    with pytest.raises(GraphContractError, match="sealed_candidate_required"):
+        reduce_events(manifest(), (*phase3_build_events(), prepared_event, deterministic))
+
+    sealed_event = candidate_event(
+        attempt="seal-phase3",
+        event_type=EventType.CANDIDATE_SEALED,
+        second=2,
+        payload=sealed_candidate().to_canonical_dict(),
+    )
+    paired_transition = transition(
+        attempt="stage-paired-phase3",
+        source=ExperimentState.DETERMINISTIC_VALIDATION,
+        target=ExperimentState.PAIRED_EVALUATION,
+        second=11,
+    )
+    events = (
+        *phase3_build_events(),
+        prepared_event,
+        sealed_event,
+        deterministic,
+        paired_transition,
+    )
+    projection = reduce_events(manifest(), events)
+    assert projection.candidate == sealed_candidate()
+    assert evaluate_phase3(manifest(), projection).next_action == "bind_paired_evidence"
+
+    evidence_event = candidate_event(
+        attempt="paired-evidence-phase3",
+        event_type=EventType.PAIRED_EVIDENCE_RECORDED,
+        second=3,
+        payload=paired_evidence().to_canonical_dict(),
+    )
+    projection = reduce_events(manifest(), (*events, evidence_event))
+    assert projection.paired_evidence == paired_evidence()
+    assert evaluate_phase3(manifest(), projection).next_action == "issue_review_packets"
+
+    holdout = transition(
+        attempt="stage-holdout-phase3",
+        source=ExperimentState.PAIRED_EVALUATION,
+        target=ExperimentState.HOLDOUT_VALIDATION,
+        second=12,
+    )
+    with pytest.raises(GraphContractError, match="phase4_protected_validation_required"):
+        reduce_events(manifest(), (*events, evidence_event, holdout))
+
+
+def test_phase3_review_identity_quorum_and_draft_are_bound_to_one_candidate() -> None:
+    prepared_event = candidate_event(
+        attempt="prepare-phase3",
+        event_type=EventType.WORKSPACE_PREPARED,
+        second=1,
+        payload=prepared_candidate().to_canonical_dict(),
+    )
+    sealed_event = candidate_event(
+        attempt="seal-phase3",
+        event_type=EventType.CANDIDATE_SEALED,
+        second=2,
+        payload=sealed_candidate().to_canonical_dict(),
+    )
+    deterministic = transition(
+        attempt="stage-deterministic-phase3",
+        source=ExperimentState.BUILDING,
+        target=ExperimentState.DETERMINISTIC_VALIDATION,
+        second=10,
+    )
+    paired_transition = transition(
+        attempt="stage-paired-phase3",
+        source=ExperimentState.DETERMINISTIC_VALIDATION,
+        target=ExperimentState.PAIRED_EVALUATION,
+        second=11,
+    )
+    evidence_event = candidate_event(
+        attempt="paired-evidence-phase3",
+        event_type=EventType.PAIRED_EVIDENCE_RECORDED,
+        second=3,
+        payload=paired_evidence().to_canonical_dict(),
+    )
+    events: tuple[ExperimentEvent, ...] = (
+        *phase3_build_events(),
+        prepared_event,
+        sealed_event,
+        deterministic,
+        paired_transition,
+        evidence_event,
+    )
+    packets: dict[str, ReviewPacket] = {}
+    for index, role in enumerate(
+        ("correctness", "security", "maintainability", "benchmark_integrity"), start=4
+    ):
+        packet = ReviewPacket(
+            schema_version=1,
+            experiment_id=manifest().experiment_id,
+            manifest_digest=manifest().digest,
+            candidate_commit=sealed_candidate().candidate_commit,
+            role=role,
+            diff_digest=sealed_candidate().diff_artifact.digest,
+            deterministic_evidence_digest=sealed_candidate().digest,
+            paired_evidence_digest=paired_evidence().digest,
+            review_contract_version="candidate-review-v1",
+        )
+        packets[role] = packet
+        events = (
+            *events,
+            candidate_event(
+                attempt=f"packet-{role}",
+                event_type=EventType.REVIEW_PACKET_RECORDED,
+                second=index,
+                payload=packet.to_canonical_dict(),
+            ),
+        )
+
+    projection = reduce_events(manifest(), events)
+    assert evaluate_phase3(manifest(), projection).next_action == "collect_candidate_reviews"
+
+    for index, (role, verdict) in enumerate(
+        (
+            ("correctness", "approve"),
+            ("security", "approve"),
+            ("maintainability", "approve"),
+            ("benchmark_integrity", "reject"),
+        ),
+        start=8,
+    ):
+        attestation = ReviewAttestation(
+            schema_version=1,
+            experiment_id=manifest().experiment_id,
+            manifest_digest=manifest().digest,
+            candidate_commit=sealed_candidate().candidate_commit,
+            role=role,
+            reviewer_id=f"reviewer-{role}",
+            context_id=f"context-{role}",
+            packet_digest=packets[role].digest,
+            verdict=verdict,
+            report_artifact=candidate_artifact("review_report", str(index)[-1]),
+        )
+        events = (
+            *events,
+            candidate_event(
+                attempt=f"attest-{role}",
+                event_type=EventType.REVIEW_ATTESTED,
+                second=index,
+                payload=attestation.to_canonical_dict(),
+            ),
+        )
+
+    projection = reduce_events(manifest(), events)
+    assert evaluate_phase3(manifest(), projection).next_action == "open_draft_pr"
+
+    draft = DraftPullRequest(
+        schema_version=1,
+        repository="StephenBickel/carl-agent",
+        number=99,
+        url="https://github.com/StephenBickel/carl-agent/pull/99",
+        state="OPEN",
+        is_draft=True,
+        base_branch="main",
+        head_branch=sealed_candidate().branch,
+        candidate_commit=sealed_candidate().candidate_commit,
+    )
+    draft_event = candidate_event(
+        attempt="draft-pr-phase3",
+        event_type=EventType.DRAFT_PR_RECORDED,
+        second=12,
+        payload=draft.to_canonical_dict(),
+    )
+    completed = reduce_events(manifest(), (*events, draft_event))
+    decision = evaluate_phase3(manifest(), completed)
+    assert completed.state is ExperimentState.PAIRED_EVALUATION
+    assert completed.draft_pull_request == draft
+    assert decision.outcome == "draft_open"
+    assert decision.next_action == "await_phase4_protected_validation"
+
+    reused = ReviewAttestation(
+        schema_version=1,
+        experiment_id=manifest().experiment_id,
+        manifest_digest=manifest().digest,
+        candidate_commit=sealed_candidate().candidate_commit,
+        role="benchmark_integrity",
+        reviewer_id="reviewer-correctness",
+        context_id="new-context",
+        packet_digest=packets["benchmark_integrity"].digest,
+        verdict="approve",
+        report_artifact=candidate_artifact("review_report", "f"),
+    )
+    reuse_event = candidate_event(
+        attempt="attest-reused-reviewer",
+        event_type=EventType.REVIEW_ATTESTED,
+        second=13,
+        payload=reused.to_canonical_dict(),
+    )
+    with pytest.raises(GraphContractError, match="reviewer_identity_reused"):
+        reduce_events(manifest(), (*events[:-1], reuse_event))
+
+
+def test_phase3_draft_requires_three_approvals_and_no_hard_finding() -> None:
+    base_events = phase3_build_events()
+    prepared_event = candidate_event(
+        attempt="prepare-phase3",
+        event_type=EventType.WORKSPACE_PREPARED,
+        second=1,
+        payload=prepared_candidate().to_canonical_dict(),
+    )
+    sealed_event = candidate_event(
+        attempt="seal-phase3",
+        event_type=EventType.CANDIDATE_SEALED,
+        second=2,
+        payload=sealed_candidate().to_canonical_dict(),
+    )
+    deterministic = transition(
+        attempt="stage-deterministic-phase3",
+        source=ExperimentState.BUILDING,
+        target=ExperimentState.DETERMINISTIC_VALIDATION,
+        second=10,
+    )
+    paired_transition = transition(
+        attempt="stage-paired-phase3",
+        source=ExperimentState.DETERMINISTIC_VALIDATION,
+        target=ExperimentState.PAIRED_EVALUATION,
+        second=11,
+    )
+    evidence_event = candidate_event(
+        attempt="paired-evidence-phase3",
+        event_type=EventType.PAIRED_EVIDENCE_RECORDED,
+        second=3,
+        payload=paired_evidence().to_canonical_dict(),
+    )
+    draft = DraftPullRequest(
+        schema_version=1,
+        repository="StephenBickel/carl-agent",
+        number=100,
+        url="https://github.com/StephenBickel/carl-agent/pull/100",
+        state="OPEN",
+        is_draft=True,
+        base_branch="main",
+        head_branch=sealed_candidate().branch,
+        candidate_commit=sealed_candidate().candidate_commit,
+    )
+    draft_event = candidate_event(
+        attempt="draft-too-early",
+        event_type=EventType.DRAFT_PR_RECORDED,
+        second=4,
+        payload=draft.to_canonical_dict(),
+    )
+    with pytest.raises(GraphContractError, match="candidate_attestation_quorum_unsatisfied"):
+        reduce_events(
+            manifest(),
+            (
+                *base_events,
+                prepared_event,
+                sealed_event,
+                deterministic,
+                paired_transition,
+                evidence_event,
+                draft_event,
+            ),
+        )

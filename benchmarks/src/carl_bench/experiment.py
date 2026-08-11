@@ -11,6 +11,16 @@ from enum import Enum
 from pathlib import PurePosixPath
 from typing import Any
 
+from carl_bench.candidate import (
+    CandidateContractError,
+    DraftPullRequest,
+    PairedEvidence,
+    Phase3Decision,
+    PreparedCandidate,
+    ReviewAttestation,
+    ReviewPacket,
+    SealedCandidate,
+)
 from carl_bench.canonical import CanonicalizationError, canonical_json_bytes
 
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
@@ -115,6 +125,12 @@ class EventType(str, Enum):
     LEASE_RECONCILED = "lease_reconciled"
     LEASE_RELEASED = "lease_released"
     LIVE_SPEND_RECORDED = "live_spend_recorded"
+    WORKSPACE_PREPARED = "workspace_prepared"
+    CANDIDATE_SEALED = "candidate_sealed"
+    PAIRED_EVIDENCE_RECORDED = "paired_evidence_recorded"
+    REVIEW_PACKET_RECORDED = "review_packet_recorded"
+    REVIEW_ATTESTED = "review_attested"
+    DRAFT_PR_RECORDED = "draft_pr_recorded"
 
 
 class ReviewRole(str, Enum):
@@ -603,6 +619,12 @@ class ExperimentProjection:
     candidate_reviews: tuple[ReviewOutput, ...]
     lease: MutableStageLease | None
     live_spend_microdollars: int
+    prepared_candidate: PreparedCandidate | None
+    candidate: SealedCandidate | None
+    paired_evidence: PairedEvidence | None
+    review_packets: tuple[ReviewPacket, ...]
+    candidate_attestations: tuple[ReviewAttestation, ...]
+    draft_pull_request: DraftPullRequest | None
 
     @property
     def digest(self) -> str:
@@ -633,6 +655,16 @@ class ExperimentProjection:
             ),
             "live_spend_microdollars": self.live_spend_microdollars,
             "manifest_digest": self.manifest_digest,
+            "paired_evidence": (
+                self.paired_evidence.to_canonical_dict()
+                if self.paired_evidence is not None
+                else None
+            ),
+            "prepared_candidate": (
+                self.prepared_candidate.to_canonical_dict()
+                if self.prepared_candidate is not None
+                else None
+            ),
             "proposal_reviews": [
                 {
                     "artifact_digest": review.artifact_digest,
@@ -642,6 +674,18 @@ class ExperimentProjection:
                 }
                 for review in self.proposal_reviews
             ],
+            "candidate": (
+                self.candidate.to_canonical_dict() if self.candidate is not None else None
+            ),
+            "candidate_attestations": [
+                review.to_canonical_dict() for review in self.candidate_attestations
+            ],
+            "draft_pull_request": (
+                self.draft_pull_request.to_canonical_dict()
+                if self.draft_pull_request is not None
+                else None
+            ),
+            "review_packets": [packet.to_canonical_dict() for packet in self.review_packets],
             "state": self.state.value,
         }
         return hashlib.sha256(canonical_json_bytes(value)).hexdigest()
@@ -740,6 +784,12 @@ def _projection(
     candidate_reviews: dict[ReviewRole, ReviewOutput],
     lease: MutableStageLease | None,
     live_spend_microdollars: int,
+    prepared_candidate: PreparedCandidate | None,
+    candidate: SealedCandidate | None,
+    paired_evidence: PairedEvidence | None,
+    review_packets: dict[str, ReviewPacket],
+    candidate_attestations: dict[str, ReviewAttestation],
+    draft_pull_request: DraftPullRequest | None,
 ) -> ExperimentProjection:
     return ExperimentProjection(
         experiment_id=manifest.experiment_id,
@@ -756,6 +806,14 @@ def _projection(
         ),
         lease=lease,
         live_spend_microdollars=live_spend_microdollars,
+        prepared_candidate=prepared_candidate,
+        candidate=candidate,
+        paired_evidence=paired_evidence,
+        review_packets=tuple(review_packets[role] for role in sorted(review_packets)),
+        candidate_attestations=tuple(
+            candidate_attestations[role] for role in sorted(candidate_attestations)
+        ),
+        draft_pull_request=draft_pull_request,
     )
 
 
@@ -771,6 +829,12 @@ def reduce_events(
     candidate_reviews: dict[ReviewRole, ReviewOutput] = {}
     lease: MutableStageLease | None = None
     live_spend_microdollars = 0
+    prepared_candidate: PreparedCandidate | None = None
+    candidate: SealedCandidate | None = None
+    paired_evidence: PairedEvidence | None = None
+    review_packets: dict[str, ReviewPacket] = {}
+    candidate_attestations: dict[str, ReviewAttestation] = {}
+    draft_pull_request: DraftPullRequest | None = None
     for event in events:
         if event.experiment_id != manifest.experiment_id:
             raise GraphContractError("event_experiment_mismatch")
@@ -798,6 +862,16 @@ def reduce_events(
                 approved, _ = _candidate_quorum(tuple(candidate_reviews.values()))
                 if not approved:
                     raise GraphContractError("candidate_quorum_unsatisfied")
+            if target is ExperimentState.DETERMINISTIC_VALIDATION and (
+                prepared_candidate is not None and candidate is None
+            ):
+                raise GraphContractError("sealed_candidate_required")
+            if target is ExperimentState.PAIRED_EVALUATION and candidate is not None:
+                check_ids = tuple(check.check_id for check in candidate.checks)
+                if check_ids != tuple(sorted(manifest.deterministic_checks, key=str.encode)):
+                    raise GraphContractError("deterministic_checks_mismatch")
+            if target is ExperimentState.HOLDOUT_VALIDATION and candidate is not None:
+                raise GraphContractError("phase4_protected_validation_required")
             state = target
         elif event.event_type is EventType.ROLE_RECORDED:
             review = _review_payload(event)
@@ -877,6 +951,135 @@ def reduce_events(
             except (TypeError, GraphContractError) as error:
                 raise GraphContractError("invalid_spend_payload") from error
             live_spend_microdollars += amount
+        elif event.event_type is EventType.WORKSPACE_PREPARED:
+            if state is not ExperimentState.BUILDING:
+                raise GraphContractError("candidate_prepare_wrong_state")
+            if lease is None or _parse_utc(event.occurred_at) > _parse_utc(lease.expires_at):
+                raise GraphContractError("mutable_lease_required")
+            if prepared_candidate is not None:
+                raise GraphContractError("candidate_already_prepared")
+            try:
+                prepared = PreparedCandidate.from_canonical_dict(event.payload)
+            except CandidateContractError as error:
+                raise GraphContractError("invalid_prepared_candidate_payload") from error
+            if (
+                prepared.experiment_id != manifest.experiment_id
+                or prepared.manifest_digest != manifest.digest
+                or prepared.parent_commit != manifest.parent_commit
+            ):
+                raise GraphContractError("prepared_candidate_manifest_mismatch")
+            prepared_candidate = prepared
+        elif event.event_type is EventType.CANDIDATE_SEALED:
+            if state is not ExperimentState.BUILDING:
+                raise GraphContractError("candidate_seal_wrong_state")
+            if prepared_candidate is None:
+                raise GraphContractError("prepared_candidate_required")
+            if candidate is not None:
+                raise GraphContractError("candidate_already_sealed")
+            try:
+                sealed = SealedCandidate.from_canonical_dict(event.payload)
+            except CandidateContractError as error:
+                raise GraphContractError("invalid_sealed_candidate_payload") from error
+            if (
+                sealed.experiment_id != manifest.experiment_id
+                or sealed.manifest_digest != manifest.digest
+                or sealed.parent_commit != manifest.parent_commit
+                or sealed.branch != prepared_candidate.branch
+            ):
+                raise GraphContractError("sealed_candidate_manifest_mismatch")
+            check_ids = tuple(check.check_id for check in sealed.checks)
+            if check_ids != tuple(sorted(manifest.deterministic_checks, key=str.encode)):
+                raise GraphContractError("deterministic_checks_mismatch")
+            candidate = sealed
+        elif event.event_type is EventType.PAIRED_EVIDENCE_RECORDED:
+            if state is not ExperimentState.PAIRED_EVALUATION:
+                raise GraphContractError("paired_evidence_wrong_state")
+            if candidate is None:
+                raise GraphContractError("sealed_candidate_required")
+            if paired_evidence is not None:
+                raise GraphContractError("paired_evidence_already_recorded")
+            try:
+                evidence = PairedEvidence.from_canonical_dict(event.payload)
+            except CandidateContractError as error:
+                raise GraphContractError("invalid_paired_evidence_payload") from error
+            if (
+                evidence.experiment_id != manifest.experiment_id
+                or evidence.manifest_digest != manifest.digest
+                or evidence.parent_commit != manifest.parent_commit
+                or evidence.candidate_commit != candidate.candidate_commit
+            ):
+                raise GraphContractError("paired_evidence_candidate_mismatch")
+            paired_evidence = evidence
+        elif event.event_type is EventType.REVIEW_PACKET_RECORDED:
+            if state is not ExperimentState.PAIRED_EVALUATION:
+                raise GraphContractError("review_packet_wrong_state")
+            if candidate is None or paired_evidence is None:
+                raise GraphContractError("paired_evidence_required")
+            if paired_evidence.decision != "improvement":
+                raise GraphContractError("paired_improvement_required")
+            try:
+                packet = ReviewPacket.from_canonical_dict(event.payload)
+            except CandidateContractError as error:
+                raise GraphContractError("invalid_review_packet_payload") from error
+            if packet.role in review_packets:
+                raise GraphContractError("duplicate_review_packet_role")
+            if (
+                packet.experiment_id != manifest.experiment_id
+                or packet.manifest_digest != manifest.digest
+                or packet.candidate_commit != candidate.candidate_commit
+                or packet.diff_digest != candidate.diff_artifact.digest
+                or packet.deterministic_evidence_digest != candidate.digest
+                or packet.paired_evidence_digest != paired_evidence.digest
+            ):
+                raise GraphContractError("review_packet_candidate_mismatch")
+            review_packets[packet.role] = packet
+        elif event.event_type is EventType.REVIEW_ATTESTED:
+            if state is not ExperimentState.PAIRED_EVALUATION:
+                raise GraphContractError("review_attestation_wrong_state")
+            try:
+                raw_role = event.payload.get("role")
+            except AttributeError as error:
+                raise GraphContractError("invalid_review_attestation_payload") from error
+            packet = review_packets.get(raw_role)
+            if packet is None:
+                raise GraphContractError("review_packet_required")
+            if raw_role in candidate_attestations:
+                raise GraphContractError("duplicate_review_attestation_role")
+            try:
+                attestation = ReviewAttestation.from_packet_dict(event.payload, packet)
+            except CandidateContractError as error:
+                raise GraphContractError("invalid_review_attestation_payload") from error
+            if any(
+                prior.reviewer_id == attestation.reviewer_id
+                for prior in candidate_attestations.values()
+            ):
+                raise GraphContractError("reviewer_identity_reused")
+            if any(
+                prior.context_id == attestation.context_id
+                for prior in candidate_attestations.values()
+            ):
+                raise GraphContractError("review_context_reused")
+            candidate_attestations[attestation.role] = attestation
+        elif event.event_type is EventType.DRAFT_PR_RECORDED:
+            if state is not ExperimentState.PAIRED_EVALUATION:
+                raise GraphContractError("draft_pr_wrong_state")
+            if candidate is None or paired_evidence is None:
+                raise GraphContractError("paired_evidence_required")
+            if draft_pull_request is not None:
+                raise GraphContractError("draft_pr_already_recorded")
+            attestations = tuple(candidate_attestations.values())
+            if (
+                len(attestations) != len(_CANDIDATE_ROLES)
+                or set(candidate_attestations) != {role.value for role in _CANDIDATE_ROLES}
+                or sum(review.verdict == "approve" for review in attestations) < 3
+                or any(review.verdict == "hard_finding" for review in attestations)
+            ):
+                raise GraphContractError("candidate_attestation_quorum_unsatisfied")
+            try:
+                draft = DraftPullRequest.from_candidate_dict(event.payload, candidate)
+            except CandidateContractError as error:
+                raise GraphContractError("invalid_draft_pr_payload") from error
+            draft_pull_request = draft
         else:
             raise GraphContractError("unsupported_event_type")
         seen_attempts.add(event.stage_attempt_id)
@@ -891,6 +1094,12 @@ def reduce_events(
         candidate_reviews=candidate_reviews,
         lease=lease,
         live_spend_microdollars=live_spend_microdollars,
+        prepared_candidate=prepared_candidate,
+        candidate=candidate,
+        paired_evidence=paired_evidence,
+        review_packets=review_packets,
+        candidate_attestations=candidate_attestations,
+        draft_pull_request=draft_pull_request,
     )
 
 
@@ -954,4 +1163,68 @@ def evaluate_dry_run(
         outcome=outcome,
         next_action=next_action,
         reasons=tuple(sorted(reasons)),
+    )
+
+
+def evaluate_phase3(
+    manifest: ExperimentManifest, projection: ExperimentProjection
+) -> Phase3Decision:
+    """Return the next local candidate action without claiming protected validation."""
+    if (
+        projection.experiment_id != manifest.experiment_id
+        or projection.manifest_digest != manifest.digest
+    ):
+        raise GraphContractError("projection_manifest_mismatch")
+
+    outcome = "advance"
+    reasons: tuple[str, ...] = ()
+    if projection.candidate is None:
+        if projection.state is ExperimentState.BUILDING:
+            next_action = (
+                "prepare_candidate" if projection.prepared_candidate is None else "seal_candidate"
+            )
+        else:
+            outcome = "blocked"
+            next_action = "reach_building_state"
+            reasons = ("phase3_candidate_not_building",)
+    elif projection.state is ExperimentState.BUILDING:
+        next_action = "record_deterministic_validation"
+    elif projection.state is ExperimentState.DETERMINISTIC_VALIDATION:
+        next_action = "record_paired_evaluation"
+    elif projection.state is not ExperimentState.PAIRED_EVALUATION:
+        outcome = "blocked"
+        next_action = "none"
+        reasons = ("phase3_state_not_supported",)
+    elif projection.paired_evidence is None:
+        next_action = "bind_paired_evidence"
+    elif projection.paired_evidence.decision != "improvement":
+        outcome = "blocked"
+        next_action = "record_candidate_rejection"
+        reasons = ("paired_improvement_required",)
+    elif len(projection.review_packets) < len(_CANDIDATE_ROLES):
+        next_action = "issue_review_packets"
+    elif len(projection.candidate_attestations) < len(_CANDIDATE_ROLES):
+        next_action = "collect_candidate_reviews"
+    elif any(review.verdict == "hard_finding" for review in projection.candidate_attestations):
+        outcome = "blocked"
+        next_action = "record_candidate_rejection"
+        reasons = ("candidate_hard_finding",)
+    elif sum(review.verdict == "approve" for review in projection.candidate_attestations) < 3:
+        outcome = "blocked"
+        next_action = "record_candidate_rejection"
+        reasons = ("candidate_approvals_below_three",)
+    elif projection.draft_pull_request is None:
+        next_action = "open_draft_pr"
+    else:
+        outcome = "draft_open"
+        next_action = "await_phase4_protected_validation"
+
+    return Phase3Decision(
+        schema_version=1,
+        experiment_id=manifest.experiment_id,
+        manifest_digest=manifest.digest,
+        projection_digest=projection.digest,
+        outcome=outcome,
+        next_action=next_action,
+        reasons=reasons,
     )
