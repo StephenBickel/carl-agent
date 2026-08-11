@@ -45,6 +45,7 @@ from carl_bench.experiment import (
     ReviewVerdict,
     evaluate_dry_run,
     evaluate_phase3,
+    reduce_events,
 )
 from carl_bench.github_draft import DraftPrGateway
 from carl_bench.ledger import ExperimentLedger
@@ -207,6 +208,12 @@ def _parser() -> argparse.ArgumentParser:
     draft.add_argument("--gateway-env-name", action="append", default=[])
     draft.add_argument("--enable-github-draft", action="store_true")
     draft.add_argument("--public-result", required=True, type=Path)
+
+    dispose = candidate_commands.add_parser(
+        "dispose", help="remove the exact clean candidate worktree after draft creation"
+    )
+    add_mutation(dispose)
+    dispose.add_argument("--public-result", required=True, type=Path)
     return parser
 
 
@@ -609,6 +616,7 @@ def _candidate_status_dict(
         "reasons": list(decision.reasons),
         "schema_version": 1,
         "state": projection.state.value,
+        "workspace_disposed": projection.workspace_disposed,
     }
 
 
@@ -803,6 +811,42 @@ def _candidate_command(args: argparse.Namespace) -> int:
             _experiment_output(args.public_result, args.ledger), value, REPOSITORY_ROOT
         )
         print(f"candidate {args.experiment_id}: recorded {attestation.role} review")
+        return 0
+
+    if args.candidate_command == "dispose":
+        existing = _existing_candidate_event(
+            ledger, args.experiment_id, args.stage_attempt_id, EventType.WORKSPACE_DISPOSED
+        )
+        if existing is None:
+            if projection.prepared_candidate is None or projection.candidate is None:
+                raise ValueError("candidate has not been sealed")
+            payload = {
+                "branch": projection.candidate.branch,
+                "candidate_commit": projection.candidate.candidate_commit,
+            }
+            event = ExperimentEvent.create(
+                experiment_id=args.experiment_id,
+                stage_attempt_id=args.stage_attempt_id,
+                event_type=EventType.WORKSPACE_DISPOSED,
+                occurred_at=args.occurred_at,
+                payload=payload,
+            )
+            reduce_events(manifest, (*ledger.events(args.experiment_id), event))
+            manager.dispose(projection.prepared_candidate, projection.candidate)
+            ledger.append(event)
+        else:
+            payload = existing.payload
+        value = {
+            "branch": payload["branch"],
+            "candidate_commit": payload["candidate_commit"],
+            "disposed": True,
+            "experiment_id": args.experiment_id,
+            "schema_version": 1,
+        }
+        write_public_json(
+            _experiment_output(args.public_result, args.ledger), value, REPOSITORY_ROOT
+        )
+        print(f"candidate {args.experiment_id}: disposed candidate worktree")
         return 0
 
     if not args.enable_github_draft:

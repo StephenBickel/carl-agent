@@ -182,6 +182,8 @@ final serializer gate.
 - A prepared but unsealed worktree remains blocked for inspection; it is not automatically erased.
 - A pushed branch without a PR is safe to retry. A matching draft PR is recorded rather than
   duplicated.
+- Cleanup is explicit after draft reconciliation, refuses dirty or mismatched worktrees, preserves
+  the sealed branch, and records an idempotent disposal event.
 - A PR with a different head, non-draft state, base, or repository is a hard conflict.
 - Expired mutable leases still require the phase-two explicit worker-not-live reconciliation.
 
@@ -197,8 +199,9 @@ final serializer gate.
   their captured argv prove no force-push, merge, auto-merge, or ready operation is issued.
 - Reducer and ledger tests prove evidence-gated transitions, replay stability, corruption detection,
   and exact idempotency.
-- CLI integration tests run prepare/edit/seal/evidence/review/draft flows against temporary private
-  stores and repositories while asserting public output contains no private material.
+- CLI integration tests run prepare/edit/seal/evidence/review/draft/disposal flows against
+  temporary private stores and repositories while asserting public output contains no private
+  material.
 - Full Python, Ruff, benchmark smoke, Cargo formatting, tests, clippy, and GitHub CI remain required.
 
 ## Delivery boundary

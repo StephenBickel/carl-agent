@@ -17,6 +17,8 @@ phase-four protected validation.
 **Tech Stack:** Python 3.12, frozen dataclasses, canonical JSON/SHA-256, SQLite replay ledger,
 subprocess argv execution, real temporary Git repositories, pytest, Ruff, GitHub CLI gateway.
 
+**Status:** Tasks 1-6 are complete. Task 7 security review and final verification are in progress.
+
 ## Global Constraints
 
 - No merge, auto-merge, ready-for-review, release, deployment, rollback, or acceptance operation.

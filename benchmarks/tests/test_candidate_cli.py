@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import subprocess
 from dataclasses import replace
 from pathlib import Path
 
@@ -356,6 +357,40 @@ def test_candidate_cli_runs_prepare_seal_evidence_review_and_draft_without_claim
     draft = json.loads(draft_result.read_text())
     assert draft["is_draft"] is True
 
+    dispose_result = tmp_path / "dispose.json"
+    assert workspace.is_dir()
+    assert (
+        cli.main(
+            [
+                "candidate",
+                "dispose",
+                *common,
+                "--stage-attempt-id",
+                "dispose-cli",
+                "--occurred-at",
+                "2026-08-10T12:04:02Z",
+                "--public-result",
+                os.fspath(dispose_result),
+            ]
+        )
+        == 0
+    )
+    assert not workspace.exists()
+    assert json.loads(dispose_result.read_text())["disposed"] is True
+    branch_commit = subprocess.run(
+        (
+            "git",
+            "-C",
+            os.fspath(repository),
+            "rev-parse",
+            f"refs/heads/{prepared['branch']}",
+        ),
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert branch_commit == sealed["candidate_commit"]
+
     assert (
         cli.main(
             [
@@ -375,6 +410,7 @@ def test_candidate_cli_runs_prepare_seal_evidence_review_and_draft_without_claim
     assert final["state"] == "paired_evaluation"
     assert final["next_action"] == "await_phase4_protected_validation"
     assert final["draft_pull_request_number"] == 17
+    assert final["workspace_disposed"] is True
     serialized = status_path.read_text().casefold()
     for forbidden in ("worktree", "private", "hypothesis", "stdout", "review report"):
         assert forbidden not in serialized

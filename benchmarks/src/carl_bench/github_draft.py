@@ -172,33 +172,73 @@ class DraftPrGateway:
                 raise DraftPrGatewayError("gateway_private_root_unsafe")
         if not isinstance(command_env, dict):
             raise DraftPrGatewayError("invalid_gateway_environment")
-        environment = {"LANG": "C", "LC_ALL": "C", "PATH": os.environ.get("PATH", "")}
+        base_environment = {"LANG": "C", "LC_ALL": "C", "PATH": os.environ.get("PATH", "")}
+        git_environment = dict(base_environment)
+        github_environment = dict(base_environment)
+        allowed_names = {
+            "GH_ENTERPRISE_TOKEN",
+            "GH_HOST",
+            "GH_TOKEN",
+            "HOME",
+            "SSH_AUTH_SOCK",
+            "XDG_CONFIG_HOME",
+        }
         for name, value in command_env.items():
             if (
                 not isinstance(name, str)
                 or not _ENV_RE.fullmatch(name)
+                or (name not in allowed_names and not name.startswith("FAKE_GH_"))
                 or not isinstance(value, str)
                 or "\x00" in value
                 or len(value.encode("utf-8")) > 65_536
             ):
                 raise DraftPrGatewayError("invalid_gateway_environment")
-            environment[name] = value
+            if name in {"HOME", "SSH_AUTH_SOCK"}:
+                git_environment[name] = value
+            if name in {
+                "GH_ENTERPRISE_TOKEN",
+                "GH_HOST",
+                "GH_TOKEN",
+                "HOME",
+                "XDG_CONFIG_HOME",
+            } or name.startswith("FAKE_GH_"):
+                github_environment[name] = value
+        hooks_root = root / "empty-hooks"
+        try:
+            hooks_root.mkdir(mode=0o700, exist_ok=True)
+            if os.name != "nt":
+                hooks_root.chmod(0o700)
+        except OSError as error:
+            raise DraftPrGatewayError("gateway_hooks_root_unavailable") from error
+        if not _private_directory(hooks_root):
+            raise DraftPrGatewayError("gateway_hooks_root_unsafe")
         self.repository_root = repository
         self.repository_slug = repository_slug
         self.remote = remote
         self.base_branch = base_branch
         self.gh_executable = executable
         self.private_root = root
-        self._environment = environment
+        self._hooks_root = hooks_root
+        self._git_environment = git_environment
+        self._github_environment = github_environment
         remote_url = self._git("remote", "get-url", remote).decode("utf-8").strip()
         if remote_url != expected_remote_url:
             raise DraftPrGatewayError("candidate_remote_mismatch")
 
     def _git(self, *args: str) -> bytes:
         return _run_bounded(
-            ("git", "-C", os.fspath(self.repository_root), *args),
+            (
+                "git",
+                "-C",
+                os.fspath(self.repository_root),
+                "-c",
+                f"core.hooksPath={self._hooks_root}",
+                "-c",
+                "credential.helper=",
+                *args,
+            ),
             cwd=self.repository_root,
-            environment=self._environment,
+            environment=self._git_environment,
             failure_code="git_gateway_failed",
         )
 
@@ -206,7 +246,7 @@ class DraftPrGateway:
         return _run_bounded(
             (os.fspath(self.gh_executable), *args),
             cwd=self.repository_root,
-            environment=self._environment,
+            environment=self._github_environment,
             failure_code="github_cli_failed",
         )
 
@@ -344,6 +384,7 @@ class DraftPrGateway:
             return self._reconciled_draft(existing[0], candidate.candidate_commit, candidate.branch)
         self._git(
             "push",
+            "--no-verify",
             "--porcelain",
             self.remote,
             f"{candidate.candidate_commit}:refs/heads/{candidate.branch}",

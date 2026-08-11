@@ -256,6 +256,8 @@ uv run --project benchmarks --locked carl-bench candidate open-draft-pr \
   --gh-executable /absolute/path/to/gh \
   --gateway-private-root "$CONTROL_ROOT/github" \
   --gateway-env-name GH_TOKEN \
+  --gateway-env-name HOME \
+  --gateway-env-name SSH_AUTH_SOCK \
   --public-result "$CONTROL_ROOT/draft.json" \
   --enable-github-draft
 ```
@@ -264,6 +266,20 @@ The gateway pushes `<sealed-commit>:refs/heads/<derived-branch>` without force, 
 reconciles one open draft, and has no merge/auto-merge/ready/release operation. The builder never
 receives its environment. The experiment deliberately remains in `paired_evaluation` with next
 action `await_phase4_protected_validation`; a draft PR is not promotion evidence.
+
+After the draft is recorded, explicitly remove the candidate worktree while preserving its sealed
+branch and private evidence:
+
+```bash
+uv run --project benchmarks --locked carl-bench candidate dispose \
+  "${COMMON[@]}" \
+  --stage-attempt-id dispose-exp-real-id-1 \
+  --occurred-at 2026-08-10T15:01:00Z \
+  --public-result "$CONTROL_ROOT/disposed.json"
+```
+
+Cleanup is ledger-recorded and idempotent. It refuses a dirty worktree, a moved branch, a different
+commit, a missing draft record, or an expired lease; it never force-removes or deletes the branch.
 
 ## Budget and proposal handoff
 

@@ -131,6 +131,7 @@ class EventType(str, Enum):
     REVIEW_PACKET_RECORDED = "review_packet_recorded"
     REVIEW_ATTESTED = "review_attested"
     DRAFT_PR_RECORDED = "draft_pr_recorded"
+    WORKSPACE_DISPOSED = "workspace_disposed"
 
 
 class ReviewRole(str, Enum):
@@ -625,6 +626,7 @@ class ExperimentProjection:
     review_packets: tuple[ReviewPacket, ...]
     candidate_attestations: tuple[ReviewAttestation, ...]
     draft_pull_request: DraftPullRequest | None
+    workspace_disposed: bool = False
 
     @property
     def digest(self) -> str:
@@ -687,6 +689,7 @@ class ExperimentProjection:
             ),
             "review_packets": [packet.to_canonical_dict() for packet in self.review_packets],
             "state": self.state.value,
+            "workspace_disposed": self.workspace_disposed,
         }
         return hashlib.sha256(canonical_json_bytes(value)).hexdigest()
 
@@ -774,6 +777,11 @@ def _candidate_quorum(reviews: tuple[ReviewOutput, ...]) -> tuple[bool, tuple[st
     return not reasons, tuple(reasons)
 
 
+def _require_live_lease(lease: MutableStageLease | None, occurred_at: str) -> None:
+    if lease is None or _parse_utc(occurred_at) > _parse_utc(lease.expires_at):
+        raise GraphContractError("mutable_lease_required")
+
+
 def _projection(
     *,
     manifest: ExperimentManifest,
@@ -790,6 +798,7 @@ def _projection(
     review_packets: dict[str, ReviewPacket],
     candidate_attestations: dict[str, ReviewAttestation],
     draft_pull_request: DraftPullRequest | None,
+    workspace_disposed: bool,
 ) -> ExperimentProjection:
     return ExperimentProjection(
         experiment_id=manifest.experiment_id,
@@ -814,6 +823,7 @@ def _projection(
             candidate_attestations[role] for role in sorted(candidate_attestations)
         ),
         draft_pull_request=draft_pull_request,
+        workspace_disposed=workspace_disposed,
     )
 
 
@@ -835,6 +845,7 @@ def reduce_events(
     review_packets: dict[str, ReviewPacket] = {}
     candidate_attestations: dict[str, ReviewAttestation] = {}
     draft_pull_request: DraftPullRequest | None = None
+    workspace_disposed = False
     for event in events:
         if event.experiment_id != manifest.experiment_id:
             raise GraphContractError("event_experiment_mismatch")
@@ -954,8 +965,7 @@ def reduce_events(
         elif event.event_type is EventType.WORKSPACE_PREPARED:
             if state is not ExperimentState.BUILDING:
                 raise GraphContractError("candidate_prepare_wrong_state")
-            if lease is None or _parse_utc(event.occurred_at) > _parse_utc(lease.expires_at):
-                raise GraphContractError("mutable_lease_required")
+            _require_live_lease(lease, event.occurred_at)
             if prepared_candidate is not None:
                 raise GraphContractError("candidate_already_prepared")
             try:
@@ -972,6 +982,7 @@ def reduce_events(
         elif event.event_type is EventType.CANDIDATE_SEALED:
             if state is not ExperimentState.BUILDING:
                 raise GraphContractError("candidate_seal_wrong_state")
+            _require_live_lease(lease, event.occurred_at)
             if prepared_candidate is None:
                 raise GraphContractError("prepared_candidate_required")
             if candidate is not None:
@@ -994,6 +1005,7 @@ def reduce_events(
         elif event.event_type is EventType.PAIRED_EVIDENCE_RECORDED:
             if state is not ExperimentState.PAIRED_EVALUATION:
                 raise GraphContractError("paired_evidence_wrong_state")
+            _require_live_lease(lease, event.occurred_at)
             if candidate is None:
                 raise GraphContractError("sealed_candidate_required")
             if paired_evidence is not None:
@@ -1013,6 +1025,7 @@ def reduce_events(
         elif event.event_type is EventType.REVIEW_PACKET_RECORDED:
             if state is not ExperimentState.PAIRED_EVALUATION:
                 raise GraphContractError("review_packet_wrong_state")
+            _require_live_lease(lease, event.occurred_at)
             if candidate is None or paired_evidence is None:
                 raise GraphContractError("paired_evidence_required")
             if paired_evidence.decision != "improvement":
@@ -1036,6 +1049,7 @@ def reduce_events(
         elif event.event_type is EventType.REVIEW_ATTESTED:
             if state is not ExperimentState.PAIRED_EVALUATION:
                 raise GraphContractError("review_attestation_wrong_state")
+            _require_live_lease(lease, event.occurred_at)
             try:
                 raw_role = event.payload.get("role")
             except AttributeError as error:
@@ -1063,6 +1077,7 @@ def reduce_events(
         elif event.event_type is EventType.DRAFT_PR_RECORDED:
             if state is not ExperimentState.PAIRED_EVALUATION:
                 raise GraphContractError("draft_pr_wrong_state")
+            _require_live_lease(lease, event.occurred_at)
             if candidate is None or paired_evidence is None:
                 raise GraphContractError("paired_evidence_required")
             if draft_pull_request is not None:
@@ -1080,6 +1095,26 @@ def reduce_events(
             except CandidateContractError as error:
                 raise GraphContractError("invalid_draft_pr_payload") from error
             draft_pull_request = draft
+        elif event.event_type is EventType.WORKSPACE_DISPOSED:
+            if state is not ExperimentState.PAIRED_EVALUATION:
+                raise GraphContractError("workspace_dispose_wrong_state")
+            _require_live_lease(lease, event.occurred_at)
+            if prepared_candidate is None or candidate is None or draft_pull_request is None:
+                raise GraphContractError("draft_pr_required")
+            if workspace_disposed:
+                raise GraphContractError("workspace_already_disposed")
+            if not isinstance(event.payload, dict) or set(event.payload) != {
+                "branch",
+                "candidate_commit",
+            }:
+                raise GraphContractError("invalid_workspace_disposed_payload")
+            if (
+                event.payload["branch"] != prepared_candidate.branch
+                or event.payload["branch"] != candidate.branch
+                or event.payload["candidate_commit"] != candidate.candidate_commit
+            ):
+                raise GraphContractError("workspace_disposed_candidate_mismatch")
+            workspace_disposed = True
         else:
             raise GraphContractError("unsupported_event_type")
         seen_attempts.add(event.stage_attempt_id)
@@ -1100,6 +1135,7 @@ def reduce_events(
         review_packets=review_packets,
         candidate_attestations=candidate_attestations,
         draft_pull_request=draft_pull_request,
+        workspace_disposed=workspace_disposed,
     )
 
 

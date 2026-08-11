@@ -28,6 +28,7 @@ MAX_REGISTRY_BYTES = 1_048_576
 _CHECK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
 _ENV_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
 _REMOTE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+_SENSITIVE_ENV_FRAGMENTS = ("AUTH", "COOKIE", "CREDENTIAL", "KEY", "PASSWORD", "SECRET", "TOKEN")
 
 
 class CandidateGitError(ValueError):
@@ -135,7 +136,9 @@ class CheckSpec:
             not isinstance(self.environment, tuple)
             or self.environment != tuple(sorted(set(self.environment), key=str.encode))
             or any(
-                not isinstance(name, str) or not _ENV_RE.fullmatch(name)
+                not isinstance(name, str)
+                or not _ENV_RE.fullmatch(name)
+                or any(fragment in name for fragment in _SENSITIVE_ENV_FRAGMENTS)
                 for name in self.environment
             )
         ):
@@ -347,10 +350,20 @@ class CandidateGitManager:
                 raise CandidateGitError("candidate_worktree_root_unsafe")
         if not isinstance(artifact_store, PrivateArtifactStore):
             raise CandidateGitError("invalid_artifact_store")
+        hooks_root = root / ".controller-empty-hooks"
+        try:
+            hooks_root.mkdir(mode=0o700, exist_ok=True)
+            if os.name != "nt":
+                hooks_root.chmod(0o700)
+        except OSError as error:
+            raise CandidateGitError("candidate_hooks_root_unavailable") from error
+        if not _private_directory(hooks_root):
+            raise CandidateGitError("candidate_hooks_root_unsafe")
         self.repository_root = repository
         self.worktree_root = root
         self.artifact_store = artifact_store
         self.remote = remote
+        self._hooks_root = hooks_root
 
     def _path_for_experiment(self, experiment_id: str) -> Path:
         return self.worktree_root / candidate_branch(experiment_id).removeprefix("codex/")
@@ -422,6 +435,8 @@ class CandidateGitManager:
                 raise CandidateGitError("candidate_branch_conflict")
             _git(
                 self.repository_root,
+                "-c",
+                f"core.hooksPath={self._hooks_root}",
                 "worktree",
                 "add",
                 "-b",
@@ -614,6 +629,8 @@ class CandidateGitManager:
             _git(
                 workspace,
                 "-c",
+                f"core.hooksPath={self._hooks_root}",
+                "-c",
                 "user.name=Carl Improvement Factory",
                 "-c",
                 "user.email=carl-improvement@invalid",
@@ -643,3 +660,75 @@ class CandidateGitManager:
             changed_path_count=len(before),
             checks=tuple(checks),
         )
+
+    def dispose(self, prepared: PreparedCandidate, candidate: SealedCandidate) -> bool:
+        """Remove an exact, clean candidate worktree while preserving its branch."""
+        if not isinstance(prepared, PreparedCandidate) or not isinstance(
+            candidate, SealedCandidate
+        ):
+            raise CandidateGitError("invalid_candidate_dispose_input")
+        if (
+            prepared.experiment_id != candidate.experiment_id
+            or prepared.manifest_digest != candidate.manifest_digest
+            or prepared.parent_commit != candidate.parent_commit
+            or prepared.branch != candidate.branch
+            or prepared.branch != candidate_branch(prepared.experiment_id)
+        ):
+            raise CandidateGitError("candidate_dispose_conflict")
+
+        _, reference_output = _git(
+            self.repository_root,
+            "rev-parse",
+            "--verify",
+            f"refs/heads/{prepared.branch}^{{commit}}",
+        )
+        if (
+            _decode_line(reference_output, "candidate_dispose_conflict")
+            != candidate.candidate_commit
+        ):
+            raise CandidateGitError("candidate_dispose_conflict")
+
+        workspace = self.worktree_path(prepared)
+        if not workspace.exists() and not workspace.is_symlink():
+            return False
+        try:
+            metadata = workspace.lstat()
+        except OSError as error:
+            raise CandidateGitError("candidate_dispose_conflict") from error
+        if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+            raise CandidateGitError("candidate_dispose_conflict")
+
+        _, top_output = _git(workspace, "rev-parse", "--show-toplevel")
+        _, branch_output = _git(workspace, "branch", "--show-current")
+        _, head_output = _git(workspace, "rev-parse", "HEAD")
+        _, status_output = _git(workspace, "status", "--porcelain=v1", "-z")
+        if (
+            _anchored(Path(_decode_line(top_output, "candidate_dispose_conflict"))) != workspace
+            or _decode_line(branch_output, "candidate_dispose_conflict") != prepared.branch
+            or _decode_line(head_output, "candidate_dispose_conflict") != candidate.candidate_commit
+            or status_output
+        ):
+            raise CandidateGitError("candidate_dispose_conflict")
+
+        _git(
+            self.repository_root,
+            "-c",
+            f"core.hooksPath={self._hooks_root}",
+            "worktree",
+            "remove",
+            os.fspath(workspace),
+        )
+        if workspace.exists() or workspace.is_symlink():
+            raise CandidateGitError("candidate_dispose_conflict")
+        _, remaining_output = _git(
+            self.repository_root,
+            "rev-parse",
+            "--verify",
+            f"refs/heads/{prepared.branch}^{{commit}}",
+        )
+        if (
+            _decode_line(remaining_output, "candidate_dispose_conflict")
+            != candidate.candidate_commit
+        ):
+            raise CandidateGitError("candidate_dispose_conflict")
+        return True

@@ -666,6 +666,16 @@ def test_phase3_candidate_evidence_gates_build_and_cannot_claim_holdout_validati
     with pytest.raises(GraphContractError, match="sealed_candidate_required"):
         reduce_events(manifest(), (*phase3_build_events(), prepared_event, deterministic))
 
+    expired_seal = ExperimentEvent.create(
+        experiment_id=manifest().experiment_id,
+        stage_attempt_id="seal-after-lease-expired",
+        event_type=EventType.CANDIDATE_SEALED,
+        occurred_at="2026-08-10T18:00:07Z",
+        payload=sealed_candidate().to_canonical_dict(),
+    )
+    with pytest.raises(GraphContractError, match="mutable_lease_required"):
+        reduce_events(manifest(), (*phase3_build_events(), prepared_event, expired_seal))
+
     sealed_event = candidate_event(
         attempt="seal-phase3",
         event_type=EventType.CANDIDATE_SEALED,
@@ -834,6 +844,37 @@ def test_phase3_review_identity_quorum_and_draft_are_bound_to_one_candidate() ->
     assert completed.draft_pull_request == draft
     assert decision.outcome == "draft_open"
     assert decision.next_action == "await_phase4_protected_validation"
+
+    disposed_event = candidate_event(
+        attempt="dispose-workspace-phase3",
+        event_type=EventType.WORKSPACE_DISPOSED,
+        second=13,
+        payload={
+            "branch": sealed_candidate().branch,
+            "candidate_commit": sealed_candidate().candidate_commit,
+        },
+    )
+    disposed = reduce_events(manifest(), (*events, draft_event, disposed_event))
+    assert disposed.workspace_disposed is True
+    assert evaluate_phase3(manifest(), disposed).next_action == (
+        "await_phase4_protected_validation"
+    )
+
+    with pytest.raises(GraphContractError, match="workspace_already_disposed"):
+        reduce_events(
+            manifest(),
+            (
+                *events,
+                draft_event,
+                disposed_event,
+                candidate_event(
+                    attempt="dispose-workspace-again-phase3",
+                    event_type=EventType.WORKSPACE_DISPOSED,
+                    second=14,
+                    payload=disposed_event.payload,
+                ),
+            ),
+        )
 
     reused = ReviewAttestation(
         schema_version=1,

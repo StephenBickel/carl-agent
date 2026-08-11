@@ -199,3 +199,17 @@ def test_gateway_requires_full_local_review_quorum_and_exact_local_branch(tmp_pa
     )
     with pytest.raises(DraftPrGatewayError, match="candidate_local_ref_mismatch"):
         gateway.open_or_reconcile(selected, projection)
+
+
+def test_gateway_never_executes_repository_push_hooks(tmp_path: Path) -> None:
+    gateway, selected, projection, _, _, repository = _fixture(tmp_path)
+    marker = tmp_path / "push-hook-ran"
+    hooks = repository / ".git" / "hooks"
+    hooks.mkdir(exist_ok=True)
+    hook = hooks / "pre-push"
+    hook.write_text(f"#!/bin/sh\nprintf ran > '{marker}'\n", encoding="utf-8")
+    hook.chmod(0o700)
+
+    gateway.open_or_reconcile(selected, projection)
+
+    assert not marker.exists()

@@ -116,9 +116,10 @@ private control directory and replace every example value. The full operator seq
 boundary are in [the benchmark operator guide](../docs/benchmarks.md#dry-run-experiment-graph).
 
 Phase three adds the `carl-bench candidate` prepare/edit/seal protocol, paired-evidence binding,
-role-specific independent review packets, sanitized status, and a draft-only GitHub gateway. The
-Codex task performs the edit inside the prepared worktree; Carl installations do not mutate
-themselves. See the operator guide for the private check registry and command sequence.
+role-specific independent review packets, sanitized status, a draft-only GitHub gateway, and
+explicit conflict-safe candidate-worktree disposal. The Codex task performs the edit inside the
+prepared worktree; Carl installations do not mutate themselves. See the operator guide for the
+private check registry and command sequence.
 
 This is deliberately not autonomous promotion yet. Protected holdouts, merge credentials,
 auto-merge, merge queue, soak, release, and rollback remain absent. A draft candidate stays in

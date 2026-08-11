@@ -205,6 +205,79 @@ def test_seal_reconciles_an_exact_parent_commit_created_before_ledger_append(
     )
 
 
+def test_seal_never_executes_repository_git_hooks(tmp_path: Path) -> None:
+    manager, repository, parent = _manager(tmp_path)
+    selected = replace(manifest(), parent_commit=parent, deterministic_checks=("pass",))
+    prepared = manager.prepare(selected, stage_attempt_id="prepare-hook-test")
+    worktree = manager.worktree_path(prepared)
+    (worktree / "src" / "runtime" / "task" / "value.txt").write_text(
+        "candidate\n", encoding="utf-8"
+    )
+    marker = tmp_path / "hook-ran"
+    hooks = repository / ".git" / "hooks"
+    hooks.mkdir(exist_ok=True)
+    hook = hooks / "pre-commit"
+    hook.write_text(f"#!/bin/sh\nprintf ran > '{marker}'\n", encoding="utf-8")
+    hook.chmod(0o700)
+    registry = _registry(
+        tmp_path / "private" / "checks-hook.json",
+        [_check("pass", "raise SystemExit(0)")],
+    )
+
+    manager.seal(selected, prepared, registry, report=b'{"summary":"hook test"}')
+
+    assert not marker.exists()
+
+
+def test_dispose_removes_only_clean_matching_worktree_and_is_idempotent(tmp_path: Path) -> None:
+    manager, repository, parent = _manager(tmp_path)
+    selected = replace(manifest(), parent_commit=parent, deterministic_checks=("pass",))
+    prepared = manager.prepare(selected, stage_attempt_id="prepare-dispose")
+    worktree = manager.worktree_path(prepared)
+    (worktree / "src" / "runtime" / "task" / "value.txt").write_text(
+        "candidate\n", encoding="utf-8"
+    )
+    registry = _registry(
+        tmp_path / "private" / "checks-dispose.json",
+        [_check("pass", "raise SystemExit(0)")],
+    )
+    candidate = manager.seal(selected, prepared, registry, report=b'{"summary":"dispose test"}')
+
+    assert manager.dispose(prepared, candidate) is True
+    assert not worktree.exists()
+    assert manager.dispose(prepared, candidate) is False
+    assert (
+        _run("git", "rev-parse", f"refs/heads/{candidate.branch}", cwd=repository)
+        == candidate.candidate_commit
+    )
+
+
+def test_dispose_rejects_dirty_or_mismatched_candidate_worktree(tmp_path: Path) -> None:
+    manager, _, parent = _manager(tmp_path)
+    selected = replace(manifest(), parent_commit=parent, deterministic_checks=("pass",))
+    prepared = manager.prepare(selected, stage_attempt_id="prepare-dirty-dispose")
+    worktree = manager.worktree_path(prepared)
+    (worktree / "src" / "runtime" / "task" / "value.txt").write_text(
+        "candidate\n", encoding="utf-8"
+    )
+    registry = _registry(
+        tmp_path / "private" / "checks-dirty-dispose.json",
+        [_check("pass", "raise SystemExit(0)")],
+    )
+    candidate = manager.seal(
+        selected, prepared, registry, report=b'{"summary":"dirty dispose test"}'
+    )
+    (worktree / "src" / "runtime" / "task" / "extra.txt").write_text(
+        "uncommitted\n", encoding="utf-8"
+    )
+    with pytest.raises(CandidateGitError, match="candidate_dispose_conflict"):
+        manager.dispose(prepared, candidate)
+
+    mismatched = replace(candidate, candidate_commit="f" * 40)
+    with pytest.raises(CandidateGitError, match="candidate_dispose_conflict"):
+        manager.dispose(prepared, mismatched)
+
+
 @pytest.mark.parametrize(
     ("mutation", "code"),
     [
@@ -277,6 +350,7 @@ def test_check_registry_rejects_shell_strings_relative_executables_and_unknown_k
         ({**base, "executable": "python"}, "check_executable_unsafe"),
         ({**base, "argv": "-c echo bad"}, "invalid_check_argv"),
         ({**base, "shell": True}, "invalid_check_keys"),
+        ({**base, "environment": ["GH_TOKEN"]}, "invalid_check_environment"),
     )
     for index, (value, code) in enumerate(cases):
         source = private / f"invalid-{index}.json"
