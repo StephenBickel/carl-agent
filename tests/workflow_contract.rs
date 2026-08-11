@@ -456,6 +456,25 @@ fn validate_ci_workflow(workflow: &str) -> Result<(), String> {
         ));
     }
 
+    let long_horizon_test_count = jobs
+        .iter()
+        .map(|(name, value)| {
+            let name = name.as_str().unwrap_or("<non-string-job>");
+            let job = value_map(value, &format!("jobs.{name}"))?;
+            Ok(run_commands(job, &format!("jobs.{name}"))?
+                .into_iter()
+                .filter(|command| *command == "cargo test --locked --test long_horizon_eval")
+                .count())
+        })
+        .collect::<Result<Vec<usize>, String>>()?
+        .into_iter()
+        .sum::<usize>();
+    if long_horizon_test_count != 1 {
+        return Err(format!(
+            "CI must run `cargo test --locked --test long_horizon_eval` exactly once per matrix expansion, found {long_horizon_test_count} step definitions"
+        ));
+    }
+
     Ok(())
 }
 
@@ -944,6 +963,20 @@ fn checker_rejects_required_command_in_nonrequired_job() {
     assert_ci_rejected(
         &workflow,
         "required command `cargo fmt --check` must appear only in jobs.quality",
+    );
+}
+
+#[test]
+fn checker_rejects_duplicate_long_horizon_release_gate_steps() {
+    let workflow = replace_in_workflow(
+        "ci.yml",
+        "      - name: Test deterministic long-horizon evaluation\n        run: cargo test --locked --test long_horizon_eval\n",
+        "      - name: Test deterministic long-horizon evaluation\n        run: cargo test --locked --test long_horizon_eval\n      - name: Duplicate deterministic long-horizon evaluation\n        run: cargo test --locked --test long_horizon_eval\n",
+    );
+
+    assert_ci_rejected(
+        &workflow,
+        "CI must run `cargo test --locked --test long_horizon_eval` exactly once per matrix expansion, found 2 step definitions",
     );
 }
 

@@ -2601,6 +2601,10 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                         task_id,
                         status: active.snapshot.status,
                     });
+                    // A committed checkpoint is a natural cooperative scheduling boundary for a
+                    // long-running task. Yielding here lets supervisors snapshot or stop the
+                    // process without interrupting an operation lifecycle.
+                    tokio::task::yield_now().await;
                 }
             }
         }
@@ -4602,13 +4606,16 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
         next_objective: &str,
     ) -> Result<CanonicalCheckpoint, TaskEngineError> {
         let snapshot = self.snapshot(task_id)?;
-        let mut events = self
+        let events = self
             .store()
-            .read_task_events(task_id)
+            .read_task_events_after(
+                task_id,
+                runtime
+                    .previous_checkpoint
+                    .as_ref()
+                    .map_or(0, |checkpoint| checkpoint.source_sequence_end),
+            )
             .map_err(storage_error)?;
-        if let Some(previous) = &runtime.previous_checkpoint {
-            events.retain(|event| event.sequence > previous.source_sequence_end);
-        }
         let exact_identifiers = report
             .exact_identifiers
             .iter()

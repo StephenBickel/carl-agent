@@ -2767,8 +2767,16 @@ impl Store {
     }
 
     pub fn read_task_events(&self, task_id: TaskId) -> Result<Vec<EventEnvelope>, CarlError> {
+        self.read_task_events_after(task_id, 0)
+    }
+
+    pub fn read_task_events_after(
+        &self,
+        task_id: TaskId,
+        exclusive_sequence: u64,
+    ) -> Result<Vec<EventEnvelope>, CarlError> {
         let mut events = Vec::new();
-        let mut after_sequence = None;
+        let mut after_sequence = Some(exclusive_sequence);
         loop {
             let page = self.read_task_event_page(task_id, after_sequence, 512)?;
             if page.is_empty() {

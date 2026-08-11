@@ -690,6 +690,37 @@ fn task_event_pages_are_bounded_stable_and_isolated() -> Result<(), Box<dyn Erro
         512,
     )?;
     assert_eq!(final_page.len(), 2);
+    let tail = store
+        .read_task_events_after(first.snapshot.task_id, first_page.last().unwrap().sequence)?;
+    assert_eq!(tail, final_page);
+    assert!(
+        tail.iter()
+            .all(|event| event.sequence > first_page.last().unwrap().sequence)
+    );
+    assert_eq!(
+        store
+            .read_task_events_after(first.snapshot.task_id, 0)?
+            .len(),
+        514
+    );
+    assert!(
+        store
+            .read_task_events_after(first.snapshot.task_id, final_page.last().unwrap().sequence,)?
+            .is_empty()
+    );
+    let second_events = store.read_task_events_after(second.snapshot.task_id, 0)?;
+    assert_eq!(second_events.len(), 1);
+    assert!(matches!(
+        second_events[0].event,
+        carl::events::Event::TaskLifecycle { task_id, .. }
+            if task_id == second.snapshot.task_id
+    ));
+    assert!(matches!(
+        store
+            .read_task_events_after(first.snapshot.task_id, u64::MAX)
+            .expect_err("an unrepresentable cursor must be rejected"),
+        CarlError::Validation { .. }
+    ));
     assert!(
         store
             .read_task_event_page(

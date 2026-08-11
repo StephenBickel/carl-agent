@@ -1,9 +1,11 @@
 use std::error::Error;
+use std::fs;
 use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use carl::evals::{
-    EvaluationMetrics, EvaluationScenario, NEEDLE_IDENTIFIER, evaluate_release_gate,
-    run_long_horizon_evaluation, run_repository_release_gate_matrix,
+    EvaluationError, EvaluationMetrics, EvaluationScenario, NEEDLE_IDENTIFIER,
+    evaluate_release_gate, run_long_horizon_evaluation, run_repository_release_gate_matrix,
     unresolved_started_cut_fails_closed,
 };
 
@@ -11,6 +13,32 @@ type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
 fn fixture_source() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/long_horizon/needle")
+}
+
+struct TestFixtureCopy {
+    root: PathBuf,
+}
+
+impl TestFixtureCopy {
+    fn new() -> TestResult<Self> {
+        let unique = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "carl-long-horizon-fixture-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(root.join("src"))?;
+        fs::create_dir_all(root.join("tests"))?;
+        for relative in ["README.md", "Cargo.toml", "src/lib.rs", "tests/contract.rs"] {
+            fs::copy(fixture_source().join(relative), root.join(relative))?;
+        }
+        Ok(Self { root })
+    }
+}
+
+impl Drop for TestFixtureCopy {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.root);
+    }
 }
 
 fn passing_metrics() -> EvaluationMetrics {
@@ -83,6 +111,35 @@ fn public_contracts_are_bounded_sanitized_and_strict() -> TestResult {
     Ok(())
 }
 
+#[test]
+fn exhaustive_real_engine_lifecycle_cut_matrix_remains_a_release_dependency() {
+    let lifecycle_contract = include_str!("epoch_engine_contract.rs");
+    assert!(
+        lifecycle_contract.contains(
+            "async fn every_required_engine_restart_cut_restarts_from_real_engine_state()"
+        )
+    );
+    for required_cut in [
+        "TaskCreated",
+        "EpochStarted",
+        "OperationIntentRecorded",
+        "EffectAuthorized",
+        "ItemStarted",
+        "WorkspaceMutated",
+        "ItemCompleted",
+        "CheckpointCandidateBuilt",
+        "CheckpointCommitted",
+        "CompactionRequested",
+        "ProviderReplacementStarted",
+        "ProviderBindingCommitted",
+    ] {
+        assert!(
+            lifecycle_contract.contains(&format!("RequiredEngineRestartCut::{required_cut}")),
+            "missing required real-engine lifecycle cut {required_cut}"
+        );
+    }
+}
+
 #[tokio::test(start_paused = true)]
 async fn actual_engine_survives_one_hundred_epochs_and_normalizes_replay() -> TestResult {
     let result =
@@ -116,9 +173,9 @@ async fn unresolved_started_operation_fails_closed_without_replay() -> TestResul
     Ok(())
 }
 
-#[test]
-fn repository_release_gate_matrix_is_bounded_and_isolated() -> TestResult {
-    let results = run_repository_release_gate_matrix(&fixture_source())?;
+#[tokio::test(start_paused = true)]
+async fn repository_release_gate_matrix_is_bounded_and_isolated() -> TestResult {
+    let results = run_repository_release_gate_matrix(&fixture_source()).await?;
     assert_eq!(
         results
             .iter()
@@ -137,7 +194,10 @@ fn repository_release_gate_matrix_is_bounded_and_isolated() -> TestResult {
             "ambiguous-external-effect",
         ]
     );
-    assert!(results.iter().all(|result| result.passed));
+    assert!(
+        results.iter().all(|result| result.passed),
+        "matrix failures: {results:#?}"
+    );
     assert_eq!(
         results
             .iter()
@@ -159,5 +219,44 @@ fn repository_release_gate_matrix_is_bounded_and_isolated() -> TestResult {
             && result.metrics.orphan_processes == 0
             && result.metrics.secret_policy_violations == 0
     }));
+    let by_name = |name: &str| {
+        results
+            .iter()
+            .find(|result| result.scenario == name)
+            .expect("matrix case exists")
+    };
+    assert_eq!(by_name("command-failure-recovery").metrics.tool_calls, 2);
+    assert_eq!(by_name("provider-loss").metrics.restarts, 1);
+    assert_eq!(by_name("provider-loss").metrics.strategy_changes, 1);
+    assert_eq!(by_name("out-of-scope-write").metrics.tool_calls, 1);
+    assert_eq!(by_name("ambiguous-external-effect").metrics.restarts, 1);
+    assert_eq!(by_name("ambiguous-external-effect").metrics.tool_calls, 1);
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn repository_fixture_rejects_files_outside_the_exact_manifest() -> TestResult {
+    let fixture = TestFixtureCopy::new()?;
+    fs::write(fixture.root.join("unexpected.txt"), "must be rejected")?;
+
+    let error = run_repository_release_gate_matrix(&fixture.root)
+        .await
+        .expect_err("an extra fixture file must fail closed");
+    assert_eq!(error, EvaluationError::Fixture);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(start_paused = true)]
+async fn repository_fixture_rejects_symlinks() -> TestResult {
+    use std::os::unix::fs::symlink;
+
+    let fixture = TestFixtureCopy::new()?;
+    symlink("README.md", fixture.root.join("linked-readme"))?;
+
+    let error = run_repository_release_gate_matrix(&fixture.root)
+        .await
+        .expect_err("a symlink in the fixture must fail closed");
+    assert_eq!(error, EvaluationError::Fixture);
     Ok(())
 }

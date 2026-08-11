@@ -202,18 +202,8 @@ pub(super) fn derive_metrics(
         .filter(|operation| operation.evidence.is_some())
         .map(|operation| operation.epoch_id)
         .collect::<BTreeSet<_>>();
-    let semantic_provider_requests = provider_request_events
-        .iter()
-        .filter(|(epoch_id, purpose)| {
-            *purpose == ProviderRequestPurpose::ContractPlanning
-                || (matches!(
-                    purpose,
-                    ProviderRequestPurpose::Work | ProviderRequestPurpose::Recovery
-                ) && tool_bearing_epochs.contains(epoch_id))
-        })
-        .count();
     let provider_requests =
-        u32::try_from(semantic_provider_requests).map_err(|_| EvaluationError::Invariant)?;
+        u32::try_from(provider_request_events.len()).map_err(|_| EvaluationError::Invariant)?;
     let work_epochs = provider_request_events
         .iter()
         .filter(|(epoch_id, purpose)| {
