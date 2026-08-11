@@ -48,6 +48,7 @@ pub enum PermissionMode {
     Default,
     AcceptEdits,
     DontAsk,
+    FullAccess,
     BypassPermissions,
 }
 
@@ -64,7 +65,7 @@ impl PermissionMode {
         Self::Default,
         Self::AcceptEdits,
         Self::DontAsk,
-        Self::BypassPermissions,
+        Self::FullAccess,
     ];
 
     #[must_use]
@@ -74,6 +75,7 @@ impl PermissionMode {
             Self::Default => "default",
             Self::AcceptEdits => "acceptEdits",
             Self::DontAsk => "dontAsk",
+            Self::FullAccess => "fullAccess",
             Self::BypassPermissions => "bypassPermissions",
         }
     }
@@ -84,7 +86,7 @@ impl PermissionMode {
             Self::Plan => PermissionProfile::ReadOnly,
             Self::Default | Self::AcceptEdits => PermissionProfile::Approval,
             Self::DontAsk => PermissionProfile::ReadOnly,
-            Self::BypassPermissions => PermissionProfile::FullAccess,
+            Self::FullAccess | Self::BypassPermissions => PermissionProfile::FullAccess,
         }
     }
 }
@@ -98,6 +100,7 @@ impl FromStr for PermissionMode {
             "default" => Ok(Self::Default),
             "acceptEdits" => Ok(Self::AcceptEdits),
             "dontAsk" => Ok(Self::DontAsk),
+            "fullAccess" => Ok(Self::FullAccess),
             "bypassPermissions" => Ok(Self::BypassPermissions),
             _ => Err(ConfigError::from_code(ConfigErrorCode::InvalidValue)),
         }
@@ -280,7 +283,7 @@ impl SessionConfiguration {
     }
 
     pub fn set_mode(&mut self, mode: PermissionMode, activation: ModeActivation) -> ConfigChange {
-        if mode == PermissionMode::BypassPermissions
+        if mode.profile() == PermissionProfile::FullAccess
             && activation == ModeActivation::RemoteUnconfirmed
         {
             let display_code = Uuid::new_v4()
@@ -354,6 +357,7 @@ const fn mode_display(mode: PermissionMode) -> &'static str {
         PermissionMode::Default => "Default",
         PermissionMode::AcceptEdits => "Accept edits",
         PermissionMode::DontAsk => "Don't ask",
+        PermissionMode::FullAccess => "Full access",
         PermissionMode::BypassPermissions => "Bypass permissions",
     }
 }

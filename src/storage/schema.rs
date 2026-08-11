@@ -55,6 +55,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "long-horizon tasks",
         sql: include_str!("../../migrations/0008_long_horizon_tasks.sql"),
     },
+    Migration {
+        version: 9,
+        name: "trusted frontend owners",
+        sql: include_str!("../../migrations/0009_trusted_frontend_owners.sql"),
+    },
 ];
 
 pub(crate) fn migrate(connection: &mut Connection) -> Result<(), CarlError> {

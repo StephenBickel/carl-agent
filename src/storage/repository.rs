@@ -29,8 +29,9 @@ use crate::runtime::subscription::{
     RunTrustLabel, VerificationId,
 };
 use crate::runtime::task::{
-    CanonicalCheckpoint, CompletionContract, ContextPackage, EffectClass, OperationEvidenceState,
-    OperationStatus, TaskBudget, TaskEvent, TaskId, TaskSnapshot, TaskStatus, reduce_task,
+    CanonicalCheckpoint, CompletionContract, ContextPackage, EffectClass, EpochInterruptReason,
+    OperationEvidenceState, OperationStatus, TaskBudget, TaskEvent, TaskId, TaskSnapshot,
+    TaskStatus, reduce_task,
 };
 use crate::security::SecretFilter;
 use crate::sidecar::DataRootLock;
@@ -134,6 +135,44 @@ pub struct FrontendSessionRecord {
     pub provider_thread_id: Option<ProviderThreadId>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TrustedFrontendOwnerInput {
+    pub frontend: Frontend,
+    pub actor_id: ActorId,
+    pub workspace: PathBuf,
+    pub permission_mode: PermissionMode,
+    pub trusted_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TrustedFrontendOwnerRecord {
+    pub frontend: Frontend,
+    pub actor_id: ActorId,
+    pub channel_id: Option<ChannelId>,
+    pub workspace_digest: Sha256Digest,
+    pub permission_mode: PermissionMode,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaskControlMutationInput {
+    pub external_session_id: ExternalSessionId,
+    pub idempotency_key: String,
+    pub task_id: TaskId,
+    pub method: String,
+    pub request_digest: Sha256Digest,
+    pub result_json: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TaskControlMutationClaim {
+    Fresh,
+    Pending,
+    Replay { result_json: String },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -901,8 +940,9 @@ impl Store {
             .execute(
                 "INSERT INTO frontend_sessions (
                     external_session_id, frontend, session_id, client_name, protocol_version,
-                    cwd, channel_id, provider_thread_id, permission_mode, created_at, updated_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8, ?9, ?9)",
+                    cwd, channel_id, provider_thread_id, permission_mode, permission_profile,
+                    created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8, ?9, ?10, ?10)",
                 params![
                     record.external_session_id.as_str(),
                     record.frontend.as_str(),
@@ -911,7 +951,8 @@ impl Store {
                     i64::from(record.protocol_version),
                     record.cwd.to_str(),
                     record.channel_id.as_ref().map(ChannelId::as_str),
-                    record.permission_mode.as_wire_str(),
+                    stored_permission_mode(record.permission_mode),
+                    permission_profile_str(record.permission_mode),
                     format_timestamp(record.created_at),
                 ],
             )
@@ -927,7 +968,7 @@ impl Store {
             .connection
             .query_row(
                 "SELECT frontend, session_id, client_name, protocol_version, cwd, channel_id,
-                        provider_thread_id, permission_mode, created_at, updated_at
+                        provider_thread_id, permission_profile, created_at, updated_at
                  FROM frontend_sessions
                  WHERE external_session_id = ?1",
                 [external_session_id],
@@ -963,9 +1004,7 @@ impl Store {
             )| {
                 let protocol_version = u32::try_from(protocol_version)
                     .map_err(|_| invalid_stored_value("protocol version", "out of range"))?;
-                let permission_mode = permission_mode
-                    .parse()
-                    .map_err(|_| invalid_stored_value("permission mode", &permission_mode))?;
+                let permission_mode = permission_mode_from_profile(&permission_mode)?;
                 Ok(FrontendSessionRecord {
                     frontend: Frontend::parse(&frontend)?,
                     external_session_id: ExternalSessionId::try_from(external_session_id)?,
@@ -997,12 +1036,14 @@ impl Store {
             .connection
             .execute(
                 "UPDATE frontend_sessions
-                 SET provider_thread_id = ?2, permission_mode = ?3, updated_at = ?4
-                 WHERE external_session_id = ?1 AND updated_at <= ?4",
+                 SET provider_thread_id = ?2, permission_mode = ?3,
+                     permission_profile = ?4, updated_at = ?5
+                 WHERE external_session_id = ?1 AND updated_at <= ?5",
                 params![
                     external_session_id.as_str(),
                     provider_thread_id.map(ProviderThreadId::as_str),
-                    permission_mode.as_wire_str(),
+                    stored_permission_mode(permission_mode),
+                    permission_profile_str(permission_mode),
                     format_timestamp(updated_at),
                 ],
             )
@@ -1118,6 +1159,404 @@ impl Store {
         transaction.commit().map_err(storage_error)?;
         self.get_frontend_session(external_session_id.as_str())?
             .ok_or_else(|| storage_invariant("claimed frontend session disappeared"))
+    }
+
+    pub fn trust_frontend_owner(
+        &self,
+        input: TrustedFrontendOwnerInput,
+    ) -> Result<TrustedFrontendOwnerRecord, CarlError> {
+        if input.frontend != Frontend::Buzz
+            || input.permission_mode.profile() != crate::acp::PermissionProfile::FullAccess
+        {
+            return Err(policy_error("trusted frontend owner binding is invalid"));
+        }
+        validate_canonical_frontend_cwd(&input.workspace)?;
+        let workspace_digest = frontend_workspace_digest(&input.workspace);
+        if let Some(existing) = self.get_trusted_frontend_owner(input.frontend, workspace_digest)?
+            && existing.actor_id == input.actor_id
+            && existing.permission_mode.profile() == crate::acp::PermissionProfile::FullAccess
+        {
+            return Ok(existing);
+        }
+        self.connection
+            .execute(
+                "INSERT INTO trusted_frontend_owners (
+                    frontend, actor_id, channel_id, workspace_digest, permission_mode,
+                    created_at, updated_at
+                 ) VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?5)
+                 ON CONFLICT(frontend, workspace_digest) DO UPDATE SET
+                    actor_id = excluded.actor_id,
+                    channel_id = NULL,
+                    permission_mode = excluded.permission_mode,
+                    created_at = excluded.created_at,
+                    updated_at = excluded.updated_at",
+                params![
+                    input.frontend.as_str(),
+                    input.actor_id.as_str(),
+                    workspace_digest.to_string(),
+                    stored_permission_mode(input.permission_mode),
+                    format_timestamp(input.trusted_at),
+                ],
+            )
+            .map_err(storage_error)?;
+        self.get_trusted_frontend_owner(input.frontend, workspace_digest)?
+            .ok_or_else(|| storage_invariant("trusted frontend owner disappeared"))
+    }
+
+    pub fn get_trusted_frontend_owner(
+        &self,
+        frontend: Frontend,
+        workspace_digest: Sha256Digest,
+    ) -> Result<Option<TrustedFrontendOwnerRecord>, CarlError> {
+        let raw = self
+            .connection
+            .query_row(
+                "SELECT actor_id, channel_id, permission_mode, created_at, updated_at
+                 FROM trusted_frontend_owners
+                 WHERE frontend = ?1 AND workspace_digest = ?2",
+                params![frontend.as_str(), workspace_digest.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(storage_error)?;
+        raw.map(
+            |(actor_id, channel_id, permission_mode, created_at, updated_at)| {
+                let stored = permission_mode
+                    .parse::<PermissionMode>()
+                    .map_err(|_| invalid_stored_value("permission mode", &permission_mode))?;
+                if stored.profile() != crate::acp::PermissionProfile::FullAccess {
+                    return Err(invalid_stored_value(
+                        "trusted frontend permission mode",
+                        &permission_mode,
+                    ));
+                }
+                Ok(TrustedFrontendOwnerRecord {
+                    frontend,
+                    actor_id: ActorId::parse(actor_id)?,
+                    channel_id: channel_id.map(ChannelId::try_from).transpose()?,
+                    workspace_digest,
+                    permission_mode: PermissionMode::FullAccess,
+                    created_at: parse_timestamp(&created_at)?,
+                    updated_at: parse_timestamp(&updated_at)?,
+                })
+            },
+        )
+        .transpose()
+    }
+
+    pub fn admit_trusted_frontend_owner(
+        &self,
+        frontend: Frontend,
+        actor_id: &ActorId,
+        channel_id: &ChannelId,
+        workspace: &Path,
+        admitted_at: DateTime<Utc>,
+    ) -> Result<TrustedFrontendOwnerRecord, CarlError> {
+        if frontend != Frontend::Buzz {
+            return Err(policy_error("trusted frontend admission is invalid"));
+        }
+        validate_canonical_frontend_cwd(workspace)?;
+        let workspace_digest = frontend_workspace_digest(workspace);
+        let existing = self
+            .get_trusted_frontend_owner(frontend, workspace_digest)?
+            .ok_or_else(|| policy_error("trusted frontend owner is unavailable"))?;
+        if existing.actor_id != *actor_id
+            || existing
+                .channel_id
+                .as_ref()
+                .is_some_and(|bound| bound != channel_id)
+        {
+            return Err(policy_error("trusted frontend owner does not match"));
+        }
+        if existing.channel_id.is_none() {
+            let changed = self
+                .connection
+                .execute(
+                    "UPDATE trusted_frontend_owners
+                     SET channel_id = ?3, updated_at = ?4
+                     WHERE frontend = ?1 AND workspace_digest = ?2
+                       AND actor_id = ?5 AND channel_id IS NULL AND updated_at <= ?4",
+                    params![
+                        frontend.as_str(),
+                        workspace_digest.to_string(),
+                        channel_id.as_str(),
+                        format_timestamp(admitted_at),
+                        actor_id.as_str(),
+                    ],
+                )
+                .map_err(storage_error)?;
+            if changed != 1 {
+                return Err(policy_error(
+                    "trusted frontend channel fill was not applied",
+                ));
+            }
+        }
+        self.get_trusted_frontend_owner(frontend, workspace_digest)?
+            .ok_or_else(|| storage_invariant("admitted trusted frontend owner disappeared"))
+    }
+
+    pub fn admit_trusted_frontend_message(
+        &self,
+        frontend: Frontend,
+        actor_id: &ActorId,
+        channel_id: &ChannelId,
+        workspace: &Path,
+        event_id: &str,
+        admitted_at: DateTime<Utc>,
+    ) -> Result<TrustedFrontendOwnerRecord, CarlError> {
+        if event_id.len() != 64
+            || !event_id
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(policy_error("trusted frontend event is invalid"));
+        }
+        validate_canonical_frontend_cwd(workspace)?;
+        let workspace_digest = frontend_workspace_digest(workspace);
+        let transaction = self
+            .connection
+            .unchecked_transaction()
+            .map_err(storage_error)?;
+        let binding = transaction
+            .query_row(
+                "SELECT actor_id, channel_id, permission_mode, created_at, updated_at
+                 FROM trusted_frontend_owners
+                 WHERE frontend = ?1 AND workspace_digest = ?2",
+                params![frontend.as_str(), workspace_digest.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(storage_error)?
+            .ok_or_else(|| policy_error("trusted frontend owner is unavailable"))?;
+        if binding.0 != actor_id.as_str()
+            || binding
+                .1
+                .as_deref()
+                .is_some_and(|bound| bound != channel_id.as_str())
+        {
+            return Err(policy_error("trusted frontend owner does not match"));
+        }
+        if binding.1.is_none() {
+            let changed = transaction
+                .execute(
+                    "UPDATE trusted_frontend_owners
+                     SET channel_id = ?3, updated_at = ?4
+                     WHERE frontend = ?1 AND workspace_digest = ?2
+                       AND actor_id = ?5 AND channel_id IS NULL AND updated_at <= ?4",
+                    params![
+                        frontend.as_str(),
+                        workspace_digest.to_string(),
+                        channel_id.as_str(),
+                        format_timestamp(admitted_at),
+                        actor_id.as_str(),
+                    ],
+                )
+                .map_err(storage_error)?;
+            if changed != 1 {
+                return Err(policy_error(
+                    "trusted frontend channel fill was not applied",
+                ));
+            }
+        }
+        transaction
+            .execute(
+                "INSERT INTO trusted_frontend_events (
+                    event_id, frontend, workspace_digest, actor_id, channel_id, admitted_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    event_id,
+                    frontend.as_str(),
+                    workspace_digest.to_string(),
+                    actor_id.as_str(),
+                    channel_id.as_str(),
+                    format_timestamp(admitted_at),
+                ],
+            )
+            .map_err(|_| policy_error("trusted frontend event is unavailable"))?;
+        transaction.commit().map_err(storage_error)?;
+        self.get_trusted_frontend_owner(frontend, workspace_digest)?
+            .ok_or_else(|| storage_invariant("admitted trusted frontend owner disappeared"))
+    }
+
+    pub fn claim_task_control_mutation(
+        &self,
+        input: TaskControlMutationInput,
+    ) -> Result<TaskControlMutationClaim, CarlError> {
+        if input.idempotency_key.is_empty()
+            || input.idempotency_key.len() > 128
+            || input.idempotency_key.chars().any(char::is_control)
+            || !matches!(input.method.as_str(), "resume" | "cancel" | "steer")
+            || input.result_json.len() > 65_536
+            || !serde_json::from_str::<serde_json::Value>(&input.result_json)
+                .is_ok_and(|value| value.is_object())
+        {
+            return Err(policy_error("task control mutation binding is invalid"));
+        }
+        let transaction = self
+            .connection
+            .unchecked_transaction()
+            .map_err(storage_error)?;
+        let expected_session = transaction
+            .query_row(
+                "SELECT session_id FROM frontend_sessions WHERE external_session_id = ?1",
+                [input.external_session_id.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(storage_error)?
+            .ok_or_else(|| policy_error("task control frontend session is unavailable"))?;
+        let (task_session, starting_revision) = transaction
+            .query_row(
+                "SELECT session_id, revision FROM agent_tasks WHERE id = ?1",
+                [input.task_id.to_string()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()
+            .map_err(storage_error)?
+            .ok_or_else(|| policy_error("task control task is unavailable"))?;
+        if expected_session != task_session {
+            return Err(policy_error("task control session binding is invalid"));
+        }
+        let existing = transaction
+            .query_row(
+                "SELECT task_id, method, request_digest, state, result_json
+                 FROM task_control_receipts
+                 WHERE external_session_id = ?1 AND idempotency_key = ?2",
+                params![input.external_session_id.as_str(), input.idempotency_key],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(storage_error)?;
+        if let Some((task_id, method, request_digest, state, result_json)) = existing {
+            if task_id != input.task_id.to_string()
+                || method != input.method
+                || request_digest != input.request_digest.to_string()
+            {
+                return Err(policy_error("task control idempotency key was rebound"));
+            }
+            return match (state.as_str(), result_json) {
+                ("pending", None) => Ok(TaskControlMutationClaim::Pending),
+                ("completed", Some(result_json)) => {
+                    Ok(TaskControlMutationClaim::Replay { result_json })
+                }
+                _ => Err(storage_invariant("task control receipt state is invalid")),
+            };
+        }
+        let receipt_count = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM task_control_receipts WHERE external_session_id = ?1",
+                [input.external_session_id.as_str()],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(storage_error)?;
+        if receipt_count >= 256 {
+            return Err(policy_error("task control receipt capacity is exhausted"));
+        }
+        transaction
+            .execute(
+                "INSERT INTO task_control_receipts (
+                    external_session_id, idempotency_key, task_id, method,
+                    request_digest, state, starting_revision, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6, ?7)",
+                params![
+                    input.external_session_id.as_str(),
+                    input.idempotency_key,
+                    input.task_id.to_string(),
+                    input.method,
+                    input.request_digest.to_string(),
+                    starting_revision,
+                    format_timestamp(input.created_at),
+                ],
+            )
+            .map_err(storage_error)?;
+        transaction.commit().map_err(storage_error)?;
+        Ok(TaskControlMutationClaim::Fresh)
+    }
+
+    pub fn complete_task_control_mutation(
+        &self,
+        input: TaskControlMutationInput,
+    ) -> Result<String, CarlError> {
+        let transaction = self
+            .connection
+            .unchecked_transaction()
+            .map_err(storage_error)?;
+        let current_revision = transaction
+            .query_row(
+                "SELECT revision FROM agent_tasks WHERE id = ?1",
+                [input.task_id.to_string()],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(storage_error)?
+            .ok_or_else(|| policy_error("task control task is unavailable"))?;
+        let changed = transaction
+            .execute(
+                "UPDATE task_control_receipts
+                 SET state = 'completed', applied_revision = ?6, result_json = ?7,
+                     completed_at = ?8
+                 WHERE external_session_id = ?1 AND idempotency_key = ?2
+                   AND task_id = ?3 AND method = ?4 AND request_digest = ?5
+                   AND state = 'pending' AND starting_revision <= ?6",
+                params![
+                    input.external_session_id.as_str(),
+                    input.idempotency_key,
+                    input.task_id.to_string(),
+                    input.method,
+                    input.request_digest.to_string(),
+                    current_revision,
+                    input.result_json,
+                    format_timestamp(input.created_at),
+                ],
+            )
+            .map_err(storage_error)?;
+        if changed != 1 {
+            let existing = transaction
+                .query_row(
+                    "SELECT result_json FROM task_control_receipts
+                     WHERE external_session_id = ?1 AND idempotency_key = ?2
+                       AND task_id = ?3 AND method = ?4 AND request_digest = ?5
+                       AND state = 'completed'",
+                    params![
+                        input.external_session_id.as_str(),
+                        input.idempotency_key,
+                        input.task_id.to_string(),
+                        input.method,
+                        input.request_digest.to_string(),
+                    ],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(storage_error)?;
+            return existing
+                .ok_or_else(|| policy_error("task control mutation was not durably applied"));
+        }
+        transaction.commit().map_err(storage_error)?;
+        Ok(input.result_json)
     }
 
     pub fn create_remote_code(
@@ -1605,6 +2044,53 @@ impl Store {
         }))
     }
 
+    pub fn append_controlled_task_steering(
+        &mut self,
+        task_id: TaskId,
+        expected_revision: u64,
+        steering_sequence: u64,
+        text_digest: String,
+        control_id: &str,
+        at: DateTime<Utc>,
+    ) -> Result<Option<TaskRecord>, CarlError> {
+        if control_id.len() != 64
+            || !control_id
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(policy_error("task steering control ID is invalid"));
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage_error)?;
+        let Some(current) = load_task_record(&transaction, task_id)? else {
+            return Ok(None);
+        };
+        if current.revision != expected_revision {
+            return Ok(None);
+        }
+        let (record, event_sequence) = append_task_event_in_transaction(
+            &transaction,
+            current,
+            TaskEvent::SteeringQueued {
+                steering_sequence,
+                text_digest,
+            },
+            at,
+        )?;
+        let changed = transaction
+            .execute(
+                "UPDATE task_steering SET control_id = ?3
+                 WHERE task_id = ?1 AND event_sequence = ?2 AND control_id IS NULL",
+                params![task_id.to_string(), event_sequence, control_id],
+            )
+            .map_err(storage_error)?;
+        require_projection_change(changed, "task steering control binding was not applied")?;
+        transaction.commit().map_err(storage_error)?;
+        Ok(Some(record))
+    }
+
     pub fn commit_checkpoint(
         &mut self,
         input: NewCheckpoint,
@@ -1700,6 +2186,57 @@ impl Store {
 
     pub fn get_task(&self, task_id: TaskId) -> Result<Option<TaskRecord>, CarlError> {
         load_task_record(&self.connection, task_id)
+    }
+
+    pub fn list_tasks_for_session(
+        &self,
+        session_id: SessionId,
+        limit: usize,
+    ) -> Result<Vec<TaskRecord>, CarlError> {
+        let limit = limit.min(64);
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT id FROM agent_tasks
+                 WHERE session_id = ?1
+                 ORDER BY updated_at DESC, id ASC
+                 LIMIT ?2",
+            )
+            .map_err(storage_error)?;
+        let task_ids = statement
+            .query_map(params![session_id.to_string(), limit as i64], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(storage_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(storage_error)?;
+        task_ids
+            .into_iter()
+            .map(|task_id| {
+                let task_id = task_id
+                    .parse::<TaskId>()
+                    .map_err(|_| storage_invariant("stored task ID is invalid"))?;
+                load_task_record(&self.connection, task_id)?
+                    .ok_or_else(|| storage_invariant("listed task disappeared"))
+            })
+            .collect()
+    }
+
+    pub fn task_has_steering_control(
+        &self,
+        task_id: TaskId,
+        control_id: &str,
+    ) -> Result<bool, CarlError> {
+        self.connection
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM task_steering
+                    WHERE task_id = ?1 AND control_id = ?2
+                 )",
+                params![task_id.to_string(), control_id],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(storage_error)
     }
 
     pub fn get_latest_task_checkpoint(
@@ -3586,6 +4123,15 @@ impl RuntimeStore {
     #[must_use]
     pub fn store(&self) -> &Store {
         &self.store
+    }
+
+    pub(crate) fn open_peer_store(&self) -> Result<Store, CarlError> {
+        let path = self
+            .store
+            .connection
+            .path()
+            .ok_or_else(|| storage_invariant("runtime database path is unavailable"))?;
+        Store::open(path)
     }
 
     #[must_use]
@@ -6057,7 +6603,7 @@ fn insert_task_projection(
                 workspace,
                 model.as_str(),
                 effort.as_codex_value(),
-                permission_mode.as_wire_str(),
+                stored_permission_mode(permission_mode),
                 revision_to_sql(snapshot.revision)?,
                 format_timestamp(created_at),
             ],
@@ -6162,6 +6708,22 @@ fn apply_task_child_projection(
                 )
                 .map_err(storage_error)?;
             require_projection_change(changed, "active task epoch projection is missing")?;
+        }
+        TaskEvent::EpochInterrupted { epoch_id, reason } => {
+            transaction
+                .execute(
+                    "INSERT INTO task_epoch_interruptions (
+                        task_id, epoch_id, reason, event_sequence, interrupted_at
+                     ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        task_id,
+                        epoch_id.to_string(),
+                        epoch_interrupt_reason_str(*reason),
+                        event_sequence,
+                        timestamp,
+                    ],
+                )
+                .map_err(storage_error)?;
         }
         TaskEvent::OperationIntentRecorded {
             operation_id,
@@ -6646,6 +7208,12 @@ const fn task_status_str(status: TaskStatus) -> &'static str {
         TaskStatus::Completing => "completing",
         TaskStatus::Completed => "completed",
         TaskStatus::Failed => "failed",
+    }
+}
+
+const fn epoch_interrupt_reason_str(reason: EpochInterruptReason) -> &'static str {
+    match reason {
+        EpochInterruptReason::PermissionTightening => "permission_tightening",
     }
 }
 
@@ -7878,6 +8446,37 @@ fn validate_canonical_frontend_cwd(cwd: &Path) -> Result<(), CarlError> {
         });
     }
     Ok(())
+}
+
+fn frontend_workspace_digest(workspace: &Path) -> Sha256Digest {
+    let mut hasher = Sha256::new();
+    hasher.update(b"carl.trusted-frontend-workspace.v1\0");
+    hasher.update(workspace.as_os_str().as_encoded_bytes());
+    Sha256Digest::from_bytes(hasher.finalize().into())
+}
+
+const fn stored_permission_mode(mode: PermissionMode) -> &'static str {
+    match mode {
+        PermissionMode::FullAccess => PermissionMode::BypassPermissions.as_wire_str(),
+        _ => mode.as_wire_str(),
+    }
+}
+
+const fn permission_profile_str(mode: PermissionMode) -> &'static str {
+    match mode.profile() {
+        crate::acp::PermissionProfile::ReadOnly => "read_only",
+        crate::acp::PermissionProfile::Approval => "approval",
+        crate::acp::PermissionProfile::FullAccess => "full_access",
+    }
+}
+
+fn permission_mode_from_profile(profile: &str) -> Result<PermissionMode, CarlError> {
+    match profile {
+        "read_only" => Ok(PermissionMode::Plan),
+        "approval" => Ok(PermissionMode::Default),
+        "full_access" => Ok(PermissionMode::FullAccess),
+        other => Err(invalid_stored_value("permission profile", other)),
+    }
 }
 
 fn validate_remote_display_code(display_code: &str) -> Result<(), CarlError> {

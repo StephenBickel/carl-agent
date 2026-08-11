@@ -34,9 +34,9 @@ use crate::storage::{
 use super::{
     CanonicalCheckpoint, CheckpointBuildInput, CheckpointId, ClauseStatus, CompactionDecision,
     CompletionClause, CompletionContract, CompletionDecision, ContextBudget, ContextEngine,
-    ContextInput, EpochId, EpochReport, EvidenceRef, ExactIdentifier, FilePostcondition,
-    FilePostconditionEntry, NormalizedOperationEvidence, OperationEvidence, OperationId,
-    OperationStatus, ProcessCheckpoint, ProgressAssessment, ProviderCheckpoint,
+    ContextInput, EpochId, EpochInterruptReason, EpochReport, EvidenceRef, ExactIdentifier,
+    FilePostcondition, FilePostconditionEntry, NormalizedOperationEvidence, OperationEvidence,
+    OperationId, OperationStatus, ProcessCheckpoint, ProgressAssessment, ProviderCheckpoint,
     ProviderRequestPurpose, RecoveryAttempt, RecoveryAttemptOutcome, RecoveryStrategy,
     RepositoryCheckpoint, TaskBudget, TaskEvent, TaskId, TaskSnapshot, TaskStatus,
     assess_progress_with_recovery_attempts, classify_effect, decide_completion, parse_epoch_report,
@@ -172,6 +172,7 @@ pub enum TaskEngineUpdate {
 pub(crate) enum TaskEngineControl {
     Steer {
         text: String,
+        control_id: Option<String>,
         session_id: SessionId,
         turn_id: crate::events::TurnId,
         acknowledgement: u64,
@@ -179,6 +180,13 @@ pub(crate) enum TaskEngineControl {
     Cancel {
         session_id: SessionId,
         turn_id: crate::events::TurnId,
+        acknowledgement: u64,
+    },
+    Configure {
+        model: ModelId,
+        effort: ReasoningEffort,
+        permission_mode: PermissionMode,
+        tightening: bool,
         acknowledgement: u64,
     },
     Approval {
@@ -232,6 +240,7 @@ struct RuntimeTask {
     completed_tools: u64,
     started_tools: u64,
     provider_requests: u64,
+    pending_configuration: Option<(ModelId, ReasoningEffort, PermissionMode)>,
 }
 
 struct ActiveOperation {
@@ -250,6 +259,7 @@ struct PendingRecovery {
 struct WorkEpochOutput {
     transcript: String,
     terminal_status: String,
+    configuration_boundary: bool,
 }
 
 pub trait TaskEngineStore: Send {
@@ -556,6 +566,7 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
             completed_tools: 0,
             started_tools: 0,
             provider_requests: 0,
+            pending_configuration: None,
         };
         let planned = self.plan_contract(task_id, &mut runtime, &input).await;
         self.tasks.insert(task_id, runtime);
@@ -1165,22 +1176,54 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
     }
 
     pub async fn steer(&mut self, task_id: TaskId, text: String) -> Result<(), TaskEngineError> {
+        self.steer_controlled(task_id, text, None).await
+    }
+
+    pub(crate) async fn steer_controlled(
+        &mut self,
+        task_id: TaskId,
+        text: String,
+        control_id: Option<&str>,
+    ) -> Result<(), TaskEngineError> {
         validate_steering(&text)?;
-        let runtime = self.tasks.get_mut(&task_id).ok_or_else(invalid_task)?;
         let digest = sha256(text.as_bytes());
+        if let Some(control_id) = control_id
+            && self
+                .store()
+                .task_has_steering_control(task_id, control_id)
+                .map_err(storage_error)?
+        {
+            return Ok(());
+        }
+        let runtime = self.tasks.get_mut(&task_id).ok_or_else(invalid_task)?;
         let steering_sequence = runtime.steering_sequence;
         runtime.steering_sequence = runtime
             .steering_sequence
             .checked_add(1)
             .ok_or_else(invalid_task)?;
         runtime.steering.push_back(text);
-        self.append(
-            task_id,
-            TaskEvent::SteeringQueued {
-                steering_sequence,
-                text_digest: digest,
-            },
-        )?;
+        if let Some(control_id) = control_id {
+            let revision = self.current_revision(task_id)?;
+            self.store_mut()
+                .append_controlled_task_steering(
+                    task_id,
+                    revision,
+                    steering_sequence,
+                    digest,
+                    control_id,
+                    Utc::now(),
+                )
+                .map_err(storage_error)?
+                .ok_or_else(|| error(TaskEngineErrorCode::Storage))?;
+        } else {
+            self.append(
+                task_id,
+                TaskEvent::SteeringQueued {
+                    steering_sequence,
+                    text_digest: digest,
+                },
+            )?;
+        }
         Ok(())
     }
 
@@ -1654,6 +1697,11 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                 objective: objective.clone(),
             });
             let provider_input = self.assemble_epoch_context(task_id, runtime, &objective)?;
+            if let Some((model, effort, permission_mode)) = runtime.pending_configuration.take() {
+                runtime.model = model;
+                runtime.effort = effort;
+                runtime.permission_mode = permission_mode;
+            }
             let purpose = if runtime.pending_recovery.is_some() || runtime.fresh_context_diagnosis {
                 ProviderRequestPurpose::Recovery
             } else {
@@ -1697,6 +1745,19 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
             let epoch_output = self
                 .drain_work_epoch(task_id, epoch_id, &provider_epoch_id, runtime)
                 .await?;
+            if epoch_output.configuration_boundary {
+                if runtime.estimated_tokens_since_usage > 0 {
+                    self.record_estimated_usage(task_id, epoch_id, runtime)?;
+                }
+                self.append(
+                    task_id,
+                    TaskEvent::EpochInterrupted {
+                        epoch_id,
+                        reason: EpochInterruptReason::PermissionTightening,
+                    },
+                )?;
+                continue;
+            }
             let report = match parse_epoch_report(&epoch_output.transcript) {
                 Ok(report) => report,
                 Err(_) => {
@@ -2147,7 +2208,7 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
     }
 
     fn assemble_epoch_context(
-        &self,
+        &mut self,
         task_id: TaskId,
         runtime: &mut RuntimeTask,
         objective: &str,
@@ -2160,9 +2221,27 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
             clause_evidence: Vec::new(),
             exact_identifiers: Vec::new(),
         };
-        let provisional =
-            self.build_checkpoint(task_id, runtime, CheckpointId::new(), &report, objective)?;
-        let package = context_engine(runtime)?
+        let provisional = match self.build_checkpoint(
+            task_id,
+            runtime,
+            CheckpointId::new(),
+            &report,
+            objective,
+        ) {
+            Ok(provisional) => provisional,
+            Err(error) => {
+                self.block_task(task_id, "next epoch checkpoint assembly failed")?;
+                return Err(error);
+            }
+        };
+        let engine = match context_engine(runtime) {
+            Ok(engine) => engine,
+            Err(error) => {
+                self.block_task(task_id, "next epoch context policy failed")?;
+                return Err(error);
+            }
+        };
+        let package = engine
             .assemble(ContextInput {
                 runtime_instructions: runtime_instructions().to_owned(),
                 owner_instructions: runtime.request.clone(),
@@ -2174,7 +2253,14 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                 retrieved_evidence: Vec::new(),
                 epoch_objective: objective.to_owned(),
             })
-            .map_err(|_| error(TaskEngineErrorCode::Context))?;
+            .map_err(|_| error(TaskEngineErrorCode::Context));
+        let package = match package {
+            Ok(package) => package,
+            Err(error) => {
+                self.block_task(task_id, "next epoch context package exceeded its bounds")?;
+                return Err(error);
+            }
+        };
         Ok(package.rendered)
     }
 
@@ -2411,6 +2497,7 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                         return Ok(WorkEpochOutput {
                             transcript: output,
                             terminal_status,
+                            configuration_boundary: false,
                         });
                     }
                     if !boundary_requested
@@ -2468,6 +2555,13 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                     return Err(error(TaskEngineErrorCode::Blocked));
                 }
                 Next::Control(Some(control)) => {
+                    let tightening_configuration = matches!(
+                        &control,
+                        TaskEngineControl::Configure {
+                            tightening: true,
+                            ..
+                        }
+                    );
                     let acknowledgement = match &control {
                         TaskEngineControl::Steer {
                             acknowledgement, ..
@@ -2476,6 +2570,9 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                             acknowledgement, ..
                         }
                         | TaskEngineControl::Approval {
+                            acknowledgement, ..
+                        }
+                        | TaskEngineControl::Configure {
                             acknowledgement, ..
                         } => *acknowledgement,
                     };
@@ -2506,6 +2603,34 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                             "provider work control failed",
                         )
                         .await?;
+                        return Err(error(TaskEngineErrorCode::Blocked));
+                    }
+                    if tightening_configuration && operations.is_empty() {
+                        return Ok(WorkEpochOutput {
+                            transcript: String::new(),
+                            terminal_status: "interrupted".to_owned(),
+                            configuration_boundary: true,
+                        });
+                    }
+                    if tightening_configuration {
+                        let reason =
+                            "permission tightening interrupted operations with uncertain outcome";
+                        for operation in operations.values() {
+                            self.close_operation_with_evidence(
+                                task_id,
+                                operation.operation_id,
+                                OperationStatus::Uncertain,
+                                reason,
+                            )?;
+                        }
+                        self.append(
+                            task_id,
+                            TaskEvent::EpochInterrupted {
+                                epoch_id,
+                                reason: EpochInterruptReason::PermissionTightening,
+                            },
+                        )?;
+                        self.block_task(task_id, reason)?;
                         return Err(error(TaskEngineErrorCode::Blocked));
                     }
                 }
@@ -2585,11 +2710,21 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
         match control {
             TaskEngineControl::Steer {
                 text,
+                control_id,
                 session_id,
                 turn_id,
                 ..
             } => {
                 validate_steering(&text)?;
+                let text_digest = sha256(text.as_bytes());
+                if let Some(control_id) = control_id.as_deref()
+                    && self
+                        .store()
+                        .task_has_steering_control(task_id, control_id)
+                        .map_err(storage_error)?
+                {
+                    return Ok(());
+                }
                 self.store_mut()
                     .append(
                         session_id,
@@ -2602,13 +2737,28 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                     .steering_sequence
                     .checked_add(1)
                     .ok_or_else(invalid_task)?;
-                self.append(
-                    task_id,
-                    TaskEvent::SteeringQueued {
-                        steering_sequence,
-                        text_digest: sha256(text.as_bytes()),
-                    },
-                )?;
+                if let Some(control_id) = control_id.as_deref() {
+                    let revision = self.current_revision(task_id)?;
+                    self.store_mut()
+                        .append_controlled_task_steering(
+                            task_id,
+                            revision,
+                            steering_sequence,
+                            text_digest,
+                            control_id,
+                            Utc::now(),
+                        )
+                        .map_err(storage_error)?
+                        .ok_or_else(|| error(TaskEngineErrorCode::Storage))?;
+                } else {
+                    self.append(
+                        task_id,
+                        TaskEvent::SteeringQueued {
+                            steering_sequence,
+                            text_digest,
+                        },
+                    )?;
+                }
                 self.port
                     .steer(&runtime.context_id, provider_epoch_id, text)
                     .await
@@ -2628,6 +2778,22 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                     Some((session_id, turn_id)),
                 )
                 .await
+            }
+            TaskEngineControl::Configure {
+                model,
+                effort,
+                permission_mode,
+                tightening,
+                ..
+            } => {
+                runtime.pending_configuration = Some((model, effort, permission_mode));
+                if tightening {
+                    self.port
+                        .interrupt(&runtime.context_id, provider_epoch_id)
+                        .await
+                        .map_err(provider_error)?;
+                }
+                Ok(())
             }
             TaskEngineControl::Approval { .. } => Err(error(TaskEngineErrorCode::Blocked)),
         }
@@ -3375,6 +3541,9 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                 }
                 | TaskEngineControl::Approval {
                     acknowledgement, ..
+                }
+                | TaskEngineControl::Configure {
+                    acknowledgement, ..
                 } => *acknowledgement,
             };
             match control {
@@ -3468,6 +3637,44 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                 TaskEngineControl::Steer { .. } => {
                     self.acknowledge(acknowledgement, Err(error(TaskEngineErrorCode::Blocked)))
                         .await;
+                }
+                TaskEngineControl::Configure {
+                    model,
+                    effort,
+                    permission_mode,
+                    tightening,
+                    ..
+                } => {
+                    runtime.pending_configuration = Some((model, effort, permission_mode));
+                    if tightening {
+                        let interrupted = self
+                            .port
+                            .interrupt(&runtime.context_id, &request.epoch_id)
+                            .await
+                            .map_err(provider_error);
+                        self.acknowledge(acknowledgement, interrupted.clone()).await;
+                        let reason = if interrupted.is_ok() {
+                            "permission tightening interrupted an operation awaiting approval"
+                        } else {
+                            "permission tightening could not confirm interruption of an operation awaiting approval"
+                        };
+                        self.close_operation_with_evidence(
+                            task_id,
+                            operation_id,
+                            OperationStatus::Uncertain,
+                            reason,
+                        )?;
+                        self.append(
+                            task_id,
+                            TaskEvent::EpochInterrupted {
+                                epoch_id,
+                                reason: EpochInterruptReason::PermissionTightening,
+                            },
+                        )?;
+                        self.block_task(task_id, reason)?;
+                        return Err(error(TaskEngineErrorCode::Blocked));
+                    }
+                    self.acknowledge(acknowledgement, Ok(())).await;
                 }
             }
         }
@@ -3883,7 +4090,7 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                         replacement_bound_sequence = Some(envelope.sequence);
                     }
                 }
-                TaskEvent::EpochFinished { .. }
+                TaskEvent::EpochFinished { .. } | TaskEvent::EpochInterrupted { .. }
                     if replacement_bound_sequence
                         .is_some_and(|sequence| envelope.sequence > sequence) =>
                 {
@@ -4023,6 +4230,7 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
             completed_tools,
             started_tools,
             provider_requests,
+            pending_configuration: None,
         })
     }
 }
@@ -4059,6 +4267,9 @@ const fn control_acknowledgement(control: &TaskEngineControl) -> u64 {
             acknowledgement, ..
         }
         | TaskEngineControl::Approval {
+            acknowledgement, ..
+        }
+        | TaskEngineControl::Configure {
             acknowledgement, ..
         } => *acknowledgement,
     }

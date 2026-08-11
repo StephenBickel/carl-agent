@@ -25,5 +25,6 @@ pub use server::{
 };
 pub use session::{
     ConfigOutcome, ConfigSelection, KernelError, KernelErrorCode, KernelSession, KernelUpdate,
-    NewSessionRequest, Prompt, PromptOutcome, PromptStopReason, ToolKind, ToolStatus,
+    NewSessionRequest, Prompt, PromptOutcome, PromptStopReason, TaskContextView, TaskView,
+    ToolKind, ToolStatus,
 };

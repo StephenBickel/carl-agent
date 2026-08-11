@@ -684,7 +684,7 @@ impl CodexAppServer {
                         PermissionMode::AcceptEdits => {
                             approval.kind() == CodexApprovalKind::Command
                         }
-                        PermissionMode::BypassPermissions => true,
+                        PermissionMode::FullAccess | PermissionMode::BypassPermissions => true,
                         PermissionMode::Plan | PermissionMode::DontAsk => false,
                     };
                     if surface {
@@ -2050,7 +2050,9 @@ fn thread_mode(mode: PermissionMode) -> (&'static str, &'static str) {
         PermissionMode::Plan => ("never", "read-only"),
         PermissionMode::Default | PermissionMode::AcceptEdits => ("on-request", "workspace-write"),
         PermissionMode::DontAsk => ("never", "workspace-write"),
-        PermissionMode::BypassPermissions => ("on-request", "read-only"),
+        PermissionMode::FullAccess | PermissionMode::BypassPermissions => {
+            ("on-request", "read-only")
+        }
     }
 }
 
@@ -2077,7 +2079,7 @@ fn turn_mode(mode: PermissionMode) -> (&'static str, Value) {
                 "excludeSlashTmp":false
             }),
         ),
-        PermissionMode::BypassPermissions => (
+        PermissionMode::FullAccess | PermissionMode::BypassPermissions => (
             "on-request",
             json!({"type":"readOnly","networkAccess":false}),
         ),

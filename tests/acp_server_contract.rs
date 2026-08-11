@@ -12,8 +12,9 @@ use carl::runtime::agent_port::{
     AgentPort, AgentPortError, AgentPortErrorCode, AgentProcess, AgentRequestId, EffectDecision,
     ResumeAgentContext, StartAgentContext, StartAgentEpoch,
 };
+use carl::runtime::task::{ClauseStatus, CompletionClause, CompletionContract, TaskBudget};
 use carl::sidecar::DataRootLock;
-use carl::storage::RuntimeStore;
+use carl::storage::{NewTask, RuntimeStore, Store};
 use chrono::Utc;
 use serde_json::{Value, json};
 use tokio::io::{AsyncWriteExt, BufReader, DuplexStream, ReadHalf, WriteHalf};
@@ -69,6 +70,45 @@ async fn initialization_sessions_configuration_and_prompt_updates_are_exact() ->
         assert_eq!(
             created.value()["result"]["configOptions"][0]["configId"],
             "model"
+        );
+
+        client
+            .send(json!({
+                "jsonrpc":"2.0","id":20,"method":"_task/list","params":{
+                    "sessionId":session_id
+                }
+            }))
+            .await?;
+        let listed = client.read().await?;
+        assert_eq!(
+            listed.value()["result"]["tasks"],
+            json!([]),
+            "{}",
+            listed.value()
+        );
+        client
+            .send(json!({
+                "jsonrpc":"2.0","id":21,"method":"_task/cancel","params":{
+                    "sessionId":session_id,
+                    "taskId":Uuid::new_v4().to_string()
+                }
+            }))
+            .await?;
+        assert_eq!(client.read().await?.value()["error"]["code"], -32602);
+
+        client
+            .send(json!({
+                "jsonrpc":"2.0","id":22,"method":"session/prompt","params":{
+                    "sessionId":session_id,
+                    "prompt":[{"type":"text","text":"/status"}]
+                }
+            }))
+            .await?;
+        let status_update = client.read().await?;
+        assert_eq!(status_update.method(), Some("session/update"));
+        assert_eq!(
+            client.read().await?.value()["result"]["stopReason"],
+            "end_turn"
         );
 
         client
@@ -161,6 +201,21 @@ async fn steering_and_idless_cancellation_remain_responsive_during_prompt() -> T
         }
         tokio::task::yield_now().await;
     }
+    for (id, config_id, value) in [
+        (39, "model", "gpt-5.6-codex"),
+        (40, "thought_level", "high"),
+        (41, "mode", "fullAccess"),
+        (42, "mode", "plan"),
+    ] {
+        client
+            .send(json!({
+                "jsonrpc":"2.0","id":id,"method":"session/set_config_option","params":{
+                    "sessionId":session_id,"configId":config_id,"value":value
+                }
+            }))
+            .await?;
+        assert!(client.read().await?.value()["result"]["configOptions"].is_array());
+    }
     client
         .send(json!({"jsonrpc":"2.0","id":4,"method":"_session/steering","params":{"sessionId":session_id,"prompt":[{"type":"text","text":"focus on parsing"}]}}))
         .await?;
@@ -172,11 +227,99 @@ async fn steering_and_idless_cancellation_remain_responsive_during_prompt() -> T
     let cancelled = client.read().await?;
     assert_eq!(cancelled.value()["id"], 3);
     assert_eq!(cancelled.value()["result"]["stopReason"], "cancelled");
+    client
+        .send(json!({"jsonrpc":"2.0","id":5,"method":"session/prompt","params":{"sessionId":session_id,"prompt":[{"type":"text","text":"next epoch"}]}}))
+        .await?;
+    for _ in 0..100 {
+        if state.lock().unwrap().starts == 2 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    client
+        .send(json!({"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":session_id}}))
+        .await?;
+    assert_eq!(client.read().await?.value()["id"], 5);
     {
         let state = state.lock().unwrap();
         assert_eq!(state.steers, ["focus on parsing"]);
-        assert_eq!(state.interrupts, 1);
+        assert_eq!(state.interrupts, 3);
+        assert_eq!(state.start_requests[1].model.as_str(), "gpt-5.6-codex");
+        assert_eq!(state.start_requests[1].effort, ReasoningEffort::High);
+        assert_eq!(
+            state.start_requests[1].permission_mode,
+            carl::acp::PermissionMode::Plan
+        );
     }
+    client.finish().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn task_resume_executes_a_bound_queued_task_and_returns_its_result() -> TestResult {
+    let layout = Layout::new()?;
+    let kernel = Kernel::start_with_ports(
+        layout.runtime()?,
+        Box::new(FakePort::autonomous_completion()?),
+        None,
+    )
+    .await?;
+    let mut client = Client::start(AcpServer::new(kernel, Frontend::Acp)).await;
+    client
+        .send(json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":2,"clientInfo":{"name":"contract","version":"1"}}}))
+        .await?;
+    client.read().await?;
+    client
+        .send(json!({"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":layout.workspace,"mcpServers":[]}}))
+        .await?;
+    let session_id = client.read().await?.value()["result"]["sessionId"]
+        .as_str()
+        .ok_or("session missing")?
+        .to_owned();
+
+    let mut store = Store::open(layout.root.join("carl.sqlite3"))?;
+    let local_session = store
+        .get_frontend_session(&session_id)?
+        .ok_or("frontend binding missing")?
+        .session_id;
+    let task = store.create_task(NewTask {
+        session_id: local_session,
+        workspace: layout.workspace.clone(),
+        contract: CompletionContract {
+            version: 1,
+            goal: "Finish the queued task".to_owned(),
+            constraints: Vec::new(),
+            clauses: vec![CompletionClause {
+                id: "report".to_owned(),
+                description: "Report completion".to_owned(),
+                required: false,
+                status: ClauseStatus::Pending,
+                evidence: Vec::new(),
+            }],
+        },
+        model: ModelId::parse("gpt-5.6-codex")?,
+        effort: ReasoningEffort::Medium,
+        permission_mode: carl::acp::PermissionMode::FullAccess,
+        budget: TaskBudget::default(),
+        created_at: Utc::now(),
+    })?;
+    drop(store);
+
+    client
+        .send(
+            json!({"jsonrpc":"2.0","id":3,"method":"_task/resume","params":{
+                "sessionId":session_id,"taskId":task.snapshot.task_id.to_string(),
+                "idempotencyKey":"resume-success"
+            }}),
+        )
+        .await?;
+    let resumed = client.read().await?;
+    assert_eq!(
+        resumed.value()["result"]["outcome"],
+        "accepted",
+        "{}",
+        resumed.value(),
+    );
     client.finish().await?;
     Ok(())
 }
@@ -239,6 +382,7 @@ struct FakePort {
 struct PortState {
     events: VecDeque<AgentEvent>,
     starts: usize,
+    start_requests: Vec<StartAgentEpoch>,
     steers: Vec<String>,
     interrupts: usize,
 }
@@ -272,11 +416,31 @@ impl FakePort {
         Ok(Self::with_events([]))
     }
 
+    fn autonomous_completion() -> TestResult<Self> {
+        Ok(Self::with_events([
+            AgentEvent::EpochStarted {
+                context_id: context()?,
+                epoch_id: epoch()?,
+            },
+            AgentEvent::AssistantDelta {
+                context_id: context()?,
+                epoch_id: epoch()?,
+                text: "Done. <carl-epoch-report>{\"schema_version\":1,\"disposition\":\"complete\",\"summary\":\"Done\",\"clause_evidence\":[],\"exact_identifiers\":[]}</carl-epoch-report>".into(),
+            },
+            AgentEvent::EpochCompleted {
+                context_id: context()?,
+                epoch_id: epoch()?,
+                status: "completed".into(),
+            },
+        ]))
+    }
+
     fn with_events<const N: usize>(events: [AgentEvent; N]) -> Self {
         Self {
             state: Arc::new(Mutex::new(PortState {
                 events: events.into(),
                 starts: 0,
+                start_requests: Vec::new(),
                 steers: Vec::new(),
                 interrupts: 0,
             })),
@@ -315,10 +479,11 @@ impl AgentPort for FakePort {
     fn compact_context(&mut self, _context_id: &AgentContextId) -> AgentFuture<'_, ()> {
         Box::pin(async { Ok(()) })
     }
-    fn start_epoch(&mut self, _request: StartAgentEpoch) -> AgentFuture<'_, AgentEpochId> {
+    fn start_epoch(&mut self, request: StartAgentEpoch) -> AgentFuture<'_, AgentEpochId> {
         let state = Arc::clone(&self.state);
         Box::pin(async move {
             state.lock().unwrap().starts += 1;
+            state.lock().unwrap().start_requests.push(request);
             epoch()
         })
     }

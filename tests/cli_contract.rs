@@ -1,4 +1,4 @@
-use carl::cli::{AcpEffort, AcpPermissionMode, Cli, Command};
+use carl::cli::{AcpEffort, AcpPermissionMode, Cli, Command, TrustCommand};
 use clap::Parser;
 use predicates::prelude::PredicateBooleanExt;
 
@@ -41,6 +41,21 @@ fn acp_startup_options_parse_exactly() {
         parsed.command,
         Command::Acp(args) if args.dangerously_bypass_permissions
     ));
+
+    let parsed = Cli::try_parse_from(["carl", "acp", "--permission-mode", "fullAccess"])
+        .expect("canonical full access parses");
+    let Command::Acp(args) = parsed.command else {
+        panic!("expected ACP command");
+    };
+    assert_eq!(args.permission_mode, Some(AcpPermissionMode::FullAccess));
+    assert_eq!(
+        carl::acp::PermissionMode::from(AcpPermissionMode::FullAccess),
+        carl::acp::PermissionMode::FullAccess
+    );
+    assert_eq!(
+        carl::acp::PermissionMode::from(AcpPermissionMode::BypassPermissions).profile(),
+        carl::acp::PermissionProfile::FullAccess
+    );
 }
 
 #[test]
@@ -58,4 +73,25 @@ fn acp_rejects_ambiguous_bypass_and_secret_flags() {
     for flag in ["--buzz-private-key", "--buzz-relay-url", "--openai-api-key"] {
         assert!(Cli::try_parse_from(["carl", "acp", flag, "secret"]).is_err());
     }
+}
+
+#[test]
+fn local_buzz_trust_command_requires_an_actor_and_absolute_workspace() {
+    let parsed = Cli::try_parse_from([
+        "carl",
+        "trust",
+        "buzz",
+        "--actor",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "--workspace",
+        "/tmp/carl-workspace",
+    ])
+    .expect("trusted owner command parses");
+    assert!(matches!(
+        parsed.command,
+        Command::Trust {
+            command: TrustCommand::Buzz { actor, workspace }
+        } if actor == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            && workspace == std::path::Path::new("/tmp/carl-workspace")
+    ));
 }

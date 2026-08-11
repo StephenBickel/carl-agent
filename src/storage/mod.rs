@@ -10,5 +10,7 @@ pub use repository::{
     RemoteCodeClaim, RemoteCodeKind, RemoteCodeRecord, RuntimeStore, SessionDelegateSettingsRecord,
     SessionRecord, Store, SubscriptionRunBaselineEntryRecord, SubscriptionRunBaselineRecord,
     SubscriptionRunInspectionOutcome, SubscriptionRunInspectionRecord,
-    SubscriptionRunProposalRecord, SubscriptionRunRecord, TaskRecord, VerificationCompletionRecord,
+    SubscriptionRunProposalRecord, SubscriptionRunRecord, TaskControlMutationClaim,
+    TaskControlMutationInput, TaskRecord, TrustedFrontendOwnerInput, TrustedFrontendOwnerRecord,
+    VerificationCompletionRecord,
 };

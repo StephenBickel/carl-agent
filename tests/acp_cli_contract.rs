@@ -31,6 +31,10 @@ fn main() {
                 "ACP isolates Codex and enforces one data-root owner",
                 acp_isolates_codex_and_enforces_one_owner,
             ),
+            trial(
+                "local Buzz trust persists an exact full-access owner binding",
+                local_buzz_trust_persists_exact_owner,
+            ),
         ],
     )
     .exit();
@@ -197,6 +201,40 @@ fn acp_isolates_codex_and_enforces_one_owner() -> TestResult {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(output.stdout.is_empty());
+    Ok(())
+}
+
+fn local_buzz_trust_persists_exact_owner() -> TestResult {
+    let layout = Layout::new()?;
+    let actor = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    for _ in 0..2 {
+        let output = Command::new(assert_cmd::cargo::cargo_bin!("carl"))
+            .current_dir(&layout.workspace)
+            .env_clear()
+            .env("CARL_DATA_DIR", fs::canonicalize(&layout.data)?)
+            .args(["trust", "buzz", "--actor", actor, "--workspace"])
+            .arg(fs::canonicalize(&layout.workspace)?)
+            .output()?;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value: Value = serde_json::from_slice(&output.stdout)?;
+        assert_eq!(value["trusted"], true);
+        assert_eq!(value["permission_mode"], "fullAccess");
+        assert_eq!(value["channel_bound"], false);
+    }
+    let connection = rusqlite::Connection::open(layout.data.join("carl.sqlite3"))?;
+    assert_eq!(
+        connection.query_row(
+            "SELECT actor_id || ':' || permission_mode || ':' || COALESCE(channel_id, 'null')
+             FROM trusted_frontend_owners WHERE frontend = 'buzz'",
+            [],
+            |row| row.get::<_, String>(0),
+        )?,
+        format!("{actor}:bypassPermissions:null")
+    );
     Ok(())
 }
 

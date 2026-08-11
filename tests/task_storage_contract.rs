@@ -5,14 +5,17 @@ use std::path::{Path, PathBuf};
 use carl::acp::PermissionMode;
 use carl::delegates::{ModelId, ReasoningEffort};
 use carl::error::CarlError;
-use carl::policy::Sha256Digest;
+use carl::policy::{Frontend, Sha256Digest};
 use carl::runtime::task::{
     CheckpointId, ClauseStatus, CompletionClause, CompletionContract, ContextPackageId,
-    EffectClass, EpochId, OperationId, OperationStatus, TaskBudget, TaskEvent, TaskSnapshot,
-    TaskStatus, reduce_task,
+    EffectClass, EpochId, EpochInterruptReason, OperationId, OperationStatus, TaskBudget,
+    TaskEvent, TaskSnapshot, TaskStatus, reduce_task,
 };
 use carl::sidecar::DataRootLock;
-use carl::storage::{NewTask, RuntimeStore, Store};
+use carl::storage::{
+    ClientName, ExternalSessionId, NewFrontendSession, NewTask, RuntimeStore, Store,
+    TaskControlMutationClaim, TaskControlMutationInput,
+};
 use chrono::{DateTime, Utc};
 use rusqlite::Connection;
 use uuid::Uuid;
@@ -21,6 +24,70 @@ struct TemporaryTaskDatabase {
     root: PathBuf,
     database: PathBuf,
     workspace: PathBuf,
+}
+
+#[test]
+fn permission_tightening_interrupts_an_epoch_without_provider_report_evidence()
+-> Result<(), Box<dyn Error>> {
+    let fixture = TemporaryTaskDatabase::new()?;
+    let mut store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let created = store.create_task(new_task(session.id, &fixture.workspace))?;
+    let task_id = created.snapshot.task_id;
+    let epoch_id = EpochId::new();
+    let active = store
+        .append_task_event(
+            task_id,
+            created.revision,
+            TaskEvent::StateTransitioned {
+                from: TaskStatus::Queued,
+                to: TaskStatus::Active,
+                reason: "execution started".to_owned(),
+            },
+            timestamp(1),
+        )?
+        .expect("revision matches");
+    let started = store
+        .append_task_event(
+            task_id,
+            active.revision,
+            TaskEvent::EpochStarted {
+                epoch_id,
+                objective: "apply safer permissions".to_owned(),
+            },
+            timestamp(2),
+        )?
+        .expect("revision matches");
+    let interrupted = store
+        .append_task_event(
+            task_id,
+            started.revision,
+            TaskEvent::EpochInterrupted {
+                epoch_id,
+                reason: EpochInterruptReason::PermissionTightening,
+            },
+            timestamp(3),
+        )?
+        .expect("revision matches");
+
+    assert_eq!(interrupted.snapshot.status, TaskStatus::Active);
+    assert_eq!(interrupted.snapshot.active_epoch, None);
+    let events = store.read_task_events(task_id)?;
+    assert_eq!(interrupted.snapshot, replay(&events)?);
+    let wire = serde_json::to_value(&events.last().expect("interrupt event").event)?;
+    assert_eq!(wire["event"]["task_event"], "epoch_interrupted");
+    assert_eq!(wire["event"]["reason"], "permission_tightening");
+
+    let connection = Connection::open(&fixture.database)?;
+    let projection = connection.query_row(
+        "SELECT reason, event_sequence FROM task_epoch_interruptions
+         WHERE task_id = ?1 AND epoch_id = ?2",
+        [task_id.to_string(), epoch_id.to_string()],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+    )?;
+    assert_eq!(projection.0, "permission_tightening");
+    assert!(projection.1 > 0);
+    Ok(())
 }
 
 impl TemporaryTaskDatabase {
@@ -96,6 +163,108 @@ fn replay(events: &[carl::events::EventEnvelope]) -> Result<TaskSnapshot, Box<dy
         snapshot = Some(reduce_task(snapshot, event)?);
     }
     Ok(snapshot.expect("task has a creation event"))
+}
+
+#[test]
+fn task_control_receipts_survive_both_crash_windows_without_key_rebinding()
+-> Result<(), Box<dyn Error>> {
+    let fixture = TemporaryTaskDatabase::new()?;
+    let mut store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let external_session_id = ExternalSessionId::try_from("task-control-session")?;
+    store.bind_frontend_session(NewFrontendSession {
+        frontend: Frontend::Acp,
+        external_session_id: external_session_id.clone(),
+        session_id: session.id,
+        cwd: fs::canonicalize(&fixture.workspace)?,
+        protocol_version: 2,
+        client_name: ClientName::try_from("task-control-test")?,
+        permission_mode: PermissionMode::FullAccess,
+        channel_id: None,
+        created_at: timestamp(0),
+    })?;
+    let created = store.create_task(new_task(session.id, &fixture.workspace))?;
+    let task_id = created.snapshot.task_id;
+    let request_digest =
+        Sha256Digest::parse("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")?;
+    let input = TaskControlMutationInput {
+        external_session_id,
+        idempotency_key: "receipt-1".to_owned(),
+        task_id,
+        method: "steer".to_owned(),
+        request_digest,
+        result_json: format!(r#"{{"outcome":"accepted","taskId":"{task_id}"}}"#),
+        created_at: timestamp(1),
+    };
+    assert_eq!(
+        store.claim_task_control_mutation(input.clone())?,
+        TaskControlMutationClaim::Fresh
+    );
+    drop(store);
+
+    let mut store = Store::open(&fixture.database)?;
+    assert_eq!(
+        store.claim_task_control_mutation(input.clone())?,
+        TaskControlMutationClaim::Pending,
+        "a reservation-only crash must not replay false success"
+    );
+    let text_digest = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let first_control = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    let second_control = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+    let first_steering = store
+        .append_controlled_task_steering(
+            task_id,
+            created.revision,
+            0,
+            text_digest.to_owned(),
+            first_control,
+            timestamp(2),
+        )?
+        .ok_or("first controlled steering was not stored")?;
+    store
+        .append_controlled_task_steering(
+            task_id,
+            first_steering.revision,
+            1,
+            text_digest.to_owned(),
+            second_control,
+            timestamp(2),
+        )?
+        .ok_or("second controlled steering was not stored")?;
+    assert!(store.task_has_steering_control(task_id, first_control)?);
+    assert!(store.task_has_steering_control(task_id, second_control)?);
+    assert_eq!(
+        rusqlite::Connection::open(&fixture.database)?.query_row(
+            "SELECT COUNT(*) FROM task_steering WHERE task_id = ?1 AND text_digest = ?2",
+            rusqlite::params![task_id.to_string(), text_digest],
+            |row| row.get::<_, i64>(0),
+        )?,
+        2,
+        "identical text under distinct control identities is two mutation intents"
+    );
+    let completed = store.complete_task_control_mutation(TaskControlMutationInput {
+        created_at: timestamp(3),
+        ..input.clone()
+    })?;
+    drop(store);
+
+    let store = Store::open(&fixture.database)?;
+    assert_eq!(
+        store.claim_task_control_mutation(input.clone())?,
+        TaskControlMutationClaim::Replay {
+            result_json: completed,
+        }
+    );
+    assert!(
+        store
+            .claim_task_control_mutation(TaskControlMutationInput {
+                method: "cancel".to_owned(),
+                ..input
+            })
+            .is_err(),
+        "method or payload reuse must never rebind an idempotency key"
+    );
+    Ok(())
 }
 
 #[test]

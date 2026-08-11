@@ -11,6 +11,9 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use carl::policy::{ActorId, Frontend};
+use carl::storage::{ChannelId, Store};
+use chrono::Utc;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -105,6 +108,146 @@ impl Layout {
         }
     }
 
+    pub fn trust_owner(&self) -> TestResult {
+        let output = Command::new(assert_cmd::cargo::cargo_bin!("carl"))
+            .current_dir(&self.workspace)
+            .env_clear()
+            .env("CARL_DATA_DIR", fs::canonicalize(&self.data)?)
+            .args(["trust", "buzz", "--actor", ACTOR_HEX, "--workspace"])
+            .arg(fs::canonicalize(&self.workspace)?)
+            .output()?;
+        if !output.status.success() {
+            return Err(format!(
+                "owner trust failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    pub fn seed_admitted_event(&self, event_id: &str, channel_id: &str) -> TestResult {
+        let store = Store::open(self.data.join("carl.sqlite3"))?;
+        store.admit_trusted_frontend_message(
+            Frontend::Buzz,
+            &ActorId::parse(ACTOR_HEX)?,
+            &ChannelId::try_from(channel_id)?,
+            &fs::canonicalize(&self.workspace)?,
+            event_id,
+            Utc::now(),
+        )?;
+        Ok(())
+    }
+
+    pub fn provider_work_count(&self) -> TestResult<usize> {
+        Ok(self
+            .provider_requests()?
+            .iter()
+            .filter(|request| {
+                matches!(
+                    request["method"].as_str(),
+                    Some("thread/start" | "turn/start")
+                )
+            })
+            .count())
+    }
+
+    pub fn provider_requests(&self) -> TestResult<Vec<Value>> {
+        let path = self.workspace.join(".provider-requests.jsonl");
+        let requests = match fs::read_to_string(path) {
+            Ok(contents) => contents
+                .get(..=contents.rfind('\n').unwrap_or(0))
+                .unwrap_or_default()
+                .lines()
+                .map(serde_json::from_str::<Value>)
+                .collect::<Result<Vec<_>, _>>()?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => return Err(error.into()),
+        };
+        Ok(requests)
+    }
+
+    pub fn provider_method_count(&self, method: &str) -> TestResult<usize> {
+        Ok(self
+            .provider_requests()?
+            .iter()
+            .filter(|request| request["method"] == method)
+            .count())
+    }
+
+    pub fn task_count(&self) -> TestResult<i64> {
+        let connection = rusqlite::Connection::open(self.data.join("carl.sqlite3"))?;
+        Ok(connection.query_row("SELECT COUNT(*) FROM agent_tasks", [], |row| row.get(0))?)
+    }
+
+    pub fn latest_task_id(&self) -> TestResult<String> {
+        let connection = rusqlite::Connection::open(self.data.join("carl.sqlite3"))?;
+        Ok(connection.query_row(
+            "SELECT id FROM agent_tasks ORDER BY updated_at DESC, id ASC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub fn started_operation_count(&self) -> TestResult<i64> {
+        self.operation_status_count("started")
+    }
+
+    pub fn operation_status_count(&self, status: &str) -> TestResult<i64> {
+        let connection = rusqlite::Connection::open(self.data.join("carl.sqlite3"))?;
+        Ok(connection.query_row(
+            "SELECT COUNT(*) FROM task_operations WHERE status = ?1",
+            [status],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub fn task_lifecycle_event_count(&self, event: &str) -> TestResult<i64> {
+        let connection = rusqlite::Connection::open(self.data.join("carl.sqlite3"))?;
+        Ok(connection.query_row(
+            "SELECT COUNT(*) FROM events
+             WHERE json_extract(event_json, '$.type') = 'task_lifecycle'
+               AND json_extract(event_json, '$.event.task_event') = ?1",
+            [event],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub fn permission_tightening_interrupt_count(&self) -> TestResult<i64> {
+        let connection = rusqlite::Connection::open(self.data.join("carl.sqlite3"))?;
+        Ok(connection.query_row(
+            "SELECT COUNT(*) FROM events
+             WHERE json_extract(event_json, '$.type') = 'task_lifecycle'
+               AND json_extract(event_json, '$.event.task_event') = 'epoch_interrupted'
+               AND json_extract(event_json, '$.event.reason') = 'permission_tightening'",
+            [],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub fn task_lifecycle_events(&self) -> TestResult<Vec<Value>> {
+        let connection = rusqlite::Connection::open(self.data.join("carl.sqlite3"))?;
+        let mut statement = connection.prepare(
+            "SELECT event_json FROM events
+             WHERE json_extract(event_json, '$.type') = 'task_lifecycle'
+             ORDER BY sequence",
+        )?;
+        Ok(statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .map(|event| {
+                event.and_then(|event| {
+                    serde_json::from_str(&event).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+
     pub fn wait_for_provider_method(&self, method: &str, minimum: usize) -> TestResult {
         let path = self.workspace.join(".provider-requests.jsonl");
         for _ in 0..400 {
@@ -124,7 +267,11 @@ impl Layout {
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        Err(format!("provider method {method} was not observed {minimum} times").into())
+        let requests = fs::read_to_string(&path).unwrap_or_default();
+        Err(format!(
+            "provider method {method} was not observed {minimum} times; requests: {requests}"
+        )
+        .into())
     }
 }
 
@@ -330,6 +477,28 @@ pub fn prompt_frame_for_channel(
     })
 }
 
+pub fn prompt_frame_for_identity(
+    id: i64,
+    session: &str,
+    text: &str,
+    event_id: &str,
+    channel_id: &str,
+    actor_hex: &str,
+    kind: u32,
+) -> Value {
+    json!({
+        "jsonrpc":"2.0", "id":id, "method":"session/prompt", "params":{
+            "sessionId":session,
+            "prompt":[
+                {"type":"text","text":text},
+                {"type":"text","text":format!(
+                    "Event ID: {event_id}\nChannel: Carl Test (#{channel_id})\nKind: {kind}\nFrom: Owner (hex: {actor_hex})\nTime: 2026-08-10T12:00:00Z\nContent: command"
+                )}
+            ]
+        }
+    })
+}
+
 fn replace_string(value: &mut Value, needle: &str, replacement: &str) {
     match value {
         Value::String(text) if text == needle => *text = replacement.to_owned(),
@@ -529,7 +698,30 @@ fn app_server_fixture() -> i32 {
                 }
             }
             Some("turn/steer") => {
+                let boundary_configuration = request
+                    .pointer("/params/input/0/text")
+                    .and_then(Value::as_str)
+                    == Some("boundary configuration");
                 if respond(id, json!({"turnId":request["params"]["expectedTurnId"]})).is_err() {
+                    return 74;
+                }
+                if boundary_configuration {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                if boundary_configuration
+                    && agent_delta(
+                        request["params"]["threadId"].as_str().unwrap_or_default(),
+                        request["params"]["expectedTurnId"].as_str().unwrap_or_default(),
+                        "Reached a safe boundary. <carl-epoch-report>{\"schema_version\":1,\"disposition\":\"continue\",\"summary\":\"Apply queued configuration\",\"next_objective\":\"Verify queued configuration\",\"clause_evidence\":[],\"exact_identifiers\":[]}</carl-epoch-report>",
+                    )
+                    .and_then(|()| {
+                        turn_completed(
+                            request["params"]["threadId"].as_str().unwrap_or_default(),
+                            request["params"]["expectedTurnId"].as_str().unwrap_or_default(),
+                        )
+                    })
+                    .is_err()
+                {
                     return 74;
                 }
             }

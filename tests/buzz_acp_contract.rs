@@ -89,6 +89,7 @@ fn fixture_hashes() -> TestResult {
 
 fn process_boundary_conforms() -> TestResult {
     let layout = Layout::new("contract")?;
+    layout.trust_owner()?;
     let mut client = Client::spawn(&layout, false)?;
     client.send_partial(&fixture("initialize", &layout.workspace, None)?)?;
     assert_eq!(client.read_id(0)?["result"]["protocolVersion"], 2);
@@ -145,7 +146,7 @@ fn process_boundary_conforms() -> TestResult {
         &second_session,
         "wait for cancel",
         'd',
-        "22222222-2222-4222-8222-222222222222",
+        support::CHANNEL_ID,
     ))?;
     layout.wait_for_provider_method("turn/start", 2)?;
     let mut steer = fixture("steer", &layout.workspace, Some(&second_session))?;

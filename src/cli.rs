@@ -37,7 +37,7 @@ use crate::sidecar::{
     SidecarLimits, TrustedExecutable, authorize_local_foreground,
     local_foreground_terminal_available, write_local_foreground_stderr,
 };
-use crate::storage::Store;
+use crate::storage::{Store, TrustedFrontendOwnerInput};
 
 #[derive(Debug, Parser)]
 #[command(name = "carl")]
@@ -57,6 +57,10 @@ pub enum Command {
     Memory {
         #[command(subcommand)]
         command: MemoryCommand,
+    },
+    Trust {
+        #[command(subcommand)]
+        command: TrustCommand,
     },
     Pair,
     Doctor,
@@ -157,6 +161,16 @@ pub enum MemoryCommand {
     },
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Subcommand)]
+pub enum TrustCommand {
+    Buzz {
+        #[arg(long)]
+        actor: String,
+        #[arg(long)]
+        workspace: PathBuf,
+    },
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub enum MemoryKindArgument {
     Profile,
@@ -186,6 +200,8 @@ pub enum AcpPermissionMode {
     AcceptEdits,
     #[value(name = "dontAsk")]
     DontAsk,
+    #[value(name = "fullAccess")]
+    FullAccess,
     #[value(name = "bypassPermissions")]
     BypassPermissions,
 }
@@ -197,6 +213,7 @@ impl From<AcpPermissionMode> for PermissionMode {
             AcpPermissionMode::Default => Self::Default,
             AcpPermissionMode::AcceptEdits => Self::AcceptEdits,
             AcpPermissionMode::DontAsk => Self::DontAsk,
+            AcpPermissionMode::FullAccess => Self::FullAccess,
             AcpPermissionMode::BypassPermissions => Self::BypassPermissions,
         }
     }
@@ -384,6 +401,14 @@ struct MemoryMutationOutput {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+struct TrustOutput {
+    trusted: bool,
+    frontend: Frontend,
+    channel_bound: bool,
+    permission_mode: PermissionMode,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum AuthAvailability {
     Available,
@@ -521,10 +546,70 @@ where
         Command::Auth { command } => run_auth(command, cancellation.as_mut()).await,
         Command::Acp(_) => CliRunResult::not_implemented("acp streaming dispatch"),
         Command::Memory { command } => run_memory(command),
+        Command::Trust { command } => run_trust(command),
         Command::Serve => CliRunResult::not_implemented("serve"),
         Command::Pair => CliRunResult::not_implemented("pair"),
         Command::Doctor => CliRunResult::not_implemented("doctor"),
         Command::Sessions => CliRunResult::not_implemented("sessions"),
+    }
+}
+
+fn run_trust(command: TrustCommand) -> CliRunResult {
+    let configuration = match load_common_configuration() {
+        Ok(configuration) => configuration,
+        Err(_) => {
+            return CliRunResult::memory_error(&CarlError::Configuration {
+                detail: "trust commands require a trusted CARL_DATA_DIR".to_owned(),
+            });
+        }
+    };
+    let data_root_lock = match DataRootLock::acquire(&configuration.data_root) {
+        Ok(lock) => lock,
+        Err(_) => {
+            return CliRunResult::memory_error(&CarlError::Storage {
+                detail: "the Carl data directory is unavailable".to_owned(),
+            });
+        }
+    };
+    let store = match Store::open_locked(&data_root_lock) {
+        Ok(store) => store,
+        Err(error) => return CliRunResult::memory_error(&error),
+    };
+    let result = match command {
+        TrustCommand::Buzz { actor, workspace } => {
+            if actor.len() != 64
+                || !actor
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                Err(CarlError::Validation {
+                    detail: "Buzz owner actor ID is invalid".to_owned(),
+                })
+            } else {
+                crate::policy::ActorId::parse(actor)
+                    .map_err(|_| CarlError::Validation {
+                        detail: "Buzz owner actor ID is invalid".to_owned(),
+                    })
+                    .and_then(|actor_id| {
+                        store.trust_frontend_owner(TrustedFrontendOwnerInput {
+                            frontend: Frontend::Buzz,
+                            actor_id,
+                            workspace,
+                            permission_mode: PermissionMode::FullAccess,
+                            trusted_at: Utc::now(),
+                        })
+                    })
+            }
+        }
+    };
+    match result {
+        Ok(record) => CliRunResult::json_success(&TrustOutput {
+            trusted: true,
+            frontend: record.frontend,
+            channel_bound: record.channel_id.is_some(),
+            permission_mode: record.permission_mode,
+        }),
+        Err(error) => CliRunResult::memory_error(&error),
     }
 }
 
@@ -578,11 +663,15 @@ pub async fn run_acp_stdio(args: AcpArgs) -> ExitClassification {
         None => None,
     };
     let permission_mode = if args.dangerously_bypass_permissions {
-        PermissionMode::BypassPermissions
+        PermissionMode::FullAccess
     } else {
         args.permission_mode
             .map(Into::into)
-            .unwrap_or(PermissionMode::Default)
+            .unwrap_or(if frontend == Frontend::Acp {
+                PermissionMode::FullAccess
+            } else {
+                PermissionMode::Default
+            })
     };
     let server = AcpServer::configured(
         kernel.clone(),

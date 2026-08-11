@@ -199,6 +199,13 @@ pub fn reduce_task(
             }
             state.active_epoch = None;
         }
+        TaskEvent::EpochInterrupted { epoch_id, .. } => {
+            require_active_epoch(&state, *epoch_id)?;
+            if state.has_in_flight_operations() {
+                return Err(error(TaskReduceErrorCode::UnsafeBoundary));
+            }
+            state.active_epoch = None;
+        }
         TaskEvent::OperationIntentRecorded {
             operation_id,
             epoch_id,

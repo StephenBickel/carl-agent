@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use chrono::{TimeDelta, Utc};
 use serde_json::json;
@@ -12,7 +12,8 @@ use uuid::Uuid;
 
 use super::session::{
     ConfigOutcome, ConfigSelection, KernelError, KernelErrorCode, KernelSession, KernelUpdate,
-    NewSessionRequest, Prompt, PromptOutcome, PromptStopReason, ToolKind, ToolStatus,
+    NewSessionRequest, Prompt, PromptOutcome, PromptStopReason, TaskContextView, TaskView,
+    ToolKind, ToolStatus,
 };
 use super::{
     BuzzContext, BuzzErrorCode, BuzzPublisher, ConfigChange, ModeActivation, ModelCatalog,
@@ -27,7 +28,7 @@ use crate::runtime::agent_port::{
 };
 use crate::runtime::task::{
     EngineToolKind, EngineToolStatus, StartTask, TaskBudget, TaskEngine, TaskEngineError,
-    TaskEngineErrorCode, TaskEngineUpdate,
+    TaskEngineErrorCode, TaskEngineUpdate, TaskId,
 };
 use crate::runtime::task::{
     TaskEngineAcknowledgement, TaskEngineControl, TaskEngineFrontendContext,
@@ -37,7 +38,8 @@ use crate::security::SecretFilter;
 use crate::storage::{
     ApprovalStatus, BoundApprovalBinding, DeliveryKind, DeliveryStatus, ExternalSessionId,
     NewDelivery, NewFrontendSession, NewRemoteCode, ProviderRequestId, ProviderThreadId,
-    RemoteCodeClaim, RemoteCodeKind, RuntimeStore,
+    RemoteCodeClaim, RemoteCodeKind, RuntimeStore, Store, TaskControlMutationClaim,
+    TaskControlMutationInput,
 };
 
 const COMMAND_CAPACITY: usize = 64;
@@ -197,7 +199,36 @@ pub enum KernelCommand {
     Steer {
         session_id: SessionId,
         input: String,
+        task_id: Option<TaskId>,
+        control_id: Option<String>,
         reply: oneshot::Sender<Result<(), KernelError>>,
+    },
+    TaskStatus {
+        session_id: SessionId,
+        task_id: TaskId,
+        reply: oneshot::Sender<Result<TaskView, KernelError>>,
+    },
+    TaskList {
+        session_id: SessionId,
+        reply: oneshot::Sender<Result<Vec<TaskView>, KernelError>>,
+    },
+    TaskContext {
+        session_id: SessionId,
+        task_id: TaskId,
+        reply: oneshot::Sender<Result<TaskContextView, KernelError>>,
+    },
+    TaskResume {
+        session_id: SessionId,
+        task_id: TaskId,
+        reply: oneshot::Sender<Result<TaskView, KernelError>>,
+    },
+    ClaimTaskMutation {
+        input: TaskControlMutationInput,
+        reply: oneshot::Sender<Result<TaskControlMutationClaim, KernelError>>,
+    },
+    CompleteTaskMutation {
+        input: TaskControlMutationInput,
+        reply: oneshot::Sender<Result<String, KernelError>>,
     },
     Shutdown {
         reply: oneshot::Sender<Result<(), KernelError>>,
@@ -299,9 +330,111 @@ impl KernelHandle {
         self.send(KernelCommand::Steer {
             session_id,
             input,
+            task_id: None,
+            control_id: None,
             reply,
         })
         .await?;
+        result.await.map_err(|_| stopped_error())?
+    }
+
+    pub async fn task_status(
+        &self,
+        session_id: SessionId,
+        task_id: TaskId,
+    ) -> Result<TaskView, KernelError> {
+        let (reply, result) = oneshot::channel();
+        self.send(KernelCommand::TaskStatus {
+            session_id,
+            task_id,
+            reply,
+        })
+        .await?;
+        result.await.map_err(|_| stopped_error())?
+    }
+
+    pub async fn task_list(&self, session_id: SessionId) -> Result<Vec<TaskView>, KernelError> {
+        let (reply, result) = oneshot::channel();
+        self.send(KernelCommand::TaskList { session_id, reply })
+            .await?;
+        result.await.map_err(|_| stopped_error())?
+    }
+
+    pub async fn task_context(
+        &self,
+        session_id: SessionId,
+        task_id: TaskId,
+    ) -> Result<TaskContextView, KernelError> {
+        let (reply, result) = oneshot::channel();
+        self.send(KernelCommand::TaskContext {
+            session_id,
+            task_id,
+            reply,
+        })
+        .await?;
+        result.await.map_err(|_| stopped_error())?
+    }
+
+    pub async fn task_cancel(
+        &self,
+        session_id: SessionId,
+        task_id: TaskId,
+    ) -> Result<(), KernelError> {
+        self.task_status(session_id, task_id).await?;
+        self.cancel(session_id).await
+    }
+
+    pub async fn task_steer(
+        &self,
+        session_id: SessionId,
+        task_id: TaskId,
+        input: String,
+        control_id: String,
+    ) -> Result<(), KernelError> {
+        let (reply, result) = oneshot::channel();
+        self.send(KernelCommand::Steer {
+            session_id,
+            input,
+            task_id: Some(task_id),
+            control_id: Some(control_id),
+            reply,
+        })
+        .await?;
+        result.await.map_err(|_| stopped_error())?
+    }
+
+    pub async fn task_resume(
+        &self,
+        session_id: SessionId,
+        task_id: TaskId,
+    ) -> Result<TaskView, KernelError> {
+        let (reply, result) = oneshot::channel();
+        self.send(KernelCommand::TaskResume {
+            session_id,
+            task_id,
+            reply,
+        })
+        .await?;
+        result.await.map_err(|_| stopped_error())?
+    }
+
+    pub async fn claim_task_mutation(
+        &self,
+        input: TaskControlMutationInput,
+    ) -> Result<TaskControlMutationClaim, KernelError> {
+        let (reply, result) = oneshot::channel();
+        self.send(KernelCommand::ClaimTaskMutation { input, reply })
+            .await?;
+        result.await.map_err(|_| stopped_error())?
+    }
+
+    pub async fn complete_task_mutation(
+        &self,
+        input: TaskControlMutationInput,
+    ) -> Result<String, KernelError> {
+        let (reply, result) = oneshot::channel();
+        self.send(KernelCommand::CompleteTaskMutation { input, reply })
+            .await?;
         result.await.map_err(|_| stopped_error())?
     }
 
@@ -348,11 +481,13 @@ impl Kernel {
             catalog: Arc::clone(&catalog),
         };
         let durable_tasks = agent.supports_autonomous_tasks();
+        let admission_store = Mutex::new(store.open_peer_store().map_err(map_storage)?);
         let mut engine = TaskEngine::new_runtime(store, agent);
         engine.reconcile_startup().await.map_err(map_task_engine)?;
         tokio::spawn(
             KernelActor {
                 engine: Some(engine),
+                admission_store,
                 durable_tasks,
                 publisher,
                 catalog,
@@ -375,9 +510,10 @@ struct SessionState {
     actor_id: ActorId,
     frontend: Frontend,
     buzz_context: Option<BuzzContext>,
-    provider_context: AgentContextId,
+    provider_context: Option<AgentContextId>,
     active: Option<ActiveTurn>,
     pending_bypass: Option<PendingBypass>,
+    pending_configuration: Option<SessionConfiguration>,
     task_id: Option<crate::runtime::task::TaskId>,
 }
 
@@ -401,6 +537,7 @@ struct PendingBypass {
 
 struct KernelActor {
     engine: Option<TaskEngine<Box<dyn AgentPort>, RuntimeStore>>,
+    admission_store: Mutex<Store>,
     durable_tasks: bool,
     publisher: Option<Box<dyn KernelPublisher>>,
     catalog: Arc<ModelCatalog>,
@@ -418,6 +555,10 @@ enum PendingDurableReply {
     Cancel(oneshot::Sender<Result<(), KernelError>>),
     Shutdown(oneshot::Sender<Result<(), KernelError>>),
     Approval,
+    Config(
+        oneshot::Sender<Result<ConfigOutcome, KernelError>>,
+        ConfigOutcome,
+    ),
 }
 
 enum AgentEventOwner {
@@ -478,7 +619,7 @@ impl KernelActor {
                     context,
                     reply,
                 } => {
-                    let result = self.attach_buzz_context(session_id, context);
+                    let result = self.attach_buzz_context(session_id, context).await;
                     let _ = reply.send(result);
                     false
                 }
@@ -500,9 +641,90 @@ impl KernelActor {
                 KernelCommand::Steer {
                     session_id,
                     input,
+                    task_id,
+                    control_id,
                     reply,
                 } => {
-                    let result = self.steer_session(session_id, input).await;
+                    let result = match (task_id, control_id) {
+                        (None, None) => self.steer_session(session_id, input).await,
+                        (Some(task_id), Some(control_id)) => {
+                            let binding = task_view(
+                                self.engine_ref().store(),
+                                &self.sessions,
+                                session_id,
+                                task_id,
+                            );
+                            match binding {
+                                Ok(_) => self
+                                    .engine_mut()
+                                    .steer_controlled(task_id, input, Some(&control_id))
+                                    .await
+                                    .map_err(map_task_engine),
+                                Err(error) => Err(error),
+                            }
+                        }
+                        _ => Err(invalid_input()),
+                    };
+                    let _ = reply.send(result);
+                    false
+                }
+                KernelCommand::TaskStatus {
+                    session_id,
+                    task_id,
+                    reply,
+                } => {
+                    let result = task_view(
+                        self.engine_ref().store(),
+                        &self.sessions,
+                        session_id,
+                        task_id,
+                    );
+                    let _ = reply.send(result);
+                    false
+                }
+                KernelCommand::TaskList { session_id, reply } => {
+                    let result = task_views(self.engine_ref().store(), &self.sessions, session_id);
+                    let _ = reply.send(result);
+                    false
+                }
+                KernelCommand::TaskContext {
+                    session_id,
+                    task_id,
+                    reply,
+                } => {
+                    let result = task_context_view(
+                        self.engine_ref().store(),
+                        &self.sessions,
+                        session_id,
+                        task_id,
+                    );
+                    let _ = reply.send(result);
+                    false
+                }
+                KernelCommand::TaskResume {
+                    session_id,
+                    task_id,
+                    reply,
+                } => {
+                    let result = self.resume_task(session_id, task_id).await;
+                    let _ = reply.send(result);
+                    false
+                }
+                KernelCommand::ClaimTaskMutation { input, reply } => {
+                    let result = self
+                        .engine_ref()
+                        .store()
+                        .claim_task_control_mutation(input)
+                        .map_err(map_storage);
+                    let _ = reply.send(result);
+                    false
+                }
+                KernelCommand::CompleteTaskMutation { input, reply } => {
+                    let result = self
+                        .engine_ref()
+                        .store()
+                        .complete_task_control_mutation(input)
+                        .map_err(map_storage);
                     let _ = reply.send(result);
                     false
                 }
@@ -583,27 +805,32 @@ impl KernelActor {
                 },
             )
             .map_err(map_storage)?;
-        let provider_context = self
-            .engine_mut()
-            .port_mut()
-            .start_context(StartAgentContext {
-                cwd: request.cwd.clone(),
-                model,
-                permission_mode: request.mode,
-            })
-            .await
-            .map_err(map_agent_port)?;
-        let provider_thread_id =
-            ProviderThreadId::try_from(provider_context.as_str()).map_err(|_| provider_error())?;
-        self.engine_ref()
-            .store()
-            .configure_frontend_session(
-                &bound.external_session_id,
-                Some(&provider_thread_id),
-                request.mode,
-                Utc::now(),
-            )
-            .map_err(map_storage)?;
+        let provider_context = if request.frontend == Frontend::Buzz {
+            None
+        } else {
+            let context = self
+                .engine_mut()
+                .port_mut()
+                .start_context(StartAgentContext {
+                    cwd: request.cwd.clone(),
+                    model,
+                    permission_mode: request.mode,
+                })
+                .await
+                .map_err(map_agent_port)?;
+            let provider_thread_id =
+                ProviderThreadId::try_from(context.as_str()).map_err(|_| provider_error())?;
+            self.engine_ref()
+                .store()
+                .configure_frontend_session(
+                    &bound.external_session_id,
+                    Some(&provider_thread_id),
+                    request.mode,
+                    Utc::now(),
+                )
+                .map_err(map_storage)?;
+            Some(context)
+        };
         let public =
             KernelSession::new(created.id, bound.external_session_id.clone(), configuration);
         self.sessions.insert(
@@ -617,6 +844,7 @@ impl KernelActor {
                 provider_context,
                 active: None,
                 pending_bypass: None,
+                pending_configuration: None,
                 task_id: None,
             },
         );
@@ -689,6 +917,9 @@ impl KernelActor {
                 ))],
             });
         }
+        if let Some(command) = prompt.task_slash_command() {
+            return self.handle_task_slash(session_id, command).await;
+        }
 
         let input = prompt.provider_text();
         SecretFilter
@@ -706,7 +937,10 @@ impl KernelActor {
             )
             .map_err(map_storage)?;
         let state = self.sessions.get(&session_id).ok_or_else(unknown_session)?;
-        let context_id = state.provider_context.clone();
+        let context_id = state
+            .provider_context
+            .clone()
+            .ok_or_else(|| KernelError::from_code(KernelErrorCode::ApprovalUnavailable))?;
         let model = state.public.configuration().model().clone();
         let effort = state.public.configuration().effort();
         let permission_mode = state.public.configuration().mode();
@@ -733,6 +967,122 @@ impl KernelActor {
             item_ids: HashMap::new(),
         });
         self.drive_turn(session_id).await
+    }
+
+    async fn handle_task_slash(
+        &mut self,
+        session_id: SessionId,
+        command: &str,
+    ) -> Result<PromptOutcome, KernelError> {
+        let message = match command {
+            "/permissions fullAccess" => {
+                let trusted = self
+                    .sessions
+                    .get(&session_id)
+                    .ok_or_else(unknown_session)
+                    .is_ok_and(|state| {
+                        state.frontend == Frontend::Acp
+                            || (state.frontend == Frontend::Buzz && state.buzz_context.is_some())
+                    });
+                if !trusted {
+                    return Err(KernelError::from_code(KernelErrorCode::ApprovalUnavailable));
+                }
+                let ConfigOutcome::Applied(configuration) = self.set_config(
+                    session_id,
+                    ConfigSelection::Mode {
+                        mode: PermissionMode::FullAccess,
+                        remote: false,
+                    },
+                )?
+                else {
+                    return Err(invalid_input());
+                };
+                return Ok(PromptOutcome {
+                    stop_reason: PromptStopReason::EndTurn,
+                    updates: vec![KernelUpdate::SessionInfoChanged { configuration }],
+                });
+            }
+            "/permissions approval" | "/permissions readOnly" => {
+                let mode = if command.ends_with("approval") {
+                    PermissionMode::Default
+                } else {
+                    PermissionMode::Plan
+                };
+                let ConfigOutcome::Applied(configuration) = self.set_config(
+                    session_id,
+                    ConfigSelection::Mode {
+                        mode,
+                        remote: false,
+                    },
+                )?
+                else {
+                    return Err(invalid_input());
+                };
+                return Ok(PromptOutcome {
+                    stop_reason: PromptStopReason::EndTurn,
+                    updates: vec![KernelUpdate::SessionInfoChanged { configuration }],
+                });
+            }
+            "/status" => {
+                let tasks = task_views(self.engine_ref().store(), &self.sessions, session_id)?;
+                serde_json::to_string(&json!({"tasks":tasks})).map_err(|_| invalid_input())?
+            }
+            "/context" => {
+                let task_id = self.latest_session_task(session_id)?;
+                let context = task_context_view(
+                    self.engine_ref().store(),
+                    &self.sessions,
+                    session_id,
+                    task_id,
+                )?;
+                serde_json::to_string(&json!({"context":context})).map_err(|_| invalid_input())?
+            }
+            "/cancel" => {
+                let task_id = self.latest_session_task(session_id)?;
+                self.engine_mut()
+                    .cancel(task_id)
+                    .await
+                    .map_err(map_task_engine)?;
+                json!({"outcome":"accepted","taskId":task_id}).to_string()
+            }
+            "/resume" => {
+                let task_id = self.latest_session_task(session_id)?;
+                let snapshot = self
+                    .engine_mut()
+                    .run(task_id)
+                    .await
+                    .map_err(map_task_engine)?;
+                self.sessions
+                    .get_mut(&session_id)
+                    .ok_or_else(unknown_session)?
+                    .task_id = Some(task_id);
+                serde_json::to_string(&json!({"task":TaskView::from(&snapshot)}))
+                    .map_err(|_| invalid_input())?
+            }
+            _ => return Err(invalid_input()),
+        };
+        Ok(PromptOutcome {
+            stop_reason: PromptStopReason::EndTurn,
+            updates: vec![KernelUpdate::AgentMessageChunk(message)],
+        })
+    }
+
+    fn latest_session_task(&self, session_id: SessionId) -> Result<TaskId, KernelError> {
+        if let Some(task_id) = self
+            .sessions
+            .get(&session_id)
+            .ok_or_else(unknown_session)?
+            .task_id
+        {
+            return Ok(task_id);
+        }
+        self.engine_ref()
+            .store()
+            .list_tasks_for_session(session_id, 1)
+            .map_err(map_storage)?
+            .first()
+            .map(|record| record.snapshot.task_id)
+            .ok_or_else(invalid_input)
     }
 
     async fn begin_durable_prompt(
@@ -773,7 +1123,10 @@ impl KernelActor {
             )
             .map_err(map_storage)?;
         let state = self.sessions.get(&session_id).ok_or_else(unknown_session)?;
-        let context_id = state.provider_context.clone();
+        let context_id = state
+            .provider_context
+            .clone()
+            .ok_or_else(|| KernelError::from_code(KernelErrorCode::ApprovalUnavailable))?;
         let workspace = state.cwd.clone();
         let model = state.public.configuration().model().clone();
         let effort = state.public.configuration().effort();
@@ -815,8 +1168,12 @@ impl KernelActor {
         let mut receiver_open = true;
         let mut durable_shutdown = false;
         let result = {
-            let (engine, receiver, sessions) =
-                (&mut self.engine, &mut self.receiver, &mut self.sessions);
+            let (engine, admission_store, receiver, sessions) = (
+                &mut self.engine,
+                &self.admission_store,
+                &mut self.receiver,
+                &mut self.sessions,
+            );
             let engine = engine.as_mut().expect("kernel engine is actor-owned");
             let execution = async {
                 if let Some(task_id) = existing_task {
@@ -924,6 +1281,7 @@ impl KernelActor {
                                 control_sender
                                     .send(TaskEngineControl::Steer {
                                         text,
+                                        control_id: None,
                                         session_id,
                                         turn_id,
                                         acknowledgement,
@@ -938,7 +1296,7 @@ impl KernelActor {
                                 reply,
                             } if target == session_id => {
                                 let result = sessions
-                                    .get_mut(&session_id)
+                                    .get(&session_id)
                                     .ok_or_else(unknown_session)
                                     .and_then(|state| {
                                         let matches_binding = state.frontend == Frontend::Buzz
@@ -954,23 +1312,112 @@ impl KernelActor {
                                                 KernelErrorCode::ApprovalUnavailable,
                                             ));
                                         }
-                                        state.buzz_context = Some(context);
+                                        let actor = ActorId::parse(context.actor_hex())
+                                            .map_err(|_| invalid_input())?;
+                                        let channel = crate::storage::ChannelId::try_from(
+                                            context.channel_id().to_string(),
+                                        )
+                                        .map_err(map_storage)?;
+                                        admission_store
+                                            .lock()
+                                            .map_err(|_| {
+                                                KernelError::from_code(
+                                                    KernelErrorCode::ProviderFailed,
+                                                )
+                                            })?
+                                            .admit_trusted_frontend_message(
+                                                Frontend::Buzz,
+                                                &actor,
+                                                &channel,
+                                                &state.cwd,
+                                                context.reply_to(),
+                                                Utc::now(),
+                                            )
+                                            .map_err(|_| {
+                                                KernelError::from_code(
+                                                    KernelErrorCode::ApprovalUnavailable,
+                                                )
+                                            })?;
                                         Ok(())
                                     });
+                                if result.is_ok()
+                                    && let Some(state) = sessions.get_mut(&session_id)
+                                {
+                                    state.buzz_context = Some(context);
+                                }
                                 let _ = reply.send(result);
+                            }
+                            KernelCommand::SetConfig {
+                                session_id: target,
+                                selection,
+                                reply,
+                            } if target == session_id => {
+                                let prior = sessions
+                                    .get(&session_id)
+                                    .and_then(|state| {
+                                        state
+                                            .pending_configuration
+                                            .as_ref()
+                                            .or_else(|| Some(state.public.configuration()))
+                                    })
+                                    .map(SessionConfiguration::mode)
+                                    .ok_or_else(unknown_session)?;
+                                let result = sessions
+                                    .get_mut(&session_id)
+                                    .ok_or_else(unknown_session)
+                                    .and_then(|state| {
+                                        queue_session_configuration(state, selection)
+                                    });
+                                let Ok(ConfigOutcome::Applied(configuration)) = &result else {
+                                    let _ = reply.send(result);
+                                    continue;
+                                };
+                                control_sender
+                                    .send(TaskEngineControl::Configure {
+                                        model: configuration.model().clone(),
+                                        effort: configuration.effort(),
+                                        permission_mode: configuration.mode(),
+                                        tightening: permission_strength(configuration.mode())
+                                            < permission_strength(prior),
+                                        acknowledgement,
+                                    })
+                                    .await
+                                    .map_err(|_| stopped_error())?;
+                                pending.insert(
+                                    acknowledgement,
+                                    PendingDurableReply::Config(
+                                        reply,
+                                        ConfigOutcome::Applied(configuration.clone()),
+                                    ),
+                                );
                             }
                             KernelCommand::Steer {
                                 session_id: target,
                                 input,
+                                task_id,
+                                control_id,
                                 reply,
                             } if target == session_id => {
                                 if validate_durable_steering(&input).is_err() {
                                     let _ = reply.send(Err(invalid_input()));
                                     continue;
                                 }
+                                if let Some(task_id) = task_id {
+                                    let exact = admission_store
+                                        .lock()
+                                        .map_err(|_| provider_error())
+                                        .and_then(|store| {
+                                            task_view(&store, sessions, session_id, task_id)
+                                        });
+                                    if exact.is_err() || control_id.is_none() {
+                                        let _ = reply.send(Err(invalid_input()));
+                                        continue;
+                                    }
+                                }
                                 control_sender
                                     .send(TaskEngineControl::Steer {
                                         text: input,
+                                        control_id,
                                         session_id,
                                         turn_id: TurnId::new(),
                                         acknowledgement,
@@ -978,6 +1425,67 @@ impl KernelActor {
                                     .await
                                     .map_err(|_| stopped_error())?;
                                 pending.insert(acknowledgement, PendingDurableReply::Steer(reply));
+                            }
+                            KernelCommand::TaskStatus {
+                                session_id: target,
+                                task_id,
+                                reply,
+                            } if target == session_id => {
+                                let result = admission_store
+                                    .lock()
+                                    .map_err(|_| provider_error())
+                                    .and_then(|store| {
+                                        task_view(&store, sessions, session_id, task_id)
+                                    });
+                                let _ = reply.send(result);
+                            }
+                            KernelCommand::TaskList {
+                                session_id: target,
+                                reply,
+                            } if target == session_id => {
+                                let result = admission_store
+                                    .lock()
+                                    .map_err(|_| provider_error())
+                                    .and_then(|store| task_views(&store, sessions, session_id));
+                                let _ = reply.send(result);
+                            }
+                            KernelCommand::TaskContext {
+                                session_id: target,
+                                task_id,
+                                reply,
+                            } if target == session_id => {
+                                let result = admission_store
+                                    .lock()
+                                    .map_err(|_| provider_error())
+                                    .and_then(|store| {
+                                        task_context_view(&store, sessions, session_id, task_id)
+                                    });
+                                let _ = reply.send(result);
+                            }
+                            KernelCommand::TaskResume { reply, .. } => {
+                                let _ = reply.send(Err(session_busy()));
+                            }
+                            KernelCommand::ClaimTaskMutation { input, reply } => {
+                                let result = admission_store
+                                    .lock()
+                                    .map_err(|_| provider_error())
+                                    .and_then(|store| {
+                                        store
+                                            .claim_task_control_mutation(input)
+                                            .map_err(map_storage)
+                                    });
+                                let _ = reply.send(result);
+                            }
+                            KernelCommand::CompleteTaskMutation { input, reply } => {
+                                let result = admission_store
+                                    .lock()
+                                    .map_err(|_| provider_error())
+                                    .and_then(|store| {
+                                        store
+                                            .complete_task_control_mutation(input)
+                                            .map_err(map_storage)
+                                    });
+                                let _ = reply.send(result);
                             }
                             KernelCommand::Cancel {
                                 session_id: target,
@@ -1051,6 +1559,7 @@ impl KernelActor {
                 }
             }
         };
+        self.apply_pending_configuration(session_id)?;
         while let Ok((acknowledgement, result)) = acknowledgement_receiver.try_recv() {
             if let Some(reply) = pending.remove(&acknowledgement) {
                 if matches!(reply, PendingDurableReply::Approval) {
@@ -1236,6 +1745,7 @@ impl KernelActor {
                         let accepted = result.is_ok();
                         let _ = reply.send(result);
                         if accepted {
+                            self.apply_pending_configuration(session_id)?;
                             return Ok(PromptOutcome {
                                 stop_reason: PromptStopReason::Cancelled,
                                 updates,
@@ -1245,9 +1755,100 @@ impl KernelActor {
                     KernelCommand::Steer {
                         session_id: target,
                         input,
+                        task_id,
+                        reply,
+                        ..
+                    } if target == session_id => {
+                        let result = if task_id.is_some() {
+                            Err(invalid_input())
+                        } else {
+                            self.steer_session(session_id, input).await
+                        };
+                        let _ = reply.send(result);
+                    }
+                    KernelCommand::SetConfig {
+                        session_id: target,
+                        selection,
                         reply,
                     } if target == session_id => {
-                        let result = self.steer_session(session_id, input).await;
+                        let prior = self
+                            .sessions
+                            .get(&session_id)
+                            .ok_or_else(unknown_session)?
+                            .public
+                            .configuration()
+                            .mode();
+                        let result = self.set_config(session_id, selection);
+                        let tightening = matches!(
+                            &result,
+                            Ok(ConfigOutcome::Applied(configuration))
+                                if permission_strength(configuration.mode())
+                                    < permission_strength(prior)
+                        );
+                        if tightening {
+                            let (context_id, epoch_id) = {
+                                let state =
+                                    self.sessions.get(&session_id).ok_or_else(unknown_session)?;
+                                let active = state.active.as_ref().ok_or_else(session_busy)?;
+                                (
+                                    state.provider_context.clone().ok_or_else(session_busy)?,
+                                    active.provider_epoch_id.clone(),
+                                )
+                            };
+                            let _ = self
+                                .engine_mut()
+                                .port_mut()
+                                .interrupt(&context_id, &epoch_id)
+                                .await;
+                        }
+                        let _ = reply.send(result);
+                    }
+                    KernelCommand::TaskStatus {
+                        session_id: target,
+                        task_id,
+                        reply,
+                    } => {
+                        let result =
+                            task_view(self.engine_ref().store(), &self.sessions, target, task_id);
+                        let _ = reply.send(result);
+                    }
+                    KernelCommand::TaskList {
+                        session_id: target,
+                        reply,
+                    } => {
+                        let result = task_views(self.engine_ref().store(), &self.sessions, target);
+                        let _ = reply.send(result);
+                    }
+                    KernelCommand::TaskContext {
+                        session_id: target,
+                        task_id,
+                        reply,
+                    } => {
+                        let result = task_context_view(
+                            self.engine_ref().store(),
+                            &self.sessions,
+                            target,
+                            task_id,
+                        );
+                        let _ = reply.send(result);
+                    }
+                    KernelCommand::TaskResume { reply, .. } => {
+                        let _ = reply.send(Err(session_busy()));
+                    }
+                    KernelCommand::ClaimTaskMutation { input, reply } => {
+                        let result = self
+                            .engine_ref()
+                            .store()
+                            .claim_task_control_mutation(input)
+                            .map_err(map_storage);
+                        let _ = reply.send(result);
+                    }
+                    KernelCommand::CompleteTaskMutation { input, reply } => {
+                        let result = self
+                            .engine_ref()
+                            .store()
+                            .complete_task_control_mutation(input)
+                            .map_err(map_storage);
                         let _ = reply.send(result);
                     }
                     KernelCommand::Shutdown { reply } => {
@@ -1443,6 +2044,7 @@ impl KernelActor {
                     .get_mut(&session_id)
                     .ok_or_else(unknown_session)?
                     .active = None;
+                self.apply_pending_configuration(session_id)?;
                 return Ok(Some(PromptOutcome {
                     stop_reason: PromptStopReason::EndTurn,
                     updates: std::mem::take(updates),
@@ -1736,7 +2338,7 @@ impl KernelActor {
                 .provider_thread_id
                 .as_ref()
                 .map(ProviderThreadId::as_str)
-                != Some(state.provider_context.as_str())
+                != state.provider_context.as_ref().map(AgentContextId::as_str)
         {
             return Err(KernelError::from_code(KernelErrorCode::ApprovalUnavailable));
         }
@@ -1807,14 +2409,14 @@ impl KernelActor {
             .sessions
             .get_mut(&session_id)
             .ok_or_else(unknown_session)?;
-        if state.active.is_some() {
-            return Err(session_busy());
-        }
         if let ConfigSelection::Mode {
             mode: PermissionMode::BypassPermissions,
             remote: true,
         } = selection
         {
+            if state.active.is_some() {
+                return Err(session_busy());
+            }
             let external_session_id = state.public.external_session_id.clone();
             let actor_id = state.actor_id.clone();
             let cwd = state.cwd.clone();
@@ -1839,30 +2441,38 @@ impl KernelActor {
             });
             return Ok(ConfigOutcome::PendingBypass { display_code });
         }
+        if let ConfigSelection::Mode { mode, remote: true } = selection
+            && mode.profile() == PermissionProfile::FullAccess
+            && !(state.frontend == Frontend::Buzz && state.buzz_context.is_some())
+        {
+            return Err(KernelError::from_code(KernelErrorCode::ApprovalUnavailable));
+        }
+        let base = state
+            .pending_configuration
+            .clone()
+            .unwrap_or_else(|| state.public.configuration.clone());
         let configuration = match selection {
             ConfigSelection::Model(model) => {
-                apply_change(state.public.configuration.clone(), |configuration| {
-                    configuration.set_model(model)
-                })?
+                apply_change(base, |configuration| configuration.set_model(model))?
             }
             ConfigSelection::Effort(effort) => {
-                apply_change(state.public.configuration.clone(), |configuration| {
-                    configuration.set_effort(effort)
-                })?
+                apply_change(base, |configuration| configuration.set_effort(effort))?
             }
-            ConfigSelection::Mode { mode, remote } => {
-                apply_change(state.public.configuration.clone(), |configuration| {
-                    configuration.set_mode(
-                        mode,
-                        if remote {
-                            ModeActivation::RemoteConfirmed
-                        } else {
-                            ModeActivation::LocalExplicit
-                        },
-                    )
-                })?
-            }
+            ConfigSelection::Mode { mode, remote } => apply_change(base, |configuration| {
+                configuration.set_mode(
+                    mode,
+                    if remote {
+                        ModeActivation::RemoteConfirmed
+                    } else {
+                        ModeActivation::LocalExplicit
+                    },
+                )
+            })?,
         };
+        if state.active.is_some() {
+            state.pending_configuration = Some(configuration.clone());
+            return Ok(ConfigOutcome::Applied(configuration));
+        }
         state.public = KernelSession::new(
             state.public.id(),
             state.public.external_session_id.clone(),
@@ -1872,7 +2482,23 @@ impl KernelActor {
         Ok(ConfigOutcome::Applied(configuration))
     }
 
-    fn attach_buzz_context(
+    fn apply_pending_configuration(&mut self, session_id: SessionId) -> Result<(), KernelError> {
+        let state = self
+            .sessions
+            .get_mut(&session_id)
+            .ok_or_else(unknown_session)?;
+        let Some(configuration) = state.pending_configuration.take() else {
+            return Ok(());
+        };
+        state.public = KernelSession::new(
+            state.public.id(),
+            state.public.external_session_id.clone(),
+            configuration,
+        );
+        self.persist_configuration(session_id)
+    }
+
+    async fn attach_buzz_context(
         &mut self,
         session_id: SessionId,
         context: BuzzContext,
@@ -1889,30 +2515,81 @@ impl KernelActor {
         let actor = ActorId::parse(context.actor_hex()).map_err(|_| invalid_input())?;
         let channel = crate::storage::ChannelId::try_from(context.channel_id().to_string())
             .map_err(map_storage)?;
-        if self.sessions.iter().any(|(other_id, other)| {
-            *other_id != session_id
-                && other.cwd == state.cwd
-                && other
-                    .buzz_context
-                    .as_ref()
-                    .is_some_and(|existing| existing.channel_id() == context.channel_id())
-        }) {
-            return Err(KernelError::from_code(KernelErrorCode::ApprovalUnavailable));
-        }
         if let Some(existing) = state.buzz_context.as_ref()
             && (existing.channel_id() != context.channel_id()
                 || existing.actor_hex() != context.actor_hex())
         {
             return Err(KernelError::from_code(KernelErrorCode::ApprovalUnavailable));
         }
+        let cwd = state.cwd.clone();
+        let external_session_id = state.public.external_session_id.clone();
+        let model = state.public.configuration().model().clone();
+        let needs_provider_context = state.provider_context.is_none();
+        let first_admission = state.buzz_context.is_none();
         self.engine_ref()
             .store()
-            .claim_frontend_channel(&state.public.external_session_id, &channel, Utc::now())
-            .map_err(map_storage)?;
+            .admit_trusted_frontend_message(
+                Frontend::Buzz,
+                &actor,
+                &channel,
+                &cwd,
+                context.reply_to(),
+                Utc::now(),
+            )
+            .map_err(|_| KernelError::from_code(KernelErrorCode::ApprovalUnavailable))?;
+        self.engine_ref()
+            .store()
+            .claim_frontend_channel(&external_session_id, &channel, Utc::now())
+            .map_err(|_| KernelError::from_code(KernelErrorCode::ApprovalUnavailable))?;
+        let provider_context = if needs_provider_context {
+            Some(
+                self.engine_mut()
+                    .port_mut()
+                    .start_context(StartAgentContext {
+                        cwd,
+                        model,
+                        permission_mode: PermissionMode::FullAccess,
+                    })
+                    .await
+                    .map_err(map_agent_port)?,
+            )
+        } else {
+            None
+        };
+        if let Some(provider_context) = provider_context.as_ref() {
+            let provider_thread_id = ProviderThreadId::try_from(provider_context.as_str())
+                .map_err(|_| provider_error())?;
+            self.engine_ref()
+                .store()
+                .configure_frontend_session(
+                    &external_session_id,
+                    Some(&provider_thread_id),
+                    PermissionMode::FullAccess,
+                    Utc::now(),
+                )
+                .map_err(map_storage)?;
+        }
         let state = self
             .sessions
             .get_mut(&session_id)
             .ok_or_else(unknown_session)?;
+        let mut configuration = state.public.configuration().clone();
+        if first_admission
+            && !matches!(
+                configuration.set_mode(PermissionMode::FullAccess, ModeActivation::LocalExplicit),
+                ConfigChange::Applied
+            )
+        {
+            return Err(invalid_input());
+        }
+        state.public = KernelSession::new(
+            state.public.id(),
+            state.public.external_session_id.clone(),
+            configuration,
+        );
+        if let Some(provider_context) = provider_context {
+            state.provider_context = Some(provider_context);
+        }
         state.actor_id = actor;
         state.buzz_context = Some(context);
         Ok(())
@@ -1970,8 +2647,12 @@ impl KernelActor {
     fn persist_configuration(&mut self, session_id: SessionId) -> Result<(), KernelError> {
         let state = self.sessions.get(&session_id).ok_or_else(unknown_session)?;
         let external_session_id = state.public.external_session_id.clone();
-        let provider_thread_id =
-            ProviderThreadId::try_from(state.provider_context.as_str()).map_err(map_storage)?;
+        let provider_thread_id = state
+            .provider_context
+            .as_ref()
+            .map(|context| ProviderThreadId::try_from(context.as_str()))
+            .transpose()
+            .map_err(map_storage)?;
         let permission_mode = state.public.configuration.mode();
         let settings = DelegateSettings::new(
             Some(state.public.configuration().model().clone()),
@@ -1981,7 +2662,7 @@ impl KernelActor {
             .store()
             .configure_frontend_session(
                 &external_session_id,
-                Some(&provider_thread_id),
+                provider_thread_id.as_ref(),
                 permission_mode,
                 Utc::now(),
             )
@@ -2007,7 +2688,7 @@ impl KernelActor {
     async fn cancel_session(&mut self, session_id: SessionId) -> Result<(), KernelError> {
         let state = self.sessions.get(&session_id).ok_or_else(unknown_session)?;
         let active = state.active.as_ref().ok_or_else(session_busy)?;
-        let context_id = state.provider_context.clone();
+        let context_id = state.provider_context.clone().ok_or_else(session_busy)?;
         let epoch_id = active.provider_epoch_id.clone();
         let turn_id = active.local_turn_id;
         self.engine_mut()
@@ -2032,6 +2713,38 @@ impl KernelActor {
         Ok(())
     }
 
+    async fn resume_task(
+        &mut self,
+        session_id: SessionId,
+        task_id: TaskId,
+    ) -> Result<TaskView, KernelError> {
+        task_view(
+            self.engine_ref().store(),
+            &self.sessions,
+            session_id,
+            task_id,
+        )?;
+        if self
+            .sessions
+            .get(&session_id)
+            .ok_or_else(unknown_session)?
+            .active
+            .is_some()
+        {
+            return Err(session_busy());
+        }
+        let snapshot = self
+            .engine_mut()
+            .run(task_id)
+            .await
+            .map_err(map_task_engine)?;
+        self.sessions
+            .get_mut(&session_id)
+            .ok_or_else(unknown_session)?
+            .task_id = Some(task_id);
+        Ok(TaskView::from(&snapshot))
+    }
+
     async fn steer_session(
         &mut self,
         session_id: SessionId,
@@ -2048,7 +2761,7 @@ impl KernelActor {
         if active.pending_approval.is_some() {
             return Err(session_busy());
         }
-        let context_id = state.provider_context.clone();
+        let context_id = state.provider_context.clone().ok_or_else(session_busy)?;
         let epoch_id = active.provider_epoch_id.clone();
         let turn_id = active.local_turn_id;
         self.engine_mut()
@@ -2184,7 +2897,8 @@ impl KernelActor {
     ) -> Result<bool, KernelError> {
         let state = self.sessions.get(&session_id).ok_or_else(unknown_session)?;
         let active = state.active.as_ref().ok_or_else(session_busy)?;
-        let context_matches = |context_id: &AgentContextId| context_id == &state.provider_context;
+        let context_matches =
+            |context_id: &AgentContextId| state.provider_context.as_ref() == Some(context_id);
         let epoch_matches = |epoch_id: &AgentEpochId| epoch_id == &active.provider_epoch_id;
         let valid = match event {
             AgentEvent::ContextStarted { context_id } => context_matches(context_id),
@@ -2275,7 +2989,7 @@ impl KernelActor {
         let mut matches = self
             .sessions
             .iter()
-            .filter(|(_, state)| &state.provider_context == context_id)
+            .filter(|(_, state)| state.provider_context.as_ref() == Some(context_id))
             .map(|(session_id, _)| *session_id);
         let owner = matches.next()?;
         matches.next().is_none().then_some(owner)
@@ -2314,11 +3028,13 @@ impl KernelActor {
                         .resolve_effect(&request_id, EffectDecision::Deny)
                         .await;
                 }
-                let _ = self
-                    .engine_mut()
-                    .port_mut()
-                    .interrupt(&context_id, &epoch_id)
-                    .await;
+                if let Some(context_id) = context_id {
+                    let _ = self
+                        .engine_mut()
+                        .port_mut()
+                        .interrupt(&context_id, &epoch_id)
+                        .await;
+                }
             }
             return;
         }
@@ -2415,6 +3131,21 @@ fn reject_busy_command(command: KernelCommand) {
             let _ = reply.send(Err(session_busy()));
         }
         KernelCommand::Cancel { reply, .. } | KernelCommand::Steer { reply, .. } => {
+            let _ = reply.send(Err(session_busy()));
+        }
+        KernelCommand::TaskStatus { reply, .. } | KernelCommand::TaskResume { reply, .. } => {
+            let _ = reply.send(Err(session_busy()));
+        }
+        KernelCommand::TaskList { reply, .. } => {
+            let _ = reply.send(Err(session_busy()));
+        }
+        KernelCommand::TaskContext { reply, .. } => {
+            let _ = reply.send(Err(session_busy()));
+        }
+        KernelCommand::ClaimTaskMutation { reply, .. } => {
+            let _ = reply.send(Err(session_busy()));
+        }
+        KernelCommand::CompleteTaskMutation { reply, .. } => {
             let _ = reply.send(Err(session_busy()));
         }
         KernelCommand::Shutdown { reply } => {
@@ -2532,6 +3263,59 @@ fn map_publication_error(error: crate::acp::BuzzError) -> PublicationFailure {
     }
 }
 
+fn task_view(
+    store: &Store,
+    sessions: &HashMap<SessionId, SessionState>,
+    session_id: SessionId,
+    task_id: TaskId,
+) -> Result<TaskView, KernelError> {
+    if !sessions.contains_key(&session_id) {
+        return Err(unknown_session());
+    }
+    let record = store
+        .get_task(task_id)
+        .map_err(map_storage)?
+        .filter(|record| record.snapshot.session_id == session_id)
+        .ok_or_else(invalid_input)?;
+    Ok(TaskView::from(&record.snapshot))
+}
+
+fn task_views(
+    store: &Store,
+    sessions: &HashMap<SessionId, SessionState>,
+    session_id: SessionId,
+) -> Result<Vec<TaskView>, KernelError> {
+    if !sessions.contains_key(&session_id) {
+        return Err(unknown_session());
+    }
+    store
+        .list_tasks_for_session(session_id, 64)
+        .map_err(map_storage)
+        .map(|records| {
+            records
+                .iter()
+                .map(|record| TaskView::from(&record.snapshot))
+                .collect()
+        })
+}
+
+fn task_context_view(
+    store: &Store,
+    sessions: &HashMap<SessionId, SessionState>,
+    session_id: SessionId,
+    task_id: TaskId,
+) -> Result<TaskContextView, KernelError> {
+    if !sessions.contains_key(&session_id) {
+        return Err(unknown_session());
+    }
+    let record = store
+        .get_task(task_id)
+        .map_err(map_storage)?
+        .filter(|record| record.snapshot.session_id == session_id)
+        .ok_or_else(invalid_input)?;
+    Ok(TaskContextView::from(&record.snapshot))
+}
+
 fn map_storage(_error: crate::error::CarlError) -> KernelError {
     KernelError::from_code(KernelErrorCode::StorageFailed)
 }
@@ -2582,6 +3366,9 @@ fn complete_durable_reply(reply: PendingDurableReply, result: Result<(), TaskEng
             let _ = reply.send(accepted);
         }
         PendingDurableReply::Approval => {}
+        PendingDurableReply::Config(reply, outcome) => {
+            let _ = reply.send(result.map(|()| outcome).map_err(map_task_engine));
+        }
     }
 }
 
@@ -2596,6 +3383,9 @@ fn fail_durable_reply(reply: PendingDurableReply, error: KernelError) {
             let _ = reply.send(Err(error));
         }
         PendingDurableReply::Approval => {}
+        PendingDurableReply::Config(reply, _) => {
+            let _ = reply.send(Err(error));
+        }
     }
 }
 
@@ -2633,6 +3423,59 @@ fn effect_title(request: &AgentEffectRequest) -> String {
             AgentEffectKind::External => "external effect",
         })
         .to_owned()
+}
+
+const fn permission_strength(mode: PermissionMode) -> u8 {
+    match mode.profile() {
+        PermissionProfile::ReadOnly => 0,
+        PermissionProfile::Approval => 1,
+        PermissionProfile::FullAccess => 2,
+    }
+}
+
+fn queue_session_configuration(
+    state: &mut SessionState,
+    selection: ConfigSelection,
+) -> Result<ConfigOutcome, KernelError> {
+    if matches!(
+        selection,
+        ConfigSelection::Mode {
+            mode: PermissionMode::BypassPermissions,
+            remote: true
+        }
+    ) {
+        return Err(session_busy());
+    }
+    if let ConfigSelection::Mode { mode, remote: true } = selection
+        && mode.profile() == PermissionProfile::FullAccess
+        && !(state.frontend == Frontend::Buzz && state.buzz_context.is_some())
+    {
+        return Err(KernelError::from_code(KernelErrorCode::ApprovalUnavailable));
+    }
+    let base = state
+        .pending_configuration
+        .clone()
+        .unwrap_or_else(|| state.public.configuration.clone());
+    let configuration = match selection {
+        ConfigSelection::Model(model) => {
+            apply_change(base, |configuration| configuration.set_model(model))?
+        }
+        ConfigSelection::Effort(effort) => {
+            apply_change(base, |configuration| configuration.set_effort(effort))?
+        }
+        ConfigSelection::Mode { mode, remote } => apply_change(base, |configuration| {
+            configuration.set_mode(
+                mode,
+                if remote {
+                    ModeActivation::RemoteConfirmed
+                } else {
+                    ModeActivation::LocalExplicit
+                },
+            )
+        })?,
+    };
+    state.pending_configuration = Some(configuration.clone());
+    Ok(ConfigOutcome::Applied(configuration))
 }
 
 const fn invalid_input() -> KernelError {

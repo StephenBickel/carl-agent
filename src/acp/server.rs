@@ -2,7 +2,9 @@ use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
 
+use chrono::Utc;
 use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::io::{AsyncBufRead, AsyncWrite};
 use tokio::sync::mpsc;
@@ -17,9 +19,12 @@ use super::{
 };
 use crate::delegates::{ModelId, ReasoningEffort};
 use crate::events::SessionId;
-use crate::policy::{ActorId, Frontend};
+use crate::policy::{ActorId, Frontend, Sha256Digest};
+use crate::runtime::task::TaskId;
 use crate::sidecar::{ExecutionWorkspace, TrustedExecutable};
-use crate::storage::{ClientName, ExternalSessionId};
+use crate::storage::{
+    ClientName, ExternalSessionId, TaskControlMutationClaim, TaskControlMutationInput,
+};
 
 const MAX_FRAME_BYTES: usize = 1_048_576;
 const WRITER_CAPACITY: usize = 128;
@@ -234,6 +239,30 @@ impl AcpServer {
                 let result = self.set_config(params).await;
                 enqueue_result(outbound, id, result, cancelled)
             }
+            ("_task/status", Some(id)) => {
+                let result = self.task_status(params).await;
+                enqueue_result(outbound, id, result, cancelled)
+            }
+            ("_task/list", Some(id)) => {
+                let result = self.task_list(params).await;
+                enqueue_result(outbound, id, result, cancelled)
+            }
+            ("_task/context", Some(id)) => {
+                let result = self.task_context(params).await;
+                enqueue_result(outbound, id, result, cancelled)
+            }
+            ("_task/resume", Some(id)) => {
+                let result = self.task_mutation("resume", params).await;
+                enqueue_result(outbound, id, result, cancelled)
+            }
+            ("_task/cancel", Some(id)) => {
+                let result = self.task_mutation("cancel", params).await;
+                enqueue_result(outbound, id, result, cancelled)
+            }
+            ("_task/steer", Some(id)) => {
+                let result = self.task_mutation("steer", params).await;
+                enqueue_result(outbound, id, result, cancelled)
+            }
             ("session/prompt", Some(id)) => {
                 let result = self
                     .start_prompt(params, id.clone(), outbound.clone(), cancelled.clone())
@@ -437,6 +466,158 @@ impl AcpServer {
             }
         }
         Ok(result)
+    }
+
+    async fn task_status(&self, params: Value) -> Result<Value, AcpServerError> {
+        self.require_initialized()?;
+        let (local_id, task_id) = self.parse_task_binding(&params, &[])?;
+        let task = self
+            .kernel
+            .task_status(local_id, task_id)
+            .await
+            .map_err(map_kernel)?;
+        Ok(json!({"task":task}))
+    }
+
+    async fn task_list(&self, params: Value) -> Result<Value, AcpServerError> {
+        self.require_initialized()?;
+        let params = params.as_object().ok_or_else(invalid_input)?;
+        require_keys(params, &["sessionId"], &[])?;
+        let external = bounded_string(params.get("sessionId"), 128)?;
+        let local_id = self
+            .sessions
+            .get(&external)
+            .ok_or_else(invalid_input)?
+            .local_id;
+        let tasks = self.kernel.task_list(local_id).await.map_err(map_kernel)?;
+        Ok(json!({"tasks":tasks}))
+    }
+
+    async fn task_context(&self, params: Value) -> Result<Value, AcpServerError> {
+        self.require_initialized()?;
+        let (local_id, task_id) = self.parse_task_binding(&params, &[])?;
+        let context = self
+            .kernel
+            .task_context(local_id, task_id)
+            .await
+            .map_err(map_kernel)?;
+        Ok(json!({"context":context}))
+    }
+
+    async fn task_mutation(
+        &self,
+        method: &'static str,
+        params: Value,
+    ) -> Result<Value, AcpServerError> {
+        self.require_initialized()?;
+        let optional = if method == "steer" {
+            &["text"][..]
+        } else {
+            &[][..]
+        };
+        let params = params.as_object().ok_or_else(invalid_input)?;
+        require_keys(params, &["sessionId", "taskId", "idempotencyKey"], optional)?;
+        if method == "steer" && !params.contains_key("text") {
+            return Err(invalid_input());
+        }
+        let external = bounded_string(params.get("sessionId"), 128)?;
+        let binding = self.sessions.get(&external).ok_or_else(invalid_input)?;
+        let task_id = bounded_string(params.get("taskId"), 128)?
+            .parse::<TaskId>()
+            .map_err(|_| invalid_input())?;
+        let idempotency_key = bounded_string(params.get("idempotencyKey"), 128)?;
+        let control_id = task_control_identity(&external, &idempotency_key, task_id, method);
+        let text = if method == "steer" {
+            Some(bounded_text(params.get("text"), 256 * 1_024)?)
+        } else {
+            None
+        };
+        let current = self
+            .kernel
+            .task_status(binding.local_id, task_id)
+            .await
+            .map_err(map_kernel)?;
+        let result = json!({"outcome":"accepted","taskId":task_id});
+        let result_json = serde_json::to_string(&result).map_err(|_| invalid_input())?;
+        let request_digest = task_control_digest(method, task_id, text.as_deref());
+        let mutation = TaskControlMutationInput {
+            external_session_id: ExternalSessionId::try_from(external)
+                .map_err(|_| invalid_input())?,
+            idempotency_key,
+            task_id,
+            method: method.to_owned(),
+            request_digest,
+            result_json: result_json.clone(),
+            created_at: Utc::now(),
+        };
+        let claim = self
+            .kernel
+            .claim_task_mutation(mutation.clone())
+            .await
+            .map_err(map_kernel)?;
+        match claim {
+            TaskControlMutationClaim::Replay { result_json } => {
+                serde_json::from_str(&result_json).map_err(|_| invalid_input())
+            }
+            TaskControlMutationClaim::Fresh | TaskControlMutationClaim::Pending => {
+                if current.status.is_terminal() {
+                    return Err(invalid_input());
+                }
+                match method {
+                    "resume" => {
+                        self.kernel
+                            .task_resume(binding.local_id, task_id)
+                            .await
+                            .map_err(map_kernel)?;
+                    }
+                    "cancel" => {
+                        self.kernel
+                            .task_cancel(binding.local_id, task_id)
+                            .await
+                            .map_err(map_kernel)?;
+                    }
+                    "steer" => {
+                        self.kernel
+                            .task_steer(
+                                binding.local_id,
+                                task_id,
+                                text.ok_or_else(invalid_input)?,
+                                control_id,
+                            )
+                            .await
+                            .map_err(map_kernel)?;
+                    }
+                    _ => return Err(invalid_input()),
+                }
+                let mut completion = mutation;
+                completion.created_at = Utc::now();
+                let completed = self
+                    .kernel
+                    .complete_task_mutation(completion)
+                    .await
+                    .map_err(map_kernel)?;
+                serde_json::from_str(&completed).map_err(|_| invalid_input())
+            }
+        }
+    }
+
+    fn parse_task_binding(
+        &self,
+        params: &Value,
+        optional: &[&str],
+    ) -> Result<(SessionId, TaskId), AcpServerError> {
+        let params = params.as_object().ok_or_else(invalid_input)?;
+        require_keys(params, &["sessionId", "taskId"], optional)?;
+        let external = bounded_string(params.get("sessionId"), 128)?;
+        let local_id = self
+            .sessions
+            .get(&external)
+            .ok_or_else(invalid_input)?
+            .local_id;
+        let task_id = bounded_string(params.get("taskId"), 128)?
+            .parse::<TaskId>()
+            .map_err(|_| invalid_input())?;
+        Ok((local_id, task_id))
     }
 
     async fn start_prompt(
@@ -823,6 +1004,37 @@ fn parse_effort(value: &str) -> Result<ReasoningEffort, AcpServerError> {
         "ultra" => Ok(ReasoningEffort::Ultra),
         _ => Err(invalid_input()),
     }
+}
+
+fn task_control_digest(method: &str, task_id: TaskId, text: Option<&str>) -> Sha256Digest {
+    let mut hasher = Sha256::new();
+    hasher.update(b"carl.task-control.v1\0");
+    hasher.update((method.len() as u64).to_be_bytes());
+    hasher.update(method.as_bytes());
+    hasher.update(task_id.to_string().as_bytes());
+    if let Some(text) = text {
+        hasher.update((text.len() as u64).to_be_bytes());
+        hasher.update(text.as_bytes());
+    } else {
+        hasher.update(0_u64.to_be_bytes());
+    }
+    Sha256Digest::from_bytes(hasher.finalize().into())
+}
+
+fn task_control_identity(
+    external_session_id: &str,
+    idempotency_key: &str,
+    task_id: TaskId,
+    method: &str,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"carl.task-control-identity.v1\0");
+    for value in [external_session_id, idempotency_key, method] {
+        hasher.update((value.len() as u64).to_be_bytes());
+        hasher.update(value.as_bytes());
+    }
+    hasher.update(task_id.to_string().as_bytes());
+    format!("{:x}", hasher.finalize())
 }
 
 const fn stop_reason(reason: PromptStopReason) -> &'static str {

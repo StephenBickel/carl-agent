@@ -79,11 +79,14 @@ fn fresh_database_is_migrated_and_configured_for_durable_use() -> Result<(), Box
         "subscription_run_verification_results".to_owned(),
         "subscription_runs".to_owned(),
         "task_checkpoints".to_owned(),
+        "task_control_receipts".to_owned(),
         "task_context_packages".to_owned(),
         "task_epochs".to_owned(),
         "task_operations".to_owned(),
         "task_steering".to_owned(),
         "telegram_state".to_owned(),
+        "trusted_frontend_events".to_owned(),
+        "trusted_frontend_owners".to_owned(),
         "usage_observations".to_owned(),
     ]);
     assert!(
@@ -94,12 +97,12 @@ fn fresh_database_is_migrated_and_configured_for_durable_use() -> Result<(), Box
     let migrations = connection.query_row("SELECT COUNT(*) FROM migrations", [], |row| {
         row.get::<_, u64>(0)
     })?;
-    assert_eq!(migrations, 8);
+    assert_eq!(migrations, 9);
     let checksums = connection
         .prepare("SELECT checksum FROM migrations ORDER BY version")?
         .query_map([], |row| row.get::<_, String>(0))?
         .collect::<Result<Vec<_>, _>>()?;
-    assert_eq!(checksums.len(), 8);
+    assert_eq!(checksums.len(), 9);
     assert_eq!(
         &checksums[..3],
         [
@@ -128,6 +131,10 @@ fn fresh_database_is_migrated_and_configured_for_durable_use() -> Result<(), Box
         checksums[7],
         "c5202d503ebce6e60ef5807779e1750e252b25fdeff9df195a79a0c48971778b"
     );
+    assert_eq!(
+        checksums[8],
+        "93a3bcfa21bcec9ec54698e7290499f7e52c49796f03535dd95c8de3eb08e9a2"
+    );
     assert!(checksums.iter().all(|checksum| {
         checksum.len() == 64
             && checksum
@@ -143,7 +150,7 @@ fn fresh_database_is_migrated_and_configured_for_durable_use() -> Result<(), Box
     let migrations = connection.query_row("SELECT COUNT(*) FROM migrations", [], |row| {
         row.get::<_, u64>(0)
     })?;
-    assert_eq!(migrations, 8);
+    assert_eq!(migrations, 9);
 
     Ok(())
 }
@@ -208,7 +215,7 @@ fn every_pre_task_schema_version_upgrades_without_rewriting_its_ledger()
             connection.query_row("SELECT COUNT(*) FROM migrations", [], |row| {
                 row.get::<_, u64>(0)
             })?,
-            8,
+            9,
             "migration prefix {prefix_length} did not upgrade"
         );
         assert_eq!(
@@ -374,7 +381,7 @@ fn store_open_rejects_a_future_database_migration() -> Result<(), Box<dyn Error>
     ensure_checksum_column(&connection)?;
     connection.execute(
         "INSERT INTO migrations (version, name, applied_at, checksum)
-         VALUES (9, 'future migration', '2026-07-13T12:00:00Z', ?1)",
+         VALUES (10, 'future migration', '2026-07-13T12:00:00Z', ?1)",
         ["ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"],
     )?;
     drop(connection);
@@ -383,7 +390,7 @@ fn store_open_rejects_a_future_database_migration() -> Result<(), Box<dyn Error>
     assert!(matches!(
         error,
         CarlError::Storage { ref detail }
-            if detail.contains("unsupported database migration version 9")
+            if detail.contains("unsupported database migration version 10")
     ));
     Ok(())
 }
@@ -501,13 +508,13 @@ fn pre_subscription_run_database_upgrades_without_rewriting_old_migrations()
         connection.query_row("SELECT COUNT(*) FROM migrations", [], |row| {
             row.get::<_, u64>(0)
         })?,
-        8
+        9
     );
     let checksums = connection
         .prepare("SELECT checksum FROM migrations ORDER BY version")?
         .query_map([], |row| row.get::<_, String>(0))?
         .collect::<Result<Vec<_>, _>>()?;
-    assert_eq!(checksums.len(), 8);
+    assert_eq!(checksums.len(), 9);
     assert_eq!(
         &checksums[..3],
         [
@@ -581,7 +588,7 @@ fn pre_proposal_artifact_database_upgrades_through_migration_eight_and_reopens()
         connection.query_row("SELECT COUNT(*) FROM migrations", [], |row| {
             row.get::<_, u64>(0)
         })?,
-        8
+        9
     );
     let tables = connection
         .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")?
@@ -610,7 +617,7 @@ fn pre_proposal_artifact_database_upgrades_through_migration_eight_and_reopens()
         connection.query_row("SELECT COUNT(*) FROM migrations", [], |row| {
             row.get::<_, u64>(0)
         })?,
-        8
+        9
     );
 
     Ok(())
@@ -647,7 +654,7 @@ fn pre_verification_database_applies_migrations_five_through_eight_and_reopens()
         connection.query_row("SELECT COUNT(*) FROM migrations", [], |row| {
             row.get::<_, u64>(0)
         })?,
-        8
+        9
     );
     assert_eq!(
         connection.query_row(

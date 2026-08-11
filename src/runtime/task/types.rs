@@ -421,6 +421,12 @@ pub enum EffectClass {
     AmbiguousConsequential,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EpochInterruptReason {
+    PermissionTightening,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "evidence_kind", rename_all = "snake_case")]
 pub enum NormalizedOperationEvidence {
@@ -826,6 +832,10 @@ pub enum TaskEvent {
         #[serde(deserialize_with = "deserialize_event_identifier")]
         report_digest: String,
     },
+    EpochInterrupted {
+        epoch_id: EpochId,
+        reason: EpochInterruptReason,
+    },
     ProviderRequestRecorded {
         epoch_id: EpochId,
         purpose: ProviderRequestPurpose,
@@ -1032,6 +1042,7 @@ impl TaskEvent {
                 validate_event_identifier(item_id)
             }
             Self::UsageObserved { .. }
+            | Self::EpochInterrupted { .. }
             | Self::CompactionCompleted { .. }
             | Self::CancellationRequested
             | Self::Completed => Ok(()),
