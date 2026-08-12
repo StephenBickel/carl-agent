@@ -2585,7 +2585,8 @@ impl Store {
                 true,
             )
         } else {
-            let authoritative = validate_task_authority_from_journal(&transaction, input.task_id)?;
+            let authoritative = validate_task_authority_from_journal(&transaction, input.task_id)
+                .map_err(checkpoint_fallback_authority_error)?;
             current = authoritative.record;
             validate_task_canonical_payloads_filtered(&transaction, Some(input.task_id))?;
             #[cfg(test)]
@@ -2603,22 +2604,6 @@ impl Store {
             )
         };
         validate_checkpoint_artifacts(&transaction, &input.checkpoint)?;
-        #[cfg(test)]
-        if used_incremental_path {
-            self.checkpoint_authority_incremental_validations.set(
-                self.checkpoint_authority_incremental_validations
-                    .get()
-                    .saturating_add(1),
-            );
-        } else {
-            self.checkpoint_authority_full_validations.set(
-                self.checkpoint_authority_full_validations
-                    .get()
-                    .saturating_add(1),
-            );
-        }
-        #[cfg(not(test))]
-        let _ = used_incremental_path;
 
         let envelope = append_event_in_transaction(
             &transaction,
@@ -2670,6 +2655,22 @@ impl Store {
             .map_err(storage_error)?;
         update_task_projection(&transaction, &snapshot, input.created_at)?;
         transaction.commit().map_err(storage_error)?;
+        #[cfg(test)]
+        if used_incremental_path {
+            self.checkpoint_authority_incremental_validations.set(
+                self.checkpoint_authority_incremental_validations
+                    .get()
+                    .saturating_add(1),
+            );
+        } else {
+            self.checkpoint_authority_full_validations.set(
+                self.checkpoint_authority_full_validations
+                    .get()
+                    .saturating_add(1),
+            );
+        }
+        #[cfg(not(test))]
+        let _ = used_incremental_path;
         let record = CheckpointRecord {
             checkpoint: input.checkpoint,
             checkpoint_digest: input.checkpoint_digest,
@@ -6860,12 +6861,21 @@ fn validate_checkpoint_authority_from_anchor(
     let mut after_sequence = anchor.map(|authority| authority.source_sequence_end);
     let mut last_tail_sequence = after_sequence;
     loop {
-        let page = read_task_event_page_from_connection(
-            transaction,
-            checkpoint.task_id,
-            after_sequence,
-            512,
-        )?;
+        let page = match anchor {
+            Some(authority) => read_task_event_page_for_known_session_from_connection(
+                transaction,
+                authority.task_snapshot.session_id,
+                checkpoint.task_id,
+                after_sequence,
+                512,
+            )?,
+            None => read_task_event_page_from_connection(
+                transaction,
+                checkpoint.task_id,
+                after_sequence,
+                512,
+            )?,
+        };
         if page.is_empty() {
             break;
         }
@@ -7404,6 +7414,15 @@ fn context_validation_error(_error: crate::runtime::task::ContextError) -> CarlE
 fn checkpoint_validation(detail: &str) -> CarlError {
     CarlError::Validation {
         detail: detail.to_owned(),
+    }
+}
+
+fn checkpoint_fallback_authority_error(error: CarlError) -> CarlError {
+    match error {
+        CarlError::Storage { detail } if detail.ends_with("disagrees with journal replay") => {
+            CarlError::Validation { detail }
+        }
+        error => error,
     }
 }
 
@@ -8047,6 +8066,21 @@ fn load_task_configuration_record(
         .transpose()
 }
 
+#[cfg(test)]
+thread_local! {
+    static TASK_EVENT_SESSION_DISCOVERY_QUERIES: Cell<u64> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+fn reset_task_event_session_discovery_queries() {
+    TASK_EVENT_SESSION_DISCOVERY_QUERIES.set(0);
+}
+
+#[cfg(test)]
+fn task_event_session_discovery_queries() -> u64 {
+    TASK_EVENT_SESSION_DISCOVERY_QUERIES.get()
+}
+
 fn read_task_event_page_from_connection(
     connection: &Connection,
     task_id: TaskId,
@@ -8065,6 +8099,9 @@ fn read_task_event_page_from_connection(
         None => 0,
     };
     let task_id_text = task_id.to_string();
+    #[cfg(test)]
+    TASK_EVENT_SESSION_DISCOVERY_QUERIES
+        .set(TASK_EVENT_SESSION_DISCOVERY_QUERIES.get().saturating_add(1));
     let session_ids = connection
         .prepare(
             "SELECT DISTINCT session_id
@@ -8090,6 +8127,34 @@ fn read_task_event_page_from_connection(
     let session_id: SessionId = session_id
         .parse()
         .map_err(|_| storage_invariant("task journal contains an invalid session identifier"))?;
+    read_task_event_page_for_known_session_from_connection(
+        connection,
+        session_id,
+        task_id,
+        Some(stored_u64(after_sequence, "task event page cursor")?),
+        limit,
+    )
+}
+
+fn read_task_event_page_for_known_session_from_connection(
+    connection: &Connection,
+    session_id: SessionId,
+    task_id: TaskId,
+    after_sequence: Option<u64>,
+    limit: u16,
+) -> Result<Vec<EventEnvelope>, CarlError> {
+    if !(1..=512).contains(&limit) {
+        return Err(CarlError::Validation {
+            detail: "task event page limit must be between 1 and 512".to_owned(),
+        });
+    }
+    let after_sequence = match after_sequence {
+        Some(sequence) => i64::try_from(sequence).map_err(|_| CarlError::Validation {
+            detail: "task event page cursor is too large".to_owned(),
+        })?,
+        None => 0,
+    };
+    let task_id_text = task_id.to_string();
     let rows = connection
         .prepare(
             "SELECT id, turn_id, sequence, timestamp, schema_version, event_json
@@ -10106,6 +10171,23 @@ mod checkpoint_authority_tests {
         assert_eq!(store.checkpoint_full_prefix_scan_count(), 1);
 
         let task_id = first.task_id;
+        let session_id = store
+            .get_task(task_id)?
+            .expect("task exists")
+            .snapshot
+            .session_id;
+        let isolated_task = store.create_task(test_task(session_id, &_fixture.workspace))?;
+        store
+            .append_task_event(
+                isolated_task.snapshot.task_id,
+                isolated_task.revision,
+                TaskEvent::ProgressAssessed {
+                    fingerprint: "other-task-event".to_owned(),
+                    stalled: false,
+                },
+                test_instant(2),
+            )?
+            .expect("other task revision matches");
         let mut task = store.get_task(task_id)?.expect("task exists");
         for index in 0..513_u32 {
             task = store
@@ -10130,12 +10212,21 @@ mod checkpoint_authority_tests {
             tail.windows(2)
                 .all(|pair| pair[0].sequence < pair[1].sequence)
         );
+        assert!(tail.iter().all(|event| matches!(
+            &event.event,
+            Event::TaskLifecycle {
+                task_id: event_task_id,
+                ..
+            } if *event_task_id == task_id
+        )));
 
         let (task, second) = build_next_checkpoint(&store, task_id, Some(first))?;
+        reset_task_event_session_discovery_queries();
         let second = commit_checkpoint(&mut store, &task, second, 516)?;
         assert_eq!(second.source_sequence_end, tail.last().unwrap().sequence);
         assert_eq!(store.checkpoint_authority_validation_counts(), (1, 1));
         assert_eq!(store.checkpoint_full_prefix_scan_count(), 1);
+        assert_eq!(task_event_session_discovery_queries(), 0);
         Ok(())
     }
 
@@ -10199,7 +10290,7 @@ mod checkpoint_authority_tests {
             },
             task.revision,
         );
-        assert!(rejected.is_err());
+        assert!(matches!(rejected, Err(CarlError::Validation { .. })));
         assert_eq!(store.read_task_events(task_id)?.len(), before_events);
         assert_eq!(
             store.get_task(task_id)?.expect("task exists").revision,
@@ -10216,6 +10307,105 @@ mod checkpoint_authority_tests {
                 |row| row.get::<_, u64>(0),
             )?,
             2
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn late_checkpoint_insert_failure_rolls_back_without_advancing_cache_or_counters() -> TestResult
+    {
+        let (_fixture, mut store, first) = setup_authenticated_anchor()?;
+        let task_id = first.task_id;
+        let task = store.get_task(task_id)?.expect("task exists");
+        store
+            .append_task_event(
+                task_id,
+                task.revision,
+                TaskEvent::ProgressAssessed {
+                    fingerprint: "late-failure-tail".to_owned(),
+                    stalled: false,
+                },
+                test_instant(2),
+            )?
+            .expect("task revision matches");
+        let (task, candidate) = build_next_checkpoint(&store, task_id, Some(first))?;
+        let package = checkpoint_package(candidate.clone())?;
+        let input = NewCheckpoint {
+            task_id,
+            checkpoint_digest: candidate.digest()?,
+            context_package_digest: package.digest()?,
+            checkpoint: candidate,
+            context_package: package,
+            created_at: test_instant(3),
+        };
+        let before_events = store.read_task_events(task_id)?.len();
+        let before_revision = task.revision;
+        let before_counts = store.checkpoint_authority_validation_counts();
+        let before_rows = store.connection.query_row(
+            "SELECT COUNT(*) FROM task_checkpoints WHERE task_id = ?1",
+            [task_id.to_string()],
+            |row| row.get::<_, u64>(0),
+        )?;
+        let authority_before = Arc::clone(
+            store
+                .authenticated_checkpoint_authority
+                .get(&task_id)
+                .expect("authenticated authority exists"),
+        );
+        store.connection.execute_batch(
+            "CREATE TRIGGER test_reject_checkpoint_insert
+             BEFORE INSERT ON task_checkpoints
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected checkpoint insert failure');
+             END;",
+        )?;
+
+        let rejected = store.commit_checkpoint(input.clone(), before_revision);
+        assert!(matches!(rejected, Err(CarlError::Storage { .. })));
+        store
+            .connection
+            .execute_batch("DROP TRIGGER test_reject_checkpoint_insert;")?;
+        assert_eq!(store.read_task_events(task_id)?.len(), before_events);
+        assert_eq!(
+            store.get_task(task_id)?.expect("task exists").revision,
+            before_revision
+        );
+        assert_eq!(
+            store.connection.query_row(
+                "SELECT COUNT(*) FROM task_checkpoints WHERE task_id = ?1",
+                [task_id.to_string()],
+                |row| row.get::<_, u64>(0),
+            )?,
+            before_rows
+        );
+        assert_eq!(
+            store.checkpoint_authority_validation_counts(),
+            before_counts
+        );
+        assert!(Arc::ptr_eq(
+            &authority_before,
+            store
+                .authenticated_checkpoint_authority
+                .get(&task_id)
+                .expect("failed commit preserves authority")
+        ));
+
+        store
+            .commit_checkpoint(input, before_revision)?
+            .expect("same candidate commits after removing failure trigger");
+        assert_eq!(store.checkpoint_authority_validation_counts(), (1, 1));
+        assert_eq!(store.read_task_events(task_id)?.len(), before_events + 1);
+        assert_eq!(
+            store.get_task(task_id)?.expect("task exists").revision,
+            before_revision + 1
+        );
+        assert_eq!(
+            store.connection.query_row(
+                "SELECT COUNT(*) FROM task_checkpoints WHERE task_id = ?1",
+                [task_id.to_string()],
+                |row| row.get::<_, u64>(0),
+            )?,
+            before_rows + 1
         );
         Ok(())
     }
