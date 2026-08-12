@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from carl_bench.metrics import MetricContractError, load_metric_pack
+from carl_bench.metrics import Disclosure, MetricContractError, MetricVerdict, load_metric_pack
 
 
 def metric(metric_id: str, observation: str, *, mode: str = "deterministic") -> dict[str, object]:
@@ -71,6 +71,114 @@ def test_judge_metric_requires_semantic_justification(tmp_path: Path) -> None:
 
     with pytest.raises(MetricContractError, match="judge_justification_required"):
         load_metric_pack(write_pack(tmp_path, metrics=[value]))
+
+
+@pytest.mark.parametrize(
+    ("justification", "code"),
+    [
+        (
+            "A semantic review is required.\nIt must stay on one line.",
+            "metric_text_not_single_line",
+        ),
+        (
+            "A semantic review is required.\x1fIt must exclude controls.",
+            "metric_text_control_character",
+        ),
+        (
+            "A semantic review must not expose Bearer abcdefghijklmnopqrstuvwxyz.",
+            "metric_text_secret_pattern",
+        ),
+    ],
+)
+def test_judge_justification_rejects_unsafe_text(
+    tmp_path: Path, justification: str, code: str
+) -> None:
+    value = metric("reply.tone", "final_response", mode="judge")
+    value["judge_justification"] = justification
+
+    with pytest.raises(MetricContractError, match=code):
+        load_metric_pack(write_pack(tmp_path, metrics=[value]))
+
+
+@pytest.mark.parametrize(
+    ("reason", "code"),
+    [
+        (
+            "The final state is incomplete.\nDo not include this line.",
+            "metric_text_not_single_line",
+        ),
+        ("The final state is incomplete.\x1f", "metric_text_control_character"),
+        ("The final state leaked api_key=abcdefghijklmnop.", "metric_text_secret_pattern"),
+    ],
+)
+def test_metric_verdict_rejects_unsafe_reason_text(reason: str, code: str) -> None:
+    with pytest.raises(MetricContractError, match=code):
+        MetricVerdict(
+            metric_id="coding.tests_pass",
+            passed=False,
+            score_basis_points=0,
+            reason_code="tests_failed",
+            reason=reason,
+            disclosure=Disclosure.PUBLIC,
+        )
+
+
+def test_metric_text_accepts_declared_byte_boundaries(tmp_path: Path) -> None:
+    minimum = metric("reply.minimum", "final_response", mode="judge")
+    minimum["judge_justification"] = "é" * 10
+    maximum = metric("reply.maximum", "final_response", mode="judge")
+    maximum["judge_justification"] = "é" * 256
+    pack = load_metric_pack(write_pack(tmp_path, metrics=[maximum, minimum]))
+
+    empty_passing_reason = MetricVerdict(
+        metric_id="reply.minimum",
+        passed=True,
+        score_basis_points=10_000,
+        reason_code="",
+        reason="",
+        disclosure=Disclosure.PUBLIC,
+    )
+    maximum_reason = MetricVerdict(
+        metric_id="reply.maximum",
+        passed=False,
+        score_basis_points=0,
+        reason_code="behavior_failed",
+        reason="é" * 256,
+        disclosure=Disclosure.PUBLIC,
+    )
+
+    assert len(pack.metrics) == 2
+    assert empty_passing_reason.reason == ""
+    assert maximum_reason.reason == "é" * 256
+
+
+def test_metric_text_rejects_values_over_the_declared_byte_bound(tmp_path: Path) -> None:
+    value = metric("reply.too_long", "final_response", mode="judge")
+    value["judge_justification"] = "j" * 513
+    with pytest.raises(MetricContractError, match="metric_text_too_long"):
+        load_metric_pack(write_pack(tmp_path, metrics=[value]))
+
+    with pytest.raises(MetricContractError, match="metric_text_too_long"):
+        MetricVerdict(
+            metric_id="reply.too_long",
+            passed=False,
+            score_basis_points=0,
+            reason_code="behavior_failed",
+            reason="r" * 513,
+            disclosure=Disclosure.PUBLIC,
+        )
+
+
+def test_failed_metric_verdict_requires_a_nonempty_reason() -> None:
+    with pytest.raises(MetricContractError, match="metric_verdict_reason_required"):
+        MetricVerdict(
+            metric_id="coding.tests_pass",
+            passed=False,
+            score_basis_points=0,
+            reason_code="tests_failed",
+            reason="",
+            disclosure=Disclosure.PUBLIC,
+        )
 
 
 def test_metric_pack_rejects_unsorted_duplicate_and_incomplete_metric_contracts(

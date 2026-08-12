@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from carl_bench.canonical import canonical_json_bytes
+from carl_bench.sanitize import _SECRET_PATTERNS
 
 _PACK_KEYS = frozenset({"schema_version", "pack_id", "pack_version", "metrics"})
 _METRIC_KEYS = frozenset(
@@ -37,6 +38,29 @@ class MetricContractError(ValueError):
     def __init__(self, code: str) -> None:
         self.code = code
         super().__init__(code)
+
+
+def _validate_text(
+    value: object,
+    *,
+    minimum_bytes: int,
+    maximum_bytes: int,
+    required_code: str,
+) -> str:
+    if not isinstance(value, str):
+        raise MetricContractError("metric_text_invalid")
+    encoded = value.encode("utf-8")
+    if len(encoded) < minimum_bytes:
+        raise MetricContractError(required_code)
+    if len(encoded) > maximum_bytes:
+        raise MetricContractError("metric_text_too_long")
+    if "\n" in value or "\r" in value or "\u2028" in value or "\u2029" in value:
+        raise MetricContractError("metric_text_not_single_line")
+    if any(ord(character) <= 0x1F or 0x7F <= ord(character) <= 0x9F for character in value):
+        raise MetricContractError("metric_text_control_character")
+    if any(pattern.search(value) for pattern in _SECRET_PATTERNS):
+        raise MetricContractError("metric_text_secret_pattern")
+    return value
 
 
 class MetricMode(str, Enum):
@@ -109,6 +133,16 @@ class MetricVerdict:
     reason_code: str
     reason: str
     disclosure: Disclosure
+
+    def __post_init__(self) -> None:
+        _validate_text(
+            self.reason,
+            minimum_bytes=0,
+            maximum_bytes=512,
+            required_code="metric_verdict_reason_required",
+        )
+        if not self.passed and not self.reason:
+            raise MetricContractError("metric_verdict_reason_required")
 
 
 def is_metric_id(value: object) -> bool:
@@ -211,11 +245,12 @@ def _metric_definition(value: object) -> MetricDefinition:
     if mode is MetricMode.JUDGE:
         if observation is not ObservationKind.FINAL_RESPONSE:
             raise MetricContractError("judge_observation_invalid")
-        if (
-            not isinstance(justification, str)
-            or not 20 <= len(justification.encode("utf-8")) <= 512
-        ):
-            raise MetricContractError("judge_justification_required")
+        justification = _validate_text(
+            justification,
+            minimum_bytes=20,
+            maximum_bytes=512,
+            required_code="judge_justification_required",
+        )
     elif justification is not None:
         raise MetricContractError("metric_judge_justification_invalid")
     return MetricDefinition(
