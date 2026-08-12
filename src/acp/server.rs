@@ -31,6 +31,8 @@ use crate::storage::{
     ClientName, ExternalSessionId, TaskControlMutationClaim, TaskControlMutationInput,
 };
 
+use super::session::exact_task_metrics_command;
+
 const MAX_FRAME_BYTES: usize = 1_048_576;
 const WRITER_CAPACITY: usize = 128;
 
@@ -1266,9 +1268,7 @@ impl ServiceAcpServer {
         let external = bounded_string(params.get("sessionId"), 128)?;
         let blocks = parse_service_prompt_blocks(params.get("prompt"))?;
         let text = blocks.join("\n\n");
-        let metrics_slash = blocks
-            .first()
-            .is_some_and(|block| block.trim() == "/metrics");
+        let metrics_slash = exact_task_metrics_command(&blocks);
         let mut session = self
             .sessions
             .lock()

@@ -2655,11 +2655,104 @@ async fn acp_reconnect_during_three_epoch_task_replays_once_and_completes() -> T
     })
     .await
     .map_err(|_| "three-epoch reconnect steer did not reach the provider")?;
-    shared.lock().unwrap().release_epoch_two = true;
 
     let mut replayed = Vec::new();
     let mut visible_assistant = 0_u64;
     let mut visible_diff = 0_u64;
+    for (id, prompt) in [
+        (120, vec!["\n/metrics"]),
+        (121, vec!["\r\n/metrics"]),
+        (122, vec!["\t/metrics"]),
+        (123, vec![" /metrics"]),
+        (124, vec!["/metrics\n"]),
+        (125, vec!["/metrics "]),
+        (126, vec!["/metrics", "second block"]),
+        (127, vec!["\"/metrics\""]),
+    ] {
+        client_write
+            .write_all(
+                format!(
+                    "{}\n",
+                    json!({
+                        "jsonrpc":"2.0","id":id,"method":"session/prompt","params":{
+                            "sessionId":session_id,
+                            "prompt":prompt.into_iter().map(|text| json!({"type":"text","text":text})).collect::<Vec<_>>()
+                        }
+                    })
+                )
+                .as_bytes(),
+            )
+            .await?;
+        client_write.flush().await?;
+        let response = loop {
+            let frame =
+                tokio::time::timeout(Duration::from_secs(5), read_frame(&mut reader, 1024 * 1024))
+                    .await??
+                    .ok_or("malformed metrics response missing")?;
+            if let Some(sequence) = frame.value()["params"]["_meta"]["eventSequence"].as_u64() {
+                replayed.push(sequence);
+            }
+            visible_assistant += u64::from(
+                frame.value()["params"]["update"]["content"]["text"] == "visible assistant update",
+            );
+            visible_diff += u64::from(
+                frame.value()["params"]["update"]["content"][0]["diff"]
+                    == "diff --git a/live b/live",
+            );
+            if frame.value()["id"] == id {
+                break frame;
+            }
+        };
+        assert_eq!(
+            response.value()["error"]["code"],
+            -32602,
+            "non-exact metrics prompt must remain ordinary input: {response:?}"
+        );
+    }
+
+    client_write
+        .write_all(
+            format!(
+                "{}\n",
+                json!({"jsonrpc":"2.0","id":128,"method":"session/prompt","params":{"sessionId":session_id,"prompt":[{"type":"text","text":"/metrics"}]}})
+            )
+            .as_bytes(),
+        )
+        .await?;
+    client_write.flush().await?;
+    let mut saw_exact_metrics = false;
+    loop {
+        let frame =
+            tokio::time::timeout(Duration::from_secs(5), read_frame(&mut reader, 1024 * 1024))
+                .await??
+                .ok_or("exact metrics response missing")?;
+        if let Some(sequence) = frame.value()["params"]["_meta"]["eventSequence"].as_u64() {
+            replayed.push(sequence);
+        }
+        visible_assistant += u64::from(
+            frame.value()["params"]["update"]["content"]["text"] == "visible assistant update",
+        );
+        visible_diff += u64::from(
+            frame.value()["params"]["update"]["content"][0]["diff"] == "diff --git a/live b/live",
+        );
+        if let Some(text) = frame.value()["params"]["update"]["content"]["text"].as_str()
+            && serde_json::from_str::<serde_json::Value>(text)
+                .is_ok_and(|value| value["metrics"]["schema_version"] == 1)
+        {
+            saw_exact_metrics = true;
+        }
+        if frame.value()["id"] == 128 {
+            assert_eq!(frame.value()["result"]["stopReason"], "end_turn");
+            break;
+        }
+    }
+    assert!(
+        saw_exact_metrics,
+        "exact raw metrics command must remain enabled"
+    );
+
+    shared.lock().unwrap().release_epoch_two = true;
+
     let mut prompt_completed = false;
     let mut prompt_response = None;
     let mut durable_completed = false;

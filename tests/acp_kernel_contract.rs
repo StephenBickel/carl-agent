@@ -33,16 +33,23 @@ use uuid::Uuid;
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
 #[test]
-fn embedded_or_quoted_metrics_text_is_not_a_slash_command() -> TestResult {
-    for text in [
-        "please run /metrics now",
-        "\"/metrics\"",
-        "prefix\n/metrics",
+fn metrics_slash_requires_one_exact_raw_prompt_block() -> TestResult {
+    for blocks in [
+        vec!["\n/metrics".to_owned()],
+        vec!["\r\n/metrics".to_owned()],
+        vec!["\t/metrics".to_owned()],
+        vec![" /metrics".to_owned()],
+        vec!["/metrics\n".to_owned()],
+        vec!["/metrics ".to_owned()],
+        vec!["/metrics".to_owned(), "second block".to_owned()],
+        vec!["please run /metrics now".to_owned()],
+        vec!["\"/metrics\"".to_owned()],
+        vec!["prefix\n/metrics".to_owned()],
     ] {
-        let prompt = Prompt::new(vec![text.to_owned()])?;
-        assert_eq!(prompt.task_slash_command(), None, "{text}");
+        let prompt = Prompt::new(blocks.clone())?;
+        assert_eq!(prompt.task_slash_command(), None, "{blocks:?}");
     }
-    let exact = Prompt::new(vec![" /metrics ".to_owned()])?;
+    let exact = Prompt::new(vec!["/metrics".to_owned()])?;
     assert_eq!(exact.task_slash_command(), Some("/metrics"));
     Ok(())
 }

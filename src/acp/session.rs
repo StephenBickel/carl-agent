@@ -19,6 +19,10 @@ const MAX_PROMPT_BYTES: usize = 256 * 1_024;
 const MAX_TASK_CONTEXT_TEXT_BYTES: usize = 4 * 1_024;
 const MAX_TASK_CONTEXT_CONSTRAINTS: usize = 16;
 
+pub(crate) fn exact_task_metrics_command(blocks: &[String]) -> bool {
+    matches!(blocks, [block] if block == "/metrics")
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskView {
@@ -227,11 +231,13 @@ impl Prompt {
 
     #[must_use]
     pub fn task_slash_command(&self) -> Option<&str> {
+        if exact_task_metrics_command(&self.blocks) {
+            return Some("/metrics");
+        }
         self.leading_slash_command().filter(|command| {
             matches!(
                 *command,
                 "/status"
-                    | "/metrics"
                     | "/resume"
                     | "/cancel"
                     | "/context"
