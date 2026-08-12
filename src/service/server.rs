@@ -294,6 +294,8 @@ pub enum TaskServiceErrorCode {
     Busy,
     #[error("the Carl service stopped")]
     Stopped,
+    #[error("the Carl service idempotency key conflicts with another command")]
+    IdempotencyConflict,
 }
 
 #[derive(Debug, Error)]
@@ -323,6 +325,8 @@ pub struct TaskService<P: AgentPort + 'static> {
     next_acknowledgement: Arc<AtomicU64>,
     actor_state: Arc<TaskActorState>,
     info: ServiceInfo,
+    #[cfg(test)]
+    maintenance_control_test_gate: Option<Arc<MaintenanceControlTestGate>>,
 }
 
 impl<P: AgentPort + 'static> fmt::Debug for TaskService<P> {
@@ -378,6 +382,8 @@ impl<P: AgentPort + 'static> TaskService<P> {
             next_acknowledgement: Arc::new(AtomicU64::new(1)),
             actor_state: Arc::new(TaskActorState::default()),
             info,
+            #[cfg(test)]
+            maintenance_control_test_gate: None,
         })
     }
 
@@ -396,6 +402,8 @@ impl<P: AgentPort + 'static> TaskService<P> {
             next_acknowledgement,
             actor_state,
             info,
+            #[cfg(test)]
+            maintenance_control_test_gate,
         } = self;
         let (actor_sender, actor_receiver) = mpsc::channel(SERVICE_COMMAND_CAPACITY);
         let actor_lifecycle = Arc::clone(&actor_state);
@@ -415,6 +423,8 @@ impl<P: AgentPort + 'static> TaskService<P> {
             actor_state,
             actor_sender,
             info,
+            #[cfg(test)]
+            maintenance_control_test_gate,
         });
         let live_task = tokio::spawn(async move {
             loop {
@@ -626,6 +636,15 @@ impl TaskActorState {
         owner.phase == MaintenancePhase::Running
             || owner.maintenance_idempotency_key.as_deref() == Some(idempotency_key)
     }
+
+    async fn owns_maintenance_key(&self, idempotency_key: &str) -> bool {
+        self.owner
+            .lock()
+            .await
+            .maintenance_idempotency_key
+            .as_deref()
+            == Some(idempotency_key)
+    }
 }
 
 fn maintenance_status(owner: &TaskActorOwner) -> ServiceMaintenanceStatus {
@@ -650,6 +669,40 @@ struct ServiceShared {
     actor_state: Arc<TaskActorState>,
     actor_sender: mpsc::Sender<ActorCommand>,
     info: ServiceInfo,
+    #[cfg(test)]
+    maintenance_control_test_gate: Option<Arc<MaintenanceControlTestGate>>,
+}
+
+#[cfg(test)]
+struct MaintenanceControlTestGate {
+    reached: tokio::sync::Semaphore,
+    released: tokio::sync::Semaphore,
+}
+
+#[cfg(test)]
+impl Default for MaintenanceControlTestGate {
+    fn default() -> Self {
+        Self {
+            reached: tokio::sync::Semaphore::new(0),
+            released: tokio::sync::Semaphore::new(0),
+        }
+    }
+}
+
+#[cfg(test)]
+impl MaintenanceControlTestGate {
+    async fn pause(&self) {
+        self.reached.add_permits(1);
+        let _permit = self.released.acquire().await.expect("test gate stays open");
+    }
+
+    async fn wait_reached(&self) {
+        let _permit = self.reached.acquire().await.expect("test gate stays open");
+    }
+
+    fn release(&self) {
+        self.released.add_permits(1);
+    }
 }
 
 struct LiveUpdateHub {
@@ -1164,21 +1217,6 @@ async fn dispatch_request(
         return execute_command(shared, &request, false).await;
     }
     let _gate = shared.mutation_gate.lock().await;
-    if matches!(request.command, ServiceCommand::PrepareMaintenance)
-        && !shared
-            .actor_state
-            .allows_prepare(&request.idempotency_key)
-            .await
-    {
-        return Err(service_error(TaskServiceErrorCode::Stopped));
-    }
-    if !matches!(
-        request.command,
-        ServiceCommand::PrepareMaintenance | ServiceCommand::Shutdown
-    ) && shared.actor_state.rejects_mutations().await
-    {
-        return Err(service_error(TaskServiceErrorCode::Stopped));
-    }
     let digest = command_digest(&request.command)
         .map_err(|_| service_error(TaskServiceErrorCode::InvalidRequest))?;
     let receipt = ServiceCommandReceiptInput {
@@ -1187,7 +1225,33 @@ async fn dispatch_request(
         command_kind: service_command_kind(&request.command).to_owned(),
         created_at: Utc::now(),
     };
+    if matches!(request.command, ServiceCommand::PrepareMaintenance)
+        && !shared
+            .actor_state
+            .allows_prepare(&request.idempotency_key)
+            .await
+    {
+        return Err(service_error(TaskServiceErrorCode::Stopped));
+    }
+    let phase_rejects = !matches!(
+        request.command,
+        ServiceCommand::PrepareMaintenance | ServiceCommand::Shutdown
+    ) && shared.actor_state.rejects_mutations().await;
+    let checks_maintenance_binding = phase_rejects
+        && shared
+            .actor_state
+            .owns_maintenance_key(&request.idempotency_key)
+            .await;
+    if phase_rejects && !checks_maintenance_binding {
+        return Err(service_error(TaskServiceErrorCode::Stopped));
+    }
     let claim = claim_service_command(shared, receipt.clone()).await?;
+    if claim == ServiceCommandReceiptClaim::Conflict {
+        return Err(service_error(TaskServiceErrorCode::IdempotencyConflict));
+    }
+    if phase_rejects {
+        return Err(service_error(TaskServiceErrorCode::Stopped));
+    }
     if let ServiceCommandReceiptClaim::Replay { result_json } = claim {
         let result = serde_json::from_str(&result_json)
             .map_err(|_| service_error(TaskServiceErrorCode::Storage))?;
@@ -2007,14 +2071,25 @@ async fn prepare_maintenance(
             let task_id = status
                 .task_id
                 .ok_or_else(|| service_error(TaskServiceErrorCode::Engine))?;
-            send_active_control(
+            #[cfg(test)]
+            if let Some(gate) = shared.maintenance_control_test_gate.as_ref() {
+                gate.pause().await;
+            }
+            let quiesce = send_active_control(
                 shared,
                 TaskEngineControl::Quiesce {
                     task_id,
                     acknowledgement: next_ack(shared)?,
                 },
             )
-            .await?;
+            .await;
+            if let Err(error) = quiesce {
+                let current = shared.actor_state.status().await;
+                if current.phase == MaintenancePhase::Ready && current.task_id == Some(task_id) {
+                    return Ok(current);
+                }
+                return Err(error);
+            }
         }
         MaintenancePhase::Ready => {
             let (reply, response) = oneshot::channel();
@@ -2132,6 +2207,7 @@ const fn service_code(code: TaskServiceErrorCode) -> &'static str {
         TaskServiceErrorCode::InvalidRequest => "invalid_request",
         TaskServiceErrorCode::Busy => "busy",
         TaskServiceErrorCode::Stopped => "stopped",
+        TaskServiceErrorCode::IdempotencyConflict => "idempotency_conflict",
     }
 }
 
@@ -2152,7 +2228,9 @@ mod tests {
     };
     use crate::runtime::task::{OperationId, OperationStatus};
     #[cfg(unix)]
-    use crate::service::protocol::{SERVICE_PROTOCOL_VERSION, StartTaskCommand};
+    use crate::service::protocol::{
+        SERVICE_PROTOCOL_VERSION, StartTaskCommand, decode_frame_line, encode_request,
+    };
     #[cfg(unix)]
     use crate::service::{client::ServiceClientErrorCode, client::TaskServiceClient};
     #[cfg(unix)]
@@ -2383,6 +2461,315 @@ mod tests {
             .expect("ready service exits immediately on signal")
             .expect("service task did not panic")
             .expect("service exits cleanly");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reconnect_conflicts_with_the_durable_prepare_key_before_phase_rejection() {
+        async fn raw_request(data: &Path, request: &ServiceRequest) -> ServiceFrame {
+            let stream = tokio::net::UnixStream::connect(data.join("carl.sock"))
+                .await
+                .unwrap();
+            let (reader, mut writer) = stream.into_split();
+            writer
+                .write_all(&encode_request(request).unwrap())
+                .await
+                .unwrap();
+            writer.flush().await.unwrap();
+            let mut line = Vec::new();
+            BufReader::new(reader)
+                .read_until(b'\n', &mut line)
+                .await
+                .unwrap();
+            decode_frame_line(&line).unwrap()
+        }
+
+        let layout = ShutdownTestLayout::new();
+        let port_state = Arc::new(Mutex::new(HandoffPortState {
+            workspace: layout.workspace.clone(),
+            continue_at_boundary: true,
+            ..HandoffPortState::default()
+        }));
+        let service = TaskService::bind(&layout.data, HandoffPort::new(Arc::clone(&port_state)))
+            .await
+            .unwrap();
+        let cancellation = CancellationToken::new();
+        let serve_cancellation = cancellation.clone();
+        let service_task = tokio::spawn(async move { service.serve(serve_cancellation).await });
+        let mut client = TaskServiceClient::connect(&layout.data).await.unwrap();
+        let ServiceResult::Accepted { task_id } = client
+            .request(ServiceRequest {
+                protocol_version: SERVICE_PROTOCOL_VERSION,
+                request_id: "conflict-active-start".to_owned(),
+                idempotency_key: "conflict-active-start-key".to_owned(),
+                command: ServiceCommand::StartTask(StartTaskCommand {
+                    external_session_id: "conflict-active-session".to_owned(),
+                    workspace: layout.workspace.clone(),
+                    request: "remain active across the prepare conflict checks".to_owned(),
+                    model: ModelId::parse("gpt-test").unwrap(),
+                    effort: ReasoningEffort::High,
+                    permission_mode: PermissionMode::FullAccess,
+                    budget: crate::runtime::task::TaskBudget::default(),
+                }),
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("conflict task was not accepted");
+        };
+        loop {
+            let ready = {
+                let state = port_state.lock().unwrap();
+                state.effect_count == 1 && state.operation_id.is_some()
+            };
+            if ready {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let prepare_key = "durable-prepare-conflict-key";
+        let ServiceResult::Maintenance(draining) = client
+            .request(ServiceRequest {
+                protocol_version: SERVICE_PROTOCOL_VERSION,
+                request_id: "conflict-prepare".to_owned(),
+                idempotency_key: prepare_key.to_owned(),
+                command: ServiceCommand::PrepareMaintenance,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("prepare returned the wrong result");
+        };
+        assert_eq!(draining.phase, MaintenancePhase::Draining);
+        drop(client);
+
+        let conflicting_start = ServiceRequest {
+            protocol_version: SERVICE_PROTOCOL_VERSION,
+            request_id: "conflict-reconnect-start".to_owned(),
+            idempotency_key: prepare_key.to_owned(),
+            command: ServiceCommand::StartTask(StartTaskCommand {
+                external_session_id: "must-not-exist".to_owned(),
+                workspace: layout.workspace.clone(),
+                request: "must not create a second task".to_owned(),
+                model: ModelId::parse("gpt-test").unwrap(),
+                effort: ReasoningEffort::High,
+                permission_mode: PermissionMode::FullAccess,
+                budget: crate::runtime::task::TaskBudget::default(),
+            }),
+        };
+        for conflicting in [
+            conflicting_start,
+            ServiceRequest {
+                protocol_version: SERVICE_PROTOCOL_VERSION,
+                request_id: "conflict-reconnect-cancel".to_owned(),
+                idempotency_key: prepare_key.to_owned(),
+                command: ServiceCommand::Cancel { task_id },
+            },
+        ] {
+            let ServiceFrame::Error {
+                request_id, code, ..
+            } = raw_request(&layout.data, &conflicting).await
+            else {
+                panic!("conflicting reconnect request returned success");
+            };
+            assert_eq!(request_id, conflicting.request_id);
+            assert_eq!(code, "idempotency_conflict");
+        }
+        let unrelated = ServiceRequest {
+            protocol_version: SERVICE_PROTOCOL_VERSION,
+            request_id: "unrelated-draining-start".to_owned(),
+            idempotency_key: "unrelated-draining-start-key".to_owned(),
+            command: ServiceCommand::StartTask(StartTaskCommand {
+                external_session_id: "unrelated-must-not-exist".to_owned(),
+                workspace: layout.workspace.clone(),
+                request: "must remain rejected while draining".to_owned(),
+                model: ModelId::parse("gpt-test").unwrap(),
+                effort: ReasoningEffort::High,
+                permission_mode: PermissionMode::FullAccess,
+                budget: crate::runtime::task::TaskBudget::default(),
+            }),
+        };
+        let ServiceFrame::Error { code, .. } = raw_request(&layout.data, &unrelated).await else {
+            panic!("unrelated draining mutation returned success");
+        };
+        assert_eq!(code, "stopped");
+        assert_eq!(
+            Store::open(layout.data.join("carl.sqlite3"))
+                .unwrap()
+                .list_tasks(64)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            Connection::open(layout.data.join("carl.sqlite3"))
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM service_command_receipts", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            2,
+            "conflicts and phase rejection must not consume receipt capacity"
+        );
+        {
+            let state = port_state.lock().unwrap();
+            assert_eq!(state.effect_count, 1);
+            assert_eq!(state.epoch, 1);
+            assert_eq!(state.boundary_requests, 1);
+        }
+
+        port_state.lock().unwrap().release_completion = true;
+        let mut client = TaskServiceClient::connect(&layout.data).await.unwrap();
+        loop {
+            let ServiceResult::Maintenance(status) = client
+                .request(ServiceRequest {
+                    protocol_version: SERVICE_PROTOCOL_VERSION,
+                    request_id: format!("conflict-ready-status-{}", uuid::Uuid::new_v4()),
+                    idempotency_key: format!("conflict-ready-key-{}", uuid::Uuid::new_v4()),
+                    command: ServiceCommand::MaintenanceStatus,
+                })
+                .await
+                .unwrap()
+            else {
+                panic!("maintenance status returned the wrong result");
+            };
+            if status.phase == MaintenancePhase::Ready {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        cancellation.cancel();
+        service_task.await.unwrap().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn natural_completion_before_quiesce_ack_completes_prepare_as_ready() {
+        let layout = ShutdownTestLayout::new();
+        let port_state = Arc::new(Mutex::new(HandoffPortState {
+            workspace: layout.workspace.clone(),
+            ..HandoffPortState::default()
+        }));
+        let maintenance_gate = Arc::new(MaintenanceControlTestGate::default());
+        let mut service =
+            TaskService::bind(&layout.data, HandoffPort::new(Arc::clone(&port_state)))
+                .await
+                .unwrap();
+        service.maintenance_control_test_gate = Some(Arc::clone(&maintenance_gate));
+        let cancellation = CancellationToken::new();
+        let serve_cancellation = cancellation.clone();
+        let service_task = tokio::spawn(async move { service.serve(serve_cancellation).await });
+        let mut client = TaskServiceClient::connect(&layout.data).await.unwrap();
+        let ServiceResult::Accepted { task_id } = client
+            .request(ServiceRequest {
+                protocol_version: SERVICE_PROTOCOL_VERSION,
+                request_id: "terminal-race-start".to_owned(),
+                idempotency_key: "terminal-race-start-key".to_owned(),
+                command: ServiceCommand::StartTask(StartTaskCommand {
+                    external_session_id: "terminal-race-session".to_owned(),
+                    workspace: layout.workspace.clone(),
+                    request: "complete naturally while maintenance is being admitted".to_owned(),
+                    model: ModelId::parse("gpt-test").unwrap(),
+                    effort: ReasoningEffort::High,
+                    permission_mode: PermissionMode::FullAccess,
+                    budget: crate::runtime::task::TaskBudget::default(),
+                }),
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("terminal race task was not accepted");
+        };
+        loop {
+            let ready = {
+                let state = port_state.lock().unwrap();
+                state.effect_count == 1 && state.operation_id.is_some()
+            };
+            if ready {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        let prepare_request = ServiceRequest {
+            protocol_version: SERVICE_PROTOCOL_VERSION,
+            request_id: "terminal-race-prepare".to_owned(),
+            idempotency_key: "terminal-race-prepare-key".to_owned(),
+            command: ServiceCommand::PrepareMaintenance,
+        };
+        let mut prepare_client = TaskServiceClient::connect(&layout.data).await.unwrap();
+        let prepare_replay = prepare_request.clone();
+        let prepare = tokio::spawn(async move { prepare_client.request(prepare_request).await });
+        maintenance_gate.wait_reached().await;
+        port_state.lock().unwrap().release_completion = true;
+
+        let ready = loop {
+            let ServiceResult::Maintenance(status) = client
+                .request(ServiceRequest {
+                    protocol_version: SERVICE_PROTOCOL_VERSION,
+                    request_id: format!("terminal-race-status-{}", uuid::Uuid::new_v4()),
+                    idempotency_key: format!("terminal-race-status-key-{}", uuid::Uuid::new_v4()),
+                    command: ServiceCommand::MaintenanceStatus,
+                })
+                .await
+                .unwrap()
+            else {
+                panic!("maintenance status returned the wrong result");
+            };
+            if status.phase == MaintenancePhase::Ready {
+                break status;
+            }
+            tokio::task::yield_now().await;
+        };
+        maintenance_gate.release();
+
+        let ServiceResult::Maintenance(prepared) = prepare.await.unwrap().unwrap() else {
+            panic!("prepare returned the wrong result");
+        };
+        assert_eq!(prepared, ready);
+        assert_eq!(ready.phase, MaintenancePhase::Ready);
+        assert_eq!(ready.task_id, Some(task_id));
+        assert!(ready.checkpoint_id.is_some());
+        let ServiceResult::Snapshot(snapshot) = client
+            .request(ServiceRequest {
+                protocol_version: SERVICE_PROTOCOL_VERSION,
+                request_id: "terminal-race-task-status".to_owned(),
+                idempotency_key: "terminal-race-task-status-key".to_owned(),
+                command: ServiceCommand::Status { task_id },
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("terminal task status returned the wrong result");
+        };
+        assert_eq!(snapshot.status, TaskStatus::Completed);
+        let (receipt_state, result_json) = Connection::open(layout.data.join("carl.sqlite3"))
+            .unwrap()
+            .query_row(
+                "SELECT state, result_json FROM service_command_receipts
+                 WHERE idempotency_key = 'terminal-race-prepare-key'",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .unwrap();
+        assert_eq!(receipt_state, "completed");
+        assert_eq!(
+            serde_json::from_str::<ServiceResult>(&result_json).unwrap(),
+            ServiceResult::Maintenance(prepared.clone())
+        );
+        drop(client);
+        let mut replay_client = TaskServiceClient::connect(&layout.data).await.unwrap();
+        assert_eq!(
+            replay_client.request(prepare_replay).await.unwrap(),
+            ServiceResult::Maintenance(prepared)
+        );
+        {
+            let state = port_state.lock().unwrap();
+            assert_eq!(state.effect_count, 1);
+            assert_eq!(state.shutdowns, 1);
+        }
+        cancellation.cancel();
+        service_task.await.unwrap().unwrap();
     }
 
     #[cfg(unix)]
@@ -2628,6 +3015,7 @@ mod tests {
             next_acknowledgement,
             actor_state,
             info,
+            maintenance_control_test_gate,
         } = service;
         let (actor_sender, actor_receiver) = mpsc::channel(SERVICE_COMMAND_CAPACITY);
         let actor_task = tokio::spawn(run_task_actor(
@@ -2646,6 +3034,7 @@ mod tests {
             actor_state: Arc::clone(&actor_state),
             actor_sender,
             info,
+            maintenance_control_test_gate,
         });
 
         let start = |suffix: &str| ServiceRequest {
@@ -2851,6 +3240,7 @@ mod tests {
             next_acknowledgement,
             actor_state,
             info,
+            maintenance_control_test_gate,
         } = service;
         let (actor_sender, actor_receiver) = mpsc::channel(SERVICE_COMMAND_CAPACITY);
         let actor_task = tokio::spawn(run_task_actor(
@@ -2869,6 +3259,7 @@ mod tests {
             actor_state,
             actor_sender,
             info,
+            maintenance_control_test_gate,
         });
         let receipt = ServiceCommandReceiptInput {
             idempotency_key: "signal-admitted-mutation".to_owned(),

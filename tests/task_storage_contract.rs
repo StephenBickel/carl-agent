@@ -404,16 +404,15 @@ fn service_command_receipts_are_global_durable_and_canonical() -> Result<(), Box
             result_json: result.to_owned()
         }
     );
-    assert!(
-        store
-            .claim_service_command(ServiceCommandReceiptInput {
-                command_digest: Sha256Digest::parse(
-                    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-                )?,
-                command_kind: "cancel".to_owned(),
-                ..input
-            })
-            .is_err(),
+    assert_eq!(
+        store.claim_service_command(ServiceCommandReceiptInput {
+            command_digest: Sha256Digest::parse(
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            )?,
+            command_kind: "cancel".to_owned(),
+            ..input
+        })?,
+        ServiceCommandReceiptClaim::Conflict,
         "one global key cannot be rebound to another method or digest"
     );
     Ok(())

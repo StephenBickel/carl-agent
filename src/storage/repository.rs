@@ -198,6 +198,7 @@ pub enum ServiceCommandReceiptClaim {
     Fresh,
     Pending,
     Replay { result_json: String },
+    Conflict,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1752,7 +1753,7 @@ impl Store {
             .map_err(storage_error)?;
         if let Some((digest, state, result_json)) = existing {
             if digest != input.command_digest.to_string() {
-                return Err(policy_error("service command idempotency key was rebound"));
+                return Ok(ServiceCommandReceiptClaim::Conflict);
             }
             return match (state.as_str(), result_json) {
                 ("pending", None) => Ok(ServiceCommandReceiptClaim::Pending),
