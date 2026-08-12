@@ -2084,9 +2084,12 @@ async fn prepare_maintenance(
             )
             .await;
             if let Err(error) = quiesce {
-                let current = shared.actor_state.status().await;
-                if current.phase == MaintenancePhase::Ready && current.task_id == Some(task_id) {
-                    return Ok(current);
+                if error.code() == TaskServiceErrorCode::InvalidRequest {
+                    let current = shared.actor_state.status().await;
+                    if current.phase == MaintenancePhase::Ready && current.task_id == Some(task_id)
+                    {
+                        return Ok(current);
+                    }
                 }
                 return Err(error);
             }
@@ -2223,8 +2226,8 @@ mod tests {
     #[cfg(unix)]
     use crate::runtime::agent_port::{
         AgentCapabilities, AgentContextId, AgentEffectKind, AgentEffectRequest, AgentEpochId,
-        AgentEvent, AgentFuture, AgentItem, AgentModel, AgentProcess, AgentRequestId,
-        ResumeAgentContext, StartAgentContext, StartAgentEpoch,
+        AgentEvent, AgentFuture, AgentItem, AgentModel, AgentPortError, AgentPortErrorCode,
+        AgentProcess, AgentRequestId, ResumeAgentContext, StartAgentContext, StartAgentEpoch,
     };
     use crate::runtime::task::{OperationId, OperationStatus};
     #[cfg(unix)]
@@ -2770,6 +2773,162 @@ mod tests {
         }
         cancellation.cancel();
         service_task.await.unwrap().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn provider_shutdown_failure_is_not_recovered_as_natural_completion_ready() {
+        let layout = ShutdownTestLayout::new();
+        let port_state = Arc::new(Mutex::new(HandoffPortState {
+            workspace: layout.workspace.clone(),
+            shutdown_fails: true,
+            ..HandoffPortState::default()
+        }));
+        let maintenance_gate = Arc::new(MaintenanceControlTestGate::default());
+        let mut service =
+            TaskService::bind(&layout.data, HandoffPort::new(Arc::clone(&port_state)))
+                .await
+                .unwrap();
+        service.maintenance_control_test_gate = Some(Arc::clone(&maintenance_gate));
+        let TaskService {
+            endpoint,
+            engine,
+            read_store,
+            initial_tasks,
+            controls,
+            acknowledgements,
+            mutation_gate,
+            live_updates,
+            live_update_receiver,
+            permission_receiver,
+            next_acknowledgement,
+            actor_state,
+            info,
+            maintenance_control_test_gate,
+        } = service;
+        let (actor_sender, actor_receiver) = mpsc::channel(SERVICE_COMMAND_CAPACITY);
+        let actor_task = tokio::spawn(run_task_actor(
+            engine,
+            initial_tasks,
+            actor_receiver,
+            Arc::clone(&actor_state),
+        ));
+        let shared = Arc::new(ServiceShared {
+            read_store,
+            controls,
+            acknowledgements,
+            mutation_gate,
+            live_updates,
+            next_acknowledgement,
+            actor_state: Arc::clone(&actor_state),
+            actor_sender,
+            info,
+            maintenance_control_test_gate,
+        });
+        let ServiceResult::Accepted { task_id } = dispatch_request(
+            &shared,
+            ServiceRequest {
+                protocol_version: SERVICE_PROTOCOL_VERSION,
+                request_id: "shutdown-failure-start".to_owned(),
+                idempotency_key: "shutdown-failure-start-key".to_owned(),
+                command: ServiceCommand::StartTask(StartTaskCommand {
+                    external_session_id: "shutdown-failure-session".to_owned(),
+                    workspace: layout.workspace.clone(),
+                    request: "complete naturally before the failed provider shutdown".to_owned(),
+                    model: ModelId::parse("gpt-test").unwrap(),
+                    effort: ReasoningEffort::High,
+                    permission_mode: PermissionMode::FullAccess,
+                    budget: crate::runtime::task::TaskBudget::default(),
+                }),
+            },
+        )
+        .await
+        .unwrap() else {
+            panic!("shutdown failure task was not accepted");
+        };
+        loop {
+            let ready = {
+                let state = port_state.lock().unwrap();
+                state.effect_count == 1 && state.operation_id.is_some()
+            };
+            if ready {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        let prepare_key = "shutdown-failure-prepare-key";
+        let prepare_command = ServiceCommand::PrepareMaintenance;
+        let receipt = ServiceCommandReceiptInput {
+            idempotency_key: prepare_key.to_owned(),
+            command_digest: Sha256Digest::from_bytes(command_digest(&prepare_command).unwrap()),
+            command_kind: service_command_kind(&prepare_command).to_owned(),
+            created_at: Utc::now(),
+        };
+        assert_eq!(
+            claim_service_command(&shared, receipt.clone())
+                .await
+                .unwrap(),
+            ServiceCommandReceiptClaim::Fresh
+        );
+        let prepare_shared = Arc::clone(&shared);
+        let prepare =
+            tokio::spawn(
+                async move { prepare_maintenance(&prepare_shared, Some(prepare_key)).await },
+            );
+        maintenance_gate.wait_reached().await;
+        port_state.lock().unwrap().release_completion = true;
+        loop {
+            let status = actor_state.status().await;
+            let shutdowns = port_state.lock().unwrap().shutdowns;
+            if status.phase == MaintenancePhase::Ready && shutdowns == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        maintenance_gate.release();
+
+        let error = prepare
+            .await
+            .unwrap()
+            .expect_err("provider shutdown failure must not become Ready success");
+        assert_eq!(error.code(), TaskServiceErrorCode::Stopped);
+        let (receipt_state, result_json) = Connection::open(layout.data.join("carl.sqlite3"))
+            .unwrap()
+            .query_row(
+                "SELECT state, result_json FROM service_command_receipts
+                 WHERE idempotency_key = 'shutdown-failure-prepare-key'",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .unwrap();
+        assert_eq!(receipt_state, "pending");
+        assert_eq!(result_json, None);
+        let store = Store::open(layout.data.join("carl.sqlite3")).unwrap();
+        assert_eq!(
+            store.claim_service_command(receipt).unwrap(),
+            ServiceCommandReceiptClaim::Pending,
+            "failed Prepare must not expose a completed replay"
+        );
+        assert_eq!(
+            store.get_task(task_id).unwrap().unwrap().snapshot.status,
+            TaskStatus::Completed
+        );
+        {
+            let state = port_state.lock().unwrap();
+            assert_eq!(state.effect_count, 1);
+            assert_eq!(state.shutdowns, 1);
+            assert!(!state.provider_shutdown);
+        }
+        assert_eq!(task_id, actor_state.status().await.task_id.unwrap());
+        assert_eq!(
+            actor_task.await.unwrap().unwrap_err().code(),
+            TaskServiceErrorCode::Engine
+        );
+        drop(shared);
+        drop(live_update_receiver);
+        drop(permission_receiver);
+        drop(endpoint);
     }
 
     #[cfg(unix)]
@@ -3613,6 +3772,7 @@ mod tests {
         started_contexts: u64,
         shutdowns: u64,
         provider_shutdown: bool,
+        shutdown_fails: bool,
         operations_after_shutdown: u64,
     }
 
@@ -3919,6 +4079,9 @@ mod tests {
             Box::pin(async move {
                 let mut state = state.lock().unwrap();
                 state.shutdowns += 1;
+                if state.shutdown_fails {
+                    return Err(AgentPortError::from_code(AgentPortErrorCode::Transport));
+                }
                 state.provider_shutdown = true;
                 Ok(())
             })
