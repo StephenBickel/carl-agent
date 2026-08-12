@@ -1,6 +1,7 @@
 use std::error::Error;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use carl::evals::{
@@ -10,6 +11,8 @@ use carl::evals::{
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
+
+static FIXTURE_SERIAL: AtomicU64 = AtomicU64::new(0);
 
 fn fixture_source() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/long_horizon/needle")
@@ -21,10 +24,15 @@ struct TestFixtureCopy {
 
 impl TestFixtureCopy {
     fn new() -> TestResult<Self> {
-        let unique = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        Self::new_with_timestamp(SystemTime::now())
+    }
+
+    fn new_with_timestamp(timestamp: SystemTime) -> TestResult<Self> {
+        let unique = timestamp.duration_since(UNIX_EPOCH)?.as_nanos();
+        let serial = FIXTURE_SERIAL.fetch_add(1, Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!(
-            "carl-long-horizon-fixture-{}-{unique}",
-            std::process::id()
+            "carl-long-horizon-fixture-{}-{unique}-{serial}",
+            std::process::id(),
         ));
         fs::create_dir_all(root.join("src"))?;
         fs::create_dir_all(root.join("tests"))?;
@@ -33,6 +41,17 @@ impl TestFixtureCopy {
         }
         Ok(Self { root })
     }
+}
+
+#[test]
+fn fixture_copies_with_the_same_clock_read_are_isolated() -> TestResult {
+    let timestamp = SystemTime::now();
+    let first = TestFixtureCopy::new_with_timestamp(timestamp)?;
+    let second = TestFixtureCopy::new_with_timestamp(timestamp)?;
+    assert_ne!(first.root, second.root);
+    assert!(first.root.is_dir());
+    assert!(second.root.is_dir());
+    Ok(())
 }
 
 impl Drop for TestFixtureCopy {
