@@ -225,3 +225,87 @@ intentionally not run, as required by the Task 14C brief.
 ## Commit
 
 - `b49ac7c feat: add recoverable service maintenance`
+
+## Review fix round 1: Durable conflicts and terminal Quiesce race
+
+Two Important review findings were addressed in code commit `8f68dbf`.
+
+### Durable Prepare-key conflicts
+
+Mutation admission now constructs the bounded receipt claim before maintenance-phase
+rejection, but only consults durable storage for a rejected mutation when its key is
+the synchronized maintenance-owner key. A digest mismatch returns the typed
+`idempotency_conflict` service error. Unrelated keys still return `stopped` before
+receipt creation, task creation, or provider dispatch, so receipt capacity and the
+existing emergency ordering remain unchanged.
+
+The RED used fresh Unix-socket connections after an active Prepare returned
+Draining. StartTask and Cancel with the Prepare key both returned `stopped` instead
+of the required conflict. The GREEN asserts `idempotency_conflict` for both commands,
+one task, one effect, one provider epoch, one boundary request, and exactly the two
+legitimate receipts (Start plus Prepare). Existing Ready-phase denial coverage also
+remained green. The storage receipt contract now asserts the typed `Conflict` claim
+instead of treating digest reuse as an undifferentiated repository error.
+
+### Natural completion before Quiesce acknowledgement
+
+A deterministic test-only gate pauses Prepare after its durable claim and
+`Running -> Draining` transition but before Quiesce delivery. The test releases a
+valid terminal provider report, observes the actor reach Ready and shut the provider
+down once, then releases Quiesce for idle-engine consumption. The RED returned a
+rejected Prepare even though the same task was terminal and maintenance was Ready,
+which left the Prepare receipt pending.
+
+Prepare now handles a failed Quiesce acknowledgement by re-reading the synchronized
+owner status. It returns success only when that status is Ready and retains the exact
+same task binding; every other phase/task combination propagates the original actor
+error. The GREEN asserts a Completed task, a real final checkpoint, one effect, one
+provider shutdown, a completed receipt containing the Ready result, and exact replay
+over a fresh connection.
+
+### Fix-round verification
+
+```text
+cargo test --locked --lib service::server::tests
+PASS: 17 passed, 0 failed
+
+cargo test --locked --test service_protocol_contract
+PASS: 15 passed, 0 failed
+
+cargo test --locked --lib service::client::tests
+PASS: 4 passed, 0 failed
+
+cargo test --locked --lib runtime::task::engine::tests
+PASS: 7 passed, 0 failed
+
+cargo test --locked --test service_end_to_end
+PASS: 20 passed, 0 failed
+
+cargo test --locked --test task_storage_contract \
+  service_command_receipts_are_global_durable_and_canonical -- --exact
+PASS: 1 passed, 0 failed
+
+cargo test --locked --lib acp::server::tests
+PASS: 2 passed, 0 failed
+
+cargo test --locked --lib cli::tests
+PASS: 5 passed, 0 failed
+
+cargo test --locked --test cli_contract
+PASS: 9 passed, 0 failed
+
+cargo test --locked --test buzz_end_to_end
+PASS: 8 passed, 0 failed
+
+cargo clippy --locked --all-targets --all-features -- -D warnings
+PASS: exit 0, no warnings
+
+cargo fmt --all -- --check
+PASS: exit 0
+
+git diff --check
+PASS: exit 0
+```
+
+The prohibited broad all-features test suite and live provider/OAuth/network tests
+were not run. `SECURITY.md`, `Cargo.lock`, and the database schema were not changed.
