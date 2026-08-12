@@ -2,11 +2,12 @@
 
 ## Status
 
-`DONE_WITH_CONCERNS`: the semantic and corruption gates pass, but the required warm
-100-epoch speedup was not demonstrated. The final capped run took 36.73 seconds in
-the test (37.38 seconds wall clock), compared with the 27.61-second test baseline
-(27.70 seconds wall clock). This follow-on therefore does not satisfy its release
-performance objective and should remain a blocker before Task 14.
+`DONE_WITH_CONCERNS` after fix round 1/5: the semantic, corruption, formatting, and
+lint gates pass, and the capped exact test execution improved from 27.61 seconds to
+26.61 seconds. The surrounding process wall time is not comparable because Cargo
+rebuilt the integration binary for 8.23 seconds immediately before the only
+authorized measurement. The execution-time speedup is real, but warm wall-clock
+confirmation remains a performance-evidence concern for the next independent review.
 
 ## Design
 
@@ -186,6 +187,161 @@ unmet; no additional tuning or weakening of proof was attempted after the cap.
   advance.
 - Confirmed the fixture fix uses a deterministic process-local uniqueness suffix and
   does not modify the long-horizon scenario, counts, cuts, or assertions.
-- Concern: correctness is supported by all required gates, but the binding speedup
-  requirement is not met. The implementation should not be promoted as completing
-  the Task 13 release dependency without a separately authorized performance design.
+- Pre-fix-round concern: the original implementation passed its correctness gates
+  but did not meet the speedup requirement. Fix round 1/5 evidence follows.
+
+## Fix round 1/5 — authoritative fallback and prefix-free fast path
+
+### Reviewer findings addressed
+
+1. On every cache miss, row mismatch, or `data_version` change, checkpoint commit now
+   replays the task journal inside the existing immediate transaction, requires the
+   mutable task/configuration projections to agree, and uses the replayed safe
+   boundary, contract, provider context, model, and effort for checkpoint authority.
+2. The fallback runs task-filtered full canonical checkpoint-chain validation before
+   authority can be refreshed. This checks every stored checkpoint/package pair,
+   canonical bytes, digests, identities, source bounds, generation/event binding,
+   previous-digest lineage, and artifacts, including predecessors older than the
+   latest checkpoint.
+3. The `MIN/MAX` source-prefix query and mutable latest-checkpoint digest lookup now
+   run only on the full fallback. The incremental branch proves source start and
+   previous digest from its authenticated anchor, then proves source end, ordering,
+   and completeness by reading the exclusive task-local tail to exhaustion.
+4. The cache no longer owns or clones a full `CanonicalCheckpoint`. It stores a
+   compact authority summary: identity, digest, source bounds, generation, operation
+   authority, usage authority, and `Arc`-shared task snapshot. Cache map lookups clone
+   only an `Arc`.
+5. Incremental validation replays the task snapshot and configuration from the
+   authenticated anchor through the exact durable tail, then compares the result to
+   current projections before using safe-boundary, contract, or provider facts.
+6. Full/incremental test counters now increment only after validation succeeds.
+   Failure-path mutations explicitly assert that counts remain unchanged. A separate
+   test-only prefix-scan counter proves the full-prefix query is not used by the
+   second same-Store checkpoint.
+
+### Systematic debugging and RED evidence
+
+Root-cause tracing found three distinct trust/cost boundaries in
+`Store::commit_checkpoint`: fallback facts came from `load_task_record`, fallback
+canonical authentication inspected only the latest row, and
+`validate_checkpoint_history` ran before the fast/fallback choice. The cache entry
+also derived `Clone` over a full `CanonicalCheckpoint`.
+
+The following mutations were written and observed failing before the production fix:
+
+- `full_fallback_rejects_corruption_in_an_older_canonical_checkpoint`: whitespace was
+  prepended to the first of two canonical checkpoint payloads through a separate
+  SQLite connection. The candidate was incorrectly accepted and committed;
+  `assert!(rejected.is_err())` failed.
+- `full_fallback_rejects_an_externally_forged_safe_boundary`: the journal retained an
+  active epoch while an external connection forged `agent_tasks` and `snapshot_json`
+  to clear it. The checkpoint was incorrectly accepted;
+  `assert!(rejected.is_err())` failed.
+- `incremental_cache_rejects_same_connection_safe_boundary_tampering`: the same
+  projection forgery was made through the Store's connection, for which
+  `data_version` does not change. The cached fast path incorrectly accepted it;
+  `assert!(rejected.is_err())` failed.
+- `corrupted_authenticated_anchor_falls_back_and_fails_closed`: a rejected anchor
+  mutation changed the counter from `(1, 0)` to `(2, 0)`, proving the counter measured
+  attempts rather than successful validations.
+- `first_checkpoint_uses_full_authority_then_incremental_tail_crosses_page_boundary`
+  gained a literal prefix-scan assertion. Before the test-only observation point was
+  implemented it failed to compile because no prefix-scan count existed; its final
+  behavioral assertion is one prefix scan after both the full first checkpoint and
+  the incremental 514-event tail checkpoint.
+
+Every rejection contract also checks that journal length, task revision, checkpoint
+row count, and successful-validation counters do not advance.
+
+### GREEN evidence
+
+Focused commands and results for the round follow. The 9-test authority suite,
+formatting, strict Clippy, and diff check were rerun after the last production change;
+the unchanged integration contracts were run after the authority implementation was
+in place:
+
+```text
+cargo test --locked --lib checkpoint_authority_tests
+  9 passed; 0 failed; 69 filtered out
+
+cargo test --locked --test context_engine_contract
+  20 passed; 0 failed
+
+cargo test --locked --test task_storage_contract
+  21 passed; 0 failed
+
+cargo test --locked --test epoch_engine_contract startup
+  3 passed; 0 failed; 78 filtered out
+
+cargo test --locked --test long_horizon_eval fixture_copies_with_the_same_clock_read_are_isolated
+  1 passed; 0 failed; 7 filtered out
+
+cargo test --locked --test long_horizon_eval repository_fixture_rejects
+  2 passed; 0 failed; 6 filtered out
+
+cargo fmt -- --check
+  exit 0
+
+cargo clippy --locked --all-targets --all-features -- -D warnings
+  exit 0
+
+git diff --check
+  exit 0
+```
+
+No full all-features test suite was run. The fixture-isolation fix and the dedicated
+scenario's epochs, restarts, compactions, cuts, and assertions were unchanged.
+
+### Path-selection evidence
+
+- First checkpoint: 1 successful full validation, 0 incremental validations, 1
+  full-prefix scan.
+- Same-Store checkpoint with a 514-event exclusive tail: cumulative 1 full, 1
+  incremental, still 1 full-prefix scan.
+- Separate-connection invalidation followed by a same-Store checkpoint: cumulative
+  2 full, 0 incremental; the following unchanged-connection checkpoint reaches 2
+  full, 1 incremental.
+- Every fallback or incremental corruption mutation leaves successful path counters
+  unchanged.
+
+### Capped exact benchmark
+
+The one authorized unchanged command was:
+
+```text
+/usr/bin/time -p cargo test --locked --test long_horizon_eval actual_engine_survives_one_hundred_epochs_and_normalizes_replay -- --exact --nocapture
+```
+
+It passed the 100-epoch uninterrupted-versus-restarted normalized replay proof:
+
+```text
+test result: 1 passed; 0 failed; 7 filtered out; finished in 26.61s
+real 36.02
+user 29.58
+sys 2.38
+```
+
+The test execution is 1.00 second (3.6%) faster than the original 27.61-second
+baseline and 10.12 seconds faster than the pre-fix-round 36.73-second regression.
+Cargo reported `Compiling carl-agent` and spent 8.23 seconds rebuilding the
+integration target immediately before the test, so the 36.02-second process wall
+time cannot be compared to the original 27.70-second warm wall time. The timing cap
+prohibited a second run; no rerun or further tuning was performed.
+
+### Fix-round self-review and residual concerns
+
+- The production/test change is confined to `src/storage/repository.rs`; the report
+  is the only documentation change. `SECURITY.md` is unchanged.
+- Fallback authority now originates in durable journal replay and the complete
+  task-filtered canonical chain, all inside the immediate transaction/CAS boundary.
+- The fast path retains transitive trust only for a same-Store authenticated anchor,
+  verifies the exact latest row's stored bytes against the authenticated digest, and
+  replays every subsequent task event before trusting current projections.
+- The cache remains non-serialized and contains a bounded summary rather than
+  multi-MiB checkpoint narrative/work/repository vectors. Operation and task-snapshot
+  authority are retained because they are required to reconstruct tail semantics.
+- The full fallback remains intentionally expensive after every reopen or external
+  commit. No total-linear-complexity claim is made.
+- The execution-time objective is met by one second, but the single process wall
+  sample included compilation. A separately authorized prebuilt warm measurement
+  would be needed to close that evidence gap without violating this round's cap.
