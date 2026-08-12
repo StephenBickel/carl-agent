@@ -4,6 +4,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, HashSet};
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 use std::{fs, io};
 
@@ -35,8 +36,8 @@ use crate::runtime::subscription::{
 };
 use crate::runtime::task::{
     CanonicalCheckpoint, CompletionContract, ContextPackage, EffectClass, EpochInterruptReason,
-    OperationEvidenceState, OperationStatus, TaskBudget, TaskControlKind, TaskEvent, TaskId,
-    TaskSnapshot, TaskStatus, reduce_task,
+    OperationCheckpoint, OperationEvidenceState, OperationStatus, TaskBudget, TaskControlKind,
+    TaskEvent, TaskId, TaskSnapshot, TaskStatus, reduce_task,
 };
 use crate::security::SecretFilter;
 use crate::sidecar::DataRootLock;
@@ -809,21 +810,30 @@ struct StoredVerificationResult {
 
 pub struct Store {
     connection: Connection,
-    authenticated_checkpoint_authority: BTreeMap<TaskId, AuthenticatedCheckpointAuthority>,
+    authenticated_checkpoint_authority: BTreeMap<TaskId, Arc<AuthenticatedCheckpointAuthority>>,
     validated_startup_tasks: RefCell<Option<ValidatedStartupTasks>>,
     #[cfg(test)]
     checkpoint_authority_full_validations: Cell<u64>,
     #[cfg(test)]
     checkpoint_authority_incremental_validations: Cell<u64>,
     #[cfg(test)]
+    checkpoint_full_prefix_scans: Cell<u64>,
+    #[cfg(test)]
     startup_authority_scans: Cell<u64>,
 }
 
-#[derive(Clone)]
 struct AuthenticatedCheckpointAuthority {
-    checkpoint: CanonicalCheckpoint,
-    digest: String,
+    checkpoint_id: crate::runtime::task::CheckpointId,
+    task_id: TaskId,
+    source_sequence_start: u64,
     source_sequence_end: u64,
+    compaction_generation: u32,
+    operations: Arc<[OperationCheckpoint]>,
+    observed_total_tokens: Option<u64>,
+    observed_context_window: Option<u64>,
+    task_snapshot: Arc<TaskSnapshot>,
+    configuration: TaskConfigurationRecord,
+    digest: String,
     data_version: i64,
 }
 
@@ -891,6 +901,8 @@ impl Store {
             checkpoint_authority_full_validations: Cell::new(0),
             #[cfg(test)]
             checkpoint_authority_incremental_validations: Cell::new(0),
+            #[cfg(test)]
+            checkpoint_full_prefix_scans: Cell::new(0),
             #[cfg(test)]
             startup_authority_scans: Cell::new(1),
         })
@@ -970,6 +982,11 @@ impl Store {
     #[cfg(test)]
     fn startup_authority_scan_count(&self) -> u64 {
         self.startup_authority_scans.get()
+    }
+
+    #[cfg(test)]
+    fn checkpoint_full_prefix_scan_count(&self) -> u64 {
+        self.checkpoint_full_prefix_scans.get()
     }
 
     pub fn busy_timeout_millis(&self) -> Result<u64, CarlError> {
@@ -2535,14 +2552,14 @@ impl Store {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(storage_error)?;
-        let Some(current) = load_task_record(&transaction, input.task_id)? else {
+        let Some(mut current) = load_task_record(&transaction, input.task_id)? else {
             return Ok(None);
         };
         if current.revision != expected_task_revision {
             return Ok(None);
         }
         let data_version = sqlite_data_version(&transaction)?;
-        let incremental_anchor = match cached_authority.as_ref() {
+        let incremental_anchor = match cached_authority.as_deref() {
             Some(authority)
                 if authority.data_version == data_version
                     && authenticated_checkpoint_matches_database(
@@ -2555,8 +2572,39 @@ impl Store {
             }
             _ => None,
         };
+        let (validated_authority, used_incremental_path) = if let Some(authority) =
+            incremental_anchor
+        {
+            (
+                validate_checkpoint_authority_incremental(
+                    &transaction,
+                    &current,
+                    &input.checkpoint,
+                    authority,
+                )?,
+                true,
+            )
+        } else {
+            let authoritative = validate_task_authority_from_journal(&transaction, input.task_id)?;
+            current = authoritative.record;
+            validate_task_canonical_payloads_filtered(&transaction, Some(input.task_id))?;
+            #[cfg(test)]
+            self.checkpoint_full_prefix_scans
+                .set(self.checkpoint_full_prefix_scans.get().saturating_add(1));
+            validate_checkpoint_history(&transaction, &current, &input)?;
+            (
+                validate_checkpoint_authority(
+                    &transaction,
+                    &current,
+                    &authoritative.configuration,
+                    &input.checkpoint,
+                )?,
+                false,
+            )
+        };
+        validate_checkpoint_artifacts(&transaction, &input.checkpoint)?;
         #[cfg(test)]
-        if incremental_anchor.is_some() {
+        if used_incremental_path {
             self.checkpoint_authority_incremental_validations.set(
                 self.checkpoint_authority_incremental_validations
                     .get()
@@ -2569,19 +2617,8 @@ impl Store {
                     .saturating_add(1),
             );
         }
-        validate_checkpoint_history(&transaction, &current, &input)?;
-        if let Some(authority) = incremental_anchor {
-            validate_checkpoint_authority_incremental(
-                &transaction,
-                &current,
-                &input.checkpoint,
-                authority,
-            )?;
-        } else {
-            authenticate_latest_checkpoint_predecessor(&transaction, &current)?;
-            validate_checkpoint_authority(&transaction, &current, &input.checkpoint)?;
-        }
-        validate_checkpoint_artifacts(&transaction, &input.checkpoint)?;
+        #[cfg(not(test))]
+        let _ = used_incremental_path;
 
         let envelope = append_event_in_transaction(
             &transaction,
@@ -2641,12 +2678,20 @@ impl Store {
         };
         self.authenticated_checkpoint_authority.insert(
             input.task_id,
-            AuthenticatedCheckpointAuthority {
+            Arc::new(AuthenticatedCheckpointAuthority {
+                checkpoint_id: record.checkpoint.checkpoint_id,
+                task_id: record.checkpoint.task_id,
+                source_sequence_start: record.checkpoint.source_sequence_start,
                 source_sequence_end: record.checkpoint.source_sequence_end,
-                checkpoint: record.checkpoint.clone(),
+                compaction_generation: record.checkpoint.compaction_generation,
+                operations: Arc::from(record.checkpoint.operations.clone()),
+                observed_total_tokens: record.checkpoint.provider.observed_total_tokens,
+                observed_context_window: record.checkpoint.provider.observed_context_window,
+                task_snapshot: Arc::new(validated_authority.task_snapshot),
+                configuration: validated_authority.configuration,
                 digest: record.checkpoint_digest.clone(),
                 data_version,
-            },
+            }),
         );
         Ok(Some(record))
     }
@@ -4770,6 +4815,8 @@ impl RuntimeStore {
             #[cfg(test)]
             checkpoint_authority_incremental_validations: Cell::new(0),
             #[cfg(test)]
+            checkpoint_full_prefix_scans: Cell::new(0),
+            #[cfg(test)]
             startup_authority_scans: Cell::new(1),
         })
     }
@@ -6718,10 +6765,7 @@ fn authenticated_checkpoint_matches_database(
     let Some(checkpoint_id) = current.snapshot.latest_checkpoint else {
         return Ok(false);
     };
-    if checkpoint_id != authority.checkpoint.checkpoint_id
-        || current.snapshot.task_id != authority.checkpoint.task_id
-        || authority.source_sequence_end != authority.checkpoint.source_sequence_end
-    {
+    if checkpoint_id != authority.checkpoint_id || current.snapshot.task_id != authority.task_id {
         return Ok(false);
     }
     let stored = transaction
@@ -6740,151 +6784,17 @@ fn authenticated_checkpoint_matches_database(
     let Some((stored_digest, Some(checkpoint_json))) = stored else {
         return Ok(false);
     };
-    let Ok(stored_checkpoint) = serde_json::from_str::<CanonicalCheckpoint>(&checkpoint_json)
-    else {
-        return Ok(false);
-    };
-    let Ok(canonical_bytes) = stored_checkpoint.canonical_bytes() else {
-        return Ok(false);
-    };
-    Ok(stored_checkpoint == authority.checkpoint
-        && canonical_bytes == checkpoint_json.as_bytes()
-        && stored_digest == authority.digest
-        && stored_checkpoint.digest().ok().as_deref() == Some(authority.digest.as_str()))
-}
-
-fn authenticate_latest_checkpoint_predecessor(
-    transaction: &Transaction<'_>,
-    current: &TaskRecord,
-) -> Result<Option<CanonicalCheckpoint>, CarlError> {
-    let task_id = current.snapshot.task_id.to_string();
-    let latest = transaction
-        .query_row(
-            "SELECT id, digest, event_sequence, checkpoint_json
-             FROM task_checkpoints
-             WHERE task_id = ?1
-             ORDER BY event_sequence DESC
-             LIMIT 1",
-            [&task_id],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                ))
-            },
-        )
-        .optional()
-        .map_err(storage_error)?;
-    let Some(projected_checkpoint_id) = current.snapshot.latest_checkpoint else {
-        if latest.is_some() {
-            return Err(checkpoint_validation(
-                "task projection omits its latest canonical checkpoint",
-            ));
-        }
-        return Ok(None);
-    };
-    let Some((checkpoint_id, stored_digest, checkpoint_event_sequence, Some(checkpoint_json))) =
-        latest
-    else {
-        return Err(checkpoint_validation(
-            "latest checkpoint has no canonical predecessor payload",
-        ));
-    };
-    if checkpoint_id != projected_checkpoint_id.to_string() {
-        return Err(checkpoint_validation(
-            "task projection does not reference the latest canonical checkpoint",
-        ));
-    }
-    let checkpoint = serde_json::from_str::<CanonicalCheckpoint>(&checkpoint_json)
-        .map_err(|_| checkpoint_validation("latest canonical checkpoint is invalid"))?;
-    let checkpoint_bytes = checkpoint
-        .canonical_bytes()
-        .map_err(checkpoint_validation_error)?;
-    if checkpoint_bytes != checkpoint_json.as_bytes()
-        || checkpoint.task_id != current.snapshot.task_id
-        || checkpoint.checkpoint_id != projected_checkpoint_id
-        || checkpoint.digest().map_err(checkpoint_validation_error)? != stored_digest
-    {
-        return Err(checkpoint_validation(
-            "latest canonical checkpoint bytes or identity do not match",
-        ));
-    }
-    validate_canonical_source_bounds(transaction, &checkpoint, checkpoint_event_sequence)
-        .map_err(|_| checkpoint_validation("latest canonical checkpoint source is invalid"))?;
-    let expected_previous = transaction
-        .query_row(
-            "SELECT digest
-             FROM task_checkpoints
-             WHERE task_id = ?1 AND event_sequence < ?2
-             ORDER BY event_sequence DESC
-             LIMIT 1",
-            params![task_id, checkpoint_event_sequence],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()
-        .map_err(storage_error)?;
-    if checkpoint.previous_digest != expected_previous {
-        return Err(checkpoint_validation(
-            "latest canonical checkpoint lineage does not match",
-        ));
-    }
-
-    let package = transaction
-        .query_row(
-            "SELECT id, generation, event_sequence, package_json
-             FROM task_context_packages
-             WHERE task_id = ?1 AND checkpoint_id = ?2",
-            params![
-                current.snapshot.task_id.to_string(),
-                projected_checkpoint_id.to_string()
-            ],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                ))
-            },
-        )
-        .optional()
-        .map_err(storage_error)?;
-    let Some((package_id, generation, package_event_sequence, Some(package_json))) = package else {
-        return Err(checkpoint_validation(
-            "latest canonical checkpoint has no atomic context package",
-        ));
-    };
-    let context_package = serde_json::from_str::<ContextPackage>(&package_json)
-        .map_err(|_| checkpoint_validation("latest canonical context package is invalid"))?;
-    if context_package
-        .canonical_bytes()
-        .map_err(context_validation_error)?
-        != package_json.as_bytes()
-        || context_package.package_id.to_string() != package_id
-        || context_package.checkpoint_id != projected_checkpoint_id
-        || context_package.source_sequence_start != checkpoint.source_sequence_start
-        || context_package.source_sequence_end != checkpoint.source_sequence_end
-        || checkpoint.compaction_generation
-            != u32::try_from(stored_u64(generation, "context package generation")?)
-                .map_err(|_| checkpoint_validation("context package generation is too large"))?
-        || package_event_sequence != checkpoint_event_sequence
-    {
-        return Err(checkpoint_validation(
-            "latest canonical context package metadata does not match",
-        ));
-    }
-    validate_checkpoint_artifacts(transaction, &checkpoint)?;
-    Ok(Some(checkpoint))
+    let raw_digest = format!("{:x}", Sha256::digest(checkpoint_json.as_bytes()));
+    Ok(stored_digest == authority.digest && raw_digest == authority.digest)
 }
 
 fn validate_checkpoint_authority(
     transaction: &Transaction<'_>,
     current: &TaskRecord,
+    configuration: &TaskConfigurationRecord,
     checkpoint: &CanonicalCheckpoint,
-) -> Result<(), CarlError> {
-    validate_checkpoint_authority_from_anchor(transaction, current, checkpoint, None)
+) -> Result<ValidatedCheckpointAuthority, CarlError> {
+    validate_checkpoint_authority_from_anchor(transaction, current, configuration, checkpoint, None)
 }
 
 fn validate_checkpoint_authority_incremental(
@@ -6892,10 +6802,9 @@ fn validate_checkpoint_authority_incremental(
     current: &TaskRecord,
     checkpoint: &CanonicalCheckpoint,
     authority: &AuthenticatedCheckpointAuthority,
-) -> Result<(), CarlError> {
+) -> Result<ValidatedCheckpointAuthority, CarlError> {
     if checkpoint.previous_digest.as_deref() != Some(authority.digest.as_str())
-        || checkpoint.source_sequence_start != authority.checkpoint.source_sequence_start
-        || authority.source_sequence_end != authority.checkpoint.source_sequence_end
+        || checkpoint.source_sequence_start != authority.source_sequence_start
     {
         return Err(checkpoint_validation(
             "checkpoint does not extend its authenticated authority",
@@ -6904,58 +6813,29 @@ fn validate_checkpoint_authority_incremental(
     validate_checkpoint_authority_from_anchor(
         transaction,
         current,
+        &authority.configuration,
         checkpoint,
-        Some(&authority.checkpoint),
+        Some(authority),
     )
+}
+
+struct ValidatedCheckpointAuthority {
+    task_snapshot: TaskSnapshot,
+    configuration: TaskConfigurationRecord,
 }
 
 fn validate_checkpoint_authority_from_anchor(
     transaction: &Transaction<'_>,
     current: &TaskRecord,
+    configuration: &TaskConfigurationRecord,
     checkpoint: &CanonicalCheckpoint,
-    anchor: Option<&CanonicalCheckpoint>,
-) -> Result<(), CarlError> {
-    if current.snapshot.active_epoch.is_some() || current.snapshot.has_unresolved_operations() {
-        return Err(checkpoint_validation(
-            "checkpoint requires an authoritative safe boundary",
-        ));
-    }
-    if checkpoint.contract != current.snapshot.contract
-        || checkpoint.provider.context_id != current.snapshot.provider_context
-    {
-        return Err(checkpoint_validation(
-            "checkpoint contract or provider context does not match the task projection",
-        ));
-    }
-
-    let (provider, model, effort) = transaction
-        .query_row(
-            "SELECT provider, model, effort FROM agent_tasks WHERE id = ?1",
-            [checkpoint.task_id.to_string()],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            },
-        )
-        .map_err(storage_error)?;
-    if checkpoint.provider.provider != provider
-        || checkpoint.provider.model != model
-        || checkpoint.provider.effort != effort
-    {
-        return Err(checkpoint_validation(
-            "checkpoint provider metadata does not match the task projection",
-        ));
-    }
-
-    let mut observed_total_tokens =
-        anchor.and_then(|checkpoint| checkpoint.provider.observed_total_tokens);
+    anchor: Option<&AuthenticatedCheckpointAuthority>,
+) -> Result<ValidatedCheckpointAuthority, CarlError> {
+    let mut observed_total_tokens = anchor.and_then(|authority| authority.observed_total_tokens);
     let mut observed_context_window =
-        anchor.and_then(|checkpoint| checkpoint.provider.observed_context_window);
-    let mut journal_operations = anchor.map_or_else(BTreeMap::new, |checkpoint| {
-        checkpoint
+        anchor.and_then(|authority| authority.observed_context_window);
+    let mut journal_operations = anchor.map_or_else(BTreeMap::new, |authority| {
+        authority
             .operations
             .iter()
             .map(|operation| {
@@ -6965,7 +6845,7 @@ fn validate_checkpoint_authority_from_anchor(
                         status: operation.status,
                         effect_class: operation.effect_class,
                         request_digest: operation.request_digest.clone(),
-                        last_transition_sequence: checkpoint.source_sequence_end,
+                        last_transition_sequence: authority.source_sequence_end,
                         evidence: OperationEvidenceState::from_consumed(
                             operation.evidence_sequences.clone(),
                         ),
@@ -6974,7 +6854,10 @@ fn validate_checkpoint_authority_from_anchor(
             })
             .collect()
     });
-    let mut after_sequence = anchor.map(|checkpoint| checkpoint.source_sequence_end);
+    let mut replayed_snapshot = anchor.map(|authority| authority.task_snapshot.as_ref().clone());
+    let mut replayed_configuration = anchor.map(|authority| authority.configuration.clone());
+    let mut replayed_control_markers = Vec::new();
+    let mut after_sequence = anchor.map(|authority| authority.source_sequence_end);
     let mut last_tail_sequence = after_sequence;
     loop {
         let page = read_task_event_page_from_connection(
@@ -6987,6 +6870,15 @@ fn validate_checkpoint_authority_from_anchor(
             break;
         }
         for envelope in &page {
+            if let Some(snapshot) = replayed_snapshot.take() {
+                replayed_snapshot =
+                    Some(reduce_task(Some(snapshot), envelope).map_err(task_replay_error)?);
+                replay_task_child_projections(
+                    &mut replayed_configuration,
+                    &mut replayed_control_markers,
+                    envelope,
+                )?;
+            }
             let Event::TaskLifecycle { event, .. } = &envelope.event else {
                 return Err(storage_invariant(
                     "task event page returned a non-task event",
@@ -7080,6 +6972,49 @@ fn validate_checkpoint_authority_from_anchor(
             "checkpoint authority tail is incomplete",
         ));
     }
+    let (authoritative_snapshot, authoritative_configuration) = if let Some(replayed_snapshot) =
+        replayed_snapshot
+    {
+        let replayed_configuration = replayed_configuration
+            .ok_or_else(|| storage_invariant("incremental task configuration is missing"))?;
+        if replayed_snapshot != current.snapshot {
+            return Err(storage_invariant(
+                "task projection disagrees with authenticated journal tail replay",
+            ));
+        }
+        let stored_configuration = load_task_configuration_record(transaction, checkpoint.task_id)?
+            .ok_or_else(|| storage_invariant("task configuration projection is missing"))?;
+        if replayed_configuration != stored_configuration {
+            return Err(storage_invariant(
+                "task configuration projection disagrees with authenticated journal tail replay",
+            ));
+        }
+        (replayed_snapshot, replayed_configuration)
+    } else {
+        (current.snapshot.clone(), configuration.clone())
+    };
+    if authoritative_snapshot.active_epoch.is_some()
+        || authoritative_snapshot.has_unresolved_operations()
+    {
+        return Err(checkpoint_validation(
+            "checkpoint requires an authoritative safe boundary",
+        ));
+    }
+    if checkpoint.contract != authoritative_snapshot.contract
+        || checkpoint.provider.context_id != authoritative_snapshot.provider_context
+    {
+        return Err(checkpoint_validation(
+            "checkpoint contract or provider context does not match the authoritative journal",
+        ));
+    }
+    if checkpoint.provider.provider != "codex"
+        || checkpoint.provider.model != authoritative_configuration.active_model.as_str()
+        || checkpoint.provider.effort != authoritative_configuration.active_effort.as_codex_value()
+    {
+        return Err(checkpoint_validation(
+            "checkpoint provider metadata does not match the authoritative journal",
+        ));
+    }
     if checkpoint.provider.observed_total_tokens != observed_total_tokens
         || checkpoint.provider.observed_context_window != observed_context_window
     {
@@ -7156,7 +7091,10 @@ fn validate_checkpoint_authority_from_anchor(
             "checkpoint generation does not match durable history",
         ));
     }
-    Ok(())
+    Ok(ValidatedCheckpointAuthority {
+        task_snapshot: authoritative_snapshot,
+        configuration: authoritative_configuration,
+    })
 }
 
 struct JournalOperationState {
@@ -8265,10 +8203,22 @@ fn read_journal_task_id_page(
         .map_err(|_| storage_invariant("task journal contains invalid task metadata"))
 }
 
+struct ValidatedTaskAuthority {
+    record: TaskRecord,
+    configuration: TaskConfigurationRecord,
+}
+
 fn validate_task_projection_from_journal(
     connection: &Connection,
     task_id: TaskId,
 ) -> Result<TaskRecord, CarlError> {
+    Ok(validate_task_authority_from_journal(connection, task_id)?.record)
+}
+
+fn validate_task_authority_from_journal(
+    connection: &Connection,
+    task_id: TaskId,
+) -> Result<ValidatedTaskAuthority, CarlError> {
     let projection = load_task_record(connection, task_id)?
         .ok_or_else(|| storage_invariant("task journal has no matching task projection"))?;
     let mut replayed = None;
@@ -8316,7 +8266,15 @@ fn validate_task_projection_from_journal(
             "task control marker projection disagrees with journal replay",
         ));
     }
-    Ok(projection)
+    Ok(ValidatedTaskAuthority {
+        record: TaskRecord {
+            snapshot: replayed,
+            revision: projection.revision,
+            created_at: projection.created_at,
+            updated_at: projection.updated_at,
+        },
+        configuration: expected_configuration,
+    })
 }
 
 fn replay_task_child_projections(
@@ -10145,6 +10103,7 @@ mod checkpoint_authority_tests {
     -> TestResult {
         let (_fixture, mut store, first) = setup_authenticated_anchor()?;
         assert_eq!(store.checkpoint_authority_validation_counts(), (1, 0));
+        assert_eq!(store.checkpoint_full_prefix_scan_count(), 1);
 
         let task_id = first.task_id;
         let mut task = store.get_task(task_id)?.expect("task exists");
@@ -10176,6 +10135,7 @@ mod checkpoint_authority_tests {
         let second = commit_checkpoint(&mut store, &task, second, 516)?;
         assert_eq!(second.source_sequence_end, tail.last().unwrap().sequence);
         assert_eq!(store.checkpoint_authority_validation_counts(), (1, 1));
+        assert_eq!(store.checkpoint_full_prefix_scan_count(), 1);
         Ok(())
     }
 
@@ -10199,7 +10159,7 @@ mod checkpoint_authority_tests {
 
     #[test]
     fn full_fallback_rejects_a_projection_rolled_back_to_a_non_latest_predecessor() -> TestResult {
-        let (fixture, mut store, first) = setup_authenticated_anchor()?;
+        let (_fixture, mut store, first) = setup_authenticated_anchor()?;
         let task_id = first.task_id;
         let (task, second) = build_next_checkpoint(&store, task_id, Some(first.clone()))?;
         commit_checkpoint(&mut store, &task, second, 2)?;
@@ -10210,16 +10170,15 @@ mod checkpoint_authority_tests {
             CanonicalCheckpoint::build(checkpoint_input(&task, fork_events, Some(first.clone())))?;
         let package = checkpoint_package(fork.clone())?;
         let before_events = store.read_task_events(task_id)?.len();
+        let before_counts = store.checkpoint_authority_validation_counts();
 
-        let external = Connection::open(&fixture.database)?;
-        external.execute(
+        store.connection.execute(
             "UPDATE agent_tasks
              SET latest_checkpoint_id = ?2,
                  snapshot_json = json_set(snapshot_json, '$.latest_checkpoint', ?2)
              WHERE id = ?1",
             params![task_id.to_string(), first.checkpoint_id.to_string()],
         )?;
-        drop(external);
 
         assert_eq!(
             store
@@ -10240,8 +10199,16 @@ mod checkpoint_authority_tests {
             },
             task.revision,
         );
-        assert!(matches!(rejected, Err(CarlError::Validation { .. })));
+        assert!(rejected.is_err());
         assert_eq!(store.read_task_events(task_id)?.len(), before_events);
+        assert_eq!(
+            store.get_task(task_id)?.expect("task exists").revision,
+            task.revision
+        );
+        assert_eq!(
+            store.checkpoint_authority_validation_counts(),
+            before_counts
+        );
         assert_eq!(
             store.connection.query_row(
                 "SELECT COUNT(*) FROM task_checkpoints WHERE task_id = ?1",
@@ -10249,6 +10216,195 @@ mod checkpoint_authority_tests {
                 |row| row.get::<_, u64>(0),
             )?,
             2
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn full_fallback_rejects_corruption_in_an_older_canonical_checkpoint() -> TestResult {
+        let (fixture, mut store, first) = setup_authenticated_anchor()?;
+        let task_id = first.task_id;
+        let (task, second) = build_next_checkpoint(&store, task_id, Some(first.clone()))?;
+        let second = commit_checkpoint(&mut store, &task, second, 2)?;
+        let (task, candidate) = build_next_checkpoint(&store, task_id, Some(second))?;
+        let package = checkpoint_package(candidate.clone())?;
+        let before_events = store.read_task_events(task_id)?.len();
+        let before_revision = task.revision;
+        let before_counts = store.checkpoint_authority_validation_counts();
+
+        let external = Connection::open(&fixture.database)?;
+        assert_eq!(
+            external.execute(
+                "UPDATE task_checkpoints
+                 SET checkpoint_json = ' ' || checkpoint_json
+                 WHERE id = ?1",
+                [first.checkpoint_id.to_string()],
+            )?,
+            1
+        );
+        drop(external);
+
+        let rejected = store.commit_checkpoint(
+            NewCheckpoint {
+                task_id,
+                checkpoint_digest: candidate.digest()?,
+                context_package_digest: package.digest()?,
+                checkpoint: candidate,
+                context_package: package,
+                created_at: test_instant(3),
+            },
+            before_revision,
+        );
+        assert!(rejected.is_err());
+        assert_eq!(store.read_task_events(task_id)?.len(), before_events);
+        assert_eq!(
+            store.get_task(task_id)?.expect("task exists").revision,
+            before_revision
+        );
+        assert_eq!(
+            store.checkpoint_authority_validation_counts(),
+            before_counts
+        );
+        assert_eq!(
+            store.connection.query_row(
+                "SELECT COUNT(*) FROM task_checkpoints WHERE task_id = ?1",
+                [task_id.to_string()],
+                |row| row.get::<_, u64>(0),
+            )?,
+            2
+        );
+        Ok(())
+    }
+
+    fn active_epoch_candidate(
+        store: &mut Store,
+        first: CanonicalCheckpoint,
+    ) -> TestResult<(TaskRecord, CanonicalCheckpoint, ContextPackage)> {
+        let task_id = first.task_id;
+        let task = store.get_task(task_id)?.expect("task exists");
+        let task = store
+            .append_task_event(
+                task_id,
+                task.revision,
+                TaskEvent::StateTransitioned {
+                    from: TaskStatus::Queued,
+                    to: TaskStatus::Active,
+                    reason: "begin unsafe epoch".to_owned(),
+                },
+                test_instant(2),
+            )?
+            .expect("task revision matches");
+        let task = store
+            .append_task_event(
+                task_id,
+                task.revision,
+                TaskEvent::EpochStarted {
+                    epoch_id: crate::runtime::task::EpochId::new(),
+                    objective: "remain active across the attempted checkpoint".to_owned(),
+                },
+                test_instant(3),
+            )?
+            .expect("task revision matches");
+        let events = store.read_task_events_after(task_id, first.source_sequence_end)?;
+        let candidate = CanonicalCheckpoint::build(checkpoint_input(&task, events, Some(first)))?;
+        let package = checkpoint_package(candidate.clone())?;
+        Ok((task, candidate, package))
+    }
+
+    fn forge_safe_boundary_projection(connection: &Connection, task_id: TaskId) -> TestResult {
+        assert_eq!(
+            connection.execute(
+                "UPDATE agent_tasks
+                 SET current_epoch_id = NULL,
+                     snapshot_json = json_set(snapshot_json, '$.active_epoch', NULL)
+                 WHERE id = ?1",
+                [task_id.to_string()],
+            )?,
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn full_fallback_rejects_an_externally_forged_safe_boundary() -> TestResult {
+        let (fixture, mut store, first) = setup_authenticated_anchor()?;
+        let task_id = first.task_id;
+        let (task, candidate, package) = active_epoch_candidate(&mut store, first)?;
+        let before_events = store.read_task_events(task_id)?.len();
+        let before_counts = store.checkpoint_authority_validation_counts();
+        let external = Connection::open(&fixture.database)?;
+        forge_safe_boundary_projection(&external, task_id)?;
+        drop(external);
+
+        let rejected = store.commit_checkpoint(
+            NewCheckpoint {
+                task_id,
+                checkpoint_digest: candidate.digest()?,
+                context_package_digest: package.digest()?,
+                checkpoint: candidate,
+                context_package: package,
+                created_at: test_instant(4),
+            },
+            task.revision,
+        );
+        assert!(rejected.is_err());
+        assert_eq!(store.read_task_events(task_id)?.len(), before_events);
+        assert_eq!(
+            store.get_task(task_id)?.expect("task exists").revision,
+            task.revision
+        );
+        assert_eq!(
+            store.checkpoint_authority_validation_counts(),
+            before_counts
+        );
+        assert_eq!(
+            store.connection.query_row(
+                "SELECT COUNT(*) FROM task_checkpoints WHERE task_id = ?1",
+                [task_id.to_string()],
+                |row| row.get::<_, u64>(0),
+            )?,
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn incremental_cache_rejects_same_connection_safe_boundary_tampering() -> TestResult {
+        let (_fixture, mut store, first) = setup_authenticated_anchor()?;
+        let task_id = first.task_id;
+        let (task, candidate, package) = active_epoch_candidate(&mut store, first)?;
+        let before_events = store.read_task_events(task_id)?.len();
+        let before_counts = store.checkpoint_authority_validation_counts();
+        forge_safe_boundary_projection(&store.connection, task_id)?;
+
+        let rejected = store.commit_checkpoint(
+            NewCheckpoint {
+                task_id,
+                checkpoint_digest: candidate.digest()?,
+                context_package_digest: package.digest()?,
+                checkpoint: candidate,
+                context_package: package,
+                created_at: test_instant(4),
+            },
+            task.revision,
+        );
+        assert!(rejected.is_err());
+        assert_eq!(store.read_task_events(task_id)?.len(), before_events);
+        assert_eq!(
+            store.get_task(task_id)?.expect("task exists").revision,
+            task.revision
+        );
+        assert_eq!(
+            store.checkpoint_authority_validation_counts(),
+            before_counts
+        );
+        assert_eq!(
+            store.connection.query_row(
+                "SELECT COUNT(*) FROM task_checkpoints WHERE task_id = ?1",
+                [task_id.to_string()],
+                |row| row.get::<_, u64>(0),
+            )?,
+            1
         );
         Ok(())
     }
@@ -10276,6 +10432,7 @@ mod checkpoint_authority_tests {
             let (task, candidate) = build_next_checkpoint(&store, task_id, Some(first.clone()))?;
             let package = checkpoint_package(candidate.clone())?;
             let before_events = store.read_task_events(task_id)?.len();
+            let before_counts = store.checkpoint_authority_validation_counts();
             let external = Connection::open(&fixture.database)?;
             match tamper {
                 AnchorTamper::CanonicalJson => {
@@ -10328,6 +10485,10 @@ mod checkpoint_authority_tests {
                 task.revision,
             );
             assert!(result.is_err(), "{tamper:?} must fail closed");
+            assert_eq!(
+                store.checkpoint_authority_validation_counts(),
+                before_counts
+            );
             assert_eq!(store.read_task_events(task_id)?.len(), before_events);
             assert_eq!(
                 store.get_task(task_id)?.expect("task exists").revision,
