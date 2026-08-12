@@ -309,3 +309,58 @@ PASS: exit 0
 
 The prohibited broad all-features test suite and live provider/OAuth/network tests
 were not run. `SECURITY.md`, `Cargo.lock`, and the database schema were not changed.
+
+## Review fix round 2: Preserve provider shutdown failures
+
+The Ready fallback added in fix round 1 was narrowed in code commit `ea4b60e`.
+Prepare now re-reads synchronized Ready/same-task state only for
+`TaskServiceErrorCode::InvalidRequest`, which is the exact mapping of the idle
+engine's `TaskEngineErrorCode::InvalidTask` Quiesce acknowledgement. Channel closure
+(`Stopped`) and engine/storage failures are propagated without consulting Ready.
+
+The deterministic RED reused the terminal-before-Quiesce gate with a provider whose
+shutdown returns a transport error. The actor published Ready, attempted shutdown
+once, returned `Engine`, and dropped the control/acknowledgement channels. The old
+fallback then incorrectly converted the resulting `Stopped` error into a Ready
+Prepare result:
+
+```text
+provider shutdown failure must not become Ready success:
+ServiceMaintenanceStatus { phase: Ready, task_id: Some(...), checkpoint_id: Some(...) }
+```
+
+The GREEN asserts that Prepare returns `Stopped`, the actor preserves its `Engine`
+failure, the naturally completed task and its sole effect remain authoritative, and
+the failed shutdown is attempted exactly once without being recorded as successful.
+The preclaimed Prepare receipt remains `pending` with `result_json == NULL`, and a
+fresh durable claim returns `Pending` rather than a completed replay. The companion
+natural-completion race remains green, proving that the exact idle-engine
+InvalidTask/InvalidRequest acknowledgement still recovers to Ready.
+
+### Fix-round verification
+
+```text
+cargo test --locked --lib service::server::tests
+PASS: 18 passed, 0 failed
+
+cargo test --locked --test service_protocol_contract
+PASS: 15 passed, 0 failed
+
+cargo test --locked --lib runtime::task::engine::tests
+PASS: 7 passed, 0 failed
+
+cargo test --locked --test service_end_to_end
+PASS: 20 passed, 0 failed
+
+cargo clippy --locked --all-targets --all-features -- -D warnings
+PASS: exit 0, no warnings
+
+cargo fmt --all -- --check
+PASS: exit 0
+
+git diff --check
+PASS: exit 0
+```
+
+The broad all-features test suite and live provider/OAuth/network tests were not run.
+`SECURITY.md` and `Cargo.lock` were not changed.
