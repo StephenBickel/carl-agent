@@ -1949,6 +1949,25 @@ async fn service_restart_resumes_from_checkpoint_without_repeating_effect() -> T
             .all(|pair| pair[0].sequence < pair[1].sequence)
     );
     assert_eq!(shared.lock().unwrap().effect_count, 1);
+    let ServiceResult::Metrics(restart_metrics) = replacement
+        .request(ServiceRequest {
+            protocol_version: SERVICE_PROTOCOL_VERSION,
+            request_id: "metrics-after-owner-restart".to_owned(),
+            idempotency_key: "metrics-after-owner-restart-key".to_owned(),
+            command: ServiceCommand::Metrics { task_id },
+        })
+        .await?
+    else {
+        return Err("metrics after owner restart missing".into());
+    };
+    assert_eq!(restart_metrics.task_id, task_id);
+    assert_eq!(restart_metrics.status, TaskStatus::Completed);
+    assert_eq!(restart_metrics.provider_requests, 3);
+    assert_eq!(restart_metrics.epochs_started, 3);
+    assert_eq!(restart_metrics.epochs_completed, 3);
+    assert_eq!(restart_metrics.operation_intents, 1);
+    assert_eq!(restart_metrics.operations_succeeded, 1);
+    assert_eq!(restart_metrics.unresolved_operations, 0);
     assert_eq!(
         replacement
             .request(ServiceRequest {
@@ -2705,6 +2724,116 @@ async fn acp_reconnect_during_three_epoch_task_replays_once_and_completes() -> T
         return Err("three-epoch completion snapshot missing".into());
     };
     assert_eq!(snapshot.status, TaskStatus::Completed);
+    let database = layout.data.join("carl.sqlite3");
+    let before_poll = Connection::open(&database)?.query_row(
+        "SELECT
+            (SELECT COUNT(*) FROM events),
+            (SELECT COUNT(*) FROM service_command_receipts)",
+        [],
+        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+    )?;
+    let ServiceResult::Metrics(metrics) = owner
+        .request(ServiceRequest {
+            protocol_version: SERVICE_PROTOCOL_VERSION,
+            request_id: "three-metrics".to_owned(),
+            idempotency_key: "three-metrics-key".to_owned(),
+            command: ServiceCommand::Metrics { task_id },
+        })
+        .await?
+    else {
+        return Err("three-epoch metrics missing".into());
+    };
+    assert_eq!(metrics.status, TaskStatus::Completed);
+    assert_eq!(metrics.provider_requests, 3);
+    assert_eq!(metrics.epochs_started, 3);
+    assert_eq!(metrics.epochs_completed, 3);
+    assert_eq!(metrics.operation_intents, 1);
+    assert_eq!(metrics.operations_succeeded, 1);
+    assert_eq!(metrics.operations_failed, 0);
+    assert_eq!(metrics.operations_cancelled, 0);
+    assert_eq!(metrics.operations_uncertain, 0);
+    assert_eq!(metrics.unresolved_operations, 0);
+    assert_eq!(metrics.required_clauses_total, 2);
+    assert_eq!(metrics.required_clauses_satisfied, 2);
+    drop(owner);
+    let mut reconnected_owner = TaskServiceClient::connect(&layout.data).await?;
+    let ServiceResult::Metrics(reconnected_metrics) = reconnected_owner
+        .request(ServiceRequest {
+            protocol_version: SERVICE_PROTOCOL_VERSION,
+            request_id: "three-metrics-reconnected".to_owned(),
+            idempotency_key: "three-metrics-reconnected-key".to_owned(),
+            command: ServiceCommand::Metrics { task_id },
+        })
+        .await?
+    else {
+        return Err("reconnected three-epoch metrics missing".into());
+    };
+    assert_eq!(reconnected_metrics, metrics);
+    let after_poll = Connection::open(&database)?.query_row(
+        "SELECT
+            (SELECT COUNT(*) FROM events),
+            (SELECT COUNT(*) FROM service_command_receipts)",
+        [],
+        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+    )?;
+    assert_eq!(after_poll, before_poll, "metrics polling is read-only");
+    assert_eq!(
+        reconnected_owner
+            .request(ServiceRequest {
+                protocol_version: SERVICE_PROTOCOL_VERSION,
+                request_id: "three-metrics-unknown".to_owned(),
+                idempotency_key: "three-metrics-unknown-key".to_owned(),
+                command: ServiceCommand::Metrics {
+                    task_id: TaskId::new(),
+                },
+            })
+            .await
+            .expect_err("unknown metrics task must be rejected")
+            .code(),
+        ServiceClientErrorCode::Rejected
+    );
+    client_write
+        .write_all(
+            format!(
+                "{}\n",
+                json!({"jsonrpc":"2.0","id":13,"method":"_task/metrics","params":{"sessionId":session_id,"taskId":task_id}})
+            )
+            .as_bytes(),
+        )
+        .await?;
+    client_write.flush().await?;
+    let extension = read_frame(&mut reader, 1024 * 1024)
+        .await?
+        .ok_or("service ACP metrics extension missing")?;
+    assert_eq!(extension.value()["id"], 13);
+    assert_eq!(
+        extension.value()["result"]["metrics"],
+        serde_json::to_value(&metrics)?
+    );
+
+    client_write
+        .write_all(
+            format!(
+                "{}\n",
+                json!({"jsonrpc":"2.0","id":14,"method":"session/prompt","params":{"sessionId":session_id,"prompt":[{"type":"text","text":"/metrics"}]}})
+            )
+            .as_bytes(),
+        )
+        .await?;
+    client_write.flush().await?;
+    let slash_update = read_frame(&mut reader, 1024 * 1024)
+        .await?
+        .ok_or("service ACP metrics slash update missing")?;
+    let slash_text = slash_update.value()["params"]["update"]["content"]["text"]
+        .as_str()
+        .ok_or("service ACP metrics slash text missing")?;
+    let slash: serde_json::Value = serde_json::from_str(slash_text)?;
+    assert_eq!(slash["metrics"], serde_json::to_value(&metrics)?);
+    let slash_result = read_frame(&mut reader, 1024 * 1024)
+        .await?
+        .ok_or("service ACP metrics slash result missing")?;
+    assert_eq!(slash_result.value()["id"], 14);
+    assert_eq!(slash_result.value()["result"]["stopReason"], "end_turn");
     {
         let state = shared.lock().unwrap();
         assert_eq!(state.work_epochs, 3);
@@ -2717,7 +2846,7 @@ async fn acp_reconnect_during_three_epoch_task_replays_once_and_completes() -> T
     tokio::time::timeout(Duration::from_secs(5), reconnect_task)
         .await
         .map_err(|_| "three-epoch reconnect ACP connection did not close")???;
-    owner
+    reconnected_owner
         .request(ServiceRequest {
             protocol_version: SERVICE_PROTOCOL_VERSION,
             request_id: "three-shutdown".to_owned(),

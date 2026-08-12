@@ -181,8 +181,8 @@ impl TaskServiceClient {
         let result = self
             .request_once(&ServiceRequest {
                 protocol_version: SERVICE_PROTOCOL_VERSION,
-                request_id: "client-negotiate-v2".to_owned(),
-                idempotency_key: "client-negotiate-v2".to_owned(),
+                request_id: "client-negotiate-v3".to_owned(),
+                idempotency_key: "client-negotiate-v3".to_owned(),
                 command: ServiceCommand::Info,
             })
             .await?;
@@ -202,6 +202,7 @@ fn validate_info(info: &ServiceInfo) -> Result<(), ServiceClientError> {
         || !info.capabilities.durable_events
         || !info.capabilities.reconnect
         || !info.capabilities.explicit_task_budgets
+        || !info.capabilities.sanitized_task_metrics
     {
         return Err(client_error(ServiceClientErrorCode::InvalidResponse));
     }
@@ -242,6 +243,7 @@ fn empty_info() -> ServiceInfo {
             trusted_buzz_admission: false,
             configure_active_task: false,
             explicit_task_budgets: false,
+            sanitized_task_metrics: false,
         },
     }
 }
@@ -498,7 +500,7 @@ mod tests {
         current_user: true,
     };
 
-    fn info(explicit_task_budgets: bool) -> ServiceInfo {
+    fn info(explicit_task_budgets: bool, sanitized_task_metrics: bool) -> ServiceInfo {
         ServiceInfo {
             protocol_version: SERVICE_PROTOCOL_VERSION,
             live_generation: "11111111-1111-4111-8111-111111111111".to_owned(),
@@ -511,21 +513,22 @@ mod tests {
                 trusted_buzz_admission: true,
                 configure_active_task: true,
                 explicit_task_budgets,
+                sanitized_task_metrics,
             },
         }
     }
 
     #[test]
     fn negotiation_requires_the_explicit_task_budget_capability() {
-        validate_info(&info(true)).expect("advertised budget support is accepted");
+        validate_info(&info(true, true)).expect("advertised capabilities are accepted");
         assert_eq!(
-            validate_info(&info(false))
+            validate_info(&info(false, true))
                 .expect_err("false budget support must fail negotiation")
                 .code(),
             ServiceClientErrorCode::InvalidResponse
         );
 
-        let mut missing = serde_json::to_value(info(true)).unwrap();
+        let mut missing = serde_json::to_value(info(true, true)).unwrap();
         missing["capabilities"]
             .as_object_mut()
             .unwrap()
@@ -534,6 +537,23 @@ mod tests {
             serde_json::from_value::<ServiceInfo>(missing).is_err(),
             "missing budget capability must fail closed"
         );
+    }
+
+    #[test]
+    fn negotiation_requires_sanitized_task_metrics() {
+        assert_eq!(
+            validate_info(&info(true, false))
+                .expect_err("false metrics support must fail negotiation")
+                .code(),
+            ServiceClientErrorCode::InvalidResponse
+        );
+
+        let mut missing = serde_json::to_value(info(true, true)).unwrap();
+        missing["capabilities"]
+            .as_object_mut()
+            .unwrap()
+            .remove("sanitized_task_metrics");
+        assert!(serde_json::from_value::<ServiceInfo>(missing).is_err());
     }
 
     #[test]

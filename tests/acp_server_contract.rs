@@ -176,6 +176,84 @@ async fn unknown_methods_are_isolated_and_requests_before_initialize_fail_closed
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn direct_metrics_extension_and_exact_slash_share_the_bound_sanitized_shape() -> TestResult {
+    let layout = Layout::new()?;
+    let kernel =
+        Kernel::start_with_ports(layout.runtime()?, Box::new(FakePort::idle()?), None).await?;
+    let mut client = Client::start(AcpServer::new(kernel, Frontend::Acp)).await;
+    client
+        .send(json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":2,"clientInfo":{"name":"metrics","version":"1"}}}))
+        .await?;
+    client.read().await?;
+    for id in [2, 3] {
+        client
+            .send(json!({"jsonrpc":"2.0","id":id,"method":"session/new","params":{"cwd":layout.workspace,"mcpServers":[]}}))
+            .await?;
+    }
+    let first = client.read().await?;
+    let second = client.read().await?;
+    let first_session = first.value()["result"]["sessionId"]
+        .as_str()
+        .ok_or("first session missing")?
+        .to_owned();
+    let second_session = second.value()["result"]["sessionId"]
+        .as_str()
+        .ok_or("second session missing")?
+        .to_owned();
+    let mut store = Store::open(layout.root.join("carl.sqlite3"))?;
+    let local_session = store
+        .get_frontend_session(&first_session)?
+        .ok_or("frontend binding missing")?
+        .session_id;
+    let task = store.create_task(NewTask {
+        session_id: local_session,
+        workspace: layout.workspace.clone(),
+        contract: CompletionContract {
+            version: 1,
+            goal: "serve sanitized metrics".to_owned(),
+            constraints: Vec::new(),
+            clauses: Vec::new(),
+        },
+        model: ModelId::parse("gpt-5.6-codex")?,
+        effort: ReasoningEffort::High,
+        permission_mode: carl::acp::PermissionMode::Default,
+        budget: TaskBudget::default(),
+        created_at: Utc::now(),
+    })?;
+    drop(store);
+
+    client
+        .send(json!({"jsonrpc":"2.0","id":4,"method":"_task/metrics","params":{"sessionId":first_session,"taskId":task.snapshot.task_id}}))
+        .await?;
+    let extension = client.read().await?;
+    let metrics = extension.value()["result"]["metrics"].clone();
+    assert_eq!(metrics["schema_version"], 1);
+    assert_eq!(metrics["task_id"], task.snapshot.task_id.to_string());
+    assert_eq!(metrics["durable_event_count"], 1);
+
+    client
+        .send(json!({"jsonrpc":"2.0","id":5,"method":"session/prompt","params":{"sessionId":first_session,"prompt":[{"type":"text","text":"/metrics"}]}}))
+        .await?;
+    let update = client.read().await?;
+    let slash_text = update.value()["params"]["update"]["content"]["text"]
+        .as_str()
+        .ok_or("metrics slash text missing")?;
+    let slash: Value = serde_json::from_str(slash_text)?;
+    assert_eq!(slash["metrics"], metrics);
+    assert_eq!(
+        client.read().await?.value()["result"]["stopReason"],
+        "end_turn"
+    );
+
+    client
+        .send(json!({"jsonrpc":"2.0","id":6,"method":"_task/metrics","params":{"sessionId":second_session,"taskId":task.snapshot.task_id}}))
+        .await?;
+    assert_eq!(client.read().await?.value()["error"]["code"], -32602);
+    client.finish().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn steering_and_idless_cancellation_remain_responsive_during_prompt() -> TestResult {
     let layout = Layout::new()?;
     let port = FakePort::idle()?;

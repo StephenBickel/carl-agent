@@ -271,15 +271,37 @@ fn strict_steering_admission() -> TestResult {
         );
     }
 
+    for (id, actor, channel, event) in [
+        (16, wrong_actor, CHANNEL_ID, '2'),
+        (17, ACTOR_HEX, wrong_channel, '3'),
+    ] {
+        let events_before = layout.task_control_marker_count(&task_id)?;
+        client.send(&json!({
+            "jsonrpc":"2.0","id":id,"method":"session/prompt","params":{
+                "sessionId":session,
+                "prompt":[
+                    {"type":"text","text":"/metrics"},
+                    {"type":"text","text":metadata(event, actor, channel, 1)}
+                ]
+            }
+        }))?;
+        assert_eq!(
+            client.read_id(id)?["error"]["code"],
+            -32602,
+            "metrics must retain the exact Buzz owner binding"
+        );
+        assert_eq!(layout.task_control_marker_count(&task_id)?, events_before);
+    }
+
     let valid = steering(
-        16,
+        18,
         vec![
             "fresh owner steering".to_owned(),
             metadata('1', ACTOR_HEX, CHANNEL_ID, 1),
         ],
     );
     client.send(&valid)?;
-    assert_eq!(client.read_id(16)?["result"]["outcome"], "injected");
+    assert_eq!(client.read_id(18)?["result"]["outcome"], "injected");
     let markers_after_valid = layout.task_control_marker_count(&task_id)?;
     let provider_steers_after_valid = layout.provider_method_count("turn/steer")?;
     client.send(
@@ -287,12 +309,12 @@ fn strict_steering_admission() -> TestResult {
             .as_object()
             .map(|object| {
                 let mut replay = object.clone();
-                replay.insert("id".to_owned(), json!(17));
+                replay.insert("id".to_owned(), json!(19));
                 Value::Object(replay)
             })
             .ok_or("valid steering frame must be an object")?,
     )?;
-    assert_eq!(client.read_id(17)?["error"]["code"], -32602);
+    assert_eq!(client.read_id(19)?["error"]["code"], -32602);
     assert_eq!(
         layout.task_control_marker_count(&task_id)?,
         markers_after_valid

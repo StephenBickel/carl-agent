@@ -10,10 +10,11 @@ use crate::delegates::{ModelId, ReasoningEffort};
 use crate::events::{EventEnvelope, SessionId, TurnId};
 use crate::policy::{ActorId, Frontend};
 use crate::runtime::task::{
-    CheckpointId, CompletionClause, OperationId, TaskBudget, TaskId, TaskSnapshot, TaskStatus,
+    CheckpointId, CompletionClause, OperationId, TaskBudget, TaskId, TaskMetrics, TaskSnapshot,
+    TaskStatus,
 };
 
-pub const SERVICE_PROTOCOL_VERSION: u16 = 2;
+pub const SERVICE_PROTOCOL_VERSION: u16 = 3;
 pub const MAX_SERVICE_FRAME_BYTES: usize = 256 * 1024;
 pub const MAX_TASK_TEXT_BYTES: usize = 16 * 1024;
 const MAX_IDENTIFIER_BYTES: usize = 128;
@@ -66,6 +67,9 @@ pub enum ServiceCommand {
         decision: ServiceApprovalDecision,
     },
     Status {
+        task_id: TaskId,
+    },
+    Metrics {
         task_id: TaskId,
     },
     List,
@@ -155,6 +159,7 @@ pub struct ServiceCapabilities {
     pub trusted_buzz_admission: bool,
     pub configure_active_task: bool,
     pub explicit_task_budgets: bool,
+    pub sanitized_task_metrics: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -211,6 +216,7 @@ pub enum ServiceResult {
     Session(ServiceSessionInfo),
     Accepted { task_id: TaskId },
     Snapshot(TaskSnapshot),
+    Metrics(TaskMetrics),
     TaskList(Vec<TaskSnapshot>),
     Events(Vec<EventEnvelope>),
     LiveUpdates(LiveUpdatePage),
@@ -509,6 +515,7 @@ fn validate_request(request: &ServiceRequest) -> Result<(), ProtocolError> {
         }
         ServiceCommand::Info
         | ServiceCommand::Status { .. }
+        | ServiceCommand::Metrics { .. }
         | ServiceCommand::List
         | ServiceCommand::Resume { .. }
         | ServiceCommand::Cancel { .. }

@@ -1185,6 +1185,13 @@ async fn execute_command(
                 .ok_or_else(|| service_error(TaskServiceErrorCode::InvalidRequest))?;
             Ok(ServiceResult::Snapshot(snapshot))
         }
+        ServiceCommand::Metrics { task_id } => {
+            let metrics = lock_store(&shared.read_store)?
+                .task_metrics(*task_id)
+                .map_err(|_| service_error(TaskServiceErrorCode::Storage))?
+                .ok_or_else(|| service_error(TaskServiceErrorCode::InvalidRequest))?;
+            Ok(ServiceResult::Metrics(metrics))
+        }
         ServiceCommand::List => {
             let tasks = lock_store(&shared.read_store)?
                 .list_tasks(64)
@@ -1522,6 +1529,7 @@ fn service_info(
             trusted_buzz_admission: true,
             configure_active_task: true,
             explicit_task_budgets: true,
+            sanitized_task_metrics: true,
         },
     })
 }
@@ -1552,6 +1560,7 @@ const fn service_command_kind(command: &ServiceCommand) -> &'static str {
         ServiceCommand::Info
         | ServiceCommand::Session { .. }
         | ServiceCommand::Status { .. }
+        | ServiceCommand::Metrics { .. }
         | ServiceCommand::List
         | ServiceCommand::Events { .. }
         | ServiceCommand::LiveUpdates { .. } => "read",

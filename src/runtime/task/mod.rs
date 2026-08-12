@@ -1,6 +1,7 @@
 mod checkpoint;
 mod context;
 mod engine;
+mod metrics;
 mod progress;
 mod reducer;
 mod report;
@@ -27,6 +28,11 @@ pub(crate) use engine::{
     OwnerConfigureSession, OwnerStartTask, OwnerTrustedAdmission, OwnerTrustedMessage,
     TaskEngineAcknowledgement, TaskEngineControl, TaskEngineFrontendContext,
     TaskEnginePermissionNotice,
+};
+pub(crate) use metrics::TaskMetricsReducer;
+pub use metrics::{
+    TASK_METRICS_SCHEMA_VERSION, TaskMetrics, TaskMetricsError, TaskMetricsErrorCode,
+    derive_task_metrics,
 };
 pub use progress::{
     ProgressAssessment, RecoveryAttempt, RecoveryAttemptOutcome, RecoveryStrategy, assess_progress,

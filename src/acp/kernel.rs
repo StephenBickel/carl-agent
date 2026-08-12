@@ -28,7 +28,7 @@ use crate::runtime::agent_port::{
 };
 use crate::runtime::task::{
     EngineToolKind, EngineToolStatus, StartTask, TaskBudget, TaskEngine, TaskEngineError,
-    TaskEngineErrorCode, TaskEngineUpdate, TaskId,
+    TaskEngineErrorCode, TaskEngineUpdate, TaskId, TaskMetrics,
 };
 use crate::runtime::task::{
     TaskEngineAcknowledgement, TaskEngineControl, TaskEngineFrontendContext,
@@ -210,6 +210,11 @@ pub enum KernelCommand {
         task_id: TaskId,
         reply: oneshot::Sender<Result<TaskView, KernelError>>,
     },
+    TaskMetrics {
+        session_id: SessionId,
+        task_id: TaskId,
+        reply: oneshot::Sender<Result<TaskMetrics, KernelError>>,
+    },
     TaskList {
         session_id: SessionId,
         reply: oneshot::Sender<Result<Vec<TaskView>, KernelError>>,
@@ -369,6 +374,21 @@ impl KernelHandle {
         let (reply, result) = oneshot::channel();
         self.send(KernelCommand::TaskList { session_id, reply })
             .await?;
+        result.await.map_err(|_| stopped_error())?
+    }
+
+    pub async fn task_metrics(
+        &self,
+        session_id: SessionId,
+        task_id: TaskId,
+    ) -> Result<TaskMetrics, KernelError> {
+        let (reply, result) = oneshot::channel();
+        self.send(KernelCommand::TaskMetrics {
+            session_id,
+            task_id,
+            reply,
+        })
+        .await?;
         result.await.map_err(|_| stopped_error())?
     }
 
@@ -744,6 +764,20 @@ impl KernelActor {
                     let _ = reply.send(result);
                     false
                 }
+                KernelCommand::TaskMetrics {
+                    session_id,
+                    task_id,
+                    reply,
+                } => {
+                    let result = task_metrics(
+                        self.engine_ref().store(),
+                        &self.sessions,
+                        session_id,
+                        task_id,
+                    );
+                    let _ = reply.send(result);
+                    false
+                }
                 KernelCommand::TaskContext {
                     session_id,
                     task_id,
@@ -1101,6 +1135,16 @@ impl KernelActor {
                 let tasks = task_views(self.engine_ref().store(), &self.sessions, session_id)?;
                 serde_json::to_string(&json!({"tasks":tasks})).map_err(|_| invalid_input())?
             }
+            "/metrics" => {
+                let task_id = self.latest_session_task(session_id)?;
+                let metrics = task_metrics(
+                    self.engine_ref().store(),
+                    &self.sessions,
+                    session_id,
+                    task_id,
+                )?;
+                serde_json::to_string(&json!({"metrics":metrics})).map_err(|_| invalid_input())?
+            }
             "/context" => {
                 let task_id = self.latest_session_task(session_id)?;
                 let context = task_context_view(
@@ -1307,6 +1351,26 @@ impl KernelActor {
                                     let _ = reply.send(Err(KernelError::from_code(
                                         KernelErrorCode::ApprovalUnavailable,
                                     )));
+                                    continue;
+                                }
+                                if prompt.task_slash_command() == Some("/metrics") {
+                                    let task_id =
+                                        locked_active_durable_task_id(admission_store, session_id)?;
+                                    let result = admission_store
+                                        .lock()
+                                        .map_err(|_| provider_error())
+                                        .and_then(|store| {
+                                            task_metrics(&store, sessions, session_id, task_id)
+                                        })
+                                        .and_then(|metrics| {
+                                            serde_json::to_string(&json!({"metrics":metrics}))
+                                                .map_err(|_| invalid_input())
+                                        })
+                                        .map(|message| PromptOutcome {
+                                            stop_reason: PromptStopReason::EndTurn,
+                                            updates: vec![KernelUpdate::AgentMessageChunk(message)],
+                                        });
+                                    let _ = reply.send(result);
                                     continue;
                                 }
                                 if let Some(notice) = &pending_permission {
@@ -1541,6 +1605,19 @@ impl KernelActor {
                                     .lock()
                                     .map_err(|_| provider_error())
                                     .and_then(|store| task_views(&store, sessions, session_id));
+                                let _ = reply.send(result);
+                            }
+                            KernelCommand::TaskMetrics {
+                                session_id: target,
+                                task_id,
+                                reply,
+                            } if target == session_id => {
+                                let result = admission_store
+                                    .lock()
+                                    .map_err(|_| provider_error())
+                                    .and_then(|store| {
+                                        task_metrics(&store, sessions, session_id, task_id)
+                                    });
                                 let _ = reply.send(result);
                             }
                             KernelCommand::TaskContext {
@@ -1979,6 +2056,19 @@ impl KernelActor {
                         reply,
                     } => {
                         let result = task_views(self.engine_ref().store(), &self.sessions, target);
+                        let _ = reply.send(result);
+                    }
+                    KernelCommand::TaskMetrics {
+                        session_id: target,
+                        task_id,
+                        reply,
+                    } => {
+                        let result = task_metrics(
+                            self.engine_ref().store(),
+                            &self.sessions,
+                            target,
+                            task_id,
+                        );
                         let _ = reply.send(result);
                     }
                     KernelCommand::TaskContext {
@@ -3334,6 +3424,9 @@ fn reject_busy_command(command: KernelCommand) {
         KernelCommand::TaskList { reply, .. } => {
             let _ = reply.send(Err(session_busy()));
         }
+        KernelCommand::TaskMetrics { reply, .. } => {
+            let _ = reply.send(Err(session_busy()));
+        }
         KernelCommand::TaskContext { reply, .. } => {
             let _ = reply.send(Err(session_busy()));
         }
@@ -3476,6 +3569,19 @@ fn task_view(
         .filter(|record| record.snapshot.session_id == session_id)
         .ok_or_else(invalid_input)?;
     Ok(TaskView::from(&record.snapshot))
+}
+
+fn task_metrics(
+    store: &Store,
+    sessions: &HashMap<SessionId, SessionState>,
+    session_id: SessionId,
+    task_id: TaskId,
+) -> Result<TaskMetrics, KernelError> {
+    task_view(store, sessions, session_id, task_id)?;
+    store
+        .task_metrics(task_id)
+        .map_err(map_storage)?
+        .ok_or_else(invalid_input)
 }
 
 fn active_durable_task_id(store: &Store, session_id: SessionId) -> Result<TaskId, KernelError> {

@@ -37,7 +37,8 @@ use crate::runtime::subscription::{
 use crate::runtime::task::{
     CanonicalCheckpoint, CompletionContract, ContextPackage, EffectClass, EpochInterruptReason,
     OperationCheckpoint, OperationEvidenceState, OperationStatus, TaskBudget, TaskControlKind,
-    TaskEvent, TaskId, TaskSnapshot, TaskStatus, reduce_task,
+    TaskEvent, TaskId, TaskMetrics, TaskMetricsErrorCode, TaskMetricsReducer, TaskSnapshot,
+    TaskStatus, reduce_task,
 };
 use crate::security::SecretFilter;
 use crate::sidecar::DataRootLock;
@@ -2999,6 +3000,41 @@ impl Store {
         limit: u16,
     ) -> Result<Vec<EventEnvelope>, CarlError> {
         read_task_event_page_from_connection(&self.connection, task_id, after_sequence, limit)
+    }
+
+    pub fn task_metrics(&self, task_id: TaskId) -> Result<Option<TaskMetrics>, CarlError> {
+        let transaction = self
+            .connection
+            .unchecked_transaction()
+            .map_err(storage_error)?;
+        let projection = load_task_record(&transaction, task_id)?;
+        let mut reducer = TaskMetricsReducer::new(task_id);
+        let mut after_sequence = None;
+        let mut found = false;
+        loop {
+            let page =
+                read_task_event_page_from_connection(&transaction, task_id, after_sequence, 512)?;
+            if page.is_empty() {
+                break;
+            }
+            found = true;
+            after_sequence = page.last().map(|event| event.sequence);
+            for envelope in &page {
+                reducer.push(envelope).map_err(task_metrics_error)?;
+            }
+        }
+        let metrics = match (found, projection) {
+            (false, None) => Ok(None),
+            (false, Some(_)) | (true, None) => {
+                Err(storage_invariant("task metrics authority is incomplete"))
+            }
+            (true, Some(projection)) => reducer
+                .finish(&projection.snapshot)
+                .map(Some)
+                .map_err(task_metrics_error),
+        }?;
+        transaction.commit().map_err(storage_error)?;
+        Ok(metrics)
     }
 
     pub fn set_session_delegate_settings(
@@ -8589,6 +8625,17 @@ const fn effect_class_str(effect_class: EffectClass) -> &'static str {
 fn task_reduce_error(error: crate::runtime::task::TaskReduceError) -> CarlError {
     CarlError::Validation {
         detail: format!("task event cannot be applied: {}", error.code().as_str()),
+    }
+}
+
+fn task_metrics_error(error: crate::runtime::task::TaskMetricsError) -> CarlError {
+    let detail = match error.code() {
+        TaskMetricsErrorCode::Storage => "task metrics storage failed",
+        TaskMetricsErrorCode::InvalidHistory => "task metrics history is invalid",
+        TaskMetricsErrorCode::ArithmeticOverflow => "task metrics arithmetic overflowed",
+    };
+    CarlError::Storage {
+        detail: detail.to_owned(),
     }
 }
 

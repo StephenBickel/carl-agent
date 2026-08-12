@@ -33,6 +33,21 @@ use uuid::Uuid;
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
 #[test]
+fn embedded_or_quoted_metrics_text_is_not_a_slash_command() -> TestResult {
+    for text in [
+        "please run /metrics now",
+        "\"/metrics\"",
+        "prefix\n/metrics",
+    ] {
+        let prompt = Prompt::new(vec![text.to_owned()])?;
+        assert_eq!(prompt.task_slash_command(), None, "{text}");
+    }
+    let exact = Prompt::new(vec![" /metrics ".to_owned()])?;
+    assert_eq!(exact.task_slash_command(), Some("/metrics"));
+    Ok(())
+}
+
+#[test]
 fn durable_engine_updates_map_to_frontend_kernel_updates() {
     let task_id = TaskId::new();
     let epoch_id = EpochId::new();
@@ -341,6 +356,23 @@ async fn autonomous_prompt_durably_steers_and_cancels_while_provider_read_is_pen
         }
     })
     .await?;
+
+    let metrics = kernel
+        .prompt(session.id(), Prompt::new(vec!["/metrics".into()])?)
+        .await?;
+    assert_eq!(metrics.stop_reason, PromptStopReason::EndTurn);
+    let [carl::acp::KernelUpdate::AgentMessageChunk(metrics_text)] = metrics.updates.as_slice()
+    else {
+        return Err("active metrics slash did not return one sanitized message".into());
+    };
+    let metrics_json: serde_json::Value = serde_json::from_str(metrics_text)?;
+    assert_eq!(metrics_json["metrics"]["status"], "active");
+    assert_eq!(metrics_json["metrics"]["operation_intents"], 1);
+    let after_metrics = Store::open(&layout.database)?.read_events(session.id())?;
+    assert!(!after_metrics.iter().any(|event| matches!(
+        &event.event,
+        Event::UserInput { text } if text == "/metrics"
+    )));
 
     let steered = kernel
         .prompt(

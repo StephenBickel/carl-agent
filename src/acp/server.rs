@@ -250,6 +250,10 @@ impl AcpServer {
                 let result = self.task_status(params).await;
                 enqueue_result(outbound, id, result, cancelled)
             }
+            ("_task/metrics", Some(id)) => {
+                let result = self.task_metrics(params).await;
+                enqueue_result(outbound, id, result, cancelled)
+            }
             ("_task/list", Some(id)) => {
                 let result = self.task_list(params).await;
                 enqueue_result(outbound, id, result, cancelled)
@@ -499,6 +503,17 @@ impl AcpServer {
             .local_id;
         let tasks = self.kernel.task_list(local_id).await.map_err(map_kernel)?;
         Ok(json!({"tasks":tasks}))
+    }
+
+    async fn task_metrics(&self, params: Value) -> Result<Value, AcpServerError> {
+        self.require_initialized()?;
+        let (local_id, task_id) = self.parse_task_binding(&params, &[])?;
+        let metrics = self
+            .kernel
+            .task_metrics(local_id, task_id)
+            .await
+            .map_err(map_kernel)?;
+        Ok(json!({"metrics":metrics}))
     }
 
     async fn task_context(&self, params: Value) -> Result<Value, AcpServerError> {
@@ -944,6 +959,10 @@ impl ServiceAcpServer {
                     let result = self.service_task_status(params).await;
                     service_outgoing(id, result)
                 }
+                (Some("_task/metrics"), Some(id)) => {
+                    let result = self.service_task_metrics(params).await;
+                    service_outgoing(id, result)
+                }
                 (Some("_task/list"), Some(id)) => {
                     let result = self.service_task_list(params).await;
                     service_outgoing(id, result)
@@ -1247,6 +1266,9 @@ impl ServiceAcpServer {
         let external = bounded_string(params.get("sessionId"), 128)?;
         let blocks = parse_service_prompt_blocks(params.get("prompt"))?;
         let text = blocks.join("\n\n");
+        let metrics_slash = blocks
+            .first()
+            .is_some_and(|block| block.trim() == "/metrics");
         let mut session = self
             .sessions
             .lock()
@@ -1254,7 +1276,7 @@ impl ServiceAcpServer {
             .get(&external)
             .cloned()
             .ok_or_else(invalid_input)?;
-        if session.prompt_active {
+        if session.prompt_active && !metrics_slash {
             return Err(invalid_input());
         }
         let buzz_context = if self.config.frontend == Frontend::Buzz {
@@ -1306,6 +1328,43 @@ impl ServiceAcpServer {
             && service_approval_shaped(&blocks)
         {
             return Err(invalid_input());
+        }
+        if resolved_approval.is_none() && metrics_slash {
+            if !service_metrics_context_matches(
+                &session,
+                buzz_context.as_ref(),
+                self.config.frontend,
+            ) {
+                return Err(invalid_input());
+            }
+            let task_id = session.task_id.ok_or_else(invalid_input)?;
+            let ServiceResult::Metrics(metrics) = self
+                .service_request(ServiceCommand::Metrics { task_id })
+                .await?
+            else {
+                return Err(server_error(AcpServerErrorCode::KernelFailed));
+            };
+            enqueue(
+                &outbound,
+                OutgoingFrame::notification(
+                    "session/update",
+                    json!({
+                        "sessionId":external,
+                        "update":{
+                            "sessionUpdate":"agent_message_chunk",
+                            "content":{"type":"text","text":json!({"metrics":metrics}).to_string()}
+                        }
+                    }),
+                )
+                .map_err(|_| server_error(AcpServerErrorCode::OutputUnavailable))?,
+                &cancelled,
+            )?;
+            enqueue(
+                &outbound,
+                OutgoingFrame::result(id, json!({"stopReason":"end_turn"})),
+                &cancelled,
+            )?;
+            return Ok(());
         }
         if resolved_approval.is_none()
             && let Some(permission_mode) = service_permission_slash(&blocks)
@@ -1549,6 +1608,17 @@ impl ServiceAcpServer {
         }
     }
 
+    async fn service_task_metrics(&mut self, params: Value) -> Result<Value, AcpServerError> {
+        let task_id = self.bound_service_task(&params).await?;
+        match self
+            .service_request(ServiceCommand::Metrics { task_id })
+            .await?
+        {
+            ServiceResult::Metrics(metrics) => Ok(json!({"metrics":metrics})),
+            _ => Err(server_error(AcpServerErrorCode::KernelFailed)),
+        }
+    }
+
     async fn service_task_context(&mut self, params: Value) -> Result<Value, AcpServerError> {
         let task_id = self.bound_service_task(&params).await?;
         match self
@@ -1753,6 +1823,21 @@ fn service_steer_command(
             })
         }
         _ => Err(invalid_input()),
+    }
+}
+
+fn service_metrics_context_matches(
+    session: &ServiceSessionBinding,
+    context: Option<&BuzzContext>,
+    frontend: Frontend,
+) -> bool {
+    match (frontend, context, session.buzz_context.as_ref()) {
+        (Frontend::Acp, None, _) => true,
+        (Frontend::Buzz, Some(context), Some(existing)) => {
+            existing.channel_id() == context.channel_id()
+                && existing.actor_hex() == context.actor_hex()
+        }
+        _ => false,
     }
 }
 

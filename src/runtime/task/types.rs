@@ -703,6 +703,13 @@ impl TaskSnapshot {
             .any(|operation| !operation.status.is_resolved())
     }
 
+    pub(crate) fn unresolved_operation_count(&self) -> usize {
+        self.operations
+            .values()
+            .filter(|operation| !operation.status.is_resolved())
+            .count()
+    }
+
     pub(crate) fn has_in_flight_operations(&self) -> bool {
         self.operations.values().any(|operation| {
             matches!(

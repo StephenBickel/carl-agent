@@ -231,6 +231,7 @@ impl Prompt {
             matches!(
                 *command,
                 "/status"
+                    | "/metrics"
                     | "/resume"
                     | "/cancel"
                     | "/context"

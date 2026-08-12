@@ -1,28 +1,17 @@
-use std::{error::Error, path::PathBuf};
+use std::{error::Error, path::PathBuf, str::FromStr as _};
 
 use carl::acp::PermissionMode;
 use carl::delegates::{ModelId, ReasoningEffort};
-use carl::runtime::task::TaskBudget;
-use carl::runtime::task::TaskId;
+use carl::runtime::task::{TaskBudget, TaskId, TaskMetrics, TaskStatus};
 use carl::service::protocol::{
     MAX_SERVICE_FRAME_BYTES, MAX_TASK_TEXT_BYTES, ProtocolErrorCode, RequestLedger,
-    SERVICE_PROTOCOL_VERSION, ServiceCommand, ServiceRequest, StartTaskCommand, command_digest,
-    decode_request_line, encode_request,
+    SERVICE_PROTOCOL_VERSION, ServiceCapabilities, ServiceCommand, ServiceFrame, ServiceRequest,
+    ServiceResult, StartTaskCommand, command_digest, decode_frame_line, decode_request_line,
+    encode_frame, encode_request, is_mutation,
 };
 use serde_json::json;
 
 type TestResult = Result<(), Box<dyn Error>>;
-
-fn status_request(request_id: &str, idempotency_key: &str) -> ServiceRequest {
-    ServiceRequest {
-        protocol_version: SERVICE_PROTOCOL_VERSION,
-        request_id: request_id.to_owned(),
-        idempotency_key: idempotency_key.to_owned(),
-        command: ServiceCommand::Status {
-            task_id: TaskId::new(),
-        },
-    }
-}
 
 fn start_command(budget: TaskBudget) -> StartTaskCommand {
     StartTaskCommand {
@@ -37,13 +26,37 @@ fn start_command(budget: TaskBudget) -> StartTaskCommand {
 }
 
 #[test]
-fn version_two_newline_json_round_trips_exactly() -> TestResult {
-    let request = status_request("request-1", "key-1");
-    let encoded = encode_request(&request)?;
-    assert_eq!(encoded.last(), Some(&b'\n'));
+fn version_three_metrics_and_capability_round_trip_strictly() -> TestResult {
+    let task_id = TaskId::from_str("11111111-1111-4111-8111-111111111111")?;
+    let literal = format!(
+        "{}\n",
+        json!({
+            "protocol_version": 3,
+            "request_id": "metrics-request",
+            "idempotency_key": "metrics-read-key",
+            "command": {"type":"metrics","params":{"task_id":task_id}}
+        })
+    );
+    let decoded = decode_request_line(literal.as_bytes(), &mut RequestLedger::default())?;
+    assert_eq!(decoded.protocol_version, SERVICE_PROTOCOL_VERSION);
+    assert_eq!(decoded.command, ServiceCommand::Metrics { task_id });
+    assert!(!is_mutation(&decoded.command));
 
-    let mut ledger = RequestLedger::default();
-    assert_eq!(decode_request_line(&encoded, &mut ledger)?, request);
+    let capabilities: ServiceCapabilities = serde_json::from_value(json!({
+        "durable_events": true,
+        "reconnect": true,
+        "trusted_buzz_admission": true,
+        "configure_active_task": true,
+        "explicit_task_budgets": true,
+        "sanitized_task_metrics": true
+    }))?;
+    assert!(capabilities.sanitized_task_metrics);
+
+    let frame = ServiceFrame::Response {
+        request_id: "metrics-request".to_owned(),
+        result: Box::new(ServiceResult::Metrics(metrics_fixture(task_id))),
+    };
+    assert_eq!(decode_frame_line(&encode_frame(&frame)?)?, frame);
     Ok(())
 }
 
@@ -68,7 +81,7 @@ fn unknown_fields_and_unsupported_versions_fail_closed() -> TestResult {
         ProtocolErrorCode::InvalidFrame
     );
 
-    for unsupported_version in [1, 3] {
+    for unsupported_version in [1, 2, 4] {
         let unsupported = format!(
             "{}\n",
             json!({
@@ -86,6 +99,70 @@ fn unknown_fields_and_unsupported_versions_fail_closed() -> TestResult {
         );
     }
     Ok(())
+}
+
+#[test]
+fn metrics_command_digest_is_stable_and_capabilities_fail_closed() -> TestResult {
+    let task_id = TaskId::from_str("11111111-1111-4111-8111-111111111111")?;
+    let command = ServiceCommand::Metrics { task_id };
+    assert_eq!(
+        digest_hex(command_digest(&command)?),
+        "e276a1292e0d814a5f7414f8918a17845dd28b5c1b98d4321e238be6cb631a6d"
+    );
+
+    let exact = json!({
+        "durable_events": true,
+        "reconnect": true,
+        "trusted_buzz_admission": true,
+        "configure_active_task": true,
+        "explicit_task_budgets": true,
+        "sanitized_task_metrics": true
+    });
+    let mut missing = exact.clone();
+    missing
+        .as_object_mut()
+        .unwrap()
+        .remove("sanitized_task_metrics");
+    assert!(serde_json::from_value::<ServiceCapabilities>(missing).is_err());
+    let mut unknown = exact;
+    unknown
+        .as_object_mut()
+        .unwrap()
+        .insert("raw_task_events".to_owned(), json!(true));
+    assert!(serde_json::from_value::<ServiceCapabilities>(unknown).is_err());
+    Ok(())
+}
+
+fn metrics_fixture(task_id: TaskId) -> TaskMetrics {
+    TaskMetrics {
+        schema_version: 1,
+        task_id,
+        status: TaskStatus::Active,
+        revision: 1,
+        durable_event_count: 1,
+        durable_sequence_end: 9,
+        provider_requests: 0,
+        epochs_started: 0,
+        epochs_completed: 0,
+        operation_intents: 0,
+        operations_succeeded: 0,
+        operations_failed: 0,
+        operations_cancelled: 0,
+        operations_uncertain: 0,
+        unresolved_operations: 0,
+        compactions_completed: 0,
+        provider_context_losses: 0,
+        recovery_attempts: 0,
+        latest_observed_tokens: None,
+        latest_context_window: None,
+        required_clauses_total: 0,
+        required_clauses_satisfied: 0,
+        budget: TaskBudget::default(),
+    }
+}
+
+fn digest_hex(digest: [u8; 32]) -> String {
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 #[test]
