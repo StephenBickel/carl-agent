@@ -4,6 +4,7 @@ use std::fs;
 use std::future::{Future, pending};
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::time::Duration;
 
 use chrono::{TimeDelta, Utc};
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -32,6 +33,11 @@ use crate::memory::{
 };
 use crate::policy::Frontend;
 use crate::runtime::task::TaskBudget;
+use crate::service::client::TaskServiceClient;
+use crate::service::protocol::{
+    MaintenancePhase, SERVICE_PROTOCOL_VERSION, ServiceCommand, ServiceMaintenanceStatus,
+    ServiceRequest, ServiceResult,
+};
 use crate::service::server::TaskService;
 use crate::sidecar::{
     DataRootLock, DataRootLockErrorCode, ExecutableTrustDecision, ExecutionWorkspace,
@@ -63,6 +69,10 @@ pub enum Command {
     Trust {
         #[command(subcommand)]
         command: TrustCommand,
+    },
+    Maintenance {
+        #[command(subcommand)]
+        command: MaintenanceCommand,
     },
     Pair,
     Doctor,
@@ -244,6 +254,12 @@ pub enum TrustCommand {
         #[arg(long)]
         workspace: PathBuf,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Subcommand)]
+pub enum MaintenanceCommand {
+    Status,
+    Prepare,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -619,10 +635,112 @@ where
         Command::Acp(_) => CliRunResult::not_implemented("acp streaming dispatch"),
         Command::Memory { command } => run_memory(command),
         Command::Trust { command } => run_trust(command),
+        Command::Maintenance { command } => run_maintenance(command, cancellation.as_mut()).await,
         Command::Serve => run_serve(cancellation.as_mut()).await,
         Command::Pair => CliRunResult::not_implemented("pair"),
         Command::Doctor => CliRunResult::not_implemented("doctor"),
         Command::Sessions => CliRunResult::not_implemented("sessions"),
+    }
+}
+
+async fn run_maintenance<C>(
+    command: MaintenanceCommand,
+    mut cancellation: Pin<&mut C>,
+) -> CliRunResult
+where
+    C: Future<Output = ()> + ?Sized,
+{
+    let Ok(configuration) = load_common_configuration() else {
+        return service_cli_result(
+            ExitClassification::Failure,
+            "carl maintenance: invalid Carl data directory or workspace",
+        );
+    };
+    let connected = TaskServiceClient::connect(&configuration.data_root);
+    tokio::pin!(connected);
+    let mut client = tokio::select! {
+        result = &mut connected => match result {
+            Ok(client) => client,
+            Err(_) => return service_cli_result(
+                ExitClassification::Failure,
+                "carl maintenance: persistent task service unavailable",
+            ),
+        },
+        () = cancellation.as_mut() => {
+            return service_cli_result(ExitClassification::Cancelled, "");
+        }
+    };
+    let first_command = match command {
+        MaintenanceCommand::Status => ServiceCommand::MaintenanceStatus,
+        MaintenanceCommand::Prepare => ServiceCommand::PrepareMaintenance,
+    };
+    let mut status = {
+        let initial = maintenance_request(&mut client, first_command);
+        tokio::pin!(initial);
+        tokio::select! {
+            result = &mut initial => match result {
+                Some(status) => status,
+                None => return service_cli_result(
+                    ExitClassification::Failure,
+                    "carl maintenance: service command failed",
+                ),
+            },
+            () = cancellation.as_mut() => {
+                return service_cli_result(ExitClassification::Cancelled, "");
+            }
+        }
+    };
+    let mut poll = maintenance_poll_interval();
+    while command == MaintenanceCommand::Prepare && status.phase != MaintenancePhase::Ready {
+        tokio::select! {
+            _ = poll.tick() => {}
+            () = cancellation.as_mut() => {
+                return service_cli_result(ExitClassification::Cancelled, "");
+            }
+        }
+        let requested = maintenance_request(&mut client, ServiceCommand::MaintenanceStatus);
+        tokio::pin!(requested);
+        status = tokio::select! {
+            result = &mut requested => match result {
+                Some(status) => status,
+                None => return service_cli_result(
+                    ExitClassification::Failure,
+                    "carl maintenance: status polling failed",
+                ),
+            },
+            () = cancellation.as_mut() => {
+                return service_cli_result(ExitClassification::Cancelled, "");
+            }
+        };
+    }
+    CliRunResult::json_success(&status)
+}
+
+fn maintenance_poll_interval() -> tokio::time::Interval {
+    let period = Duration::from_millis(100);
+    let start = tokio::time::Instant::now() + period;
+    let mut interval = tokio::time::interval_at(start, period);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    interval
+}
+
+async fn maintenance_request(
+    client: &mut TaskServiceClient,
+    command: ServiceCommand,
+) -> Option<ServiceMaintenanceStatus> {
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let result = client
+        .request(ServiceRequest {
+            protocol_version: SERVICE_PROTOCOL_VERSION,
+            idempotency_key: format!("maintenance-{request_id}"),
+            request_id,
+            command,
+        })
+        .await
+        .ok()?;
+    match result {
+        ServiceResult::Maintenance(status) => Some(status),
+        _ => None,
     }
 }
 
@@ -1663,6 +1781,46 @@ mod tests {
         fn drop(&mut self) {
             self.dropped.store(true, Ordering::Release);
         }
+    }
+
+    #[test]
+    fn maintenance_output_is_one_bounded_closed_json_object() {
+        let status = ServiceMaintenanceStatus {
+            schema_version: 1,
+            phase: MaintenancePhase::Ready,
+            task_id: None,
+            checkpoint_id: None,
+        };
+        let result = CliRunResult::json_success(&status);
+        assert_eq!(
+            result.stdout(),
+            "{\"schema_version\":1,\"phase\":\"ready\",\"task_id\":null,\"checkpoint_id\":null}\n"
+        );
+        assert!(result.stdout().len() < 1024);
+        assert!(result.stderr().is_empty());
+        for ambient in ["OPENAI_API_KEY", "CARL_DATA_DIR", "/provider/home"] {
+            assert!(!result.stdout().contains(ambient));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn maintenance_polling_is_capped_while_draining() {
+        let mut poll = maintenance_poll_interval();
+        tokio::select! {
+            biased;
+            _ = poll.tick() => panic!("maintenance polled before its bounded interval"),
+            () = tokio::task::yield_now() => {}
+        }
+        tokio::time::advance(Duration::from_millis(99)).await;
+        tokio::select! {
+            biased;
+            _ = poll.tick() => panic!("maintenance polled before 100 ms elapsed"),
+            () = tokio::task::yield_now() => {}
+        }
+        tokio::time::advance(Duration::from_millis(1)).await;
+        poll.tick().await;
+        tokio::time::advance(Duration::from_millis(100)).await;
+        poll.tick().await;
     }
 
     struct CancellationBroker {

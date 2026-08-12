@@ -14,7 +14,7 @@ use crate::runtime::task::{
     TaskStatus,
 };
 
-pub const SERVICE_PROTOCOL_VERSION: u16 = 3;
+pub const SERVICE_PROTOCOL_VERSION: u16 = 4;
 pub const MAX_SERVICE_FRAME_BYTES: usize = 256 * 1024;
 pub const MAX_TASK_TEXT_BYTES: usize = 16 * 1024;
 const MAX_IDENTIFIER_BYTES: usize = 128;
@@ -110,6 +110,8 @@ pub enum ServiceCommand {
         after_cursor: Option<u64>,
         limit: u16,
     },
+    MaintenanceStatus,
+    PrepareMaintenance,
     Shutdown,
 }
 
@@ -160,6 +162,68 @@ pub struct ServiceCapabilities {
     pub configure_active_task: bool,
     pub explicit_task_budgets: bool,
     pub sanitized_task_metrics: bool,
+    pub recoverable_maintenance: bool,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MaintenancePhase {
+    Running,
+    Draining,
+    Ready,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ServiceMaintenanceStatus {
+    pub schema_version: u16,
+    pub phase: MaintenancePhase,
+    pub task_id: Option<TaskId>,
+    pub checkpoint_id: Option<CheckpointId>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UncheckedServiceMaintenanceStatus {
+    schema_version: u16,
+    phase: MaintenancePhase,
+    task_id: Option<TaskId>,
+    checkpoint_id: Option<CheckpointId>,
+}
+
+impl<'de> Deserialize<'de> for ServiceMaintenanceStatus {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let unchecked = UncheckedServiceMaintenanceStatus::deserialize(deserializer)?;
+        Self::try_from(unchecked).map_err(serde::de::Error::custom)
+    }
+}
+
+impl TryFrom<UncheckedServiceMaintenanceStatus> for ServiceMaintenanceStatus {
+    type Error = &'static str;
+
+    fn try_from(status: UncheckedServiceMaintenanceStatus) -> Result<Self, Self::Error> {
+        let valid = status.schema_version == 1
+            && match status.phase {
+                MaintenancePhase::Running => status.checkpoint_id.is_none(),
+                MaintenancePhase::Draining => {
+                    status.task_id.is_some() && status.checkpoint_id.is_none()
+                }
+                MaintenancePhase::Ready => {
+                    status.task_id.is_some() == status.checkpoint_id.is_some()
+                }
+            };
+        if !valid {
+            return Err("invalid service maintenance status");
+        }
+        Ok(Self {
+            schema_version: status.schema_version,
+            phase: status.phase,
+            task_id: status.task_id,
+            checkpoint_id: status.checkpoint_id,
+        })
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -220,6 +284,7 @@ pub enum ServiceResult {
     TaskList(Vec<TaskSnapshot>),
     Events(Vec<EventEnvelope>),
     LiveUpdates(LiveUpdatePage),
+    Maintenance(ServiceMaintenanceStatus),
     Applied,
 }
 
@@ -416,6 +481,7 @@ pub const fn is_mutation(command: &ServiceCommand) -> bool {
             | ServiceCommand::SteerTrusted { .. }
             | ServiceCommand::Cancel { .. }
             | ServiceCommand::Configure { .. }
+            | ServiceCommand::PrepareMaintenance
             | ServiceCommand::Shutdown
     )
 }
@@ -522,6 +588,8 @@ fn validate_request(request: &ServiceRequest) -> Result<(), ProtocolError> {
         | ServiceCommand::Configure { .. }
         | ServiceCommand::Events { .. }
         | ServiceCommand::LiveUpdates { .. }
+        | ServiceCommand::MaintenanceStatus
+        | ServiceCommand::PrepareMaintenance
         | ServiceCommand::Shutdown => {}
     }
     Ok(())

@@ -509,7 +509,7 @@ async fn read_polling_does_not_exhaust_process_or_connection_mutation_capacity()
 
 #[cfg(unix)]
 #[tokio::test(flavor = "current_thread")]
-async fn process_cancellation_checkpoints_and_cancels_the_active_task() -> TestResult {
+async fn process_cancellation_quiesces_the_active_task_at_a_checkpoint() -> TestResult {
     let layout = Layout::new()?;
     let port = PendingPort::new();
     let state = Arc::clone(&port.state);
@@ -572,10 +572,13 @@ async fn process_cancellation_checkpoints_and_cancels_the_active_task() -> TestR
     }
     let persisted = Store::open(layout.data.join("carl.sqlite3"))?
         .get_task(task_id)?
-        .ok_or("cancelled task missing")?;
-    assert_eq!(persisted.snapshot.status, TaskStatus::Cancelled);
+        .ok_or("quiesced task missing")?;
+    assert_eq!(persisted.snapshot.status, TaskStatus::Active);
+    assert!(persisted.snapshot.active_epoch.is_none());
+    assert!(persisted.snapshot.latest_checkpoint.is_some());
     let state = state.lock().unwrap();
-    assert_eq!(state.interrupts, 1);
+    assert_eq!(state.boundary_requests, 1);
+    assert_eq!(state.interrupts, 0);
     assert_eq!(state.shutdowns, 1);
     Ok(())
 }
@@ -2998,6 +3001,9 @@ struct PendingPort {
 struct PendingPortState {
     events: VecDeque<AgentEvent>,
     epoch: u64,
+    active_context: Option<AgentContextId>,
+    active_epoch: Option<AgentEpochId>,
+    boundary_requests: u64,
     interrupts: u64,
     shutdowns: u64,
     started_contexts: u64,
@@ -3067,9 +3073,11 @@ impl AgentPort for PendingPort {
             state.epoch += 1;
             let epoch_id = AgentEpochId::parse(format!("service-epoch-{}", state.epoch))?;
             state.events.push_back(AgentEvent::EpochStarted {
-                context_id: request.context_id,
+                context_id: request.context_id.clone(),
                 epoch_id: epoch_id.clone(),
             });
+            state.active_context = Some(request.context_id);
+            state.active_epoch = Some(epoch_id.clone());
             Ok(epoch_id)
         })
     }
@@ -3078,9 +3086,38 @@ impl AgentPort for PendingPort {
         &mut self,
         _context_id: &AgentContextId,
         _epoch_id: &AgentEpochId,
-        _text: String,
+        text: String,
     ) -> AgentFuture<'_, ()> {
-        Box::pin(async { Ok(()) })
+        let state = Arc::clone(&self.state);
+        Box::pin(async move {
+            if text.starts_with("Carl soft epoch boundary") {
+                let mut state = state.lock().unwrap();
+                state.boundary_requests += 1;
+                let context_id = state
+                    .active_context
+                    .clone()
+                    .expect("pending work context was installed");
+                let epoch_id = state
+                    .active_epoch
+                    .clone()
+                    .expect("pending work epoch was installed");
+                state.events.push_back(AgentEvent::AssistantDelta {
+                    context_id: context_id.clone(),
+                    epoch_id: epoch_id.clone(),
+                    text: epoch_report(
+                        "continue",
+                        Some("resume after recoverable maintenance"),
+                        None,
+                    ),
+                });
+                state.events.push_back(AgentEvent::EpochCompleted {
+                    context_id,
+                    epoch_id,
+                    status: "completed".to_owned(),
+                });
+            }
+            Ok(())
+        })
     }
 
     fn interrupt(

@@ -1267,6 +1267,9 @@ impl ServiceAcpServer {
         require_keys(params, &["sessionId", "prompt"], &[])?;
         let external = bounded_string(params.get("sessionId"), 128)?;
         let blocks = parse_service_prompt_blocks(params.get("prompt"))?;
+        if self.config.frontend == Frontend::Buzz && service_maintenance_shaped(&blocks) {
+            return Err(invalid_input());
+        }
         let text = blocks.join("\n\n");
         let metrics_slash = exact_task_metrics_command(&blocks);
         let mut session = self
@@ -2733,6 +2736,21 @@ fn service_permission_slash(blocks: &[String]) -> Option<PermissionMode> {
     }
 }
 
+fn service_maintenance_shaped(blocks: &[String]) -> bool {
+    let Some(command) = blocks.first().map(String::as_str) else {
+        return false;
+    };
+    matches!(
+        command,
+        "/maintenance status"
+            | "/maintenance prepare"
+            | "maintenance status"
+            | "maintenance prepare"
+            | "carl maintenance prepare"
+            | "prepare maintenance"
+    )
+}
+
 fn service_approval_slash(
     blocks: &[String],
 ) -> Result<(ServiceApprovalDecision, String), AcpServerError> {
@@ -2817,7 +2835,37 @@ const fn server_error(code: AcpServerErrorCode) -> AcpServerError {
 
 #[cfg(test)]
 mod tests {
-    use super::{PermissionMode, service_permission_slash};
+    use super::{PermissionMode, service_maintenance_shaped, service_permission_slash};
+
+    #[test]
+    fn maintenance_invocations_are_recognized_only_as_exact_owner_private_shapes() {
+        for command in [
+            "/maintenance status",
+            "/maintenance prepare",
+            "maintenance status",
+            "maintenance prepare",
+            "carl maintenance prepare",
+            "prepare maintenance",
+        ] {
+            assert!(service_maintenance_shaped(&[
+                command.to_owned(),
+                "Buzz metadata".to_owned()
+            ]));
+        }
+        for blocks in [
+            vec!["please prepare maintenance later".to_owned()],
+            vec!["\n/maintenance prepare".to_owned()],
+            vec!["quoted:\n/maintenance prepare".to_owned()],
+            vec!["/maintenance prepare now".to_owned()],
+            vec!["/maintenance prepare ".to_owned()],
+            vec![
+                "ordinary input".to_owned(),
+                "/maintenance prepare".to_owned(),
+            ],
+        ] {
+            assert!(!service_maintenance_shaped(&blocks));
+        }
+    }
 
     #[test]
     fn persistent_permission_slashes_require_an_exact_leading_block() {

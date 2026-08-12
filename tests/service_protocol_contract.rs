@@ -2,12 +2,12 @@ use std::{error::Error, path::PathBuf, str::FromStr as _};
 
 use carl::acp::PermissionMode;
 use carl::delegates::{ModelId, ReasoningEffort};
-use carl::runtime::task::{TaskBudget, TaskId, TaskMetrics, TaskStatus};
+use carl::runtime::task::{TaskBudget, TaskId};
 use carl::service::protocol::{
-    MAX_SERVICE_FRAME_BYTES, MAX_TASK_TEXT_BYTES, ProtocolErrorCode, RequestLedger,
-    SERVICE_PROTOCOL_VERSION, ServiceCapabilities, ServiceCommand, ServiceFrame, ServiceRequest,
-    ServiceResult, StartTaskCommand, command_digest, decode_frame_line, decode_request_line,
-    encode_frame, encode_request, is_mutation,
+    MAX_SERVICE_FRAME_BYTES, MAX_TASK_TEXT_BYTES, MaintenancePhase, ProtocolErrorCode,
+    RequestLedger, SERVICE_PROTOCOL_VERSION, ServiceCapabilities, ServiceCommand, ServiceFrame,
+    ServiceMaintenanceStatus, ServiceRequest, ServiceResult, StartTaskCommand, command_digest,
+    decode_frame_line, decode_request_line, encode_frame, encode_request, is_mutation,
 };
 use serde_json::json;
 
@@ -26,21 +26,24 @@ fn start_command(budget: TaskBudget) -> StartTaskCommand {
 }
 
 #[test]
-fn version_three_metrics_and_capability_round_trip_strictly() -> TestResult {
+fn version_four_maintenance_and_capability_round_trip_strictly() -> TestResult {
     let task_id = TaskId::from_str("11111111-1111-4111-8111-111111111111")?;
+    let checkpoint_id =
+        carl::runtime::task::CheckpointId::from_str("22222222-2222-4222-8222-222222222222")?;
     let literal = format!(
         "{}\n",
         json!({
-            "protocol_version": 3,
-            "request_id": "metrics-request",
-            "idempotency_key": "metrics-read-key",
-            "command": {"type":"metrics","params":{"task_id":task_id}}
+            "protocol_version": 4,
+            "request_id": "maintenance-status-request",
+            "idempotency_key": "maintenance-status-read-key",
+            "command": {"type":"maintenance_status"}
         })
     );
     let decoded = decode_request_line(literal.as_bytes(), &mut RequestLedger::default())?;
     assert_eq!(decoded.protocol_version, SERVICE_PROTOCOL_VERSION);
-    assert_eq!(decoded.command, ServiceCommand::Metrics { task_id });
+    assert_eq!(decoded.command, ServiceCommand::MaintenanceStatus);
     assert!(!is_mutation(&decoded.command));
+    assert!(is_mutation(&ServiceCommand::PrepareMaintenance));
 
     let capabilities: ServiceCapabilities = serde_json::from_value(json!({
         "durable_events": true,
@@ -48,15 +51,95 @@ fn version_three_metrics_and_capability_round_trip_strictly() -> TestResult {
         "trusted_buzz_admission": true,
         "configure_active_task": true,
         "explicit_task_budgets": true,
-        "sanitized_task_metrics": true
+        "sanitized_task_metrics": true,
+        "recoverable_maintenance": true
     }))?;
-    assert!(capabilities.sanitized_task_metrics);
+    assert!(capabilities.recoverable_maintenance);
 
     let frame = ServiceFrame::Response {
-        request_id: "metrics-request".to_owned(),
-        result: Box::new(ServiceResult::Metrics(metrics_fixture(task_id))),
+        request_id: "maintenance-status-request".to_owned(),
+        result: Box::new(ServiceResult::Maintenance(ServiceMaintenanceStatus {
+            schema_version: 1,
+            phase: MaintenancePhase::Ready,
+            task_id: Some(task_id),
+            checkpoint_id: Some(checkpoint_id),
+        })),
     };
-    assert_eq!(decode_frame_line(&encode_frame(&frame)?)?, frame);
+    let encoded = encode_frame(&frame)?;
+    assert!(encoded.len() < 1024);
+    assert_eq!(decode_frame_line(&encoded)?, frame);
+    Ok(())
+}
+
+#[test]
+fn maintenance_status_invalid_combinations_and_unknown_fields_fail_closed() -> TestResult {
+    let task_id = TaskId::from_str("11111111-1111-4111-8111-111111111111")?;
+    let checkpoint_id =
+        carl::runtime::task::CheckpointId::from_str("22222222-2222-4222-8222-222222222222")?;
+    let invalid = [
+        json!({"schema_version":2,"phase":"running","task_id":null,"checkpoint_id":null}),
+        json!({"schema_version":1,"phase":"running","task_id":task_id,"checkpoint_id":checkpoint_id}),
+        json!({"schema_version":1,"phase":"draining","task_id":null,"checkpoint_id":null}),
+        json!({"schema_version":1,"phase":"draining","task_id":task_id,"checkpoint_id":checkpoint_id}),
+        json!({"schema_version":1,"phase":"ready","task_id":task_id,"checkpoint_id":null}),
+        json!({"schema_version":1,"phase":"ready","task_id":null,"checkpoint_id":checkpoint_id}),
+        json!({"schema_version":1,"phase":"ready","task_id":null,"checkpoint_id":null,"detail":"secret/provider/path"}),
+    ];
+    for value in invalid {
+        assert!(
+            serde_json::from_value::<ServiceMaintenanceStatus>(value.clone()).is_err(),
+            "accepted invalid maintenance status {value}"
+        );
+    }
+
+    for valid in [
+        json!({"schema_version":1,"phase":"running","task_id":null,"checkpoint_id":null}),
+        json!({"schema_version":1,"phase":"running","task_id":task_id,"checkpoint_id":null}),
+        json!({"schema_version":1,"phase":"draining","task_id":task_id,"checkpoint_id":null}),
+        json!({"schema_version":1,"phase":"ready","task_id":null,"checkpoint_id":null}),
+        json!({"schema_version":1,"phase":"ready","task_id":task_id,"checkpoint_id":checkpoint_id}),
+    ] {
+        serde_json::from_value::<ServiceMaintenanceStatus>(valid)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn prepare_maintenance_digest_replays_exactly_and_conflicts_with_other_mutations() -> TestResult {
+    let first = ServiceRequest {
+        protocol_version: SERVICE_PROTOCOL_VERSION,
+        request_id: "prepare-1".to_owned(),
+        idempotency_key: "maintenance-key".to_owned(),
+        command: ServiceCommand::PrepareMaintenance,
+    };
+    let replay = ServiceRequest {
+        request_id: "prepare-2".to_owned(),
+        ..first.clone()
+    };
+    let conflict = ServiceRequest {
+        request_id: "shutdown-1".to_owned(),
+        command: ServiceCommand::Shutdown,
+        ..first.clone()
+    };
+    let mut ledger = RequestLedger::default();
+    assert_eq!(
+        decode_request_line(&encode_request(&first)?, &mut ledger)?,
+        first
+    );
+    assert_eq!(
+        decode_request_line(&encode_request(&replay)?, &mut ledger)?,
+        replay
+    );
+    assert_eq!(
+        decode_request_line(&encode_request(&conflict)?, &mut ledger)
+            .expect_err("prepare key reuse with shutdown must conflict")
+            .code(),
+        ProtocolErrorCode::IdempotencyConflict
+    );
+    assert_eq!(
+        command_digest(&ServiceCommand::PrepareMaintenance)?,
+        command_digest(&ServiceCommand::PrepareMaintenance)?
+    );
     Ok(())
 }
 
@@ -81,7 +164,7 @@ fn unknown_fields_and_unsupported_versions_fail_closed() -> TestResult {
         ProtocolErrorCode::InvalidFrame
     );
 
-    for unsupported_version in [1, 2, 4] {
+    for unsupported_version in [3, 5] {
         let unsupported = format!(
             "{}\n",
             json!({
@@ -116,13 +199,14 @@ fn metrics_command_digest_is_stable_and_capabilities_fail_closed() -> TestResult
         "trusted_buzz_admission": true,
         "configure_active_task": true,
         "explicit_task_budgets": true,
-        "sanitized_task_metrics": true
+        "sanitized_task_metrics": true,
+        "recoverable_maintenance": true
     });
     let mut missing = exact.clone();
     missing
         .as_object_mut()
         .unwrap()
-        .remove("sanitized_task_metrics");
+        .remove("recoverable_maintenance");
     assert!(serde_json::from_value::<ServiceCapabilities>(missing).is_err());
     let mut unknown = exact;
     unknown
@@ -131,34 +215,6 @@ fn metrics_command_digest_is_stable_and_capabilities_fail_closed() -> TestResult
         .insert("raw_task_events".to_owned(), json!(true));
     assert!(serde_json::from_value::<ServiceCapabilities>(unknown).is_err());
     Ok(())
-}
-
-fn metrics_fixture(task_id: TaskId) -> TaskMetrics {
-    TaskMetrics {
-        schema_version: 1,
-        task_id,
-        status: TaskStatus::Active,
-        revision: 1,
-        durable_event_count: 1,
-        durable_sequence_end: 9,
-        provider_requests: 0,
-        epochs_started: 0,
-        epochs_completed: 0,
-        operation_intents: 0,
-        operations_succeeded: 0,
-        operations_failed: 0,
-        operations_cancelled: 0,
-        operations_uncertain: 0,
-        unresolved_operations: 0,
-        compactions_completed: 0,
-        provider_context_losses: 0,
-        recovery_attempts: 0,
-        latest_observed_tokens: None,
-        latest_context_window: None,
-        required_clauses_total: 0,
-        required_clauses_satisfied: 0,
-        budget: TaskBudget::default(),
-    }
 }
 
 fn digest_hex(digest: [u8; 32]) -> String {

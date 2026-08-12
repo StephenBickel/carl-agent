@@ -3,7 +3,7 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use chrono::Utc;
@@ -21,18 +21,18 @@ use crate::events::TurnId;
 use crate::policy::{Frontend, Sha256Digest};
 use crate::runtime::agent_port::{AgentPort, EffectDecision};
 use crate::runtime::task::{
-    OwnerConfigureSession, OwnerStartTask, OwnerTrustedAdmission, OwnerTrustedMessage,
-    TaskControlKind, TaskEngine, TaskEngineAcknowledgement, TaskEngineControl, TaskEngineError,
-    TaskEngineErrorCode, TaskEngineUpdate, TaskId, TaskStatus,
+    CheckpointId, OwnerConfigureSession, OwnerStartTask, OwnerTrustedAdmission,
+    OwnerTrustedMessage, TaskControlKind, TaskEngine, TaskEngineAcknowledgement, TaskEngineControl,
+    TaskEngineError, TaskEngineErrorCode, TaskEngineUpdate, TaskId, TaskSnapshot, TaskStatus,
 };
 use crate::sidecar::{DataRootLock, DataRootLockErrorCode};
 use crate::storage::{RuntimeStore, ServiceCommandReceiptClaim, ServiceCommandReceiptInput, Store};
 
 use super::protocol::{
-    LiveUpdateEnvelope, LiveUpdatePage, MAX_SERVICE_FRAME_BYTES, ProtocolErrorCode, RequestLedger,
-    ServiceCapabilities, ServiceCommand, ServiceFrame, ServiceInfo, ServiceModel, ServiceRequest,
-    ServiceResult, ServiceSessionInfo, TaskUpdate, command_digest, decode_request_line,
-    encode_frame, is_mutation,
+    LiveUpdateEnvelope, LiveUpdatePage, MAX_SERVICE_FRAME_BYTES, MaintenancePhase,
+    ProtocolErrorCode, RequestLedger, ServiceCapabilities, ServiceCommand, ServiceFrame,
+    ServiceInfo, ServiceMaintenanceStatus, ServiceModel, ServiceRequest, ServiceResult,
+    ServiceSessionInfo, TaskUpdate, command_digest, decode_request_line, encode_frame, is_mutation,
 };
 
 #[cfg(unix)]
@@ -500,42 +500,143 @@ impl<T> Drop for AbortOnDrop<T> {
     }
 }
 
-#[derive(Default)]
 struct TaskActorState {
-    active_task: tokio::sync::Mutex<Option<TaskId>>,
-    shutdown_target: Mutex<Option<TaskId>>,
-    shutdown_requested: AtomicBool,
+    owner: tokio::sync::Mutex<TaskActorOwner>,
+    changed: tokio::sync::Notify,
+}
+
+struct TaskActorOwner {
+    active_task: Option<TaskId>,
+    phase: MaintenancePhase,
+    maintenance_task: Option<TaskId>,
+    maintenance_checkpoint: Option<CheckpointId>,
+    maintenance_idempotency_key: Option<String>,
+    emergency_requested: bool,
+    emergency_target: Option<TaskId>,
+}
+
+impl Default for TaskActorState {
+    fn default() -> Self {
+        Self {
+            owner: tokio::sync::Mutex::new(TaskActorOwner {
+                active_task: None,
+                phase: MaintenancePhase::Running,
+                maintenance_task: None,
+                maintenance_checkpoint: None,
+                maintenance_idempotency_key: None,
+                emergency_requested: false,
+                emergency_target: None,
+            }),
+            changed: tokio::sync::Notify::new(),
+        }
+    }
 }
 
 impl TaskActorState {
     async fn claim_start(&self, task_id: TaskId) -> bool {
-        let mut active_task = self.active_task.lock().await;
-        if self.shutdown_requested.load(Ordering::Acquire) {
+        let mut owner = self.owner.lock().await;
+        if owner.phase != MaintenancePhase::Running || owner.emergency_requested {
             return false;
         }
-        *active_task = Some(task_id);
+        owner.active_task = Some(task_id);
         true
     }
 
     async fn publish_shutdown(&self) -> Option<TaskId> {
-        let active_task = self.active_task.lock().await;
-        self.shutdown_requested.store(true, Ordering::Release);
-        let mut shutdown_target = self
-            .shutdown_target
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if shutdown_target.is_none() {
-            *shutdown_target = *active_task;
+        let mut owner = self.owner.lock().await;
+        owner.emergency_requested = true;
+        if owner.emergency_target.is_none() {
+            owner.emergency_target = owner.active_task;
         }
-        *shutdown_target
+        let target = owner.emergency_target;
+        drop(owner);
+        target
     }
 
-    async fn clear_active(&self) {
-        *self.active_task.lock().await = None;
+    async fn begin_maintenance(&self, idempotency_key: Option<&str>) -> ServiceMaintenanceStatus {
+        let mut owner = self.owner.lock().await;
+        if owner.phase == MaintenancePhase::Running {
+            owner.maintenance_idempotency_key = idempotency_key.map(str::to_owned);
+            match owner.active_task {
+                Some(task_id) => {
+                    owner.phase = MaintenancePhase::Draining;
+                    owner.maintenance_task = Some(task_id);
+                    owner.maintenance_checkpoint = None;
+                }
+                None => owner.phase = MaintenancePhase::Ready,
+            }
+        }
+        let status = maintenance_status(&owner);
+        drop(owner);
+        self.changed.notify_waiters();
+        status
     }
 
-    fn shutdown_requested(&self) -> bool {
-        self.shutdown_requested.load(Ordering::Acquire)
+    async fn clear_active(&self, task_id: TaskId, snapshot: &TaskSnapshot) -> bool {
+        let mut owner = self.owner.lock().await;
+        if owner.active_task == Some(task_id) {
+            owner.active_task = None;
+        }
+        if owner.phase == MaintenancePhase::Draining && owner.maintenance_task == Some(task_id) {
+            owner.phase = MaintenancePhase::Ready;
+            if snapshot.latest_checkpoint.is_some() {
+                owner.maintenance_checkpoint = snapshot.latest_checkpoint;
+            } else {
+                owner.maintenance_task = None;
+            }
+            drop(owner);
+            self.changed.notify_waiters();
+            return true;
+        }
+        drop(owner);
+        false
+    }
+
+    async fn status(&self) -> ServiceMaintenanceStatus {
+        maintenance_status(&*self.owner.lock().await)
+    }
+
+    async fn wait_ready(&self) -> ServiceMaintenanceStatus {
+        loop {
+            let notified = self.changed.notified();
+            let status = self.status().await;
+            if status.phase == MaintenancePhase::Ready {
+                return status;
+            }
+            notified.await;
+        }
+    }
+
+    async fn active_task(&self) -> Option<TaskId> {
+        self.owner.lock().await.active_task
+    }
+
+    async fn starts_stopped(&self) -> bool {
+        let owner = self.owner.lock().await;
+        owner.phase != MaintenancePhase::Running || owner.emergency_requested
+    }
+
+    async fn rejects_mutations(&self) -> bool {
+        let owner = self.owner.lock().await;
+        owner.phase != MaintenancePhase::Running || owner.emergency_requested
+    }
+
+    async fn allows_prepare(&self, idempotency_key: &str) -> bool {
+        let owner = self.owner.lock().await;
+        owner.phase == MaintenancePhase::Running
+            || owner.maintenance_idempotency_key.as_deref() == Some(idempotency_key)
+    }
+}
+
+fn maintenance_status(owner: &TaskActorOwner) -> ServiceMaintenanceStatus {
+    ServiceMaintenanceStatus {
+        schema_version: 1,
+        phase: owner.phase,
+        task_id: match owner.phase {
+            MaintenancePhase::Running => owner.active_task,
+            MaintenancePhase::Draining | MaintenancePhase::Ready => owner.maintenance_task,
+        },
+        checkpoint_id: owner.maintenance_checkpoint,
     }
 }
 
@@ -804,7 +905,8 @@ async fn run_task_actor<P: AgentPort + 'static>(
             .await;
             continue;
         }
-        if scheduled.is_empty() && !provider_shutdown && !actor_state.shutdown_requested() {
+        let starts_stopped = actor_state.starts_stopped().await;
+        if scheduled.is_empty() && !provider_shutdown && !starts_stopped {
             scheduled.extend(
                 engine
                     .store()
@@ -816,7 +918,7 @@ async fn run_task_actor<P: AgentPort + 'static>(
             );
         }
         if !provider_shutdown
-            && !actor_state.shutdown_requested()
+            && !starts_stopped
             && let Some(task_id) = scheduled.front().copied()
             && actor_state.claim_start(task_id).await
         {
@@ -827,9 +929,26 @@ async fn run_task_actor<P: AgentPort + 'static>(
             engine
                 .install_owner_frontend_context(task_id)
                 .map_err(map_engine)?;
-            let _ = engine.run(task_id).await;
+            let result = engine.run(task_id).await;
             let _ = engine.take_updates();
-            actor_state.clear_active().await;
+            let snapshot = result.ok().or_else(|| {
+                engine
+                    .store()
+                    .get_task(task_id)
+                    .ok()
+                    .flatten()
+                    .map(|record| record.snapshot)
+            });
+            if let Some(snapshot) = snapshot
+                && actor_state.clear_active(task_id, &snapshot).await
+            {
+                if engine.port_mut().shutdown().await.is_ok() {
+                    provider_shutdown = true;
+                    scheduled.clear();
+                } else {
+                    return Err(service_error(TaskServiceErrorCode::Engine));
+                }
+            }
             continue;
         }
         tokio::select! {
@@ -896,7 +1015,7 @@ async fn handle_actor_command<P: AgentPort>(
             control_id,
             reply,
         } => {
-            let mut result = if *provider_shutdown || actor_state.shutdown_requested() {
+            let mut result = if *provider_shutdown || actor_state.starts_stopped().await {
                 Err(service_error(TaskServiceErrorCode::Stopped))
             } else {
                 engine
@@ -921,7 +1040,8 @@ async fn handle_actor_command<P: AgentPort>(
                     })
             };
             if result.is_ok() {
-                result = enqueue_resumed_task(actor_state, *provider_shutdown, scheduled, task_id);
+                result =
+                    enqueue_resumed_task(actor_state, *provider_shutdown, scheduled, task_id).await;
             }
             let _ = reply.send(result);
         }
@@ -958,13 +1078,13 @@ async fn handle_actor_command<P: AgentPort>(
     let _ = engine.take_updates();
 }
 
-fn enqueue_resumed_task(
+async fn enqueue_resumed_task(
     actor_state: &TaskActorState,
     provider_shutdown: bool,
     scheduled: &mut VecDeque<TaskId>,
     task_id: TaskId,
 ) -> Result<(), TaskServiceError> {
-    if provider_shutdown || actor_state.shutdown_requested() {
+    if provider_shutdown || actor_state.starts_stopped().await {
         return Err(service_error(TaskServiceErrorCode::Stopped));
     }
     scheduled.push_back(task_id);
@@ -1044,8 +1164,18 @@ async fn dispatch_request(
         return execute_command(shared, &request, false).await;
     }
     let _gate = shared.mutation_gate.lock().await;
-    if shared.actor_state.shutdown_requested()
-        && !matches!(request.command, ServiceCommand::Shutdown)
+    if matches!(request.command, ServiceCommand::PrepareMaintenance)
+        && !shared
+            .actor_state
+            .allows_prepare(&request.idempotency_key)
+            .await
+    {
+        return Err(service_error(TaskServiceErrorCode::Stopped));
+    }
+    if !matches!(
+        request.command,
+        ServiceCommand::PrepareMaintenance | ServiceCommand::Shutdown
+    ) && shared.actor_state.rejects_mutations().await
     {
         return Err(service_error(TaskServiceErrorCode::Stopped));
     }
@@ -1241,6 +1371,9 @@ async fn execute_command(
                 snapshot,
             }))
         }
+        ServiceCommand::MaintenanceStatus => Ok(ServiceResult::Maintenance(
+            shared.actor_state.status().await,
+        )),
         ServiceCommand::Cancel { task_id } => {
             mutate_task(shared, *task_id, request, Mutation::Cancel).await?;
             Ok(ServiceResult::Applied)
@@ -1307,6 +1440,9 @@ async fn execute_command(
             mutate_task(shared, *task_id, request, Mutation::Resume).await?;
             Ok(ServiceResult::Applied)
         }
+        ServiceCommand::PrepareMaintenance => Ok(ServiceResult::Maintenance(
+            prepare_maintenance(shared, Some(&request.idempotency_key)).await?,
+        )),
         ServiceCommand::Shutdown => {
             shutdown_owner(shared).await?;
             Ok(ServiceResult::Applied)
@@ -1439,7 +1575,7 @@ async fn execute_command(
                     && binding.session_id == *session_id
                     && task.snapshot.session_id == *session_id
             };
-            if !binding_valid || *shared.actor_state.active_task.lock().await != Some(*task_id) {
+            if !binding_valid || shared.actor_state.active_task().await != Some(*task_id) {
                 return Err(service_error(TaskServiceErrorCode::InvalidRequest));
             }
             send_active_control(
@@ -1530,6 +1666,7 @@ fn service_info(
             configure_active_task: true,
             explicit_task_budgets: true,
             sanitized_task_metrics: true,
+            recoverable_maintenance: true,
         },
     })
 }
@@ -1556,6 +1693,7 @@ const fn service_command_kind(command: &ServiceCommand) -> &'static str {
         ServiceCommand::SteerTrusted { .. } => "steer_trusted",
         ServiceCommand::Cancel { .. } => "cancel",
         ServiceCommand::Configure { .. } => "configure",
+        ServiceCommand::PrepareMaintenance => "prepare_maintenance",
         ServiceCommand::Shutdown => "shutdown",
         ServiceCommand::Info
         | ServiceCommand::Session { .. }
@@ -1563,7 +1701,8 @@ const fn service_command_kind(command: &ServiceCommand) -> &'static str {
         | ServiceCommand::Metrics { .. }
         | ServiceCommand::List
         | ServiceCommand::Events { .. }
-        | ServiceCommand::LiveUpdates { .. } => "read",
+        | ServiceCommand::LiveUpdates { .. }
+        | ServiceCommand::MaintenanceStatus => "read",
     }
 }
 
@@ -1580,7 +1719,7 @@ async fn mutate_task(
         Mutation::Configure { .. } => "configure",
     };
     let control_id = service_control_id(task_id, &request.idempotency_key, method);
-    let active = *shared.actor_state.active_task.lock().await;
+    let active = shared.actor_state.active_task().await;
     if active == Some(task_id) {
         let record = lock_store(&shared.read_store)?
             .get_task(task_id)
@@ -1710,6 +1849,9 @@ async fn send_active_control(
         }
         | TaskEngineControl::Approval {
             acknowledgement, ..
+        }
+        | TaskEngineControl::Quiesce {
+            acknowledgement, ..
         } => *acknowledgement,
         TaskEngineControl::ClaimServiceCommand { .. }
         | TaskEngineControl::CompleteServiceCommand { .. }
@@ -1762,7 +1904,7 @@ async fn shutdown_cancel_state(
     shared: &ServiceShared,
     task_id: TaskId,
 ) -> Result<(ShutdownCancelRoute, crate::events::SessionId), TaskServiceError> {
-    let active_task = *shared.actor_state.active_task.lock().await;
+    let active_task = shared.actor_state.active_task().await;
     let record = lock_store(&shared.read_store)?
         .get_task(task_id)
         .map_err(|_| service_error(TaskServiceErrorCode::Storage))?
@@ -1854,9 +1996,46 @@ async fn shutdown_owner(shared: &ServiceShared) -> Result<(), TaskServiceError> 
         .map_err(|_| service_error(TaskServiceErrorCode::Stopped))?
 }
 
+async fn prepare_maintenance(
+    shared: &ServiceShared,
+    idempotency_key: Option<&str>,
+) -> Result<ServiceMaintenanceStatus, TaskServiceError> {
+    let status = shared.actor_state.begin_maintenance(idempotency_key).await;
+    match status.phase {
+        MaintenancePhase::Running => unreachable!("prepare transitions out of running"),
+        MaintenancePhase::Draining => {
+            let task_id = status
+                .task_id
+                .ok_or_else(|| service_error(TaskServiceErrorCode::Engine))?;
+            send_active_control(
+                shared,
+                TaskEngineControl::Quiesce {
+                    task_id,
+                    acknowledgement: next_ack(shared)?,
+                },
+            )
+            .await?;
+        }
+        MaintenancePhase::Ready => {
+            let (reply, response) = oneshot::channel();
+            shared
+                .actor_sender
+                .send(ActorCommand::ShutdownProvider { reply })
+                .await
+                .map_err(|_| service_error(TaskServiceErrorCode::Stopped))?;
+            response
+                .await
+                .map_err(|_| service_error(TaskServiceErrorCode::Stopped))??;
+        }
+    }
+    Ok(status)
+}
+
 async fn shutdown_owner_after_mutations(shared: &ServiceShared) -> Result<(), TaskServiceError> {
     let _gate = shared.mutation_gate.lock().await;
-    shutdown_owner(shared).await
+    let _ = prepare_maintenance(shared, None).await?;
+    let _ = shared.actor_state.wait_ready().await;
+    Ok(())
 }
 
 async fn read_bounded_line<R: tokio::io::AsyncBufRead + Unpin>(
@@ -1971,14 +2150,458 @@ mod tests {
         AgentEvent, AgentFuture, AgentItem, AgentModel, AgentProcess, AgentRequestId,
         ResumeAgentContext, StartAgentContext, StartAgentEpoch,
     };
-    use crate::runtime::task::OperationId;
+    use crate::runtime::task::{OperationId, OperationStatus};
     #[cfg(unix)]
     use crate::service::protocol::{SERVICE_PROTOCOL_VERSION, StartTaskCommand};
-    use futures_util::poll;
+    #[cfg(unix)]
+    use crate::service::{client::ServiceClientErrorCode, client::TaskServiceClient};
     #[cfg(unix)]
     use rusqlite::Connection;
     #[cfg(unix)]
     use serde_json::json;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn idle_maintenance_becomes_ready_without_provider_dispatch() {
+        let layout = ShutdownTestLayout::new();
+        let port_state = Arc::new(Mutex::new(HandoffPortState {
+            workspace: layout.workspace.clone(),
+            ..HandoffPortState::default()
+        }));
+        let service = TaskService::bind(&layout.data, HandoffPort::new(Arc::clone(&port_state)))
+            .await
+            .unwrap();
+        let cancellation = CancellationToken::new();
+        let serve_cancellation = cancellation.clone();
+        let service_task = tokio::spawn(async move { service.serve(serve_cancellation).await });
+        let mut client = TaskServiceClient::connect(&layout.data).await.unwrap();
+
+        let result = client
+            .request(ServiceRequest {
+                protocol_version: SERVICE_PROTOCOL_VERSION,
+                request_id: "idle-maintenance-prepare".to_owned(),
+                idempotency_key: "idle-maintenance-prepare-key".to_owned(),
+                command: ServiceCommand::PrepareMaintenance,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            result,
+            ServiceResult::Maintenance(ServiceMaintenanceStatus {
+                schema_version: 1,
+                phase: MaintenancePhase::Ready,
+                task_id: None,
+                checkpoint_id: None,
+            })
+        );
+        {
+            let state = port_state.lock().unwrap();
+            assert_eq!(state.started_contexts, 0);
+            assert_eq!(state.epoch, 0);
+            assert_eq!(state.effect_count, 0);
+            assert_eq!(state.shutdowns, 1);
+        }
+
+        cancellation.cancel();
+        tokio::time::timeout(Duration::from_secs(1), service_task)
+            .await
+            .expect("idle ready service exits on signal")
+            .expect("service task did not panic")
+            .expect("service exits cleanly");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn active_maintenance_drains_to_exact_checkpoint_and_denies_new_mutations() {
+        let layout = ShutdownTestLayout::new();
+        let port_state = Arc::new(Mutex::new(HandoffPortState {
+            workspace: layout.workspace.clone(),
+            release_on_boundary: true,
+            continue_at_boundary: true,
+            ..HandoffPortState::default()
+        }));
+        let service = TaskService::bind(&layout.data, HandoffPort::new(Arc::clone(&port_state)))
+            .await
+            .unwrap();
+        let cancellation = CancellationToken::new();
+        let serve_cancellation = cancellation.clone();
+        let service_task = tokio::spawn(async move { service.serve(serve_cancellation).await });
+        let mut client = TaskServiceClient::connect(&layout.data).await.unwrap();
+        let start = ServiceRequest {
+            protocol_version: SERVICE_PROTOCOL_VERSION,
+            request_id: "maintenance-active-start".to_owned(),
+            idempotency_key: "maintenance-active-start-key".to_owned(),
+            command: ServiceCommand::StartTask(StartTaskCommand {
+                external_session_id: "maintenance-active-session".to_owned(),
+                workspace: layout.workspace.clone(),
+                request: "drain this task after one exact operation".to_owned(),
+                model: ModelId::parse("gpt-test").unwrap(),
+                effort: ReasoningEffort::High,
+                permission_mode: PermissionMode::FullAccess,
+                budget: crate::runtime::task::TaskBudget::default(),
+            }),
+        };
+        let ServiceResult::Accepted { task_id } = client.request(start).await.unwrap() else {
+            panic!("maintenance task was not accepted");
+        };
+        loop {
+            let provider_ready = {
+                let state = port_state.lock().unwrap();
+                state.effect_count == 1 && state.operation_id.is_some()
+            };
+            if provider_ready {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let ServiceResult::Accepted {
+            task_id: queued_task,
+        } = client
+            .request(ServiceRequest {
+                protocol_version: SERVICE_PROTOCOL_VERSION,
+                request_id: "maintenance-queued-start".to_owned(),
+                idempotency_key: "maintenance-queued-start-key".to_owned(),
+                command: ServiceCommand::StartTask(StartTaskCommand {
+                    external_session_id: "maintenance-queued-session".to_owned(),
+                    workspace: layout.workspace.clone(),
+                    request: "remain queued during maintenance".to_owned(),
+                    model: ModelId::parse("gpt-test").unwrap(),
+                    effort: ReasoningEffort::High,
+                    permission_mode: PermissionMode::FullAccess,
+                    budget: crate::runtime::task::TaskBudget::default(),
+                }),
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("queued maintenance task was not accepted");
+        };
+
+        let prepare_request = ServiceRequest {
+            protocol_version: SERVICE_PROTOCOL_VERSION,
+            request_id: "maintenance-prepare-1".to_owned(),
+            idempotency_key: "maintenance-prepare-key".to_owned(),
+            command: ServiceCommand::PrepareMaintenance,
+        };
+        let ServiceResult::Maintenance(preparing) =
+            client.request(prepare_request.clone()).await.unwrap()
+        else {
+            panic!("prepare returned the wrong result");
+        };
+        assert_eq!(preparing.phase, MaintenancePhase::Draining);
+        assert_eq!(preparing.task_id, Some(task_id));
+        assert_eq!(preparing.checkpoint_id, None);
+
+        let ready = loop {
+            let result = client
+                .request(ServiceRequest {
+                    protocol_version: SERVICE_PROTOCOL_VERSION,
+                    request_id: format!("maintenance-poll-{}", uuid::Uuid::new_v4()),
+                    idempotency_key: format!("maintenance-poll-key-{}", uuid::Uuid::new_v4()),
+                    command: ServiceCommand::MaintenanceStatus,
+                })
+                .await
+                .unwrap();
+            let ServiceResult::Maintenance(status) = result else {
+                panic!("status returned the wrong result");
+            };
+            if status.phase == MaintenancePhase::Ready {
+                break status;
+            }
+            tokio::task::yield_now().await;
+        };
+        assert_eq!(ready.task_id, Some(task_id));
+        assert!(ready.checkpoint_id.is_some());
+
+        let mut replay = prepare_request;
+        replay.request_id = "maintenance-prepare-replay".to_owned();
+        drop(client);
+        let mut client = TaskServiceClient::connect(&layout.data).await.unwrap();
+        assert_eq!(
+            client.request(replay).await.unwrap(),
+            ServiceResult::Maintenance(preparing)
+        );
+        let fresh_prepare = client
+            .request(ServiceRequest {
+                protocol_version: SERVICE_PROTOCOL_VERSION,
+                request_id: "maintenance-prepare-fresh".to_owned(),
+                idempotency_key: "maintenance-prepare-fresh-key".to_owned(),
+                command: ServiceCommand::PrepareMaintenance,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(fresh_prepare.code(), ServiceClientErrorCode::Rejected);
+        assert_eq!(
+            client
+                .request(ServiceRequest {
+                    protocol_version: SERVICE_PROTOCOL_VERSION,
+                    request_id: "maintenance-read-info".to_owned(),
+                    idempotency_key: "maintenance-read-info-key".to_owned(),
+                    command: ServiceCommand::Info,
+                })
+                .await
+                .unwrap(),
+            ServiceResult::Info(client.info().clone())
+        );
+        let rejected = client
+            .request(ServiceRequest {
+                protocol_version: SERVICE_PROTOCOL_VERSION,
+                request_id: "maintenance-rejected-resume".to_owned(),
+                idempotency_key: "maintenance-rejected-resume-key".to_owned(),
+                command: ServiceCommand::Resume { task_id },
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(rejected.code(), ServiceClientErrorCode::Rejected);
+        let ServiceResult::Snapshot(queued) = client
+            .request(ServiceRequest {
+                protocol_version: SERVICE_PROTOCOL_VERSION,
+                request_id: "maintenance-queued-status".to_owned(),
+                idempotency_key: "maintenance-queued-status-key".to_owned(),
+                command: ServiceCommand::Status {
+                    task_id: queued_task,
+                },
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("queued status returned the wrong result");
+        };
+        assert_eq!(queued.status, TaskStatus::Queued);
+
+        {
+            let state = port_state.lock().unwrap();
+            assert_eq!(state.effect_count, 1);
+            assert_eq!(state.boundary_requests, 1);
+            assert_eq!(state.epoch, 1, "one work epoch");
+            assert_eq!(state.shutdowns, 1);
+            assert_eq!(state.operations_after_shutdown, 0);
+        }
+        cancellation.cancel();
+        tokio::time::timeout(Duration::from_secs(1), service_task)
+            .await
+            .expect("ready service exits immediately on signal")
+            .expect("service task did not panic")
+            .expect("service exits cleanly");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn crash_while_draining_reopens_uncertain_without_duplicate_effect_dispatch() {
+        let layout = ShutdownTestLayout::new();
+        let port_state = Arc::new(Mutex::new(HandoffPortState {
+            workspace: layout.workspace.clone(),
+            ..HandoffPortState::default()
+        }));
+        let service = TaskService::bind(&layout.data, HandoffPort::new(Arc::clone(&port_state)))
+            .await
+            .unwrap();
+        let cancellation = CancellationToken::new();
+        let service_task = tokio::spawn(async move { service.serve(cancellation).await });
+        let mut client = TaskServiceClient::connect(&layout.data).await.unwrap();
+        let ServiceResult::Accepted { task_id } = client
+            .request(ServiceRequest {
+                protocol_version: SERVICE_PROTOCOL_VERSION,
+                request_id: "draining-crash-start".to_owned(),
+                idempotency_key: "draining-crash-start-key".to_owned(),
+                command: ServiceCommand::StartTask(StartTaskCommand {
+                    external_session_id: "draining-crash-session".to_owned(),
+                    workspace: layout.workspace.clone(),
+                    request: "perform one consequential operation before maintenance".to_owned(),
+                    model: ModelId::parse("gpt-test").unwrap(),
+                    effort: ReasoningEffort::High,
+                    permission_mode: PermissionMode::FullAccess,
+                    budget: crate::runtime::task::TaskBudget::default(),
+                }),
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("draining crash task was not accepted");
+        };
+        let operation_id = loop {
+            let ready_operation = {
+                let state = port_state.lock().unwrap();
+                (state.effect_count == 1)
+                    .then(|| state.operation_id.clone())
+                    .flatten()
+            };
+            if let Some(operation_id) = ready_operation {
+                break OperationId::from_uuid(uuid::Uuid::parse_str(&operation_id).unwrap());
+            }
+            tokio::task::yield_now().await;
+        };
+        let ServiceResult::Maintenance(status) = client
+            .request(ServiceRequest {
+                protocol_version: SERVICE_PROTOCOL_VERSION,
+                request_id: "draining-crash-prepare".to_owned(),
+                idempotency_key: "draining-crash-prepare-key".to_owned(),
+                command: ServiceCommand::PrepareMaintenance,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("draining crash prepare returned the wrong result");
+        };
+        assert_eq!(status.phase, MaintenancePhase::Draining);
+        loop {
+            if port_state.lock().unwrap().boundary_requests == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        service_task.abort();
+        let aborted = service_task.await.unwrap_err();
+        assert!(aborted.is_cancelled());
+        drop(client);
+        assert_eq!(port_state.lock().unwrap().effect_count, 1);
+
+        let replacement_state = Arc::new(Mutex::new(HandoffPortState {
+            workspace: layout.workspace.clone(),
+            ..HandoffPortState::default()
+        }));
+        let replacement = TaskService::bind(
+            &layout.data,
+            HandoffPort::new(Arc::clone(&replacement_state)),
+        )
+        .await
+        .unwrap();
+        assert!(replacement.initial_tasks.is_empty());
+        assert_eq!(replacement_state.lock().unwrap().effect_count, 0);
+        let snapshot = Store::open(layout.data.join("carl.sqlite3"))
+            .unwrap()
+            .get_task(task_id)
+            .unwrap()
+            .unwrap()
+            .snapshot;
+        assert_eq!(snapshot.status, TaskStatus::Blocked);
+        assert_eq!(
+            snapshot.operation_status(operation_id),
+            Some(OperationStatus::Uncertain)
+        );
+        drop(replacement);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn signal_maintenance_quiesces_active_work_without_interrupting_it() {
+        let layout = ShutdownTestLayout::new();
+        let port_state = Arc::new(Mutex::new(HandoffPortState {
+            workspace: layout.workspace.clone(),
+            release_on_boundary: true,
+            continue_at_boundary: true,
+            ..HandoffPortState::default()
+        }));
+        let service = TaskService::bind(&layout.data, HandoffPort::new(Arc::clone(&port_state)))
+            .await
+            .unwrap();
+        let cancellation = CancellationToken::new();
+        let serve_cancellation = cancellation.clone();
+        let service_task = tokio::spawn(async move { service.serve(serve_cancellation).await });
+        let mut client = TaskServiceClient::connect(&layout.data).await.unwrap();
+        let ServiceResult::Accepted { task_id } = client
+            .request(ServiceRequest {
+                protocol_version: SERVICE_PROTOCOL_VERSION,
+                request_id: "signal-maintenance-start".to_owned(),
+                idempotency_key: "signal-maintenance-start-key".to_owned(),
+                command: ServiceCommand::StartTask(StartTaskCommand {
+                    external_session_id: "signal-maintenance-session".to_owned(),
+                    workspace: layout.workspace.clone(),
+                    request: "finish this operation at a safe boundary".to_owned(),
+                    model: ModelId::parse("gpt-test").unwrap(),
+                    effort: ReasoningEffort::High,
+                    permission_mode: PermissionMode::FullAccess,
+                    budget: crate::runtime::task::TaskBudget::default(),
+                }),
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("signal maintenance task was not accepted");
+        };
+        loop {
+            let provider_ready = {
+                let state = port_state.lock().unwrap();
+                state.effect_count == 1 && state.operation_id.is_some()
+            };
+            if provider_ready {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        cancellation.cancel();
+        tokio::time::timeout(Duration::from_secs(1), service_task)
+            .await
+            .expect("signal maintenance timed out")
+            .expect("service task did not panic")
+            .expect("signal maintenance failed");
+        drop(client);
+
+        let snapshot = Store::open(layout.data.join("carl.sqlite3"))
+            .unwrap()
+            .get_task(task_id)
+            .unwrap()
+            .unwrap()
+            .snapshot;
+        assert_eq!(snapshot.status, TaskStatus::Active);
+        assert!(snapshot.active_epoch.is_none());
+        assert!(snapshot.latest_checkpoint.is_some());
+        let completed_operation = {
+            let state = port_state.lock().unwrap();
+            assert_eq!(state.effect_count, 1);
+            assert_eq!(state.boundary_requests, 1);
+            assert_eq!(state.interrupts, 0);
+            assert_eq!(state.shutdowns, 1);
+            assert_eq!(state.operations_after_shutdown, 0);
+            state.operation_id.clone().unwrap()
+        };
+
+        let replacement_state = Arc::new(Mutex::new(HandoffPortState {
+            workspace: layout.workspace.clone(),
+            completion_evidence_operation_id: Some(completed_operation),
+            ..HandoffPortState::default()
+        }));
+        let replacement = TaskService::bind(
+            &layout.data,
+            HandoffPort::new(Arc::clone(&replacement_state)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(replacement.initial_tasks, vec![task_id]);
+        assert_eq!(replacement_state.lock().unwrap().effect_count, 0);
+        let replacement_cancellation = CancellationToken::new();
+        let replacement_serve_cancellation = replacement_cancellation.clone();
+        let replacement_task =
+            tokio::spawn(async move { replacement.serve(replacement_serve_cancellation).await });
+        let mut replacement_client = TaskServiceClient::connect(&layout.data).await.unwrap();
+        loop {
+            let ServiceResult::Snapshot(snapshot) = replacement_client
+                .request(ServiceRequest {
+                    protocol_version: SERVICE_PROTOCOL_VERSION,
+                    request_id: format!("signal-reopen-status-{}", uuid::Uuid::new_v4()),
+                    idempotency_key: format!("signal-reopen-key-{}", uuid::Uuid::new_v4()),
+                    command: ServiceCommand::Status { task_id },
+                })
+                .await
+                .unwrap()
+            else {
+                panic!("reopened task status returned the wrong result");
+            };
+            if snapshot.status == TaskStatus::Completed {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(replacement_state.lock().unwrap().effect_count, 0);
+        replacement_cancellation.cancel();
+        tokio::time::timeout(Duration::from_secs(1), replacement_task)
+            .await
+            .expect("reopened service shutdown timed out")
+            .expect("reopened service task panicked")
+            .expect("reopened service shutdown failed");
+    }
 
     #[cfg(unix)]
     #[tokio::test]
@@ -2059,7 +2682,7 @@ mod tests {
             if active.status == TaskStatus::Active
                 && active.active_epoch.is_some()
                 && provider_ready
-                && *actor_state.active_task.lock().await == Some(active_task)
+                && actor_state.active_task().await == Some(active_task)
             {
                 break;
             }
@@ -2082,35 +2705,38 @@ mod tests {
             TaskStatus::Queued
         );
 
-        let active_lock = actor_state.active_task.lock().await;
-        assert_eq!(*active_lock, Some(active_task));
+        let active_lock = actor_state.owner.lock().await;
+        assert_eq!(active_lock.active_task, Some(active_task));
         let shutdown_request = ServiceRequest {
             protocol_version: SERVICE_PROTOCOL_VERSION,
             request_id: "handoff-shutdown".to_owned(),
             idempotency_key: "handoff-shutdown-key".to_owned(),
             command: ServiceCommand::Shutdown,
         };
-        let mut shutdown = Box::pin(dispatch_request(&shared, shutdown_request));
-        assert!(poll!(&mut shutdown).is_pending());
+        let mut shutdown = tokio::spawn({
+            let shared = Arc::clone(&shared);
+            async move { dispatch_request(&shared, shutdown_request).await }
+        });
 
         let database = layout.data.join("carl.sqlite3");
-        loop {
-            let connection = Connection::open(&database).unwrap();
-            let claimed = connection
-                .query_row(
-                    "SELECT COUNT(*) FROM service_command_receipts
-                     WHERE idempotency_key = 'handoff-shutdown-key' AND state = 'pending'",
-                    [],
-                    |row| row.get::<_, i64>(0),
-                )
-                .unwrap();
-            if claimed == 1 {
-                break;
-            }
+        for _ in 0..16 {
             tokio::task::yield_now().await;
         }
-        assert!(poll!(&mut shutdown).is_pending());
-        assert!(!actor_state.shutdown_requested());
+        let claimed = Connection::open(&database)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM service_command_receipts
+                 WHERE idempotency_key = 'handoff-shutdown-key' AND state = 'pending'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        assert_eq!(
+            claimed, 1,
+            "shutdown receipt must precede owner publication"
+        );
+        assert!(!shutdown.is_finished());
+        assert!(!active_lock.emergency_requested);
 
         port_state.lock().unwrap().release_completion = true;
         loop {
@@ -2128,8 +2754,7 @@ mod tests {
         }
         tokio::task::yield_now().await;
         drop(active_lock);
-        assert!(poll!(&mut shutdown).is_pending());
-        assert!(actor_state.shutdown_requested());
+        assert!(actor_state.starts_stopped().await);
 
         let outcome = tokio::time::timeout(Duration::from_secs(1), &mut shutdown).await;
         drop(shutdown);
@@ -2187,7 +2812,7 @@ mod tests {
         drop(replacement);
 
         assert!(
-            matches!(outcome, Ok(Ok(ServiceResult::Applied))),
+            matches!(outcome, Ok(Ok(Ok(ServiceResult::Applied)))),
             "terminal handoff failed: outcome={outcome:?}, provider={provider:?}, receipt={receipt_state}, pending={pending}, queued={queued_status}"
         );
         assert_eq!(provider, (1, 0));
@@ -2354,32 +2979,18 @@ mod tests {
     async fn published_shutdown_wins_before_task_start_claim() {
         let actor_state = TaskActorState::default();
         let task_id = TaskId::new();
-        let active_lock = actor_state.active_task.lock().await;
-        let mut shutdown = Box::pin(actor_state.publish_shutdown());
-        let mut claim = Box::pin(actor_state.claim_start(task_id));
-        assert!(poll!(&mut shutdown).is_pending());
-        assert!(poll!(&mut claim).is_pending());
-        drop(active_lock);
-
-        assert_eq!(shutdown.await, None);
-        assert!(!claim.await);
-        assert_eq!(*actor_state.active_task.lock().await, None);
+        assert_eq!(actor_state.publish_shutdown().await, None);
+        assert!(!actor_state.claim_start(task_id).await);
+        assert_eq!(actor_state.active_task().await, None);
     }
 
     #[tokio::test]
     async fn task_start_claim_wins_before_shutdown_publication() {
         let actor_state = TaskActorState::default();
         let task_id = TaskId::new();
-        let active_lock = actor_state.active_task.lock().await;
-        let mut claim = Box::pin(actor_state.claim_start(task_id));
-        let mut shutdown = Box::pin(actor_state.publish_shutdown());
-        assert!(poll!(&mut claim).is_pending());
-        assert!(poll!(&mut shutdown).is_pending());
-        drop(active_lock);
-
-        assert!(claim.await);
-        assert_eq!(shutdown.await, Some(task_id));
-        assert_eq!(*actor_state.active_task.lock().await, Some(task_id));
+        assert!(actor_state.claim_start(task_id).await);
+        assert_eq!(actor_state.publish_shutdown().await, Some(task_id));
+        assert_eq!(actor_state.active_task().await, Some(task_id));
     }
 
     #[tokio::test]
@@ -2390,6 +3001,7 @@ mod tests {
         let task_id = TaskId::new();
 
         let error = enqueue_resumed_task(&actor_state, false, &mut scheduled, task_id)
+            .await
             .expect_err("resume after shutdown must be rejected");
 
         assert_eq!(error.code(), TaskServiceErrorCode::Stopped);
@@ -2402,7 +3014,7 @@ mod tests {
         let task_id = TaskId::new();
         assert!(actor_state.claim_start(task_id).await);
         assert_eq!(actor_state.publish_shutdown().await, Some(task_id));
-        actor_state.clear_active().await;
+        actor_state.owner.lock().await.active_task = None;
 
         assert_eq!(actor_state.publish_shutdown().await, Some(task_id));
     }
@@ -2601,7 +3213,12 @@ mod tests {
         effect_count: u64,
         operation_id: Option<String>,
         release_completion: bool,
+        release_on_boundary: bool,
+        continue_at_boundary: bool,
+        boundary_requests: u64,
+        interrupts: u64,
         completion_emitted: bool,
+        completion_evidence_operation_id: Option<String>,
         started_contexts: u64,
         shutdowns: u64,
         provider_shutdown: bool,
@@ -2702,6 +3319,31 @@ mod tests {
                 } else {
                     state.active_context = Some(request.context_id.clone());
                     state.active_epoch = Some(epoch_id.clone());
+                    if let Some(operation_id) = state.completion_evidence_operation_id.clone() {
+                        state.events.push_back(AgentEvent::AssistantDelta {
+                            context_id: request.context_id.clone(),
+                            epoch_id: epoch_id.clone(),
+                            text: format!(
+                                "<carl-epoch-report>{}</carl-epoch-report>",
+                                json!({
+                                    "schema_version": 1,
+                                    "disposition": "complete",
+                                    "summary": "resumed from the committed maintenance checkpoint",
+                                    "clause_evidence": [
+                                        {"clause_id":"requested-outcome","operation_ids":[operation_id.clone()],"event_sequences":[],"artifact_digests":[]},
+                                        {"clause_id":"explicit-verification","operation_ids":[operation_id],"event_sequences":[],"artifact_digests":[]}
+                                    ],
+                                    "exact_identifiers": []
+                                })
+                            ),
+                        });
+                        state.events.push_back(AgentEvent::EpochCompleted {
+                            context_id: request.context_id,
+                            epoch_id,
+                            status: "completed".to_owned(),
+                        });
+                        return Ok(state.active_epoch.clone().unwrap());
+                    }
                     let item = AgentItem::Command {
                         item_id: "handoff-effect".to_owned(),
                         command: "finish-before-cancel".to_owned(),
@@ -2744,6 +3386,12 @@ mod tests {
             Box::pin(async move {
                 if let Some(operation_id) = text.strip_prefix("carl-operation-id:") {
                     state.lock().unwrap().operation_id = Some(operation_id.trim().to_owned());
+                } else if text.starts_with("Carl soft epoch boundary") {
+                    let mut state = state.lock().unwrap();
+                    state.boundary_requests += 1;
+                    if state.release_on_boundary {
+                        state.release_completion = true;
+                    }
                 }
                 Ok(())
             })
@@ -2755,7 +3403,11 @@ mod tests {
             _epoch_id: &AgentEpochId,
         ) -> AgentFuture<'_, ()> {
             self.note_operation();
-            Box::pin(async { Ok(()) })
+            let state = Arc::clone(&self.state);
+            Box::pin(async move {
+                state.lock().unwrap().interrupts += 1;
+                Ok(())
+            })
         }
 
         fn next_event(&mut self) -> AgentFuture<'_, AgentEvent> {
@@ -2796,6 +3448,21 @@ mod tests {
                                     process_id: None,
                                 },
                             });
+                            let disposition = if state.continue_at_boundary {
+                                "continue"
+                            } else {
+                                "complete"
+                            };
+                            let next_objective =
+                                state.continue_at_boundary.then_some("finish after restart");
+                            let clause_evidence = if state.continue_at_boundary {
+                                json!([])
+                            } else {
+                                json!([
+                                    {"clause_id":"requested-outcome","operation_ids":[operation_id.clone()],"event_sequences":[],"artifact_digests":[]},
+                                    {"clause_id":"explicit-verification","operation_ids":[operation_id],"event_sequences":[],"artifact_digests":[]}
+                                ])
+                            };
                             state.events.push_back(AgentEvent::AssistantDelta {
                                 context_id: context_id.clone(),
                                 epoch_id: epoch_id.clone(),
@@ -2803,12 +3470,10 @@ mod tests {
                                     "<carl-epoch-report>{}</carl-epoch-report>",
                                     json!({
                                         "schema_version": 1,
-                                        "disposition": "complete",
+                                        "disposition": disposition,
                                         "summary": "completed naturally during shutdown handoff",
-                                        "clause_evidence": [
-                                            {"clause_id":"requested-outcome","operation_ids":[operation_id.clone()],"event_sequences":[],"artifact_digests":[]},
-                                            {"clause_id":"explicit-verification","operation_ids":[operation_id],"event_sequences":[],"artifact_digests":[]}
-                                        ],
+                                        "next_objective": next_objective,
+                                        "clause_evidence": clause_evidence,
                                         "exact_identifiers": []
                                     })
                                 ),

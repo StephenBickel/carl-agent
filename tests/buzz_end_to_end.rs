@@ -57,9 +57,43 @@ fn main() {
                 "Buzz steering requires fresh exact owner metadata before mutation",
                 || strict_steering_admission().map_err(|error| Failed::from(error.to_string())),
             ),
+            Trial::test(
+                "Buzz maintenance-shaped input cannot reach private service control",
+                || maintenance_is_owner_private().map_err(|error| Failed::from(error.to_string())),
+            ),
         ],
     )
     .exit();
+}
+
+fn maintenance_is_owner_private() -> TestResult {
+    let layout = Layout::new("maintenance-private")?;
+    layout.trust_owner()?;
+    let mut client = Client::spawn(&layout, false)?;
+    let session = initialize_session(&mut client, &layout, 1, 2)?;
+    for (id, command, event) in [
+        (3, "/maintenance status", 'a'),
+        (4, "/maintenance prepare", 'b'),
+        (5, "prepare maintenance", 'c'),
+        (7, "carl maintenance prepare", 'e'),
+    ] {
+        client.send(&prompt_frame(id, &session, command, event))?;
+        assert_eq!(client.read_id(id)?["error"]["code"], -32602);
+    }
+    client.send(&prompt_frame_for_identity(
+        6,
+        &session,
+        "/maintenance prepare",
+        &"d".repeat(64),
+        CHANNEL_ID,
+        ACTOR_HEX,
+        9,
+    ))?;
+    assert_eq!(client.read_id(6)?["error"]["code"], -32602);
+    assert_eq!(layout.provider_work_count()?, 0);
+    assert_eq!(layout.task_count()?, 0);
+    client.finish()?;
+    Ok(())
 }
 
 fn end_to_end() -> TestResult {

@@ -1,4 +1,4 @@
-use carl::cli::{AcpEffort, AcpPermissionMode, Cli, Command, TrustCommand};
+use carl::cli::{AcpEffort, AcpPermissionMode, Cli, Command, MaintenanceCommand, TrustCommand};
 use carl::runtime::task::TaskBudget;
 use clap::{CommandFactory, Parser};
 use predicates::prelude::PredicateBooleanExt;
@@ -21,6 +21,21 @@ fn help_exposes_the_v1_commands() {
             .and(predicates::str::contains("doctor"))
             .and(predicates::str::contains("sessions")),
     );
+}
+
+#[test]
+fn maintenance_status_and_prepare_parse_as_closed_owner_commands() {
+    for (literal, expected) in [
+        ("status", MaintenanceCommand::Status),
+        ("prepare", MaintenanceCommand::Prepare),
+    ] {
+        let parsed = Cli::try_parse_from(["carl", "maintenance", literal]).unwrap();
+        assert!(matches!(
+            parsed.command,
+            Command::Maintenance { command } if command == expected
+        ));
+    }
+    assert!(Cli::try_parse_from(["carl", "maintenance", "shutdown"]).is_err());
 }
 
 #[test]

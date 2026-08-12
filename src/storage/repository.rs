@@ -8566,6 +8566,7 @@ fn validate_service_command_receipt(input: &ServiceCommandReceiptInput) -> Resul
             | "steer_trusted"
             | "cancel"
             | "configure"
+            | "prepare_maintenance"
             | "shutdown"
     );
     if input.idempotency_key.is_empty()

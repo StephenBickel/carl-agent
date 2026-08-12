@@ -218,6 +218,10 @@ pub(crate) enum TaskEngineControl {
         permission_mode: PermissionMode,
         acknowledgement: u64,
     },
+    Quiesce {
+        task_id: TaskId,
+        acknowledgement: u64,
+    },
     Approval {
         display_code: String,
         decision: EffectDecision,
@@ -309,6 +313,8 @@ struct RuntimeTask {
     started_tools: u64,
     provider_requests: u64,
     pending_configuration: Option<PendingTaskConfiguration>,
+    quiesce_after_checkpoint: bool,
+    safe_boundary_requested: bool,
 }
 
 #[derive(Clone)]
@@ -1079,6 +1085,8 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
             started_tools: 0,
             provider_requests: 0,
             pending_configuration: None,
+            quiesce_after_checkpoint: false,
+            safe_boundary_requested: false,
         };
         let planned = self.plan_contract(task_id, &mut runtime, &input).await;
         self.tasks.insert(task_id, runtime);
@@ -2602,6 +2610,9 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                         task_id,
                         status: active.snapshot.status,
                     });
+                    if runtime.quiesce_after_checkpoint {
+                        return Ok(active.snapshot);
+                    }
                     // A committed checkpoint is a natural cooperative scheduling boundary for a
                     // long-running task. Yielding here lets supervisors snapshot or stop the
                     // process without interrupting an operation lifecycle.
@@ -2944,6 +2955,7 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
         let mut provider_events = 0_usize;
         let mut diff_bytes = 0_usize;
         let epoch_tool_start = runtime.completed_tools;
+        runtime.safe_boundary_requested = false;
         let record = self
             .store()
             .get_task(task_id)
@@ -2957,6 +2969,11 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
             record.snapshot.budget.soft_epoch_seconds,
         ));
         tokio::pin!(timer);
+        if runtime.quiesce_after_checkpoint {
+            self.request_safe_boundary(task_id, runtime, provider_epoch_id)
+                .await?;
+            boundary_requested = true;
+        }
         loop {
             enum Next {
                 Provider(Result<AgentEvent, AgentPortError>),
@@ -3200,6 +3217,9 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                             acknowledgement, ..
                         }
                         | TaskEngineControl::Configure {
+                            acknowledgement, ..
+                        }
+                        | TaskEngineControl::Quiesce {
                             acknowledgement, ..
                         } => *acknowledgement,
                         TaskEngineControl::ClaimServiceCommand { .. }
@@ -3474,6 +3494,17 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                 Ok(())
             }
             TaskEngineControl::Approval { .. } => Err(error(TaskEngineErrorCode::Blocked)),
+            TaskEngineControl::Quiesce {
+                task_id: control_task_id,
+                ..
+            } => {
+                if control_task_id != task_id {
+                    return Err(invalid_task());
+                }
+                runtime.quiesce_after_checkpoint = true;
+                self.request_safe_boundary(task_id, runtime, provider_epoch_id)
+                    .await
+            }
             TaskEngineControl::ClaimServiceCommand { .. }
             | TaskEngineControl::CompleteServiceCommand { .. }
             | TaskEngineControl::Enqueue { .. }
@@ -4280,6 +4311,9 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                 }
                 | TaskEngineControl::Configure {
                     acknowledgement, ..
+                }
+                | TaskEngineControl::Quiesce {
+                    acknowledgement, ..
                 } => *acknowledgement,
                 TaskEngineControl::ClaimServiceCommand { .. }
                 | TaskEngineControl::CompleteServiceCommand { .. }
@@ -4380,6 +4414,20 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                 TaskEngineControl::Steer { .. } => {
                     self.acknowledge(acknowledgement, Err(error(TaskEngineErrorCode::Blocked)))
                         .await;
+                }
+                TaskEngineControl::Quiesce { .. } => {
+                    let result = self
+                        .apply_control(
+                            task_id,
+                            epoch_id,
+                            runtime,
+                            &request.epoch_id,
+                            &[operation_id],
+                            control,
+                        )
+                        .await;
+                    self.acknowledge(acknowledgement, result.clone()).await;
+                    result?;
                 }
                 control @ TaskEngineControl::Configure { .. } => {
                     let tightening =
@@ -4523,6 +4571,9 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
         runtime: &mut RuntimeTask,
         provider_epoch_id: &AgentEpochId,
     ) -> Result<(), TaskEngineError> {
+        if runtime.safe_boundary_requested {
+            return Ok(());
+        }
         let steering_sequence = runtime.steering_sequence;
         runtime.steering_sequence = runtime
             .steering_sequence
@@ -4542,7 +4593,9 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                 SAFE_BOUNDARY_MESSAGE.to_owned(),
             )
             .await
-            .map_err(provider_error)
+            .map_err(provider_error)?;
+        runtime.safe_boundary_requested = true;
+        Ok(())
     }
 
     fn apply_clause_evidence(
@@ -5004,6 +5057,8 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
             started_tools,
             provider_requests,
             pending_configuration,
+            quiesce_after_checkpoint: false,
+            safe_boundary_requested: false,
         })
     }
 }
@@ -5074,6 +5129,9 @@ fn control_acknowledgement(control: &TaskEngineControl) -> u64 {
             acknowledgement, ..
         }
         | TaskEngineControl::Configure {
+            acknowledgement, ..
+        }
+        | TaskEngineControl::Quiesce {
             acknowledgement, ..
         } => *acknowledgement,
         TaskEngineControl::ClaimServiceCommand { .. }

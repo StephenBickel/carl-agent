@@ -2,9 +2,10 @@ use std::collections::VecDeque;
 use std::error::Error;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 use uuid::Uuid;
 
 use super::*;
@@ -273,8 +274,8 @@ fn input(
     }
 }
 
-fn install_frontend(
-    engine: &mut TaskEngine<ApprovalPort>,
+fn install_frontend<P: AgentPort>(
+    engine: &mut TaskEngine<P>,
     session_id: SessionId,
     workspace: PathBuf,
 ) -> TurnId {
@@ -533,5 +534,311 @@ async fn planning_approval_control_closes_the_epoch_with_typed_blocked() -> Test
         }
     )));
     assert_eq!(engine.port.interrupts, 1);
+    Ok(())
+}
+
+#[derive(Clone)]
+struct QuiescePort {
+    state: Arc<Mutex<QuiescePortState>>,
+    changed: Arc<Notify>,
+}
+
+#[derive(Default)]
+struct QuiescePortState {
+    events: VecDeque<AgentEvent>,
+    epoch_starts: usize,
+    work_epoch_starts: usize,
+    effect_count: usize,
+    boundary_requests: usize,
+    operation_id: Option<String>,
+    boundary_released: bool,
+    work_completion_queued: bool,
+    workspace: PathBuf,
+}
+
+impl QuiescePort {
+    fn new(workspace: PathBuf) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(QuiescePortState {
+                workspace,
+                ..QuiescePortState::default()
+            })),
+            changed: Arc::new(Notify::new()),
+        }
+    }
+
+    fn release_boundary(&self) {
+        self.state.lock().unwrap().boundary_released = true;
+        self.changed.notify_waiters();
+    }
+}
+
+impl AgentPort for QuiescePort {
+    fn capabilities(&self) -> AgentCapabilities {
+        AgentCapabilities {
+            resume: true,
+            compact: true,
+            token_usage: true,
+            pre_dispatch_effects: true,
+            history_paging: false,
+            background_processes: false,
+        }
+    }
+
+    fn models(&mut self) -> AgentFuture<'_, Vec<AgentModel>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    fn start_context(&mut self, _request: StartAgentContext) -> AgentFuture<'_, AgentContextId> {
+        Box::pin(async { AgentContextId::parse("quiesce-context") })
+    }
+
+    fn resume_context(&mut self, request: ResumeAgentContext) -> AgentFuture<'_, AgentContextId> {
+        Box::pin(async move { Ok(request.context_id) })
+    }
+
+    fn compact_context(&mut self, _context_id: &AgentContextId) -> AgentFuture<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn start_epoch(&mut self, request: StartAgentEpoch) -> AgentFuture<'_, AgentEpochId> {
+        let mut state = self.state.lock().unwrap();
+        state.epoch_starts += 1;
+        let epoch_id = AgentEpochId::parse(format!("quiesce-epoch-{}", state.epoch_starts));
+        let Ok(epoch_id) = epoch_id else {
+            return Box::pin(async {
+                Err(AgentPortError::from_code(
+                    AgentPortErrorCode::InvalidResponse,
+                ))
+            });
+        };
+        let context_id = request.context_id;
+        state.events.push_back(AgentEvent::EpochStarted {
+            context_id: context_id.clone(),
+            epoch_id: epoch_id.clone(),
+        });
+        if request.permission_mode == PermissionMode::Plan {
+            state.events.push_back(AgentEvent::AssistantDelta {
+                context_id: context_id.clone(),
+                epoch_id: epoch_id.clone(),
+                text: "<carl-completion-contract>{\"version\":1,\"goal\":\"Quiesce bounded work\",\"constraints\":[],\"clauses\":[{\"id\":\"done\",\"description\":\"The work is done\",\"required\":true,\"status\":\"pending\",\"evidence\":[]}]}</carl-completion-contract>".to_owned(),
+            });
+            state.events.push_back(AgentEvent::EpochCompleted {
+                context_id,
+                epoch_id: epoch_id.clone(),
+                status: "completed".to_owned(),
+            });
+        } else {
+            state.work_epoch_starts += 1;
+            let item_id = "quiesce-command".to_owned();
+            let workspace = state.workspace.clone();
+            state.events.push_back(AgentEvent::ItemStarted {
+                context_id: context_id.clone(),
+                epoch_id: epoch_id.clone(),
+                item: AgentItem::Command {
+                    item_id: item_id.clone(),
+                    command: "cargo test --test focused".to_owned(),
+                    cwd: workspace,
+                    status: "inProgress".to_owned(),
+                    exit_code: None,
+                    aggregated_output: None,
+                    process_id: None,
+                },
+            });
+            state
+                .events
+                .push_back(AgentEvent::EffectRequested(AgentEffectRequest {
+                    context_id,
+                    epoch_id: epoch_id.clone(),
+                    request_id: AgentRequestId::parse("quiesce-request")
+                        .expect("fixed request is valid"),
+                    item_id,
+                    kind: AgentEffectKind::Command,
+                    summary: "Run focused verification".to_owned(),
+                    request_digest: Sha256Digest::parse("a".repeat(64))
+                        .expect("fixed digest is valid"),
+                }));
+        }
+        Box::pin(async move { Ok(epoch_id) })
+    }
+
+    fn steer(
+        &mut self,
+        _context_id: &AgentContextId,
+        _epoch_id: &AgentEpochId,
+        text: String,
+    ) -> AgentFuture<'_, ()> {
+        let mut state = self.state.lock().unwrap();
+        if let Some(operation_id) = text.strip_prefix("carl-operation-id:") {
+            state.operation_id = Some(operation_id.trim().to_owned());
+        } else if text.starts_with("Carl soft epoch boundary") {
+            state.boundary_requests += 1;
+        }
+        drop(state);
+        self.changed.notify_waiters();
+        Box::pin(async { Ok(()) })
+    }
+
+    fn interrupt(
+        &mut self,
+        _context_id: &AgentContextId,
+        _epoch_id: &AgentEpochId,
+    ) -> AgentFuture<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn next_event(&mut self) -> AgentFuture<'_, AgentEvent> {
+        let state = Arc::clone(&self.state);
+        let changed = Arc::clone(&self.changed);
+        Box::pin(async move {
+            loop {
+                if let Some(event) = state.lock().unwrap().events.pop_front() {
+                    return Ok(event);
+                }
+                {
+                    let mut state = state.lock().unwrap();
+                    if state.boundary_released && !state.work_completion_queued {
+                        let operation_id = state
+                            .operation_id
+                            .clone()
+                            .expect("the real operation was bound before release");
+                        let context_id = AgentContextId::parse("quiesce-context")?;
+                        let epoch_id =
+                            AgentEpochId::parse(format!("quiesce-epoch-{}", state.epoch_starts))?;
+                        let workspace = state.workspace.clone();
+                        state.events.push_back(AgentEvent::ItemCompleted {
+                            context_id: context_id.clone(),
+                            epoch_id: epoch_id.clone(),
+                            item: AgentItem::Command {
+                                item_id: "quiesce-command".to_owned(),
+                                command: "cargo test --test focused".to_owned(),
+                                cwd: workspace,
+                                status: "completed".to_owned(),
+                                exit_code: Some(0),
+                                aggregated_output: Some("focused verification passed".to_owned()),
+                                process_id: None,
+                            },
+                        });
+                        state.events.push_back(AgentEvent::AssistantDelta {
+                            context_id: context_id.clone(),
+                            epoch_id: epoch_id.clone(),
+                            text: format!(
+                                "<carl-epoch-report>{{\"schema_version\":1,\"disposition\":\"continue\",\"summary\":\"First operation committed\",\"next_objective\":\"Finish the task\",\"clause_evidence\":[],\"exact_identifiers\":[{operation_id:?}]}}</carl-epoch-report>"
+                            ),
+                        });
+                        state.events.push_back(AgentEvent::EpochCompleted {
+                            context_id,
+                            epoch_id,
+                            status: "completed".to_owned(),
+                        });
+                        state.work_completion_queued = true;
+                        continue;
+                    }
+                }
+                changed.notified().await;
+            }
+        })
+    }
+
+    fn resolve_effect(
+        &mut self,
+        _request_id: &AgentRequestId,
+        decision: EffectDecision,
+    ) -> AgentFuture<'_, ()> {
+        let state = Arc::clone(&self.state);
+        let changed = Arc::clone(&self.changed);
+        Box::pin(async move {
+            assert_eq!(decision, EffectDecision::Allow);
+            state.lock().unwrap().effect_count += 1;
+            changed.notify_waiters();
+            Ok(())
+        })
+    }
+
+    fn list_background_processes(
+        &mut self,
+        _context_id: &AgentContextId,
+    ) -> AgentFuture<'_, Vec<AgentProcess>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    fn terminate_background_process(
+        &mut self,
+        _context_id: &AgentContextId,
+        _process_id: &str,
+    ) -> AgentFuture<'_, bool> {
+        Box::pin(async { Ok(false) })
+    }
+
+    fn shutdown(&mut self) -> AgentFuture<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn repeated_quiesce_coalesces_one_boundary_and_returns_the_committed_active_snapshot()
+-> TestResult {
+    let fixture = Fixture::new()?;
+    let store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let port = QuiescePort::new(fixture.workspace.clone());
+    let observed = Arc::clone(&port.state);
+    let release = port.clone();
+    let mut engine = TaskEngine::new(store, port);
+    install_frontend(&mut engine, session.id, fixture.workspace.clone());
+    let mut task_input = input(session.id, &fixture, None);
+    task_input.permission_mode = PermissionMode::FullAccess;
+    let task_id = engine.enqueue_with_receipt(task_input, None)?.task_id;
+    let (control_sender, control_receiver) = mpsc::channel(2);
+    let control_keepalive = control_sender.clone();
+    let (acknowledgement_sender, mut acknowledgement_receiver) = mpsc::channel(2);
+    let (permission_sender, _permission_receiver) = mpsc::channel(1);
+    engine.install_controls(control_receiver, acknowledgement_sender, permission_sender);
+
+    let controls = tokio::spawn(async move {
+        loop {
+            if observed.lock().unwrap().effect_count == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        control_sender
+            .send(TaskEngineControl::Quiesce {
+                task_id,
+                acknowledgement: 41,
+            })
+            .await
+            .expect("first quiesce remains deliverable");
+        assert_eq!(acknowledgement_receiver.recv().await.unwrap().0, 41);
+        control_sender
+            .send(TaskEngineControl::Quiesce {
+                task_id,
+                acknowledgement: 42,
+            })
+            .await
+            .expect("repeated quiesce remains deliverable");
+        assert_eq!(acknowledgement_receiver.recv().await.unwrap().0, 42);
+        release.release_boundary();
+    });
+
+    let result = tokio::time::timeout(Duration::from_secs(2), engine.run(task_id))
+        .await
+        .expect("quiesce must return after the committed checkpoint");
+    controls.await?;
+    let snapshot = result.unwrap_or_else(|error| {
+        panic!(
+            "quiesce failed {error:?}: {:?}",
+            engine.store().read_task_events(task_id).unwrap()
+        )
+    });
+    drop(control_keepalive);
+
+    assert_eq!(snapshot.status, TaskStatus::Active);
+    assert_eq!(snapshot.active_epoch, None);
+    assert!(snapshot.latest_checkpoint.is_some());
+    let state = engine.port.state.lock().unwrap();
+    assert_eq!(state.effect_count, 1);
+    assert_eq!(state.boundary_requests, 1);
+    assert_eq!(state.work_epoch_starts, 1);
     Ok(())
 }
