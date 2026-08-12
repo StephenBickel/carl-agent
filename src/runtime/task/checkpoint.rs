@@ -17,6 +17,22 @@ const MAX_CHECKPOINT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_NARRATIVE_BYTES: usize = 64 * 1024;
 const MAX_FIELD_BYTES: usize = 1024 * 1024;
 
+#[cfg(test)]
+std::thread_local! {
+    static CANONICAL_CHECKPOINT_SERIALIZATIONS: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_canonical_checkpoint_serializations() {
+    CANONICAL_CHECKPOINT_SERIALIZATIONS.set(0);
+}
+
+#[cfg(test)]
+pub(crate) fn canonical_checkpoint_serializations() -> u64 {
+    CANONICAL_CHECKPOINT_SERIALIZATIONS.get()
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CanonicalCheckpoint {
     pub schema_version: u16,
@@ -255,6 +271,9 @@ impl CanonicalCheckpoint {
     }
 
     pub fn canonical_bytes(&self) -> Result<Vec<u8>, CheckpointError> {
+        #[cfg(test)]
+        CANONICAL_CHECKPOINT_SERIALIZATIONS
+            .set(CANONICAL_CHECKPOINT_SERIALIZATIONS.get().saturating_add(1));
         let mut canonical = self.clone();
         canonical.normalize();
         canonical.validate_structure()?;

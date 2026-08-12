@@ -7302,12 +7302,8 @@ fn validate_task_canonical_payloads_filtered(
         let checkpoint_bytes = checkpoint
             .canonical_bytes()
             .map_err(|_| storage_invariant("stored canonical checkpoint is invalid"))?;
-        if checkpoint_bytes != checkpoint_json.as_bytes()
-            || checkpoint
-                .digest()
-                .map_err(|_| storage_invariant("stored canonical checkpoint is invalid"))?
-                != stored_digest
-        {
+        let canonical_digest = format!("{:x}", Sha256::digest(&checkpoint_bytes));
+        if checkpoint_bytes != checkpoint_json.as_bytes() || canonical_digest != stored_digest {
             return Err(storage_invariant(
                 "stored canonical checkpoint bytes or digest do not match",
             ));
@@ -7320,7 +7316,12 @@ fn validate_task_canonical_payloads_filtered(
                 "stored canonical context package bytes do not match",
             ));
         }
-        validate_canonical_source_bounds(connection, &checkpoint, checkpoint_event_sequence)?;
+        validate_canonical_source_bounds(
+            connection,
+            &checkpoint,
+            checkpoint_event_sequence,
+            &canonical_digest,
+        )?;
         let expected_previous = connection
             .query_row(
                 "SELECT digest
@@ -7349,6 +7350,7 @@ fn validate_canonical_source_bounds(
     connection: &Connection,
     checkpoint: &CanonicalCheckpoint,
     checkpoint_event_sequence: i64,
+    canonical_digest: &str,
 ) -> Result<(), CarlError> {
     let bounds = connection
         .query_row(
@@ -7387,9 +7389,7 @@ fn validate_canonical_source_bounds(
                 checkpoint_event_sequence,
                 checkpoint.task_id.to_string(),
                 checkpoint.checkpoint_id.to_string(),
-                checkpoint
-                    .digest()
-                    .map_err(|_| { storage_invariant("stored canonical checkpoint is invalid") })?,
+                canonical_digest,
             ],
             |_| Ok(()),
         )
@@ -9974,7 +9974,8 @@ mod checkpoint_authority_tests {
     use super::*;
     use crate::runtime::task::{
         CheckpointBuildInput, CheckpointId, ClauseStatus, CompletionClause, ContextBudget,
-        ContextEngine, ContextInput, RepositoryCheckpoint,
+        ContextEngine, ContextInput, RepositoryCheckpoint, canonical_checkpoint_serializations,
+        reset_canonical_checkpoint_serializations,
     };
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -10161,6 +10162,21 @@ mod checkpoint_authority_tests {
         let (task, checkpoint) = build_next_checkpoint(&store, task.snapshot.task_id, None)?;
         let checkpoint = commit_checkpoint(&mut store, &task, checkpoint, 1)?;
         Ok((fixture, store, checkpoint))
+    }
+
+    #[test]
+    fn startup_canonical_validation_serializes_each_checkpoint_once() -> TestResult {
+        let (fixture, mut store, first) = setup_authenticated_anchor()?;
+        let task_id = first.task_id;
+        let (task, second) = build_next_checkpoint(&store, task_id, Some(first))?;
+        commit_checkpoint(&mut store, &task, second, 2)?;
+        drop(store);
+
+        reset_canonical_checkpoint_serializations();
+        let _reopened = Store::open(&fixture.database)?;
+
+        assert_eq!(canonical_checkpoint_serializations(), 2);
+        Ok(())
     }
 
     #[test]

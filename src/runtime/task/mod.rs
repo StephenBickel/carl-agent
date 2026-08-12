@@ -11,6 +11,10 @@ pub use checkpoint::{
     ExactIdentifier, OperationCheckpoint, ProcessCheckpoint, ProviderCheckpoint,
     RepositoryCheckpoint, WorkEvidence,
 };
+#[cfg(test)]
+pub(crate) use checkpoint::{
+    canonical_checkpoint_serializations, reset_canonical_checkpoint_serializations,
+};
 pub use context::{
     CompactionDecision, ContextBudget, ContextEngine, ContextError, ContextInput, ContextLedger,
     ContextLedgerEntry, ContextPackage, ContextSourceKind, ContextTrust, ContextUnit,
