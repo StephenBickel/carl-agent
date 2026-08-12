@@ -1,7 +1,10 @@
+#[path = "support/private_dir.rs"]
+mod private_dir;
+
 use std::collections::VecDeque;
 use std::error::Error;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use carl::acp::{AcpServer, CodexPort, IncomingFrame, JsonRpcId, Kernel, PortFuture, read_frame};
@@ -372,8 +375,8 @@ impl Layout {
         let root = std::env::temp_dir().join(format!("carl-acp-server-{}", Uuid::new_v4()));
         let workspace = root.join("workspace");
         fs::create_dir_all(&workspace)?;
-        make_owner_only(&root)?;
-        make_owner_only(&workspace)?;
+        private_dir::make_owner_only_directory(&root)?;
+        private_dir::make_owner_only_directory(&workspace)?;
         Ok(Self {
             root,
             workspace: fs::canonicalize(workspace)?,
@@ -390,14 +393,4 @@ impl Drop for Layout {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.root);
     }
-}
-
-#[cfg(unix)]
-fn make_owner_only(path: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-}
-#[cfg(windows)]
-fn make_owner_only(_path: &Path) -> std::io::Result<()> {
-    Ok(())
 }

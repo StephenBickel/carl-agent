@@ -253,13 +253,12 @@ fn simultaneous_compare_and_transition_has_exactly_one_winner() -> TestResult {
     let run_id = create_default_run(&mut setup, session.id, instant(1))?;
     drop(setup);
 
+    let stores = [Store::open(database.path())?, Store::open(database.path())?];
     let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
     let mut workers = Vec::new();
-    for second in [2, 3] {
-        let path = database.path().to_path_buf();
+    for (mut store, second) in stores.into_iter().zip([2, 3]) {
         let barrier = std::sync::Arc::clone(&barrier);
         workers.push(std::thread::spawn(move || {
-            let mut store = Store::open(path).expect("the competing store opens");
             barrier.wait();
             store
                 .compare_and_transition_subscription_run(

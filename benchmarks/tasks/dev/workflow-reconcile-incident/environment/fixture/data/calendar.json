@@ -1,0 +1,14 @@
+[
+  {
+    "shift_id": "shift-10",
+    "owner": "alice",
+    "starts_at": "2026-08-10T16:00:00Z",
+    "ends_at": "2026-08-11T00:00:00Z"
+  },
+  {
+    "shift_id": "shift-11",
+    "owner": "bob",
+    "starts_at": "2026-08-11T00:00:00Z",
+    "ends_at": "2026-08-11T08:00:00Z"
+  }
+]

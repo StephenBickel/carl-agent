@@ -1,5 +1,8 @@
 #![allow(dead_code)]
 
+#[path = "private_dir.rs"]
+mod private_dir;
+
 use std::collections::HashMap;
 use std::error::Error;
 use std::ffi::{OsStr, OsString};
@@ -19,6 +22,8 @@ pub type TestResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
 pub const PRIVATE_KEY: &str = "fixture-private-key";
 pub const CHANNEL_ID: &str = "11111111-1111-4111-8111-111111111111";
 pub const ACTOR_HEX: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const CARL_FRAME_TIMEOUT: Duration = Duration::from_secs(30);
+const CARL_STDERR_DIAGNOSTIC_LIMIT: usize = 4 * 1_024;
 
 pub fn dispatch_fixture(arguments: &[OsString]) -> Option<i32> {
     if arguments == [OsString::from("--version")] {
@@ -63,19 +68,16 @@ pub struct Layout {
 
 impl Layout {
     pub fn new(name: &str) -> TestResult<Self> {
-        let root = std::env::current_exe()?
-            .parent()
-            .ok_or("test executable has no parent")?
-            .join(format!("carl-buzz-{name}-{}", Uuid::new_v4()));
-        let data = root.join("data");
-        let workspace = root.join("workspace");
+        let requested_root =
+            std::env::temp_dir().join(format!("carl-buzz-{name}-{}", Uuid::new_v4()));
+        let data = requested_root.join("data");
+        let workspace = requested_root.join("workspace");
         fs::create_dir_all(&data)?;
         fs::create_dir_all(&workspace)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&data, fs::Permissions::from_mode(0o700))?;
-        }
+        private_dir::make_owner_only_directory(&data)?;
+        let root = fs::canonicalize(requested_root)?;
+        let data = root.join("data");
+        let workspace = root.join("workspace");
         fs::write(workspace.join("target.txt"), "broken\n")?;
         Ok(Self {
             root,
@@ -234,12 +236,27 @@ impl Client {
     }
 
     pub fn read(&self) -> TestResult<Value> {
-        self.frames
-            .recv_timeout(Duration::from_secs(8))
-            .map_err(|error| -> Box<dyn Error + Send + Sync> {
-                format!("timed out reading Carl frame: {error}").into()
-            })?
-            .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })
+        let received = match self.frames.recv_timeout(CARL_FRAME_TIMEOUT) {
+            Ok(received) => received,
+            Err(error) => {
+                let stderr = self
+                    .raw_stderr
+                    .try_lock()
+                    .ok()
+                    .map(|bytes| {
+                        let end = bytes.len().min(CARL_STDERR_DIAGNOSTIC_LIMIT);
+                        String::from_utf8_lossy(&bytes[..end]).into_owned()
+                    })
+                    .filter(|diagnostic| !diagnostic.is_empty())
+                    .map(|diagnostic| diagnostic.replace(PRIVATE_KEY, "<redacted>"))
+                    .unwrap_or_else(|| "<unavailable>".to_owned());
+                return Err(format!(
+                    "timed out reading Carl frame: {error}; bounded Carl stderr: {stderr}"
+                )
+                .into());
+            }
+        };
+        received.map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })
     }
 
     pub fn read_id(&self, expected: i64) -> TestResult<Value> {
