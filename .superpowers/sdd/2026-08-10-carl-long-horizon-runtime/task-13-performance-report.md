@@ -2,11 +2,11 @@
 
 ## Status
 
-`DONE_WITH_CONCERNS` after fix round 2/5: the semantic, corruption, rollback,
-formatting, and lint gates pass. The required prebuilt warm measurement passed in
-27.78 seconds test / 27.88 seconds real, but did not beat the original 27.61 / 27.70
-baseline. The performance objective is therefore unmet by the current capped
-evidence; implementation and tuning stopped after that single heavy run.
+`DONE` after fix round 3/5: the semantic, corruption, rollback, formatting, and lint
+gates pass. The final prebuilt warm measurement passed in 24.85 seconds test / 26.20
+seconds real, beating the original 27.61 / 27.70 baseline by 2.76 seconds test and
+1.50 seconds real. Fix-round 2's slower measurement is retained below as explicitly
+superseded evidence.
 
 ## Design
 
@@ -170,8 +170,9 @@ recorded below and govern current status.
   workload remains dominated by residual reopen/startup and other checkpoint build,
   canonicalization, SQLite, and evaluation costs. No claim of total linear
   complexity is made.
-- Timing variance exists on the shared host, but both post-change warm exact samples
-  exceeded the baseline; there is no defensible speedup claim.
+- Timing variance exists on the shared host. The superseded round-2 samples exceeded
+  baseline; the final round-3 prebuilt warm exact sample below beat both binding
+  thresholds. No claim of total linear complexity is made.
 
 ## Self-review
 
@@ -428,7 +429,7 @@ git diff --check
 No broad all-features test suite or full dedicated test target was run. The fixture
 isolation correction and long-horizon scenario semantics were unchanged.
 
-### Current prebuilt warm benchmark
+### Superseded fix-round 2 prebuilt warm benchmark
 
 The exact integration target was prebuilt first:
 
@@ -447,7 +448,7 @@ user 26.63
 sys 0.58
 ```
 
-| Current comparison | Test | Real |
+| Round-2 comparison | Test | Real |
 | --- | ---: | ---: |
 | Original baseline | 27.61s | 27.70s |
 | Fix round 2 prebuilt warm | 27.78s | 27.88s |
@@ -457,7 +458,7 @@ The semantic proof passed, but neither test time nor real time demonstrates the
 required speedup. Per the timing cap, no second heavy command, tuning, weakened
 validation, or evaluation change was attempted.
 
-### Round-2 self-review and residual concern
+### Superseded round-2 self-review and residual concern
 
 - Production/test changes are confined to `src/storage/repository.rs`; this report is
   the only documentation change. `SECURITY.md` remains untouched.
@@ -467,6 +468,165 @@ validation, or evaluation change was attempted.
 - Tail paging uses the existing indexed `(session_id, sequence)` access path while
   retaining JSON task isolation and all decoding checks.
 - Failed SQL commit paths cannot advance the cache or successful-validation counters.
-- Correctness and rollback evidence is green. The current comparable performance
-  evidence misses the binding speedup requirement by approximately 0.6%, so Task 13's
-  performance release dependency remains a concern pending review.
+- Correctness and rollback evidence was green. At the end of round 2, its comparable
+  performance evidence missed the binding speedup requirement by approximately 0.6%,
+  so the performance release dependency remained a concern at that superseded point.
+
+## Fix round 3/5 — profile-guided canonical-byte reuse
+
+### Diagnostic profile
+
+No production or report edit preceded profiling. The first sampler setup attached to
+the `/usr/bin/time` wrapper and captured only its `sigsuspend`; it provided zero
+workload evidence and was discarded. After explicit authorization, the corrected
+diagnostic launched the already-built integration binary directly and attached
+macOS `/usr/bin/sample` to that exact PID at a 5 ms interval. The unchanged exact
+test passed in 28.20 seconds while sampled. The effective profile contained 3,748
+samples on the workload thread, representing 18.74 sampled CPU-seconds.
+
+`sample` is statistical rather than a tracing profiler, so it does not report exact
+dynamic invocation counts. The call column below records exact counts derivable from
+the fixed two-run scenario and existing path counters; for event append it records
+the sampled call-graph evidence instead. Inclusive sample buckets attribute child
+work to the named enclosing phase and therefore must not be summed as exclusive
+wall time.
+
+| Rank | Required phase | Inclusive samples | Approx. sampled CPU | Call evidence |
+| ---: | --- | ---: | ---: | --- |
+| 1 | Canonical-chain validation | 880 | 4.40s | 22 full-chain calls: open plus first-checkpoint fallback for 11 Stores |
+| 2 | Candidate construction/serialization | 531 | 2.66s | 800 `build_checkpoint` calls: four per epoch across two 100-epoch runs; serialization below it is attributed to enclosing paths |
+| 3 | SQLite event append/projection | 387 | 1.94s | 136 sampled `append_task_event` call paths; dynamic calls are one per non-checkpoint lifecycle mutation, plus 200 direct checkpoint-event appends |
+| 4 | Runtime artifact reconciliation | 99 | 0.50s | 11 RuntimeStore opens |
+| 5 | `Store::open` projection replay | 20 | 0.10s | 11 Store opens |
+| 6 | Checkpoint full fallback authority | 19 | 0.10s | 11 successful full validations |
+| 7 | Checkpoint incremental authority | 7 | 0.04s | 189 successful incremental validations |
+| 8 | Abandoned-operation reconciliation | below 5 | below 0.03s | 11 RuntimeStore opens; no standalone frame reached the report threshold |
+
+The canonical-chain phase was the largest required enclosing phase. Stack inspection
+showed that each historical checkpoint was normalized, structurally/secret validated,
+and serialized once for byte identity, then serialized again by `digest()`, and a
+third time by `validate_canonical_source_bounds` when matching the committed journal
+event. The same canonical vector was therefore recomputed three times per row even
+though the first vector already supplied the exact bytes needed for both hashes.
+
+### Single production optimization
+
+The one permitted optimization keeps the first `canonical_bytes()` result, computes
+SHA-256 directly over that exact vector, and passes the resulting digest to source-
+bounds/journal-event validation. Each historical checkpoint is now serialized once
+per full-chain call instead of three times.
+
+This does not skip a row or a validation boundary. Deserialization, normalization,
+structure and secret checks, exact stored-byte comparison, SHA-256 digest comparison,
+task/checkpoint/package identity, source bounds, committed-event identity/digest,
+previous-digest lineage, context-package canonical bytes, and artifact validation all
+remain in the same order and fail closed. The digest is mathematically identical to
+`CanonicalCheckpoint::digest()`, which hashes the same canonical byte vector.
+
+### RED/GREEN performance-path contract
+
+A test-only thread-local counter was added at
+`CanonicalCheckpoint::canonical_bytes()`. The focused startup contract creates two
+canonical checkpoints, resets the counter immediately before reopen, and requires
+one serialization for each stored row.
+
+Before the production edit:
+
+```text
+cargo test --locked --lib storage::repository::checkpoint_authority_tests::startup_canonical_validation_serializes_each_checkpoint_once -- --exact --nocapture
+  FAILED: left 6, right 2
+```
+
+After reusing the canonical bytes and digest:
+
+```text
+cargo test --locked --lib storage::repository::checkpoint_authority_tests::startup_canonical_validation_serializes_each_checkpoint_once -- --exact --nocapture
+  1 passed; 0 failed; 79 filtered out
+```
+
+The instrumentation exists only under `cfg(test)` and adds no production state,
+telemetry, serialization, or synchronization.
+
+### Focused correctness and quality gates
+
+All focused gates were rerun after the production change:
+
+```text
+cargo test --locked --lib checkpoint_authority_tests
+  11 passed; 0 failed; 69 filtered out
+
+cargo test --locked --test context_engine_contract
+  20 passed; 0 failed
+
+cargo test --locked --test task_storage_contract
+  21 passed; 0 failed
+
+cargo test --locked --test epoch_engine_contract startup
+  3 passed; 0 failed; 78 filtered out
+
+cargo test --locked --test long_horizon_eval fixture_copies_with_the_same_clock_read_are_isolated
+  1 passed; 0 failed; 7 filtered out
+
+cargo test --locked --test long_horizon_eval repository_fixture_rejects
+  2 passed; 0 failed; 6 filtered out
+
+cargo fmt -- --check
+  exit 0
+
+cargo clippy --locked --all-targets --all-features -- -D warnings
+  exit 0
+
+git diff --check
+  exit 0
+```
+
+No broad all-features test suite or full dedicated integration target was run. The
+exact 100-epoch scenario remained unchanged.
+
+### Final prebuilt warm benchmark
+
+The exact integration target was prebuilt first:
+
+```text
+cargo test --locked --test long_horizon_eval --no-run
+  Finished test profile in 7.72s
+```
+
+Then exactly one comparable warm heavy command was run:
+
+```text
+/usr/bin/time -p cargo test --locked --test long_horizon_eval actual_engine_survives_one_hundred_epochs_and_normalizes_replay -- --exact --nocapture
+test result: 1 passed; 0 failed; 7 filtered out; finished in 24.85s
+real 26.20
+user 24.02
+sys 0.58
+```
+
+| Final comparison | Test | Real |
+| --- | ---: | ---: |
+| Original baseline | 27.61s | 27.70s |
+| Fix round 2, superseded | 27.78s | 27.88s |
+| Fix round 3 final | 24.85s | 26.20s |
+| Final vs. baseline | -2.76s (-10.0%) | -1.50s (-5.4%) |
+
+Both binding dimensions beat baseline. The uninterrupted-versus-restarted normalized
+replay proof remained green with its exact 100 epochs, 33 compactions, nine candidate
+restarts, exact cuts, and zero-loss/zero-duplicate assertions. No second optimization
+or additional timing run was attempted.
+
+### Round-3 self-review and residual cost
+
+- The production change is confined to the canonical full-history validation in
+  `src/storage/repository.rs`; `src/runtime/task/checkpoint.rs` and
+  `src/runtime/task/mod.rs` contain only the focused `cfg(test)` observation point.
+- `SECURITY.md`, the evaluation scenario, durability pragmas, cache trust boundary,
+  transaction/CAS placement, journal replay, fallback rules, and corruption behavior
+  are unchanged.
+- Every new Store still replays task projections and performs full canonical-chain
+  validation at open. Its first checkpoint also intentionally performs the complete
+  fallback chain validation. This residual repeated scan is security-preserving and
+  was not changed because the round allowed exactly one optimization.
+- Same-Store steady state still uses the authenticated exclusive tail, and
+  out-of-band `data_version` changes still force full journal/canonical fallback.
+- The final sample demonstrates the mandatory speedup on this host, but shared-host
+  variance remains; no total-linear or universal percentage claim is made.
