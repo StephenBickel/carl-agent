@@ -59,3 +59,4 @@ Task 14A: implementation complete (commit d189215; explicit admission budgets, s
 Task 14A: complete (commits d189215..647081e; independent review clean)
 Task 14B: implementation complete (commit 769ef49; sanitized journal-derived metrics, strict service protocol v3, direct/service ACP and exact Buzz owner binding, focused RED/GREEN suites, complete affected targets, and strict locked gates passed; post-commit review pending)
 Task 14B: fix round 1/5 opened (post-commit review found newline-prefixed `\n/metrics` is trimmed into a privileged exact slash command in direct and service ACP; embedded-text coverage did not catch the pure leading-newline form)
+Task 14B: fix round 1/5 (privileged slash normalization edge addressed, 0 open; commit 2b123d0; shared exact raw single-block classifier, direct/service/Buzz suites, and strict locked gates passed)

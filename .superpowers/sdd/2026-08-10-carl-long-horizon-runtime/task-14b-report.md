@@ -80,8 +80,9 @@ by the public metrics type.
   `e276a1292e0d814a5f7414f8918a17845dd28b5c1b98d4321e238be6cb631a6d`.
 - Unknown service task IDs use the existing typed rejected/invalid-request path.
   ACP checks the session's task ownership before sending a service metrics request.
-- Exact `/metrics` is recognized only as the trimmed first text block. Embedded,
-  quoted, and newline-prefixed occurrences remain ordinary prompt input.
+- Exact `/metrics` is recognized only when the prompt contains one text block whose
+  raw content is the literal `/metrics`. No whitespace trimming or multi-block
+  normalization applies; all other shapes remain ordinary prompt input.
 
 ## RED evidence
 
@@ -208,3 +209,61 @@ the Task 14B brief.
 ## Commit
 
 - `769ef49 feat: add sanitized durable task metrics`
+
+## Review fix round 1: Exact raw slash routing
+
+Post-commit review found that both ACP routes trimmed the first prompt block before
+classifying `/metrics`. A raw leading-newline prompt such as `"\n/metrics"` therefore
+crossed the privileged read-control branch even though it was not the exact command.
+
+Focused tests were added before the fix. Direct ACP failed with:
+
+```text
+assertion failed for ["\n/metrics"]
+left: Some("/metrics")
+right: None
+```
+
+The real active-task service ACP test likewise failed because request 120 returned a
+successful metrics response instead of JSON-RPC invalid input:
+
+```text
+left: Null
+right: -32602
+```
+
+One shared `exact_task_metrics_command` classifier now requires exactly one prompt
+block and byte-for-byte `/metrics`. `Prompt::task_slash_command` and service ACP both
+use that helper, while every unrelated slash command retains its existing parser and
+semantics. Literal regressions cover leading newline, leading CRLF, leading tab,
+leading space, trailing newline, trailing space, multiple blocks, quoted and embedded
+forms, plus the exact literal control. The active service control proves raw
+`/metrics` still returns schema version 1 while all non-exact forms follow the normal
+busy ordinary-prompt rejection path.
+
+Fresh post-fix verification:
+
+```text
+cargo test --locked --test acp_kernel_contract
+PASS: 35 passed, 0 failed
+
+cargo test --locked --test acp_server_contract
+PASS: 5 passed, 0 failed
+
+cargo test --locked --test service_end_to_end
+PASS: 20 passed, 0 failed
+
+cargo test --locked --test buzz_end_to_end
+PASS: 7 passed, 0 failed (including wrong actor/channel denial)
+
+cargo clippy --locked --all-targets --all-features -- -D warnings
+PASS: exit 0, no warnings
+
+cargo fmt --all -- --check
+PASS: exit 0
+
+git diff --check
+PASS: exit 0
+```
+
+Fix commit: `2b123d0 fix: require exact raw metrics slash`.
