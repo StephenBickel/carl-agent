@@ -56,11 +56,11 @@
 - Fixture admission accepts exactly `README.md`, `Cargo.toml`, `src/lib.rs`, and
   `tests/contract.rs`; extra files and symlinks fail closed. CI structurally requires
   the exact locked command, ungated and exactly once in `jobs.test`. The all-features
-  command explicitly skips the named 100-epoch test. A token-aware shell classifier
-  rejects every other `cargo test` invocation carrying `--all-features`, including
-  locked, workspace, reordered, manifest-path, shell-composed, and nested-shell
-  spellings, while not treating inert arguments to commands such as `echo` as Cargo
-  invocations. The expensive proof therefore runs only once per CI execution.
+  command explicitly skips the named 100-epoch test. Every CI `run` command is checked
+  against a small job-scoped exact allowlist, so wrapper, reordered, manifest-path,
+  shell-composed, nested-shell, and arbitrary extra commands all fail closed without
+  approximating shell execution semantics. The expensive proof therefore runs only
+  once per CI execution.
 - `Store::read_task_events_after` pages an exclusive task-local tail. Checkpoint
   construction now reads only events after the previous checkpoint while preserving
   canonical merge and authority behavior.
@@ -160,3 +160,4 @@ Task 14 files were not modified.
 - `3e4293d test: harden deterministic long-horizon evaluations`
 - `2be6e65 test: harden recovery and long-horizon CI gates`
 - `92eb0e7 test: classify all-features CI commands`
+- `b5ec570 test: allowlist CI run commands`
