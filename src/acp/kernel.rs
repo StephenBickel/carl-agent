@@ -547,6 +547,7 @@ struct SessionState {
     pending_bypass: Option<PendingBypass>,
     pending_configuration: Option<SessionConfiguration>,
     task_id: Option<crate::runtime::task::TaskId>,
+    budget: TaskBudget,
 }
 
 struct ActiveTurn {
@@ -828,6 +829,10 @@ impl KernelActor {
         if !matches!(request.protocol_version, 1 | 2) || !buzz_binding_valid {
             return Err(invalid_input());
         }
+        request
+            .budget
+            .validate_for_admission()
+            .map_err(|_| invalid_input())?;
         let model = request
             .model
             .clone()
@@ -914,6 +919,7 @@ impl KernelActor {
                 pending_bypass: None,
                 pending_configuration: None,
                 task_id: None,
+                budget: request.budget,
             },
         );
         Ok(public)
@@ -1199,6 +1205,7 @@ impl KernelActor {
         let model = state.public.configuration().model().clone();
         let effort = state.public.configuration().effort();
         let permission_mode = state.public.configuration().mode();
+        let budget = state.budget;
         let session_task = state.task_id;
         let actor_id = state.actor_id.clone();
         let external_session_id = state.public.external_session_id.clone();
@@ -1257,7 +1264,7 @@ impl KernelActor {
                                 model,
                                 effort,
                                 permission_mode,
-                                budget: TaskBudget::default(),
+                                budget,
                             },
                             context_id,
                         )

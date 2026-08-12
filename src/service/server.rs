@@ -1159,6 +1159,7 @@ async fn execute_command(
                         model: command.model.clone(),
                         effort: command.effort,
                         permission_mode: command.permission_mode,
+                        budget: command.budget,
                         trusted_admission: None,
                         idempotency_key: request.idempotency_key.clone(),
                         command_digest: command_digest(&request.command)
@@ -1316,6 +1317,7 @@ async fn execute_command(
                         model: command.start.model.clone(),
                         effort: command.start.effort,
                         permission_mode: command.start.permission_mode,
+                        budget: command.start.budget,
                         trusted_admission: Some(OwnerTrustedAdmission {
                             frontend: command.frontend,
                             actor_id: command.actor_id.clone(),
@@ -1519,6 +1521,7 @@ fn service_info(
             reconnect: true,
             trusted_buzz_admission: true,
             configure_active_task: true,
+            explicit_task_budgets: true,
         },
     })
 }
@@ -1961,7 +1964,7 @@ mod tests {
     };
     use crate::runtime::task::OperationId;
     #[cfg(unix)]
-    use crate::service::protocol::StartTaskCommand;
+    use crate::service::protocol::{SERVICE_PROTOCOL_VERSION, StartTaskCommand};
     use futures_util::poll;
     #[cfg(unix)]
     use rusqlite::Connection;
@@ -2014,7 +2017,7 @@ mod tests {
         });
 
         let start = |suffix: &str| ServiceRequest {
-            protocol_version: 1,
+            protocol_version: SERVICE_PROTOCOL_VERSION,
             request_id: format!("handoff-start-{suffix}"),
             idempotency_key: format!("handoff-start-{suffix}-key"),
             command: ServiceCommand::StartTask(StartTaskCommand {
@@ -2024,6 +2027,7 @@ mod tests {
                 model: ModelId::parse("gpt-test").unwrap(),
                 effort: ReasoningEffort::High,
                 permission_mode: PermissionMode::FullAccess,
+                budget: crate::runtime::task::TaskBudget::default(),
             }),
         };
         let ServiceResult::Accepted {
@@ -2072,7 +2076,7 @@ mod tests {
         let active_lock = actor_state.active_task.lock().await;
         assert_eq!(*active_lock, Some(active_task));
         let shutdown_request = ServiceRequest {
-            protocol_version: 1,
+            protocol_version: SERVICE_PROTOCOL_VERSION,
             request_id: "handoff-shutdown".to_owned(),
             idempotency_key: "handoff-shutdown-key".to_owned(),
             command: ServiceCommand::Shutdown,

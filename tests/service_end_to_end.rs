@@ -14,11 +14,11 @@ use carl::runtime::agent_port::{
     AgentEvent, AgentFuture, AgentItem, AgentModel, AgentPort, AgentPortError, AgentProcess,
     AgentRequestId, EffectDecision, ResumeAgentContext, StartAgentContext, StartAgentEpoch,
 };
-use carl::runtime::task::{TaskControlKind, TaskEvent, TaskId, TaskStatus};
-use carl::service::client::TaskServiceClient;
+use carl::runtime::task::{TaskBudget, TaskControlKind, TaskEvent, TaskId, TaskStatus};
+use carl::service::client::{ServiceClientErrorCode, TaskServiceClient};
 use carl::service::protocol::{
-    ServiceCommand, ServiceRequest, ServiceResult, StartTaskCommand, TaskUpdate,
-    TrustedStartTaskCommand, command_digest,
+    SERVICE_PROTOCOL_VERSION, ServiceCommand, ServiceRequest, ServiceResult, StartTaskCommand,
+    TaskUpdate, TrustedStartTaskCommand, command_digest,
 };
 use carl::service::server::{EndpointErrorCode, OwnedLocalEndpoint, TaskService};
 use carl::storage::{
@@ -143,11 +143,11 @@ async fn windows_client_accepts_the_current_user_private_service_pipe() -> TestR
     let service = TaskService::bind(&layout.data, PendingPort::new()).await?;
     let running = tokio::spawn(service.serve(CancellationToken::new()));
     let mut client = TaskServiceClient::connect(&layout.data).await?;
-    assert_eq!(client.protocol_version(), 1);
+    assert_eq!(client.protocol_version(), SERVICE_PROTOCOL_VERSION);
     assert_eq!(
         client
             .request(ServiceRequest {
-                protocol_version: 1,
+                protocol_version: SERVICE_PROTOCOL_VERSION,
                 request_id: "windows-shutdown".to_owned(),
                 idempotency_key: "windows-shutdown-key".to_owned(),
                 command: ServiceCommand::Shutdown,
@@ -170,19 +170,30 @@ async fn client_eof_does_not_cancel_owner_task_and_controls_are_idempotent() -> 
     let service_task = tokio::spawn(service.serve(cancellation));
 
     let mut first = TaskServiceClient::connect(&layout.data).await?;
+    assert_eq!(first.info().protocol_version, SERVICE_PROTOCOL_VERSION);
+    assert!(first.info().capabilities.explicit_task_budgets);
+    let admitted_budget = TaskBudget {
+        max_wall_time_seconds: Some(7_200),
+        max_provider_requests: Some(321),
+        max_tool_calls: Some(654),
+        soft_epoch_seconds: 600,
+        soft_epoch_tool_calls: 77,
+    };
+    let start_command = StartTaskCommand {
+        external_session_id: "owner-session".to_owned(),
+        workspace: layout.workspace.clone(),
+        request: "keep working after the frontend disconnects".to_owned(),
+        model: ModelId::parse("gpt-test")?,
+        effort: ReasoningEffort::High,
+        permission_mode: PermissionMode::FullAccess,
+        budget: admitted_budget,
+    };
     let accepted = first
         .request(ServiceRequest {
-            protocol_version: 1,
+            protocol_version: SERVICE_PROTOCOL_VERSION,
             request_id: "start-1".to_owned(),
             idempotency_key: "start-key".to_owned(),
-            command: ServiceCommand::StartTask(StartTaskCommand {
-                external_session_id: "owner-session".to_owned(),
-                workspace: layout.workspace.clone(),
-                request: "keep working after the frontend disconnects".to_owned(),
-                model: ModelId::parse("gpt-test")?,
-                effort: ReasoningEffort::High,
-                permission_mode: PermissionMode::FullAccess,
-            }),
+            command: ServiceCommand::StartTask(start_command.clone()),
         })
         .await
         .map_err(|error| format!("start request failed: {error:?}"))?;
@@ -192,11 +203,23 @@ async fn client_eof_does_not_cancel_owner_task_and_controls_are_idempotent() -> 
     drop(first);
 
     let mut second = TaskServiceClient::connect(&layout.data).await?;
+    let mut changed_budget = start_command;
+    changed_budget.budget.max_tool_calls = Some(655);
+    let conflict = second
+        .request(ServiceRequest {
+            protocol_version: SERVICE_PROTOCOL_VERSION,
+            request_id: "start-budget-conflict".to_owned(),
+            idempotency_key: "start-key".to_owned(),
+            command: ServiceCommand::StartTask(changed_budget),
+        })
+        .await
+        .expect_err("changed budget must conflict after reconnect");
+    assert_eq!(conflict.code(), ServiceClientErrorCode::Rejected);
     let active = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let result = second
                 .request(ServiceRequest {
-                    protocol_version: 1,
+                    protocol_version: SERVICE_PROTOCOL_VERSION,
                     request_id: format!("status-{}", Uuid::new_v4()),
                     idempotency_key: format!("status-key-{}", Uuid::new_v4()),
                     command: ServiceCommand::Status { task_id },
@@ -214,13 +237,14 @@ async fn client_eof_does_not_cancel_owner_task_and_controls_are_idempotent() -> 
     })
     .await?;
     assert_eq!(active.task_id, task_id);
+    assert_eq!(active.budget, admitted_budget);
     assert_eq!(state.lock().unwrap().interrupts, 0);
 
     for request_id in ["cancel-1", "cancel-2"] {
         assert_eq!(
             second
                 .request(ServiceRequest {
-                    protocol_version: 1,
+                    protocol_version: SERVICE_PROTOCOL_VERSION,
                     request_id: request_id.to_owned(),
                     idempotency_key: "cancel-key".to_owned(),
                     command: ServiceCommand::Cancel { task_id },
@@ -234,7 +258,7 @@ async fn client_eof_does_not_cancel_owner_task_and_controls_are_idempotent() -> 
     assert_eq!(
         second
             .request(ServiceRequest {
-                protocol_version: 1,
+                protocol_version: SERVICE_PROTOCOL_VERSION,
                 request_id: "shutdown-1".to_owned(),
                 idempotency_key: "shutdown-key".to_owned(),
                 command: ServiceCommand::Shutdown,
@@ -264,12 +288,13 @@ async fn shutdown_preempts_queued_work_and_completes_its_receipt() -> TestResult
         model: ModelId::parse("gpt-test").expect("test model is valid"),
         effort: ReasoningEffort::High,
         permission_mode: PermissionMode::FullAccess,
+        budget: TaskBudget::default(),
     };
     let ServiceResult::Accepted {
         task_id: active_task,
     } = client
         .request(ServiceRequest {
-            protocol_version: 1,
+            protocol_version: SERVICE_PROTOCOL_VERSION,
             request_id: "preempt-start-active".to_owned(),
             idempotency_key: "preempt-start-active-key".to_owned(),
             command: ServiceCommand::StartTask(start(
@@ -285,7 +310,7 @@ async fn shutdown_preempts_queued_work_and_completes_its_receipt() -> TestResult
         loop {
             let ServiceResult::Snapshot(snapshot) = client
                 .request(ServiceRequest {
-                    protocol_version: 1,
+                    protocol_version: SERVICE_PROTOCOL_VERSION,
                     request_id: format!("preempt-active-status-{}", Uuid::new_v4()),
                     idempotency_key: format!("preempt-active-status-key-{}", Uuid::new_v4()),
                     command: ServiceCommand::Status {
@@ -308,7 +333,7 @@ async fn shutdown_preempts_queued_work_and_completes_its_receipt() -> TestResult
         task_id: queued_task,
     } = client
         .request(ServiceRequest {
-            protocol_version: 1,
+            protocol_version: SERVICE_PROTOCOL_VERSION,
             request_id: "preempt-start-queued".to_owned(),
             idempotency_key: "preempt-start-queued-key".to_owned(),
             command: ServiceCommand::StartTask(start(
@@ -322,7 +347,7 @@ async fn shutdown_preempts_queued_work_and_completes_its_receipt() -> TestResult
     };
     let ServiceResult::Snapshot(queued) = client
         .request(ServiceRequest {
-            protocol_version: 1,
+            protocol_version: SERVICE_PROTOCOL_VERSION,
             request_id: "preempt-queued-status".to_owned(),
             idempotency_key: "preempt-queued-status-key".to_owned(),
             command: ServiceCommand::Status {
@@ -343,7 +368,7 @@ async fn shutdown_preempts_queued_work_and_completes_its_receipt() -> TestResult
     let shutdown = tokio::time::timeout(
         Duration::from_secs(1),
         client.request(ServiceRequest {
-            protocol_version: 1,
+            protocol_version: SERVICE_PROTOCOL_VERSION,
             request_id: "preempt-shutdown".to_owned(),
             idempotency_key: "preempt-shutdown-key".to_owned(),
             command: ServiceCommand::Shutdown,
@@ -416,7 +441,7 @@ async fn read_polling_does_not_exhaust_process_or_connection_mutation_capacity()
     let mut client = TaskServiceClient::connect(&layout.data).await?;
     let ServiceResult::Accepted { task_id } = client
         .request(ServiceRequest {
-            protocol_version: 1,
+            protocol_version: SERVICE_PROTOCOL_VERSION,
             request_id: "ledger-start".to_owned(),
             idempotency_key: "ledger-start-key".to_owned(),
             command: ServiceCommand::StartTask(StartTaskCommand {
@@ -426,6 +451,7 @@ async fn read_polling_does_not_exhaust_process_or_connection_mutation_capacity()
                 model: ModelId::parse("gpt-test")?,
                 effort: ReasoningEffort::High,
                 permission_mode: PermissionMode::FullAccess,
+                budget: TaskBudget::default(),
             }),
         })
         .await?
@@ -445,7 +471,7 @@ async fn read_polling_does_not_exhaust_process_or_connection_mutation_capacity()
         };
         client
             .request(ServiceRequest {
-                protocol_version: 1,
+                protocol_version: SERVICE_PROTOCOL_VERSION,
                 request_id: format!("ledger-read-{index}"),
                 idempotency_key: format!("ledger-read-key-{index}"),
                 command,
@@ -457,7 +483,7 @@ async fn read_polling_does_not_exhaust_process_or_connection_mutation_capacity()
     assert_eq!(
         client
             .request(ServiceRequest {
-                protocol_version: 1,
+                protocol_version: SERVICE_PROTOCOL_VERSION,
                 request_id: "ledger-cancel".to_owned(),
                 idempotency_key: "ledger-cancel-key".to_owned(),
                 command: ServiceCommand::Cancel { task_id },
@@ -469,7 +495,7 @@ async fn read_polling_does_not_exhaust_process_or_connection_mutation_capacity()
     assert_eq!(
         client
             .request(ServiceRequest {
-                protocol_version: 1,
+                protocol_version: SERVICE_PROTOCOL_VERSION,
                 request_id: "ledger-shutdown".to_owned(),
                 idempotency_key: "ledger-shutdown-key".to_owned(),
                 command: ServiceCommand::Shutdown,
@@ -493,7 +519,7 @@ async fn process_cancellation_checkpoints_and_cancels_the_active_task() -> TestR
     let mut client = TaskServiceClient::connect(&layout.data).await?;
     let ServiceResult::Accepted { task_id } = client
         .request(ServiceRequest {
-            protocol_version: 1,
+            protocol_version: SERVICE_PROTOCOL_VERSION,
             request_id: "signal-start".to_owned(),
             idempotency_key: "signal-start-key".to_owned(),
             command: ServiceCommand::StartTask(StartTaskCommand {
@@ -503,6 +529,7 @@ async fn process_cancellation_checkpoints_and_cancels_the_active_task() -> TestR
                 model: ModelId::parse("gpt-test")?,
                 effort: ReasoningEffort::High,
                 permission_mode: PermissionMode::FullAccess,
+                budget: TaskBudget::default(),
             }),
         })
         .await?
@@ -513,7 +540,7 @@ async fn process_cancellation_checkpoints_and_cancels_the_active_task() -> TestR
         loop {
             let ServiceResult::Snapshot(snapshot) = client
                 .request(ServiceRequest {
-                    protocol_version: 1,
+                    protocol_version: SERVICE_PROTOCOL_VERSION,
                     request_id: format!("signal-status-{}", Uuid::new_v4()),
                     idempotency_key: format!("signal-status-key-{}", Uuid::new_v4()),
                     command: ServiceCommand::Status { task_id },
@@ -568,7 +595,7 @@ async fn service_info_identifies_the_ephemeral_live_cursor_generation() -> TestR
     assert!(Uuid::parse_str(generation).is_ok());
     client
         .request(ServiceRequest {
-            protocol_version: 1,
+            protocol_version: SERVICE_PROTOCOL_VERSION,
             request_id: "generation-shutdown".to_owned(),
             idempotency_key: "generation-shutdown-key".to_owned(),
             command: ServiceCommand::Shutdown,
@@ -588,7 +615,7 @@ async fn live_update_pages_bind_cursors_to_the_owner_generation() -> TestResult 
     let generation = client.info().live_generation.clone();
     let ServiceResult::Accepted { task_id } = client
         .request(ServiceRequest {
-            protocol_version: 1,
+            protocol_version: SERVICE_PROTOCOL_VERSION,
             request_id: "live-generation-start".to_owned(),
             idempotency_key: "live-generation-start-key".to_owned(),
             command: ServiceCommand::StartTask(StartTaskCommand {
@@ -598,6 +625,7 @@ async fn live_update_pages_bind_cursors_to_the_owner_generation() -> TestResult 
                 model: ModelId::parse("gpt-test")?,
                 effort: ReasoningEffort::High,
                 permission_mode: PermissionMode::FullAccess,
+                budget: TaskBudget::default(),
             }),
         })
         .await?
@@ -606,7 +634,7 @@ async fn live_update_pages_bind_cursors_to_the_owner_generation() -> TestResult 
     };
     let page = client
         .request(ServiceRequest {
-            protocol_version: 1,
+            protocol_version: SERVICE_PROTOCOL_VERSION,
             request_id: "live-generation-page".to_owned(),
             idempotency_key: "live-generation-page-key".to_owned(),
             command: ServiceCommand::LiveUpdates {
@@ -621,7 +649,7 @@ async fn live_update_pages_bind_cursors_to_the_owner_generation() -> TestResult 
     assert_eq!(page["value"]["live_generation"], generation);
     client
         .request(ServiceRequest {
-            protocol_version: 1,
+            protocol_version: SERVICE_PROTOCOL_VERSION,
             request_id: "live-generation-cancel".to_owned(),
             idempotency_key: "live-generation-cancel-key".to_owned(),
             command: ServiceCommand::Cancel { task_id },
@@ -629,7 +657,7 @@ async fn live_update_pages_bind_cursors_to_the_owner_generation() -> TestResult 
         .await?;
     client
         .request(ServiceRequest {
-            protocol_version: 1,
+            protocol_version: SERVICE_PROTOCOL_VERSION,
             request_id: "live-generation-page-shutdown".to_owned(),
             idempotency_key: "live-generation-page-shutdown-key".to_owned(),
             command: ServiceCommand::Shutdown,
@@ -650,13 +678,14 @@ async fn start_idempotency_survives_owner_restart_without_a_second_task() -> Tes
         model: ModelId::parse("gpt-test")?,
         effort: ReasoningEffort::High,
         permission_mode: PermissionMode::FullAccess,
+        budget: TaskBudget::default(),
     });
     let service = TaskService::bind(&layout.data, PendingPort::new()).await?;
     let running = tokio::spawn(service.serve(CancellationToken::new()));
     let mut client = TaskServiceClient::connect(&layout.data).await?;
     let ServiceResult::Accepted { task_id } = client
         .request(ServiceRequest {
-            protocol_version: 1,
+            protocol_version: SERVICE_PROTOCOL_VERSION,
             request_id: "durable-start-1".to_owned(),
             idempotency_key: "durable-start-key".to_owned(),
             command: command.clone(),
@@ -667,7 +696,7 @@ async fn start_idempotency_survives_owner_restart_without_a_second_task() -> Tes
     };
     client
         .request(ServiceRequest {
-            protocol_version: 1,
+            protocol_version: SERVICE_PROTOCOL_VERSION,
             request_id: "durable-cancel".to_owned(),
             idempotency_key: "durable-cancel-key".to_owned(),
             command: ServiceCommand::Cancel { task_id },
@@ -675,7 +704,7 @@ async fn start_idempotency_survives_owner_restart_without_a_second_task() -> Tes
         .await?;
     client
         .request(ServiceRequest {
-            protocol_version: 1,
+            protocol_version: SERVICE_PROTOCOL_VERSION,
             request_id: "durable-shutdown".to_owned(),
             idempotency_key: "durable-shutdown-key".to_owned(),
             command: ServiceCommand::Shutdown,
@@ -689,7 +718,7 @@ async fn start_idempotency_survives_owner_restart_without_a_second_task() -> Tes
     assert_eq!(
         client
             .request(ServiceRequest {
-                protocol_version: 1,
+                protocol_version: SERVICE_PROTOCOL_VERSION,
                 request_id: "durable-start-2".to_owned(),
                 idempotency_key: "durable-start-key".to_owned(),
                 command,
@@ -699,7 +728,7 @@ async fn start_idempotency_survives_owner_restart_without_a_second_task() -> Tes
     );
     let ServiceResult::TaskList(tasks) = client
         .request(ServiceRequest {
-            protocol_version: 1,
+            protocol_version: SERVICE_PROTOCOL_VERSION,
             request_id: "durable-list".to_owned(),
             idempotency_key: "durable-list-key".to_owned(),
             command: ServiceCommand::List,
@@ -711,7 +740,7 @@ async fn start_idempotency_survives_owner_restart_without_a_second_task() -> Tes
     assert_eq!(tasks.len(), 1);
     client
         .request(ServiceRequest {
-            protocol_version: 1,
+            protocol_version: SERVICE_PROTOCOL_VERSION,
             request_id: "durable-shutdown-2".to_owned(),
             idempotency_key: "durable-shutdown-key-2".to_owned(),
             command: ServiceCommand::Shutdown,
@@ -735,10 +764,11 @@ async fn every_service_mutation_replays_durably_and_keys_never_rebind() -> TestR
         model: ModelId::parse("gpt-test")?,
         effort: ReasoningEffort::High,
         permission_mode: PermissionMode::FullAccess,
+        budget: TaskBudget::default(),
     });
     let ServiceResult::Accepted { task_id } = client
         .request(ServiceRequest {
-            protocol_version: 1,
+            protocol_version: SERVICE_PROTOCOL_VERSION,
             request_id: "global-start".to_owned(),
             idempotency_key: "global-start-key".to_owned(),
             command: start.clone(),
@@ -751,7 +781,7 @@ async fn every_service_mutation_replays_durably_and_keys_never_rebind() -> TestR
         loop {
             let ServiceResult::Snapshot(snapshot) = client
                 .request(ServiceRequest {
-                    protocol_version: 1,
+                    protocol_version: SERVICE_PROTOCOL_VERSION,
                     request_id: format!("global-status-{}", Uuid::new_v4()),
                     idempotency_key: format!("global-status-key-{}", Uuid::new_v4()),
                     command: ServiceCommand::Status { task_id },
@@ -793,7 +823,7 @@ async fn every_service_mutation_replays_durably_and_keys_never_rebind() -> TestR
         assert_eq!(
             client
                 .request(ServiceRequest {
-                    protocol_version: 1,
+                    protocol_version: SERVICE_PROTOCOL_VERSION,
                     request_id: format!("global-mutation-{index}"),
                     idempotency_key: (*key).to_owned(),
                     command: command.clone(),
@@ -805,7 +835,7 @@ async fn every_service_mutation_replays_durably_and_keys_never_rebind() -> TestR
     assert_eq!(
         client
             .request(ServiceRequest {
-                protocol_version: 1,
+                protocol_version: SERVICE_PROTOCOL_VERSION,
                 request_id: "global-shutdown".to_owned(),
                 idempotency_key: "global-shutdown-key".to_owned(),
                 command: ServiceCommand::Shutdown,
@@ -850,7 +880,7 @@ async fn every_service_mutation_replays_durably_and_keys_never_rebind() -> TestR
     assert_eq!(
         replay
             .request(ServiceRequest {
-                protocol_version: 1,
+                protocol_version: SERVICE_PROTOCOL_VERSION,
                 request_id: "global-start-replay".to_owned(),
                 idempotency_key: "global-start-key".to_owned(),
                 command: start,
@@ -862,7 +892,7 @@ async fn every_service_mutation_replays_durably_and_keys_never_rebind() -> TestR
         assert_eq!(
             replay
                 .request(ServiceRequest {
-                    protocol_version: 1,
+                    protocol_version: SERVICE_PROTOCOL_VERSION,
                     request_id: format!("global-replay-{index}"),
                     idempotency_key: (*key).to_owned(),
                     command: command.clone(),
@@ -880,7 +910,7 @@ async fn every_service_mutation_replays_durably_and_keys_never_rebind() -> TestR
         assert!(
             conflict
                 .request(ServiceRequest {
-                    protocol_version: 1,
+                    protocol_version: SERVICE_PROTOCOL_VERSION,
                     request_id: format!("global-conflict-{key}"),
                     idempotency_key: (*key).to_owned(),
                     command: ServiceCommand::Cancel {
@@ -902,7 +932,7 @@ async fn every_service_mutation_replays_durably_and_keys_never_rebind() -> TestR
     assert_eq!(
         shutdown
             .request(ServiceRequest {
-                protocol_version: 1,
+                protocol_version: SERVICE_PROTOCOL_VERSION,
                 request_id: "global-shutdown-replay".to_owned(),
                 idempotency_key: "global-shutdown-key".to_owned(),
                 command: ServiceCommand::Shutdown,
@@ -925,7 +955,7 @@ async fn pending_service_receipts_reconcile_control_crash_windows_without_duplic
         let mut client = TaskServiceClient::connect(&layout.data).await?;
         let ServiceResult::Accepted { task_id } = client
             .request(ServiceRequest {
-                protocol_version: 1,
+                protocol_version: SERVICE_PROTOCOL_VERSION,
                 request_id: format!("pending-{method}-start"),
                 idempotency_key: format!("pending-{method}-start-key"),
                 command: ServiceCommand::StartTask(StartTaskCommand {
@@ -935,6 +965,7 @@ async fn pending_service_receipts_reconcile_control_crash_windows_without_duplic
                     model: ModelId::parse("gpt-test")?,
                     effort: ReasoningEffort::High,
                     permission_mode: PermissionMode::FullAccess,
+                    budget: TaskBudget::default(),
                 }),
             })
             .await?
@@ -945,7 +976,7 @@ async fn pending_service_receipts_reconcile_control_crash_windows_without_duplic
             loop {
                 let ServiceResult::Snapshot(snapshot) = client
                     .request(ServiceRequest {
-                        protocol_version: 1,
+                        protocol_version: SERVICE_PROTOCOL_VERSION,
                         request_id: format!("pending-{method}-status-{}", Uuid::new_v4()),
                         idempotency_key: format!("pending-{method}-status-key-{}", Uuid::new_v4()),
                         command: ServiceCommand::Status { task_id },
@@ -987,7 +1018,7 @@ async fn pending_service_receipts_reconcile_control_crash_windows_without_duplic
         assert!(
             client
                 .request(ServiceRequest {
-                    protocol_version: 1,
+                    protocol_version: SERVICE_PROTOCOL_VERSION,
                     request_id: format!("pending-{method}-first"),
                     idempotency_key: key.clone(),
                     command: command.clone(),
@@ -1025,7 +1056,7 @@ async fn pending_service_receipts_reconcile_control_crash_windows_without_duplic
         let mut retry = TaskServiceClient::connect(&layout.data).await?;
         let retried = retry
             .request(ServiceRequest {
-                protocol_version: 1,
+                protocol_version: SERVICE_PROTOCOL_VERSION,
                 request_id: format!("pending-{method}-retry"),
                 idempotency_key: key,
                 command,
@@ -1051,7 +1082,7 @@ async fn pending_service_receipts_reconcile_control_crash_windows_without_duplic
         }
         retry
             .request(ServiceRequest {
-                protocol_version: 1,
+                protocol_version: SERVICE_PROTOCOL_VERSION,
                 request_id: format!("pending-{method}-shutdown"),
                 idempotency_key: format!("pending-{method}-shutdown-key"),
                 command: ServiceCommand::Shutdown,
@@ -1073,7 +1104,7 @@ async fn pending_cancel_marker_without_terminal_state_resumes_the_same_control()
     let mut client = TaskServiceClient::connect(&layout.data).await?;
     let ServiceResult::Accepted { task_id } = client
         .request(ServiceRequest {
-            protocol_version: 1,
+            protocol_version: SERVICE_PROTOCOL_VERSION,
             request_id: "marker-only-start".to_owned(),
             idempotency_key: "marker-only-start-key".to_owned(),
             command: ServiceCommand::StartTask(StartTaskCommand {
@@ -1083,6 +1114,7 @@ async fn pending_cancel_marker_without_terminal_state_resumes_the_same_control()
                 model: ModelId::parse("gpt-test")?,
                 effort: ReasoningEffort::High,
                 permission_mode: PermissionMode::FullAccess,
+                budget: TaskBudget::default(),
             }),
         })
         .await?
@@ -1093,7 +1125,7 @@ async fn pending_cancel_marker_without_terminal_state_resumes_the_same_control()
         loop {
             let ServiceResult::Snapshot(snapshot) = client
                 .request(ServiceRequest {
-                    protocol_version: 1,
+                    protocol_version: SERVICE_PROTOCOL_VERSION,
                     request_id: format!("marker-status-{}", Uuid::new_v4()),
                     idempotency_key: format!("marker-status-key-{}", Uuid::new_v4()),
                     command: ServiceCommand::Status { task_id },
@@ -1160,7 +1192,7 @@ async fn pending_cancel_marker_without_terminal_state_resumes_the_same_control()
     assert_eq!(
         retry
             .request(ServiceRequest {
-                protocol_version: 1,
+                protocol_version: SERVICE_PROTOCOL_VERSION,
                 request_id: "marker-only-cancel-retry".to_owned(),
                 idempotency_key: key.to_owned(),
                 command,
@@ -1189,7 +1221,7 @@ async fn pending_cancel_marker_without_terminal_state_resumes_the_same_control()
     );
     retry
         .request(ServiceRequest {
-            protocol_version: 1,
+            protocol_version: SERVICE_PROTOCOL_VERSION,
             request_id: "marker-only-shutdown".to_owned(),
             idempotency_key: "marker-only-shutdown-key".to_owned(),
             command: ServiceCommand::Shutdown,
@@ -1209,7 +1241,7 @@ async fn startup_prepares_every_resumable_task_before_accepting_clients() -> Tes
     for index in 1..=2 {
         let ServiceResult::Accepted { .. } = client
             .request(ServiceRequest {
-                protocol_version: 1,
+                protocol_version: SERVICE_PROTOCOL_VERSION,
                 request_id: format!("startup-start-{index}"),
                 idempotency_key: format!("startup-start-key-{index}"),
                 command: ServiceCommand::StartTask(StartTaskCommand {
@@ -1219,6 +1251,7 @@ async fn startup_prepares_every_resumable_task_before_accepting_clients() -> Tes
                     model: ModelId::parse("gpt-test")?,
                     effort: ReasoningEffort::High,
                     permission_mode: PermissionMode::FullAccess,
+                    budget: TaskBudget::default(),
                 }),
             })
             .await?
@@ -1228,7 +1261,7 @@ async fn startup_prepares_every_resumable_task_before_accepting_clients() -> Tes
     }
     let ServiceResult::TaskList(tasks) = client
         .request(ServiceRequest {
-            protocol_version: 1,
+            protocol_version: SERVICE_PROTOCOL_VERSION,
             request_id: "startup-list".to_owned(),
             idempotency_key: "startup-list-key".to_owned(),
             command: ServiceCommand::List,
@@ -1269,7 +1302,7 @@ async fn slow_acp_reader_is_bounded_and_does_not_interrupt_owner_work() -> TestR
     let mut owner = TaskServiceClient::connect(&layout.data).await?;
     let ServiceResult::Accepted { task_id } = owner
         .request(ServiceRequest {
-            protocol_version: 1,
+            protocol_version: SERVICE_PROTOCOL_VERSION,
             request_id: "slow-start".to_owned(),
             idempotency_key: "slow-start-key".to_owned(),
             command: ServiceCommand::StartTask(StartTaskCommand {
@@ -1279,6 +1312,7 @@ async fn slow_acp_reader_is_bounded_and_does_not_interrupt_owner_work() -> TestR
                 model: ModelId::parse("gpt-test")?,
                 effort: ReasoningEffort::High,
                 permission_mode: PermissionMode::FullAccess,
+                budget: TaskBudget::default(),
             }),
         })
         .await?
@@ -1289,7 +1323,7 @@ async fn slow_acp_reader_is_bounded_and_does_not_interrupt_owner_work() -> TestR
         assert_eq!(
             owner
                 .request(ServiceRequest {
-                    protocol_version: 1,
+                    protocol_version: SERVICE_PROTOCOL_VERSION,
                     request_id: format!("slow-config-{index}"),
                     idempotency_key: format!("slow-config-key-{index}"),
                     command: ServiceCommand::Configure {
@@ -1311,6 +1345,7 @@ async fn slow_acp_reader_is_bounded_and_does_not_interrupt_owner_work() -> TestR
             model: None,
             effort: None,
             permission_mode: PermissionMode::FullAccess,
+            budget: TaskBudget::default(),
             buzz_publisher: None,
         },
     )
@@ -1334,7 +1369,7 @@ async fn slow_acp_reader_is_bounded_and_does_not_interrupt_owner_work() -> TestR
     assert_eq!(state.lock().unwrap().interrupts, 0);
     let ServiceResult::Snapshot(snapshot) = owner
         .request(ServiceRequest {
-            protocol_version: 1,
+            protocol_version: SERVICE_PROTOCOL_VERSION,
             request_id: "slow-status".to_owned(),
             idempotency_key: "slow-status-key".to_owned(),
             command: ServiceCommand::Status { task_id },
@@ -1346,7 +1381,7 @@ async fn slow_acp_reader_is_bounded_and_does_not_interrupt_owner_work() -> TestR
     assert_eq!(snapshot.status, TaskStatus::Active);
     owner
         .request(ServiceRequest {
-            protocol_version: 1,
+            protocol_version: SERVICE_PROTOCOL_VERSION,
             request_id: "slow-cancel".to_owned(),
             idempotency_key: "slow-cancel-key".to_owned(),
             command: ServiceCommand::Cancel { task_id },
@@ -1354,7 +1389,7 @@ async fn slow_acp_reader_is_bounded_and_does_not_interrupt_owner_work() -> TestR
         .await?;
     owner
         .request(ServiceRequest {
-            protocol_version: 1,
+            protocol_version: SERVICE_PROTOCOL_VERSION,
             request_id: "slow-shutdown".to_owned(),
             idempotency_key: "slow-shutdown-key".to_owned(),
             command: ServiceCommand::Shutdown,
@@ -1382,7 +1417,7 @@ async fn owner_restart_resets_live_cursor_for_assistant_diff_and_approval_once()
     let first_generation = first.info().live_generation.clone();
     let ServiceResult::Accepted { task_id } = first
         .request(ServiceRequest {
-            protocol_version: 1,
+            protocol_version: SERVICE_PROTOCOL_VERSION,
             request_id: "restart-live-start".to_owned(),
             idempotency_key: "restart-live-start-key".to_owned(),
             command: ServiceCommand::StartTask(StartTaskCommand {
@@ -1392,6 +1427,7 @@ async fn owner_restart_resets_live_cursor_for_assistant_diff_and_approval_once()
                 model: ModelId::parse("gpt-test")?,
                 effort: ReasoningEffort::High,
                 permission_mode: PermissionMode::Default,
+                budget: TaskBudget::default(),
             }),
         })
         .await
@@ -1409,7 +1445,7 @@ async fn owner_restart_resets_live_cursor_for_assistant_diff_and_approval_once()
         loop {
             let ServiceResult::LiveUpdates(page) = first
                 .request(ServiceRequest {
-                    protocol_version: 1,
+                    protocol_version: SERVICE_PROTOCOL_VERSION,
                     request_id: format!("restart-live-old-page-{}", Uuid::new_v4()),
                     idempotency_key: format!("restart-live-old-key-{}", Uuid::new_v4()),
                     command: ServiceCommand::LiveUpdates {
@@ -1464,6 +1500,7 @@ async fn owner_restart_resets_live_cursor_for_assistant_diff_and_approval_once()
             model: Some(ModelId::parse("gpt-test")?),
             effort: Some(ReasoningEffort::High),
             permission_mode: PermissionMode::Default,
+            budget: TaskBudget::default(),
             buzz_publisher: None,
         },
     )
@@ -1546,7 +1583,7 @@ async fn owner_restart_resets_live_cursor_for_assistant_diff_and_approval_once()
 
     let ServiceResult::LiveUpdates(page) = replacement
         .request(ServiceRequest {
-            protocol_version: 1,
+            protocol_version: SERVICE_PROTOCOL_VERSION,
             request_id: "restart-live-new-page".to_owned(),
             idempotency_key: "restart-live-new-page-key".to_owned(),
             command: ServiceCommand::LiveUpdates {
@@ -1595,7 +1632,7 @@ async fn owner_restart_resets_live_cursor_for_assistant_diff_and_approval_once()
     assert_eq!(
         replacement
             .request(ServiceRequest {
-                protocol_version: 1,
+                protocol_version: SERVICE_PROTOCOL_VERSION,
                 request_id: "restart-live-approve".to_owned(),
                 idempotency_key: "restart-live-approve-key".to_owned(),
                 command: ServiceCommand::ResolveApproval {
@@ -1618,7 +1655,7 @@ async fn owner_restart_resets_live_cursor_for_assistant_diff_and_approval_once()
     );
     let ServiceResult::LiveUpdates(after_resolution) = replacement
         .request(ServiceRequest {
-            protocol_version: 1,
+            protocol_version: SERVICE_PROTOCOL_VERSION,
             request_id: "restart-live-after-resolution".to_owned(),
             idempotency_key: "restart-live-after-resolution-key".to_owned(),
             command: ServiceCommand::LiveUpdates {
@@ -1667,7 +1704,7 @@ async fn owner_restart_resets_live_cursor_for_assistant_diff_and_approval_once()
         loop {
             let ServiceResult::Snapshot(snapshot) = replacement
                 .request(ServiceRequest {
-                    protocol_version: 1,
+                    protocol_version: SERVICE_PROTOCOL_VERSION,
                     request_id: format!("restart-live-status-{}", Uuid::new_v4()),
                     idempotency_key: format!("restart-live-status-key-{}", Uuid::new_v4()),
                     command: ServiceCommand::Status { task_id },
@@ -1687,7 +1724,7 @@ async fn owner_restart_resets_live_cursor_for_assistant_diff_and_approval_once()
     assert_eq!(completed.task_id, task_id);
     replacement
         .request(ServiceRequest {
-            protocol_version: 1,
+            protocol_version: SERVICE_PROTOCOL_VERSION,
             request_id: "restart-live-shutdown".to_owned(),
             idempotency_key: "restart-live-shutdown-key".to_owned(),
             command: ServiceCommand::Shutdown,
@@ -1715,7 +1752,7 @@ async fn service_restart_resumes_from_checkpoint_without_repeating_effect() -> T
     let mut first = TaskServiceClient::connect(&layout.data).await?;
     let result = first
         .request(ServiceRequest {
-            protocol_version: 1,
+            protocol_version: SERVICE_PROTOCOL_VERSION,
             request_id: "restart-start".to_owned(),
             idempotency_key: "restart-start-key".to_owned(),
             command: ServiceCommand::StartTask(StartTaskCommand {
@@ -1725,6 +1762,7 @@ async fn service_restart_resumes_from_checkpoint_without_repeating_effect() -> T
                 model: ModelId::parse("gpt-test")?,
                 effort: ReasoningEffort::High,
                 permission_mode: PermissionMode::FullAccess,
+                budget: TaskBudget::default(),
             }),
         })
         .await?;
@@ -1735,7 +1773,7 @@ async fn service_restart_resumes_from_checkpoint_without_repeating_effect() -> T
         loop {
             let result = first
                 .request(ServiceRequest {
-                    protocol_version: 1,
+                    protocol_version: SERVICE_PROTOCOL_VERSION,
                     request_id: format!("restart-status-{}", Uuid::new_v4()),
                     idempotency_key: format!("restart-status-key-{}", Uuid::new_v4()),
                     command: ServiceCommand::Status { task_id },
@@ -1755,7 +1793,7 @@ async fn service_restart_resumes_from_checkpoint_without_repeating_effect() -> T
     .await?;
     let ServiceResult::Events(events) = first
         .request(ServiceRequest {
-            protocol_version: 1,
+            protocol_version: SERVICE_PROTOCOL_VERSION,
             request_id: "events-before-crash".to_owned(),
             idempotency_key: "events-before-crash-key".to_owned(),
             command: ServiceCommand::Events {
@@ -1775,7 +1813,7 @@ async fn service_restart_resumes_from_checkpoint_without_repeating_effect() -> T
         loop {
             let ServiceResult::LiveUpdates(page) = first
                 .request(ServiceRequest {
-                    protocol_version: 1,
+                    protocol_version: SERVICE_PROTOCOL_VERSION,
                     request_id: format!("live-before-crash-{}", Uuid::new_v4()),
                     idempotency_key: format!("live-before-crash-key-{}", Uuid::new_v4()),
                     command: ServiceCommand::LiveUpdates {
@@ -1816,7 +1854,7 @@ async fn service_restart_resumes_from_checkpoint_without_repeating_effect() -> T
         loop {
             let result = replacement
                 .request(ServiceRequest {
-                    protocol_version: 1,
+                    protocol_version: SERVICE_PROTOCOL_VERSION,
                     request_id: format!("replacement-status-{}", Uuid::new_v4()),
                     idempotency_key: format!("replacement-status-key-{}", Uuid::new_v4()),
                     command: ServiceCommand::Status { task_id },
@@ -1837,7 +1875,7 @@ async fn service_restart_resumes_from_checkpoint_without_repeating_effect() -> T
     assert_ne!(replacement_generation, first_generation);
     let ServiceResult::LiveUpdates(restarted_live) = replacement
         .request(ServiceRequest {
-            protocol_version: 1,
+            protocol_version: SERVICE_PROTOCOL_VERSION,
             request_id: "live-after-restart".to_owned(),
             idempotency_key: "live-after-restart-key".to_owned(),
             command: ServiceCommand::LiveUpdates {
@@ -1873,7 +1911,7 @@ async fn service_restart_resumes_from_checkpoint_without_repeating_effect() -> T
     let replacement_live_cursor = restarted_live.cursor.ok_or("replacement cursor missing")?;
     let ServiceResult::LiveUpdates(no_duplicate_live) = replacement
         .request(ServiceRequest {
-            protocol_version: 1,
+            protocol_version: SERVICE_PROTOCOL_VERSION,
             request_id: "live-after-restart-again".to_owned(),
             idempotency_key: "live-after-restart-again-key".to_owned(),
             command: ServiceCommand::LiveUpdates {
@@ -1890,7 +1928,7 @@ async fn service_restart_resumes_from_checkpoint_without_repeating_effect() -> T
     assert!(no_duplicate_live.updates.is_empty());
     let ServiceResult::Events(after_restart) = replacement
         .request(ServiceRequest {
-            protocol_version: 1,
+            protocol_version: SERVICE_PROTOCOL_VERSION,
             request_id: "events-after-restart".to_owned(),
             idempotency_key: "events-after-restart-key".to_owned(),
             command: ServiceCommand::Events {
@@ -1914,7 +1952,7 @@ async fn service_restart_resumes_from_checkpoint_without_repeating_effect() -> T
     assert_eq!(
         replacement
             .request(ServiceRequest {
-                protocol_version: 1,
+                protocol_version: SERVICE_PROTOCOL_VERSION,
                 request_id: "replacement-shutdown".to_owned(),
                 idempotency_key: "replacement-shutdown-key".to_owned(),
                 command: ServiceCommand::Shutdown,
@@ -1934,6 +1972,13 @@ async fn acp_stdio_disconnect_leaves_the_service_owned_task_running() -> TestRes
     let state = Arc::clone(&port.state);
     let service = TaskService::bind(&layout.data, port).await?;
     let service_task = tokio::spawn(service.serve(CancellationToken::new()));
+    let admitted_budget = TaskBudget {
+        max_wall_time_seconds: Some(1_800),
+        max_provider_requests: Some(111),
+        max_tool_calls: Some(222),
+        soft_epoch_seconds: 300,
+        soft_epoch_tool_calls: 33,
+    };
 
     let acp = ServiceAcpServer::new(
         &layout.data,
@@ -1942,6 +1987,7 @@ async fn acp_stdio_disconnect_leaves_the_service_owned_task_running() -> TestRes
             model: Some(ModelId::parse("gpt-test")?),
             effort: Some(ReasoningEffort::High),
             permission_mode: PermissionMode::FullAccess,
+            budget: admitted_budget,
             buzz_publisher: None,
         },
     )
@@ -2010,7 +2056,7 @@ async fn acp_stdio_disconnect_leaves_the_service_owned_task_running() -> TestRes
     let mut owner = TaskServiceClient::connect(&layout.data).await?;
     let ServiceResult::TaskList(tasks) = owner
         .request(ServiceRequest {
-            protocol_version: 1,
+            protocol_version: SERVICE_PROTOCOL_VERSION,
             request_id: "acp-list".to_owned(),
             idempotency_key: "acp-list-key".to_owned(),
             command: ServiceCommand::List,
@@ -2021,10 +2067,76 @@ async fn acp_stdio_disconnect_leaves_the_service_owned_task_running() -> TestRes
     };
     let task_id = tasks.first().ok_or("service-owned task missing")?.task_id;
     assert_eq!(tasks[0].status, TaskStatus::Active);
+    assert_eq!(tasks[0].budget, admitted_budget);
+
+    let reloaded_acp = ServiceAcpServer::new(
+        &layout.data,
+        AcpServerConfig {
+            frontend: Frontend::Acp,
+            model: Some(ModelId::parse("gpt-test")?),
+            effort: Some(ReasoningEffort::High),
+            permission_mode: PermissionMode::FullAccess,
+            budget: TaskBudget {
+                max_wall_time_seconds: Some(60),
+                max_provider_requests: Some(2),
+                max_tool_calls: Some(3),
+                soft_epoch_seconds: 30,
+                soft_epoch_tool_calls: 1,
+            },
+            buzz_publisher: None,
+        },
+    )
+    .await?;
+    let (reload_client, reload_server) = tokio::io::duplex(64 * 1024);
+    let (reload_read, mut reload_write) = tokio::io::split(reload_client);
+    let (reload_server_read, reload_server_write) = tokio::io::split(reload_server);
+    let reload_task =
+        tokio::spawn(reloaded_acp.serve(BufReader::new(reload_server_read), reload_server_write));
+    let mut reload_reader = BufReader::new(reload_read);
+    reload_write
+        .write_all(
+            format!(
+                "{}\n{}\n",
+                json!({"jsonrpc":"2.0","id":10,"method":"initialize","params":{"protocolVersion":1,"clientInfo":{"name":"budget-reload","version":"1.0.0"},"clientCapabilities":{}}}),
+                json!({"jsonrpc":"2.0","id":11,"method":"session/load","params":{"sessionId":session_id,"cwd":layout.workspace,"mcpServers":[],"taskId":task_id}})
+            )
+            .as_bytes(),
+        )
+        .await?;
+    reload_write.flush().await?;
+    assert_eq!(
+        read_frame(&mut reload_reader, 1024 * 1024)
+            .await?
+            .ok_or("reload initialize response missing")?
+            .value()["id"],
+        10
+    );
+    assert_eq!(
+        read_frame(&mut reload_reader, 1024 * 1024)
+            .await?
+            .ok_or("reload session response missing")?
+            .value()["id"],
+        11
+    );
+    drop(reload_write);
+    drop(reload_reader);
+    reload_task.await??;
+    let ServiceResult::Snapshot(reloaded) = owner
+        .request(ServiceRequest {
+            protocol_version: SERVICE_PROTOCOL_VERSION,
+            request_id: "acp-reloaded-budget-status".to_owned(),
+            idempotency_key: "acp-reloaded-budget-status-key".to_owned(),
+            command: ServiceCommand::Status { task_id },
+        })
+        .await?
+    else {
+        return Err("reloaded task status missing".into());
+    };
+    assert_eq!(reloaded.budget, admitted_budget);
     assert_eq!(
         owner
             .request(ServiceRequest {
-                protocol_version: 1,
+                protocol_version: SERVICE_PROTOCOL_VERSION,
                 request_id: "acp-cancel".to_owned(),
                 idempotency_key: "acp-cancel-key".to_owned(),
                 command: ServiceCommand::Cancel { task_id },
@@ -2035,7 +2147,7 @@ async fn acp_stdio_disconnect_leaves_the_service_owned_task_running() -> TestRes
     assert_eq!(
         owner
             .request(ServiceRequest {
-                protocol_version: 1,
+                protocol_version: SERVICE_PROTOCOL_VERSION,
                 request_id: "acp-shutdown".to_owned(),
                 idempotency_key: "acp-shutdown-key".to_owned(),
                 command: ServiceCommand::Shutdown,
@@ -2068,6 +2180,13 @@ async fn buzz_start_is_admitted_by_the_owner_writer_before_task_creation() -> Te
         client.info().default_model.as_ref().map(ModelId::as_str),
         Some("gpt-test")
     );
+    let admitted_budget = TaskBudget {
+        max_wall_time_seconds: Some(3_600),
+        max_provider_requests: Some(222),
+        max_tool_calls: Some(333),
+        soft_epoch_seconds: 450,
+        soft_epoch_tool_calls: 55,
+    };
 
     let trusted = |actor_id: ActorId, event_id: char| {
         ServiceCommand::StartTrustedTask(TrustedStartTaskCommand {
@@ -2078,6 +2197,7 @@ async fn buzz_start_is_admitted_by_the_owner_writer_before_task_creation() -> Te
                 model: ModelId::parse("gpt-test").expect("test model is valid"),
                 effort: ReasoningEffort::High,
                 permission_mode: PermissionMode::Plan,
+                budget: admitted_budget,
             },
             frontend: Frontend::Buzz,
             actor_id,
@@ -2087,7 +2207,7 @@ async fn buzz_start_is_admitted_by_the_owner_writer_before_task_creation() -> Te
     };
     let rejected = client
         .request(ServiceRequest {
-            protocol_version: 1,
+            protocol_version: SERVICE_PROTOCOL_VERSION,
             request_id: "buzz-rejected".to_owned(),
             idempotency_key: "buzz-rejected-key".to_owned(),
             command: trusted(ActorId::parse("b".repeat(64))?, '1'),
@@ -2100,7 +2220,7 @@ async fn buzz_start_is_admitted_by_the_owner_writer_before_task_creation() -> Te
     );
     let ServiceResult::TaskList(tasks) = client
         .request(ServiceRequest {
-            protocol_version: 1,
+            protocol_version: SERVICE_PROTOCOL_VERSION,
             request_id: "buzz-list-empty".to_owned(),
             idempotency_key: "buzz-list-empty-key".to_owned(),
             command: ServiceCommand::List,
@@ -2113,7 +2233,7 @@ async fn buzz_start_is_admitted_by_the_owner_writer_before_task_creation() -> Te
 
     let ServiceResult::Accepted { task_id } = client
         .request(ServiceRequest {
-            protocol_version: 1,
+            protocol_version: SERVICE_PROTOCOL_VERSION,
             request_id: "buzz-accepted".to_owned(),
             idempotency_key: "buzz-accepted-key".to_owned(),
             command: trusted(actor, '2'),
@@ -2122,9 +2242,27 @@ async fn buzz_start_is_admitted_by_the_owner_writer_before_task_creation() -> Te
     else {
         return Err("trusted task was not accepted".into());
     };
+    let ServiceResult::TaskList(tasks) = client
+        .request(ServiceRequest {
+            protocol_version: SERVICE_PROTOCOL_VERSION,
+            request_id: "buzz-list-budget".to_owned(),
+            idempotency_key: "buzz-list-budget-key".to_owned(),
+            command: ServiceCommand::List,
+        })
+        .await?
+    else {
+        return Err("trusted task list missing".into());
+    };
+    assert_eq!(
+        tasks
+            .iter()
+            .find(|snapshot| snapshot.task_id == task_id)
+            .map(|snapshot| snapshot.budget),
+        Some(admitted_budget)
+    );
     client
         .request(ServiceRequest {
-            protocol_version: 1,
+            protocol_version: SERVICE_PROTOCOL_VERSION,
             request_id: "buzz-cancel".to_owned(),
             idempotency_key: "buzz-cancel-key".to_owned(),
             command: ServiceCommand::Cancel { task_id },
@@ -2132,7 +2270,7 @@ async fn buzz_start_is_admitted_by_the_owner_writer_before_task_creation() -> Te
         .await?;
     client
         .request(ServiceRequest {
-            protocol_version: 1,
+            protocol_version: SERVICE_PROTOCOL_VERSION,
             request_id: "buzz-shutdown".to_owned(),
             idempotency_key: "buzz-shutdown-key".to_owned(),
             command: ServiceCommand::Shutdown,
@@ -2166,6 +2304,7 @@ async fn acp_controls_complete_prompt_and_reconnect_replays_cursor_events() -> T
             model: None,
             effort: None,
             permission_mode: PermissionMode::FullAccess,
+            budget: TaskBudget::default(),
             buzz_publisher: None,
         },
     )
@@ -2272,6 +2411,7 @@ async fn acp_controls_complete_prompt_and_reconnect_replays_cursor_events() -> T
             model: None,
             effort: None,
             permission_mode: PermissionMode::FullAccess,
+            budget: TaskBudget::default(),
             buzz_publisher: None,
         },
     )
@@ -2314,7 +2454,7 @@ async fn acp_controls_complete_prompt_and_reconnect_replays_cursor_events() -> T
     let mut owner = TaskServiceClient::connect(&layout.data).await?;
     owner
         .request(ServiceRequest {
-            protocol_version: 1,
+            protocol_version: SERVICE_PROTOCOL_VERSION,
             request_id: "parity-shutdown".to_owned(),
             idempotency_key: "parity-shutdown-key".to_owned(),
             command: ServiceCommand::Shutdown,
@@ -2343,6 +2483,7 @@ async fn acp_reconnect_during_three_epoch_task_replays_once_and_completes() -> T
             model: None,
             effort: None,
             permission_mode: PermissionMode::FullAccess,
+            budget: TaskBudget::default(),
             buzz_publisher: None,
         },
     )
@@ -2399,7 +2540,7 @@ async fn acp_reconnect_during_three_epoch_task_replays_once_and_completes() -> T
     let mut owner = TaskServiceClient::connect(&layout.data).await?;
     let ServiceResult::TaskList(tasks) = owner
         .request(ServiceRequest {
-            protocol_version: 1,
+            protocol_version: SERVICE_PROTOCOL_VERSION,
             request_id: "three-list".to_owned(),
             idempotency_key: "three-list-key".to_owned(),
             command: ServiceCommand::List,
@@ -2411,7 +2552,7 @@ async fn acp_reconnect_during_three_epoch_task_replays_once_and_completes() -> T
     let task_id = tasks.first().ok_or("three-epoch task missing")?.task_id;
     let ServiceResult::Events(events) = owner
         .request(ServiceRequest {
-            protocol_version: 1,
+            protocol_version: SERVICE_PROTOCOL_VERSION,
             request_id: "three-before-disconnect".to_owned(),
             idempotency_key: "three-before-disconnect-key".to_owned(),
             command: ServiceCommand::Events {
@@ -2448,6 +2589,7 @@ async fn acp_reconnect_during_three_epoch_task_replays_once_and_completes() -> T
             model: None,
             effort: None,
             permission_mode: PermissionMode::FullAccess,
+            budget: TaskBudget::default(),
             buzz_publisher: None,
         },
     )
@@ -2553,7 +2695,7 @@ async fn acp_reconnect_during_three_epoch_task_replays_once_and_completes() -> T
 
     let ServiceResult::Snapshot(snapshot) = owner
         .request(ServiceRequest {
-            protocol_version: 1,
+            protocol_version: SERVICE_PROTOCOL_VERSION,
             request_id: "three-completed".to_owned(),
             idempotency_key: "three-completed-key".to_owned(),
             command: ServiceCommand::Status { task_id },
@@ -2577,7 +2719,7 @@ async fn acp_reconnect_during_three_epoch_task_replays_once_and_completes() -> T
         .map_err(|_| "three-epoch reconnect ACP connection did not close")???;
     owner
         .request(ServiceRequest {
-            protocol_version: 1,
+            protocol_version: SERVICE_PROTOCOL_VERSION,
             request_id: "three-shutdown".to_owned(),
             idempotency_key: "three-shutdown-key".to_owned(),
             command: ServiceCommand::Shutdown,

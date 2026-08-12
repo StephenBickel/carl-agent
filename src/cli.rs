@@ -31,6 +31,7 @@ use crate::memory::{
     MemoryKind, MemoryPartition, MemoryQuery, MemoryScope, MemorySettings, MemoryWrite,
 };
 use crate::policy::Frontend;
+use crate::runtime::task::TaskBudget;
 use crate::service::server::TaskService;
 use crate::sidecar::{
     DataRootLock, DataRootLockErrorCode, ExecutableTrustDecision, ExecutionWorkspace,
@@ -78,6 +79,79 @@ pub struct AcpArgs {
     pub permission_mode: Option<AcpPermissionMode>,
     #[arg(long, conflicts_with = "permission_mode")]
     pub dangerously_bypass_permissions: bool,
+    #[arg(long, value_parser = parse_max_wall_time_seconds)]
+    pub max_wall_time_seconds: Option<u64>,
+    #[arg(long, value_parser = parse_max_provider_requests)]
+    pub max_provider_requests: Option<u64>,
+    #[arg(long, value_parser = parse_max_tool_calls)]
+    pub max_tool_calls: Option<u64>,
+    #[arg(long, default_value_t = 900, value_parser = parse_soft_epoch_seconds)]
+    pub soft_epoch_seconds: u64,
+    #[arg(long, default_value_t = 40, value_parser = parse_soft_epoch_tool_calls)]
+    pub soft_epoch_tool_calls: u32,
+}
+
+impl AcpArgs {
+    #[must_use]
+    pub const fn task_budget(&self) -> TaskBudget {
+        TaskBudget {
+            max_wall_time_seconds: self.max_wall_time_seconds,
+            max_provider_requests: self.max_provider_requests,
+            max_tool_calls: self.max_tool_calls,
+            soft_epoch_seconds: self.soft_epoch_seconds,
+            soft_epoch_tool_calls: self.soft_epoch_tool_calls,
+        }
+    }
+}
+
+fn parse_max_wall_time_seconds(value: &str) -> Result<u64, String> {
+    parse_budget_u64(value, |budget, parsed| {
+        budget.max_wall_time_seconds = Some(parsed);
+    })
+}
+
+fn parse_max_provider_requests(value: &str) -> Result<u64, String> {
+    parse_budget_u64(value, |budget, parsed| {
+        budget.max_provider_requests = Some(parsed);
+    })
+}
+
+fn parse_max_tool_calls(value: &str) -> Result<u64, String> {
+    parse_budget_u64(value, |budget, parsed| {
+        budget.max_tool_calls = Some(parsed);
+    })
+}
+
+fn parse_soft_epoch_seconds(value: &str) -> Result<u64, String> {
+    parse_budget_u64(value, |budget, parsed| {
+        budget.soft_epoch_seconds = parsed;
+    })
+}
+
+fn parse_soft_epoch_tool_calls(value: &str) -> Result<u32, String> {
+    let parsed = value
+        .parse::<u32>()
+        .map_err(|_| "value must be an unsigned 32-bit integer".to_owned())?;
+    let budget = TaskBudget {
+        soft_epoch_tool_calls: parsed,
+        ..TaskBudget::default()
+    };
+    budget
+        .validate_for_admission()
+        .map_err(|error| error.to_string())?;
+    Ok(parsed)
+}
+
+fn parse_budget_u64(value: &str, assign: impl FnOnce(&mut TaskBudget, u64)) -> Result<u64, String> {
+    let parsed = value
+        .parse::<u64>()
+        .map_err(|_| "value must be an unsigned 64-bit integer".to_owned())?;
+    let mut budget = TaskBudget::default();
+    assign(&mut budget, parsed);
+    budget
+        .validate_for_admission()
+        .map_err(|error| error.to_string())?;
+    Ok(parsed)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -705,6 +779,7 @@ async fn try_run_service_acp(
     args: AcpArgs,
     frontend: Frontend,
 ) -> Option<ExitClassification> {
+    let budget = args.task_budget();
     let model = match args.model {
         Some(model) => match ModelId::parse(model) {
             Ok(model) => Some(model),
@@ -737,6 +812,7 @@ async fn try_run_service_acp(
             model,
             effort: args.effort.map(Into::into),
             permission_mode,
+            budget,
             buzz_publisher,
         },
     )

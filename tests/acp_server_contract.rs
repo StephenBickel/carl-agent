@@ -280,6 +280,13 @@ async fn task_resume_executes_a_bound_queued_task_and_returns_its_result() -> Te
         .get_frontend_session(&session_id)?
         .ok_or("frontend binding missing")?
         .session_id;
+    let persisted_budget = TaskBudget {
+        max_wall_time_seconds: Some(7_200),
+        max_provider_requests: Some(321),
+        max_tool_calls: Some(654),
+        soft_epoch_seconds: 600,
+        soft_epoch_tool_calls: 77,
+    };
     let task = store.create_task(NewTask {
         session_id: local_session,
         workspace: layout.workspace.clone(),
@@ -298,7 +305,7 @@ async fn task_resume_executes_a_bound_queued_task_and_returns_its_result() -> Te
         model: ModelId::parse("gpt-5.6-codex")?,
         effort: ReasoningEffort::Medium,
         permission_mode: carl::acp::PermissionMode::FullAccess,
-        budget: TaskBudget::default(),
+        budget: persisted_budget,
         created_at: Utc::now(),
     })?;
     drop(store);
@@ -331,6 +338,15 @@ async fn task_resume_executes_a_bound_queued_task_and_returns_its_result() -> Te
         resumed.value(),
     );
     assert_eq!(port_state.lock().unwrap().starts, 1);
+    assert_eq!(
+        Store::open(layout.root.join("carl.sqlite3"))?
+            .get_task(task.snapshot.task_id)?
+            .ok_or("resumed task missing")?
+            .snapshot
+            .budget,
+        persisted_budget,
+        "resuming through a default-config ACP server must retain persisted admission policy"
+    );
     client.finish().await?;
     Ok(())
 }

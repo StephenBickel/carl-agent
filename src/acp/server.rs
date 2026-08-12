@@ -20,7 +20,7 @@ use super::{
 use crate::delegates::{ModelId, ReasoningEffort};
 use crate::events::{Event, EventEnvelope, SessionId};
 use crate::policy::{ActorId, Frontend, Sha256Digest};
-use crate::runtime::task::{TaskEvent, TaskId, TaskStatus};
+use crate::runtime::task::{TaskBudget, TaskEvent, TaskId, TaskStatus};
 use crate::service::client::TaskServiceClient;
 use crate::service::protocol::{
     SERVICE_PROTOCOL_VERSION, ServiceApprovalDecision, ServiceCommand, ServiceRequest,
@@ -106,17 +106,19 @@ pub struct AcpServerConfig {
     pub model: Option<ModelId>,
     pub effort: Option<ReasoningEffort>,
     pub permission_mode: PermissionMode,
+    pub budget: TaskBudget,
     pub buzz_publisher: Option<BuzzPublisherBootstrap>,
 }
 
 impl AcpServerConfig {
     #[must_use]
-    pub const fn new(frontend: Frontend) -> Self {
+    pub fn new(frontend: Frontend) -> Self {
         Self {
             frontend,
             model: None,
             effort: None,
             permission_mode: PermissionMode::Default,
+            budget: TaskBudget::default(),
             buzz_publisher: None,
         }
     }
@@ -406,6 +408,7 @@ impl AcpServer {
                 model: self.config.model.clone(),
                 effort: self.config.effort,
                 mode: self.config.permission_mode,
+                budget: self.config.budget,
             })
             .await
             .map_err(map_kernel)?;
@@ -768,6 +771,7 @@ struct ServiceSessionBinding {
     model: ModelId,
     effort: ReasoningEffort,
     permission_mode: PermissionMode,
+    budget: TaskBudget,
     task_id: Option<TaskId>,
     last_event_cursor: Option<u64>,
     live_generation: String,
@@ -820,6 +824,10 @@ impl ServiceAcpServer {
         {
             return Err(invalid_input());
         }
+        config
+            .budget
+            .validate_for_admission()
+            .map_err(|_| invalid_input())?;
         let data_root = data_root.as_ref().to_path_buf();
         let client = TaskServiceClient::connect(&data_root)
             .await
@@ -1030,6 +1038,7 @@ impl ServiceAcpServer {
                 model: model.clone(),
                 effort,
                 permission_mode: self.config.permission_mode,
+                budget: self.config.budget,
                 task_id: None,
                 last_event_cursor: None,
                 live_generation: self.info.live_generation.clone(),
@@ -1126,6 +1135,7 @@ impl ServiceAcpServer {
                 model: model.clone(),
                 effort,
                 permission_mode: service_session.permission_mode,
+                budget: self.config.budget,
                 task_id,
                 last_event_cursor,
                 live_generation: live_generation.clone(),
@@ -1701,6 +1711,7 @@ fn service_start_command(
         model: session.model.clone(),
         effort: session.effort,
         permission_mode: session.permission_mode,
+        budget: session.budget,
     };
     match frontend {
         Frontend::Acp if buzz_context.is_none() => Ok(ServiceCommand::StartTask(start)),

@@ -8,6 +8,7 @@ use super::{BuzzContext, PermissionMode, SessionConfiguration};
 use crate::delegates::{ModelId, ReasoningEffort};
 use crate::events::SessionId;
 use crate::policy::{ActorId, Frontend};
+use crate::runtime::task::TaskBudget;
 use crate::runtime::task::{
     CheckpointId, CompletionClause, EpochId, RecoveryStrategy, TaskId, TaskSnapshot, TaskStatus,
 };
@@ -132,6 +133,7 @@ pub struct NewSessionRequest {
     pub model: Option<ModelId>,
     pub effort: Option<ReasoningEffort>,
     pub mode: PermissionMode,
+    pub budget: TaskBudget,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

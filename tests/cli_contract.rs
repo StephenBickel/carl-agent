@@ -1,5 +1,6 @@
 use carl::cli::{AcpEffort, AcpPermissionMode, Cli, Command, TrustCommand};
-use clap::Parser;
+use carl::runtime::task::TaskBudget;
+use clap::{CommandFactory, Parser};
 use predicates::prelude::PredicateBooleanExt;
 
 #[tokio::test(flavor = "current_thread")]
@@ -67,6 +68,86 @@ fn acp_startup_options_parse_exactly() {
         Cli::try_parse_from(["carl", "acp", "--permission-mode", "bypassPermissions"]).is_err(),
         "the legacy wire value must not remain an advertised CLI choice"
     );
+}
+
+#[test]
+fn acp_task_budget_flags_parse_exact_values_and_defaults() {
+    let parsed = Cli::try_parse_from([
+        "carl",
+        "acp",
+        "--max-wall-time-seconds",
+        "86400",
+        "--max-provider-requests",
+        "10000",
+        "--max-tool-calls",
+        "100000",
+        "--soft-epoch-seconds",
+        "3600",
+        "--soft-epoch-tool-calls",
+        "1000",
+    ])
+    .unwrap();
+    let Command::Acp(args) = parsed.command else {
+        panic!("expected ACP command");
+    };
+    assert_eq!(
+        args.task_budget(),
+        TaskBudget {
+            max_wall_time_seconds: Some(86_400),
+            max_provider_requests: Some(10_000),
+            max_tool_calls: Some(100_000),
+            soft_epoch_seconds: 3_600,
+            soft_epoch_tool_calls: 1_000,
+        }
+    );
+
+    let parsed = Cli::try_parse_from(["carl", "acp"]).unwrap();
+    let Command::Acp(args) = parsed.command else {
+        panic!("expected ACP command");
+    };
+    assert_eq!(args.task_budget(), TaskBudget::default());
+}
+
+#[test]
+fn acp_task_budget_flags_reject_values_outside_consumer_bounds() {
+    for (flag, maximum) in [
+        ("--max-wall-time-seconds", 86_400_u64),
+        ("--max-provider-requests", 10_000),
+        ("--max-tool-calls", 100_000),
+        ("--soft-epoch-seconds", 3_600),
+        ("--soft-epoch-tool-calls", 1_000),
+    ] {
+        for invalid in [0, maximum + 1] {
+            assert!(
+                Cli::try_parse_from(["carl", "acp", flag, &invalid.to_string()]).is_err(),
+                "{flag} accepted {invalid}"
+            );
+        }
+    }
+}
+
+#[test]
+fn acp_help_exposes_all_budget_flags_and_soft_defaults() {
+    let help = Cli::command()
+        .find_subcommand_mut("acp")
+        .expect("ACP subcommand exists")
+        .render_long_help()
+        .to_string();
+
+    for flag in [
+        "--max-wall-time-seconds",
+        "--max-provider-requests",
+        "--max-tool-calls",
+        "--soft-epoch-seconds",
+        "--soft-epoch-tool-calls",
+    ] {
+        assert!(help.contains(flag), "ACP help omitted {flag}: {help}");
+    }
+    assert!(
+        help.contains("[default: 900]"),
+        "soft seconds default missing"
+    );
+    assert!(help.contains("[default: 40]"), "soft tool default missing");
 }
 
 #[test]

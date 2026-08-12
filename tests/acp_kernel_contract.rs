@@ -21,7 +21,7 @@ use carl::runtime::agent_port::{
 };
 use carl::runtime::task::{
     CheckpointId, ClauseStatus, CompletionClause, EpochId, OperationStatus, RecoveryStrategy,
-    TaskEngineUpdate, TaskId, TaskStatus,
+    TaskBudget, TaskEngineUpdate, TaskId, TaskStatus,
 };
 use carl::sidecar::DataRootLock;
 use carl::storage::{ChannelId, ClientName, ExternalSessionId, RuntimeStore, Store};
@@ -197,6 +197,67 @@ async fn autonomous_capability_routes_initial_prompt_through_the_durable_task_en
         shared.lock().unwrap().starts,
         2,
         "one planning request plus one work request proves the legacy one-turn path was not used"
+    );
+    kernel.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn direct_acp_admission_budget_reaches_the_durable_task() -> TestResult {
+    let layout = Layout::new()?;
+    let port = ScriptedPort::autonomous_small_edit();
+    let kernel = Kernel::start_with_ports(layout.runtime()?, Box::new(port), None).await?;
+    let expected = TaskBudget {
+        max_wall_time_seconds: Some(7_200),
+        max_provider_requests: Some(321),
+        max_tool_calls: Some(654),
+        soft_epoch_seconds: 600,
+        soft_epoch_tool_calls: 77,
+    };
+    let mut request = new_session(&layout, Frontend::Acp, None)?;
+    request.mode = PermissionMode::BypassPermissions;
+    request.budget = expected;
+    let session = kernel.new_session(request).await?;
+
+    kernel
+        .prompt(
+            session.id(),
+            Prompt::new(vec!["complete a directly admitted durable edit".into()])?,
+        )
+        .await?;
+
+    let events = Store::open(&layout.database)?.read_events(session.id())?;
+    let persisted = events.iter().find_map(|envelope| match &envelope.event {
+        Event::TaskLifecycle {
+            event: carl::runtime::task::TaskEvent::Created { budget, .. },
+            ..
+        } => Some(*budget),
+        _ => None,
+    });
+    assert_eq!(persisted, Some(expected));
+    kernel.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn direct_acp_rejects_a_budget_outside_consumer_policy() -> TestResult {
+    let layout = Layout::new()?;
+    let kernel = Kernel::start_with_ports(
+        layout.runtime()?,
+        Box::new(ScriptedPort::autonomous_small_edit()),
+        None,
+    )
+    .await?;
+    let mut request = new_session(&layout, Frontend::Acp, None)?;
+    request.budget.soft_epoch_seconds = 29;
+
+    assert_eq!(
+        kernel
+            .new_session(request)
+            .await
+            .expect_err("programmatic ACP admission must share consumer budget policy")
+            .code(),
+        carl::acp::KernelErrorCode::InvalidInput
     );
     kernel.shutdown().await?;
     Ok(())
@@ -2415,6 +2476,7 @@ fn new_session(
         model: Some(ModelId::parse("gpt-5.6-codex")?),
         effort: Some(ReasoningEffort::High),
         mode: PermissionMode::Default,
+        budget: TaskBudget::default(),
     })
 }
 

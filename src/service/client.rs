@@ -181,8 +181,8 @@ impl TaskServiceClient {
         let result = self
             .request_once(&ServiceRequest {
                 protocol_version: SERVICE_PROTOCOL_VERSION,
-                request_id: "client-negotiate-v1".to_owned(),
-                idempotency_key: "client-negotiate-v1".to_owned(),
+                request_id: "client-negotiate-v2".to_owned(),
+                idempotency_key: "client-negotiate-v2".to_owned(),
                 command: ServiceCommand::Info,
             })
             .await?;
@@ -201,6 +201,7 @@ fn validate_info(info: &ServiceInfo) -> Result<(), ServiceClientError> {
         || info.models.len() > 128
         || !info.capabilities.durable_events
         || !info.capabilities.reconnect
+        || !info.capabilities.explicit_task_budgets
     {
         return Err(client_error(ServiceClientErrorCode::InvalidResponse));
     }
@@ -240,6 +241,7 @@ fn empty_info() -> ServiceInfo {
             reconnect: false,
             trusted_buzz_admission: false,
             configure_active_task: false,
+            explicit_task_budgets: false,
         },
     }
 }
@@ -482,7 +484,11 @@ const fn client_error(code: ServiceClientErrorCode) -> ServiceClientError {
 
 #[cfg(test)]
 mod tests {
-    use super::{WindowsPipeAceShape, valid_windows_pipe_security_shape};
+    use super::{
+        ServiceClientErrorCode, WindowsPipeAceShape, valid_windows_pipe_security_shape,
+        validate_info,
+    };
+    use crate::service::protocol::{SERVICE_PROTOCOL_VERSION, ServiceCapabilities, ServiceInfo};
     use crate::service::server::WINDOWS_PIPE_ACCESS;
 
     const LEGITIMATE: WindowsPipeAceShape = WindowsPipeAceShape {
@@ -491,6 +497,44 @@ mod tests {
         mask: WINDOWS_PIPE_ACCESS,
         current_user: true,
     };
+
+    fn info(explicit_task_budgets: bool) -> ServiceInfo {
+        ServiceInfo {
+            protocol_version: SERVICE_PROTOCOL_VERSION,
+            live_generation: "11111111-1111-4111-8111-111111111111".to_owned(),
+            models: Vec::new(),
+            default_model: None,
+            default_effort: None,
+            capabilities: ServiceCapabilities {
+                durable_events: true,
+                reconnect: true,
+                trusted_buzz_admission: true,
+                configure_active_task: true,
+                explicit_task_budgets,
+            },
+        }
+    }
+
+    #[test]
+    fn negotiation_requires_the_explicit_task_budget_capability() {
+        validate_info(&info(true)).expect("advertised budget support is accepted");
+        assert_eq!(
+            validate_info(&info(false))
+                .expect_err("false budget support must fail negotiation")
+                .code(),
+            ServiceClientErrorCode::InvalidResponse
+        );
+
+        let mut missing = serde_json::to_value(info(true)).unwrap();
+        missing["capabilities"]
+            .as_object_mut()
+            .unwrap()
+            .remove("explicit_task_budgets");
+        assert!(
+            serde_json::from_value::<ServiceInfo>(missing).is_err(),
+            "missing budget capability must fail closed"
+        );
+    }
 
     #[test]
     fn windows_pipe_security_shape_rejects_every_non_private_variant() {

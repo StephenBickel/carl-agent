@@ -10,10 +10,10 @@ use crate::delegates::{ModelId, ReasoningEffort};
 use crate::events::{EventEnvelope, SessionId, TurnId};
 use crate::policy::{ActorId, Frontend};
 use crate::runtime::task::{
-    CheckpointId, CompletionClause, OperationId, TaskId, TaskSnapshot, TaskStatus,
+    CheckpointId, CompletionClause, OperationId, TaskBudget, TaskId, TaskSnapshot, TaskStatus,
 };
 
-pub const SERVICE_PROTOCOL_VERSION: u16 = 1;
+pub const SERVICE_PROTOCOL_VERSION: u16 = 2;
 pub const MAX_SERVICE_FRAME_BYTES: usize = 256 * 1024;
 pub const MAX_TASK_TEXT_BYTES: usize = 16 * 1024;
 const MAX_IDENTIFIER_BYTES: usize = 128;
@@ -118,6 +118,7 @@ pub struct StartTaskCommand {
     pub model: ModelId,
     pub effort: ReasoningEffort,
     pub permission_mode: PermissionMode,
+    pub budget: TaskBudget,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -153,6 +154,7 @@ pub struct ServiceCapabilities {
     pub reconnect: bool,
     pub trusted_buzz_admission: bool,
     pub configure_active_task: bool,
+    pub explicit_task_budgets: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -524,7 +526,11 @@ fn validate_start(command: &StartTaskCommand) -> Result<(), ProtocolError> {
         MAX_EXTERNAL_SESSION_BYTES,
         false,
     )?;
-    validate_bounded_text(&command.request, MAX_TASK_TEXT_BYTES, true)
+    validate_bounded_text(&command.request, MAX_TASK_TEXT_BYTES, true)?;
+    command
+        .budget
+        .validate_for_admission()
+        .map_err(|_| protocol_error(ProtocolErrorCode::InvalidRequest))
 }
 
 fn validate_hex_digest(value: &str) -> Result<(), ProtocolError> {

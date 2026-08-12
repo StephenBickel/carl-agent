@@ -286,6 +286,79 @@ fn task_budget_uses_fixed_soft_epoch_defaults() {
 }
 
 #[test]
+fn task_budget_structural_validation_preserves_engine_fixture_values() {
+    let valid = [
+        TaskBudget::default(),
+        TaskBudget {
+            max_wall_time_seconds: Some(0),
+            max_provider_requests: Some(0),
+            max_tool_calls: Some(0),
+            soft_epoch_seconds: 1,
+            soft_epoch_tool_calls: 1,
+        },
+        TaskBudget {
+            max_wall_time_seconds: Some(u64::MAX),
+            max_provider_requests: Some(u64::MAX),
+            max_tool_calls: Some(u64::MAX),
+            soft_epoch_seconds: u64::MAX,
+            soft_epoch_tool_calls: u32::MAX,
+        },
+    ];
+    for budget in valid {
+        budget
+            .validate()
+            .expect("structurally valid engine budget must remain accepted");
+    }
+
+    for budget in [
+        TaskBudget {
+            soft_epoch_seconds: 0,
+            ..TaskBudget::default()
+        },
+        TaskBudget {
+            soft_epoch_tool_calls: 0,
+            ..TaskBudget::default()
+        },
+    ] {
+        assert_eq!(
+            budget
+                .validate()
+                .expect_err("zero soft epoch limit must fail")
+                .code(),
+            TaskValidationErrorCode::InvalidBudget
+        );
+    }
+}
+
+#[test]
+fn created_event_rejects_a_structurally_invalid_budget() {
+    let mut event = created();
+    let TaskEvent::Created { budget, .. } = &mut event else {
+        unreachable!("created helper always returns a creation event");
+    };
+    budget.soft_epoch_seconds = 0;
+
+    assert_eq!(
+        event
+            .validate()
+            .expect_err("created event must fail closed on an invalid budget")
+            .code(),
+        TaskValidationErrorCode::InvalidBudget
+    );
+}
+
+#[test]
+fn task_budget_serde_rejects_unknown_fields() {
+    let mut encoded = serde_json::to_value(TaskBudget::default()).unwrap();
+    encoded["unexpected_limit"] = json!(1);
+
+    assert!(
+        serde_json::from_value::<TaskBudget>(encoded).is_err(),
+        "unknown budget policy fields must fail closed"
+    );
+}
+
+#[test]
 fn only_exact_file_change_effect_requests_are_idempotent_mutations() {
     let request = AgentEffectRequest {
         context_id: AgentContextId::parse("context").unwrap(),

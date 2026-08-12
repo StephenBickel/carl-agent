@@ -235,6 +235,8 @@ pub enum TaskValidationErrorCode {
     InvalidEvidenceSequence,
     #[error("file postcondition is invalid")]
     InvalidFilePostcondition,
+    #[error("task budget is invalid")]
+    InvalidBudget,
 }
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
@@ -448,12 +450,45 @@ pub enum NormalizedOperationEvidence {
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct TaskBudget {
     pub max_wall_time_seconds: Option<u64>,
     pub max_provider_requests: Option<u64>,
     pub max_tool_calls: Option<u64>,
     pub soft_epoch_seconds: u64,
     pub soft_epoch_tool_calls: u32,
+}
+
+impl TaskBudget {
+    pub fn validate(&self) -> Result<(), TaskValidationError> {
+        if self.soft_epoch_seconds == 0 || self.soft_epoch_tool_calls == 0 {
+            return Err(TaskValidationError::from_code(
+                TaskValidationErrorCode::InvalidBudget,
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn validate_for_admission(&self) -> Result<(), TaskValidationError> {
+        self.validate()?;
+        if self
+            .max_wall_time_seconds
+            .is_some_and(|value| !(1..=86_400).contains(&value))
+            || self
+                .max_provider_requests
+                .is_some_and(|value| !(1..=10_000).contains(&value))
+            || self
+                .max_tool_calls
+                .is_some_and(|value| !(1..=100_000).contains(&value))
+            || !(30..=3_600).contains(&self.soft_epoch_seconds)
+            || !(1..=1_000).contains(&self.soft_epoch_tool_calls)
+        {
+            return Err(TaskValidationError::from_code(
+                TaskValidationErrorCode::InvalidBudget,
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl Default for TaskBudget {
@@ -978,10 +1013,12 @@ impl TaskEvent {
             Self::Created {
                 workspace,
                 contract,
+                budget,
                 ..
             } => {
                 validate_workspace(workspace)?;
-                contract.validate()
+                contract.validate()?;
+                budget.validate()
             }
             Self::StateTransitioned { reason, .. }
             | Self::CompactionRequested { reason, .. }

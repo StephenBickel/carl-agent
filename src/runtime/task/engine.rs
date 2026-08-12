@@ -234,6 +234,7 @@ pub(crate) struct OwnerStartTask {
     pub model: ModelId,
     pub effort: ReasoningEffort,
     pub permission_mode: PermissionMode,
+    pub budget: TaskBudget,
     pub trusted_admission: Option<OwnerTrustedAdmission>,
     pub idempotency_key: String,
     pub command_digest: [u8; 32],
@@ -1002,7 +1003,7 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                 model: input.model,
                 effort: input.effort,
                 permission_mode,
-                budget: TaskBudget::default(),
+                budget: input.budget,
             },
             Some((&input.idempotency_key, input.command_digest)),
         )
@@ -5013,8 +5014,7 @@ fn validate_start(input: &StartTask) -> Result<(), TaskEngineError> {
         || input.request.as_bytes().contains(&0)
         || !input.workspace.is_absolute()
         || !input.workspace.is_dir()
-        || input.budget.soft_epoch_seconds == 0
-        || input.budget.soft_epoch_tool_calls == 0
+        || input.budget.validate().is_err()
     {
         return Err(invalid_task());
     }
