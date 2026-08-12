@@ -269,7 +269,12 @@ def load_metric_pack(path: Path) -> MetricPack:
     """Load one immutable metric pack after its complete contract validates."""
     value = _read_pack(path)
     _exact_keys(value, _PACK_KEYS, name="metric_pack")
-    if value["schema_version"] != 1:
+    schema_version = value["schema_version"]
+    if (
+        isinstance(schema_version, bool)
+        or not isinstance(schema_version, int)
+        or schema_version != 1
+    ):
         raise MetricContractError("metric_pack_schema_unsupported")
     pack_id = value["pack_id"]
     if (

@@ -59,6 +59,21 @@ def test_metric_pack_is_canonical_sorted_and_content_addressed(tmp_path: Path) -
     assert len(pack.digest) == 64
 
 
+@pytest.mark.parametrize("schema_version", [True, 1.0])
+def test_metric_pack_rejects_non_integer_schema_version(
+    tmp_path: Path, schema_version: object
+) -> None:
+    path = write_pack(
+        tmp_path, metrics=[metric("workflow.audit_written", "final_state")]
+    )
+    value = json.loads(path.read_text(encoding="utf-8"))
+    value["schema_version"] = schema_version
+    path.write_text(json.dumps(value), encoding="utf-8")
+
+    with pytest.raises(MetricContractError, match="metric_pack_schema_unsupported"):
+        load_metric_pack(path)
+
+
 @pytest.mark.parametrize("observation", ["command_sequence", "exact_trajectory"])
 def test_path_scoring_observations_are_rejected(tmp_path: Path, observation: str) -> None:
     with pytest.raises(MetricContractError, match="metric_observation_unsupported"):

@@ -97,6 +97,27 @@ def test_pack_field_change_invalidates_existing_task_binding(
     assert not destination.exists()
 
 
+@pytest.mark.parametrize("schema_version", [True, 1.0])
+def test_cli_rejects_non_integer_pack_schema_before_adapter_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, schema_version: object
+) -> None:
+    repository = tmp_path / "repository"
+    pack_directory = repository / "benchmarks" / "metrics"
+    pack_directory.mkdir(parents=True)
+    pack_path = pack_directory / "dev-v1.json"
+    pack = json.loads(
+        (Path(__file__).parents[1] / "metrics" / "dev-v1.json").read_text(encoding="utf-8")
+    )
+    pack["schema_version"] = schema_version
+    pack_path.write_text(json.dumps(pack), encoding="utf-8")
+    monkeypatch.setattr(cli, "REPOSITORY_ROOT", repository)
+    monkeypatch.setattr(cli, "_adapter", refuse_adapter_start)
+
+    destination = tmp_path / "scorecard.json"
+    assert run_scripted(destination) == 2
+    assert not destination.exists()
+
+
 def test_help_and_task_validation_are_available(capsys: pytest.CaptureFixture[str]) -> None:
     with pytest.raises(SystemExit) as help_exit:
         cli.main(["--help"])
