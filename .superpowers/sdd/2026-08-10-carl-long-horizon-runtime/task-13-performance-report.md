@@ -2,27 +2,26 @@
 
 ## Status
 
-`DONE_WITH_CONCERNS` after fix round 1/5: the semantic, corruption, formatting, and
-lint gates pass, and the capped exact test execution improved from 27.61 seconds to
-26.61 seconds. The surrounding process wall time is not comparable because Cargo
-rebuilt the integration binary for 8.23 seconds immediately before the only
-authorized measurement. The execution-time speedup is real, but warm wall-clock
-confirmation remains a performance-evidence concern for the next independent review.
+`DONE_WITH_CONCERNS` after fix round 2/5: the semantic, corruption, rollback,
+formatting, and lint gates pass. The required prebuilt warm measurement passed in
+27.78 seconds test / 27.88 seconds real, but did not beat the original 27.61 / 27.70
+baseline. The performance objective is therefore unmet by the current capped
+evidence; implementation and tuning stopped after that single heavy run.
 
 ## Design
 
 - `Store` owns a non-serialized, task-keyed authenticated-checkpoint cache. Each
-  entry binds the canonical checkpoint, its digest, source-sequence end, and the
-  SQLite `PRAGMA data_version` observed when it was authenticated.
+  entry is a compact authority summary binding checkpoint/task identity, digest,
+  source range, generation, operations, usage, replayed task/configuration state,
+  and the SQLite `PRAGMA data_version` observed when it was authenticated.
 - A checkpoint commit retains the existing immediate transaction and revision CAS.
   When the cached anchor's data version and exact database row match, authority is
   reconstructed from that authenticated checkpoint plus the exclusive, ascending,
   task-local journal tail after its source-sequence end. Paging remains at 512 rows.
 - On cache absence, uncertainty, mismatch, or an out-of-band commit, the existing
-  full journal-authority routine remains the corruption oracle. Before that full
-  scan, the exact latest predecessor is authenticated against its canonical bytes,
-  digest, task/checkpoint identity, source range, immediate previous-digest lineage,
-  atomic canonical context package, generation, event sequence, and artifact set.
+  full journal-authority routine remains the corruption oracle. The task journal is
+  replayed and the complete task-filtered canonical checkpoint/package chain is
+  validated before authority can be refreshed.
 - Successful full or transitive incremental commits refresh the cache. Failed
   validation, a failed CAS, and uncommitted writes never refresh it.
 - Startup keeps the authoritative task records already reconstructed during
@@ -74,7 +73,7 @@ confirmation remains a performance-evidence concern for the next independent rev
 
 ## GREEN evidence
 
-The final focused batch completed successfully:
+The initial implementation's focused batch completed successfully:
 
 ```text
 cargo test --locked --lib checkpoint_authority_tests
@@ -139,7 +138,7 @@ full-path checkpoint validations and 189 incremental validations across its two
 are structurally derived counts; the counters are test-only and are not exported by
 the integration evaluation.
 
-## Timing
+## Superseded pre-fix-round timing history
 
 Same host, debug test profile, locked dependencies, warm exact command:
 
@@ -149,13 +148,14 @@ Same host, debug test profile, locked dependencies, warm exact command:
 
 | Measurement | Test | Real | User | Sys |
 | --- | ---: | ---: | ---: | ---: |
-| Before | 27.61s | 27.70s | 26.72s | 0.54s |
-| Final capped after | 36.73s | 37.38s | 29.10s | 1.27s |
+| Original baseline | 27.61s | 27.70s | 26.72s | 0.54s |
+| Superseded initial implementation | 36.73s | 37.38s | 29.10s | 1.27s |
 
-The final run passed but regressed by 9.12 seconds in test time (33.0%) and 9.68
+This historical run passed but regressed by 9.12 seconds in test time (33.0%) and 9.68
 seconds in wall time (34.9%). An earlier post-change warm sample was also slower at
 31.10 seconds test / 31.44 seconds real. The performance objective is therefore
-unmet; no additional tuning or weakening of proof was attempted after the cap.
+unmet in this superseded pre-fix-round evidence. Later fix-round measurements are
+recorded below and govern current status.
 
 ## Residual work and risks
 
@@ -304,7 +304,7 @@ scenario's epochs, restarts, compactions, cuts, and assertions were unchanged.
 - Every fallback or incremental corruption mutation leaves successful path counters
   unchanged.
 
-### Capped exact benchmark
+### Superseded fix-round 1 capped exact sample
 
 The one authorized unchanged command was:
 
@@ -321,12 +321,13 @@ user 29.58
 sys 2.38
 ```
 
-The test execution is 1.00 second (3.6%) faster than the original 27.61-second
-baseline and 10.12 seconds faster than the pre-fix-round 36.73-second regression.
+This superseded sample's test execution was 1.00 second (3.6%) faster than the
+original 27.61-second baseline and 10.12 seconds faster than the pre-fix-round
+36.73-second regression.
 Cargo reported `Compiling carl-agent` and spent 8.23 seconds rebuilding the
 integration target immediately before the test, so the 36.02-second process wall
-time cannot be compared to the original 27.70-second warm wall time. The timing cap
-prohibited a second run; no rerun or further tuning was performed.
+time could not be compared to the original 27.70-second warm wall time. Fix round 2
+therefore prebuilt the target and produced the current comparable evidence below.
 
 ### Fix-round self-review and residual concerns
 
@@ -342,6 +343,130 @@ prohibited a second run; no rerun or further tuning was performed.
   authority are retained because they are required to reconstruct tail semantics.
 - The full fallback remains intentionally expensive after every reopen or external
   commit. No total-linear-complexity claim is made.
-- The execution-time objective is met by one second, but the single process wall
-  sample included compilation. A separately authorized prebuilt warm measurement
-  would be needed to close that evidence gap without violating this round's cap.
+- In this superseded round-1 sample, test execution beat baseline by one second but
+  process wall time included compilation. Round 2's prebuilt warm measurement below
+  replaces it as the current performance evidence.
+
+## Fix round 2/5 — authenticated-session paging and late-failure rollback
+
+### Findings addressed
+
+1. Incremental tail validation no longer calls the public task-to-session discovery
+   pager. A private pager accepts the `session_id` from the authenticated cached task
+   snapshot and queries `events` by `session_id` and `sequence > cursor`, ordered by
+   ascending sequence and capped at 512 rows. The SQL retains the JSON lifecycle type
+   and task-ID predicates, and every row still passes through `RawEvent` decoding and
+   envelope validation.
+2. The existing `events_by_session_sequence ON events(session_id, sequence)` index
+   supports this access path. No migration or index change was required.
+3. Projection disagreement during checkpoint fallback is again surfaced as typed
+   `CarlError::Validation`; unrelated SQLite/storage failures retain their storage
+   error type.
+4. Full/incremental counters now advance only after the immediate transaction commits,
+   rather than after authority validation but before journal/checkpoint/projection
+   writes. A late failure therefore changes neither SQL state nor in-memory path
+   evidence. Cache refresh remains after commit.
+
+### RED evidence
+
+- The existing 514-event boundary test was extended with test-only discovery-query
+  instrumentation. After resetting the counter immediately before incremental
+  commit, it observed 3 discovery queries: one for each 512-row page, 2-row page, and
+  terminating empty page. The required literal was zero.
+- `full_fallback_rejects_a_projection_rolled_back_to_a_non_latest_predecessor` was
+  restored from generic `is_err()` to `matches!(..., Err(CarlError::Validation { .. }))`.
+  It failed because journal/projection disagreement surfaced as `CarlError::Storage`.
+- `late_checkpoint_insert_failure_rolls_back_without_advancing_cache_or_counters`
+  installs a trigger that aborts insertion into `task_checkpoints`, after successful
+  incremental authority validation and checkpoint-event append. Before the fix, the
+  transaction rolled back its SQL changes but the path counters changed from
+  `(1, 0)` to `(1, 1)`.
+
+### GREEN contracts
+
+- The 514-event tail crosses the 512-row boundary and remains exclusive, complete,
+  ascending, and task-isolated even with another task's events interleaved in the
+  same session. Incremental commit records zero task-to-session discovery queries.
+- Non-latest projection rollback now returns typed `CarlError::Validation` and does
+  not advance journal length, revision, checkpoint rows, or successful path counts.
+- The injected late checkpoint-row failure returns typed `CarlError::Storage` and
+  leaves journal length, task revision, checkpoint rows, the cached authority `Arc`,
+  and path counters unchanged. After removing the trigger, the identical candidate
+  commits through the same incremental authority path and advances exactly once.
+
+Final focused evidence:
+
+```text
+cargo test --locked --lib checkpoint_authority_tests
+  10 passed; 0 failed; 69 filtered out
+
+cargo test --locked --test context_engine_contract
+  20 passed; 0 failed
+
+cargo test --locked --test task_storage_contract
+  21 passed; 0 failed
+
+cargo test --locked --test epoch_engine_contract startup
+  3 passed; 0 failed; 78 filtered out
+
+cargo test --locked --test long_horizon_eval fixture_copies_with_the_same_clock_read_are_isolated
+  1 passed; 0 failed; 7 filtered out
+
+cargo test --locked --test long_horizon_eval repository_fixture_rejects
+  2 passed; 0 failed; 6 filtered out
+
+cargo fmt -- --check
+  exit 0
+
+cargo clippy --locked --all-targets --all-features -- -D warnings
+  exit 0
+
+git diff --check
+  exit 0
+```
+
+No broad all-features test suite or full dedicated test target was run. The fixture
+isolation correction and long-horizon scenario semantics were unchanged.
+
+### Current prebuilt warm benchmark
+
+The exact integration target was prebuilt first:
+
+```text
+cargo test --locked --test long_horizon_eval --no-run
+  Finished test profile in 0.43s
+```
+
+Then exactly one warm heavy command was run:
+
+```text
+/usr/bin/time -p cargo test --locked --test long_horizon_eval actual_engine_survives_one_hundred_epochs_and_normalizes_replay -- --exact --nocapture
+test result: 1 passed; 0 failed; 7 filtered out; finished in 27.78s
+real 27.88
+user 26.63
+sys 0.58
+```
+
+| Current comparison | Test | Real |
+| --- | ---: | ---: |
+| Original baseline | 27.61s | 27.70s |
+| Fix round 2 prebuilt warm | 27.78s | 27.88s |
+| Difference | +0.17s (+0.6%) | +0.18s (+0.6%) |
+
+The semantic proof passed, but neither test time nor real time demonstrates the
+required speedup. Per the timing cap, no second heavy command, tuning, weakened
+validation, or evaluation change was attempted.
+
+### Round-2 self-review and residual concern
+
+- Production/test changes are confined to `src/storage/repository.rs`; this report is
+  the only documentation change. `SECURITY.md` remains untouched.
+- The private known-session pager is used only when the session comes from the
+  same-Store authenticated authority. Public discovery APIs and full journal replay
+  retain their multi-session ambiguity checks.
+- Tail paging uses the existing indexed `(session_id, sequence)` access path while
+  retaining JSON task isolation and all decoding checks.
+- Failed SQL commit paths cannot advance the cache or successful-validation counters.
+- Correctness and rollback evidence is green. The current comparable performance
+  evidence misses the binding speedup requirement by approximately 0.6%, so Task 13's
+  performance release dependency remains a concern pending review.
