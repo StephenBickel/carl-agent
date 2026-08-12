@@ -48,9 +48,16 @@
   multi-file mutation, actual recovery-strategy selection, provider loss and reopen,
   cancellation/interrupt lifecycle, policy denial, out-of-scope validation, and a
   possibly-applied ambiguous effect that remains blocked after reopen without replay.
+- Command-recovery cases now assert the ordered durable lifecycle itself: an exit-one
+  command records incomplete/exit-one normalized evidence and transitions to Failed
+  before the recovery intent; the final recovery command records complete/exit-zero
+  evidence and transitions to Succeeded. A focused unit test rejects any normalization
+  that treats exit one as success.
 - Fixture admission accepts exactly `README.md`, `Cargo.toml`, `src/lib.rs`, and
   `tests/contract.rs`; extra files and symlinks fail closed. CI structurally requires
-  the exact locked command, ungated and exactly once in `jobs.test`.
+  the exact locked command, ungated and exactly once in `jobs.test`. The all-features
+  command explicitly skips the named 100-epoch test and the workflow contract rejects
+  an unfiltered duplicate, so the expensive proof runs only once per CI execution.
 - `Store::read_task_events_after` pages an exclusive task-local tail. Checkpoint
   construction now reads only events after the previous checkpoint while preserving
   canonical merge and authority behavior.
@@ -98,13 +105,19 @@
 
 ```text
 cargo test --locked --test long_horizon_eval
-PASS: 7 passed, 0 failed; test body 30.40s (real 30.68s)
+PASS: 7 passed, 0 failed; test body 28.05s (real 28.27s)
+
+cargo test --locked --lib evals::scenario::tests::ordered_command_recovery_rejects_exit_one_normalized_as_success -- --exact
+PASS: 1 passed, 0 failed; 0.00s
+
+cargo test --locked --test long_horizon_eval repository_release_gate_matrix_is_bounded_and_isolated -- --exact
+PASS: 1 passed, 0 failed; 0.86s
 
 cargo test --locked --test epoch_engine_contract every_required_engine_restart_cut_restarts_from_real_engine_state -- --exact
 PASS: 1 passed, 0 failed; 1.37s
 
 cargo test --locked --test workflow_contract
-PASS: 39 passed, 0 failed; 0.01s
+PASS: 40 passed, 0 failed; 0.01s
 
 cargo test --locked --test task_storage_contract
 PASS: 21 passed, 0 failed; 3.51s
@@ -119,13 +132,21 @@ git diff --check
 PASS: exit 0
 ```
 
-The plan's under-ten-second target is not met on this host. The exact test improved
-from 49.35s to 30.40s by removing full-prefix reads from checkpoint construction
-without weakening the two real 100-epoch runs. No evaluator sleeps, subprocesses,
-network calls, credentials, or live providers are involved. Remaining cost includes
-full authoritative checkpoint validation and repeated startup reconciliation; this
-round intentionally did not weaken those checks. The root agent owns the Task 13 full
-`cargo test --locked --all-features` milestone gate after independent review.
+The bounded repository matrix meets its under-ten-second target at 0.86s. The
+dedicated heavy gate meets the reference-host target below 45 seconds at 28.05s and
+runs exactly once in CI; it is not duplicated through the all-features step. No
+evaluator sleeps, subprocesses, network calls, credentials, or live providers are
+involved. Remaining cost includes full authoritative checkpoint validation and
+repeated startup reconciliation; this round intentionally did not weaken those
+checks.
+
+Before Task 14, the plan requires a separately reviewed incremental
+checkpoint-authority/startup performance follow-on. It must optimize from the latest
+authenticated canonical checkpoint and task-local durable tail while preserving
+journal authority, lineage/digest validation, fail-closed startup, exact restart cuts,
+and the two-run normalized replay proof. The root agent owns that follow-on, its
+independent review, and the later full `cargo test --locked --all-features` milestone
+gate.
 
 No Carl service/ACP process remained. `SECURITY.md`, migrations, `Cargo.lock`, and
 Task 14 files were not modified.
@@ -134,3 +155,4 @@ Task 14 files were not modified.
 
 - `5d1b01b test: add deterministic long-horizon evaluations`
 - `3e4293d test: harden deterministic long-horizon evaluations`
+- `2be6e65 test: harden recovery and long-horizon CI gates`

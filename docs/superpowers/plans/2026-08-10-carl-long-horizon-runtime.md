@@ -1850,8 +1850,22 @@ cargo test --locked --test long_horizon_eval
 
 Extend `tests/workflow_contract.rs` to require that exact locked command. The
 deterministic evaluation must use no credentials, network, subprocess, or wall-clock
-sleeps and should complete in under ten seconds locally so `--all-features` does not
-turn it into a soak test.
+sleeps. The bounded ten-case repository matrix should complete in under ten seconds
+locally. The dedicated gate, including the two real 100-epoch runs and authoritative
+startup reconciliation, has a reference-host target below 45 seconds and must run
+exactly once in CI. The all-features step must skip the named 100-epoch test so it does
+not silently execute the heavy proof a second time.
+
+Before Task 14 begins, complete a separately reviewed incremental
+checkpoint-authority/startup performance follow-on. It must reduce repeated startup
+and checkpoint-validation work by consuming the latest authenticated canonical
+checkpoint plus its task-local durable tail. It must preserve the append-only journal
+as authority, validate checkpoint lineage and digests, fail closed on corruption or an
+unresolved `Started` operation, and retain the uninterrupted-versus-restarted replay
+digest proof. Performance work may not bypass canonical validation, reconciliation,
+or the exact durable-sequence restart semantics. This follow-on is a mandatory
+Task 13 release dependency, not optional Task 14 soak tuning, and requires an
+independent review before live OAuth work starts.
 
 - [ ] **Step 6: Verify and commit**
 
