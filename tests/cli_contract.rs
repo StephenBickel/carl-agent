@@ -1,4 +1,6 @@
-use carl::cli::{AcpEffort, AcpPermissionMode, Cli, Command, MaintenanceCommand, TrustCommand};
+use carl::cli::{
+    AcpEffort, AcpPermissionMode, BaselineCommand, Cli, Command, MaintenanceCommand, TrustCommand,
+};
 use carl::runtime::task::TaskBudget;
 use clap::{CommandFactory, Parser};
 use predicates::prelude::PredicateBooleanExt;
@@ -36,6 +38,94 @@ fn maintenance_status_and_prepare_parse_as_closed_owner_commands() {
         ));
     }
     assert!(Cli::try_parse_from(["carl", "maintenance", "shutdown"]).is_err());
+}
+
+#[test]
+fn direct_codex_baseline_parses_exact_required_values_default_and_bounds() {
+    let parsed = Cli::try_parse_from([
+        "carl",
+        "baseline",
+        "codex",
+        "--workspace",
+        "/tmp/canonical-fixture",
+        "--model",
+        "gpt-5.6-terra",
+        "--effort",
+        "low",
+    ])
+    .expect("the direct Codex baseline command parses");
+    let Command::Baseline {
+        command: BaselineCommand::Codex(args),
+    } = parsed.command
+    else {
+        panic!("expected direct Codex baseline command");
+    };
+    assert_eq!(
+        args.workspace,
+        std::path::Path::new("/tmp/canonical-fixture")
+    );
+    assert_eq!(args.model, "gpt-5.6-terra");
+    assert_eq!(args.effort, AcpEffort::Low);
+    assert_eq!(args.timeout_seconds, 7_200);
+
+    for valid in [60, 28_800] {
+        assert!(
+            Cli::try_parse_from([
+                "carl",
+                "baseline",
+                "codex",
+                "--workspace",
+                "/tmp/canonical-fixture",
+                "--model",
+                "gpt-5.6-terra",
+                "--effort",
+                "low",
+                "--timeout-seconds",
+                &valid.to_string(),
+            ])
+            .is_ok()
+        );
+    }
+    for invalid in [59, 28_801] {
+        assert!(
+            Cli::try_parse_from([
+                "carl",
+                "baseline",
+                "codex",
+                "--workspace",
+                "/tmp/canonical-fixture",
+                "--model",
+                "gpt-5.6-terra",
+                "--effort",
+                "low",
+                "--timeout-seconds",
+                &invalid.to_string(),
+            ])
+            .is_err()
+        );
+    }
+    for missing in ["--workspace", "--model", "--effort"] {
+        let mut arguments = vec![
+            "carl",
+            "baseline",
+            "codex",
+            "--workspace",
+            "/tmp/canonical-fixture",
+            "--model",
+            "gpt-5.6-terra",
+            "--effort",
+            "low",
+        ];
+        let index = arguments
+            .iter()
+            .position(|argument| *argument == missing)
+            .expect("required flag is in fixture");
+        arguments.drain(index..=index + 1);
+        assert!(
+            Cli::try_parse_from(arguments).is_err(),
+            "accepted missing {missing}"
+        );
+    }
 }
 
 #[test]

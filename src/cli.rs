@@ -9,7 +9,7 @@ use std::time::Duration;
 use chrono::{TimeDelta, Utc};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
-use tokio::io::BufReader;
+use tokio::io::{AsyncReadExt, BufReader};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -24,8 +24,11 @@ use crate::auth::{
     SubscriptionAuthBroker, SubscriptionPlan, SubscriptionService,
 };
 use crate::buzz_mcp;
-use crate::delegates::codex::CodexAppServer;
-use crate::delegates::{ModelId, ReasoningEffort};
+use crate::delegates::codex::{
+    CodexAppServer, CodexExecAdapter, DirectBaselineErrorCode, DirectCodexBaseline,
+    DirectCodexBaselineRequest,
+};
+use crate::delegates::{BoundedDelegateTask, ModelId, ReasoningEffort};
 use crate::error::{CarlError, ErrorCode};
 use crate::events::SessionId;
 use crate::memory::{
@@ -74,9 +77,40 @@ pub enum Command {
         #[command(subcommand)]
         command: MaintenanceCommand,
     },
+    Baseline {
+        #[command(subcommand)]
+        command: BaselineCommand,
+    },
     Pair,
     Doctor,
     Sessions,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Subcommand)]
+pub enum BaselineCommand {
+    Codex(BaselineCodexArgs),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Args)]
+pub struct BaselineCodexArgs {
+    #[arg(long)]
+    pub workspace: PathBuf,
+    #[arg(long)]
+    pub model: String,
+    #[arg(long, value_enum)]
+    pub effort: AcpEffort,
+    #[arg(long, default_value_t = 7_200, value_parser = parse_baseline_timeout_seconds)]
+    pub timeout_seconds: u64,
+}
+
+fn parse_baseline_timeout_seconds(value: &str) -> Result<u64, String> {
+    let parsed = value
+        .parse::<u64>()
+        .map_err(|_| "value must be an unsigned 64-bit integer".to_owned())?;
+    if !(60..=28_800).contains(&parsed) {
+        return Err("value must be between 60 and 28800 seconds".to_owned());
+    }
+    Ok(parsed)
 }
 
 #[derive(Clone, Debug, Args)]
@@ -636,10 +670,195 @@ where
         Command::Memory { command } => run_memory(command),
         Command::Trust { command } => run_trust(command),
         Command::Maintenance { command } => run_maintenance(command, cancellation.as_mut()).await,
+        Command::Baseline { command } => run_baseline(command, cancellation.as_mut()).await,
         Command::Serve => run_serve(cancellation.as_mut()).await,
         Command::Pair => CliRunResult::not_implemented("pair"),
         Command::Doctor => CliRunResult::not_implemented("doctor"),
         Command::Sessions => CliRunResult::not_implemented("sessions"),
+    }
+}
+
+async fn run_baseline<C>(command: BaselineCommand, mut cancellation: Pin<&mut C>) -> CliRunResult
+where
+    C: Future<Output = ()> + ?Sized,
+{
+    match command {
+        BaselineCommand::Codex(args) => {
+            let prepared = match prepare_direct_codex_baseline(&args) {
+                Ok(prepared) => prepared,
+                Err(code) => return direct_baseline_error(code),
+            };
+            let mut task_bytes = Vec::with_capacity(16 * 1_024 + 1);
+            let mut stdin = tokio::io::stdin().take(16 * 1_024 + 1);
+            let read = stdin.read_to_end(&mut task_bytes);
+            tokio::pin!(read);
+            tokio::select! {
+                result = &mut read => {
+                    if result.is_err() {
+                        return direct_baseline_error(DirectBaselineErrorCode::InvalidRequest);
+                    }
+                }
+                () = cancellation.as_mut() => {
+                    return direct_baseline_cancelled();
+                }
+            }
+            run_prepared_direct_codex_baseline(prepared, &task_bytes, cancellation.as_mut()).await
+        }
+    }
+}
+
+/// Run the direct baseline with explicit bytes after performing the same production
+/// trust, provider-home, and credential bootstrap used by the stdin command.
+#[doc(hidden)]
+pub async fn run_baseline_codex_with_input(
+    args: BaselineCodexArgs,
+    input: &[u8],
+    cancellation: CancellationToken,
+) -> CliRunResult {
+    let prepared = match prepare_direct_codex_baseline(&args) {
+        Ok(prepared) => prepared,
+        Err(code) => return direct_baseline_error(code),
+    };
+    let cancellation_future = cancellation.cancelled_owned();
+    tokio::pin!(cancellation_future);
+    run_prepared_direct_codex_baseline(prepared, input, cancellation_future.as_mut()).await
+}
+
+struct PreparedDirectCodexBaseline {
+    baseline: DirectCodexBaseline,
+    workspace: ExecutionWorkspace,
+    model: ModelId,
+    effort: ReasoningEffort,
+    timeout: Duration,
+    _data_root_lock: DataRootLock,
+}
+
+fn prepare_direct_codex_baseline(
+    args: &BaselineCodexArgs,
+) -> Result<PreparedDirectCodexBaseline, DirectBaselineErrorCode> {
+    if ["OPENAI_API_KEY", "CODEX_API_KEY", "AZURE_OPENAI_API_KEY"]
+        .into_iter()
+        .any(|variable| env::var_os(variable).is_some())
+    {
+        return Err(DirectBaselineErrorCode::InvalidRequest);
+    }
+    let data_root = env::var_os("CARL_DATA_DIR")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .ok_or(DirectBaselineErrorCode::StartFailed)?;
+    let data_root =
+        fs::canonicalize(data_root).map_err(|_| DirectBaselineErrorCode::StartFailed)?;
+    let data_root_lock =
+        DataRootLock::acquire(&data_root).map_err(|_| DirectBaselineErrorCode::StartFailed)?;
+    let canonical_workspace =
+        fs::canonicalize(&args.workspace).map_err(|_| DirectBaselineErrorCode::InvalidRequest)?;
+    if canonical_workspace != args.workspace {
+        return Err(DirectBaselineErrorCode::InvalidRequest);
+    }
+    let workspace = ExecutionWorkspace::open(&canonical_workspace)
+        .map_err(|_| DirectBaselineErrorCode::InvalidRequest)?;
+    let provider_home = data_root.join("providers").join("codex");
+    let home = ProviderHome::prepare(
+        ProviderEnvironmentProfile::Codex,
+        &data_root,
+        &canonical_workspace,
+        provider_home,
+    )
+    .map_err(|_| DirectBaselineErrorCode::StartFailed)?;
+    let (candidate, explicit_override) = configured_executable(AuthService::Openai)
+        .map_err(|_| DirectBaselineErrorCode::StartFailed)?;
+    let resolved = ResolvedExecutable::resolve(&candidate)
+        .map_err(|_| DirectBaselineErrorCode::StartFailed)?;
+    let decision = if resolved.metadata_risk().is_none() {
+        ExecutableTrustDecision::TrustCanonicalPath
+    } else if explicit_override && candidate == resolved.canonical_path() {
+        ExecutableTrustDecision::TrustCanonicalPathWithMetadataRisk
+    } else {
+        ExecutableTrustDecision::TrustCanonicalPath
+    };
+    let executable = resolved
+        .trust(decision)
+        .map_err(|_| DirectBaselineErrorCode::StartFailed)?;
+    let adapter =
+        CodexExecAdapter::new(executable, home, SidecarLimits::default()).map_err(|error| {
+            match error.code() {
+                crate::delegates::codex::DelegateErrorCode::AuthenticationRequired => {
+                    DirectBaselineErrorCode::AuthenticationRequired
+                }
+                crate::delegates::codex::DelegateErrorCode::Incompatible => {
+                    DirectBaselineErrorCode::Incompatible
+                }
+                _ => DirectBaselineErrorCode::StartFailed,
+            }
+        })?;
+    Ok(PreparedDirectCodexBaseline {
+        baseline: DirectCodexBaseline::new(adapter),
+        workspace,
+        model: ModelId::parse(args.model.clone())
+            .map_err(|_| DirectBaselineErrorCode::InvalidRequest)?,
+        effort: args.effort.into(),
+        timeout: Duration::from_secs(args.timeout_seconds),
+        _data_root_lock: data_root_lock,
+    })
+}
+
+async fn run_prepared_direct_codex_baseline<C>(
+    prepared: PreparedDirectCodexBaseline,
+    input: &[u8],
+    mut cancellation: Pin<&mut C>,
+) -> CliRunResult
+where
+    C: Future<Output = ()> + ?Sized,
+{
+    let task = match std::str::from_utf8(input) {
+        Ok(task) if !task.is_empty() && input.len() <= 16 * 1_024 => task,
+        _ => return direct_baseline_error(DirectBaselineErrorCode::InvalidRequest),
+    };
+    let task = match BoundedDelegateTask::parse(task.to_owned()) {
+        Ok(task) => task,
+        Err(_) => return direct_baseline_error(DirectBaselineErrorCode::InvalidRequest),
+    };
+    let token = CancellationToken::new();
+    let run = prepared.baseline.run(
+        DirectCodexBaselineRequest {
+            workspace: prepared.workspace,
+            task,
+            model: prepared.model,
+            effort: prepared.effort,
+            timeout: prepared.timeout,
+        },
+        token.clone(),
+    );
+    tokio::pin!(run);
+    let result = tokio::select! {
+        result = &mut run => result,
+        () = cancellation.as_mut() => {
+            token.cancel();
+            run.await
+        }
+    };
+    match result {
+        Ok(result) => CliRunResult::json_success(&result),
+        Err(error) if error.code() == DirectBaselineErrorCode::Cancelled => {
+            direct_baseline_cancelled()
+        }
+        Err(error) => direct_baseline_error(error.code()),
+    }
+}
+
+fn direct_baseline_error(code: DirectBaselineErrorCode) -> CliRunResult {
+    CliRunResult {
+        stdout: String::new(),
+        stderr: format!("carl baseline codex: failed ({})\n", code.as_str()),
+        exit: ExitClassification::Failure,
+    }
+}
+
+fn direct_baseline_cancelled() -> CliRunResult {
+    CliRunResult {
+        stdout: String::new(),
+        stderr: "carl baseline codex: cancelled\n".to_owned(),
+        exit: ExitClassification::Cancelled,
     }
 }
 
