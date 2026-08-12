@@ -14,11 +14,15 @@ TASK_ROOT = Path(__file__).parents[1] / "tasks" / "dev"
 
 
 def run_scripted(result: Path, *extra: str) -> int:
+    return run_scripted_for(TASK_ROOT, result, *extra)
+
+
+def run_scripted_for(task_root: Path, result: Path, *extra: str) -> int:
     return cli.main(
         [
             "run",
             "--tasks",
-            os.fspath(TASK_ROOT),
+            os.fspath(task_root),
             "--adapter",
             "scripted",
             "--attempts",
@@ -32,6 +36,65 @@ def run_scripted(result: Path, *extra: str) -> int:
             *extra,
         ]
     )
+
+
+def copy_task_root(tmp_path: Path) -> Path:
+    destination = tmp_path / "tasks"
+    shutil.copytree(TASK_ROOT, destination)
+    return destination
+
+
+def refuse_adapter_start(*_args: object) -> object:
+    raise AssertionError("adapter must not start before metric-pack validation")
+
+
+def test_cli_rejects_task_metric_pack_digest_mismatch_before_adapter_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tasks = copy_task_root(tmp_path)
+    manifest_path = tasks / "coding-fix-config-lookup" / "carl-task.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["metric_pack_digest"] = "0" * 64
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    monkeypatch.setattr(cli, "_adapter", refuse_adapter_start)
+
+    destination = tmp_path / "scorecard.json"
+    assert run_scripted_for(tasks, destination) == 2
+    assert not destination.exists()
+
+
+def test_cli_rejects_unknown_task_metric_before_adapter_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tasks = copy_task_root(tmp_path)
+    manifest_path = tasks / "coding-fix-config-lookup" / "carl-task.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["metric_ids"] = ["coding.config_precedence_correct", "coding.unknown_behavior"]
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    monkeypatch.setattr(cli, "_adapter", refuse_adapter_start)
+
+    destination = tmp_path / "scorecard.json"
+    assert run_scripted_for(tasks, destination) == 2
+    assert not destination.exists()
+
+
+def test_pack_field_change_invalidates_existing_task_binding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = tmp_path / "repository"
+    pack_directory = repository / "benchmarks" / "metrics"
+    pack_directory.mkdir(parents=True)
+    shutil.copy2(Path(__file__).parents[1] / "metrics" / "dev-v1.json", pack_directory)
+    pack_path = pack_directory / "dev-v1.json"
+    pack = json.loads(pack_path.read_text(encoding="utf-8"))
+    pack["metrics"][0]["threshold_basis_points"] = 9_999
+    pack_path.write_text(json.dumps(pack), encoding="utf-8")
+    monkeypatch.setattr(cli, "REPOSITORY_ROOT", repository)
+    monkeypatch.setattr(cli, "_adapter", refuse_adapter_start)
+
+    destination = tmp_path / "scorecard.json"
+    assert run_scripted(destination) == 2
+    assert not destination.exists()
 
 
 def test_help_and_task_validation_are_available(capsys: pytest.CaptureFixture[str]) -> None:

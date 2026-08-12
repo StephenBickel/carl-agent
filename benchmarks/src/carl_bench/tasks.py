@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import stat
 import tomllib
 from dataclasses import dataclass
@@ -10,6 +11,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from carl_bench.canonical import CanonicalizationError, sha256_tree
+from carl_bench.metrics import is_metric_id
 from carl_bench.models import TaskIdentity
 
 _MANIFEST_KEYS = frozenset(
@@ -17,6 +19,8 @@ _MANIFEST_KEYS = frozenset(
         "agent_timeout_sec",
         "capabilities",
         "fixture_dir",
+        "metric_ids",
+        "metric_pack_digest",
         "public",
         "schema_version",
         "track",
@@ -27,6 +31,7 @@ _MANIFEST_KEYS = frozenset(
 )
 _CAPABILITIES = frozenset({"filesystem", "shell"})
 _TRACKS = frozenset({"coding", "workflow", "safety"})
+_DIGEST = re.compile(r"[0-9a-f]{64}")
 _REQUIRED_FILES = (
     "carl-task.json",
     "environment/Dockerfile",
@@ -58,6 +63,8 @@ class BenchmarkTask:
     verifier_timeout_sec: int
     capabilities: frozenset[str]
     public: bool
+    metric_pack_digest: str
+    metric_ids: tuple[str, ...]
 
 
 def _read_required(path: Path, *, maximum: int = 1_048_576) -> bytes:
@@ -196,6 +203,19 @@ def load_task(path: Path) -> BenchmarkTask:
 
     if manifest["schema_version"] != 1:
         raise TaskContractError("task_schema_unsupported")
+    metric_pack_digest = manifest["metric_pack_digest"]
+    if not isinstance(metric_pack_digest, str) or _DIGEST.fullmatch(metric_pack_digest) is None:
+        raise TaskContractError("task_metric_pack_digest_invalid")
+    metric_ids_value = manifest["metric_ids"]
+    if not isinstance(metric_ids_value, list) or not metric_ids_value or any(
+        not is_metric_id(metric_id) for metric_id in metric_ids_value
+    ):
+        raise TaskContractError("task_metric_ids_invalid")
+    metric_ids = tuple(metric_ids_value)
+    if tuple(sorted(metric_ids, key=str.encode)) != metric_ids:
+        raise TaskContractError("task_metric_ids_not_sorted")
+    if len(set(metric_ids)) != len(metric_ids):
+        raise TaskContractError("task_metric_ids_duplicate")
     track = manifest["track"]
     if track not in _TRACKS:
         raise TaskContractError("task_track_unsupported")
@@ -302,6 +322,8 @@ def load_task(path: Path) -> BenchmarkTask:
         verifier_timeout_sec=verifier_timeout,
         capabilities=capabilities,
         public=public,
+        metric_pack_digest=metric_pack_digest,
+        metric_ids=metric_ids,
     )
 
 

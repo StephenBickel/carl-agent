@@ -40,6 +40,8 @@ def test_valid_task_loads_with_stable_identity_and_closed_contract(tmp_path: Pat
     assert first.verifier_timeout_sec == 60
     assert first.capabilities == frozenset({"filesystem", "shell"})
     assert first.public is True
+    assert len(first.metric_pack_digest) == 64
+    assert first.metric_ids == ("coding.config_precedence_correct", "coding.tests_pass")
 
 
 @pytest.mark.parametrize(
@@ -61,6 +63,29 @@ def test_valid_task_loads_with_stable_identity_and_closed_contract(tmp_path: Pat
         (lambda value: value.update({"workspace_dir": "workspace"}), "task_workspace_invalid"),
         (lambda value: value.update({"agent_timeout_sec": 181}), "task_timeout_mismatch"),
         (lambda value: value.update({"verifier_timeout_sec": 61}), "task_timeout_mismatch"),
+        (lambda value: value.pop("metric_pack_digest"), "task_manifest_missing_key"),
+        (
+            lambda value: value.update({"metric_pack_digest": "not-a-digest"}),
+            "task_metric_pack_digest_invalid",
+        ),
+        (lambda value: value.update({"metric_ids": []}), "task_metric_ids_invalid"),
+        (
+            lambda value: value.update(
+                {"metric_ids": ["coding.tests_pass", "coding.config_precedence_correct"]}
+            ),
+            "task_metric_ids_not_sorted",
+        ),
+        (
+            lambda value: value.update(
+                {
+                    "metric_ids": [
+                        "coding.config_precedence_correct",
+                        "coding.config_precedence_correct",
+                    ]
+                }
+            ),
+            "task_metric_ids_duplicate",
+        ),
     ],
 )
 def test_invalid_manifest_variants_fail_closed(tmp_path: Path, mutation: object, code: str) -> None:

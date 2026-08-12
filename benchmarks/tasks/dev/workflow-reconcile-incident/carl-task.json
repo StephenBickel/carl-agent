@@ -1,5 +1,7 @@
 {
   "schema_version": 1,
+  "metric_pack_digest": "abbb693f6d9db17bfe6f5c843c8cfc8d863b0829073fc76f91061b59d6abe7d2",
+  "metric_ids": ["workflow.audit_complete", "workflow.records_consistent"],
   "track": "workflow",
   "fixture_dir": "environment/fixture",
   "workspace_dir": "/workspace",

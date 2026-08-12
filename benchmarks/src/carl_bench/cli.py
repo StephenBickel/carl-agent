@@ -51,6 +51,7 @@ from carl_bench.experiment import (
 )
 from carl_bench.github_draft import DraftPrGateway
 from carl_bench.ledger import ExperimentLedger
+from carl_bench.metrics import load_metric_pack
 from carl_bench.models import RunManifest, Scorecard, TrialResult
 from carl_bench.report import compare_runs, summarize_run
 from carl_bench.run_attestation import attest_run
@@ -296,6 +297,17 @@ def _select_tasks(root: Path, selectors: Sequence[str]) -> tuple[BenchmarkTask, 
     return tuple(by_id[selector] for selector in sorted(selectors, key=str.encode))
 
 
+def _validate_metric_bindings(tasks: Sequence[BenchmarkTask]) -> None:
+    """Fail closed against the single visible development metric pack."""
+    pack = load_metric_pack(REPOSITORY_ROOT / "benchmarks" / "metrics" / "dev-v1.json")
+    metric_ids = frozenset(metric.metric_id for metric in pack.metrics)
+    for task in tasks:
+        if task.metric_pack_digest != pack.digest:
+            raise ValueError("task metric-pack digest does not match the visible pack")
+        if any(metric_id not in metric_ids for metric_id in task.metric_ids):
+            raise ValueError("task metric ID is absent from the visible pack")
+
+
 def _adapter(args: argparse.Namespace) -> tuple[AgentAdapter, str, str | None, str | None]:
     league = args.league
     if args.adapter == "scripted":
@@ -343,6 +355,7 @@ async def _execute_run(
     tasks = _select_tasks(task_root, args.task)
     if not tasks:
         raise ValueError("no benchmark tasks selected")
+    _validate_metric_bindings(tasks)
     adapter, league, model, effort = _adapter(args)
     runner = BenchmarkRunner()
     trials: list[TrialResult] = []
