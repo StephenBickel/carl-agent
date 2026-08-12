@@ -1,6 +1,11 @@
 /target/
 /.worktrees/
 
+# Opt-in live endurance artifacts are local evidence, never source inputs.
+/live-results/
+**/live-smoke.json
+**/paired-*.json
+
 # Local credentials and environment overrides
 .env
 .env.*

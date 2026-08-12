@@ -8,6 +8,7 @@ import { chmod, mkdir, mkdtemp, readFile, realpath, writeFile } from "node:fs/pr
 import { tmpdir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
+import { closedChildEnvironment } from "./lib/live-runner-core.mjs";
 
 const repository = resolve(import.meta.dirname, "..");
 const executable = resolve(process.env.CARL_BIN ?? join(repository, "target/release/carl"));
@@ -28,20 +29,10 @@ const canonicalWorkspace = await realpath(workspace);
 await chmod(tempRoot, 0o700);
 await writeFile(join(canonicalWorkspace, "target.txt"), "broken\n", { mode: 0o600 });
 
-const environment = { ...process.env };
-for (const name of Object.keys(environment)) {
-  if (
-    name === "OPENAI_API_KEY" ||
-    name === "CODEX_API_KEY" ||
-    name === "AZURE_OPENAI_API_KEY" ||
-    name.startsWith("BUZZ_") ||
-    name.startsWith("XAI_")
-  ) {
-    delete environment[name];
-  }
-}
-environment.CARL_DATA_DIR = dataRoot;
-environment.CARL_CODEX_EXECUTABLE = codex;
+const environment = closedChildEnvironment(process.env, {
+  CARL_DATA_DIR: dataRoot,
+  CARL_CODEX_EXECUTABLE: codex,
+});
 
 const child = spawn(
   executable,

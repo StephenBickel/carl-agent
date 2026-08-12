@@ -1,4 +1,4 @@
-use std::{collections::BTreeSet, fs, path::PathBuf};
+use std::{collections::BTreeSet, fs, path::PathBuf, process::Command};
 
 use carl::cli::Cli;
 use clap::{CommandFactory, Parser, error::ErrorKind};
@@ -231,6 +231,53 @@ fn readme_and_buzz_guide_publish_the_safe_operational_settings() {
             .is_file(),
         "the documented opt-in live smoke script must exist"
     );
+}
+
+#[test]
+fn long_horizon_runner_self_test_enforces_the_offline_contract() {
+    let script = repository_root().join("scripts/live-codex-long-horizon.mjs");
+    assert!(script.is_file(), "the opt-in endurance runner must exist");
+
+    let output = Command::new("node")
+        .arg(&script)
+        .arg("--self-test")
+        .current_dir(repository_root())
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .output()
+        .expect("the offline endurance self-test must start");
+    assert!(
+        output.status.success(),
+        "offline endurance self-test failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.stderr.is_empty(),
+        "successful self-test must be quiet"
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("self-test stdout must be UTF-8"),
+        "{\"schema_version\":1,\"passed\":true,\"checks\":7}\n"
+    );
+
+    let source = read_document("scripts/live-codex-long-horizon.mjs");
+    for required in [
+        "CARL_DATA_DIR=/absolute/private/root",
+        "CARL_CODEX_EXECUTABLE=/absolute/path/to/codex",
+        "CARL_BIN=/absolute/path/to/release/carl",
+        "CARL_LIVE_MODEL=gpt-5.6-terra",
+        "CARL_LIVE_EFFORT=low",
+        "CARL_LIVE_DURATION_HOURS=2",
+        "node scripts/live-codex-long-horizon.mjs",
+        "--self-test",
+        "thirty independent paired runs",
+        "no result artifact",
+    ] {
+        assert!(
+            source.contains(required),
+            "endurance runner is missing pinned contract text: {required:?}"
+        );
+    }
 }
 
 fn validate_fenced_carl_commands(markdown: &str) -> Result<(), String> {
