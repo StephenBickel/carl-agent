@@ -5,6 +5,19 @@ use serde_yaml_ng::{Mapping, Value};
 const CHECKOUT_ACTION: &str = "actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683";
 const CHECKOUT_TAG: &str = "v4.2.2";
 const APPROVED_ALL_FEATURES_TEST: &str = "cargo test --all-features -- --skip actual_engine_survives_one_hundred_epochs_and_normalizes_replay";
+const QUALITY_RUN_COMMANDS: &[&str] = &[
+    "cargo fmt --check",
+    "cargo clippy --all-targets --all-features -- -D warnings",
+    "cargo test --doc",
+    "cargo install cargo-deny --locked --version 0.20.2",
+    "cargo deny check",
+];
+const TEST_RUN_COMMANDS: &[&str] = &[
+    r#""CARGO_TARGET_DIR=$env:USERPROFILE\carl-ci-target" >> $env:GITHUB_ENV"#,
+    "cargo test --locked --test buzz_acp_contract --test buzz_end_to_end",
+    "cargo test --locked --test long_horizon_eval",
+    APPROVED_ALL_FEATURES_TEST,
+];
 
 fn repository_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -67,183 +80,26 @@ fn run_commands<'a>(job: &'a Mapping, context: &str) -> Result<Vec<&'a str>, Str
         .collect()
 }
 
-fn shell_simple_commands(command: &str) -> Result<Vec<Vec<String>>, String> {
-    #[derive(Clone, Copy, Eq, PartialEq)]
-    enum Quote {
-        None,
-        Single,
-        Double,
-    }
-
-    fn finish_word(words: &mut Vec<String>, word: &mut String, started: &mut bool) {
-        if *started {
-            words.push(std::mem::take(word));
-            *started = false;
-        }
-    }
-
-    fn finish_command(commands: &mut Vec<Vec<String>>, words: &mut Vec<String>) {
-        if !words.is_empty() {
-            commands.push(std::mem::take(words));
-        }
-    }
-
-    let mut commands = Vec::new();
-    let mut words = Vec::new();
-    let mut word = String::new();
-    let mut word_started = false;
-    let mut quote = Quote::None;
-    let mut characters = command.chars().peekable();
-    while let Some(character) = characters.next() {
-        match quote {
-            Quote::Single => {
-                if character == '\'' {
-                    quote = Quote::None;
-                } else {
-                    word.push(character);
-                }
-            }
-            Quote::Double => match character {
-                '"' => quote = Quote::None,
-                '\\' => {
-                    let escaped = characters.next().ok_or_else(|| {
-                        "CI run command must not end with an incomplete escape".to_owned()
-                    })?;
-                    word.push(escaped);
-                }
-                _ => word.push(character),
-            },
-            Quote::None => match character {
-                '\'' => {
-                    quote = Quote::Single;
-                    word_started = true;
-                }
-                '"' => {
-                    quote = Quote::Double;
-                    word_started = true;
-                }
-                '\\' => {
-                    let escaped = characters.next().ok_or_else(|| {
-                        "CI run command must not end with an incomplete escape".to_owned()
-                    })?;
-                    word.push(escaped);
-                    word_started = true;
-                }
-                '#' if !word_started => {
-                    for comment_character in characters.by_ref() {
-                        if comment_character == '\n' {
-                            break;
-                        }
-                    }
-                    finish_command(&mut commands, &mut words);
-                }
-                ';' | '|' | '&' | '\n' => {
-                    finish_word(&mut words, &mut word, &mut word_started);
-                    finish_command(&mut commands, &mut words);
-                }
-                character if character.is_whitespace() => {
-                    finish_word(&mut words, &mut word, &mut word_started);
-                }
-                _ => {
-                    word.push(character);
-                    word_started = true;
-                }
-            },
-        }
-    }
-    if quote != Quote::None {
-        return Err("CI run command must not contain an unterminated quote".to_owned());
-    }
-    finish_word(&mut words, &mut word, &mut word_started);
-    finish_command(&mut commands, &mut words);
-    Ok(commands)
-}
-
-fn is_shell_assignment(word: &str) -> bool {
-    let Some((name, _)) = word.split_once('=') else {
-        return false;
-    };
-    let mut characters = name.chars();
-    characters
-        .next()
-        .is_some_and(|character| character == '_' || character.is_ascii_alphabetic())
-        && characters.all(|character| character == '_' || character.is_ascii_alphanumeric())
-}
-
-fn executable_name(word: &str) -> &str {
-    word.rsplit('/').next().unwrap_or(word)
-}
-
-fn executable_index(words: &[String]) -> Option<usize> {
-    let mut index = 0;
-    while words
-        .get(index)
-        .is_some_and(|word| is_shell_assignment(word))
-    {
-        index += 1;
-    }
-    if words
-        .get(index)
-        .is_some_and(|word| executable_name(word) == "env")
-    {
-        index += 1;
-        while let Some(word) = words.get(index) {
-            if word == "--" {
-                index += 1;
-                break;
-            }
-            if word == "-u" || word == "--unset" {
-                index += 2;
-                continue;
-            }
-            if word.starts_with('-') || is_shell_assignment(word) {
-                index += 1;
-                continue;
-            }
-            break;
-        }
-    }
-    while words
-        .get(index)
-        .is_some_and(|word| matches!(executable_name(word), "command" | "exec"))
-    {
-        index += 1;
-        while words.get(index).is_some_and(|word| word.starts_with('-')) {
-            index += 1;
-        }
-    }
-    words.get(index).map(|_| index)
-}
-
-fn command_contains_all_features_cargo_test(command: &str) -> Result<bool, String> {
-    for words in shell_simple_commands(command)? {
-        let Some(executable) = executable_index(&words) else {
-            continue;
+fn validate_run_command_allowlist(jobs: &Mapping) -> Result<(), String> {
+    for (name, value) in jobs {
+        let name = name
+            .as_str()
+            .ok_or_else(|| "job names must be strings".to_owned())?;
+        let allowed = match name {
+            "quality" => QUALITY_RUN_COMMANDS,
+            "test" => TEST_RUN_COMMANDS,
+            _ => &[],
         };
-        match executable_name(&words[executable]) {
-            "cargo" => {
-                let arguments = &words[executable + 1..];
-                if arguments.iter().any(|word| word == "test")
-                    && arguments.iter().any(|word| word == "--all-features")
-                {
-                    return Ok(true);
-                }
+        let job = value_map(value, &format!("jobs.{name}"))?;
+        for command in run_commands(job, &format!("jobs.{name}"))? {
+            if !allowed.contains(&command) {
+                return Err(format!(
+                    "jobs.{name} contains unapproved run command `{command}`"
+                ));
             }
-            "bash" | "sh" | "zsh" => {
-                let arguments = &words[executable + 1..];
-                if let Some(command_index) = arguments
-                    .iter()
-                    .position(|word| word.starts_with('-') && word[1..].contains('c'))
-                    && let Some(nested) = arguments.get(command_index + 1)
-                    && command_contains_all_features_cargo_test(nested)?
-                {
-                    return Ok(true);
-                }
-            }
-            _ => {}
         }
     }
-    Ok(false)
+    Ok(())
 }
 
 fn validate_common(root: &Mapping, workflow: &str) -> Result<(), String> {
@@ -635,19 +491,7 @@ fn validate_ci_workflow(workflow: &str) -> Result<(), String> {
             "CI must run the filtered all-features command exactly once per matrix expansion, found {all_feature_test_count} step definitions"
         ));
     }
-    for (name, value) in jobs {
-        let name = name.as_str().unwrap_or("<non-string-job>");
-        let job = value_map(value, &format!("jobs.{name}"))?;
-        for command in run_commands(job, &format!("jobs.{name}"))? {
-            if command != APPROVED_ALL_FEATURES_TEST
-                && command_contains_all_features_cargo_test(command)?
-            {
-                return Err(format!(
-                    "CI cargo test invocations with `--all-features` must exactly equal `{APPROVED_ALL_FEATURES_TEST}`"
-                ));
-            }
-        }
-    }
+    validate_run_command_allowlist(jobs)?;
 
     let long_horizon_test_count = jobs
         .iter()
@@ -1174,20 +1018,19 @@ fn checker_rejects_duplicate_long_horizon_release_gate_steps() {
 }
 
 #[test]
-fn checker_rejects_every_unapproved_all_features_cargo_test_spelling() {
+fn checker_rejects_every_run_command_outside_the_job_allowlist() {
     for command in [
-        "cargo test --all-features",
+        "command env cargo test --all-features",
+        "env --chdir . cargo test --all-features",
+        "exec -a carl cargo test --all-features",
+        "bash -c 'exec cargo test --all-features'",
         "cargo test --locked --all-features",
-        "cargo --locked test --all-features",
-        "cargo --manifest-path Cargo.toml test --all-features",
-        "cargo test --all-features --workspace",
         "cargo test --workspace --all-features",
-        "cargo test --all-features --locked -- --skip actual_engine_survives_one_hundred_epochs_and_normalizes_replay",
-        "cargo test --all-features -- --skip actual_engine_survives_one_hundred_epochs_and_normalizes_replay && echo complete",
-        "bash -c 'cargo test --all-features'",
+        "cargo --manifest-path Cargo.toml test --all-features",
+        "echo 'cargo test --all-features'",
     ] {
         let replacement = format!(
-            "      - name: Test all features\n        run: {APPROVED_ALL_FEATURES_TEST}\n      - name: Unapproved all-features test\n        run: {command}\n"
+            "      - name: Test all features\n        run: {APPROVED_ALL_FEATURES_TEST}\n      - name: Unapproved command\n        run: {command}\n"
         );
         let workflow = replace_in_workflow(
             "ci.yml",
@@ -1199,23 +1042,9 @@ fn checker_rejects_every_unapproved_all_features_cargo_test_spelling() {
 
         assert_ci_rejected(
             &workflow,
-            "CI cargo test invocations with `--all-features` must exactly equal",
+            &format!("jobs.test contains unapproved run command `{command}`"),
         );
     }
-}
-
-#[test]
-fn checker_does_not_classify_non_cargo_command_arguments_as_cargo_invocations() {
-    let replacement = format!(
-        "      - name: Test all features\n        run: {APPROVED_ALL_FEATURES_TEST}\n      - name: Describe without running\n        run: echo 'cargo test --all-features'\n"
-    );
-    let workflow = replace_in_workflow(
-        "ci.yml",
-        &format!("      - name: Test all features\n        run: {APPROVED_ALL_FEATURES_TEST}\n"),
-        &replacement,
-    );
-
-    assert_ci_workflow(&workflow);
 }
 
 #[test]
