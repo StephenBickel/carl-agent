@@ -24,7 +24,6 @@ const CODEX_VERSION: &str = "0.146.0";
 const MINIMUM_TIMEOUT: Duration = Duration::from_secs(60);
 const MAXIMUM_TIMEOUT: Duration = Duration::from_secs(28_800);
 const MAXIMUM_TASK_BYTES: usize = 16 * 1_024;
-const START_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -383,12 +382,7 @@ impl DirectCodexBaseline {
     where
         F: Future<Output = Result<CodexExecRun, DelegateError>>,
     {
-        let mut cleanup_timeout = self.deadline.wait(START_CLEANUP_TIMEOUT);
-        let run = tokio::select! {
-            result = started_run.as_mut() => result.ok(),
-            () = cleanup_timeout.as_mut() => None,
-        };
-        if let Some(mut run) = run {
+        if let Ok(mut run) = started_run.as_mut().await {
             let _ = run.cancel().await;
         }
     }

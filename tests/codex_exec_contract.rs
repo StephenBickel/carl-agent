@@ -33,8 +33,8 @@ use libtest_mimic::{Arguments, Failed, Trial};
 use semver::VersionReq;
 use serde_json::json;
 use support::{
-    SECRET_SENTINEL, TestLayout, short_limits, wait_for_fixture_pids, wait_until_processes_exit,
-    wait_until_processes_reaped,
+    SECRET_SENTINEL, TestLayout, processes_have_been_reaped, short_limits, wait_for_fixture_pids,
+    wait_until_processes_exit, wait_until_processes_reaped,
 };
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
@@ -82,10 +82,6 @@ impl FixtureBaselineDeadline {
 
     fn fire(&self) {
         self.permits.add_permits(1);
-    }
-
-    fn fire_twice(&self) {
-        self.permits.add_permits(2);
     }
 }
 
@@ -255,8 +251,12 @@ fn main() {
             direct_baseline_timeout_reaps_descendants_without_partial_success,
         ),
         test(
-            "direct baseline timeout bounds start cleanup and reaps version descendants",
-            direct_baseline_timeout_bounds_start_cleanup_and_reaps_version_descendants,
+            "direct baseline timeout awaits bounded start cleanup and reaps version descendants",
+            direct_baseline_timeout_awaits_bounded_start_cleanup_and_reaps_version_descendants,
+        ),
+        test(
+            "direct baseline cancellation awaits start cleanup and reaps version descendants",
+            direct_baseline_cancellation_awaits_start_cleanup_and_reaps_version_descendants,
         ),
         test(
             "direct baseline CLI emits one sanitized JSON line",
@@ -1356,7 +1356,8 @@ fn direct_baseline_timeout_reaps_descendants_without_partial_success() -> TestRe
     })
 }
 
-fn direct_baseline_timeout_bounds_start_cleanup_and_reaps_version_descendants() -> TestResult {
+fn direct_baseline_timeout_awaits_bounded_start_cleanup_and_reaps_version_descendants() -> TestResult
+{
     run_async(async {
         let layout = TestLayout::new()?;
         fs::write(layout.data.join("fixture-version-hang"), b"hang")?;
@@ -1383,21 +1384,66 @@ fn direct_baseline_timeout_bounds_start_cleanup_and_reaps_version_descendants() 
             pids = wait_for_fixture_pids(&layout.home) => pids?,
             result = &mut run => return Err(format!("baseline ended before start timeout: {result:?}").into()),
         };
-        deadline.fire_twice();
+        deadline.fire();
         let error = run
             .await
             .expect_err("start-phase timeout must not return partial success");
         assert_eq!(error.code(), DirectBaselineErrorCode::TimedOut);
+        let leader_was_reaped_when_run_resolved = processes_have_been_reaped(&[leader]);
         assert_eq!(
             deadline
                 .observed
                 .lock()
                 .expect("deadline observation lock is available")
                 .as_slice(),
-            &[Duration::from_secs(60), Duration::from_secs(2)]
+            &[Duration::from_secs(60)]
         );
         wait_until_processes_exit(&[leader, grandchild]).await?;
         wait_until_processes_reaped(&[leader]).await?;
+        assert!(
+            leader_was_reaped_when_run_resolved,
+            "the start-phase leader must already be reaped when the baseline resolves"
+        );
+        assert!(!layout.home.join("exec-record.json").exists());
+        Ok(())
+    })
+}
+
+fn direct_baseline_cancellation_awaits_start_cleanup_and_reaps_version_descendants() -> TestResult {
+    run_async(async {
+        let layout = TestLayout::new()?;
+        fs::write(layout.data.join("fixture-version-hang"), b"hang")?;
+        let adapter = codex_adapter_fixture(&layout, ProviderEnvironmentProfile::Codex)?;
+        let baseline = DirectCodexBaseline::new(adapter);
+        let cancellation = CancellationToken::new();
+        let cancelled = cancellation.clone();
+        let run = baseline.run(
+            DirectCodexBaselineRequest {
+                workspace: ExecutionWorkspace::open(&layout.workspace)?,
+                task: BoundedDelegateTask::parse("cancel during version probe")?,
+                model: ModelId::parse("gpt-5.6-terra")?,
+                effort: ReasoningEffort::Low,
+                timeout: Duration::from_secs(60),
+            },
+            cancellation,
+        );
+        tokio::pin!(run);
+        let (leader, grandchild) = tokio::select! {
+            pids = wait_for_fixture_pids(&layout.home) => pids?,
+            result = &mut run => return Err(format!("baseline ended before start cancellation: {result:?}").into()),
+        };
+        cancelled.cancel();
+        let error = run
+            .await
+            .expect_err("start-phase cancellation must not return partial success");
+        assert_eq!(error.code(), DirectBaselineErrorCode::Cancelled);
+        let leader_was_reaped_when_run_resolved = processes_have_been_reaped(&[leader]);
+        wait_until_processes_exit(&[leader, grandchild]).await?;
+        wait_until_processes_reaped(&[leader]).await?;
+        assert!(
+            leader_was_reaped_when_run_resolved,
+            "the cancelled start-phase leader must already be reaped when the baseline resolves"
+        );
         assert!(!layout.home.join("exec-record.json").exists());
         Ok(())
     })
