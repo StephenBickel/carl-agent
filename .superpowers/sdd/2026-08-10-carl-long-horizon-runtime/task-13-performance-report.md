@@ -176,9 +176,11 @@ recorded below and govern current status.
 
 ## Self-review
 
-- Reviewed the complete production/test diff and confirmed the changes are limited
-  to `src/storage/repository.rs` and `tests/long_horizon_eval.rs`; the report is the
-  only documentation addition.
+- Reviewed the complete performance-follow-on production/test diff and confirmed the
+  changes are limited to `src/storage/repository.rs`,
+  `src/runtime/task/checkpoint.rs`, `src/runtime/task/mod.rs`, and
+  `tests/long_horizon_eval.rs`. The runtime/task changes are `cfg(test)` observation
+  points only; documentation changes are limited to this report and `progress.md`.
 - Confirmed cache state is memory-only, exact-task keyed, updated only after a
   successful transaction commit, and invalidated by `data_version`/row mismatch.
 - Confirmed incremental paging is exclusive and ascending, checks the exact tail
