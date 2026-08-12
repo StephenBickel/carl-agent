@@ -36,11 +36,11 @@
   nonzero provider exit, version incompatibility, and trust replacement return typed
   sanitized failures with no partial result.
 - Cancellation and timeout use the existing process-group/Job Object cancellation and
-  await teardown. Start-phase cancellation/timeout retains the bounded constructor for
-  at most a separate two-second cleanup deadline; a produced run is cancelled and
-  reaped, while expiry drops the constructor and invokes the grouped process guard.
-  Cancellation and timeout retain their primary stable code even if post-teardown
-  attestation also reports provider replacement.
+  await teardown. Start-phase cancellation/timeout awaits the adapter's internally
+  bounded constructor through version-process cleanup and, if construction produces a
+  run, cancels and reaps that run before returning. Cancellation and timeout retain
+  their primary stable code even if construction or post-teardown attestation reports
+  another provider error.
 
 ## TDD RED evidence
 
@@ -78,7 +78,7 @@ cargo test --locked --lib delegates::codex::direct_baseline::tests
 PASS: 2 passed, 0 failed
 
 cargo test --locked --test codex_exec_contract
-PASS: 35 passed, 0 failed
+PASS: 36 passed, 0 failed
 
 cargo test --locked --test cli_contract
 PASS: 10 passed, 0 failed
@@ -112,6 +112,33 @@ and cancellation/timeout descendant reaping.
 No full suite, live provider/OAuth run, network run, Node endurance runner, or soak was
 performed. `SECURITY.md` and `Cargo.lock` were not edited.
 
+## Review fix round 1
+
+Independent review found that the separate two-second start-cleanup deadline could
+drop a still-running adapter constructor. Dropping its version-process guard started
+group termination but did not synchronously wait/reap, so `DirectCodexBaseline::run`
+could resolve before the version leader was reaped.
+
+TDD added timeout and cancellation regressions that sample process existence at the
+exact point `run` resolves. Before the production fix, the complete Codex contract
+reported 34 passes and both new immediate-reap assertions failed. The implementation
+now awaits the adapter constructor instead of racing it against a second deadline,
+then cancels any constructed run before returning the original `TimedOut` or
+`Cancelled` result.
+
+The awaited start lifecycle remains bounded: version output, status polling, and the
+subsequent kill/reap phase each have a five-second bound; exec stdin write uses the
+validated graceful-shutdown bound; write failure uses the validated forced-shutdown
+reap bound; and a successfully constructed exec run uses the existing bounded
+cancel/reap path.
+The final regressions prove both primary error codes remain stable, no exec/task record
+is produced, descendants exit, and the version leader is already reaped on return.
+
+Fresh review-fix verification passed the direct-baseline unit tests (2), complete
+Codex execution contract (36), and complete sidecar contract (46), for 84 focused
+tests. Locked all-target/all-feature Clippy with warnings denied, formatting, and
+diff checks also passed.
+
 ## Self-review and residual boundary
 
 - The production command intentionally prepares and validates the executable,
@@ -132,3 +159,4 @@ performed. `SECURITY.md` and `Cargo.lock` were not edited.
 ## Code commit
 
 - `4590a5b feat: add trusted direct Codex baseline`
+- `cfe7e49 fix: await Codex start cleanup before return`
