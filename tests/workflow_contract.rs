@@ -370,7 +370,10 @@ fn validate_ci_workflow(workflow: &str) -> Result<(), String> {
             ("cargo test --doc", "quality"),
             ("cargo deny check", "quality"),
             ("cargo test --locked --test long_horizon_eval", "test"),
-            ("cargo test --all-features", "test"),
+            (
+                "cargo test --all-features -- --skip actual_engine_survives_one_hundred_epochs_and_normalizes_replay",
+                "test",
+            ),
         ],
     )?;
     let quality = job(jobs, "quality")?;
@@ -432,12 +435,33 @@ fn validate_ci_workflow(workflow: &str) -> Result<(), String> {
         "jobs.test",
         &[
             "cargo test --locked --test long_horizon_eval",
-            "cargo test --all-features",
+            "cargo test --all-features -- --skip actual_engine_survives_one_hundred_epochs_and_normalizes_replay",
         ],
     )?;
     validate_required_job_steps(test, "jobs.test")?;
 
     let all_feature_test_count = jobs
+        .iter()
+        .map(|(name, value)| {
+            let name = name.as_str().unwrap_or("<non-string-job>");
+            let job = value_map(value, &format!("jobs.{name}"))?;
+            Ok(run_commands(job, &format!("jobs.{name}"))?
+                .into_iter()
+                .filter(|command| {
+                    *command
+                        == "cargo test --all-features -- --skip actual_engine_survives_one_hundred_epochs_and_normalizes_replay"
+                })
+                .count())
+        })
+        .collect::<Result<Vec<usize>, String>>()?
+        .into_iter()
+        .sum::<usize>();
+    if all_feature_test_count != 1 {
+        return Err(format!(
+            "CI must run the filtered all-features command exactly once per matrix expansion, found {all_feature_test_count} step definitions"
+        ));
+    }
+    let unfiltered_all_features = jobs
         .iter()
         .map(|(name, value)| {
             let name = name.as_str().unwrap_or("<non-string-job>");
@@ -450,10 +474,11 @@ fn validate_ci_workflow(workflow: &str) -> Result<(), String> {
         .collect::<Result<Vec<usize>, String>>()?
         .into_iter()
         .sum::<usize>();
-    if all_feature_test_count != 1 {
-        return Err(format!(
-            "CI must run `cargo test --all-features` exactly once per matrix expansion, found {all_feature_test_count} step definitions"
-        ));
+    if unfiltered_all_features != 0 {
+        return Err(
+            "CI must not rerun the deterministic 100-epoch gate through an unfiltered all-features command"
+                .to_owned(),
+        );
     }
 
     let long_horizon_test_count = jobs
@@ -977,6 +1002,20 @@ fn checker_rejects_duplicate_long_horizon_release_gate_steps() {
     assert_ci_rejected(
         &workflow,
         "CI must run `cargo test --locked --test long_horizon_eval` exactly once per matrix expansion, found 2 step definitions",
+    );
+}
+
+#[test]
+fn checker_rejects_an_unfiltered_all_features_rerun() {
+    let workflow = replace_in_workflow(
+        "ci.yml",
+        "      - name: Test all features\n        run: cargo test --all-features -- --skip actual_engine_survives_one_hundred_epochs_and_normalizes_replay\n",
+        "      - name: Test all features\n        run: cargo test --all-features -- --skip actual_engine_survives_one_hundred_epochs_and_normalizes_replay\n      - name: Duplicate unfiltered all features\n        run: cargo test --all-features\n",
+    );
+
+    assert_ci_rejected(
+        &workflow,
+        "CI must not rerun the deterministic 100-epoch gate through an unfiltered all-features command",
     );
 }
 

@@ -50,4 +50,4 @@ jobs:
       - name: Test deterministic long-horizon evaluation
         run: cargo test --locked --test long_horizon_eval
       - name: Test all features
-        run: cargo test --all-features
+        run: cargo test --all-features -- --skip actual_engine_survives_one_hundred_epochs_and_normalizes_replay

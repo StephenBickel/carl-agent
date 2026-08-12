@@ -1714,6 +1714,11 @@ async fn run_repository_engine_case(
         .count();
     let serialized_events =
         serde_json::to_string(&events).map_err(|_| EvaluationError::Invariant)?;
+    match case.kind {
+        MatrixCaseKind::RegressionFirst => assert_ordered_command_recovery(&events, 3)?,
+        MatrixCaseKind::CommandRecovery => assert_ordered_command_recovery(&events, 2)?,
+        _ => {}
+    }
     let case_invariant = match case.kind {
         MatrixCaseKind::RegressionFirst
         | MatrixCaseKind::CommandRecovery
@@ -2417,6 +2422,110 @@ fn matrix_safe_code(
     Some(code.to_owned())
 }
 
+fn assert_ordered_command_recovery(
+    events: &[EventEnvelope],
+    expected_operations: usize,
+) -> Result<(), EvaluationError> {
+    #[derive(Default)]
+    struct OperationTrace {
+        intent_sequence: u64,
+        command_evidence: Option<(u64, bool, Option<i32>)>,
+        terminal: Option<(u64, OperationStatus)>,
+    }
+
+    if events
+        .windows(2)
+        .any(|pair| pair[0].sequence >= pair[1].sequence)
+    {
+        return Err(EvaluationError::Storage);
+    }
+    let mut operations = BTreeMap::new();
+    for envelope in events {
+        let Event::TaskLifecycle { event, .. } = &envelope.event else {
+            return Err(EvaluationError::Storage);
+        };
+        match event {
+            TaskEvent::OperationIntentRecorded { operation_id, .. } => {
+                if operations
+                    .insert(
+                        *operation_id,
+                        OperationTrace {
+                            intent_sequence: envelope.sequence,
+                            ..OperationTrace::default()
+                        },
+                    )
+                    .is_some()
+                {
+                    return Err(EvaluationError::Invariant);
+                }
+            }
+            TaskEvent::NormalizedOperationEvidenceRecorded {
+                operation_id,
+                evidence:
+                    crate::runtime::task::NormalizedOperationEvidence::Command {
+                        completed,
+                        exit_code,
+                    },
+            } => {
+                let operation = operations
+                    .get_mut(operation_id)
+                    .ok_or(EvaluationError::Invariant)?;
+                if operation
+                    .command_evidence
+                    .replace((envelope.sequence, *completed, *exit_code))
+                    .is_some()
+                {
+                    return Err(EvaluationError::Invariant);
+                }
+            }
+            TaskEvent::OperationTransitioned {
+                operation_id, to, ..
+            } if to.is_resolved() || *to == OperationStatus::Uncertain => {
+                let operation = operations
+                    .get_mut(operation_id)
+                    .ok_or(EvaluationError::Invariant)?;
+                if operation
+                    .terminal
+                    .replace((envelope.sequence, *to))
+                    .is_some()
+                {
+                    return Err(EvaluationError::Invariant);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut ordered = operations.values().collect::<Vec<_>>();
+    ordered.sort_by_key(|operation| operation.intent_sequence);
+    if ordered.len() != expected_operations || ordered.len() < 2 {
+        return Err(EvaluationError::Invariant);
+    }
+    let first = ordered[0];
+    let recovery_intent = ordered[1].intent_sequence;
+    let last = ordered.last().ok_or(EvaluationError::Invariant)?;
+    let Some((first_evidence, false, Some(1))) = first.command_evidence else {
+        return Err(EvaluationError::Invariant);
+    };
+    let Some((first_terminal, OperationStatus::Failed)) = first.terminal else {
+        return Err(EvaluationError::Invariant);
+    };
+    let Some((last_evidence, true, Some(0))) = last.command_evidence else {
+        return Err(EvaluationError::Invariant);
+    };
+    let Some((last_terminal, OperationStatus::Succeeded)) = last.terminal else {
+        return Err(EvaluationError::Invariant);
+    };
+    if !(first.intent_sequence < first_evidence
+        && first_evidence < first_terminal
+        && first_terminal < recovery_intent
+        && last.intent_sequence < last_evidence
+        && last_evidence < last_terminal)
+    {
+        return Err(EvaluationError::Invariant);
+    }
+    Ok(())
+}
+
 fn derive_negative_matrix_metrics(
     status: TaskStatus,
     events: &[EventEnvelope],
@@ -2535,5 +2644,113 @@ mod tests {
                 Err(EvaluationError::InvalidScenario)
             );
         }
+    }
+
+    fn operation_event(sequence: u64, event: TaskEvent) -> EventEnvelope {
+        EventEnvelope {
+            id: EventId::new(),
+            session_id: SessionId::new(),
+            turn_id: None,
+            sequence,
+            timestamp: Utc::now(),
+            event: Event::TaskLifecycle {
+                task_id: TaskId::new(),
+                event,
+            },
+        }
+    }
+
+    fn recovery_events(
+        first_completed: bool,
+        first_exit_code: i32,
+        first_status: OperationStatus,
+    ) -> Vec<EventEnvelope> {
+        let first_epoch = crate::runtime::task::EpochId::new();
+        let second_epoch = crate::runtime::task::EpochId::new();
+        let first = crate::runtime::task::OperationId::new();
+        let second = crate::runtime::task::OperationId::new();
+        vec![
+            operation_event(
+                10,
+                TaskEvent::OperationIntentRecorded {
+                    operation_id: first,
+                    epoch_id: first_epoch,
+                    item_id: "first-command".to_owned(),
+                    effect_class: crate::runtime::task::EffectClass::AmbiguousConsequential,
+                    request_digest: "first-request".to_owned(),
+                },
+            ),
+            operation_event(
+                12,
+                TaskEvent::NormalizedOperationEvidenceRecorded {
+                    operation_id: first,
+                    evidence: crate::runtime::task::NormalizedOperationEvidence::Command {
+                        completed: first_completed,
+                        exit_code: Some(first_exit_code),
+                    },
+                },
+            ),
+            operation_event(
+                14,
+                TaskEvent::OperationTransitioned {
+                    operation_id: first,
+                    from: OperationStatus::Started,
+                    to: first_status,
+                    evidence_sequences: vec![13],
+                },
+            ),
+            operation_event(
+                20,
+                TaskEvent::OperationIntentRecorded {
+                    operation_id: second,
+                    epoch_id: second_epoch,
+                    item_id: "recovery-command".to_owned(),
+                    effect_class: crate::runtime::task::EffectClass::AmbiguousConsequential,
+                    request_digest: "second-request".to_owned(),
+                },
+            ),
+            operation_event(
+                22,
+                TaskEvent::NormalizedOperationEvidenceRecorded {
+                    operation_id: second,
+                    evidence: crate::runtime::task::NormalizedOperationEvidence::Command {
+                        completed: true,
+                        exit_code: Some(0),
+                    },
+                },
+            ),
+            operation_event(
+                24,
+                TaskEvent::OperationTransitioned {
+                    operation_id: second,
+                    from: OperationStatus::Started,
+                    to: OperationStatus::Succeeded,
+                    evidence_sequences: vec![23],
+                },
+            ),
+        ]
+    }
+
+    #[test]
+    fn ordered_command_recovery_rejects_exit_one_normalized_as_success() {
+        assert!(
+            assert_ordered_command_recovery(&recovery_events(false, 1, OperationStatus::Failed), 2)
+                .is_ok()
+        );
+        assert!(
+            assert_ordered_command_recovery(&recovery_events(true, 0, OperationStatus::Failed), 2)
+                .is_err()
+        );
+        assert!(
+            assert_ordered_command_recovery(
+                &recovery_events(false, 1, OperationStatus::Succeeded),
+                2
+            )
+            .is_err()
+        );
+        assert!(
+            assert_ordered_command_recovery(&recovery_events(true, 1, OperationStatus::Failed), 2)
+                .is_err()
+        );
     }
 }
