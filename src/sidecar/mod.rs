@@ -5063,7 +5063,7 @@ pub(crate) mod windows_security {
 
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, LocalFree};
     use windows_sys::Win32::Security::Authorization::{
-        GetNamedSecurityInfoW, GetSecurityInfo, SE_FILE_OBJECT,
+        GetNamedSecurityInfoW, GetSecurityInfo, SE_FILE_OBJECT, SetNamedSecurityInfoW,
     };
     use windows_sys::Win32::Security::{
         ACCESS_ALLOWED_ACE, ACE_HEADER, ACE_INHERITED_OBJECT_TYPE_PRESENT, ACE_OBJECT_TYPE_PRESENT,
@@ -5072,10 +5072,11 @@ pub(crate) mod windows_security {
         GROUP_SECURITY_INFORMATION, GetAce, GetLengthSid, GetTokenInformation, INHERIT_ONLY_ACE,
         InitializeAcl, InitializeSecurityDescriptor, IsValidSid, IsWellKnownSid,
         LookupAccountNameW, MapGenericMask, OBJECT_INHERIT_ACE, OWNER_SECURITY_INFORMATION,
-        PRIVILEGE_SET, PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED, SECURITY_DESCRIPTOR,
-        SECURITY_MAX_SID_SIZE, SecurityImpersonation, SetSecurityDescriptorControl,
-        SetSecurityDescriptorDacl, SetSecurityDescriptorOwner, TOKEN_DUPLICATE, TOKEN_QUERY,
-        TOKEN_USER, TokenUser, WinBuiltinAdministratorsSid, WinLocalSystemSid,
+        PRIVILEGE_SET, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+        SE_DACL_PROTECTED, SECURITY_DESCRIPTOR, SECURITY_MAX_SID_SIZE, SecurityImpersonation,
+        SetSecurityDescriptorControl, SetSecurityDescriptorDacl, SetSecurityDescriptorOwner,
+        TOKEN_DUPLICATE, TOKEN_QUERY, TOKEN_USER, TokenUser, WinBuiltinAdministratorsSid,
+        WinLocalSystemSid,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         DELETE, FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY, FILE_ALL_ACCESS, FILE_APPEND_DATA,
@@ -5155,6 +5156,31 @@ pub(crate) mod windows_security {
 
     pub(crate) fn verify_private_directory(path: &Path) -> Result<(), ()> {
         verify_dacl(path, OwnerPolicy::CurrentUserPrivate, ObjectKind::Directory).map_err(|_| ())
+    }
+
+    pub(crate) fn make_directory_owner_only(path: &Path) -> Result<(), ()> {
+        let mut security = owner_only_directory_security_descriptor()?;
+        let mut encoded: Vec<u16> = path.as_os_str().encode_wide().collect();
+        encoded.push(0);
+        // SAFETY: encoded is NUL-terminated, the current-user SID and ACL remain
+        // live for the call, and the protected flag prevents inherited writers.
+        let result = unsafe {
+            SetNamedSecurityInfoW(
+                encoded.as_mut_ptr(),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION
+                    | DACL_SECURITY_INFORMATION
+                    | PROTECTED_DACL_SECURITY_INFORMATION,
+                security._current_user.sid(),
+                ptr::null_mut(),
+                security._acl.as_mut_ptr().cast(),
+                ptr::null_mut(),
+            )
+        };
+        if result != 0 {
+            return Err(());
+        }
+        verify_private_directory(path)
     }
 
     pub(crate) fn verify_private_file_handle(file: &impl AsRawHandle) -> Result<(), ()> {

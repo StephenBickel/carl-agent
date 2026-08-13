@@ -1321,8 +1321,9 @@ fn make_owner_only(path: &Path) -> Result<(), EvaluationError> {
 }
 
 #[cfg(windows)]
-fn make_owner_only(_path: &Path) -> Result<(), EvaluationError> {
-    Ok(())
+fn make_owner_only(path: &Path) -> Result<(), EvaluationError> {
+    crate::sidecar::windows_security::make_directory_owner_only(path)
+        .map_err(|()| EvaluationError::Fixture)
 }
 
 fn copy_fixture_tree(source: &Path, destination: &Path) -> Result<(), EvaluationError> {
