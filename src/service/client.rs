@@ -42,7 +42,7 @@ fn valid_windows_pipe_security_shape(
             [WindowsPipeAceShape {
                 allow: true,
                 inherited: false,
-                mask: super::server::WINDOWS_PIPE_ACCESS,
+                mask: super::server::WINDOWS_PIPE_DACL_ACCESS,
                 current_user: true,
             }]
         )
@@ -277,13 +277,12 @@ async fn connect_verified(
     data_root: &Path,
 ) -> Result<(LocalReader, LocalWriter), ServiceClientError> {
     use std::os::windows::io::AsRawHandle as _;
-    use tokio::net::windows::named_pipe::ClientOptions;
     use windows_sys::Win32::Foundation::ERROR_PIPE_BUSY;
 
     let pipe_name = super::server::windows_pipe_name(data_root);
     let mut attempts = 0_u8;
     let client = loop {
-        match ClientOptions::new().open(&pipe_name) {
+        match open_windows_pipe(&pipe_name) {
             Ok(client) => break client,
             Err(error) if error.raw_os_error() == Some(ERROR_PIPE_BUSY as i32) && attempts < 20 => {
                 attempts = attempts.saturating_add(1);
@@ -295,6 +294,42 @@ async fn connect_verified(
     verify_windows_pipe_server(client.as_raw_handle().cast())?;
     let (reader, writer) = tokio::io::split(client);
     Ok((Box::pin(reader), Box::pin(writer)))
+}
+
+#[cfg(windows)]
+fn open_windows_pipe(
+    pipe_name: &str,
+) -> std::io::Result<tokio::net::windows::named_pipe::NamedPipeClient> {
+    use std::os::windows::ffi::OsStrExt as _;
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_FLAG_OVERLAPPED, OPEN_EXISTING, SECURITY_IDENTIFICATION,
+        SECURITY_SQOS_PRESENT,
+    };
+
+    let mut encoded: Vec<u16> = std::ffi::OsStr::new(pipe_name).encode_wide().collect();
+    encoded.push(0);
+    // `GetSecurityInfo` below requires READ_CONTROL on the client handle. Tokio's
+    // ClientOptions intentionally requests only generic read/write, so open the
+    // same overlapped pipe explicitly with the additional verification right.
+    // SAFETY: encoded is NUL-terminated, the remaining pointers are intentionally
+    // null, and a successful handle is immediately transferred to Tokio.
+    let handle = unsafe {
+        CreateFileW(
+            encoded.as_ptr(),
+            super::server::WINDOWS_PIPE_CLIENT_ACCESS,
+            0,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_OVERLAPPED | SECURITY_IDENTIFICATION | SECURITY_SQOS_PRESENT,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: CreateFileW returned a fresh, owned, overlapped named-pipe handle.
+    unsafe { tokio::net::windows::named_pipe::NamedPipeClient::from_raw_handle(handle.cast()) }
 }
 
 #[cfg(windows)]
@@ -496,12 +531,12 @@ mod tests {
         validate_info,
     };
     use crate::service::protocol::{SERVICE_PROTOCOL_VERSION, ServiceCapabilities, ServiceInfo};
-    use crate::service::server::WINDOWS_PIPE_ACCESS;
+    use crate::service::server::WINDOWS_PIPE_DACL_ACCESS;
 
     const LEGITIMATE: WindowsPipeAceShape = WindowsPipeAceShape {
         allow: true,
         inherited: false,
-        mask: WINDOWS_PIPE_ACCESS,
+        mask: WINDOWS_PIPE_DACL_ACCESS,
         current_user: true,
     };
 
@@ -603,6 +638,19 @@ mod tests {
     }
 
     #[test]
+    fn windows_pipe_access_includes_security_query_right() {
+        #[cfg(windows)]
+        const READ_CONTROL: u32 = 0x0002_0000;
+
+        #[cfg(windows)]
+        assert_ne!(
+            crate::service::server::WINDOWS_PIPE_CLIENT_ACCESS & READ_CONTROL,
+            0
+        );
+        assert_eq!(WINDOWS_PIPE_DACL_ACCESS, 0x0012_019F);
+    }
+
+    #[test]
     fn windows_pipe_security_shape_rejects_every_non_private_variant() {
         assert!(valid_windows_pipe_security_shape(true, true, &[LEGITIMATE]));
         assert!(!valid_windows_pipe_security_shape(
@@ -630,11 +678,11 @@ mod tests {
                 ..LEGITIMATE
             },
             WindowsPipeAceShape {
-                mask: WINDOWS_PIPE_ACCESS & !0x4000_0000,
+                mask: WINDOWS_PIPE_DACL_ACCESS & !0x0000_0001,
                 ..LEGITIMATE
             },
             WindowsPipeAceShape {
-                mask: WINDOWS_PIPE_ACCESS | 0x1000_0000,
+                mask: WINDOWS_PIPE_DACL_ACCESS | 0x1000_0000,
                 ..LEGITIMATE
             },
             WindowsPipeAceShape {
@@ -653,9 +701,7 @@ mod tests {
 
         let pipe_name = format!(r"\\.\pipe\carl-contract-{}", uuid::Uuid::new_v4());
         let mut server = crate::service::server::create_owner_pipe(&pipe_name, true).unwrap();
-        let client = tokio::net::windows::named_pipe::ClientOptions::new()
-            .open(&pipe_name)
-            .unwrap();
+        let client = super::open_windows_pipe(&pipe_name).unwrap();
         server.connect().await.unwrap();
         super::verify_windows_pipe_server(client.as_raw_handle().cast()).unwrap();
     }
