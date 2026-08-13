@@ -1054,8 +1054,10 @@ impl Store {
         &self,
         input: NewFrontendSession,
     ) -> Result<FrontendSessionRecord, CarlError> {
-        if !matches!(input.frontend, Frontend::Acp | Frontend::Buzz)
-            || !matches!(input.protocol_version, 1 | 2)
+        if !matches!(
+            input.frontend,
+            Frontend::Acp | Frontend::Buzz | Frontend::Tui
+        ) || !matches!(input.protocol_version, 1 | 2)
         {
             return Err(CarlError::Validation {
                 detail: "frontend session protocol is invalid".to_owned(),
@@ -1170,6 +1172,41 @@ impl Store {
             },
         )
         .transpose()
+    }
+
+    pub fn list_frontend_sessions(
+        &self,
+        frontend: Frontend,
+        limit: u16,
+    ) -> Result<Vec<FrontendSessionRecord>, CarlError> {
+        if !(1..=64).contains(&limit) {
+            return Err(CarlError::Validation {
+                detail: "frontend session list limit must be between 1 and 64".to_owned(),
+            });
+        }
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT external_session_id FROM frontend_sessions
+                 WHERE frontend = ?1
+                 ORDER BY updated_at DESC, external_session_id ASC
+                 LIMIT ?2",
+            )
+            .map_err(storage_error)?;
+        let external_ids = statement
+            .query_map(params![frontend.as_str(), i64::from(limit)], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(storage_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(storage_error)?;
+        external_ids
+            .into_iter()
+            .map(|external_id| {
+                self.get_frontend_session(&external_id)?
+                    .ok_or_else(|| storage_invariant("listed frontend session disappeared"))
+            })
+            .collect()
     }
 
     pub fn get_frontend_session_for_session(

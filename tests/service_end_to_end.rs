@@ -161,6 +161,94 @@ async fn windows_client_accepts_the_current_user_private_service_pipe() -> TestR
 
 #[cfg(unix)]
 #[tokio::test(flavor = "current_thread")]
+async fn tui_sessions_are_durable_filtered_and_read_only_after_reconnect() -> TestResult {
+    let layout = Layout::new()?;
+    let service = TaskService::bind(&layout.data, PendingPort::new()).await?;
+    let running = tokio::spawn(service.serve(CancellationToken::new()));
+    let mut client = TaskServiceClient::connect(&layout.data).await?;
+    let ServiceResult::Accepted { task_id } = client
+        .request(ServiceRequest {
+            protocol_version: SERVICE_PROTOCOL_VERSION,
+            request_id: "tui-session-start".to_owned(),
+            idempotency_key: "tui-session-start-key".to_owned(),
+            command: ServiceCommand::StartTask(StartTaskCommand {
+                frontend: Frontend::Tui,
+                external_session_id: "tui-session-one".to_owned(),
+                workspace: layout.workspace.clone(),
+                request: "keep this TUI task resumable".to_owned(),
+                model: ModelId::parse("gpt-test")?,
+                effort: ReasoningEffort::High,
+                permission_mode: PermissionMode::FullAccess,
+                budget: TaskBudget::default(),
+            }),
+        })
+        .await?
+    else {
+        return Err("TUI task was not accepted".into());
+    };
+    drop(client);
+
+    let database = layout.data.join("carl.sqlite3");
+    let before = Connection::open(&database)?.query_row(
+        "SELECT (SELECT COUNT(*) FROM events),
+                (SELECT COUNT(*) FROM service_command_receipts)",
+        [],
+        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+    )?;
+    let mut reconnected = TaskServiceClient::connect(&layout.data).await?;
+    let ServiceResult::SessionList(sessions) = reconnected
+        .request(ServiceRequest {
+            protocol_version: SERVICE_PROTOCOL_VERSION,
+            request_id: "tui-session-list".to_owned(),
+            idempotency_key: "tui-session-list-read-key".to_owned(),
+            command: ServiceCommand::Sessions {
+                frontend: Frontend::Tui,
+                limit: 64,
+            },
+        })
+        .await?
+    else {
+        return Err("TUI session list result missing".into());
+    };
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].external_session_id, "tui-session-one");
+    assert_eq!(sessions[0].latest_task_id, Some(task_id));
+    assert_eq!(sessions[0].provider, "openai_subscription");
+    assert_eq!(
+        sessions[0].model.as_ref().map(ModelId::as_str),
+        Some("gpt-test")
+    );
+    assert_eq!(sessions[0].effort, Some(ReasoningEffort::High));
+    assert_eq!(sessions[0].permission_mode, PermissionMode::FullAccess);
+    assert_eq!(
+        Store::open(&database)?
+            .get_frontend_session("tui-session-one")?
+            .ok_or("TUI binding missing")?
+            .frontend,
+        Frontend::Tui
+    );
+    let after = Connection::open(&database)?.query_row(
+        "SELECT (SELECT COUNT(*) FROM events),
+                (SELECT COUNT(*) FROM service_command_receipts)",
+        [],
+        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+    )?;
+    assert_eq!(after, before, "TUI session listing must be read-only");
+
+    reconnected
+        .request(ServiceRequest {
+            protocol_version: SERVICE_PROTOCOL_VERSION,
+            request_id: "tui-session-shutdown".to_owned(),
+            idempotency_key: "tui-session-shutdown-key".to_owned(),
+            command: ServiceCommand::Shutdown,
+        })
+        .await?;
+    running.await??;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
 async fn client_eof_does_not_cancel_owner_task_and_controls_are_idempotent() -> TestResult {
     let layout = Layout::new()?;
     let port = PendingPort::new();
@@ -180,6 +268,7 @@ async fn client_eof_does_not_cancel_owner_task_and_controls_are_idempotent() -> 
         soft_epoch_tool_calls: 77,
     };
     let start_command = StartTaskCommand {
+        frontend: Frontend::Acp,
         external_session_id: "owner-session".to_owned(),
         workspace: layout.workspace.clone(),
         request: "keep working after the frontend disconnects".to_owned(),
@@ -282,6 +371,7 @@ async fn shutdown_preempts_queued_work_and_completes_its_receipt() -> TestResult
     let running = tokio::spawn(service.serve(CancellationToken::new()));
     let mut client = TaskServiceClient::connect(&layout.data).await?;
     let start = |session: &str, request: &str| StartTaskCommand {
+        frontend: Frontend::Acp,
         external_session_id: session.to_owned(),
         workspace: layout.workspace.clone(),
         request: request.to_owned(),
@@ -445,6 +535,7 @@ async fn read_polling_does_not_exhaust_process_or_connection_mutation_capacity()
             request_id: "ledger-start".to_owned(),
             idempotency_key: "ledger-start-key".to_owned(),
             command: ServiceCommand::StartTask(StartTaskCommand {
+                frontend: Frontend::Acp,
                 external_session_id: "ledger-session".to_owned(),
                 workspace: layout.workspace.clone(),
                 request: "remain controllable after sustained polling".to_owned(),
@@ -523,6 +614,7 @@ async fn process_cancellation_quiesces_the_active_task_at_a_checkpoint() -> Test
             request_id: "signal-start".to_owned(),
             idempotency_key: "signal-start-key".to_owned(),
             command: ServiceCommand::StartTask(StartTaskCommand {
+                frontend: Frontend::Acp,
                 external_session_id: "signal-session".to_owned(),
                 workspace: layout.workspace.clone(),
                 request: "remain durable when the owner process stops".to_owned(),
@@ -622,6 +714,7 @@ async fn live_update_pages_bind_cursors_to_the_owner_generation() -> TestResult 
             request_id: "live-generation-start".to_owned(),
             idempotency_key: "live-generation-start-key".to_owned(),
             command: ServiceCommand::StartTask(StartTaskCommand {
+                frontend: Frontend::Acp,
                 external_session_id: "live-generation-session".to_owned(),
                 workspace: layout.workspace.clone(),
                 request: "hold for a generation-bound poll".to_owned(),
@@ -675,6 +768,7 @@ async fn live_update_pages_bind_cursors_to_the_owner_generation() -> TestResult 
 async fn start_idempotency_survives_owner_restart_without_a_second_task() -> TestResult {
     let layout = Layout::new()?;
     let command = ServiceCommand::StartTask(StartTaskCommand {
+        frontend: Frontend::Acp,
         external_session_id: "durable-idempotency-session".to_owned(),
         workspace: layout.workspace.clone(),
         request: "create this durable task exactly once".to_owned(),
@@ -761,6 +855,7 @@ async fn every_service_mutation_replays_durably_and_keys_never_rebind() -> TestR
     let running = tokio::spawn(service.serve(CancellationToken::new()));
     let mut client = TaskServiceClient::connect(&layout.data).await?;
     let start = ServiceCommand::StartTask(StartTaskCommand {
+        frontend: Frontend::Acp,
         external_session_id: "global-receipt-session".to_owned(),
         workspace: layout.workspace.clone(),
         request: "exercise every durable service mutation".to_owned(),
@@ -964,6 +1059,7 @@ async fn pending_service_receipts_reconcile_control_crash_windows_without_duplic
                 request_id: format!("pending-{method}-start"),
                 idempotency_key: format!("pending-{method}-start-key"),
                 command: ServiceCommand::StartTask(StartTaskCommand {
+                    frontend: Frontend::Acp,
                     external_session_id: format!("pending-{method}-session"),
                     workspace: layout.workspace.clone(),
                     request: format!("exercise the {method} receipt crash window"),
@@ -1113,6 +1209,7 @@ async fn pending_cancel_marker_without_terminal_state_resumes_the_same_control()
             request_id: "marker-only-start".to_owned(),
             idempotency_key: "marker-only-start-key".to_owned(),
             command: ServiceCommand::StartTask(StartTaskCommand {
+                frontend: Frontend::Acp,
                 external_session_id: "marker-only-session".to_owned(),
                 workspace: layout.workspace.clone(),
                 request: "cancel from a marker-only crash cut".to_owned(),
@@ -1250,6 +1347,7 @@ async fn startup_prepares_every_resumable_task_before_accepting_clients() -> Tes
                 request_id: format!("startup-start-{index}"),
                 idempotency_key: format!("startup-start-key-{index}"),
                 command: ServiceCommand::StartTask(StartTaskCommand {
+                    frontend: Frontend::Acp,
                     external_session_id: "startup-session".to_owned(),
                     workspace: layout.workspace.clone(),
                     request: format!("durable startup task {index}"),
@@ -1311,6 +1409,7 @@ async fn slow_acp_reader_is_bounded_and_does_not_interrupt_owner_work() -> TestR
             request_id: "slow-start".to_owned(),
             idempotency_key: "slow-start-key".to_owned(),
             command: ServiceCommand::StartTask(StartTaskCommand {
+                frontend: Frontend::Acp,
                 external_session_id: "slow-session".to_owned(),
                 workspace: layout.workspace.clone(),
                 request: "stay active while a slow frontend is evicted".to_owned(),
@@ -1426,6 +1525,7 @@ async fn owner_restart_resets_live_cursor_for_assistant_diff_and_approval_once()
             request_id: "restart-live-start".to_owned(),
             idempotency_key: "restart-live-start-key".to_owned(),
             command: ServiceCommand::StartTask(StartTaskCommand {
+                frontend: Frontend::Acp,
                 external_session_id: "restart-live-session".to_owned(),
                 workspace: layout.workspace.clone(),
                 request: "request approval only after owner restart".to_owned(),
@@ -1761,6 +1861,7 @@ async fn service_restart_resumes_from_checkpoint_without_repeating_effect() -> T
             request_id: "restart-start".to_owned(),
             idempotency_key: "restart-start-key".to_owned(),
             command: ServiceCommand::StartTask(StartTaskCommand {
+                frontend: Frontend::Acp,
                 external_session_id: "restart-owner".to_owned(),
                 workspace: layout.workspace.clone(),
                 request: "apply one effect, checkpoint, and finish after restart".to_owned(),
@@ -2215,6 +2316,7 @@ async fn buzz_start_is_admitted_by_the_owner_writer_before_task_creation() -> Te
     let trusted = |actor_id: ActorId, event_id: char| {
         ServiceCommand::StartTrustedTask(TrustedStartTaskCommand {
             start: StartTaskCommand {
+                frontend: Frontend::Buzz,
                 external_session_id: "buzz-service-session".to_owned(),
                 workspace: layout.workspace.clone(),
                 request: "trusted owner task".to_owned(),

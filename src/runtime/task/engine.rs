@@ -236,6 +236,7 @@ pub(crate) enum TaskEngineControl {
 }
 
 pub(crate) struct OwnerStartTask {
+    pub frontend: Frontend,
     pub external_session_id: String,
     pub workspace: PathBuf,
     pub request: String,
@@ -579,7 +580,9 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                     .ok_or_else(invalid_task)?
                     .actor_id
             }
-            Frontend::Acp => ActorId::parse("local-owner").map_err(|_| invalid_task())?,
+            Frontend::Acp | Frontend::Tui => {
+                ActorId::parse("local-owner").map_err(|_| invalid_task())?
+            }
             _ => return Err(invalid_task()),
         };
         let turn_id = TurnId::new();
@@ -984,7 +987,7 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
             .transpose()?;
         let expected_frontend = admitted
             .as_ref()
-            .map_or(Frontend::Acp, |(frontend, _, _)| *frontend);
+            .map_or(input.frontend, |(frontend, _, _)| *frontend);
         let (session_id, permission_mode) = match self
             .store()
             .get_frontend_session(external_session_id.as_str())

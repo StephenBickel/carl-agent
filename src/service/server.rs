@@ -20,7 +20,7 @@ use crate::events::TurnId;
 use crate::policy::{Frontend, Sha256Digest};
 use crate::runtime::agent_port::{AgentPort, EffectDecision};
 use crate::runtime::task::{
-    CheckpointId, OwnerConfigureSession, OwnerStartTask, OwnerTrustedAdmission,
+    CheckpointId, EngineToolStatus, OwnerConfigureSession, OwnerStartTask, OwnerTrustedAdmission,
     OwnerTrustedMessage, TaskControlKind, TaskEngine, TaskEngineAcknowledgement, TaskEngineControl,
     TaskEngineError, TaskEngineErrorCode, TaskEngineUpdate, TaskId, TaskSnapshot, TaskStatus,
 };
@@ -358,7 +358,9 @@ impl<P: AgentPort + 'static> TaskService<P> {
                 .open_peer_store()
                 .map_err(|_| service_error(TaskServiceErrorCode::Storage))?,
         ));
+        let provider = port.provider_name();
         let info = service_info(
+            provider,
             port.models()
                 .await
                 .map_err(|_| service_error(TaskServiceErrorCode::Engine))?,
@@ -892,24 +894,69 @@ fn live_after_cursor(
 
 fn map_live_update((task_id, update): (TaskId, TaskEngineUpdate)) -> Option<(TaskId, TaskUpdate)> {
     match update {
-        TaskEngineUpdate::AgentMessageChunk(text)
-            if text.len() <= 64 * 1024
-                && crate::security::SecretFilter
-                    .inspect(text.as_bytes())
-                    .is_ok() =>
+        TaskEngineUpdate::TaskStatus { status, .. } => Some((task_id, TaskUpdate::Status(status))),
+        TaskEngineUpdate::EpochObjective { objective, .. }
+            if bounded_safe_text(&objective, 16 * 1024) =>
         {
+            Some((task_id, TaskUpdate::EpochObjective(objective)))
+        }
+        TaskEngineUpdate::CheckpointCommitted { checkpoint_id, .. } => {
+            Some((task_id, TaskUpdate::Checkpoint(checkpoint_id)))
+        }
+        TaskEngineUpdate::ContextUsage {
+            total_tokens,
+            context_window: Some(context_window),
+            ..
+        } if context_window > 0 && total_tokens <= context_window => Some((
+            task_id,
+            TaskUpdate::ContextUsage {
+                used: total_tokens,
+                window: context_window,
+            },
+        )),
+        TaskEngineUpdate::Compaction { generation, .. } => {
+            Some((task_id, TaskUpdate::Compaction { generation }))
+        }
+        TaskEngineUpdate::CompletionClauses { clauses, .. }
+            if serde_json::to_vec(&clauses).is_ok_and(|encoded| {
+                encoded.len() <= 64 * 1024
+                    && crate::security::SecretFilter.inspect(&encoded).is_ok()
+            }) =>
+        {
+            Some((task_id, TaskUpdate::CompletionClauses(clauses)))
+        }
+        TaskEngineUpdate::AgentMessageChunk(text) if bounded_safe_text(&text, 64 * 1024) => {
             Some((task_id, TaskUpdate::AssistantDelta(text)))
         }
-        TaskEngineUpdate::DiffUpdated(diff)
-            if diff.len() <= 64 * 1024
-                && crate::security::SecretFilter
-                    .inspect(diff.as_bytes())
-                    .is_ok() =>
+        TaskEngineUpdate::ToolStarted { title, .. } if bounded_safe_text(&title, 16 * 1024) => {
+            Some((task_id, TaskUpdate::ToolStarted(title)))
+        }
+        TaskEngineUpdate::ToolCompleted { title, status }
+            if bounded_safe_text(&title, 16 * 1024) =>
         {
+            let suffix = match status {
+                EngineToolStatus::Completed => "",
+                EngineToolStatus::Failed => " · failed",
+                EngineToolStatus::Cancelled => " · cancelled",
+            };
+            Some((
+                task_id,
+                TaskUpdate::ToolCompleted(format!("{title}{suffix}")),
+            ))
+        }
+        TaskEngineUpdate::DiffUpdated(diff) if bounded_safe_text(&diff, 64 * 1024) => {
             Some((task_id, TaskUpdate::Diff(diff)))
         }
         _ => None,
     }
+}
+
+fn bounded_safe_text(text: &str, maximum: usize) -> bool {
+    !text.is_empty()
+        && text.len() <= maximum
+        && crate::security::SecretFilter
+            .inspect(text.as_bytes())
+            .is_ok()
 }
 
 enum ActorCommand {
@@ -1361,6 +1408,50 @@ async fn execute_command(
                 task_ids,
             }))
         }
+        ServiceCommand::Sessions { frontend, limit } => {
+            let store = lock_store(&shared.read_store)?;
+            let mut summaries = Vec::new();
+            for binding in store
+                .list_frontend_sessions(*frontend, *limit)
+                .map_err(|_| service_error(TaskServiceErrorCode::Storage))?
+            {
+                let latest = store
+                    .list_tasks_for_session(binding.session_id, 1)
+                    .map_err(|_| service_error(TaskServiceErrorCode::Storage))?
+                    .into_iter()
+                    .next();
+                let (latest_task_id, latest_task_status, model, effort) = if let Some(task) = latest
+                {
+                    let configuration = store
+                        .get_task_configuration(task.snapshot.task_id)
+                        .map_err(|_| service_error(TaskServiceErrorCode::Storage))?;
+                    (
+                        Some(task.snapshot.task_id),
+                        Some(task.snapshot.status),
+                        configuration
+                            .as_ref()
+                            .map(|value| value.active_model.clone()),
+                        configuration.as_ref().map(|value| value.active_effort),
+                    )
+                } else {
+                    (None, None, None, None)
+                };
+                summaries.push(super::protocol::ServiceSessionSummary {
+                    external_session_id: binding.external_session_id.as_str().to_owned(),
+                    session_id: binding.session_id,
+                    workspace: binding.cwd,
+                    permission_mode: binding.permission_mode,
+                    provider: shared.info.provider.clone(),
+                    latest_task_id,
+                    latest_task_status,
+                    model,
+                    effort,
+                    created_at: binding.created_at,
+                    updated_at: binding.updated_at,
+                });
+            }
+            Ok(ServiceResult::SessionList(summaries))
+        }
         ServiceCommand::StartTask(command) => {
             validate_model_selection(&shared.info, &command.model, command.effort)?;
             let (reply, response) = oneshot::channel();
@@ -1368,6 +1459,7 @@ async fn execute_command(
                 .controls
                 .send(TaskEngineControl::Enqueue {
                     input: OwnerStartTask {
+                        frontend: command.frontend,
                         external_session_id: command.external_session_id.clone(),
                         workspace: command.workspace.clone(),
                         request: command.request.clone(),
@@ -1432,13 +1524,14 @@ async fn execute_command(
             after_cursor,
             limit,
         } => {
+            let generation_changed = live_generation != &shared.info.live_generation;
             let after_cursor =
                 live_after_cursor(live_generation, &shared.info.live_generation, *after_cursor);
             let (updates, cursor, overflowed) = shared
                 .live_updates
                 .page(*task_id, after_cursor, *limit)
                 .await?;
-            let snapshot = if overflowed {
+            let snapshot = if overflowed || generation_changed {
                 Some(
                     lock_store(&shared.read_store)?
                         .get_task(*task_id)
@@ -1546,6 +1639,7 @@ async fn execute_command(
                 .controls
                 .send(TaskEngineControl::Enqueue {
                     input: OwnerStartTask {
+                        frontend: command.start.frontend,
                         external_session_id: command.start.external_session_id.clone(),
                         workspace: command.start.workspace.clone(),
                         request: command.start.request.clone(),
@@ -1711,8 +1805,17 @@ async fn execute_command(
 }
 
 fn service_info(
+    provider: &'static str,
     models: Vec<crate::runtime::agent_port::AgentModel>,
 ) -> Result<ServiceInfo, TaskServiceError> {
+    if provider.is_empty()
+        || provider.len() > 64
+        || provider
+            .bytes()
+            .any(|byte| !(byte.is_ascii_lowercase() || byte == b'_'))
+    {
+        return Err(service_error(TaskServiceErrorCode::Engine));
+    }
     if models.len() > 128 {
         return Err(service_error(TaskServiceErrorCode::Engine));
     }
@@ -1748,6 +1851,7 @@ fn service_info(
     Ok(ServiceInfo {
         protocol_version: super::protocol::SERVICE_PROTOCOL_VERSION,
         live_generation: uuid::Uuid::new_v4().to_string(),
+        provider: provider.to_owned(),
         models,
         default_model,
         default_effort,
@@ -1760,6 +1864,7 @@ fn service_info(
             sanitized_task_metrics: true,
             recoverable_maintenance: true,
             explicit_task_compaction: true,
+            durable_frontend_sessions: true,
         },
     })
 }
@@ -1792,6 +1897,7 @@ const fn service_command_kind(command: &ServiceCommand) -> &'static str {
         ServiceCommand::Shutdown => "shutdown",
         ServiceCommand::Info
         | ServiceCommand::Session { .. }
+        | ServiceCommand::Sessions { .. }
         | ServiceCommand::Status { .. }
         | ServiceCommand::Metrics { .. }
         | ServiceCommand::List
@@ -2359,6 +2465,7 @@ mod tests {
             request_id: "maintenance-active-start".to_owned(),
             idempotency_key: "maintenance-active-start-key".to_owned(),
             command: ServiceCommand::StartTask(StartTaskCommand {
+                frontend: Frontend::Acp,
                 external_session_id: "maintenance-active-session".to_owned(),
                 workspace: layout.workspace.clone(),
                 request: "drain this task after one exact operation".to_owned(),
@@ -2389,6 +2496,7 @@ mod tests {
                 request_id: "maintenance-queued-start".to_owned(),
                 idempotency_key: "maintenance-queued-start-key".to_owned(),
                 command: ServiceCommand::StartTask(StartTaskCommand {
+                    frontend: Frontend::Acp,
                     external_session_id: "maintenance-queued-session".to_owned(),
                     workspace: layout.workspace.clone(),
                     request: "remain queued during maintenance".to_owned(),
@@ -2552,6 +2660,7 @@ mod tests {
                 request_id: "conflict-active-start".to_owned(),
                 idempotency_key: "conflict-active-start-key".to_owned(),
                 command: ServiceCommand::StartTask(StartTaskCommand {
+                    frontend: Frontend::Acp,
                     external_session_id: "conflict-active-session".to_owned(),
                     workspace: layout.workspace.clone(),
                     request: "remain active across the prepare conflict checks".to_owned(),
@@ -2597,6 +2706,7 @@ mod tests {
             request_id: "conflict-reconnect-start".to_owned(),
             idempotency_key: prepare_key.to_owned(),
             command: ServiceCommand::StartTask(StartTaskCommand {
+                frontend: Frontend::Acp,
                 external_session_id: "must-not-exist".to_owned(),
                 workspace: layout.workspace.clone(),
                 request: "must not create a second task".to_owned(),
@@ -2629,6 +2739,7 @@ mod tests {
             request_id: "unrelated-draining-start".to_owned(),
             idempotency_key: "unrelated-draining-start-key".to_owned(),
             command: ServiceCommand::StartTask(StartTaskCommand {
+                frontend: Frontend::Acp,
                 external_session_id: "unrelated-must-not-exist".to_owned(),
                 workspace: layout.workspace.clone(),
                 request: "must remain rejected while draining".to_owned(),
@@ -2715,6 +2826,7 @@ mod tests {
                 request_id: "terminal-race-start".to_owned(),
                 idempotency_key: "terminal-race-start-key".to_owned(),
                 command: ServiceCommand::StartTask(StartTaskCommand {
+                    frontend: Frontend::Acp,
                     external_session_id: "terminal-race-session".to_owned(),
                     workspace: layout.workspace.clone(),
                     request: "complete naturally while maintenance is being admitted".to_owned(),
@@ -2878,6 +2990,7 @@ mod tests {
                 request_id: "shutdown-failure-start".to_owned(),
                 idempotency_key: "shutdown-failure-start-key".to_owned(),
                 command: ServiceCommand::StartTask(StartTaskCommand {
+                    frontend: Frontend::Acp,
                     external_session_id: "shutdown-failure-session".to_owned(),
                     workspace: layout.workspace.clone(),
                     request: "complete naturally before the failed provider shutdown".to_owned(),
@@ -2997,6 +3110,7 @@ mod tests {
                 request_id: "draining-crash-start".to_owned(),
                 idempotency_key: "draining-crash-start-key".to_owned(),
                 command: ServiceCommand::StartTask(StartTaskCommand {
+                    frontend: Frontend::Acp,
                     external_session_id: "draining-crash-session".to_owned(),
                     workspace: layout.workspace.clone(),
                     request: "perform one consequential operation before maintenance".to_owned(),
@@ -3098,6 +3212,7 @@ mod tests {
                 request_id: "signal-maintenance-start".to_owned(),
                 idempotency_key: "signal-maintenance-start-key".to_owned(),
                 command: ServiceCommand::StartTask(StartTaskCommand {
+                    frontend: Frontend::Acp,
                     external_session_id: "signal-maintenance-session".to_owned(),
                     workspace: layout.workspace.clone(),
                     request: "finish this operation at a safe boundary".to_owned(),
@@ -3247,6 +3362,7 @@ mod tests {
             request_id: format!("handoff-start-{suffix}"),
             idempotency_key: format!("handoff-start-{suffix}-key"),
             command: ServiceCommand::StartTask(StartTaskCommand {
+                frontend: Frontend::Acp,
                 external_session_id: format!("handoff-{suffix}-session"),
                 workspace: layout.workspace.clone(),
                 request: format!("handoff {suffix} task"),

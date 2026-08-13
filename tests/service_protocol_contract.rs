@@ -2,6 +2,7 @@ use std::{error::Error, path::PathBuf, str::FromStr as _};
 
 use carl::acp::PermissionMode;
 use carl::delegates::{ModelId, ReasoningEffort};
+use carl::policy::Frontend;
 use carl::runtime::task::{TaskBudget, TaskId};
 use carl::service::protocol::{
     MAX_SERVICE_FRAME_BYTES, MAX_TASK_TEXT_BYTES, MaintenancePhase, ProtocolErrorCode,
@@ -15,6 +16,7 @@ type TestResult = Result<(), Box<dyn Error>>;
 
 fn start_command(budget: TaskBudget) -> StartTaskCommand {
     StartTaskCommand {
+        frontend: Frontend::Tui,
         external_session_id: "session-1".to_owned(),
         workspace: PathBuf::from("/workspace"),
         request: "Implement the bounded task".to_owned(),
@@ -26,14 +28,35 @@ fn start_command(budget: TaskBudget) -> StartTaskCommand {
 }
 
 #[test]
-fn version_five_maintenance_and_capability_round_trip_strictly() -> TestResult {
+fn version_seven_exposes_strict_durable_tui_sessions() -> TestResult {
+    let command = ServiceCommand::Sessions {
+        frontend: Frontend::Tui,
+        limit: 64,
+    };
+    let request = ServiceRequest {
+        protocol_version: SERVICE_PROTOCOL_VERSION,
+        request_id: "sessions-request".to_owned(),
+        idempotency_key: "sessions-read-key".to_owned(),
+        command: command.clone(),
+    };
+    assert_eq!(
+        decode_request_line(&encode_request(&request)?, &mut RequestLedger::default())?,
+        request
+    );
+    assert_eq!(SERVICE_PROTOCOL_VERSION, 7);
+    assert!(!is_mutation(&command));
+    Ok(())
+}
+
+#[test]
+fn version_seven_maintenance_and_capability_round_trip_strictly() -> TestResult {
     let task_id = TaskId::from_str("11111111-1111-4111-8111-111111111111")?;
     let checkpoint_id =
         carl::runtime::task::CheckpointId::from_str("22222222-2222-4222-8222-222222222222")?;
     let literal = format!(
         "{}\n",
         json!({
-            "protocol_version": 5,
+            "protocol_version": 7,
             "request_id": "maintenance-status-request",
             "idempotency_key": "maintenance-status-read-key",
             "command": {"type":"maintenance_status"}
@@ -53,7 +76,8 @@ fn version_five_maintenance_and_capability_round_trip_strictly() -> TestResult {
         "explicit_task_budgets": true,
         "sanitized_task_metrics": true,
         "recoverable_maintenance": true,
-        "explicit_task_compaction": true
+        "explicit_task_compaction": true,
+        "durable_frontend_sessions": true
     }))?;
     assert!(capabilities.recoverable_maintenance);
 
@@ -73,10 +97,10 @@ fn version_five_maintenance_and_capability_round_trip_strictly() -> TestResult {
 }
 
 #[test]
-fn version_five_exposes_idempotent_explicit_task_compaction() -> TestResult {
+fn version_seven_exposes_idempotent_explicit_task_compaction() -> TestResult {
     let task_id = TaskId::from_str("11111111-1111-4111-8111-111111111111")?;
     let request = ServiceRequest {
-        protocol_version: 5,
+        protocol_version: SERVICE_PROTOCOL_VERSION,
         request_id: "compact-request".to_owned(),
         idempotency_key: "compact-key".to_owned(),
         command: ServiceCommand::Compact { task_id },
@@ -86,7 +110,7 @@ fn version_five_exposes_idempotent_explicit_task_compaction() -> TestResult {
         decode_request_line(&encoded, &mut RequestLedger::default())?,
         request
     );
-    assert_eq!(SERVICE_PROTOCOL_VERSION, 5);
+    assert_eq!(SERVICE_PROTOCOL_VERSION, 7);
     assert!(is_mutation(&request.command));
 
     let capabilities: ServiceCapabilities = serde_json::from_value(json!({
@@ -97,7 +121,8 @@ fn version_five_exposes_idempotent_explicit_task_compaction() -> TestResult {
         "explicit_task_budgets": true,
         "sanitized_task_metrics": true,
         "recoverable_maintenance": true,
-        "explicit_task_compaction": true
+        "explicit_task_compaction": true,
+        "durable_frontend_sessions": true
     }))?;
     assert!(capabilities.explicit_task_compaction);
     Ok(())
@@ -196,7 +221,7 @@ fn unknown_fields_and_unsupported_versions_fail_closed() -> TestResult {
         ProtocolErrorCode::InvalidFrame
     );
 
-    for unsupported_version in [4, 6] {
+    for unsupported_version in [6, 8] {
         let unsupported = format!(
             "{}\n",
             json!({
@@ -233,7 +258,8 @@ fn metrics_command_digest_is_stable_and_capabilities_fail_closed() -> TestResult
         "explicit_task_budgets": true,
         "sanitized_task_metrics": true,
         "recoverable_maintenance": true,
-        "explicit_task_compaction": true
+        "explicit_task_compaction": true,
+        "durable_frontend_sessions": true
     });
     let mut missing = exact.clone();
     missing

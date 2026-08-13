@@ -181,8 +181,8 @@ impl TaskServiceClient {
         let result = self
             .request_once(&ServiceRequest {
                 protocol_version: SERVICE_PROTOCOL_VERSION,
-                request_id: "client-negotiate-v5".to_owned(),
-                idempotency_key: "client-negotiate-v5".to_owned(),
+                request_id: "client-negotiate-v7".to_owned(),
+                idempotency_key: "client-negotiate-v7".to_owned(),
                 command: ServiceCommand::Info,
             })
             .await?;
@@ -198,6 +198,12 @@ impl TaskServiceClient {
 fn validate_info(info: &ServiceInfo) -> Result<(), ServiceClientError> {
     if info.protocol_version != SERVICE_PROTOCOL_VERSION
         || uuid::Uuid::parse_str(&info.live_generation).is_err()
+        || info.provider.is_empty()
+        || info.provider.len() > 64
+        || info
+            .provider
+            .bytes()
+            .any(|byte| !(byte.is_ascii_lowercase() || byte == b'_'))
         || info.models.len() > 128
         || !info.capabilities.durable_events
         || !info.capabilities.reconnect
@@ -205,6 +211,7 @@ fn validate_info(info: &ServiceInfo) -> Result<(), ServiceClientError> {
         || !info.capabilities.sanitized_task_metrics
         || !info.capabilities.recoverable_maintenance
         || !info.capabilities.explicit_task_compaction
+        || !info.capabilities.durable_frontend_sessions
     {
         return Err(client_error(ServiceClientErrorCode::InvalidResponse));
     }
@@ -236,6 +243,7 @@ fn empty_info() -> ServiceInfo {
     ServiceInfo {
         protocol_version: 0,
         live_generation: String::new(),
+        provider: String::new(),
         models: Vec::new(),
         default_model: None,
         default_effort: None,
@@ -248,6 +256,7 @@ fn empty_info() -> ServiceInfo {
             sanitized_task_metrics: false,
             recoverable_maintenance: false,
             explicit_task_compaction: false,
+            durable_frontend_sessions: false,
         },
     }
 }
@@ -549,6 +558,7 @@ mod tests {
         ServiceInfo {
             protocol_version: SERVICE_PROTOCOL_VERSION,
             live_generation: "11111111-1111-4111-8111-111111111111".to_owned(),
+            provider: "openai_subscription".to_owned(),
             models: Vec::new(),
             default_model: None,
             default_effort: None,
@@ -561,6 +571,7 @@ mod tests {
                 sanitized_task_metrics,
                 recoverable_maintenance,
                 explicit_task_compaction,
+                durable_frontend_sessions: true,
             },
         }
     }
@@ -634,6 +645,43 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("explicit_task_compaction");
+        assert!(serde_json::from_value::<ServiceInfo>(missing).is_err());
+    }
+
+    #[test]
+    fn negotiation_requires_durable_frontend_sessions() {
+        let mut unsupported = info(true, true, true, true);
+        unsupported.capabilities.durable_frontend_sessions = false;
+        assert_eq!(
+            validate_info(&unsupported)
+                .expect_err("false frontend-session support must fail negotiation")
+                .code(),
+            ServiceClientErrorCode::InvalidResponse
+        );
+
+        let mut missing = serde_json::to_value(info(true, true, true, true)).unwrap();
+        missing["capabilities"]
+            .as_object_mut()
+            .unwrap()
+            .remove("durable_frontend_sessions");
+        assert!(serde_json::from_value::<ServiceInfo>(missing).is_err());
+    }
+
+    #[test]
+    fn negotiation_requires_a_closed_provider_identity() {
+        for provider in ["", "OpenRouter", "openrouter/other", "openrouter\nsecret"] {
+            let mut unsupported = info(true, true, true, true);
+            unsupported.provider = provider.to_owned();
+            assert_eq!(
+                validate_info(&unsupported)
+                    .expect_err("unsafe provider identity must fail negotiation")
+                    .code(),
+                ServiceClientErrorCode::InvalidResponse
+            );
+        }
+
+        let mut missing = serde_json::to_value(info(true, true, true, true)).unwrap();
+        missing.as_object_mut().unwrap().remove("provider");
         assert!(serde_json::from_value::<ServiceInfo>(missing).is_err());
     }
 

@@ -4,6 +4,7 @@ use std::fs;
 use std::future::{Future, pending};
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{TimeDelta, Utc};
@@ -24,6 +25,7 @@ use crate::auth::{
     SubscriptionAuthBroker, SubscriptionPlan, SubscriptionService,
 };
 use crate::buzz_mcp;
+use crate::credentials::{CredentialVault, load_provider_preference, store_provider_preference};
 use crate::delegates::codex::{
     CodexAppServer, CodexExecAdapter, DirectBaselineErrorCode, DirectCodexBaseline,
     DirectCodexBaselineRequest,
@@ -35,13 +37,19 @@ use crate::memory::{
     MemoryKind, MemoryPartition, MemoryQuery, MemoryScope, MemorySettings, MemoryWrite,
 };
 use crate::policy::Frontend;
+use crate::providers::catalog::{ProviderCatalog, ProviderKind, ProviderModel};
+use crate::providers::http::{ProviderEndpoint, ProviderHttpClient, SecretCredential};
+use crate::providers::openai::OpenAiProvider;
+use crate::providers::openrouter::OpenRouterProvider;
+use crate::runtime::agent_port::AgentPort;
+use crate::runtime::native_port::NativeAgentPort;
 use crate::runtime::task::TaskBudget;
-use crate::service::client::TaskServiceClient;
+use crate::service::client::{ServiceClientErrorCode, TaskServiceClient};
 use crate::service::protocol::{
     MaintenancePhase, SERVICE_PROTOCOL_VERSION, ServiceCommand, ServiceMaintenanceStatus,
     ServiceRequest, ServiceResult,
 };
-use crate::service::server::TaskService;
+use crate::service::server::{TaskService, TaskServiceErrorCode};
 use crate::sidecar::{
     DataRootLock, DataRootLockErrorCode, ExecutableTrustDecision, ExecutionWorkspace,
     ProviderEnvironmentProfile, ProviderHome, ResolvedExecutable, SidecarError, SidecarErrorCode,
@@ -54,11 +62,20 @@ use crate::storage::{Store, TrustedFrontendOwnerInput};
 #[command(name = "carl")]
 pub struct Cli {
     #[command(subcommand)]
-    pub command: Command,
+    pub command: Option<Command>,
+}
+
+impl Cli {
+    #[must_use]
+    pub fn selected_command(self) -> Command {
+        self.command
+            .unwrap_or_else(|| Command::Tui(TuiArgs::default()))
+    }
 }
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    Tui(TuiArgs),
     Serve,
     Acp(AcpArgs),
     Auth {
@@ -85,6 +102,9 @@ pub enum Command {
     Doctor,
     Sessions,
 }
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Args)]
+pub struct TuiArgs {}
 
 #[derive(Clone, Debug, Eq, PartialEq, Subcommand)]
 pub enum BaselineCommand {
@@ -366,6 +386,50 @@ pub enum AuthCommand {
         #[arg(value_enum)]
         service: AuthService,
     },
+    Key {
+        #[arg(value_enum)]
+        provider: NativeProviderArgument,
+    },
+    RemoveKey {
+        #[arg(value_enum)]
+        provider: NativeProviderArgument,
+    },
+    Use {
+        #[arg(value_enum)]
+        provider: ProviderArgument,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum NativeProviderArgument {
+    Openai,
+    Openrouter,
+}
+
+impl NativeProviderArgument {
+    const fn provider_kind(self) -> ProviderKind {
+        match self {
+            Self::Openai => ProviderKind::OpenAiApi,
+            Self::Openrouter => ProviderKind::OpenRouter,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum ProviderArgument {
+    Subscription,
+    Openai,
+    Openrouter,
+}
+
+impl ProviderArgument {
+    const fn provider_kind(self) -> ProviderKind {
+        match self {
+            Self::Subscription => ProviderKind::OpenAiSubscription,
+            Self::Openai => ProviderKind::OpenAiApi,
+            Self::Openrouter => ProviderKind::OpenRouter,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -665,6 +729,7 @@ where
 {
     let mut cancellation = Box::pin(cancellation);
     match command {
+        Command::Tui(_) => CliRunResult::not_implemented("tui streaming dispatch"),
         Command::Auth { command } => run_auth(command, cancellation.as_mut()).await,
         Command::Acp(_) => CliRunResult::not_implemented("acp streaming dispatch"),
         Command::Memory { command } => run_memory(command),
@@ -967,38 +1032,37 @@ async fn run_serve<C>(mut cancellation: Pin<&mut C>) -> CliRunResult
 where
     C: Future<Output = ()> + ?Sized,
 {
-    if env::var_os("OPENAI_API_KEY").is_some() {
-        return service_cli_result(
-            ExitClassification::Failure,
-            "carl serve: API-key authentication is not supported",
-        );
-    }
     let Ok(configuration) = load_common_configuration() else {
         return service_cli_result(
             ExitClassification::Failure,
             "carl serve: invalid Carl data directory or workspace",
         );
     };
-    let Ok((codex_executable, codex_home)) = prepare_provider(AuthService::Openai, &configuration)
-    else {
+    let Ok(port) = configured_service_port(&configuration).await else {
         return service_cli_result(
             ExitClassification::Failure,
-            "carl serve: Codex executable or provider home is invalid",
+            "carl serve: configured provider startup failed",
         );
     };
-    let Ok(codex) =
-        CodexAppServer::connect(&codex_executable, codex_home, SidecarLimits::default()).await
-    else {
-        return service_cli_result(
-            ExitClassification::Failure,
-            "carl serve: Codex app-server startup failed",
-        );
-    };
-    let Ok(service) = TaskService::bind(&configuration.data_root, codex).await else {
-        return service_cli_result(
-            ExitClassification::Failure,
-            "carl serve: Carl data directory is unsafe or already owned",
-        );
+    let service = match TaskService::bind(&configuration.data_root, port).await {
+        Ok(service) => service,
+        Err(error) => {
+            let message = match error.code() {
+                TaskServiceErrorCode::Endpoint => {
+                    "carl serve: Carl data directory is unsafe or already owned"
+                }
+                TaskServiceErrorCode::Storage => "carl serve: durable task state failed validation",
+                TaskServiceErrorCode::Engine => {
+                    "carl serve: provider model catalog failed validation"
+                }
+                TaskServiceErrorCode::Transport
+                | TaskServiceErrorCode::InvalidRequest
+                | TaskServiceErrorCode::Busy
+                | TaskServiceErrorCode::Stopped
+                | TaskServiceErrorCode::IdempotencyConflict => "carl serve: service startup failed",
+            };
+            return service_cli_result(ExitClassification::Failure, message);
+        }
     };
     let stop = CancellationToken::new();
     let serve = service.serve(stop.clone());
@@ -1018,6 +1082,85 @@ where
             "carl serve: persistent task service failed",
         ),
     }
+}
+
+async fn configured_service_port(
+    configuration: &CommonConfiguration,
+) -> Result<Box<dyn AgentPort>, ()> {
+    let selected = match env::var("CARL_PROVIDER").as_deref() {
+        Ok("openai") => ProviderKind::OpenAiApi,
+        Ok("openrouter") => ProviderKind::OpenRouter,
+        Ok("subscription") => ProviderKind::OpenAiSubscription,
+        Err(env::VarError::NotPresent) => load_provider_preference(&configuration.data_root)
+            .map_err(|_| ())?
+            .unwrap_or(ProviderKind::OpenAiSubscription),
+        Ok(_) | Err(env::VarError::NotUnicode(_)) => return Err(()),
+    };
+    match selected {
+        ProviderKind::OpenAiApi => {
+            let credential = environment_credential("OPENAI_API_KEY")
+                .or_else(|_| CredentialVault::load(ProviderKind::OpenAiApi).map_err(|_| ()))?;
+            let catalog = native_openai_catalog()?;
+            let provider = OpenAiProvider::new(
+                ProviderHttpClient::new(ProviderEndpoint::openai()).map_err(|_| ())?,
+                credential,
+                catalog.clone(),
+            )
+            .map_err(|_| ())?;
+            Ok(Box::new(NativeAgentPort::new(Arc::new(provider), catalog)))
+        }
+        ProviderKind::OpenRouter => {
+            let credential = environment_credential("OPENROUTER_API_KEY")
+                .or_else(|_| CredentialVault::load(ProviderKind::OpenRouter).map_err(|_| ()))?;
+            let provider = OpenRouterProvider::discover(
+                ProviderHttpClient::new(ProviderEndpoint::openrouter()).map_err(|_| ())?,
+                credential,
+                CancellationToken::new(),
+            )
+            .await
+            .map_err(|_| ())?;
+            let catalog = provider.catalog().clone();
+            Ok(Box::new(NativeAgentPort::new(Arc::new(provider), catalog)))
+        }
+        ProviderKind::OpenAiSubscription => {
+            let (executable, home) =
+                prepare_provider(AuthService::Openai, configuration).map_err(|_| ())?;
+            let codex = CodexAppServer::connect(&executable, home, SidecarLimits::default())
+                .await
+                .map_err(|_| ())?;
+            Ok(Box::new(codex))
+        }
+    }
+}
+
+fn environment_credential(name: &'static str) -> Result<SecretCredential, ()> {
+    let value = env::var(name).map_err(|_| ())?;
+    SecretCredential::new(value.into_bytes()).map_err(|_| ())
+}
+
+fn native_openai_catalog() -> Result<ProviderCatalog, ()> {
+    let model = ProviderModel::new(
+        ModelId::parse("gpt-5.2-codex").map_err(|_| ())?,
+        "GPT 5.2 Codex".to_owned(),
+        400_000,
+        vec![
+            ReasoningEffort::Low,
+            ReasoningEffort::Medium,
+            ReasoningEffort::High,
+            ReasoningEffort::XHigh,
+        ],
+        ReasoningEffort::High,
+        true,
+        true,
+        true,
+    )
+    .map_err(|_| ())?;
+    ProviderCatalog::new(
+        ProviderKind::OpenAiApi,
+        vec![model.clone()],
+        model.id().clone(),
+    )
+    .map_err(|_| ())
 }
 
 fn service_cli_result(exit: ExitClassification, message: &'static str) -> CliRunResult {
@@ -1426,7 +1569,7 @@ fn memory_scope(
     }
 }
 
-async fn run_auth<C>(command: AuthCommand, cancellation: Pin<&mut C>) -> CliRunResult
+async fn run_auth<C>(command: AuthCommand, mut cancellation: Pin<&mut C>) -> CliRunResult
 where
     C: Future<Output = ()> + ?Sized,
 {
@@ -1442,7 +1585,7 @@ where
             let Ok(_data_root_lock) = acquire_data_root_lock(&configuration) else {
                 return operation_error(service, AuthErrorCode::ProviderRejected);
             };
-            run_login(service, device, &configuration, cancellation).await
+            run_login(service, device, &configuration, cancellation.as_mut()).await
         }
         AuthCommand::Logout { service } => {
             if !local_foreground_terminal_available() {
@@ -1454,8 +1597,143 @@ where
             let Ok(_data_root_lock) = acquire_data_root_lock(&configuration) else {
                 return operation_error(service, AuthErrorCode::ProviderRejected);
             };
-            run_logout(service, &configuration, cancellation).await
+            run_logout(service, &configuration, cancellation.as_mut()).await
         }
+        AuthCommand::Key { provider } => {
+            if !local_foreground_terminal_available() {
+                return service_cli_result(
+                    ExitClassification::Failure,
+                    "carl auth key: an interactive terminal is required",
+                );
+            }
+            let Ok(configuration) = load_common_configuration() else {
+                return service_cli_result(
+                    ExitClassification::Failure,
+                    "carl auth key: invalid Carl data directory",
+                );
+            };
+            let prompt = format!(
+                "{} API key: ",
+                match provider {
+                    NativeProviderArgument::Openai => "OpenAI",
+                    NativeProviderArgument::Openrouter => "OpenRouter",
+                }
+            );
+            let Ok(Ok(secret)) =
+                tokio::task::spawn_blocking(move || rpassword::prompt_password(prompt)).await
+            else {
+                return service_cli_result(
+                    ExitClassification::Failure,
+                    "carl auth key: secure input failed",
+                );
+            };
+            let Ok(credential) = SecretCredential::new(secret.into_bytes()) else {
+                return service_cli_result(
+                    ExitClassification::Failure,
+                    "carl auth key: credential is invalid",
+                );
+            };
+            if CredentialVault::store(provider.provider_kind(), credential).is_err()
+                || store_provider_preference(&configuration.data_root, provider.provider_kind())
+                    .is_err()
+            {
+                return service_cli_result(
+                    ExitClassification::Failure,
+                    "carl auth key: OS credential storage failed",
+                );
+            }
+            service_cli_result(ExitClassification::Success, "")
+        }
+        AuthCommand::RemoveKey { provider } => {
+            if CredentialVault::delete(provider.provider_kind()).is_err() {
+                return service_cli_result(
+                    ExitClassification::Failure,
+                    "carl auth remove-key: credential was unavailable",
+                );
+            }
+            service_cli_result(ExitClassification::Success, "")
+        }
+        AuthCommand::Use { provider } => {
+            let Ok(configuration) = load_common_configuration() else {
+                return service_cli_result(
+                    ExitClassification::Failure,
+                    "carl auth use: invalid Carl data directory",
+                );
+            };
+            if store_provider_preference(&configuration.data_root, provider.provider_kind())
+                .is_err()
+            {
+                return service_cli_result(
+                    ExitClassification::Failure,
+                    "carl auth use: provider preference could not be saved",
+                );
+            }
+            if let Err(exit) =
+                drain_service_for_provider_switch(&configuration.data_root, cancellation.as_mut())
+                    .await
+            {
+                return service_cli_result(
+                    exit,
+                    "carl auth use: provider saved, but the running service could not switch safely",
+                );
+            }
+            service_cli_result(ExitClassification::Success, "")
+        }
+    }
+}
+
+async fn drain_service_for_provider_switch<C>(
+    data_root: &std::path::Path,
+    mut cancellation: Pin<&mut C>,
+) -> Result<(), ExitClassification>
+where
+    C: Future<Output = ()> + ?Sized,
+{
+    let connected = TaskServiceClient::connect(data_root);
+    tokio::pin!(connected);
+    let mut client = tokio::select! {
+        result = &mut connected => match result {
+            Ok(client) => client,
+            Err(error) if error.code() == ServiceClientErrorCode::Unavailable => return Ok(()),
+            Err(_) => return Err(ExitClassification::Failure),
+        },
+        () = cancellation.as_mut() => return Err(ExitClassification::Cancelled),
+    };
+    let mut status = {
+        let prepare = maintenance_request(&mut client, ServiceCommand::PrepareMaintenance);
+        tokio::pin!(prepare);
+        tokio::select! {
+            result = &mut prepare => result.ok_or(ExitClassification::Failure)?,
+            () = cancellation.as_mut() => return Err(ExitClassification::Cancelled),
+        }
+    };
+    let mut poll = maintenance_poll_interval();
+    while status.phase != MaintenancePhase::Ready {
+        tokio::select! {
+            _ = poll.tick() => {}
+            () = cancellation.as_mut() => return Err(ExitClassification::Cancelled),
+        }
+        let request = maintenance_request(&mut client, ServiceCommand::MaintenanceStatus);
+        tokio::pin!(request);
+        status = tokio::select! {
+            result = &mut request => result.ok_or(ExitClassification::Failure)?,
+            () = cancellation.as_mut() => return Err(ExitClassification::Cancelled),
+        };
+    }
+    let request_id = Uuid::new_v4().to_string();
+    let shutdown = client.request(ServiceRequest {
+        protocol_version: SERVICE_PROTOCOL_VERSION,
+        idempotency_key: format!("provider-switch-{request_id}"),
+        request_id,
+        command: ServiceCommand::Shutdown,
+    });
+    tokio::pin!(shutdown);
+    match tokio::select! {
+        result = &mut shutdown => result,
+        () = cancellation.as_mut() => return Err(ExitClassification::Cancelled),
+    } {
+        Ok(ServiceResult::Applied) => Ok(()),
+        Ok(_) | Err(_) => Err(ExitClassification::Failure),
     }
 }
 

@@ -129,11 +129,15 @@ either as adapter credentials. Carl selects Codex's explicit `file` mode rather 
 Both homes are owner-private, and Carl validates credential-file metadata without
 opening or reading the files.
 
-There is no API-key fallback for ACP. If `OPENAI_API_KEY` is set, `carl acp` fails
-before provider startup. API-key-like parent variables are not forwarded through the
-closed Codex child environment. A future native Responses adapter would use an
-OpenAI Platform key, and a future native xAI adapter would use an xAI key; neither
-path is implemented here.
+There is no API-key fallback for subscription ACP. API-key-like parent variables are
+not forwarded through the closed Codex child environment. Native service adapters
+are configured explicitly with `carl auth key openai|openrouter`; secure input is
+stored in macOS Keychain, Windows Credential Manager, or Linux Secret Service.
+`carl auth use subscription|openai|openrouter` writes only an owner-private provider
+enum. When a service is running, the command uses recoverable maintenance to drain at
+a committed checkpoint and shut it down; the next `carl` launch starts the selected
+provider. OpenAI and OpenRouter endpoints are pinned and cannot be overridden by
+profiles.
 
 Authentication status is a local provider-owned handshake and does not prove current
 subscription or model entitlement. Successful authentication enables no model by
@@ -142,8 +146,8 @@ model catalog when it starts.
 
 ## What is not configurable yet
 
-No general profile configuration is accepted today. There is no configuration file
-for native providers, endpoint URLs, native tool budgets, Telegram, TUI layout,
+No general profile configuration is accepted today. Apart from the strict provider
+preference above, there is no configuration file for endpoint URLs, native tool budgets, Telegram, TUI layout,
 memory policy, or promotion. The current working directory becomes the canonical ACP
 workspace, and `CARL_DATA_DIR` must be supplied explicitly. Do not place secrets in
 guessed profile files or non-secret Carl variables.

@@ -75,9 +75,17 @@ const MIGRATIONS: &[Migration] = &[
         name: "service command receipts",
         sql: include_str!("../../migrations/0012_service_command_receipts.sql"),
     },
+    Migration {
+        version: 13,
+        name: "TUI frontend",
+        sql: include_str!("../../migrations/0013_tui_frontend.sql"),
+    },
 ];
 
 pub(crate) fn migrate(connection: &mut Connection) -> Result<(), CarlError> {
+    connection
+        .pragma_update(None, "legacy_alter_table", "ON")
+        .map_err(storage_error)?;
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(storage_error)?;
@@ -173,7 +181,11 @@ pub(crate) fn migrate(connection: &mut Connection) -> Result<(), CarlError> {
             .map_err(storage_error)?;
     }
 
-    transaction.commit().map_err(storage_error)
+    transaction.commit().map_err(storage_error)?;
+    connection
+        .pragma_update(None, "legacy_alter_table", "OFF")
+        .map_err(storage_error)?;
+    Ok(())
 }
 
 fn scrub_unsafe_migrated_memories(

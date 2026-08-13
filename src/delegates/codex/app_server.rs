@@ -1104,6 +1104,10 @@ impl CodexAppServer {
 }
 
 impl AgentPort for CodexAppServer {
+    fn provider_name(&self) -> &'static str {
+        "openai_subscription"
+    }
+
     fn supports_autonomous_tasks(&self) -> bool {
         true
     }
