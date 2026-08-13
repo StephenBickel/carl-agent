@@ -408,10 +408,13 @@ impl<B: TuiBackend> TuiController<B> {
         })
         .await?;
         self.pending_approval = None;
-        Ok(vec![TuiEvent::Notice(match decision {
-            ServiceApprovalDecision::Approve => "operation approved".to_owned(),
-            ServiceApprovalDecision::Deny => "operation denied".to_owned(),
-        })])
+        Ok(vec![
+            TuiEvent::ApprovalResolved,
+            TuiEvent::Notice(match decision {
+                ServiceApprovalDecision::Approve => "operation approved".to_owned(),
+                ServiceApprovalDecision::Deny => "operation denied".to_owned(),
+            }),
+        ])
     }
 
     fn model_notice(&self) -> String {

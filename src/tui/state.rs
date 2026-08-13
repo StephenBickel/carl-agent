@@ -66,6 +66,7 @@ pub enum TuiEvent {
         snapshot: Option<TaskSnapshot>,
     },
     ExitRequested,
+    ApprovalResolved,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
@@ -94,6 +95,7 @@ pub struct TuiState {
     live_generation: Option<String>,
     last_cursor: Option<u64>,
     exit_requested: bool,
+    approval_pending: bool,
 }
 
 impl Default for TuiState {
@@ -115,6 +117,7 @@ impl Default for TuiState {
             live_generation: None,
             last_cursor: None,
             exit_requested: false,
+            approval_pending: false,
         }
     }
 }
@@ -177,6 +180,7 @@ impl TuiState {
                 }
             }
             TuiEvent::ExitRequested => self.exit_requested = true,
+            TuiEvent::ApprovalResolved => self.approval_pending = false,
         }
         Ok(())
     }
@@ -225,6 +229,11 @@ impl TuiState {
         self.exit_requested
     }
 
+    #[must_use]
+    pub const fn approval_pending(&self) -> bool {
+        self.approval_pending
+    }
+
     fn apply_snapshot(&mut self, snapshot: &TaskSnapshot) {
         self.task_id = Some(snapshot.task_id);
         self.status = Some(snapshot.status);
@@ -264,10 +273,13 @@ impl TuiState {
                 display_code,
                 summary,
                 ..
-            } => self.transcript.push(TranscriptItem::Approval {
-                display_code,
-                summary,
-            }),
+            } => {
+                self.approval_pending = true;
+                self.transcript.push(TranscriptItem::Approval {
+                    display_code,
+                    summary,
+                });
+            }
             TaskUpdate::Checkpoint(checkpoint) => self
                 .transcript
                 .push(TranscriptItem::Notice(format!("checkpoint {checkpoint}"))),
