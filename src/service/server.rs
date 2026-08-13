@@ -20,7 +20,7 @@ use crate::events::TurnId;
 use crate::policy::{Frontend, Sha256Digest};
 use crate::runtime::agent_port::{AgentPort, EffectDecision};
 use crate::runtime::task::{
-    CheckpointId, OwnerConfigureSession, OwnerStartTask, OwnerTrustedAdmission,
+    CheckpointId, EngineToolStatus, OwnerConfigureSession, OwnerStartTask, OwnerTrustedAdmission,
     OwnerTrustedMessage, TaskControlKind, TaskEngine, TaskEngineAcknowledgement, TaskEngineControl,
     TaskEngineError, TaskEngineErrorCode, TaskEngineUpdate, TaskId, TaskSnapshot, TaskStatus,
 };
@@ -892,24 +892,69 @@ fn live_after_cursor(
 
 fn map_live_update((task_id, update): (TaskId, TaskEngineUpdate)) -> Option<(TaskId, TaskUpdate)> {
     match update {
-        TaskEngineUpdate::AgentMessageChunk(text)
-            if text.len() <= 64 * 1024
-                && crate::security::SecretFilter
-                    .inspect(text.as_bytes())
-                    .is_ok() =>
+        TaskEngineUpdate::TaskStatus { status, .. } => Some((task_id, TaskUpdate::Status(status))),
+        TaskEngineUpdate::EpochObjective { objective, .. }
+            if bounded_safe_text(&objective, 16 * 1024) =>
         {
+            Some((task_id, TaskUpdate::EpochObjective(objective)))
+        }
+        TaskEngineUpdate::CheckpointCommitted { checkpoint_id, .. } => {
+            Some((task_id, TaskUpdate::Checkpoint(checkpoint_id)))
+        }
+        TaskEngineUpdate::ContextUsage {
+            total_tokens,
+            context_window: Some(context_window),
+            ..
+        } if context_window > 0 && total_tokens <= context_window => Some((
+            task_id,
+            TaskUpdate::ContextUsage {
+                used: total_tokens,
+                window: context_window,
+            },
+        )),
+        TaskEngineUpdate::Compaction { generation, .. } => {
+            Some((task_id, TaskUpdate::Compaction { generation }))
+        }
+        TaskEngineUpdate::CompletionClauses { clauses, .. }
+            if serde_json::to_vec(&clauses).is_ok_and(|encoded| {
+                encoded.len() <= 64 * 1024
+                    && crate::security::SecretFilter.inspect(&encoded).is_ok()
+            }) =>
+        {
+            Some((task_id, TaskUpdate::CompletionClauses(clauses)))
+        }
+        TaskEngineUpdate::AgentMessageChunk(text) if bounded_safe_text(&text, 64 * 1024) => {
             Some((task_id, TaskUpdate::AssistantDelta(text)))
         }
-        TaskEngineUpdate::DiffUpdated(diff)
-            if diff.len() <= 64 * 1024
-                && crate::security::SecretFilter
-                    .inspect(diff.as_bytes())
-                    .is_ok() =>
+        TaskEngineUpdate::ToolStarted { title, .. } if bounded_safe_text(&title, 16 * 1024) => {
+            Some((task_id, TaskUpdate::ToolStarted(title)))
+        }
+        TaskEngineUpdate::ToolCompleted { title, status }
+            if bounded_safe_text(&title, 16 * 1024) =>
         {
+            let suffix = match status {
+                EngineToolStatus::Completed => "",
+                EngineToolStatus::Failed => " · failed",
+                EngineToolStatus::Cancelled => " · cancelled",
+            };
+            Some((
+                task_id,
+                TaskUpdate::ToolCompleted(format!("{title}{suffix}")),
+            ))
+        }
+        TaskEngineUpdate::DiffUpdated(diff) if bounded_safe_text(&diff, 64 * 1024) => {
             Some((task_id, TaskUpdate::Diff(diff)))
         }
         _ => None,
     }
+}
+
+fn bounded_safe_text(text: &str, maximum: usize) -> bool {
+    !text.is_empty()
+        && text.len() <= maximum
+        && crate::security::SecretFilter
+            .inspect(text.as_bytes())
+            .is_ok()
 }
 
 enum ActorCommand {
@@ -1477,13 +1522,14 @@ async fn execute_command(
             after_cursor,
             limit,
         } => {
+            let generation_changed = live_generation != &shared.info.live_generation;
             let after_cursor =
                 live_after_cursor(live_generation, &shared.info.live_generation, *after_cursor);
             let (updates, cursor, overflowed) = shared
                 .live_updates
                 .page(*task_id, after_cursor, *limit)
                 .await?;
-            let snapshot = if overflowed {
+            let snapshot = if overflowed || generation_changed {
                 Some(
                     lock_store(&shared.read_store)?
                         .get_task(*task_id)

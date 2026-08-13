@@ -1,6 +1,7 @@
 use carl::acp::PermissionMode;
 use carl::delegates::{ModelId, ReasoningEffort};
 use carl::runtime::task::TaskId;
+use carl::service::protocol::ServiceSessionSummary;
 use carl::service::protocol::TaskUpdate;
 use carl::tui::render::render;
 use carl::tui::state::{TuiEvent, TuiState};
@@ -66,6 +67,33 @@ fn disconnected_and_narrow_layout_remain_honest_and_bounded() {
     assert!(screen.contains("CARL"));
     assert!(screen.contains("disconnected"));
     assert!(screen.contains("❯"));
+}
+
+#[test]
+fn sessions_overlay_renders_numbered_resumable_sessions() {
+    let mut state = TuiState::default();
+    state
+        .apply(TuiEvent::SessionsLoaded(vec![ServiceSessionSummary {
+            external_session_id: "tui-existing-session".to_owned(),
+            session_id: carl::events::SessionId::new(),
+            workspace: std::path::PathBuf::from("/workspace"),
+            permission_mode: PermissionMode::FullAccess,
+            provider: "openai_subscription".to_owned(),
+            latest_task_id: Some(TaskId::new()),
+            latest_task_status: Some(carl::runtime::task::TaskStatus::Active),
+            model: Some(ModelId::parse("gpt-5.6-codex").unwrap()),
+            effort: Some(ReasoningEffort::High),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }]))
+        .unwrap();
+    let backend = TestBackend::new(100, 12);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| render(frame, &state)).unwrap();
+    let screen = screen(terminal.backend());
+    assert!(screen.contains("Sessions"), "{screen}");
+    assert!(screen.contains("1. tui-existing-session"), "{screen}");
+    assert!(screen.contains("openai_subscription"), "{screen}");
 }
 
 fn screen(backend: &TestBackend) -> String {

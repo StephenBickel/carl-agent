@@ -104,7 +104,10 @@ impl<B: TuiBackend> TuiController<B> {
         Self {
             model: info.default_model.clone(),
             effort: info.default_effort,
-            live_generation: info.live_generation.clone(),
+            // A fresh controller has neither a cursor nor an authoritative
+            // snapshot. A distinct valid generation forces the first
+            // bound-task poll through the service's reconnect/snapshot path.
+            live_generation: Uuid::new_v4().to_string(),
             backend,
             workspace,
             sessions: Vec::new(),
@@ -228,7 +231,8 @@ impl<B: TuiBackend> TuiController<B> {
                 self.external_session_id = None;
                 self.task_id = None;
                 self.live_cursor = None;
-                Ok(vec![TuiEvent::Notice("new session ready".to_owned())])
+                self.pending_approval = None;
+                Ok(vec![TuiEvent::SessionCleared])
             }
             SlashCommand::Sessions => self.refresh_sessions().await,
             SlashCommand::Resume(target) => self.resume(target).await,

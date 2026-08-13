@@ -1,6 +1,6 @@
 # Carl Native TUI and Provider Runtime Design
 
-Status: approved for implementation
+Status: Slice 1 implemented and verified; native providers/tools/onboarding remain
 Date: 2026-08-13
 
 ## Product thesis

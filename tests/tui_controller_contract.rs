@@ -173,6 +173,42 @@ async fn sessions_resume_and_slice_one_provider_commands_are_honest() {
 }
 
 #[tokio::test]
+async fn new_session_clears_the_previous_binding_before_the_next_prompt() {
+    let first_task = TaskId::new();
+    let second_task = TaskId::new();
+    let backend = FakeBackend {
+        info: info(),
+        responses: VecDeque::from([
+            ServiceResult::SessionList(Vec::new()),
+            ServiceResult::Accepted {
+                task_id: first_task,
+            },
+            ServiceResult::Accepted {
+                task_id: second_task,
+            },
+        ]),
+        commands: Vec::new(),
+    };
+    let mut controller = TuiController::new(backend, PathBuf::from("/workspace"));
+    controller.initialize().await.unwrap();
+    controller
+        .submit(SubmittedInput::Prompt("first".to_owned()))
+        .await
+        .unwrap();
+    let cleared = controller
+        .submit(SubmittedInput::Command(SlashCommand::New))
+        .await
+        .unwrap();
+    assert_eq!(cleared, vec![TuiEvent::SessionCleared]);
+    controller
+        .submit(SubmittedInput::Prompt("second".to_owned()))
+        .await
+        .unwrap();
+    let backend = controller.into_backend();
+    assert!(matches!(backend.commands[2], ServiceCommand::StartTask(_)));
+}
+
+#[tokio::test]
 async fn approval_resolution_is_bound_to_the_exact_durable_tui_notice() {
     let task_id = TaskId::new();
     let session_id = SessionId::new();

@@ -6,7 +6,7 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use crate::acp::PermissionMode;
 
-use super::state::{ToolPresentationStatus, TranscriptItem, TuiState};
+use super::state::{Overlay, ToolPresentationStatus, TranscriptItem, TuiState};
 
 pub fn render(frame: &mut Frame<'_>, state: &TuiState) {
     let areas = Layout::vertical([
@@ -41,7 +41,37 @@ pub fn render(frame: &mut Frame<'_>, state: &TuiState) {
         areas[0],
     );
 
-    let mut lines = Vec::new();
+    let mut lines = match state.overlay() {
+        Some(Overlay::Sessions(sessions)) => {
+            let mut rows = vec![Line::styled(
+                "Sessions",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )];
+            if sessions.is_empty() {
+                rows.push(Line::raw("No durable TUI sessions yet."));
+            }
+            for (index, session) in sessions.iter().enumerate() {
+                let status = session.latest_task_status.map_or_else(
+                    || "new".to_owned(),
+                    |status| format!("{status:?}").to_lowercase(),
+                );
+                rows.push(Line::raw(format!(
+                    "{}. {} · {} · {}",
+                    index + 1,
+                    session.external_session_id,
+                    session.provider,
+                    status
+                )));
+            }
+            rows
+        }
+        Some(Overlay::Help) => vec![Line::raw(
+            "/model /effort /permissions /compact /new /sessions /resume /status /cancel /help /exit",
+        )],
+        Some(Overlay::Models) | None => Vec::new(),
+    };
     for item in state.transcript() {
         match item {
             TranscriptItem::User(text) => lines.push(Line::from(vec![

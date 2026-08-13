@@ -7,7 +7,7 @@ Carl's personality and operating principles are public in the
 [public operating contract](CARL.md). The name is Stephen's middle name and his
 grandfather's name.
 
-## Status: pre-alpha, usable ACP coding path
+## Status: pre-alpha, usable terminal and ACP coding paths
 
 Carl now has a usable ACP coding path: `carl acp` runs a real, version-pinned Codex
 app-server through an existing ChatGPT subscription and can serve Buzz or another
@@ -15,6 +15,12 @@ compatible ACP client over stdio. It supports durable sessions, provider-reporte
 model and reasoning choices, plan/default/edit/don't-ask/bypass permission modes,
 exact single-use approvals, steering, cancellation, diffs, and final publication.
 The ACP path is CLI-reachable and covered by process-level offline tests.
+
+Carl also has a native interactive terminal UI. Running `carl` (or the explicit
+`carl tui` alias) connects to the persistent local service, starts it when needed,
+and uses the signed-in OpenAI subscription through Codex. The TUI defaults to
+owner-selected **full access**, streams durable task updates, and keeps sessions
+available after the terminal closes.
 
 The coding path now includes a durable long-horizon task engine: immutable admission
 budgets, completion contracts, operation evidence, canonical checkpoints, structured
@@ -29,7 +35,7 @@ episode memory with scoped isolation, bounded lexical retrieval, proposal approv
 versioned export, hard deletion, and no external service dependency. Memory is
 managed through the implemented `carl memory` command tree.
 
-This remains pre-alpha. TUI interaction, the Telegram gateway, Grok execution,
+This remains pre-alpha. The Telegram gateway, Grok execution,
 native HTTP/OpenAI adapters, Carl's native tool loop, stale-safe live-workspace
 promotion, and broader consumer packaging are incomplete. `serve`, `acp`, `auth`, `memory`, `maintenance`, and the
 direct Codex baseline have implemented behavior; `pair`, `doctor`, and `sessions`
@@ -45,8 +51,27 @@ cargo build --locked --release
 mkdir -m 700 "$HOME/.carl"
 export CARL_DATA_DIR="$HOME/.carl"
 carl auth login openai
-carl acp --permission-mode default
+carl
 ```
+
+`carl tui` opens the same interface explicitly. Type a prompt and press Enter;
+Shift+Enter inserts a newline. Ctrl+C cancels an active task and Ctrl+D exits.
+The terminal supports these commands:
+
+- `/model [id]` and `/effort <level>` inspect or change model configuration.
+- `/permissions <plan|default|accept-edits|dont-ask|full-access>` changes the
+  active policy; **full access** is the local TUI default.
+- `/compact`, `/status`, and `/cancel` control the active durable task.
+- `/sessions` lists durable TUI sessions and `/resume <number|session-id>` loads one.
+- `/new` starts with a clean session, while `/help` and `/exit` are local controls.
+
+Slice 1 intentionally uses only the OpenAI subscription provider already owned by
+Codex. `/provider`, `/login`, and `/logout` report that native provider onboarding
+is not in this slice; OpenRouter/API-key and additional provider support come next.
+
+The background service remains alive when the TUI exits so long-running work and
+session state survive terminal restarts. To use ACP instead, run
+`carl acp --permission-mode default`.
 
 Use `--model <id>` and `--effort low|medium|high|xhigh|max|ultra` to select values
 reported by the active provider. A local operator can explicitly launch unrestricted
@@ -210,7 +235,7 @@ promotion controller, protected runner, merge queue, soak, and rollback remain s
 - [x] Exact remote approvals, model/effort modes, steering, and cancellation
 - [x] Durable long-horizon tasks, checkpoints, compaction, metrics, and restart recovery
 - [x] Local curated-memory storage, retrieval, settings, and CLI controls
-- [ ] Interactive local TUI
+- [x] Interactive local TUI backed by durable subscription tasks
 - [ ] Owner-only Telegram gateway
 - [ ] Grok execution adapter
 - [ ] Native tools, broader sandboxing, and stale-safe promotion

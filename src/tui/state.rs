@@ -58,6 +58,7 @@ pub enum TuiEvent {
     },
     AuthoritativeSnapshot(TaskSnapshot),
     SessionsLoaded(Vec<ServiceSessionSummary>),
+    SessionCleared,
     Notice(String),
     Disconnected,
     Reconnected {
@@ -139,6 +140,7 @@ impl TuiState {
                 self.model = Some(model);
                 self.effort = Some(effort);
                 self.permission_mode = permission_mode;
+                self.overlay = None;
             }
             TuiEvent::TaskUpdate(update) => self.apply_update(update)?,
             TuiEvent::DurableUpdate {
@@ -164,6 +166,18 @@ impl TuiState {
             TuiEvent::AuthoritativeSnapshot(snapshot) => self.apply_snapshot(&snapshot),
             TuiEvent::SessionsLoaded(sessions) => {
                 self.overlay = Some(Overlay::Sessions(sessions));
+            }
+            TuiEvent::SessionCleared => {
+                self.external_session_id = None;
+                self.task_id = None;
+                self.status = None;
+                self.context = None;
+                self.live_generation = None;
+                self.last_cursor = None;
+                self.overlay = None;
+                self.tools.clear();
+                self.transcript.clear();
+                self.approval_pending = false;
             }
             TuiEvent::Notice(notice) => self.transcript.push(TranscriptItem::Notice(notice)),
             TuiEvent::Disconnected => self.connected = false,

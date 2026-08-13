@@ -449,7 +449,8 @@ fn readme_states_the_current_status_and_security_boundaries() {
             "not a complete security sandbox",
             "native http/openai adapters",
             "native tool loop",
-            "tui interaction",
+            "native interactive terminal ui",
+            "running `carl` (or the explicit `carl tui` alias)",
             "telegram gateway",
             "`serve`, `acp`, `auth`, `memory`, `maintenance`, and the direct codex baseline have implemented behavior",
             "`pair`, `doctor`, and `sessions` remain inert cli shells",
@@ -679,6 +680,27 @@ fn readme_points_to_the_carl_design_and_public_contract() {
             .lines()
             .any(|line| line == "Status: approved for implementation")
     );
+}
+
+#[test]
+fn readme_documents_subscription_tui() {
+    let readme = read_readme().to_lowercase();
+    for required in [
+        "carl tui",
+        "carl_data_dir",
+        "openai subscription",
+        "full access",
+        "/sessions",
+        "/compact",
+        "/resume",
+        "/model",
+        "/effort",
+        "/permissions",
+    ] {
+        assert!(readme.contains(required), "README missing `{required}`");
+    }
+    assert!(!readme.contains("tui interaction, the telegram gateway"));
+    assert!(!readme.contains("- [ ] interactive local tui"));
 }
 
 fn markdown_link_targets(markdown: &str) -> Vec<&str> {
