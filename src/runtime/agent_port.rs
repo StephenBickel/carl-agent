@@ -591,6 +591,11 @@ impl AgentProcess {
 }
 
 pub trait AgentPort: Send {
+    /// Stable provider identifier exposed through the local service protocol.
+    fn provider_name(&self) -> &'static str {
+        "openai_subscription"
+    }
+
     /// Whether this provider instance is ready to be driven by Carl's durable
     /// autonomous task loop. Legacy adapters default to the direct turn path.
     fn supports_autonomous_tasks(&self) -> bool {

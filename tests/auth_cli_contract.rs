@@ -185,7 +185,10 @@ fn auth_help_is_exact() -> TestResult {
         .get_subcommands()
         .map(|subcommand| subcommand.get_name())
         .collect();
-    assert_eq!(auth_commands, BTreeSet::from(["login", "logout", "status"]));
+    assert_eq!(
+        auth_commands,
+        BTreeSet::from(["key", "login", "logout", "remove-key", "status", "use"])
+    );
 
     let login = auth
         .find_subcommand("login")

@@ -281,6 +281,10 @@ impl NativeAgentPort {
 }
 
 impl AgentPort for NativeAgentPort {
+    fn provider_name(&self) -> &'static str {
+        self.catalog.provider().as_str()
+    }
+
     fn supports_autonomous_tasks(&self) -> bool {
         true
     }

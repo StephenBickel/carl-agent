@@ -134,7 +134,10 @@ not forwarded through the closed Codex child environment. Native service adapter
 are configured explicitly with `carl auth key openai|openrouter`; secure input is
 stored in macOS Keychain, Windows Credential Manager, or Linux Secret Service.
 `carl auth use subscription|openai|openrouter` writes only an owner-private provider
-enum. OpenAI and OpenRouter endpoints are pinned and cannot be overridden by profiles.
+enum. When a service is running, the command uses recoverable maintenance to drain at
+a committed checkpoint and shut it down; the next `carl` launch starts the selected
+provider. OpenAI and OpenRouter endpoints are pinned and cannot be overridden by
+profiles.
 
 Authentication status is a local provider-owned handshake and does not prove current
 subscription or model entitlement. Successful authentication enables no model by

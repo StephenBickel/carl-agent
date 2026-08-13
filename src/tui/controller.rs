@@ -199,10 +199,10 @@ impl<B: TuiBackend> TuiController<B> {
                 self.configure_active().await?;
                 Ok(vec![TuiEvent::Notice("model updated".to_owned())])
             }
-            SlashCommand::Provider(None) => Ok(vec![TuiEvent::Notice(
-                "provider is selected at service startup; use `carl auth use subscription|openai|openrouter`, then restart the service"
-                    .to_owned(),
-            )]),
+            SlashCommand::Provider(None) => Ok(vec![TuiEvent::Notice(format!(
+                "provider: {}; switch with `carl auth use subscription|openai|openrouter`, then restart Carl",
+                self.backend.info().provider
+            ))]),
             SlashCommand::Provider(Some(provider)) => Ok(vec![TuiEvent::Notice(format!(
                 "to select {provider}, exit Carl and run `carl auth use {provider}` before restarting the service"
             ))]),

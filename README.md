@@ -37,15 +37,16 @@ versioned export, hard deletion, and no external service dependency. Memory is
 managed through the implemented `carl memory` command tree.
 
 This remains pre-alpha. The Telegram gateway, Grok execution,
-provider hot-switching inside a running service, stale-safe live-workspace
+in-process provider hot-swapping, stale-safe live-workspace
 promotion, and broader consumer packaging are incomplete. `serve`, `acp`, `auth`, `memory`, `maintenance`, and the
 direct Codex baseline have implemented behavior; `pair`, `doctor`, and `sessions`
 remain inert CLI shells.
 
 ## Try Carl locally
 
-Carl requires the Rust toolchain in `rust-toolchain.toml`, Codex CLI `0.146.0`, an
-absolute pre-existing private data directory, and a local ChatGPT subscription login.
+Carl requires the Rust toolchain in `rust-toolchain.toml` and an absolute
+pre-existing private data directory. The default subscription path additionally
+requires Codex CLI `0.146.0` and a local ChatGPT subscription login.
 
 ```sh
 cargo build --locked --release
@@ -80,8 +81,10 @@ Use `carl auth key openai` for an OpenAI Platform key, or select
 
 OpenRouter exposes only models advertising text input/output, structured tools, and
 at least a 32K context window. DeepSeek, Qwen, Kimi, Anthropic, Google, and xAI
-models appear when their live metadata qualifies. Provider changes currently require
-restarting the service; `/provider`, `/login`, and `/logout` show the exact commands.
+models appear when their live metadata qualifies. `carl auth use` safely drains any
+running task to a committed checkpoint and stops the old service; the next `carl`
+launch starts the selected provider. `/provider` reports the actual running provider,
+while `/login` and `/logout` show the exact credential commands.
 
 The background service remains alive when the TUI exits so long-running work and
 session state survive terminal restarts. To use ACP instead, run

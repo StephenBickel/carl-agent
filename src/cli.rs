@@ -44,7 +44,7 @@ use crate::providers::openrouter::OpenRouterProvider;
 use crate::runtime::agent_port::AgentPort;
 use crate::runtime::native_port::NativeAgentPort;
 use crate::runtime::task::TaskBudget;
-use crate::service::client::TaskServiceClient;
+use crate::service::client::{ServiceClientErrorCode, TaskServiceClient};
 use crate::service::protocol::{
     MaintenancePhase, SERVICE_PROTOCOL_VERSION, ServiceCommand, ServiceMaintenanceStatus,
     ServiceRequest, ServiceResult,
@@ -1555,7 +1555,7 @@ fn memory_scope(
     }
 }
 
-async fn run_auth<C>(command: AuthCommand, cancellation: Pin<&mut C>) -> CliRunResult
+async fn run_auth<C>(command: AuthCommand, mut cancellation: Pin<&mut C>) -> CliRunResult
 where
     C: Future<Output = ()> + ?Sized,
 {
@@ -1571,7 +1571,7 @@ where
             let Ok(_data_root_lock) = acquire_data_root_lock(&configuration) else {
                 return operation_error(service, AuthErrorCode::ProviderRejected);
             };
-            run_login(service, device, &configuration, cancellation).await
+            run_login(service, device, &configuration, cancellation.as_mut()).await
         }
         AuthCommand::Logout { service } => {
             if !local_foreground_terminal_available() {
@@ -1583,7 +1583,7 @@ where
             let Ok(_data_root_lock) = acquire_data_root_lock(&configuration) else {
                 return operation_error(service, AuthErrorCode::ProviderRejected);
             };
-            run_logout(service, &configuration, cancellation).await
+            run_logout(service, &configuration, cancellation.as_mut()).await
         }
         AuthCommand::Key { provider } => {
             if !local_foreground_terminal_available() {
@@ -1654,8 +1654,72 @@ where
                     "carl auth use: provider preference could not be saved",
                 );
             }
+            if let Err(exit) =
+                drain_service_for_provider_switch(&configuration.data_root, cancellation.as_mut())
+                    .await
+            {
+                return service_cli_result(
+                    exit,
+                    "carl auth use: provider saved, but the running service could not switch safely",
+                );
+            }
             service_cli_result(ExitClassification::Success, "")
         }
+    }
+}
+
+async fn drain_service_for_provider_switch<C>(
+    data_root: &std::path::Path,
+    mut cancellation: Pin<&mut C>,
+) -> Result<(), ExitClassification>
+where
+    C: Future<Output = ()> + ?Sized,
+{
+    let connected = TaskServiceClient::connect(data_root);
+    tokio::pin!(connected);
+    let mut client = tokio::select! {
+        result = &mut connected => match result {
+            Ok(client) => client,
+            Err(error) if error.code() == ServiceClientErrorCode::Unavailable => return Ok(()),
+            Err(_) => return Err(ExitClassification::Failure),
+        },
+        () = cancellation.as_mut() => return Err(ExitClassification::Cancelled),
+    };
+    let mut status = {
+        let prepare = maintenance_request(&mut client, ServiceCommand::PrepareMaintenance);
+        tokio::pin!(prepare);
+        tokio::select! {
+            result = &mut prepare => result.ok_or(ExitClassification::Failure)?,
+            () = cancellation.as_mut() => return Err(ExitClassification::Cancelled),
+        }
+    };
+    let mut poll = maintenance_poll_interval();
+    while status.phase != MaintenancePhase::Ready {
+        tokio::select! {
+            _ = poll.tick() => {}
+            () = cancellation.as_mut() => return Err(ExitClassification::Cancelled),
+        }
+        let request = maintenance_request(&mut client, ServiceCommand::MaintenanceStatus);
+        tokio::pin!(request);
+        status = tokio::select! {
+            result = &mut request => result.ok_or(ExitClassification::Failure)?,
+            () = cancellation.as_mut() => return Err(ExitClassification::Cancelled),
+        };
+    }
+    let request_id = Uuid::new_v4().to_string();
+    let shutdown = client.request(ServiceRequest {
+        protocol_version: SERVICE_PROTOCOL_VERSION,
+        idempotency_key: format!("provider-switch-{request_id}"),
+        request_id,
+        command: ServiceCommand::Shutdown,
+    });
+    tokio::pin!(shutdown);
+    match tokio::select! {
+        result = &mut shutdown => result,
+        () = cancellation.as_mut() => return Err(ExitClassification::Cancelled),
+    } {
+        Ok(ServiceResult::Applied) => Ok(()),
+        Ok(_) | Err(_) => Err(ExitClassification::Failure),
     }
 }
 

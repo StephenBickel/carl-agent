@@ -293,6 +293,7 @@ fn info() -> ServiceInfo {
     ServiceInfo {
         protocol_version: SERVICE_PROTOCOL_VERSION,
         live_generation: "11111111-1111-4111-8111-111111111111".to_owned(),
+        provider: "openai_subscription".to_owned(),
         models: vec![ServiceModel {
             id: ModelId::parse("gpt-5.6-codex").unwrap(),
             display_name: "GPT 5.6 Codex".to_owned(),

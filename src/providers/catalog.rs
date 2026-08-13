@@ -22,6 +22,17 @@ pub enum ProviderKind {
     OpenRouter,
 }
 
+impl ProviderKind {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::OpenAiSubscription => "openai_subscription",
+            Self::OpenAiApi => "openai_api",
+            Self::OpenRouter => "openrouter",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 #[error("native provider catalog is invalid")]
 pub struct ProviderCatalogError;

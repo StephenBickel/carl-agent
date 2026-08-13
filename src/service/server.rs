@@ -358,7 +358,9 @@ impl<P: AgentPort + 'static> TaskService<P> {
                 .open_peer_store()
                 .map_err(|_| service_error(TaskServiceErrorCode::Storage))?,
         ));
+        let provider = port.provider_name();
         let info = service_info(
+            provider,
             port.models()
                 .await
                 .map_err(|_| service_error(TaskServiceErrorCode::Engine))?,
@@ -1439,7 +1441,7 @@ async fn execute_command(
                     session_id: binding.session_id,
                     workspace: binding.cwd,
                     permission_mode: binding.permission_mode,
-                    provider: "openai_subscription".to_owned(),
+                    provider: shared.info.provider.clone(),
                     latest_task_id,
                     latest_task_status,
                     model,
@@ -1803,8 +1805,17 @@ async fn execute_command(
 }
 
 fn service_info(
+    provider: &'static str,
     models: Vec<crate::runtime::agent_port::AgentModel>,
 ) -> Result<ServiceInfo, TaskServiceError> {
+    if provider.is_empty()
+        || provider.len() > 64
+        || provider
+            .bytes()
+            .any(|byte| !(byte.is_ascii_lowercase() || byte == b'_'))
+    {
+        return Err(service_error(TaskServiceErrorCode::Engine));
+    }
     if models.len() > 128 {
         return Err(service_error(TaskServiceErrorCode::Engine));
     }
@@ -1840,6 +1851,7 @@ fn service_info(
     Ok(ServiceInfo {
         protocol_version: super::protocol::SERVICE_PROTOCOL_VERSION,
         live_generation: uuid::Uuid::new_v4().to_string(),
+        provider: provider.to_owned(),
         models,
         default_model,
         default_effort,

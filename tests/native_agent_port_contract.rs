@@ -121,6 +121,67 @@ async fn consequential_tools_pause_for_durable_effect_decisions_and_execute_once
     Ok(())
 }
 
+#[tokio::test]
+async fn multi_step_coding_task_reads_patches_verifies_and_finishes() -> TestResult {
+    let fixture = Fixture::new()?;
+    fs::create_dir(fixture.path.join("src"))?;
+    fs::write(
+        fixture.path.join("src/lib.rs"),
+        "pub fn add(left: i32, right: i32) -> i32 { left - right }\n",
+    )?;
+    let provider = Arc::new(ScriptedProvider::from_json(&multi_step_script())?);
+    let mut port = NativeAgentPort::new(provider.clone(), catalog());
+    let context_id = port
+        .start_context(StartAgentContext {
+            cwd: fixture.path.clone(),
+            model: model(),
+            permission_mode: PermissionMode::FullAccess,
+        })
+        .await?;
+    let _ = port.next_event().await?;
+    port.start_epoch(StartAgentEpoch {
+        context_id,
+        input: "Fix add(), inspect the file first, and verify the result".to_owned(),
+        model: model(),
+        effort: ReasoningEffort::High,
+        permission_mode: PermissionMode::FullAccess,
+    })
+    .await?;
+
+    let mut effects = 0;
+    let mut completed = false;
+    for _ in 0..32 {
+        match port.next_event().await? {
+            AgentEvent::EffectRequested(request) => {
+                effects += 1;
+                port.resolve_effect(&request.request_id, EffectDecision::Allow)
+                    .await?;
+            }
+            AgentEvent::EpochCompleted { status, .. } => {
+                assert_eq!(status, "completed");
+                completed = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(completed);
+    assert_eq!(
+        effects, 2,
+        "patch and verification command require decisions"
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.path.join("src/lib.rs"))?,
+        "pub fn add(left: i32, right: i32) -> i32 { left + right }\n"
+    );
+    let requests = provider.recorded_requests();
+    assert_eq!(requests.len(), 4);
+    assert!(requests[3].messages.iter().any(|message| {
+        message.content.iter().any(|content| matches!(content, carl::providers::MessageContent::ToolResult { output, .. } if output["exit_code"] == 0))
+    }));
+    Ok(())
+}
+
 fn script(tool: &str, arguments: &str) -> String {
     format!(
         r#"{{
@@ -140,6 +201,36 @@ fn script(tool: &str, arguments: &str) -> String {
       ]
     }}"#
     )
+}
+
+fn multi_step_script() -> String {
+    r#"{
+      "schema_version":1,
+      "capabilities":{"streaming":true,"structured_tool_calls":true,"parallel_tool_calls":true,"usage_reporting":true,"context_window":131072},
+      "responses":[
+        {"events":[
+          {"type":"tool_call","tool_call_id":"11111111-1111-4111-8111-111111111111","provider_call_id":"call_read","name":"read_file","arguments":{"path":"src/lib.rs"}},
+          {"type":"usage","input_tokens":20,"output_tokens":5},
+          {"type":"finish","reason":"tool_calls"}
+        ]},
+        {"events":[
+          {"type":"tool_call","tool_call_id":"22222222-2222-4222-8222-222222222222","provider_call_id":"call_patch","name":"apply_patch","arguments":{"changes":[{"path":"src/lib.rs","find":"left - right","replace":"left + right"}]}},
+          {"type":"usage","input_tokens":30,"output_tokens":8},
+          {"type":"finish","reason":"tool_calls"}
+        ]},
+        {"events":[
+          {"type":"tool_call","tool_call_id":"33333333-3333-4333-8333-333333333333","provider_call_id":"call_verify","name":"run_command","arguments":{"argv":["/usr/bin/grep","left + right","src/lib.rs"],"timeout_seconds":5}},
+          {"type":"usage","input_tokens":40,"output_tokens":6},
+          {"type":"finish","reason":"tool_calls"}
+        ]},
+        {"events":[
+          {"type":"text_delta","text":"Fixed add() and verified the implementation."},
+          {"type":"usage","input_tokens":50,"output_tokens":9},
+          {"type":"finish","reason":"stop"}
+        ]}
+      ]
+    }"#
+    .to_owned()
 }
 
 fn model() -> ModelId {

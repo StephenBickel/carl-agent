@@ -15,7 +15,7 @@ use crate::runtime::task::{
     TaskStatus,
 };
 
-pub const SERVICE_PROTOCOL_VERSION: u16 = 6;
+pub const SERVICE_PROTOCOL_VERSION: u16 = 7;
 pub const MAX_SERVICE_FRAME_BYTES: usize = 256 * 1024;
 pub const MAX_TASK_TEXT_BYTES: usize = 16 * 1024;
 const MAX_IDENTIFIER_BYTES: usize = 128;
@@ -242,6 +242,7 @@ impl TryFrom<UncheckedServiceMaintenanceStatus> for ServiceMaintenanceStatus {
 pub struct ServiceInfo {
     pub protocol_version: u16,
     pub live_generation: String,
+    pub provider: String,
     pub models: Vec<ServiceModel>,
     pub default_model: Option<ModelId>,
     pub default_effort: Option<ReasoningEffort>,
