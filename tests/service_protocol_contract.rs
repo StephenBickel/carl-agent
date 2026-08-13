@@ -26,14 +26,14 @@ fn start_command(budget: TaskBudget) -> StartTaskCommand {
 }
 
 #[test]
-fn version_four_maintenance_and_capability_round_trip_strictly() -> TestResult {
+fn version_five_maintenance_and_capability_round_trip_strictly() -> TestResult {
     let task_id = TaskId::from_str("11111111-1111-4111-8111-111111111111")?;
     let checkpoint_id =
         carl::runtime::task::CheckpointId::from_str("22222222-2222-4222-8222-222222222222")?;
     let literal = format!(
         "{}\n",
         json!({
-            "protocol_version": 4,
+            "protocol_version": 5,
             "request_id": "maintenance-status-request",
             "idempotency_key": "maintenance-status-read-key",
             "command": {"type":"maintenance_status"}
@@ -52,7 +52,8 @@ fn version_four_maintenance_and_capability_round_trip_strictly() -> TestResult {
         "configure_active_task": true,
         "explicit_task_budgets": true,
         "sanitized_task_metrics": true,
-        "recoverable_maintenance": true
+        "recoverable_maintenance": true,
+        "explicit_task_compaction": true
     }))?;
     assert!(capabilities.recoverable_maintenance);
 
@@ -68,6 +69,37 @@ fn version_four_maintenance_and_capability_round_trip_strictly() -> TestResult {
     let encoded = encode_frame(&frame)?;
     assert!(encoded.len() < 1024);
     assert_eq!(decode_frame_line(&encoded)?, frame);
+    Ok(())
+}
+
+#[test]
+fn version_five_exposes_idempotent_explicit_task_compaction() -> TestResult {
+    let task_id = TaskId::from_str("11111111-1111-4111-8111-111111111111")?;
+    let request = ServiceRequest {
+        protocol_version: 5,
+        request_id: "compact-request".to_owned(),
+        idempotency_key: "compact-key".to_owned(),
+        command: ServiceCommand::Compact { task_id },
+    };
+    let encoded = encode_request(&request)?;
+    assert_eq!(
+        decode_request_line(&encoded, &mut RequestLedger::default())?,
+        request
+    );
+    assert_eq!(SERVICE_PROTOCOL_VERSION, 5);
+    assert!(is_mutation(&request.command));
+
+    let capabilities: ServiceCapabilities = serde_json::from_value(json!({
+        "durable_events": true,
+        "reconnect": true,
+        "trusted_buzz_admission": true,
+        "configure_active_task": true,
+        "explicit_task_budgets": true,
+        "sanitized_task_metrics": true,
+        "recoverable_maintenance": true,
+        "explicit_task_compaction": true
+    }))?;
+    assert!(capabilities.explicit_task_compaction);
     Ok(())
 }
 
@@ -164,7 +196,7 @@ fn unknown_fields_and_unsupported_versions_fail_closed() -> TestResult {
         ProtocolErrorCode::InvalidFrame
     );
 
-    for unsupported_version in [3, 5] {
+    for unsupported_version in [4, 6] {
         let unsupported = format!(
             "{}\n",
             json!({
@@ -200,7 +232,8 @@ fn metrics_command_digest_is_stable_and_capabilities_fail_closed() -> TestResult
         "configure_active_task": true,
         "explicit_task_budgets": true,
         "sanitized_task_metrics": true,
-        "recoverable_maintenance": true
+        "recoverable_maintenance": true,
+        "explicit_task_compaction": true
     });
     let mut missing = exact.clone();
     missing

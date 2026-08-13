@@ -419,6 +419,26 @@ fn service_command_receipts_are_global_durable_and_canonical() -> Result<(), Box
 }
 
 #[test]
+fn explicit_compaction_has_a_durable_service_command_receipt() -> Result<(), Box<dyn Error>> {
+    let fixture = TemporaryTaskDatabase::new()?;
+    let store = Store::open(&fixture.database)?;
+    let input = ServiceCommandReceiptInput {
+        idempotency_key: "explicit-compaction-key".to_owned(),
+        command_digest: Sha256Digest::parse(
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        )?,
+        command_kind: "compact".to_owned(),
+        created_at: timestamp(0),
+    };
+
+    assert_eq!(
+        store.claim_service_command(input)?,
+        ServiceCommandReceiptClaim::Fresh
+    );
+    Ok(())
+}
+
+#[test]
 fn startup_rejects_a_stale_task_configuration_projection() -> Result<(), Box<dyn Error>> {
     let (fixture, _) = queued_plan_configuration_fixture()?;
     Connection::open(&fixture.database)?.execute(

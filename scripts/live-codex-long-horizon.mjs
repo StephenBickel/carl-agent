@@ -4,6 +4,7 @@
 // Production:
 // CARL_DATA_DIR=/absolute/private/root \
 // CARL_CODEX_EXECUTABLE=/absolute/path/to/codex \
+// CARL_LIVE_CARGO_EXECUTABLE=/absolute/path/to/cargo \
 // CARL_BIN=/absolute/path/to/release/carl \
 // CARL_LIVE_MODEL=gpt-5.6-terra \
 // CARL_LIVE_EFFORT=low \
@@ -47,8 +48,10 @@ import {
   deriveEvidence,
   digestBytes,
   fixtureManifest,
+  forceCodexContextLoss,
   parseOneJsonLine,
   parseReadyMaintenance,
+  readConsistentTaskState,
   directBaselineInvocation,
   validateMetricsResponse,
   validateFixture,
@@ -58,6 +61,22 @@ import {
 } from "./lib/live-runner-core.mjs";
 
 const repository = resolve(import.meta.dirname, "..");
+function validateChapterObservationWindow(holdSeconds, rpcTimeoutSeconds) {
+  if (!Number.isSafeInteger(holdSeconds) || !Number.isSafeInteger(rpcTimeoutSeconds) ||
+      holdSeconds <= rpcTimeoutSeconds || rpcTimeoutSeconds <= 0) {
+    throw Object.assign(new Error("invalid_chapter_observation_window"), {
+      code: "invalid_chapter_observation_window",
+    });
+  }
+  return holdSeconds * 1_000;
+}
+
+const TASK_STATE_RPC_TIMEOUT_MS = 5_000;
+const CHAPTER_MARKER_HOLD_MS = validateChapterObservationWindow(
+  8,
+  TASK_STATE_RPC_TIMEOUT_MS / 1_000,
+);
+
 const PROMPT = Buffer.from(
   "Fix the failing regression with a test-first change, refactor parsing across source files, " +
   "preserve needle_7f3a91c2 exactly, and update README with the exact clause " +
@@ -69,7 +88,7 @@ const PROMPT = Buffer.from(
   "sed ranges and do not batch ranges or chapters into one command. After all twelve reads for one " +
   "chapter, append exactly " +
   "chapter_NN followed by a newline to .chapter-audit, substituting that chapter's two-digit number; " +
-  "then keep that same append command alive for at least five seconds so its following durable checkpoint " +
+  `then keep that same append command alive for at least ${CHAPTER_MARKER_HOLD_MS / 1_000} seconds. After that command returns, immediately end the current turn with a structured continue epoch report before starting the next chapter, so its following durable checkpoint ` +
   "is externally observable. Create no other audit entries and never edit, truncate, or delete " +
   ".chapter-audit. Continue with " +
   "evidence-backed repository inspection until " +
@@ -77,6 +96,21 @@ const PROMPT = Buffer.from(
   "utf8",
 );
 const REDACTED_FAILURE = "live endurance failed";
+
+function buildTaskInput(cargoExecutable) {
+  if (typeof cargoExecutable !== "string" || !cargoExecutable.startsWith("/") ||
+      cargoExecutable.includes("\n") || cargoExecutable.includes("\0")) {
+    throw Object.assign(new Error("invalid_cargo_binary"), { code: "invalid_cargo_binary" });
+  }
+  return Buffer.concat([
+    PROMPT,
+    Buffer.from(
+      ` The provider environment deliberately has a closed PATH. Use the exact Cargo executable ${cargoExecutable} for every Cargo command. ` +
+      "The base sandbox is deliberately read-only; request approval for every mutation and continue after Carl authorizes it.",
+      "utf8",
+    ),
+  ]);
+}
 
 function expect(condition, message = "self_test_failed") {
   if (!condition) throw Object.assign(new Error(message), { code: message });
@@ -260,11 +294,24 @@ function sampleStatus(metrics = sampleMetrics()) {
   };
 }
 
+function carlCompletionIsSafe(metrics) {
+  return metrics.status === "completed" &&
+    metrics.required_clauses_total >= 2 &&
+    metrics.required_clauses_satisfied === metrics.required_clauses_total &&
+    metrics.unresolved_operations === 0 &&
+    metrics.operations_uncertain === 0;
+}
+
 async function selfTest() {
   const root = await mkdtemp(join(tmpdir(), "carl-live-self-test-"));
   await chmod(root, 0o700);
-  const canonicalRoot = await realpath(root);
+    const canonicalRoot = await realpath(root);
   try {
+    expect(validateChapterObservationWindow(8, 5) === 8_000);
+    await expectCode(
+      () => Promise.resolve(validateChapterObservationWindow(5, 5)),
+      "invalid_chapter_observation_window",
+    );
     // 1. Closed admission: no API keys, proxy, Buzz/XAI, debug, or fixture controls survive.
     const environment = closedChildEnvironment(
       { PATH: "/bin", HOME: root, OPENAI_API_KEY: "secret", HTTPS_PROXY: "secret", BUZZ_TOKEN: "secret", CARL_TEST_SECRET: "secret" },
@@ -316,18 +363,84 @@ async function selfTest() {
       const before = `11111111-1111-4111-8111-${String(index).padStart(12, "0")}`;
       const after = `22222222-2222-4222-8222-${String(index).padStart(12, "0")}`;
       expect(chapters.observe(audit, before) === null);
+      expect(chapters.pendingCount() === index);
       expect(chapters.observe(audit, after) === index);
+      expect(chapters.pendingCount() === null);
     }
     chapters.assertComplete();
     const batchedChapters = new ChapterProgressTracker();
     await expectCode(() => Promise.resolve(batchedChapters.observe("chapter_01\nchapter_02\n", null)), "chapter_progress_batched");
+    const reloadTracker = new ChapterProgressTracker();
+    const reloadEvidence = [];
+    const reloadWorkspace = join(root, "reload-workspace");
+    await mkdir(reloadWorkspace, { mode: 0o700 });
+    await writeFile(join(reloadWorkspace, ".chapter-audit"), "chapter_01\n", { mode: 0o600 });
+    expect(await observeDurableChapterProgress(
+      reloadTracker,
+      reloadWorkspace,
+      "11111111-1111-4111-8111-000000000001",
+      reloadEvidence,
+    ) === null);
+    expect(await observeDurableChapterProgress(
+      reloadTracker,
+      reloadWorkspace,
+      "22222222-2222-4222-8222-000000000001",
+      reloadEvidence,
+    ) === 1);
+    await writeFile(join(reloadWorkspace, ".chapter-audit"), "chapter_01\nchapter_02\n", { mode: 0o600 });
+    expect(await observeDurableChapterProgress(
+      reloadTracker,
+      reloadWorkspace,
+      "22222222-2222-4222-8222-000000000001",
+      reloadEvidence,
+    ) === null);
+    expect(JSON.stringify(reloadEvidence) === JSON.stringify([{ kind: "chapter", key: "chapter-1", completed: true }]));
     const metrics = validateMetricsResponse({ metrics: sampleMetrics() });
+    const blockedStateTracker = new ChapterProgressTracker();
+    const blockedStateEvidence = [];
+    await writeFile(join(reloadWorkspace, ".chapter-audit"), "chapter_01\n", { mode: 0o600 });
+    blockedStateTracker.observe(
+      "chapter_01\n",
+      "11111111-1111-4111-8111-000000000001",
+    );
+    blockedStateTracker.observe(
+      "chapter_01\n",
+      "22222222-2222-4222-8222-000000000001",
+    );
+    await writeFile(join(reloadWorkspace, ".chapter-audit"), "chapter_01\nchapter_02\n", { mode: 0o600 });
+    const blockedState = await readTaskStateWithChapterProgress({
+      tracker: blockedStateTracker,
+      workspace: reloadWorkspace,
+      evidence: blockedStateEvidence,
+      previousCheckpoint: "22222222-2222-4222-8222-000000000001",
+      readMetrics: async () => ({ metrics }),
+      readStatus: async () => sampleStatus(metrics),
+    });
+    expect(blockedState.snapshot.revision === metrics.revision);
+    expect(JSON.stringify(blockedStateEvidence) === JSON.stringify([{ kind: "chapter", key: "chapter-2", completed: true }]));
     validateStatusResponse(sampleStatus(metrics), metrics);
+    const advanced = sampleMetrics({ revision: metrics.revision + 1, durable_event_count: metrics.durable_event_count + 1, durable_sequence_end: metrics.durable_sequence_end + 1 });
+    const metricSamples = [metrics, advanced, advanced, advanced];
+    const statusSamples = [sampleStatus(metrics), sampleStatus(advanced)];
+    const consistent = await readConsistentTaskState(
+      async () => ({ metrics: metricSamples.shift() }),
+      async () => statusSamples.shift(),
+    );
+    expect(consistent.metrics.revision === advanced.revision && consistent.snapshot.revision === advanced.revision);
+    const staleStatusSamples = [sampleStatus(metrics), sampleStatus(advanced)];
+    const retried = await readConsistentTaskState(
+      async () => ({ metrics: advanced }),
+      async () => staleStatusSamples.shift(),
+      metrics,
+    );
+    expect(retried.metrics.revision === advanced.revision && retried.snapshot.revision === advanced.revision);
     await expectCode(() => Promise.resolve(validateMetricsResponse({ metrics: { ...metrics, revision: "30" } })), "invalid_metrics");
     await expectCode(() => Promise.resolve(validateMetricsResponse({ metrics: { ...metrics, surprise: 1 } })), "invalid_metrics");
     await expectCode(() => Promise.resolve(validateMetricsResponse({ metrics: { ...metrics, revision: 29 } }, metrics)), "regressing_metrics");
     await expectCode(() => Promise.resolve(validateStatusResponse({ task: { ...sampleStatus(metrics).task, status: "active" } }, metrics)), "invalid_status");
     await expectCode(() => Promise.resolve(validateStatusResponse({ task: { ...sampleStatus(metrics).task, surprise: true } }, metrics)), "invalid_status");
+    expect(carlCompletionIsSafe(sampleMetrics({ required_clauses_total: 2, required_clauses_satisfied: 2 })));
+    expect(!carlCompletionIsSafe(sampleMetrics({ required_clauses_total: 1, required_clauses_satisfied: 1 })));
 
     // 5. Malformed/extra child output and fixture divergence fail closed.
     await expectCode(() => Promise.resolve(parseOneJsonLine("{}\n{}\n")), "malformed_child_json");
@@ -365,24 +478,32 @@ async function selfTest() {
     await mkdir(releaseDirectory, { recursive: true, mode: 0o700 });
     const fakeCarl = join(releaseDirectory, "carl");
     const fakeCodex = join(canonicalRoot, "codex");
-    for (const executable of [fakeCarl, fakeCodex]) {
+    const fakeCargo = join(canonicalRoot, "cargo");
+    for (const executable of [fakeCarl, fakeCodex, fakeCargo]) {
       await writeFile(executable, "#!/bin/sh\nexit 0\n", { mode: 0o700 });
       await chmod(executable, 0o700);
     }
     const admitted = await admitProduction({
       CARL_DATA_DIR: canonicalRoot,
       CARL_CODEX_EXECUTABLE: fakeCodex,
+      CARL_LIVE_CARGO_EXECUTABLE: fakeCargo,
       CARL_BIN: fakeCarl,
       CARL_LIVE_MODEL: "gpt-5.6-terra",
       CARL_LIVE_EFFORT: "low",
       CARL_LIVE_DURATION_HOURS: "2",
     }, repository);
+    expect(admitted.cargo === fakeCargo);
+    const livePrompt = buildTaskInput(admitted.cargo);
     const acpInvocation = carlAcpInvocation(admitted, carl);
-    const directInvocation = directBaselineInvocation(admitted, direct, PROMPT);
+    const softTimeIndex = acpInvocation.argv.indexOf("--soft-epoch-seconds");
+    expect(softTimeIndex >= 0 && acpInvocation.argv[softTimeIndex + 1] === "900");
+    const softToolIndex = acpInvocation.argv.indexOf("--soft-epoch-tool-calls");
+    expect(softToolIndex >= 0 && acpInvocation.argv[softToolIndex + 1] === "6");
+    const directInvocation = directBaselineInvocation(admitted, direct, livePrompt);
     expect(!JSON.stringify({ argv: acpInvocation.argv, environment: acpInvocation.environment }).includes("needle_7f3a91c2"));
     expect(!JSON.stringify({ argv: directInvocation.argv, environment: directInvocation.environment }).includes("needle_7f3a91c2"));
-    expect(directInvocation.stdin.equals(PROMPT));
-    await expectCode(() => admitProduction({ ...process.env, CARL_DATA_DIR: canonicalRoot, CARL_CODEX_EXECUTABLE: fakeCodex, CARL_BIN: fakeCarl, CARL_LIVE_MODEL: "gpt-5.6-terra", CARL_LIVE_EFFORT: "low", CARL_LIVE_DURATION_HOURS: "1" }, repository), "invalid_duration");
+    expect(directInvocation.stdin.equals(livePrompt));
+    await expectCode(() => admitProduction({ ...process.env, CARL_DATA_DIR: canonicalRoot, CARL_CODEX_EXECUTABLE: fakeCodex, CARL_LIVE_CARGO_EXECUTABLE: fakeCargo, CARL_BIN: fakeCarl, CARL_LIVE_MODEL: "gpt-5.6-terra", CARL_LIVE_EFFORT: "low", CARL_LIVE_DURATION_HOURS: "1" }, repository), "invalid_duration");
 
     // 7. Maintenance parsing, signal cancellation, and stubborn-child cleanup use
     // the same production seams and observe exit before success.
@@ -399,6 +520,33 @@ async function selfTest() {
     binding.dispose();
     expect(cancellation.signal.aborted && stubborn.signals.includes("SIGTERM") && stubborn.signals.includes("SIGKILL"));
     expect(registry.size === 0);
+    const exitingChild = spawnTracked(
+      registry,
+      process.execPath,
+      ["-e", "process.stdin.once('data', () => process.exit(0))"],
+      { env: closedChildEnvironment(process.env), stdio: ["pipe", "pipe", "pipe"] },
+    );
+    const exitingRpc = new RpcClient(exitingChild, registry);
+    await expectCode(() => exitingRpc.request("fixture/exit", {}, 1_000), "child_exited");
+    expect(exitingRpc.pendingTimerCount === 0, "rpc_timer_leak");
+    await registry.terminateAll();
+    const providerRoot = join(canonicalRoot, "providers", "codex");
+    await mkdir(providerRoot, { recursive: true, mode: 0o700 });
+    await writeFile(join(providerRoot, "auth.json"), "auth-sentinel\n", { mode: 0o600 });
+    for (const name of ["state_5.sqlite", "state_5.sqlite-shm", "state_5.sqlite-wal"]) {
+      await writeFile(join(providerRoot, name), "disposable\n", { mode: 0o600 });
+    }
+    const sessions = join(providerRoot, "sessions", "2026", "08", "12");
+    await mkdir(sessions, { recursive: true, mode: 0o700 });
+    await writeFile(join(sessions, "rollout-fixture.jsonl"), "transcript-sentinel\n", { mode: 0o600 });
+    await forceCodexContextLoss(canonicalRoot, 1);
+    expect((await readFile(join(providerRoot, "auth.json"), "utf8")) === "auth-sentinel\n");
+    expect(await lstat(join(providerRoot, "state_5.sqlite")).catch(() => null) === null);
+    expect(await lstat(join(providerRoot, "sessions")).catch(() => null) === null);
+    expect(
+      (await readFile(join(providerRoot, "context-loss-fixtures", "loss-1", "sessions", "2026", "08", "12", "rollout-fixture.jsonl"), "utf8")) ===
+      "transcript-sentinel\n",
+    );
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -420,6 +568,7 @@ class RpcClient {
     this.registry = registry;
     this.nextId = 1;
     this.pending = new Map();
+    this.activeTimers = 0;
     this.notifications = [];
     this.stderrBytes = 0;
     createInterface({ input: child.stdout, crlfDelay: Infinity }).on("line", (line) => this.#line(line));
@@ -428,9 +577,16 @@ class RpcClient {
       if (this.stderrBytes > 256 * 1024) void registry.terminate(child, 0);
     });
     child.once("exit", () => {
-      for (const pending of this.pending.values()) pending.reject(Object.assign(new Error("child_exited"), { code: "child_exited" }));
+      for (const pending of this.pending.values()) {
+        clearTimeout(pending.timer);
+        this.activeTimers -= 1;
+        pending.reject(Object.assign(new Error("child_exited"), { code: "child_exited" }));
+      }
       this.pending.clear();
     });
+  }
+  get pendingTimerCount() {
+    return this.activeTimers;
   }
   #line(line) {
     let message;
@@ -439,6 +595,7 @@ class RpcClient {
       const pending = this.pending.get(message.id);
       this.pending.delete(message.id);
       clearTimeout(pending.timer);
+      this.activeTimers -= 1;
       if (message.error) pending.reject(Object.assign(new Error("rpc_failed"), { code: `rpc_${message.error.code}` }));
       else pending.resolve(message.result);
     } else if (message.method === "session/update") {
@@ -462,10 +619,13 @@ class RpcClient {
     const id = this.nextId++;
     const result = new Promise((resolveRequest, rejectRequest) => {
       const timer = setTimeout(() => {
-        this.pending.delete(id);
-        rejectRequest(Object.assign(new Error("rpc_timeout"), { code: "rpc_timeout" }));
+        if (this.pending.delete(id)) {
+          this.activeTimers -= 1;
+          rejectRequest(Object.assign(new Error("rpc_timeout"), { code: "rpc_timeout" }));
+        }
       }, timeoutMilliseconds);
       this.pending.set(id, { resolve: resolveRequest, reject: rejectRequest, timer });
+      this.activeTimers += 1;
     });
     this.child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
     return result;
@@ -572,20 +732,73 @@ async function validateCompletedTopology(workspace) {
   }
 }
 
+async function observeDurableChapterProgress(tracker, workspace, latestCheckpoint, evidence) {
+  let audit = "";
+  try {
+    audit = await readFile(join(workspace, ".chapter-audit"), "utf8");
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+  const provenChapter = tracker.observe(audit, latestCheckpoint);
+  if (provenChapter !== null) {
+    evidence.push({ kind: "chapter", key: `chapter-${provenChapter}`, completed: true });
+  }
+  return provenChapter;
+}
+
+async function readTaskStateWithChapterProgress({
+  tracker,
+  workspace,
+  evidence,
+  previousCheckpoint,
+  readMetrics,
+  readStatus,
+  previousMetrics = null,
+}) {
+  await observeDurableChapterProgress(
+    tracker,
+    workspace,
+    previousCheckpoint,
+    evidence,
+  );
+  const state = await readConsistentTaskState(
+    readMetrics,
+    readStatus,
+    previousMetrics,
+  );
+  await observeDurableChapterProgress(
+    tracker,
+    workspace,
+    state.snapshot.latest_checkpoint,
+    evidence,
+  );
+  return state;
+}
+
 async function production() {
   const admission = await admitProduction(process.env, repository);
+  const taskInput = buildTaskInput(admission.cargo);
   const registry = new ChildRegistry();
   const abort = new AbortController();
   const signalBinding = bindTerminationSignals(process, abort, registry);
-  const root = await mkdtemp(join(tmpdir(), "carl-live-long-horizon-"));
-  await chmod(root, 0o700);
+  const temporaryRoot = await mkdtemp(join(tmpdir(), "carl-live-long-horizon-"));
+  await chmod(temporaryRoot, 0o700);
+  const root = await realpath(temporaryRoot);
   let success = false;
   try {
     const source = join(root, "source");
     const carlWorkspace = join(root, "carl");
     const directWorkspace = join(root, "direct");
-    const manifest = await createFixture(source);
-    if ((await copyFixture(source, carlWorkspace, repository)) !== manifest || (await copyFixture(source, directWorkspace, repository)) !== manifest) throw new Error("fixture_parity");
+    let manifest;
+    try {
+      manifest = await createFixture(source);
+      if ((await copyFixture(source, carlWorkspace, repository)) !== manifest ||
+          (await copyFixture(source, directWorkspace, repository)) !== manifest) {
+        throw new Error("fixture_parity");
+      }
+    } catch {
+      throw Object.assign(new Error("fixture_setup_failed"), { code: "fixture_setup_failed" });
+    }
     const environment = closedChildEnvironment(process.env, {
       CARL_DATA_DIR: admission.dataRoot,
       CARL_CODEX_EXECUTABLE: admission.codex,
@@ -599,9 +812,10 @@ async function production() {
     let sessionId = created.sessionId;
     // The ACP response may be lost during a deliberate service reconnect; durable
     // metrics and the loaded task are the completion authority.
-    void rpc.request("session/prompt", { sessionId, prompt: [{ type: "text", text: PROMPT.toString("utf8") }] }, admission.timeoutSeconds * 1_000).catch(() => {});
+    void rpc.request("session/prompt", { sessionId, prompt: [{ type: "text", text: taskInput.toString("utf8") }] }, admission.timeoutSeconds * 1_000).catch(() => {});
     let taskId = null;
     let lastMetrics = null;
+    let lastCheckpoint = null;
     let lastDigest = manifest;
     let steering = 0;
     let restartAttempts = 0;
@@ -612,6 +826,7 @@ async function production() {
     const commandStarts = new Map();
     let longObserved = false;
     const observedCompactions = new Set();
+    const requestedCompactions = new Set();
     const chapterTracker = new ChapterProgressTracker();
     let lastProgressAt = process.hrtime.bigint();
     const evidence = [];
@@ -636,13 +851,26 @@ async function production() {
         }
       }
       if (taskId) {
-        const response = await rpc.request("_task/metrics", { sessionId, taskId }, 30_000);
-        const metrics = validateMetricsResponse(response, lastMetrics);
-        const statusResponse = await rpc.request("_task/status", { sessionId, taskId }, 30_000);
-        const snapshot = validateStatusResponse(statusResponse, metrics);
-        const chapterAudit = await readFile(join(carlWorkspace, ".chapter-audit"), "utf8").catch(() => "");
-        const provenChapter = chapterTracker.observe(chapterAudit, snapshot.latest_checkpoint);
-        if (provenChapter !== null) evidence.push({ kind: "chapter", key: `chapter-${provenChapter}`, completed: true });
+        const { metrics, snapshot } = await readTaskStateWithChapterProgress({
+          tracker: chapterTracker,
+          workspace: carlWorkspace,
+          evidence,
+          previousCheckpoint: lastCheckpoint,
+          readMetrics: () => rpc.request("_task/metrics", { sessionId, taskId }, TASK_STATE_RPC_TIMEOUT_MS),
+          readStatus: () => rpc.request("_task/status", { sessionId, taskId }, TASK_STATE_RPC_TIMEOUT_MS),
+          previousMetrics: lastMetrics,
+        });
+        lastCheckpoint = snapshot.latest_checkpoint;
+        const pendingChapter = chapterTracker.pendingCount();
+        if (pendingChapter !== null && !requestedCompactions.has(pendingChapter)) {
+          const compacted = await rpc.request("_task/compact", {
+            sessionId,
+            taskId,
+            idempotencyKey: `chapter-compaction-${pendingChapter}`,
+          });
+          if (compacted.outcome !== "accepted") throw new Error("compaction_not_accepted");
+          requestedCompactions.add(pendingChapter);
+        }
         if (metrics.provider_context_losses > (lastMetrics?.provider_context_losses ?? 0)) {
           const delta = metrics.provider_context_losses - (lastMetrics?.provider_context_losses ?? 0);
           if (delta !== 1) throw new Error("context_loss_observation_gap");
@@ -680,18 +908,24 @@ async function production() {
           parseReadyMaintenance(maintained.stdout, taskId);
           await registry.terminate(service);
           await registry.terminate(acp);
+          if (restartAttempts === 1 || restartAttempts === 3) {
+            await forceCodexContextLoss(admission.dataRoot, restartAttempts);
+          }
           service = await startService(admission, registry, carlWorkspace, environment);
           ({ child: acp, rpc } = await connectAcp(admission, registry, carlWorkspace, environment));
           const loaded = await rpc.request("session/load", { sessionId, cwd: carlWorkspace, mcpServers: [], taskId });
           sessionId = loaded.sessionId ?? sessionId;
-          const reloadedMetrics = validateMetricsResponse(
-            await rpc.request("_task/metrics", { sessionId, taskId }, 30_000),
-            metrics,
-          );
-          const reloadedSnapshot = validateStatusResponse(
-            await rpc.request("_task/status", { sessionId, taskId }, 30_000),
-            reloadedMetrics,
-          );
+          const { metrics: reloadedMetrics, snapshot: reloadedSnapshot } =
+            await readTaskStateWithChapterProgress({
+              tracker: chapterTracker,
+              workspace: carlWorkspace,
+              evidence,
+              previousCheckpoint: lastCheckpoint,
+              readMetrics: () => rpc.request("_task/metrics", { sessionId, taskId }, TASK_STATE_RPC_TIMEOUT_MS),
+              readStatus: () => rpc.request("_task/status", { sessionId, taskId }, TASK_STATE_RPC_TIMEOUT_MS),
+              previousMetrics: metrics,
+            });
+          lastCheckpoint = reloadedSnapshot.latest_checkpoint;
           pendingRestart = {
             index: restartAttempts,
             revision: reloadedMetrics.revision,
@@ -717,12 +951,12 @@ async function production() {
     if (provenContextLosses !== lastMetrics.provider_context_losses) throw new Error("context_replacement_not_proven");
     if (confirmedRestarts < 5 || pendingRestart) throw new Error("restart_not_proven");
     const counts = deriveEvidence(evidence);
-    if (lastMetrics.status !== "completed" || lastMetrics.required_clauses_total < 5 || lastMetrics.required_clauses_satisfied !== lastMetrics.required_clauses_total || lastMetrics.unresolved_operations !== 0 || lastMetrics.operations_uncertain !== 0) throw new Error("unsafe_carl_result");
+    if (!carlCompletionIsSafe(lastMetrics)) throw new Error("unsafe_carl_result");
     carlElapsed = Number((process.hrtime.bigint() - startedAt) / 1_000_000n);
     const carlVerified = await verifyCompletedWorkspace(registry, carlWorkspace, environment);
     if (!carlVerified) throw new Error("carl_fixture_failed");
     if ((await fixtureManifest(source)) !== manifest || (await fixtureManifest(directWorkspace)) !== manifest) throw new Error("fixture_provenance_changed");
-    const directInvocation = directBaselineInvocation(admission, directWorkspace, PROMPT);
+    const directInvocation = directBaselineInvocation(admission, directWorkspace, taskInput);
     const direct = await runCommand(
       registry,
       directInvocation.executable,
@@ -744,7 +978,7 @@ async function production() {
       effort: admission.effort,
       requested_duration_hours: admission.durationHours,
       fixture_manifest_digest: manifest,
-      task_input_digest: digestBytes(PROMPT),
+      task_input_digest: digestBytes(taskInput),
       carl: {
         completed: true,
         elapsed_milliseconds: carlElapsed,

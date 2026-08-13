@@ -550,6 +550,7 @@ struct QuiescePortState {
     work_epoch_starts: usize,
     effect_count: usize,
     boundary_requests: usize,
+    compactions: usize,
     operation_id: Option<String>,
     boundary_released: bool,
     work_completion_queued: bool,
@@ -598,6 +599,7 @@ impl AgentPort for QuiescePort {
     }
 
     fn compact_context(&mut self, _context_id: &AgentContextId) -> AgentFuture<'_, ()> {
+        self.state.lock().unwrap().compactions += 1;
         Box::pin(async { Ok(()) })
     }
 
@@ -840,5 +842,90 @@ async fn repeated_quiesce_coalesces_one_boundary_and_returns_the_committed_activ
     assert_eq!(state.effect_count, 1);
     assert_eq!(state.boundary_requests, 1);
     assert_eq!(state.work_epoch_starts, 1);
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn explicit_compaction_waits_for_one_safe_checkpoint_and_compacts_below_pressure()
+-> TestResult {
+    let fixture = Fixture::new()?;
+    let store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let port = QuiescePort::new(fixture.workspace.clone());
+    let observed = Arc::clone(&port.state);
+    let release = port.clone();
+    let mut engine = TaskEngine::new(store, port);
+    install_frontend(&mut engine, session.id, fixture.workspace.clone());
+    let mut task_input = input(session.id, &fixture, None);
+    task_input.permission_mode = PermissionMode::FullAccess;
+    let task_id = engine.enqueue_with_receipt(task_input, None)?.task_id;
+    let (control_sender, control_receiver) = mpsc::channel(1);
+    let control_keepalive = control_sender.clone();
+    let (acknowledgement_sender, mut acknowledgement_receiver) = mpsc::channel(1);
+    let (permission_sender, _permission_receiver) = mpsc::channel(1);
+    engine.install_controls(control_receiver, acknowledgement_sender, permission_sender);
+
+    let controls = tokio::spawn(async move {
+        loop {
+            if observed.lock().unwrap().effect_count == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        control_sender
+            .send(TaskEngineControl::Compact {
+                task_id,
+                acknowledgement: 51,
+            })
+            .await
+            .expect("explicit compaction remains deliverable");
+        assert_eq!(acknowledgement_receiver.recv().await.unwrap().0, 51);
+        release.release_boundary();
+    });
+
+    let result = tokio::time::timeout(Duration::from_secs(2), engine.run(task_id))
+        .await
+        .expect("explicit compaction must reach a safe checkpoint");
+    controls.await?;
+    let snapshot = result.unwrap_or_else(|error| {
+        panic!(
+            "explicit compaction failed {error:?}: {:?}",
+            engine.store().read_task_events(task_id).unwrap()
+        )
+    });
+    drop(control_keepalive);
+
+    assert_eq!(snapshot.status, TaskStatus::Active);
+    let state = engine.port.state.lock().unwrap();
+    assert_eq!(state.boundary_requests, 1);
+    assert_eq!(state.compactions, 1);
+    drop(state);
+    let events = engine.store().read_task_events(task_id)?;
+    assert_eq!(
+        events
+            .iter()
+            .filter(|envelope| matches!(
+                envelope.event,
+                crate::events::Event::TaskLifecycle {
+                    event: TaskEvent::CompactionRequested { .. },
+                    ..
+                }
+            ))
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|envelope| matches!(
+                envelope.event,
+                crate::events::Event::TaskLifecycle {
+                    event: TaskEvent::CompactionCompleted { .. },
+                    ..
+                }
+            ))
+            .count(),
+        1
+    );
     Ok(())
 }

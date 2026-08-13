@@ -8566,6 +8566,7 @@ fn validate_service_command_receipt(input: &ServiceCommandReceiptInput) -> Resul
             | "steer"
             | "steer_trusted"
             | "cancel"
+            | "compact"
             | "configure"
             | "prepare_maintenance"
             | "shutdown"

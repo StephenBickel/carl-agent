@@ -268,6 +268,7 @@ struct EnginePortState {
     compactions: usize,
     replacements: usize,
     usage: Option<(u64, u64)>,
+    usage_last_total: Option<u64>,
     ambiguous_event_failure: bool,
     definitely_not_applied_event_failure: bool,
     invalid_event_after_binding: bool,
@@ -304,6 +305,7 @@ struct EnginePortState {
     durable_mutation_count: u64,
     resume_attempts: Vec<String>,
     resume_unavailable: bool,
+    reject_missing_resume_workspace: bool,
     active_context_id: String,
     background_capable: bool,
     background_processes: Vec<AgentProcess>,
@@ -314,6 +316,7 @@ struct EnginePortState {
     completed_process: Option<AgentProcess>,
     file_mutation: Option<(PathBuf, Vec<u8>)>,
     file_change_path: String,
+    implicit_observation_first: bool,
 }
 
 impl EnginePort {
@@ -345,6 +348,23 @@ impl EnginePort {
         )])
     }
 
+    fn implicit_observation_then_edit() -> Self {
+        let port = Self::new([
+            (
+                WorkKind::Command,
+                "Inspected repository state",
+                "continue:Implement the repair",
+            ),
+            (
+                WorkKind::FileChange,
+                "Implemented and verified the repair",
+                "complete:requested-outcome,explicit-verification",
+            ),
+        ]);
+        port.state.lock().unwrap().implicit_observation_first = true;
+        port
+    }
+
     fn new<const N: usize>(work: [(WorkKind, &'static str, &'static str); N]) -> Self {
         Self {
             state: Arc::new(Mutex::new(EnginePortState {
@@ -361,6 +381,7 @@ impl EnginePort {
                 compactions: 0,
                 replacements: 0,
                 usage: None,
+                usage_last_total: None,
                 ambiguous_event_failure: false,
                 definitely_not_applied_event_failure: false,
                 invalid_event_after_binding: false,
@@ -397,6 +418,7 @@ impl EnginePort {
                 durable_mutation_count: 0,
                 resume_attempts: Vec::new(),
                 resume_unavailable: false,
+                reject_missing_resume_workspace: false,
                 active_context_id: "engine-context".to_owned(),
                 background_capable: false,
                 background_processes: Vec::new(),
@@ -407,6 +429,7 @@ impl EnginePort {
                 completed_process: None,
                 file_mutation: None,
                 file_change_path: "src/lib.rs".to_owned(),
+                implicit_observation_first: false,
             })),
         }
     }
@@ -462,8 +485,24 @@ impl EnginePort {
         let port = Self::continuation_checkpoint_then_compaction_failure();
         let mut state = port.state.lock().unwrap();
         state.started_process = Some(started_process);
-        state.completed_process = completed_process;
+        if let Some(completed_process) = completed_process {
+            state.background_capable = true;
+            state.background_processes = vec![completed_process.clone()];
+            state.completed_process = Some(completed_process);
+        }
         drop(state);
+        port
+    }
+
+    fn continuation_checkpoint_with_terminal_process_then_compaction_failure(
+        started_process: AgentProcess,
+        completed_process: AgentProcess,
+    ) -> Self {
+        let port = Self::continuation_checkpoint_with_process_then_compaction_failure(
+            started_process,
+            Some(completed_process),
+        );
+        port.state.lock().unwrap().background_processes.clear();
         port
     }
 
@@ -518,8 +557,34 @@ impl EnginePort {
         port
     }
 
+    fn cumulative_usage_after_compaction() -> Self {
+        let port = Self::small_edit();
+        let mut state = port.state.lock().unwrap();
+        state.usage = Some((900_000, 128_000));
+        state.usage_last_total = Some(10_000);
+        drop(state);
+        port
+    }
+
     fn two_effects_in_one_epoch() -> Self {
         let port = Self::small_edit();
+        port.state.lock().unwrap().additional_effects_in_epoch = 1;
+        port
+    }
+
+    fn effect_after_soft_boundary_then_next_epoch() -> Self {
+        let port = Self::new([
+            (
+                WorkKind::Command,
+                "First operation reached the safe boundary",
+                "continue:Retry denied work after the checkpoint",
+            ),
+            (
+                WorkKind::FileChange,
+                "Retried after the checkpoint and verified the repair",
+                "complete:requested-outcome,explicit-verification",
+            ),
+        ]);
         port.state.lock().unwrap().additional_effects_in_epoch = 1;
         port
     }
@@ -724,6 +789,11 @@ impl AgentPort for EnginePort {
         let state = Arc::clone(&self.state);
         Box::pin(async move {
             let mut state = state.lock().unwrap();
+            if state.reject_missing_resume_workspace && !request.cwd.is_dir() {
+                return Err(AgentPortError::definitely_not_applied(
+                    AgentPortErrorCode::InvalidRequest,
+                ));
+            }
             state
                 .resume_attempts
                 .push(request.context_id.as_str().to_owned());
@@ -880,11 +950,55 @@ impl AgentPort for EnginePort {
                     state.started_process.as_ref(),
                 );
                 let item = work_item_with_file_change_path(item, &state.file_change_path);
+                if state.implicit_observation_first && work_number == 1 {
+                    let message = AgentItem::Other {
+                        item_id: "provider-message-1".into(),
+                        item_type: "agentMessage".into(),
+                    };
+                    state.events.push_back(AgentEvent::ItemStarted {
+                        context_id: context_id.clone(),
+                        epoch_id: epoch_id.clone(),
+                        item: message.clone(),
+                    });
+                    state.events.push_back(AgentEvent::ItemCompleted {
+                        context_id: context_id.clone(),
+                        epoch_id: epoch_id.clone(),
+                        item: message,
+                    });
+                }
                 state.events.push_back(AgentEvent::ItemStarted {
                     context_id: context_id.clone(),
                     epoch_id: epoch_id.clone(),
                     item,
                 });
+                if state.implicit_observation_first && work_number == 1 {
+                    state.events.push_back(AgentEvent::ItemCompleted {
+                        context_id: context_id.clone(),
+                        epoch_id: epoch_id.clone(),
+                        item: work_item(WorkKind::Command, &item_id, "completed"),
+                    });
+                    state.events.push_back(AgentEvent::AssistantDelta {
+                        context_id: context_id.clone(),
+                        epoch_id: epoch_id.clone(),
+                        text: concat!(
+                            "<carl-epoch-report>{\"schema_version\":1,",
+                            "\"disposition\":\"continue\",",
+                            "\"summary\":\"Inspected repository state\",",
+                            "\"next_objective\":\"Implement the repair\",",
+                            "\"clause_evidence\":[],\"exact_identifiers\":[]}",
+                            "</carl-epoch-report>"
+                        )
+                        .to_owned(),
+                    });
+                    state.events.push_back(AgentEvent::EpochCompleted {
+                        context_id,
+                        epoch_id: epoch_id.clone(),
+                        status: "completed".into(),
+                    });
+                    state.current_item_id = None;
+                    state.work.pop_front();
+                    return Ok(epoch_id);
+                }
                 let effect_kind = state.work_effect_kind.unwrap_or(match kind {
                     WorkKind::Command => AgentEffectKind::Command,
                     WorkKind::FileChange => AgentEffectKind::FileChange,
@@ -1041,7 +1155,11 @@ impl AgentPort for EnginePort {
             let completed_item = work_item_with_process(
                 kind,
                 &item_id,
-                "completed",
+                if state.resolved.last() == Some(&EffectDecision::Deny) {
+                    "failed"
+                } else {
+                    "completed"
+                },
                 state.completed_process.as_ref(),
             );
             let completed_item =
@@ -1086,11 +1204,12 @@ impl AgentPort for EnginePort {
             state.current_item_id = None;
             state.work.pop_front();
             if let Some((total_tokens, context_window)) = state.usage.take() {
+                let last_total_tokens = state.usage_last_total.take().unwrap_or(total_tokens);
                 state.events.push_back(AgentEvent::UsageUpdated {
                     context_id: context_id.clone(),
                     epoch_id: epoch_id.clone(),
                     usage: carl::runtime::agent_port::AgentUsage {
-                        last_total_tokens: total_tokens,
+                        last_total_tokens,
                         total_tokens,
                         model_context_window: Some(context_window),
                     },
@@ -1654,6 +1773,37 @@ async fn small_full_access_edit_uses_one_plan_one_work_and_no_compaction_ceremon
         state.epoch_starts[1].permission_mode,
         PermissionMode::BypassPermissions
     );
+    assert!(
+        state.epoch_starts[1].input.contains(concat!(
+            "<carl-epoch-report>{\"schema_version\":1,",
+            "\"disposition\":\"continue\",",
+            "\"summary\":\"Describe verified progress\",",
+            "\"next_objective\":\"State one bounded next objective\",",
+            "\"clause_evidence\":[],\"exact_identifiers\":[]}",
+            "</carl-epoch-report>"
+        )),
+        "the live provider receives the exact terminal report schema"
+    );
+    assert!(
+        state.epoch_starts[1].input.contains(concat!(
+            "{\"clause_id\":\"exact-clause-id\",",
+            "\"operation_ids\":[\"successful-operation-uuid\"],",
+            "\"event_sequences\":[],\"artifact_digests\":[]}"
+        )),
+        "complete reports receive the full deny-unknown-fields clause evidence schema"
+    );
+    assert!(
+        state.epoch_starts[1]
+            .input
+            .contains("\"exact_identifiers\":[\"literal-string-only\"]"),
+        "exact identifiers are explicitly declared as strings rather than objects"
+    );
+    assert!(
+        state.epoch_starts[1].input.contains(
+            "The provider base sandbox is intentionally read-only. Request Carl approval for every mutation"
+        ),
+        "the provider is told how to cross the Carl-owned mutation boundary"
+    );
     assert_eq!(state.compactions, 0);
     assert_eq!(state.replacements, 0);
     assert_eq!(state.resolved, [EffectDecision::Allow]);
@@ -1662,6 +1812,39 @@ async fn small_full_access_edit_uses_one_plan_one_work_and_no_compaction_ceremon
             .take_updates()
             .iter()
             .all(|update| !matches!(update, TaskEngineUpdate::PermissionRequired { .. }))
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn provider_absolute_file_change_under_workspace_is_normalized() -> TestResult {
+    let fixture = EngineFixture::new()?;
+    let absolute_path = fixture.workspace.join("src/lib.rs");
+    let absolute_path = absolute_path.to_str().expect("the test workspace is UTF-8");
+    let store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let port = EnginePort::file_effect_with_path(
+        &fixture.workspace,
+        absolute_path,
+        b"pub fn fixed() -> bool { true }\n",
+    );
+    let mut engine = TaskEngine::new(store, port);
+
+    let snapshot = engine
+        .start(start_task(session.id, &fixture.workspace)?)
+        .await?;
+
+    assert_eq!(snapshot.status, TaskStatus::Completed);
+    let checkpoint = engine
+        .store()
+        .get_latest_task_checkpoint(snapshot.task_id)?
+        .expect("completion commits a checkpoint");
+    assert!(checkpoint.repository.file_hashes.contains_key("src/lib.rs"));
+    assert!(
+        !checkpoint
+            .repository
+            .file_hashes
+            .contains_key(absolute_path)
     );
     Ok(())
 }
@@ -1988,6 +2171,43 @@ async fn planning_provider_faults_close_the_epoch_and_return_typed_blocked() -> 
             }
         )));
     }
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn provider_implicit_read_is_recorded_as_a_durable_observation() -> TestResult {
+    let fixture = EngineFixture::new()?;
+    let store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let port = EnginePort::implicit_observation_then_edit();
+    let shared = port.shared();
+    let mut engine = TaskEngine::new(store, port);
+
+    let snapshot = engine
+        .start(start_task(session.id, &fixture.workspace)?)
+        .await?;
+
+    assert_eq!(snapshot.status, TaskStatus::Completed);
+    let events = engine.store().read_task_events(snapshot.task_id)?;
+    let classes = events
+        .iter()
+        .filter_map(|envelope| match &envelope.event {
+            carl::events::Event::TaskLifecycle {
+                event: carl::runtime::task::TaskEvent::OperationIntentRecorded { effect_class, .. },
+                ..
+            } => Some(*effect_class),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        classes,
+        vec![EffectClass::Observation, EffectClass::IdempotentMutation]
+    );
+    assert_eq!(
+        operation_statuses(engine.store(), snapshot.task_id)?,
+        vec![OperationStatus::Succeeded, OperationStatus::Succeeded]
+    );
+    assert_eq!(shared.lock().unwrap().resolved, vec![EffectDecision::Allow]);
     Ok(())
 }
 
@@ -2440,9 +2660,8 @@ async fn completed_tool_soft_limit_durably_requests_a_safe_boundary_before_steer
 
     let snapshot = engine.start(input).await?;
 
-    let boundary_steer = shared
-        .lock()
-        .unwrap()
+    let state = shared.lock().unwrap();
+    let boundary_steer = state
         .steers
         .iter()
         .position(|steer| steer.contains("soft epoch boundary"))
@@ -2451,6 +2670,12 @@ async fn completed_tool_soft_limit_durably_requests_a_safe_boundary_before_steer
         boundary_steer > 0,
         "operation binding precedes boundary steering"
     );
+    assert!(
+        state.steers[boundary_steer].contains("<carl-epoch-report>")
+            && state.steers[boundary_steer].contains("no text after the closing tag"),
+        "boundary steering preserves the exact terminal report contract"
+    );
+    drop(state);
     assert!(
         engine
             .store()
@@ -2463,6 +2688,40 @@ async fn completed_tool_soft_limit_durably_requests_a_safe_boundary_before_steer
                     ..
                 }
             ))
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn effect_requested_after_soft_boundary_is_denied_before_dispatch_and_retried_next_epoch()
+-> TestResult {
+    let fixture = EngineFixture::new()?;
+    let store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let port = EnginePort::effect_after_soft_boundary_then_next_epoch();
+    let shared = port.shared();
+    let mut engine = TaskEngine::new(store, port);
+    let mut input = start_task(session.id, &fixture.workspace)?;
+    input.budget.soft_epoch_tool_calls = 1;
+
+    let snapshot = engine.start(input).await?;
+
+    assert_eq!(snapshot.status, TaskStatus::Completed);
+    assert_eq!(
+        shared.lock().unwrap().resolved,
+        [
+            EffectDecision::Allow,
+            EffectDecision::Deny,
+            EffectDecision::Allow
+        ]
+    );
+    assert_eq!(
+        operation_statuses(engine.store(), snapshot.task_id)?,
+        [
+            OperationStatus::Succeeded,
+            OperationStatus::Failed,
+            OperationStatus::Succeeded,
+        ]
     );
     Ok(())
 }
@@ -2519,6 +2778,32 @@ async fn context_pressure_compacts_only_after_the_checkpoint_is_committed() -> T
         .expect("compaction completed");
     assert!(checkpoint < requested && requested < completed);
     assert_eq!(shared.lock().unwrap().compactions, 1);
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cumulative_thread_usage_does_not_recompact_a_small_current_context() -> TestResult {
+    let fixture = EngineFixture::new()?;
+    let store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let port = EnginePort::cumulative_usage_after_compaction();
+    let shared = port.shared();
+    let mut engine = TaskEngine::new(store, port);
+
+    let snapshot = engine
+        .start(start_task(session.id, &fixture.workspace)?)
+        .await?;
+
+    assert_eq!(snapshot.status, TaskStatus::Completed);
+    assert_eq!(shared.lock().unwrap().compactions, 0);
+    assert_eq!(
+        engine
+            .store()
+            .task_metrics(snapshot.task_id)?
+            .expect("completed task metrics exist")
+            .compactions_completed,
+        0
+    );
     Ok(())
 }
 
@@ -2858,8 +3143,7 @@ async fn restart_after_replacement_binding_retains_fresh_context_diagnosis() -> 
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn completed_background_process_metadata_replaces_started_metadata_and_restores_exactly()
--> TestResult {
+async fn completed_command_with_process_id_is_not_restored_as_background() -> TestResult {
     let fixture = EngineFixture::new()?;
     let store = Store::open(&fixture.database)?;
     let session = store.create_session()?;
@@ -2879,9 +3163,9 @@ async fn completed_background_process_metadata_replaces_started_metadata_and_res
     };
     let mut first = TaskEngine::new(
         store,
-        EnginePort::continuation_checkpoint_with_process_then_compaction_failure(
+        EnginePort::continuation_checkpoint_with_terminal_process_then_compaction_failure(
             started_process,
-            Some(completed_process.clone()),
+            completed_process.clone(),
         ),
     );
     assert!(
@@ -2895,14 +3179,9 @@ async fn completed_background_process_metadata_replaces_started_metadata_and_res
         .store()
         .get_latest_task_checkpoint(task_id)?
         .expect("the engine committed a checkpoint before compaction");
-    assert_eq!(
-        checkpoint.running_processes,
-        [ProcessCheckpoint {
-            process_id: "process-123".to_owned(),
-            item_id: "work-item-1".to_owned(),
-            command_digest: digest(b"cargo test new"),
-            cwd_digest: digest(completed_process.cwd.as_os_str().as_encoded_bytes()),
-        }]
+    assert!(
+        checkpoint.running_processes.is_empty(),
+        "a terminal command process id is identity evidence, not a live background handle"
     );
     let (store, _) = first.into_parts();
     let port = EnginePort::resume_with_background_process(completed_process, true);
@@ -2913,7 +3192,7 @@ async fn completed_background_process_metadata_replaces_started_metadata_and_res
 
     assert_eq!(snapshot.status, TaskStatus::Completed);
     let state = shared.lock().unwrap();
-    assert_eq!(state.background_lists, 1);
+    assert_eq!(state.background_lists, 0);
     assert!(state.terminations.is_empty());
     Ok(())
 }
@@ -4072,6 +4351,74 @@ async fn startup_reconciles_a_matching_bound_postcondition_without_redispatch() 
     let state = shared.lock().unwrap();
     assert_eq!(state.durable_effect_count, 1);
     assert_eq!(state.epoch_starts.len(), epoch_starts_before);
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn startup_quarantines_a_missing_workspace_without_contacting_the_provider() -> TestResult {
+    let fixture = EngineFixture::new()?;
+    let mut store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let created = store.create_task(NewTask {
+        session_id: session.id,
+        workspace: fixture.workspace.clone(),
+        contract: CompletionContract {
+            version: 1,
+            goal: "Resume only from a trustworthy workspace".to_owned(),
+            constraints: Vec::new(),
+            clauses: vec![CompletionClause {
+                id: "workspace-authority".to_owned(),
+                description: "The original workspace remains authoritative".to_owned(),
+                required: true,
+                status: ClauseStatus::Pending,
+                evidence: Vec::new(),
+            }],
+        },
+        model: ModelId::parse("gpt-5.6-codex")?,
+        effort: ReasoningEffort::High,
+        permission_mode: PermissionMode::BypassPermissions,
+        budget: TaskBudget::default(),
+        created_at: chrono::Utc::now(),
+    })?;
+    let active = store
+        .append_task_event(
+            created.snapshot.task_id,
+            created.revision,
+            carl::runtime::task::TaskEvent::StateTransitioned {
+                from: TaskStatus::Queued,
+                to: TaskStatus::Active,
+                reason: "fixture activated".to_owned(),
+            },
+            chrono::Utc::now(),
+        )?
+        .expect("activation is durable");
+    store
+        .append_task_event(
+            created.snapshot.task_id,
+            active.revision,
+            carl::runtime::task::TaskEvent::ProviderContextBound {
+                context_id: "missing-workspace-context".to_owned(),
+            },
+            chrono::Utc::now(),
+        )?
+        .expect("provider binding is durable");
+    drop(store);
+    fs::remove_dir(&fixture.workspace)?;
+
+    let runtime = RuntimeStore::open(DataRootLock::acquire(&fixture.root)?, chrono::Utc::now())?;
+    let port = EnginePort::resume_small_edit();
+    let shared = port.shared();
+    port.state.lock().unwrap().reject_missing_resume_workspace = true;
+    let mut restarted = TaskEngine::new_runtime(runtime, port);
+
+    assert!(restarted.reconcile_startup().await?.is_empty());
+    let snapshot = restarted
+        .store()
+        .get_task(created.snapshot.task_id)?
+        .expect("task remains durable")
+        .snapshot;
+    assert_eq!(snapshot.status, TaskStatus::Blocked);
+    assert!(shared.lock().unwrap().resume_attempts.is_empty());
     Ok(())
 }
 

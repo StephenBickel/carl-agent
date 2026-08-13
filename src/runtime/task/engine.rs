@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -60,7 +60,7 @@ const CONTEXT_TRIGGER_PERCENT: u8 = 80;
 const CONTEXT_TARGET_PERCENT: u8 = 60;
 const CONTRACT_OPEN: &str = "<carl-completion-contract>";
 const CONTRACT_CLOSE: &str = "</carl-completion-contract>";
-const SAFE_BOUNDARY_MESSAGE: &str = "Carl soft epoch boundary reached. Finish the active operation, then emit a safe checkpoint report.";
+const SAFE_BOUNDARY_MESSAGE: &str = "Carl soft epoch boundary reached. Finish the active operation, then end with exactly one <carl-epoch-report> block using the exact JSON schema in the runtime instructions, with no text after the closing tag.";
 const APPROVAL_LIFETIME: TimeDelta = TimeDelta::minutes(15);
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
@@ -210,6 +210,10 @@ pub(crate) enum TaskEngineControl {
         turn_id: crate::events::TurnId,
         acknowledgement: u64,
     },
+    Compact {
+        task_id: TaskId,
+        acknowledgement: u64,
+    },
     Configure {
         task_id: TaskId,
         control_id: String,
@@ -315,6 +319,7 @@ struct RuntimeTask {
     pending_configuration: Option<PendingTaskConfiguration>,
     quiesce_after_checkpoint: bool,
     safe_boundary_requested: bool,
+    explicit_compaction_requested: bool,
 }
 
 #[derive(Clone)]
@@ -634,6 +639,13 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
         {
             return Ok(false);
         }
+        if !self.startup_workspace_is_trustworthy(task_id)? {
+            self.block_task(
+                task_id,
+                "startup workspace is unavailable or no longer canonical",
+            )?;
+            return Ok(false);
+        }
         let mut provider_ready = false;
         if record.snapshot.status == TaskStatus::Queued {
             self.activate_queued_task(task_id).await?;
@@ -680,6 +692,39 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
         }
         self.tasks.insert(task_id, runtime);
         Ok(true)
+    }
+
+    fn startup_workspace_is_trustworthy(&self, task_id: TaskId) -> Result<bool, TaskEngineError> {
+        let mut workspace = None;
+        for envelope in self
+            .store()
+            .read_task_events(task_id)
+            .map_err(storage_error)?
+        {
+            let crate::events::Event::TaskLifecycle {
+                task_id: event_task_id,
+                event,
+            } = envelope.event
+            else {
+                return Err(error(TaskEngineErrorCode::Storage));
+            };
+            if event_task_id != task_id {
+                return Err(error(TaskEngineErrorCode::Storage));
+            }
+            if let TaskEvent::Created {
+                workspace: created_workspace,
+                ..
+            } = event
+                && workspace.replace(created_workspace).is_some()
+            {
+                return Err(error(TaskEngineErrorCode::Storage));
+            }
+        }
+        let workspace = workspace.ok_or_else(|| error(TaskEngineErrorCode::Storage))?;
+        let Ok(canonical_workspace) = std::fs::canonicalize(&workspace) else {
+            return Ok(false);
+        };
+        Ok(canonical_workspace == workspace && canonical_workspace.is_dir())
     }
 
     pub async fn start(&mut self, input: StartTask) -> Result<TaskSnapshot, TaskEngineError> {
@@ -1087,6 +1132,7 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
             pending_configuration: None,
             quiesce_after_checkpoint: false,
             safe_boundary_requested: false,
+            explicit_compaction_requested: false,
         };
         let planned = self.plan_contract(task_id, &mut runtime, &input).await;
         self.tasks.insert(task_id, runtime);
@@ -1167,6 +1213,20 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                 }
             }
         };
+        self.tasks.insert(task_id, runtime);
+        result
+    }
+
+    pub(crate) fn compact_controlled(&mut self, task_id: TaskId) -> Result<(), TaskEngineError> {
+        let snapshot = self.snapshot(task_id)?;
+        if snapshot.status != TaskStatus::Active || snapshot.active_epoch.is_some() {
+            return Err(invalid_task());
+        }
+        let mut runtime = match self.tasks.remove(&task_id) {
+            Some(runtime) => runtime,
+            None => self.rehydrate_runtime(task_id, &snapshot)?,
+        };
+        let result = self.queue_explicit_compaction(task_id, &mut runtime);
         self.tasks.insert(task_id, runtime);
         result
     }
@@ -2240,6 +2300,16 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
         provider_epoch_id: &AgentEpochId,
         control: TaskEngineControl,
     ) -> Result<(), TaskEngineError> {
+        if let TaskEngineControl::Compact {
+            task_id: control_task_id,
+            ..
+        } = control
+        {
+            if control_task_id != task_id {
+                return Err(invalid_task());
+            }
+            return self.queue_explicit_compaction(task_id, runtime);
+        }
         self.apply_control(task_id, epoch_id, runtime, provider_epoch_id, &[], control)
             .await
     }
@@ -2611,6 +2681,7 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                         status: active.snapshot.status,
                     });
                     if runtime.quiesce_after_checkpoint {
+                        runtime.quiesce_after_checkpoint = false;
                         return Ok(active.snapshot);
                     }
                     // A committed checkpoint is a natural cooperative scheduling boundary for a
@@ -2763,7 +2834,7 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
         runtime: &mut RuntimeTask,
         usage: AgentUsage,
     ) -> Result<(), TaskEngineError> {
-        runtime.observed_total_tokens = Some(usage.total_tokens);
+        runtime.observed_total_tokens = Some(usage.last_total_tokens);
         runtime.estimated_tokens_since_usage = 0;
         if usage.model_context_window.is_some() {
             runtime.observed_context_window = usage.model_context_window;
@@ -2772,13 +2843,13 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
             task_id,
             TaskEvent::UsageObserved {
                 epoch_id,
-                total_tokens: usage.total_tokens,
+                total_tokens: usage.last_total_tokens,
                 context_window: usage.model_context_window,
             },
         )?;
         self.updates.push(TaskEngineUpdate::ContextUsage {
             task_id,
-            total_tokens: usage.total_tokens,
+            total_tokens: usage.last_total_tokens,
             context_window: usage.model_context_window,
         });
         Ok(())
@@ -2949,6 +3020,7 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
         let mut output = String::new();
         let mut items = HashMap::<String, AgentItem>::new();
         let mut operations = HashMap::<String, ActiveOperation>::new();
+        let mut boundary_denied_items = HashSet::<String>::new();
         let mut boundary_requested = false;
         let mut usage_observed = false;
         let mut definitely_not_applied_read_retries = 0_u8;
@@ -3104,6 +3176,8 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                             event,
                             &mut items,
                             &mut operations,
+                            &mut boundary_denied_items,
+                            boundary_requested,
                             &mut output,
                             &mut usage_observed,
                         )
@@ -3220,6 +3294,9 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                             acknowledgement, ..
                         }
                         | TaskEngineControl::Quiesce {
+                            acknowledgement, ..
+                        }
+                        | TaskEngineControl::Compact {
                             acknowledgement, ..
                         } => *acknowledgement,
                         TaskEngineControl::ClaimServiceCommand { .. }
@@ -3457,6 +3534,17 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                 )
                 .await
             }
+            TaskEngineControl::Compact {
+                task_id: control_task_id,
+                ..
+            } => {
+                if control_task_id != task_id {
+                    return Err(invalid_task());
+                }
+                self.queue_explicit_compaction(task_id, runtime)?;
+                self.request_safe_boundary(task_id, runtime, provider_epoch_id)
+                    .await
+            }
             TaskEngineControl::Configure {
                 task_id: control_task_id,
                 control_id,
@@ -3513,6 +3601,32 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                 unreachable!("owner control was processed before task control dispatch")
             }
         }
+    }
+
+    fn queue_explicit_compaction(
+        &mut self,
+        task_id: TaskId,
+        runtime: &mut RuntimeTask,
+    ) -> Result<(), TaskEngineError> {
+        runtime.quiesce_after_checkpoint = true;
+        if runtime.explicit_compaction_requested {
+            return Ok(());
+        }
+        let generation = runtime
+            .previous_checkpoint
+            .as_ref()
+            .map_or(0, |checkpoint| {
+                checkpoint.compaction_generation.saturating_add(1)
+            });
+        self.append(
+            task_id,
+            TaskEvent::CompactionRequested {
+                generation,
+                reason: "owner requested compaction at the next safe checkpoint".to_owned(),
+            },
+        )?;
+        runtime.explicit_compaction_requested = true;
+        Ok(())
     }
 
     fn queue_configuration(
@@ -3689,6 +3803,8 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
         event: AgentEvent,
         items: &mut HashMap<String, AgentItem>,
         operations: &mut HashMap<String, ActiveOperation>,
+        boundary_denied_items: &mut HashSet<String>,
+        boundary_requested: bool,
         output: &mut String,
         usage_observed: &mut bool,
     ) -> Result<Option<String>, TaskEngineError> {
@@ -3719,7 +3835,7 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                 if request.context_id == runtime.context_id
                     && request.epoch_id == *provider_epoch_id =>
             {
-                let item = items
+                let mut item = items
                     .get(&request.item_id)
                     .cloned()
                     .ok_or_else(|| error(TaskEngineErrorCode::Provider))?;
@@ -3728,9 +3844,76 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                 }
                 let operation_id = OperationId::new();
                 let effect_class = classify_effect(&request, &item);
+                if boundary_requested {
+                    self.append(
+                        task_id,
+                        TaskEvent::OperationIntentRecorded {
+                            operation_id,
+                            epoch_id,
+                            item_id: request.item_id.clone(),
+                            effect_class,
+                            request_digest: request.request_digest.to_string(),
+                        },
+                    )?;
+                    self.append(
+                        task_id,
+                        TaskEvent::OperationTransitioned {
+                            operation_id,
+                            from: OperationStatus::IntentRecorded,
+                            to: OperationStatus::Started,
+                            evidence_sequences: Vec::new(),
+                        },
+                    )?;
+                    runtime.started_tools = runtime
+                        .started_tools
+                        .checked_add(1)
+                        .ok_or_else(invalid_task)?;
+                    operations.insert(
+                        request.item_id.clone(),
+                        ActiveOperation {
+                            operation_id,
+                            item: item.clone(),
+                            postcondition_paths: None,
+                            frontend_tool_call_id: None,
+                        },
+                    );
+                    self.port
+                        .steer(
+                            &runtime.context_id,
+                            provider_epoch_id,
+                            format!("carl-operation-id: {operation_id}"),
+                        )
+                        .await
+                        .map_err(provider_error)?;
+                    self.port
+                        .resolve_effect(&request.request_id, EffectDecision::Deny)
+                        .await
+                        .map_err(provider_error)?;
+                    operations.remove(&request.item_id);
+                    self.close_operation_with_evidence(
+                        task_id,
+                        operation_id,
+                        OperationStatus::Failed,
+                        "soft-boundary-pending",
+                    )?;
+                    runtime.completed_tools = runtime
+                        .completed_tools
+                        .checked_add(1)
+                        .ok_or_else(invalid_task)?;
+                    update_running_processes(runtime, &item, true)?;
+                    items.remove(&request.item_id);
+                    boundary_denied_items.insert(request.item_id.clone());
+                    self.updates.push(TaskEngineUpdate::ToolCompleted {
+                        title: request.item_id,
+                        status: engine_tool_status(OperationStatus::Failed),
+                    });
+                    return Ok(None);
+                }
                 let postcondition_paths = if effect_class == super::EffectClass::IdempotentMutation
                 {
-                    match validated_file_change_paths(&item) {
+                    match normalize_file_change_item_paths(&mut item, &runtime.workspace)
+                        .and_then(|()| validated_file_change_paths(&item))
+                    {
                         Ok(paths) => Some(paths),
                         Err(_) => {
                             self.append(
@@ -3834,12 +4017,68 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
             AgentEvent::ItemCompleted {
                 context_id,
                 epoch_id: observed_epoch,
-                item,
+                mut item,
             } if context_id == runtime.context_id && observed_epoch == *provider_epoch_id => {
                 let item_id = item.item_id().to_owned();
-                let active = operations
-                    .remove(&item_id)
-                    .ok_or_else(|| error(TaskEngineErrorCode::Provider))?;
+                if boundary_denied_items.remove(&item_id) {
+                    if terminal_status(&item) != OperationStatus::Failed {
+                        return Err(error(TaskEngineErrorCode::Provider));
+                    }
+                    return Ok(None);
+                }
+                if engine_tool_kind(&item).is_none() {
+                    let started = items
+                        .remove(&item_id)
+                        .ok_or_else(|| error(TaskEngineErrorCode::Provider))?;
+                    if started != item || operations.contains_key(&item_id) {
+                        return Err(error(TaskEngineErrorCode::Provider));
+                    }
+                    update_running_processes(runtime, &item, true)?;
+                    return Ok(None);
+                }
+                let active = if let Some(active) = operations.remove(&item_id) {
+                    active
+                } else {
+                    let started = items
+                        .get(&item_id)
+                        .cloned()
+                        .ok_or_else(|| error(TaskEngineErrorCode::Provider))?;
+                    if !self.port.capabilities().pre_dispatch_effects
+                        || !matches!(started, AgentItem::Command { .. })
+                    {
+                        return Err(error(TaskEngineErrorCode::Provider));
+                    }
+                    let operation_id = OperationId::new();
+                    self.append(
+                        task_id,
+                        TaskEvent::OperationIntentRecorded {
+                            operation_id,
+                            epoch_id,
+                            item_id: item_id.clone(),
+                            effect_class: super::EffectClass::Observation,
+                            request_digest: normalized_item_digest(&started)?,
+                        },
+                    )?;
+                    self.append(
+                        task_id,
+                        TaskEvent::OperationTransitioned {
+                            operation_id,
+                            from: OperationStatus::IntentRecorded,
+                            to: OperationStatus::Started,
+                            evidence_sequences: Vec::new(),
+                        },
+                    )?;
+                    runtime.started_tools = runtime
+                        .started_tools
+                        .checked_add(1)
+                        .ok_or_else(invalid_task)?;
+                    ActiveOperation {
+                        operation_id,
+                        item: started,
+                        postcondition_paths: None,
+                        frontend_tool_call_id: None,
+                    }
+                };
                 if active.item.item_id() != item.item_id() {
                     return Err(error(TaskEngineErrorCode::Provider));
                 }
@@ -3847,12 +4086,15 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                 if terminal == OperationStatus::Succeeded
                     && let Some(expected_paths) = active.postcondition_paths.as_ref()
                 {
-                    let postcondition = match validated_file_change_paths(&item) {
-                        Ok(paths) if paths == *expected_paths => {
-                            capture_file_postcondition(&runtime.workspace, &paths)
-                        }
-                        Ok(_) | Err(_) => Err(error(TaskEngineErrorCode::Verification)),
-                    };
+                    let postcondition =
+                        match normalize_file_change_item_paths(&mut item, &runtime.workspace)
+                            .and_then(|()| validated_file_change_paths(&item))
+                        {
+                            Ok(paths) if paths == *expected_paths => {
+                                capture_file_postcondition(&runtime.workspace, &paths)
+                            }
+                            Ok(_) | Err(_) => Err(error(TaskEngineErrorCode::Verification)),
+                        };
                     let Ok(postcondition) = postcondition else {
                         self.close_operation_with_evidence(
                             task_id,
@@ -3922,7 +4164,7 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                     title: item_id.clone(),
                     status: engine_tool_status(terminal),
                 });
-                update_running_processes(runtime, &item, true)?;
+                self.reconcile_completed_process(runtime, &item).await?;
                 items.remove(&item_id);
             }
             AgentEvent::AssistantDelta {
@@ -3968,6 +4210,61 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
             _ => return Err(error(TaskEngineErrorCode::Provider)),
         }
         Ok(None)
+    }
+
+    async fn reconcile_completed_process(
+        &mut self,
+        runtime: &mut RuntimeTask,
+        item: &AgentItem,
+    ) -> Result<(), TaskEngineError> {
+        let AgentItem::Command {
+            item_id,
+            command,
+            cwd,
+            process_id,
+            ..
+        } = item
+        else {
+            return update_running_processes(runtime, item, true);
+        };
+        runtime
+            .running_processes
+            .retain(|process| process.item_id != *item_id);
+        let Some(process_id) = process_id else {
+            return Ok(());
+        };
+        if !self.port.capabilities().background_processes {
+            return Ok(());
+        }
+        let observed = self
+            .port
+            .list_background_processes(&runtime.context_id)
+            .await
+            .map_err(provider_error)?;
+        if observed.iter().any(|process| process.validate().is_err()) {
+            return Err(error(TaskEngineErrorCode::Provider));
+        }
+        let matching = observed
+            .iter()
+            .filter(|process| {
+                process.process_id == *process_id
+                    && process.item_id == *item_id
+                    && process.command == *command
+                    && process.cwd == *cwd
+            })
+            .collect::<Vec<_>>();
+        if matching.len() > 1
+            || (matching.is_empty()
+                && observed.iter().any(|process| {
+                    process.process_id == *process_id || process.item_id == *item_id
+                }))
+        {
+            return Err(error(TaskEngineErrorCode::Provider));
+        }
+        if let Some(process) = matching.first() {
+            runtime.running_processes.push((*process).clone());
+        }
+        Ok(())
     }
 
     async fn resolve_effect(
@@ -4314,6 +4611,9 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                 }
                 | TaskEngineControl::Quiesce {
                     acknowledgement, ..
+                }
+                | TaskEngineControl::Compact {
+                    acknowledgement, ..
                 } => *acknowledgement,
                 TaskEngineControl::ClaimServiceCommand { .. }
                 | TaskEngineControl::CompleteServiceCommand { .. }
@@ -4415,7 +4715,7 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                     self.acknowledge(acknowledgement, Err(error(TaskEngineErrorCode::Blocked)))
                         .await;
                 }
-                TaskEngineControl::Quiesce { .. } => {
+                TaskEngineControl::Quiesce { .. } | TaskEngineControl::Compact { .. } => {
                     let result = self
                         .apply_control(
                             task_id,
@@ -4742,23 +5042,26 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
         checkpoint: &CanonicalCheckpoint,
         context_package: &super::ContextPackage,
     ) -> Result<(), TaskEngineError> {
-        let Some(total_tokens) = runtime.observed_total_tokens else {
-            return Ok(());
+        let explicit = runtime.explicit_compaction_requested;
+        let pressure = match runtime.observed_total_tokens {
+            Some(total_tokens) => matches!(
+                context_engine(runtime)?.decide(total_tokens),
+                CompactionDecision::Compact | CompactionDecision::ReplaceProviderContext
+            ),
+            None => false,
         };
-        let decision = context_engine(runtime)?.decide(total_tokens);
-        if !matches!(
-            decision,
-            CompactionDecision::Compact | CompactionDecision::ReplaceProviderContext
-        ) {
+        if !explicit && !pressure {
             return Ok(());
         }
-        self.append(
-            task_id,
-            TaskEvent::CompactionRequested {
-                generation: checkpoint.compaction_generation,
-                reason: "provider context pressure reached the durable threshold".to_owned(),
-            },
-        )?;
+        if !explicit {
+            self.append(
+                task_id,
+                TaskEvent::CompactionRequested {
+                    generation: checkpoint.compaction_generation,
+                    reason: "provider context pressure reached the durable threshold".to_owned(),
+                },
+            )?;
+        }
         let old_context = runtime.context_id.clone();
         let recovery = self
             .port
@@ -4809,6 +5112,7 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
             generation: checkpoint.compaction_generation,
             replaced_provider,
         });
+        runtime.explicit_compaction_requested = false;
         Ok(())
     }
 
@@ -4868,6 +5172,7 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
         let mut last_provider_context = None;
         let mut replacement_pending = false;
         let mut replacement_bound_sequence = None;
+        let mut explicit_compaction_requested = false;
         for envelope in &events {
             let crate::events::Event::TaskLifecycle { event, .. } = &envelope.event else {
                 return Err(error(TaskEngineErrorCode::Storage));
@@ -4909,6 +5214,12 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
                     if context_window.is_some() {
                         observed_context_window = *context_window;
                     }
+                }
+                TaskEvent::CompactionRequested { .. } => {
+                    explicit_compaction_requested = true;
+                }
+                TaskEvent::CompactionCompleted { .. } => {
+                    explicit_compaction_requested = false;
                 }
                 TaskEvent::ProgressAssessed {
                     fingerprint,
@@ -5059,6 +5370,7 @@ impl<P: AgentPort, S: TaskEngineStore> TaskEngine<P, S> {
             pending_configuration,
             quiesce_after_checkpoint: false,
             safe_boundary_requested: false,
+            explicit_compaction_requested,
         })
     }
 }
@@ -5132,6 +5444,9 @@ fn control_acknowledgement(control: &TaskEngineControl) -> u64 {
             acknowledgement, ..
         }
         | TaskEngineControl::Quiesce {
+            acknowledgement, ..
+        }
+        | TaskEngineControl::Compact {
             acknowledgement, ..
         } => *acknowledgement,
         TaskEngineControl::ClaimServiceCommand { .. }
@@ -5303,7 +5618,24 @@ fn recovery_terminal_outcome(status: &str) -> RecoveryAttemptOutcome {
 }
 
 fn runtime_instructions() -> &'static str {
-    "Advance only the bounded epoch objective. Do not claim completion without tool evidence. End with exactly one <carl-epoch-report> JSON block."
+    concat!(
+        "Advance only the bounded epoch objective. Do not claim completion without tool evidence. ",
+        "The provider base sandbox is intentionally read-only. Request Carl approval for every mutation and continue after Carl authorizes it; do not treat the base sandbox as a blocker. ",
+        "End with exactly one terminal report block as the final non-whitespace output. ",
+        "For continuation, use this exact JSON shape: ",
+        "<carl-epoch-report>{\"schema_version\":1,",
+        "\"disposition\":\"continue\",",
+        "\"summary\":\"Describe verified progress\",",
+        "\"next_objective\":\"State one bounded next objective\",",
+        "\"clause_evidence\":[],\"exact_identifiers\":[]}",
+        "</carl-epoch-report>. ",
+        "For complete or blocked, set disposition accordingly and next_objective to null. ",
+        "A complete report must include every satisfied required clause in clause_evidence, using exact clause IDs and successful operation UUIDs received in carl-operation-id steering. ",
+        "Every clause_evidence entry must use this exact closed shape, including empty arrays: ",
+        "{\"clause_id\":\"exact-clause-id\",\"operation_ids\":[\"successful-operation-uuid\"],\"event_sequences\":[],\"artifact_digests\":[]}. ",
+        "exact_identifiers is an array of literal strings only, for example \"exact_identifiers\":[\"literal-string-only\"]; never use objects there. ",
+        "Never invent clause IDs, operation UUIDs, event sequences, artifact digests, or exact identifiers."
+    )
 }
 
 fn context_engine(runtime: &RuntimeTask) -> Result<ContextEngine, TaskEngineError> {
@@ -5455,6 +5787,58 @@ fn validated_file_change_paths(item: &AgentItem) -> Result<Vec<String>, TaskEngi
         return Err(error(TaskEngineErrorCode::Verification));
     }
     Ok(paths)
+}
+
+fn normalize_file_change_item_paths(
+    item: &mut AgentItem,
+    workspace: &Path,
+) -> Result<(), TaskEngineError> {
+    let AgentItem::FileChange { changes, .. } = item else {
+        return Ok(());
+    };
+    let changes = changes
+        .as_array_mut()
+        .ok_or_else(|| error(TaskEngineErrorCode::Verification))?;
+    if changes.is_empty() || changes.len() > 256 {
+        return Err(error(TaskEngineErrorCode::Verification));
+    }
+    let mut normalized = Vec::with_capacity(changes.len());
+    for change in changes.iter() {
+        let path = change
+            .as_object()
+            .and_then(|change| change.get("path"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| error(TaskEngineErrorCode::Verification))?;
+        let supplied = Path::new(path);
+        let relative = if supplied.is_absolute() {
+            supplied
+                .strip_prefix(workspace)
+                .map_err(|_| error(TaskEngineErrorCode::Verification))?
+        } else {
+            supplied
+        };
+        let relative = relative
+            .to_str()
+            .ok_or_else(|| error(TaskEngineErrorCode::Verification))?;
+        if relative.is_empty()
+            || relative.len() > 4 * 1024
+            || relative.contains(['\\', '\0', ':'])
+            || relative.chars().any(char::is_control)
+            || relative
+                .split('/')
+                .any(|component| component.is_empty() || matches!(component, "." | ".."))
+        {
+            return Err(error(TaskEngineErrorCode::Verification));
+        }
+        normalized.push(relative.to_owned());
+    }
+    for (change, path) in changes.iter_mut().zip(normalized) {
+        change
+            .as_object_mut()
+            .ok_or_else(|| error(TaskEngineErrorCode::Verification))?
+            .insert("path".to_owned(), Value::String(path));
+    }
+    Ok(())
 }
 
 fn capture_file_postcondition(
@@ -5736,12 +6120,13 @@ fn update_running_processes(
     else {
         return Ok(());
     };
+    if completed {
+        runtime
+            .running_processes
+            .retain(|process| process.item_id != *item_id);
+        return Ok(());
+    }
     let Some(process_id) = process_id else {
-        if completed {
-            runtime
-                .running_processes
-                .retain(|process| process.item_id != *item_id);
-        }
         return Ok(());
     };
     let process = AgentProcess {

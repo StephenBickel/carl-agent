@@ -820,6 +820,7 @@ async fn every_service_mutation_replays_durably_and_keys_never_rebind() -> TestR
                 permission_mode: PermissionMode::FullAccess,
             },
         ),
+        ("global-compact-key", ServiceCommand::Compact { task_id }),
         ("global-cancel-key", ServiceCommand::Cancel { task_id }),
     ];
     for (index, (key, command)) in mutations.iter().enumerate() {
@@ -853,6 +854,7 @@ async fn every_service_mutation_replays_durably_and_keys_never_rebind() -> TestR
         "resume",
         "steer",
         "configure",
+        "compact",
         "cancel",
         "shutdown",
     ] {

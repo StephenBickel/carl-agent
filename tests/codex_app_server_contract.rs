@@ -15,7 +15,7 @@ use carl::delegates::codex::{
 };
 use carl::delegates::{ModelId, ReasoningEffort};
 use carl::runtime::agent_port::{
-    AgentContextId, AgentEvent, AgentPort, AgentPortErrorCode, ResumeAgentContext, StartAgentEpoch,
+    AgentContextId, AgentPort, AgentPortErrorCode, ResumeAgentContext, StartAgentEpoch,
 };
 use carl::sidecar::{
     ExecutableTrustDecision, ProviderEnvironmentProfile, ProviderHome, SidecarCommand,
@@ -50,6 +50,10 @@ fn main() {
             lifecycle_and_approval,
         ),
         test(
+            "Codex app-server exposes only the superseding terminal report",
+            superseding_terminal_report_is_emitted_once,
+        ),
+        test(
             "Codex app-server denies invalid bypass approvals before protocol failure",
             invalid_bypass_approval_is_denied_before_protocol_failure,
         ),
@@ -66,6 +70,10 @@ fn main() {
             native_lifecycle_controls_are_exact_and_correlated,
         ),
         test(
+            "Codex turn start waits for the correlated provider-start barrier",
+            turn_start_waits_for_provider_started,
+        ),
+        test(
             "Codex lifecycle controls reject mismatched bindings and hostile process pages",
             lifecycle_controls_fail_closed,
         ),
@@ -75,6 +83,51 @@ fn main() {
         ),
     ];
     libtest_mimic::run(&Arguments::from_args(), trials).exit();
+}
+
+fn turn_start_waits_for_provider_started() -> Result<(), Box<dyn Error + Send + Sync>> {
+    run_async(async {
+        let layout = TestLayout::new()?;
+        fs::write(layout.root.join("gate-turn-start"), b"gate")?;
+        let mut server = connect(&layout).await?;
+        server.models().await?;
+        let thread = server
+            .start_thread(StartThread {
+                cwd: layout.workspace.clone(),
+                model: Some(ModelId::parse("gpt-5.6-codex")?),
+                mode: PermissionMode::Default,
+            })
+            .await?;
+        let turn = {
+            let start = server.start_turn(StartTurn {
+                thread_id: thread,
+                input: "wait for the provider start barrier".into(),
+                model: Some(ModelId::parse("gpt-5.6-codex")?),
+                effort: Some(ReasoningEffort::High),
+                mode: PermissionMode::Default,
+            });
+            tokio::pin!(start);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), &mut start)
+                    .await
+                    .is_err(),
+                "start_turn returned before turn/started was observable"
+            );
+            fs::write(layout.root.join("release-turn-start"), b"release")?;
+            start.await?
+        };
+        assert_eq!(turn.as_str(), "turn_123");
+        assert!(matches!(
+            server.next_event().await?,
+            CodexEvent::ThreadStarted { .. }
+        ));
+        assert!(matches!(
+            server.next_event().await?,
+            CodexEvent::TurnStarted { .. }
+        ));
+        server.cancel().await?;
+        Ok(())
+    })
 }
 
 fn native_lifecycle_controls_are_exact_and_correlated() -> Result<(), Box<dyn Error + Send + Sync>>
@@ -107,28 +160,16 @@ fn native_lifecycle_controls_are_exact_and_correlated() -> Result<(), Box<dyn Er
             .compact_context(&context_id)
             .await
             .map_err(|error| format!("compact failed: {error:?}"))?;
-        server.compact_context(&context_id).await?;
-        let blocked = server
+        let epoch = server
             .start_epoch(StartAgentEpoch {
                 context_id: context_id.clone(),
-                input: "must wait for compaction".into(),
+                input: "continue after the completed compaction barrier".into(),
                 model: ModelId::parse("gpt-5.6-codex")?,
                 effort: ReasoningEffort::High,
                 permission_mode: PermissionMode::Default,
             })
-            .await
-            .expect_err("an epoch must not cross the compaction barrier");
-        assert_eq!(blocked.code(), AgentPortErrorCode::InvalidRequest);
-        assert!(matches!(
-            AgentPort::next_event(&mut server).await?,
-            AgentEvent::CompactionStarted { context_id: seen, item_id }
-                if seen == context_id && item_id == "compact_native"
-        ));
-        assert!(matches!(
-            AgentPort::next_event(&mut server).await?,
-            AgentEvent::CompactionCompleted { context_id: seen, item_id }
-                if seen == context_id && item_id == "compact_native"
-        ));
+            .await?;
+        assert_eq!(epoch.as_str(), "turn_123");
 
         let processes = server
             .list_background_processes(&context_id)
@@ -549,6 +590,21 @@ fn lifecycle_and_approval() -> Result<(), Box<dyn Error + Send + Sync>> {
             json!({"id":"approval-7","result":{"decision":"accept"}})
         );
         let requests = read_requests(&layout)?;
+        let thread_start = requests
+            .iter()
+            .find(|request| request["method"] == "thread/start")
+            .unwrap();
+        assert_eq!(thread_start["params"]["approvalPolicy"], "on-request");
+        assert_eq!(thread_start["params"]["sandbox"], "read-only");
+        let turn_start = requests
+            .iter()
+            .find(|request| request["method"] == "turn/start")
+            .unwrap();
+        assert_eq!(turn_start["params"]["approvalPolicy"], "on-request");
+        assert_eq!(
+            turn_start["params"]["sandboxPolicy"],
+            json!({"type":"readOnly","networkAccess":false})
+        );
         let steer = requests
             .iter()
             .find(|request| request["method"] == "turn/steer")
@@ -562,6 +618,44 @@ fn lifecycle_and_approval() -> Result<(), Box<dyn Error + Send + Sync>> {
             interrupt["params"],
             json!({"threadId":"thr_123","turnId":"turn_123"})
         );
+        server.cancel().await?;
+        Ok(())
+    })
+}
+
+fn superseding_terminal_report_is_emitted_once() -> Result<(), Box<dyn Error + Send + Sync>> {
+    run_async(async {
+        let layout = TestLayout::new()?;
+        let mut server = connect(&layout).await?;
+        server.models().await?;
+        let thread = server
+            .start_thread(StartThread {
+                cwd: layout.workspace.clone(),
+                model: Some(ModelId::parse("gpt-5.6-codex")?),
+                mode: PermissionMode::Default,
+            })
+            .await?;
+        server
+            .start_turn(StartTurn {
+                thread_id: thread,
+                input: "superseded terminal reports".into(),
+                model: Some(ModelId::parse("gpt-5.6-codex")?),
+                effort: Some(ReasoningEffort::High),
+                mode: PermissionMode::Default,
+            })
+            .await?;
+
+        let mut assistant = Vec::new();
+        loop {
+            match server.next_event().await? {
+                CodexEvent::AgentMessageDelta { text, .. } => assistant.push(text),
+                CodexEvent::TurnCompleted { .. } => break,
+                _ => {}
+            }
+        }
+        assert_eq!(assistant.len(), 1);
+        assert!(assistant[0].contains("second bounded objective"));
+        assert!(!assistant[0].contains("first bounded objective"));
         server.cancel().await?;
         Ok(())
     })
@@ -632,6 +726,10 @@ fn malformed_long_horizon_evidence_fails_closed() -> Result<(), Box<dyn Error + 
             "malformed-command",
             "malformed-command-action",
             "unknown-command-field",
+            "malformed-thread-settings",
+            "unknown-thread-settings-field",
+            "malformed-config-warning",
+            "unknown-config-warning-field",
         ] {
             let layout = TestLayout::new()?;
             let mut server = connect(&layout).await?;
@@ -901,25 +999,49 @@ fn app_server_fixture() -> i32 {
                 })
             }
             Some("thread/compact/start") => {
-                if write_message(&json!({"id":id,"result":{}})).is_err()
-                    || write_message(&json!({
-                        "method":"item/started",
-                        "params":{
-                            "threadId":"thr_123","turnId":"turn_compact","startedAtMs":8,
-                            "item":{"type":"contextCompaction","id":"compact_native"}
-                        },
-                        "emittedAtMs":8
-                    }))
-                    .is_err()
-                    || write_message(&json!({
-                        "method":"item/completed",
-                        "params":{
-                            "threadId":"thr_123","turnId":"turn_compact","completedAtMs":9,
-                            "item":{"type":"contextCompaction","id":"compact_native"}
-                        },
-                        "emittedAtMs":9
-                    }))
-                    .is_err()
+                if write_message(&json!({"id":id,"result":{}})).is_err() || write_message(&json!({
+                    "method":"turn/started",
+                    "params":{
+                        "threadId":"thr_123",
+                        "turn":{"id":"turn_compact","items":[],"status":"inProgress","error":null}
+                    },
+                    "emittedAtMs":8
+                }))
+                .is_err() || write_message(&json!({
+                    "method":"item/started",
+                    "params":{
+                        "threadId":"thr_123","turnId":"turn_compact","startedAtMs":8,
+                        "item":{"type":"contextCompaction","id":"compact_native"}
+                    },
+                    "emittedAtMs":8
+                }))
+                .is_err() || write_message(&json!({
+                    "method":"thread/tokenUsage/updated",
+                    "params":{
+                        "threadId":"thr_123","turnId":"turn_compact","tokenUsage":{
+                            "total":{"totalTokens":8,"inputTokens":6,"cachedInputTokens":0,"cacheWriteInputTokens":0,"outputTokens":2,"reasoningOutputTokens":0},
+                            "last":{"totalTokens":5,"inputTokens":4,"cachedInputTokens":0,"cacheWriteInputTokens":0,"outputTokens":1,"reasoningOutputTokens":0},
+                            "modelContextWindow":258400
+                        }
+                    }
+                }))
+                .is_err() || write_message(&json!({
+                    "method":"item/completed",
+                    "params":{
+                        "threadId":"thr_123","turnId":"turn_compact","completedAtMs":9,
+                        "item":{"type":"contextCompaction","id":"compact_native"}
+                    },
+                    "emittedAtMs":9
+                }))
+                .is_err() || write_message(&json!({
+                    "method":"turn/completed",
+                    "params":{
+                        "threadId":"thr_123",
+                        "turn":{"id":"turn_compact","items":[],"status":"completed","error":null}
+                    },
+                    "emittedAtMs":10
+                }))
+                .is_err()
                 {
                     return 74;
                 }
@@ -978,15 +1100,33 @@ fn app_server_fixture() -> i32 {
                 if write_message(&json!({"id":id,"result":result})).is_err() {
                     return 74;
                 }
+                if fixture_root(&home).join("gate-turn-start").exists() {
+                    if write_message(&json!({
+                        "method":"thread/goal/cleared",
+                        "params":{"threadId":"thr_123"},
+                        "emittedAtMs":1
+                    }))
+                    .is_err()
+                    {
+                        return 74;
+                    }
+                    while !fixture_root(&home).join("release-turn-start").exists() {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                }
                 let input = request["params"]["input"][0]["text"]
                     .as_str()
                     .unwrap_or_default();
-                let notifications = match input.strip_prefix("invalid bypass approval ") {
-                    Some(scenario) => invalid_approval_notifications(scenario),
-                    None => match input.strip_prefix("malformed evidence ") {
-                        Some(scenario) => malformed_evidence_notifications(scenario),
-                        None => turn_notifications(),
-                    },
+                let notifications = if input == "superseded terminal reports" {
+                    superseded_terminal_report_notifications()
+                } else {
+                    match input.strip_prefix("invalid bypass approval ") {
+                        Some(scenario) => invalid_approval_notifications(scenario),
+                        None => match input.strip_prefix("malformed evidence ") {
+                            Some(scenario) => malformed_evidence_notifications(scenario),
+                            None => turn_notifications(),
+                        },
+                    }
                 };
                 for notification in notifications {
                     if write_message(&notification).is_err() {
@@ -1135,6 +1275,8 @@ fn workspace_for(home: &Path) -> PathBuf {
 fn turn_notifications() -> Vec<Value> {
     let mut notifications = vec![
         json!({"method":"turn/started","params":{"threadId":"thr_123","turn":{"id":"turn_123","items":[],"status":"inProgress"}}}),
+        thread_settings_notification(),
+        json!({"method":"configWarning","params":{"summary":"fixture warning","details":null}}),
         json!({"method":"thread/status/changed","params":{"threadId":"thr_123","status":{"type":"active","activeFlags":[]}}}),
         json!({"method":"warning","params":{"threadId":"thr_123","message":"fixture warning"}}),
         json!({"method":"thread/tokenUsage/updated","params":{
@@ -1159,10 +1301,35 @@ fn turn_notifications() -> Vec<Value> {
             "command":"cargo test","reason":"Run the test suite","cwd":null
         }}),
     ];
-    for notification in &mut notifications[..9] {
+    for notification in &mut notifications[..10] {
         notification["emittedAtMs"] = json!(2);
     }
     notifications
+}
+
+fn superseded_terminal_report_notifications() -> Vec<Value> {
+    let report = |objective: &str| {
+        format!(
+            "<carl-epoch-report>{{\"schema_version\":1,\"disposition\":\"continue\",\"summary\":\"verified progress\",\"next_objective\":{objective:?},\"clause_evidence\":[],\"exact_identifiers\":[]}}</carl-epoch-report>"
+        )
+    };
+    let first = report("first bounded objective");
+    let second = report("second bounded objective");
+    let report_open = "<carl-epoch-report>";
+    let first_tail = first.strip_prefix(report_open).unwrap();
+    let second_tail = second.strip_prefix(report_open).unwrap();
+    vec![
+        json!({"method":"turn/started","params":{"threadId":"thr_123","turn":{"id":"turn_123","items":[],"status":"inProgress"}},"emittedAtMs":1}),
+        json!({"method":"item/started","params":{"threadId":"thr_123","turnId":"turn_123","startedAtMs":2,"item":{"type":"agentMessage","id":"report_first","text":""}},"emittedAtMs":2}),
+        json!({"method":"item/agentMessage/delta","params":{"threadId":"thr_123","turnId":"turn_123","itemId":"report_first","delta":report_open},"emittedAtMs":3}),
+        json!({"method":"item/agentMessage/delta","params":{"threadId":"thr_123","turnId":"turn_123","itemId":"report_first","delta":first_tail},"emittedAtMs":3}),
+        json!({"method":"item/completed","params":{"threadId":"thr_123","turnId":"turn_123","completedAtMs":4,"item":{"type":"agentMessage","id":"report_first","text":first}},"emittedAtMs":4}),
+        json!({"method":"item/started","params":{"threadId":"thr_123","turnId":"turn_123","startedAtMs":5,"item":{"type":"agentMessage","id":"report_second","text":""}},"emittedAtMs":5}),
+        json!({"method":"item/agentMessage/delta","params":{"threadId":"thr_123","turnId":"turn_123","itemId":"report_second","delta":report_open},"emittedAtMs":6}),
+        json!({"method":"item/agentMessage/delta","params":{"threadId":"thr_123","turnId":"turn_123","itemId":"report_second","delta":second_tail},"emittedAtMs":6}),
+        json!({"method":"item/completed","params":{"threadId":"thr_123","turnId":"turn_123","completedAtMs":7,"item":{"type":"agentMessage","id":"report_second","text":second}},"emittedAtMs":7}),
+        json!({"method":"turn/completed","params":{"threadId":"thr_123","turn":{"id":"turn_123","items":[],"status":"completed","error":null}},"emittedAtMs":8}),
+    ]
 }
 
 fn invalid_approval_notifications(scenario: &str) -> Vec<Value> {
@@ -1222,12 +1389,62 @@ fn malformed_evidence_notifications(scenario: &str) -> Vec<Value> {
             "aggregatedOutput":"ok","processId":null,"commandActions":[],
             "providerPayload":"must not be accepted"
         })),
+        "malformed-thread-settings" => {
+            let mut notification = thread_settings_notification();
+            notification["params"]["threadSettings"]["effort"] = json!(-1);
+            notification
+        }
+        "unknown-thread-settings-field" => {
+            let mut notification = thread_settings_notification();
+            notification["params"]["threadSettings"]["providerPayload"] =
+                json!("must not be accepted");
+            notification
+        }
+        "malformed-config-warning" => json!({
+            "method":"configWarning",
+            "params":{"summary":"fixture warning","details":{}}
+        }),
+        "unknown-config-warning-field" => json!({
+            "method":"configWarning",
+            "params":{"summary":"fixture warning","details":null,"providerPayload":true}
+        }),
         _ => return Vec::new(),
     };
     vec![
         json!({"method":"turn/started","params":{"threadId":"thr_123","turn":{"id":"turn_123","items":[],"status":"inProgress"}},"emittedAtMs":2}),
         malformed,
     ]
+}
+
+fn thread_settings_notification() -> Value {
+    json!({
+        "method":"thread/settings/updated",
+        "params":{
+            "threadId":"thr_123",
+            "threadSettings":{
+                "cwd":"/workspace",
+                "approvalPolicy":"never",
+                "approvalsReviewer":"user",
+                "sandboxPolicy":{"type":"readOnly","networkAccess":false},
+                "activePermissionProfile":null,
+                "model":"gpt-5.6-codex",
+                "modelProvider":"openai",
+                "serviceTier":null,
+                "effort":"high",
+                "summary":null,
+                "collaborationMode":{
+                    "mode":"default",
+                    "settings":{
+                        "model":"gpt-5.6-codex",
+                        "reasoning_effort":"high",
+                        "developer_instructions":null
+                    }
+                },
+                "multiAgentMode":"explicitRequestOnly",
+                "personality":"none"
+            }
+        }
+    })
 }
 
 fn command_notification(item: Value) -> Value {

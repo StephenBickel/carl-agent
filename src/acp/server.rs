@@ -981,6 +981,10 @@ impl ServiceAcpServer {
                     let result = self.service_task_mutation(params, "cancel").await;
                     service_outgoing(id, result)
                 }
+                (Some("_task/compact"), Some(id)) => {
+                    let result = self.service_task_mutation(params, "compact").await;
+                    service_outgoing(id, result)
+                }
                 (Some("_task/steer"), Some(id)) => {
                     let result = self.service_task_mutation(params, "steer").await;
                     service_outgoing(id, result)
@@ -1640,7 +1644,7 @@ impl ServiceAcpServer {
         params: Value,
         method: &'static str,
     ) -> Result<Value, AcpServerError> {
-        if self.config.frontend == Frontend::Buzz && method == "steer" {
+        if self.config.frontend == Frontend::Buzz && matches!(method, "steer" | "compact") {
             return Err(invalid_input());
         }
         let (task_id, idempotency_key) = self
@@ -1650,6 +1654,7 @@ impl ServiceAcpServer {
         let command = match method {
             "resume" => ServiceCommand::Resume { task_id },
             "cancel" => ServiceCommand::Cancel { task_id },
+            "compact" => ServiceCommand::Compact { task_id },
             "steer" => ServiceCommand::Steer {
                 task_id,
                 text: bounded_text(

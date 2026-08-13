@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsString;
 use std::fmt;
 use std::fs;
@@ -35,6 +35,7 @@ const MAX_BACKGROUND_PROCESS_PAGES: usize = 16;
 const MAX_TEXT_BYTES: usize = 256 * 1_024;
 const MAX_CURSOR_BYTES: usize = 128;
 const MAX_EFFECT_SUMMARY_BYTES: usize = 32 * 1_024;
+const EPOCH_REPORT_OPEN: &str = "<carl-epoch-report>";
 const APP_SERVER_CONFIG: &[u8] = concat!(
     "cli_auth_credentials_store = \"file\"\n",
     "approval_policy = \"never\"\n",
@@ -128,7 +129,9 @@ struct ThreadState {
 
 #[derive(Clone, Debug)]
 struct CompactionState {
+    turn_id: Option<CodexTurnId>,
     item_id: Option<String>,
+    item_completed: bool,
 }
 
 #[derive(Clone)]
@@ -144,6 +147,9 @@ pub struct CodexAppServer {
     models: Vec<CodexModel>,
     threads: HashMap<String, ThreadState>,
     outstanding_approvals: HashMap<String, OutstandingApproval>,
+    buffered_events: VecDeque<CodexEvent>,
+    terminal_report_fragments: HashMap<(String, String, String), String>,
+    pending_terminal_reports: HashMap<(String, String), CodexEvent>,
 }
 
 impl fmt::Debug for CodexAppServer {
@@ -171,6 +177,9 @@ impl CodexAppServer {
                 "thread/compact/start": ["threadId"]
             },
             "notifications": {
+                "configWarning": ["summary", "details"],
+                "thread/goal/cleared": ["threadId"],
+                "thread/settings/updated": ["threadId", "threadSettings"],
                 "thread/tokenUsage/updated": ["threadId", "turnId", "tokenUsage"],
                 "item/started": ["threadId", "turnId", "item", "startedAtMs"],
                 "item/completed": ["threadId", "turnId", "item", "completedAtMs"]
@@ -249,6 +258,9 @@ impl CodexAppServer {
             models: Vec::new(),
             threads: HashMap::new(),
             outstanding_approvals: HashMap::new(),
+            buffered_events: VecDeque::new(),
+            terminal_report_fragments: HashMap::new(),
+            pending_terminal_reports: HashMap::new(),
         })
     }
 
@@ -441,7 +453,59 @@ impl CodexAppServer {
             .threads
             .get_mut(thread_id.as_str())
             .ok_or_else(protocol_error)?;
-        state.compaction = Some(CompactionState { item_id: None });
+        state.compaction = Some(CompactionState {
+            turn_id: None,
+            item_id: None,
+            item_completed: false,
+        });
+        let compact_turn = match self.next_event().await? {
+            CodexEvent::TurnStarted {
+                thread_id: observed,
+                turn_id,
+            } if observed == *thread_id => turn_id,
+            _ => return Err(protocol_error()),
+        };
+        let mut item_id = None;
+        let mut item_completed = false;
+        loop {
+            match self.next_event().await? {
+                CodexEvent::TokenUsageUpdated {
+                    thread_id: observed,
+                    turn_id,
+                    ..
+                } if observed == *thread_id && turn_id == compact_turn => {}
+                CodexEvent::ItemStarted {
+                    thread_id: observed,
+                    turn_id,
+                    item: CodexItem::ContextCompaction { item_id: started },
+                } if observed == *thread_id && turn_id == compact_turn && item_id.is_none() => {
+                    item_id = Some(started);
+                }
+                CodexEvent::ItemCompleted {
+                    thread_id: observed,
+                    turn_id,
+                    item: CodexItem::ContextCompaction { item_id: completed },
+                } if observed == *thread_id
+                    && turn_id == compact_turn
+                    && item_id.as_deref() == Some(completed.as_str())
+                    && !item_completed =>
+                {
+                    item_completed = true;
+                }
+                CodexEvent::TurnCompleted {
+                    thread_id: observed,
+                    turn_id,
+                    ..
+                } if observed == *thread_id
+                    && turn_id == compact_turn
+                    && item_id.is_some()
+                    && item_completed =>
+                {
+                    break;
+                }
+                _ => return Err(protocol_error()),
+            }
+        }
         Ok(())
     }
 
@@ -486,6 +550,31 @@ impl CodexAppServer {
             .ok_or_else(protocol_error)?;
         state.mode = request.mode;
         state.active_turn = Some(turn_id.clone());
+        let mut buffered = VecDeque::new();
+        loop {
+            let event = self.next_event().await?;
+            let started = matches!(
+                &event,
+                CodexEvent::TurnStarted {
+                    thread_id: observed_thread,
+                    turn_id: observed_turn,
+                } if observed_thread == &request.thread_id && observed_turn == &turn_id
+            );
+            let permitted = started
+                || matches!(
+                    &event,
+                    CodexEvent::ThreadStarted { thread_id }
+                        if thread_id == &request.thread_id
+                );
+            if !permitted {
+                return Err(protocol_error());
+            }
+            buffered.push_back(event);
+            if started {
+                break;
+            }
+        }
+        self.buffered_events.extend(buffered);
         Ok(turn_id)
     }
 
@@ -616,6 +705,9 @@ impl CodexAppServer {
     }
 
     pub async fn next_event(&mut self) -> Result<CodexEvent, DelegateError> {
+        if let Some(event) = self.buffered_events.pop_front() {
+            return Ok(event);
+        }
         loop {
             let incoming = if let Some(notification) = self
                 .sidecar
@@ -650,18 +742,97 @@ impl CodexAppServer {
                     }
                     let event = parse_notification(value)?;
                     self.validate_event_binding(&event)?;
+                    if let CodexEvent::AgentMessageDelta {
+                        thread_id,
+                        turn_id,
+                        item_id,
+                        text,
+                    } = &event
+                    {
+                        let key = (
+                            thread_id.as_str().to_owned(),
+                            turn_id.as_str().to_owned(),
+                            item_id.clone(),
+                        );
+                        if let Some(mut accumulated) = self.terminal_report_fragments.remove(&key) {
+                            if accumulated.len().checked_add(text.len()).is_none()
+                                || accumulated.len() + text.len() > MAX_TEXT_BYTES
+                            {
+                                return Err(protocol_error());
+                            }
+                            accumulated.push_str(text);
+                            if could_be_terminal_report(&accumulated) {
+                                self.terminal_report_fragments.insert(key, accumulated);
+                                continue;
+                            }
+                            return Ok(CodexEvent::AgentMessageDelta {
+                                thread_id: thread_id.clone(),
+                                turn_id: turn_id.clone(),
+                                item_id: item_id.clone(),
+                                text: accumulated,
+                            });
+                        }
+                        if could_be_terminal_report(text) {
+                            self.terminal_report_fragments.insert(key, text.clone());
+                            continue;
+                        }
+                    }
+                    if let CodexEvent::ItemCompleted {
+                        thread_id,
+                        turn_id,
+                        item: CodexItem::Other { item_id, item_type },
+                    } = &event
+                        && item_type == "agentMessage"
+                    {
+                        let turn_key = (thread_id.as_str().to_owned(), turn_id.as_str().to_owned());
+                        let item_key = (turn_key.0.clone(), turn_key.1.clone(), item_id.clone());
+                        if let Some(text) = self.terminal_report_fragments.remove(&item_key) {
+                            self.pending_terminal_reports.insert(
+                                turn_key,
+                                CodexEvent::AgentMessageDelta {
+                                    thread_id: thread_id.clone(),
+                                    turn_id: turn_id.clone(),
+                                    item_id: item_id.clone(),
+                                    text,
+                                },
+                            );
+                        } else {
+                            self.pending_terminal_reports.remove(&turn_key);
+                        }
+                    }
                     if let CodexEvent::TurnCompleted {
                         thread_id, turn_id, ..
                     } = &event
                     {
+                        let turn_key = (thread_id.as_str().to_owned(), turn_id.as_str().to_owned());
+                        if self
+                            .terminal_report_fragments
+                            .keys()
+                            .any(|key| key.0 == turn_key.0 && key.1 == turn_key.1)
+                        {
+                            return Err(protocol_error());
+                        }
                         let state = self
                             .threads
                             .get_mut(thread_id.as_str())
                             .ok_or_else(protocol_error)?;
-                        if state.active_turn.as_ref() != Some(turn_id) {
+                        if state.active_turn.as_ref() == Some(turn_id) {
+                            state.active_turn = None;
+                        } else if state.active_turn.is_none()
+                            && state.compaction.as_ref().is_some_and(|compaction| {
+                                compaction.turn_id.as_ref() == Some(turn_id)
+                                    && compaction.item_id.is_some()
+                                    && compaction.item_completed
+                            })
+                        {
+                            state.compaction = None;
+                        } else {
                             return Err(protocol_error());
                         }
-                        state.active_turn = None;
+                        if let Some(report) = self.pending_terminal_reports.remove(&turn_key) {
+                            self.buffered_events.push_back(event);
+                            return Ok(report);
+                        }
                     }
                     return Ok(event);
                 }
@@ -784,8 +955,40 @@ impl CodexAppServer {
     }
 
     fn validate_event_binding(&mut self, event: &CodexEvent) -> Result<(), DelegateError> {
+        if let CodexEvent::TurnStarted { thread_id, turn_id } = event {
+            let state = self
+                .threads
+                .get_mut(thread_id.as_str())
+                .ok_or_else(protocol_error)?;
+            if state.active_turn.is_none()
+                && let Some(compaction) = state.compaction.as_mut()
+            {
+                if compaction.turn_id.replace(turn_id.clone()).is_some() {
+                    return Err(protocol_error());
+                }
+                return Ok(());
+            }
+        }
+        if let CodexEvent::TokenUsageUpdated {
+            thread_id, turn_id, ..
+        } = event
+        {
+            let state = self
+                .threads
+                .get(thread_id.as_str())
+                .ok_or_else(protocol_error)?;
+            if state.active_turn.is_none()
+                && state
+                    .compaction
+                    .as_ref()
+                    .is_some_and(|compaction| compaction.turn_id.as_ref() == Some(turn_id))
+            {
+                return Ok(());
+            }
+        }
         if let CodexEvent::ItemStarted {
             thread_id,
+            turn_id,
             item: CodexItem::ContextCompaction { item_id },
             ..
         } = event
@@ -796,7 +999,10 @@ impl CodexAppServer {
                 .compaction
                 .as_mut()
         {
-            if compaction.item_id.is_some() {
+            if compaction.turn_id.as_ref() != Some(turn_id)
+                || compaction.item_id.is_some()
+                || compaction.item_completed
+            {
                 return Err(protocol_error());
             }
             compaction.item_id = Some(item_id.clone());
@@ -804,6 +1010,7 @@ impl CodexAppServer {
         }
         if let CodexEvent::ItemCompleted {
             thread_id,
+            turn_id,
             item: CodexItem::ContextCompaction { item_id },
             ..
         } = event
@@ -812,11 +1019,34 @@ impl CodexAppServer {
                 .threads
                 .get_mut(thread_id.as_str())
                 .ok_or_else(protocol_error)?;
-            if let Some(compaction) = state.compaction.as_ref() {
-                if compaction.item_id.as_deref() != Some(item_id) {
+            if let Some(compaction) = state.compaction.as_mut() {
+                if compaction.turn_id.as_ref() != Some(turn_id)
+                    || compaction.item_id.as_deref() != Some(item_id)
+                    || compaction.item_completed
+                {
                     return Err(protocol_error());
                 }
-                state.compaction = None;
+                compaction.item_completed = true;
+                return Ok(());
+            }
+        }
+        if let CodexEvent::TurnCompleted {
+            thread_id, turn_id, ..
+        } = event
+        {
+            let state = self
+                .threads
+                .get_mut(thread_id.as_str())
+                .ok_or_else(protocol_error)?;
+            if state.active_turn.is_none()
+                && let Some(compaction) = state.compaction.as_ref()
+            {
+                if compaction.turn_id.as_ref() != Some(turn_id)
+                    || compaction.item_id.is_none()
+                    || !compaction.item_completed
+                {
+                    return Err(protocol_error());
+                }
                 return Ok(());
             }
         }
@@ -1189,6 +1419,12 @@ fn translate_codex_event(event: CodexEvent) -> Result<AgentEvent, AgentPortError
             }))
         }
     }
+}
+
+fn could_be_terminal_report(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    !trimmed.is_empty()
+        && (EPOCH_REPORT_OPEN.starts_with(trimmed) || trimmed.starts_with(EPOCH_REPORT_OPEN))
 }
 
 fn translate_item_event(
@@ -1738,6 +1974,17 @@ fn is_ignorable_notification(value: &Value) -> Result<bool, DelegateError> {
         .and_then(Value::as_object)
         .ok_or_else(protocol_error)?;
     match method {
+        "configWarning" => {
+            require_keys(params, &["summary", "details"], &[])?;
+            bounded_string(params.get("summary"), MAX_TEXT_BYTES)?;
+            optional_bounded_string(params.get("details"), MAX_TEXT_BYTES)?;
+            Ok(true)
+        }
+        "thread/goal/cleared" => {
+            require_keys(params, &["threadId"], &[])?;
+            bounded_string(params.get("threadId"), 128)?;
+            Ok(true)
+        }
         "remoteControl/status/changed" => {
             require_keys(
                 params,
@@ -1802,6 +2049,10 @@ fn is_ignorable_notification(value: &Value) -> Result<bool, DelegateError> {
             }
             Ok(true)
         }
+        "thread/settings/updated" => {
+            validate_thread_settings_notification(params)?;
+            Ok(true)
+        }
         "warning" => {
             require_keys(params, &["threadId", "message"], &[])?;
             bounded_string(params.get("threadId"), 128)?;
@@ -1832,6 +2083,143 @@ fn is_ignorable_notification(value: &Value) -> Result<bool, DelegateError> {
         }
         _ => Ok(false),
     }
+}
+
+fn validate_thread_settings_notification(params: &Map<String, Value>) -> Result<(), DelegateError> {
+    require_keys(params, &["threadId", "threadSettings"], &[])?;
+    bounded_string(params.get("threadId"), 128)?;
+    let settings = params
+        .get("threadSettings")
+        .and_then(Value::as_object)
+        .ok_or_else(protocol_error)?;
+    require_keys(
+        settings,
+        &[
+            "activePermissionProfile",
+            "approvalPolicy",
+            "approvalsReviewer",
+            "collaborationMode",
+            "cwd",
+            "effort",
+            "model",
+            "modelProvider",
+            "multiAgentMode",
+            "personality",
+            "sandboxPolicy",
+            "serviceTier",
+            "summary",
+        ],
+        &[],
+    )?;
+    bounded_string(settings.get("cwd"), MAX_TEXT_BYTES)?;
+    let approval = bounded_string(settings.get("approvalPolicy"), 32)?;
+    let effort = bounded_string(settings.get("effort"), 32)?;
+    if !matches!(
+        approval.as_str(),
+        "untrusted" | "on-failure" | "on-request" | "never"
+    ) || settings.get("approvalsReviewer").and_then(Value::as_str) != Some("user")
+        || settings.get("modelProvider").and_then(Value::as_str) != Some("openai")
+        || !matches!(
+            effort.as_str(),
+            "low" | "medium" | "high" | "xhigh" | "max" | "ultra"
+        )
+    {
+        return Err(protocol_error());
+    }
+    bounded_string(settings.get("model"), 128)?;
+    bounded_string(settings.get("multiAgentMode"), 64)?;
+    bounded_string(settings.get("personality"), 64)?;
+    optional_bounded_string(settings.get("serviceTier"), 64)?;
+    optional_bounded_string(settings.get("summary"), MAX_TEXT_BYTES)?;
+    validate_settings_permission_profile(settings.get("activePermissionProfile"))?;
+    validate_settings_sandbox(settings.get("sandboxPolicy"))?;
+    validate_settings_collaboration(settings.get("collaborationMode"))
+}
+
+fn validate_settings_permission_profile(value: Option<&Value>) -> Result<(), DelegateError> {
+    let value = value.ok_or_else(protocol_error)?;
+    if value.is_null() {
+        return Ok(());
+    }
+    let profile = value.as_object().ok_or_else(protocol_error)?;
+    require_keys(profile, &["id"], &["extends"])?;
+    bounded_string(profile.get("id"), 128)?;
+    if let Some(extends) = profile.get("extends") {
+        optional_bounded_string(Some(extends), 128)?;
+    }
+    Ok(())
+}
+
+fn validate_settings_sandbox(value: Option<&Value>) -> Result<(), DelegateError> {
+    let sandbox = value
+        .and_then(Value::as_object)
+        .ok_or_else(protocol_error)?;
+    let sandbox_type = bounded_string(sandbox.get("type"), 32)?;
+    match sandbox_type.as_str() {
+        "readOnly" => {
+            require_keys(sandbox, &["type", "networkAccess"], &[])?;
+            if !sandbox.get("networkAccess").is_some_and(Value::is_boolean) {
+                return Err(protocol_error());
+            }
+        }
+        "workspaceWrite" => {
+            require_keys(
+                sandbox,
+                &[
+                    "type",
+                    "writableRoots",
+                    "networkAccess",
+                    "excludeTmpdirEnvVar",
+                    "excludeSlashTmp",
+                ],
+                &[],
+            )?;
+            let roots = sandbox
+                .get("writableRoots")
+                .and_then(Value::as_array)
+                .ok_or_else(protocol_error)?;
+            if roots.len() > 16
+                || roots
+                    .iter()
+                    .any(|root| bounded_string(Some(root), MAX_TEXT_BYTES).is_err())
+                || ["networkAccess", "excludeTmpdirEnvVar", "excludeSlashTmp"]
+                    .iter()
+                    .any(|key| !sandbox.get(*key).is_some_and(Value::is_boolean))
+            {
+                return Err(protocol_error());
+            }
+        }
+        "dangerFullAccess" => require_keys(sandbox, &["type"], &[])?,
+        _ => return Err(protocol_error()),
+    }
+    Ok(())
+}
+
+fn validate_settings_collaboration(value: Option<&Value>) -> Result<(), DelegateError> {
+    let collaboration = value
+        .and_then(Value::as_object)
+        .ok_or_else(protocol_error)?;
+    require_keys(collaboration, &["mode", "settings"], &[])?;
+    bounded_string(collaboration.get("mode"), 64)?;
+    let settings = collaboration
+        .get("settings")
+        .and_then(Value::as_object)
+        .ok_or_else(protocol_error)?;
+    require_keys(
+        settings,
+        &["developer_instructions", "model", "reasoning_effort"],
+        &[],
+    )?;
+    bounded_string(settings.get("model"), 128)?;
+    let effort = bounded_string(settings.get("reasoning_effort"), 32)?;
+    optional_bounded_string(settings.get("developer_instructions"), MAX_TEXT_BYTES)?;
+    if !matches!(
+        effort.as_str(),
+        "low" | "medium" | "high" | "xhigh" | "max" | "ultra"
+    ) {
+        return Err(protocol_error());
+    }
+    Ok(())
 }
 
 fn validate_rate_limits(value: Option<&Value>) -> Result<(), DelegateError> {
@@ -2048,8 +2436,8 @@ fn parse_effort(value: &str) -> Result<ReasoningEffort, DelegateError> {
 fn thread_mode(mode: PermissionMode) -> (&'static str, &'static str) {
     match mode {
         PermissionMode::Plan => ("never", "read-only"),
-        PermissionMode::Default | PermissionMode::AcceptEdits => ("on-request", "workspace-write"),
-        PermissionMode::DontAsk => ("never", "workspace-write"),
+        PermissionMode::Default | PermissionMode::AcceptEdits => ("on-request", "read-only"),
+        PermissionMode::DontAsk => ("never", "read-only"),
         PermissionMode::FullAccess | PermissionMode::BypassPermissions => {
             ("on-request", "read-only")
         }
@@ -2061,24 +2449,9 @@ fn turn_mode(mode: PermissionMode) -> (&'static str, Value) {
         PermissionMode::Plan => ("never", json!({"type":"readOnly","networkAccess":false})),
         PermissionMode::Default | PermissionMode::AcceptEdits => (
             "on-request",
-            json!({
-                "type":"workspaceWrite",
-                "writableRoots":[],
-                "networkAccess":false,
-                "excludeTmpdirEnvVar":false,
-                "excludeSlashTmp":false
-            }),
+            json!({"type":"readOnly","networkAccess":false}),
         ),
-        PermissionMode::DontAsk => (
-            "never",
-            json!({
-                "type":"workspaceWrite",
-                "writableRoots":[],
-                "networkAccess":false,
-                "excludeTmpdirEnvVar":false,
-                "excludeSlashTmp":false
-            }),
-        ),
+        PermissionMode::DontAsk => ("never", json!({"type":"readOnly","networkAccess":false})),
         PermissionMode::FullAccess | PermissionMode::BypassPermissions => (
             "on-request",
             json!({"type":"readOnly","networkAccess":false}),

@@ -14,7 +14,7 @@ use crate::runtime::task::{
     TaskStatus,
 };
 
-pub const SERVICE_PROTOCOL_VERSION: u16 = 4;
+pub const SERVICE_PROTOCOL_VERSION: u16 = 5;
 pub const MAX_SERVICE_FRAME_BYTES: usize = 256 * 1024;
 pub const MAX_TASK_TEXT_BYTES: usize = 16 * 1024;
 const MAX_IDENTIFIER_BYTES: usize = 128;
@@ -93,6 +93,9 @@ pub enum ServiceCommand {
     Cancel {
         task_id: TaskId,
     },
+    Compact {
+        task_id: TaskId,
+    },
     Configure {
         task_id: TaskId,
         model: ModelId,
@@ -163,6 +166,7 @@ pub struct ServiceCapabilities {
     pub explicit_task_budgets: bool,
     pub sanitized_task_metrics: bool,
     pub recoverable_maintenance: bool,
+    pub explicit_task_compaction: bool,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -480,6 +484,7 @@ pub const fn is_mutation(command: &ServiceCommand) -> bool {
             | ServiceCommand::Steer { .. }
             | ServiceCommand::SteerTrusted { .. }
             | ServiceCommand::Cancel { .. }
+            | ServiceCommand::Compact { .. }
             | ServiceCommand::Configure { .. }
             | ServiceCommand::PrepareMaintenance
             | ServiceCommand::Shutdown
@@ -585,6 +590,7 @@ fn validate_request(request: &ServiceRequest) -> Result<(), ProtocolError> {
         | ServiceCommand::List
         | ServiceCommand::Resume { .. }
         | ServiceCommand::Cancel { .. }
+        | ServiceCommand::Compact { .. }
         | ServiceCommand::Configure { .. }
         | ServiceCommand::Events { .. }
         | ServiceCommand::LiveUpdates { .. }

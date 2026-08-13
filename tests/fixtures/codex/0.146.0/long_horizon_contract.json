@@ -6,6 +6,9 @@
     "thread/compact/start": ["threadId"]
   },
   "notifications": {
+    "configWarning": ["summary", "details"],
+    "thread/goal/cleared": ["threadId"],
+    "thread/settings/updated": ["threadId", "threadSettings"],
     "thread/tokenUsage/updated": ["threadId", "turnId", "tokenUsage"],
     "item/started": ["threadId", "turnId", "item", "startedAtMs"],
     "item/completed": ["threadId", "turnId", "item", "completedAtMs"]

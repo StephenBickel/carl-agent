@@ -5,6 +5,7 @@ import {
   lstat,
   mkdir,
   open,
+  readdir,
   readFile,
   realpath,
   rename,
@@ -125,9 +126,69 @@ export async function admitProduction(environment, repository) {
   const dataRoot = await canonicalPrivateDirectory(environment.CARL_DATA_DIR, "invalid_data_root");
   const carl = await canonicalRegularExecutable(environment.CARL_BIN, "invalid_carl_binary");
   const codex = await canonicalRegularExecutable(environment.CARL_CODEX_EXECUTABLE, "invalid_codex_binary");
+  const cargo = await canonicalRegularExecutable(
+    environment.CARL_LIVE_CARGO_EXECUTABLE,
+    "invalid_cargo_binary",
+  );
   if (!carl.endsWith(`${sep}target${sep}release${sep}carl`)) throw coded("invalid_carl_binary");
   const canonicalRepository = await realpath(repository);
-  return { carl, codex, dataRoot, repository: canonicalRepository, model, effort, durationHours, timeoutSeconds: durationHours * 3600 };
+  return { carl, codex, cargo, dataRoot, repository: canonicalRepository, model, effort, durationHours, timeoutSeconds: durationHours * 3600 };
+}
+
+export async function forceCodexContextLoss(dataRoot, lossIndex) {
+  if (!Number.isSafeInteger(lossIndex) || lossIndex < 0 || lossIndex > 4) {
+    throw coded("invalid_provider_state");
+  }
+  const root = await canonicalPrivateDirectory(dataRoot, "invalid_data_root");
+  const providerRoot = await canonicalPrivateDirectory(
+    join(root, "providers", "codex"),
+    "invalid_provider_state",
+  );
+  const names = ["state_5.sqlite", "state_5.sqlite-shm", "state_5.sqlite-wal"];
+  const primary = await lstat(join(providerRoot, names[0])).catch(() => null);
+  if (!primary?.isFile() || primary.isSymbolicLink() || !ownerPrivate(primary)) {
+    throw coded("invalid_provider_state");
+  }
+  const sessions = await canonicalPrivateDirectory(
+    join(providerRoot, "sessions"),
+    "invalid_provider_state",
+  );
+  const stack = [sessions];
+  let entries = 0;
+  while (stack.length > 0) {
+    const directory = stack.pop();
+    for (const entry of await readdir(directory, { withFileTypes: true })) {
+      entries += 1;
+      if (entries > 256) throw coded("invalid_provider_state");
+      const path = join(directory, entry.name);
+      const info = await lstat(path);
+      if (info.isSymbolicLink() || !ownerPrivate(info)) throw coded("invalid_provider_state");
+      if (info.isDirectory()) {
+        if (!/^\d{2,4}$/.test(entry.name)) throw coded("invalid_provider_state");
+        stack.push(path);
+      } else if (!info.isFile() || !/^rollout-[A-Za-z0-9._:-]+\.jsonl$/.test(entry.name)) {
+        throw coded("invalid_provider_state");
+      }
+    }
+  }
+  if (entries === 0) throw coded("invalid_provider_state");
+  const quarantine = join(providerRoot, "context-loss-fixtures");
+  await mkdir(quarantine, { mode: 0o700 }).catch((error) => {
+    if (error?.code !== "EEXIST") throw error;
+  });
+  await canonicalPrivateDirectory(quarantine, "invalid_provider_state");
+  const destination = join(quarantine, `loss-${lossIndex}`);
+  await mkdir(destination, { mode: 0o700 });
+  await rename(sessions, join(destination, "sessions"));
+  for (const name of names) {
+    const path = join(providerRoot, name);
+    const info = await lstat(path).catch(() => null);
+    if (info === null) continue;
+    if (!info.isFile() || info.isSymbolicLink() || !ownerPrivate(info)) {
+      throw coded("invalid_provider_state");
+    }
+    await rename(path, join(destination, name));
+  }
 }
 
 const AUDIT_CHAPTERS = Object.fromEntries(Array.from({ length: 20 }, (_, index) => {
@@ -223,8 +284,8 @@ export function carlAcpInvocation(admission, workspace) {
       "--max-wall-time-seconds", String(admission.timeoutSeconds),
       "--max-provider-requests", "10000",
       "--max-tool-calls", "100000",
-      "--soft-epoch-seconds", "30",
-      "--soft-epoch-tool-calls", "1",
+      "--soft-epoch-seconds", "900",
+      "--soft-epoch-tool-calls", "6",
     ],
     environment: closedChildEnvironment(process.env, {
       CARL_DATA_DIR: admission.dataRoot,
@@ -345,6 +406,10 @@ export class ChapterProgressTracker {
     return null;
   }
 
+  pendingCount() {
+    return this.#pending?.count ?? null;
+  }
+
   assertComplete() {
     if (this.#proven !== 20 || this.#pending !== null) throw coded("chapter_checkpoints_not_proven");
   }
@@ -406,7 +471,7 @@ export function validateMetricsResponse(response, previous = null) {
   return metrics;
 }
 
-export function validateStatusResponse(response, metrics) {
+export function validateStatusResponse(response, metrics = null) {
   exactObject(response, ["task"], "invalid_status");
   const snapshot = response.task;
   exactObject(snapshot, SNAPSHOT_KEYS, "invalid_status");
@@ -416,11 +481,14 @@ export function validateStatusResponse(response, metrics) {
     ![snapshot.active_epoch, snapshot.latest_checkpoint].every((value) => value === null || UUID.test(value)) ||
     !(snapshot.provider_context === null || (typeof snapshot.provider_context === "string" && snapshot.provider_context.length > 0 && snapshot.provider_context.length <= 4096)) ||
     !snapshot.operations || typeof snapshot.operations !== "object" || Array.isArray(snapshot.operations) ||
-    !(snapshot.pending_recovery === null || Array.isArray(snapshot.pending_recovery)) ||
-    snapshot.task_id !== metrics.task_id || snapshot.status !== metrics.status || snapshot.revision !== metrics.revision
+    !(snapshot.pending_recovery === null || Array.isArray(snapshot.pending_recovery))
   ) throw coded("invalid_status");
   validateBudget(snapshot.budget, "invalid_status");
-  if (JSON.stringify(snapshot.budget) !== JSON.stringify(metrics.budget)) throw coded("invalid_status");
+  if (metrics !== null && (
+    snapshot.task_id !== metrics.task_id || snapshot.status !== metrics.status ||
+    snapshot.revision !== metrics.revision ||
+    JSON.stringify(snapshot.budget) !== JSON.stringify(metrics.budget)
+  )) throw coded("invalid_status");
   exactObject(snapshot.contract, CONTRACT_KEYS, "invalid_status");
   const contract = snapshot.contract;
   if (
@@ -453,8 +521,36 @@ export function validateStatusResponse(response, metrics) {
       if (clause.status === "satisfied" && clause.evidence.length > 0) satisfied += 1;
     }
   }
-  if (required !== metrics.required_clauses_total || satisfied !== metrics.required_clauses_satisfied) throw coded("invalid_status");
+  if (metrics !== null && (
+    required !== metrics.required_clauses_total || satisfied !== metrics.required_clauses_satisfied
+  )) throw coded("invalid_status");
   return snapshot;
+}
+
+export async function readConsistentTaskState(readMetrics, readStatus, previous = null, attempts = 8) {
+  if (typeof readMetrics !== "function" || typeof readStatus !== "function" ||
+      !Number.isSafeInteger(attempts) || attempts <= 0 || attempts > 32) {
+    throw coded("invalid_status_reader");
+  }
+  let floor = previous;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    const before = validateMetricsResponse(await readMetrics(), floor);
+    const response = await readStatus();
+    const snapshot = validateStatusResponse(response);
+    const after = validateMetricsResponse(await readMetrics(), before);
+    if (snapshot.task_id !== after.task_id || snapshot.revision > after.revision) {
+      throw coded("invalid_status");
+    }
+    if (snapshot.revision < before.revision) {
+      floor = after;
+      continue;
+    }
+    if (snapshot.revision === after.revision) {
+      return { metrics: after, snapshot: validateStatusResponse(response, after) };
+    }
+    floor = after;
+  }
+  throw coded("unstable_status");
 }
 
 export function parseReadyMaintenance(stdout, expectedTaskId = null) {

@@ -913,6 +913,10 @@ enum ActorCommand {
         control_id: String,
         reply: oneshot::Sender<Result<(), TaskServiceError>>,
     },
+    Compact {
+        task_id: TaskId,
+        reply: oneshot::Sender<Result<(), TaskServiceError>>,
+    },
     Steer {
         task_id: TaskId,
         text: String,
@@ -1050,6 +1054,18 @@ async fn handle_actor_command<P: AgentPort>(
         } => {
             let result = engine.cancel_controlled(task_id, Some(&control_id)).await;
             let _ = reply.send(map_control_result(result));
+        }
+        ActorCommand::Compact { task_id, reply } => {
+            let mut result = if *provider_shutdown || actor_state.starts_stopped().await {
+                Err(service_error(TaskServiceErrorCode::Stopped))
+            } else {
+                engine.compact_controlled(task_id).map_err(map_engine)
+            };
+            if result.is_ok() {
+                result =
+                    enqueue_resumed_task(actor_state, *provider_shutdown, scheduled, task_id).await;
+            }
+            let _ = reply.send(result);
         }
         ActorCommand::Steer {
             task_id,
@@ -1442,6 +1458,13 @@ async fn execute_command(
             mutate_task(shared, *task_id, request, Mutation::Cancel).await?;
             Ok(ServiceResult::Applied)
         }
+        ServiceCommand::Compact { .. } => {
+            let ServiceCommand::Compact { task_id } = &request.command else {
+                unreachable!();
+            };
+            mutate_task(shared, *task_id, request, Mutation::Compact).await?;
+            Ok(ServiceResult::Applied)
+        }
         ServiceCommand::Steer { task_id, text } => {
             mutate_task(shared, *task_id, request, Mutation::Steer(text.clone())).await?;
             Ok(ServiceResult::Applied)
@@ -1731,12 +1754,14 @@ fn service_info(
             explicit_task_budgets: true,
             sanitized_task_metrics: true,
             recoverable_maintenance: true,
+            explicit_task_compaction: true,
         },
     })
 }
 
 enum Mutation {
     Cancel,
+    Compact,
     Steer(String),
     Resume,
     Configure {
@@ -1756,6 +1781,7 @@ const fn service_command_kind(command: &ServiceCommand) -> &'static str {
         ServiceCommand::Steer { .. } => "steer",
         ServiceCommand::SteerTrusted { .. } => "steer_trusted",
         ServiceCommand::Cancel { .. } => "cancel",
+        ServiceCommand::Compact { .. } => "compact",
         ServiceCommand::Configure { .. } => "configure",
         ServiceCommand::PrepareMaintenance => "prepare_maintenance",
         ServiceCommand::Shutdown => "shutdown",
@@ -1778,6 +1804,7 @@ async fn mutate_task(
 ) -> Result<(), TaskServiceError> {
     let method = match &mutation {
         Mutation::Cancel => "cancel",
+        Mutation::Compact => "compact",
         Mutation::Steer(_) => "steer",
         Mutation::Resume => "resume",
         Mutation::Configure { .. } => "configure",
@@ -1798,6 +1825,16 @@ async fn mutate_task(
                         control_id: Some(control_id.clone()),
                         session_id: record.snapshot.session_id,
                         turn_id: TurnId::new(),
+                        acknowledgement: next_ack(shared)?,
+                    },
+                )
+                .await
+            }
+            Mutation::Compact => {
+                send_active_control(
+                    shared,
+                    TaskEngineControl::Compact {
+                        task_id,
                         acknowledgement: next_ack(shared)?,
                     },
                 )
@@ -1848,6 +1885,7 @@ async fn mutate_task(
             control_id,
             reply,
         },
+        Mutation::Compact => ActorCommand::Compact { task_id, reply },
         Mutation::Steer(text) => ActorCommand::Steer {
             task_id,
             text,
@@ -1915,6 +1953,9 @@ async fn send_active_control(
             acknowledgement, ..
         }
         | TaskEngineControl::Quiesce {
+            acknowledgement, ..
+        }
+        | TaskEngineControl::Compact {
             acknowledgement, ..
         } => *acknowledgement,
         TaskEngineControl::ClaimServiceCommand { .. }

@@ -662,8 +662,8 @@ fn durable_configuration_supersession() -> TestResult {
         .ok_or("superseding epoch was not dispatched")?;
     assert_eq!(dispatched["params"]["approvalPolicy"], "on-request");
     assert_eq!(
-        dispatched["params"]["sandboxPolicy"]["type"],
-        "workspaceWrite"
+        dispatched["params"]["sandboxPolicy"]["type"], "readOnly",
+        "Carl keeps provider mutation capability closed and mediates effects itself"
     );
     assert_eq!(
         task_configuration_modes(&layout, &task_id)?,
