@@ -18,7 +18,8 @@ The ACP path is CLI-reachable and covered by process-level offline tests.
 
 Carl also has a native interactive terminal UI. Running `carl` (or the explicit
 `carl tui` alias) connects to the persistent local service, starts it when needed,
-and uses the signed-in OpenAI subscription through Codex. The TUI defaults to
+and uses the configured provider. OpenAI subscription is the zero-key default;
+native OpenAI Responses and OpenRouter are also supported. The TUI defaults to
 owner-selected **full access**, streams durable task updates, and keeps sessions
 available after the terminal closes.
 
@@ -36,7 +37,7 @@ versioned export, hard deletion, and no external service dependency. Memory is
 managed through the implemented `carl memory` command tree.
 
 This remains pre-alpha. The Telegram gateway, Grok execution,
-native HTTP/OpenAI adapters, Carl's native tool loop, stale-safe live-workspace
+provider hot-switching inside a running service, stale-safe live-workspace
 promotion, and broader consumer packaging are incomplete. `serve`, `acp`, `auth`, `memory`, `maintenance`, and the
 direct Codex baseline have implemented behavior; `pair`, `doctor`, and `sessions`
 remain inert CLI shells.
@@ -65,9 +66,22 @@ The terminal supports these commands:
 - `/sessions` lists durable TUI sessions and `/resume <number|session-id>` loads one.
 - `/new` starts with a clean session, while `/help` and `/exit` are local controls.
 
-Slice 1 intentionally uses only the OpenAI subscription provider already owned by
-Codex. `/provider`, `/login`, and `/logout` report that native provider onboarding
-is not in this slice; OpenRouter/API-key and additional provider support come next.
+OpenAI subscription through Codex is the default. Native keys are captured without
+terminal echo and stored in the operating-system credential vault:
+
+```sh
+carl auth key openrouter
+carl auth use openrouter
+carl
+```
+
+Use `carl auth key openai` for an OpenAI Platform key, or select
+`subscription|openai|openrouter` with `carl auth use`.
+
+OpenRouter exposes only models advertising text input/output, structured tools, and
+at least a 32K context window. DeepSeek, Qwen, Kimi, Anthropic, Google, and xAI
+models appear when their live metadata qualifies. Provider changes currently require
+restarting the service; `/provider`, `/login`, and `/logout` show the exact commands.
 
 The background service remains alive when the TUI exits so long-running work and
 session state survive terminal restarts. To use ACP instead, run
@@ -238,7 +252,8 @@ promotion controller, protected runner, merge queue, soak, and rollback remain s
 - [x] Interactive local TUI backed by durable subscription tasks
 - [ ] Owner-only Telegram gateway
 - [ ] Grok execution adapter
-- [ ] Native tools, broader sandboxing, and stale-safe promotion
+- [x] Native OpenAI/OpenRouter adapters and Carl-owned coding tools
+- [ ] Broader sandboxing and stale-safe promotion
 - [ ] Cross-platform release packaging
 
 ## License

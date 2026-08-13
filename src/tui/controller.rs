@@ -199,12 +199,21 @@ impl<B: TuiBackend> TuiController<B> {
                 self.configure_active().await?;
                 Ok(vec![TuiEvent::Notice("model updated".to_owned())])
             }
-            SlashCommand::Provider(_) | SlashCommand::Login | SlashCommand::Logout => Ok(vec![
-                TuiEvent::Notice(
-                    "Slice 1 uses the configured OpenAI subscription; native provider onboarding follows"
-                        .to_owned(),
-                ),
-            ]),
+            SlashCommand::Provider(None) => Ok(vec![TuiEvent::Notice(
+                "provider is selected at service startup; use `carl auth use subscription|openai|openrouter`, then restart the service"
+                    .to_owned(),
+            )]),
+            SlashCommand::Provider(Some(provider)) => Ok(vec![TuiEvent::Notice(format!(
+                "to select {provider}, exit Carl and run `carl auth use {provider}` before restarting the service"
+            ))]),
+            SlashCommand::Login => Ok(vec![TuiEvent::Notice(
+                "subscription: `carl auth login openai`; API keys: `carl auth key openai|openrouter`"
+                    .to_owned(),
+            )]),
+            SlashCommand::Logout => Ok(vec![TuiEvent::Notice(
+                "subscription: `carl auth logout openai`; API keys: `carl auth remove-key openai|openrouter`"
+                    .to_owned(),
+            )]),
             SlashCommand::Effort(effort) => {
                 let model = self.model.as_ref().ok_or(TuiError::UnsupportedConfiguration)?;
                 let supported = self.backend.info().models.iter().any(|candidate| {
@@ -251,7 +260,7 @@ impl<B: TuiBackend> TuiController<B> {
                 Ok(vec![TuiEvent::Notice("cancellation requested".to_owned())])
             }
             SlashCommand::Help => Ok(vec![TuiEvent::Notice(
-                "/model /effort /permissions /compact /new /sessions /resume /status /cancel /help /exit"
+                "/provider /model /effort /permissions /compact /new /sessions /resume /status /cancel /login /logout /help /exit"
                     .to_owned(),
             )]),
             SlashCommand::Exit => Ok(vec![TuiEvent::ExitRequested]),
