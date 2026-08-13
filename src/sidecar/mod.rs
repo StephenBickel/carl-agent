@@ -1193,6 +1193,7 @@ impl DataRootLock {
         &self.data_root
     }
 
+    #[cfg(unix)]
     pub(crate) fn try_clone_root_directory(&self) -> std::io::Result<File> {
         self._root_directory.try_clone()
     }

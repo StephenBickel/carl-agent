@@ -343,9 +343,8 @@ impl Client {
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()?;
-        let endpoint = data_root.join("carl.sock");
         for _ in 0..500 {
-            if endpoint.exists() {
+            if service_is_ready(layout, &data_root) {
                 break;
             }
             if let Some(status) = service.try_wait()? {
@@ -361,10 +360,10 @@ impl Client {
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        if !endpoint.exists() {
+        if !service_is_ready(layout, &data_root) {
             let _ = service.kill();
             let _ = service.wait();
-            return Err("Carl service endpoint was not created".into());
+            return Err("Carl service did not become ready".into());
         }
         let mut command = Command::new(binary);
         command
@@ -518,6 +517,20 @@ impl Client {
         let _ = self.service.wait();
         Ok(CapturedProcess { stdout, stderr })
     }
+}
+
+fn service_is_ready(layout: &Layout, data_root: &Path) -> bool {
+    #[cfg(unix)]
+    if !data_root.join("carl.sock").exists() {
+        return false;
+    }
+
+    fs::read_to_string(layout.workspace.join(".provider-requests.jsonl")).is_ok_and(|contents| {
+        contents.lines().any(|line| {
+            serde_json::from_str::<Value>(line)
+                .is_ok_and(|request| request["method"] == "model/list")
+        })
+    })
 }
 
 pub struct CapturedProcess {
