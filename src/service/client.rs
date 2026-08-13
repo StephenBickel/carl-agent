@@ -181,8 +181,8 @@ impl TaskServiceClient {
         let result = self
             .request_once(&ServiceRequest {
                 protocol_version: SERVICE_PROTOCOL_VERSION,
-                request_id: "client-negotiate-v5".to_owned(),
-                idempotency_key: "client-negotiate-v5".to_owned(),
+                request_id: "client-negotiate-v6".to_owned(),
+                idempotency_key: "client-negotiate-v6".to_owned(),
                 command: ServiceCommand::Info,
             })
             .await?;
@@ -205,6 +205,7 @@ fn validate_info(info: &ServiceInfo) -> Result<(), ServiceClientError> {
         || !info.capabilities.sanitized_task_metrics
         || !info.capabilities.recoverable_maintenance
         || !info.capabilities.explicit_task_compaction
+        || !info.capabilities.durable_frontend_sessions
     {
         return Err(client_error(ServiceClientErrorCode::InvalidResponse));
     }
@@ -248,6 +249,7 @@ fn empty_info() -> ServiceInfo {
             sanitized_task_metrics: false,
             recoverable_maintenance: false,
             explicit_task_compaction: false,
+            durable_frontend_sessions: false,
         },
     }
 }
@@ -561,6 +563,7 @@ mod tests {
                 sanitized_task_metrics,
                 recoverable_maintenance,
                 explicit_task_compaction,
+                durable_frontend_sessions: true,
             },
         }
     }
@@ -634,6 +637,25 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("explicit_task_compaction");
+        assert!(serde_json::from_value::<ServiceInfo>(missing).is_err());
+    }
+
+    #[test]
+    fn negotiation_requires_durable_frontend_sessions() {
+        let mut unsupported = info(true, true, true, true);
+        unsupported.capabilities.durable_frontend_sessions = false;
+        assert_eq!(
+            validate_info(&unsupported)
+                .expect_err("false frontend-session support must fail negotiation")
+                .code(),
+            ServiceClientErrorCode::InvalidResponse
+        );
+
+        let mut missing = serde_json::to_value(info(true, true, true, true)).unwrap();
+        missing["capabilities"]
+            .as_object_mut()
+            .unwrap()
+            .remove("durable_frontend_sessions");
         assert!(serde_json::from_value::<ServiceInfo>(missing).is_err());
     }
 

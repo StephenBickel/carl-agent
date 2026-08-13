@@ -1783,6 +1783,7 @@ fn service_start_command(
     frontend: Frontend,
 ) -> Result<ServiceCommand, AcpServerError> {
     let start = StartTaskCommand {
+        frontend,
         external_session_id: external_session_id.to_owned(),
         workspace: session.cwd.clone(),
         request,

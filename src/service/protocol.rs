@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::PathBuf;
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -14,7 +15,7 @@ use crate::runtime::task::{
     TaskStatus,
 };
 
-pub const SERVICE_PROTOCOL_VERSION: u16 = 5;
+pub const SERVICE_PROTOCOL_VERSION: u16 = 6;
 pub const MAX_SERVICE_FRAME_BYTES: usize = 256 * 1024;
 pub const MAX_TASK_TEXT_BYTES: usize = 16 * 1024;
 const MAX_IDENTIFIER_BYTES: usize = 128;
@@ -41,6 +42,10 @@ pub enum ServiceCommand {
     Info,
     Session {
         external_session_id: String,
+    },
+    Sessions {
+        frontend: Frontend,
+        limit: u16,
     },
     StartTask(StartTaskCommand),
     StartTrustedTask(TrustedStartTaskCommand),
@@ -121,6 +126,7 @@ pub enum ServiceCommand {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct StartTaskCommand {
+    pub frontend: Frontend,
     pub external_session_id: String,
     pub workspace: PathBuf,
     pub request: String,
@@ -167,6 +173,7 @@ pub struct ServiceCapabilities {
     pub sanitized_task_metrics: bool,
     pub recoverable_maintenance: bool,
     pub explicit_task_compaction: bool,
+    pub durable_frontend_sessions: bool,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -253,6 +260,22 @@ pub struct ServiceSessionInfo {
     pub task_ids: Vec<TaskId>,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceSessionSummary {
+    pub external_session_id: String,
+    pub session_id: SessionId,
+    pub workspace: PathBuf,
+    pub permission_mode: PermissionMode,
+    pub provider: String,
+    pub latest_task_id: Option<TaskId>,
+    pub latest_task_status: Option<TaskStatus>,
+    pub model: Option<ModelId>,
+    pub effort: Option<ReasoningEffort>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ServiceFrame {
@@ -282,6 +305,7 @@ pub enum ServiceFrame {
 pub enum ServiceResult {
     Info(ServiceInfo),
     Session(ServiceSessionInfo),
+    SessionList(Vec<ServiceSessionSummary>),
     Accepted { task_id: TaskId },
     Snapshot(TaskSnapshot),
     Metrics(TaskMetrics),
@@ -498,7 +522,12 @@ fn validate_request(request: &ServiceRequest) -> Result<(), ProtocolError> {
     validate_identifier(&request.request_id)?;
     validate_identifier(&request.idempotency_key)?;
     match &request.command {
-        ServiceCommand::StartTask(command) => validate_start(command)?,
+        ServiceCommand::StartTask(command) => {
+            if !matches!(command.frontend, Frontend::Acp | Frontend::Tui) {
+                return Err(protocol_error(ProtocolErrorCode::InvalidRequest));
+            }
+            validate_start(command)?;
+        }
         ServiceCommand::StartTrustedTask(command) => {
             validate_start(&command.start)?;
             if command.frontend != Frontend::Buzz {
@@ -551,13 +580,18 @@ fn validate_request(request: &ServiceRequest) -> Result<(), ProtocolError> {
                             .ok_or_else(|| protocol_error(ProtocolErrorCode::InvalidRequest))?,
                     )?;
                 }
-                Frontend::Acp if channel_id.is_none() && event_id.is_none() => {}
+                Frontend::Acp | Frontend::Tui if channel_id.is_none() && event_id.is_none() => {}
                 _ => return Err(protocol_error(ProtocolErrorCode::InvalidRequest)),
             }
         }
         ServiceCommand::Session {
             external_session_id,
         } => validate_bounded_text(external_session_id, MAX_EXTERNAL_SESSION_BYTES, false)?,
+        ServiceCommand::Sessions { limit, .. } => {
+            if !(1..=64).contains(limit) {
+                return Err(protocol_error(ProtocolErrorCode::InvalidEventLimit));
+            }
+        }
         ServiceCommand::SteerTrusted {
             text,
             external_session_id,

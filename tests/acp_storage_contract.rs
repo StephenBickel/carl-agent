@@ -17,6 +17,43 @@ use rusqlite::Connection;
 static NEXT_LAYOUT: AtomicU64 = AtomicU64::new(0);
 
 #[test]
+fn list_frontend_sessions_is_bounded_ordered_and_isolated() -> Result<(), Box<dyn Error>> {
+    let layout = TestLayout::new()?;
+    let store = Store::open(&layout.database)?;
+    for (external, frontend, offset) in [
+        ("tui-old", Frontend::Tui, 0),
+        ("acp-hidden", Frontend::Acp, 1),
+        ("tui-new", Frontend::Tui, 2),
+    ] {
+        let session = store.create_session()?;
+        store.bind_frontend_session(NewFrontendSession {
+            frontend,
+            external_session_id: ExternalSessionId::try_from(external)?,
+            session_id: session.id,
+            cwd: layout.workspace.clone(),
+            protocol_version: 2,
+            client_name: ClientName::try_from("carl-test")?,
+            permission_mode: PermissionMode::FullAccess,
+            channel_id: None,
+            created_at: fixed_time() + Duration::seconds(offset),
+        })?;
+    }
+
+    let sessions = store.list_frontend_sessions(Frontend::Tui, 2)?;
+    assert_eq!(sessions.len(), 2);
+    assert!(
+        sessions
+            .iter()
+            .all(|record| record.frontend == Frontend::Tui)
+    );
+    assert_eq!(sessions[0].external_session_id.as_str(), "tui-new");
+    assert_eq!(sessions[1].external_session_id.as_str(), "tui-old");
+    assert!(store.list_frontend_sessions(Frontend::Tui, 0).is_err());
+    assert!(store.list_frontend_sessions(Frontend::Tui, 65).is_err());
+    Ok(())
+}
+
+#[test]
 fn migration_six_binds_and_recovers_frontend_sessions() -> Result<(), Box<dyn Error>> {
     let layout = TestLayout::new()?;
     let store = Store::open(&layout.database)?;
@@ -49,7 +86,7 @@ fn migration_six_binds_and_recovers_frontend_sessions() -> Result<(), Box<dyn Er
     assert_eq!(
         connection.query_row("SELECT COUNT(*) FROM migrations", [], |row| row
             .get::<_, u64>(0))?,
-        12
+        13
     );
     for table in [
         "frontend_sessions",
