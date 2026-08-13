@@ -6,7 +6,7 @@ use std::time::Duration;
 use futures_core::Stream;
 use futures_util::{StreamExt, stream};
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderValue};
-use reqwest::{Client, Response, StatusCode, Url, redirect};
+use reqwest::{Client, Method, Response, StatusCode, Url, redirect};
 use serde_json::Value;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
@@ -123,7 +123,7 @@ impl ProviderEndpoint {
     fn request_url(&self, path: &str) -> Result<Url, ProviderHttpError> {
         if !path.starts_with('/')
             || path.starts_with("//")
-            || path.contains(['?', '#', '\\'])
+            || path.contains(['#', '\\'])
             || path.bytes().any(|byte| byte.is_ascii_control())
         {
             return Err(invalid_request("provider request path is invalid"));
@@ -172,7 +172,17 @@ impl ProviderHttpClient {
         cancellation: CancellationToken,
     ) -> Result<Value, ProviderHttpError> {
         let response = self
-            .send(path, credential, body, &cancellation, "application/json")
+            .send(
+                RequestSpec {
+                    method: Method::POST,
+                    path,
+                    body: Some(body),
+                    headers: &[],
+                    accept: "application/json",
+                },
+                credential,
+                &cancellation,
+            )
             .await?;
         require_content_type(&response, "application/json")?;
         let bytes = read_bounded(response, MAX_JSON_BYTES, &cancellation).await?;
@@ -187,8 +197,30 @@ impl ProviderHttpClient {
         body: &Value,
         cancellation: CancellationToken,
     ) -> Result<ProviderSseStream, ProviderHttpError> {
+        self.post_sse_with_headers(path, credential, body, &[], cancellation)
+            .await
+    }
+
+    pub async fn post_sse_with_headers(
+        &self,
+        path: &str,
+        credential: &SecretCredential,
+        body: &Value,
+        headers: &[(&'static str, &'static str)],
+        cancellation: CancellationToken,
+    ) -> Result<ProviderSseStream, ProviderHttpError> {
         let response = self
-            .send(path, credential, body, &cancellation, "text/event-stream")
+            .send(
+                RequestSpec {
+                    method: Method::POST,
+                    path,
+                    body: Some(body),
+                    headers,
+                    accept: "text/event-stream",
+                },
+                credential,
+                &cancellation,
+            )
             .await?;
         require_content_type(&response, "text/event-stream")?;
         let state = SseState {
@@ -202,21 +234,51 @@ impl ProviderHttpClient {
         Ok(Box::pin(stream::unfold(state, next_sse_item)))
     }
 
-    async fn send(
+    pub async fn get_json(
         &self,
         path: &str,
         credential: &SecretCredential,
-        body: &Value,
+        headers: &[(&'static str, &'static str)],
+        cancellation: CancellationToken,
+    ) -> Result<Value, ProviderHttpError> {
+        let response = self
+            .send(
+                RequestSpec {
+                    method: Method::GET,
+                    path,
+                    body: None,
+                    headers,
+                    accept: "application/json",
+                },
+                credential,
+                &cancellation,
+            )
+            .await?;
+        require_content_type(&response, "application/json")?;
+        let bytes = read_bounded(response, MAX_JSON_BYTES, &cancellation).await?;
+        serde_json::from_slice(&bytes)
+            .map_err(|_| invalid_response("provider JSON response is malformed"))
+    }
+
+    async fn send(
+        &self,
+        spec: RequestSpec<'_>,
+        credential: &SecretCredential,
         cancellation: &CancellationToken,
-        accept: &'static str,
     ) -> Result<Response, ProviderHttpError> {
         if cancellation.is_cancelled() {
             return Err(cancelled());
         }
-        let url = self.endpoint.request_url(path)?;
-        let encoded = serde_json::to_vec(body)
+        let url = self.endpoint.request_url(spec.path)?;
+        let encoded = spec
+            .body
+            .map(serde_json::to_vec)
+            .transpose()
             .map_err(|_| invalid_request("provider request JSON is invalid"))?;
-        if encoded.len() > MAX_JSON_BYTES {
+        if encoded
+            .as_ref()
+            .is_some_and(|encoded| encoded.len() > MAX_JSON_BYTES)
+        {
             return Err(invalid_request("provider request is too large"));
         }
         let authorization = credential.with_bytes(|secret| {
@@ -226,13 +288,18 @@ impl ProviderHttpClient {
             HeaderValue::from_bytes(&value)
                 .map_err(|_| invalid_request("provider credential is invalid"))
         })?;
-        let request = self
+        let mut request = self
             .client
-            .post(url)
+            .request(spec.method, url)
             .header(AUTHORIZATION, authorization)
-            .header(reqwest::header::ACCEPT, accept)
-            .header(CONTENT_TYPE, "application/json")
-            .body(encoded);
+            .header(reqwest::header::ACCEPT, spec.accept)
+            .header(CONTENT_TYPE, "application/json");
+        for (name, value) in spec.headers {
+            request = request.header(*name, *value);
+        }
+        if let Some(encoded) = encoded {
+            request = request.body(encoded);
+        }
         let response = tokio::select! {
             biased;
             () = cancellation.cancelled() => return Err(cancelled()),
@@ -241,6 +308,14 @@ impl ProviderHttpClient {
         ensure_success(response.status())?;
         Ok(response)
     }
+}
+
+struct RequestSpec<'a> {
+    method: Method,
+    path: &'a str,
+    body: Option<&'a Value>,
+    headers: &'a [(&'static str, &'static str)],
+    accept: &'static str,
 }
 
 impl fmt::Debug for ProviderHttpClient {

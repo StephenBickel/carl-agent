@@ -1,6 +1,7 @@
 pub mod catalog;
 pub mod http;
 pub mod openai;
+pub mod openrouter;
 pub mod scripted;
 
 use std::future::Future;
