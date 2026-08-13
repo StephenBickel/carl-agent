@@ -54,11 +54,20 @@ use crate::storage::{Store, TrustedFrontendOwnerInput};
 #[command(name = "carl")]
 pub struct Cli {
     #[command(subcommand)]
-    pub command: Command,
+    pub command: Option<Command>,
+}
+
+impl Cli {
+    #[must_use]
+    pub fn selected_command(self) -> Command {
+        self.command
+            .unwrap_or_else(|| Command::Tui(TuiArgs::default()))
+    }
 }
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    Tui(TuiArgs),
     Serve,
     Acp(AcpArgs),
     Auth {
@@ -85,6 +94,9 @@ pub enum Command {
     Doctor,
     Sessions,
 }
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Args)]
+pub struct TuiArgs {}
 
 #[derive(Clone, Debug, Eq, PartialEq, Subcommand)]
 pub enum BaselineCommand {
@@ -665,6 +677,7 @@ where
 {
     let mut cancellation = Box::pin(cancellation);
     match command {
+        Command::Tui(_) => CliRunResult::not_implemented("tui streaming dispatch"),
         Command::Auth { command } => run_auth(command, cancellation.as_mut()).await,
         Command::Acp(_) => CliRunResult::not_implemented("acp streaming dispatch"),
         Command::Memory { command } => run_memory(command),

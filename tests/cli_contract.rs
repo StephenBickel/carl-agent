@@ -26,6 +26,22 @@ fn help_exposes_the_v1_commands() {
 }
 
 #[test]
+fn no_subcommand_and_tui_alias_select_the_interactive_tui() {
+    let implicit = Cli::try_parse_from(["carl"]).expect("default TUI parses");
+    let explicit = Cli::try_parse_from(["carl", "tui"]).expect("TUI alias parses");
+    assert!(matches!(implicit.selected_command(), Command::Tui(_)));
+    assert!(matches!(explicit.selected_command(), Command::Tui(_)));
+}
+
+#[test]
+fn existing_explicit_commands_do_not_fall_through_to_tui() {
+    for args in [["carl", "serve"], ["carl", "doctor"], ["carl", "sessions"]] {
+        let parsed = Cli::try_parse_from(args).expect("existing command parses");
+        assert!(!matches!(parsed.selected_command(), Command::Tui(_)));
+    }
+}
+
+#[test]
 fn maintenance_status_and_prepare_parse_as_closed_owner_commands() {
     for (literal, expected) in [
         ("status", MaintenanceCommand::Status),
@@ -33,7 +49,7 @@ fn maintenance_status_and_prepare_parse_as_closed_owner_commands() {
     ] {
         let parsed = Cli::try_parse_from(["carl", "maintenance", literal]).unwrap();
         assert!(matches!(
-            parsed.command,
+            parsed.selected_command(),
             Command::Maintenance { command } if command == expected
         ));
     }
@@ -56,7 +72,7 @@ fn direct_codex_baseline_parses_exact_required_values_default_and_bounds() {
     .expect("the direct Codex baseline command parses");
     let Command::Baseline {
         command: BaselineCommand::Codex(args),
-    } = parsed.command
+    } = parsed.selected_command()
     else {
         panic!("expected direct Codex baseline command");
     };
@@ -141,7 +157,7 @@ fn acp_startup_options_parse_exactly() {
         "default",
     ])
     .unwrap();
-    let Command::Acp(args) = parsed.command else {
+    let Command::Acp(args) = parsed.selected_command() else {
         panic!("expected ACP command");
     };
     assert_eq!(args.model.as_deref(), Some("gpt-5.6-codex"));
@@ -151,13 +167,13 @@ fn acp_startup_options_parse_exactly() {
 
     let parsed = Cli::try_parse_from(["carl", "acp", "--dangerously-bypass-permissions"]).unwrap();
     assert!(matches!(
-        parsed.command,
+        parsed.selected_command(),
         Command::Acp(args) if args.dangerously_bypass_permissions
     ));
 
     let parsed = Cli::try_parse_from(["carl", "acp", "--permission-mode", "fullAccess"])
         .expect("canonical full access parses");
-    let Command::Acp(args) = parsed.command else {
+    let Command::Acp(args) = parsed.selected_command() else {
         panic!("expected ACP command");
     };
     assert_eq!(args.permission_mode, Some(AcpPermissionMode::FullAccess));
@@ -192,7 +208,7 @@ fn acp_task_budget_flags_parse_exact_values_and_defaults() {
         "1000",
     ])
     .unwrap();
-    let Command::Acp(args) = parsed.command else {
+    let Command::Acp(args) = parsed.selected_command() else {
         panic!("expected ACP command");
     };
     assert_eq!(
@@ -207,7 +223,7 @@ fn acp_task_budget_flags_parse_exact_values_and_defaults() {
     );
 
     let parsed = Cli::try_parse_from(["carl", "acp"]).unwrap();
-    let Command::Acp(args) = parsed.command else {
+    let Command::Acp(args) = parsed.selected_command() else {
         panic!("expected ACP command");
     };
     assert_eq!(args.task_budget(), TaskBudget::default());
@@ -285,7 +301,7 @@ fn local_buzz_trust_command_requires_an_actor_and_absolute_workspace() {
     ])
     .expect("trusted owner command parses");
     assert!(matches!(
-        parsed.command,
+        parsed.selected_command(),
         Command::Trust {
             command: TrustCommand::Buzz { actor, workspace }
         } if actor == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"

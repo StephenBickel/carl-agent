@@ -16,4 +16,5 @@ pub mod service;
 pub mod sidecar;
 pub mod staging;
 pub mod storage;
+pub mod tui;
 pub mod verification;

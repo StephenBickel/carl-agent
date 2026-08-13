@@ -18,7 +18,7 @@ fn main() -> ExitCode {
     let command = if buzz_mcp {
         None
     } else {
-        Some(Cli::parse().command)
+        Some(Cli::parse().selected_command())
     };
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -33,6 +33,9 @@ fn main() -> ExitCode {
     let command = command.expect("non-MCP invocation parsed a Carl command");
     if let Command::Acp(args) = command {
         return exit_code(runtime.block_on(run_acp_stdio(args)));
+    }
+    if let Command::Tui(args) = command {
+        return exit_code(runtime.block_on(carl::tui::run(args)));
     }
     let result = runtime.block_on(run_command(command));
 
