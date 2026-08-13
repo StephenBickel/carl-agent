@@ -102,10 +102,11 @@ function buildTaskInput(cargoExecutable) {
       cargoExecutable.includes("\n") || cargoExecutable.includes("\0")) {
     throw Object.assign(new Error("invalid_cargo_binary"), { code: "invalid_cargo_binary" });
   }
+  const toolchainPath = `${dirname(cargoExecutable)}:/usr/bin:/bin:/usr/sbin:/sbin`;
   return Buffer.concat([
     PROMPT,
     Buffer.from(
-      ` The provider environment deliberately has a closed PATH. Use the exact Cargo executable ${cargoExecutable} for every Cargo command. ` +
+      ` The provider environment deliberately has a closed PATH. Prefix every Cargo, rustc, rustdoc, cargo-fmt, and rustfmt command with PATH=${toolchainPath}. Use the exact Cargo executable ${cargoExecutable} for every Cargo command. ` +
       "The base sandbox is deliberately read-only; request approval for every mutation and continue after Carl authorizes it.",
       "utf8",
     ),
@@ -494,6 +495,12 @@ async function selfTest() {
     }, repository);
     expect(admitted.cargo === fakeCargo);
     const livePrompt = buildTaskInput(admitted.cargo);
+    expect(
+      livePrompt.toString("utf8").includes(
+        `PATH=${dirname(fakeCargo)}:/usr/bin:/bin:/usr/sbin:/sbin`,
+      ),
+      "task input must make the admitted Rust toolchain discoverable without ambient PATH",
+    );
     const acpInvocation = carlAcpInvocation(admitted, carl);
     const softTimeIndex = acpInvocation.argv.indexOf("--soft-epoch-seconds");
     expect(softTimeIndex >= 0 && acpInvocation.argv[softTimeIndex + 1] === "900");

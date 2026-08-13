@@ -68,3 +68,19 @@ contract; and the offline paired runner proved orchestration and result validati
 This report deliberately does not collapse those separate facts into a claimed green
 paired benchmark or any superiority claim. Comparative claims still require at least
 thirty independent successful pairs.
+
+## Recorded terminal acceptance follow-up
+
+A disposable three-test Rust bug-fix task was run through the release Carl service and
+ACP frontend under owner full access. Carl reproduced the failing zero-port case, added
+surrounding-whitespace regression coverage, edited the parser, recovered from an
+initial verification problem, committed a structured completion report, and reached
+`completed`. A separate post-run `cargo test --locked` passed all three tests.
+
+The run exposed that telling the provider only the exact Cargo executable leaves
+Cargo's adjacent `rustc`, `rustdoc`, `cargo-fmt`, and `rustfmt` helpers absent from the
+closed PATH. Carl recovered by adding that exact toolchain directory. The live runner
+now includes the admitted Cargo directory plus only the fixed system directories in
+its task instruction; it still does not forward ambient PATH. The terminal MP4 remains
+outside the repository, and the disposable auth copy/workspace are not release
+artifacts.
