@@ -1,5 +1,6 @@
 use std::env;
 use std::io;
+use std::io::IsTerminal as _;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -8,6 +9,9 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
 use crate::cli::{ExitClassification, TuiArgs};
+use crate::credentials::{CredentialVault, load_provider_preference, store_provider_preference};
+use crate::providers::catalog::ProviderKind;
+use crate::providers::http::SecretCredential;
 use crate::service::protocol::ServiceApprovalDecision;
 
 use self::bootstrap::connect_or_launch;
@@ -42,6 +46,7 @@ async fn run_inner() -> Result<(), &'static str> {
     let workspace = env::current_dir()
         .and_then(std::fs::canonicalize)
         .map_err(|_| "the current workspace is unavailable")?;
+    ensure_first_run_provider(&data_root).await?;
     let client = connect_or_launch(&data_root, &workspace)
         .await
         .map_err(|_| "the persistent task service is unavailable")?;
@@ -137,6 +142,65 @@ async fn run_inner() -> Result<(), &'static str> {
         .restore()
         .map_err(|_| "the terminal could not restore its mode")?;
     loop_result
+}
+
+async fn ensure_first_run_provider(data_root: &std::path::Path) -> Result<(), &'static str> {
+    match load_provider_preference(data_root) {
+        Ok(Some(_)) => return Ok(()),
+        Ok(None) => {}
+        Err(_) => return Err("the provider preference is invalid"),
+    }
+    if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
+        return Ok(());
+    }
+    let selection = tokio::task::spawn_blocking(|| {
+        eprintln!("Choose Carl provider:");
+        eprintln!("  1) OpenAI subscription (recommended)");
+        eprintln!("  2) OpenAI API key");
+        eprintln!("  3) OpenRouter API key");
+        eprint!("Selection [1]: ");
+        use std::io::Write as _;
+        io::stderr().flush().map_err(|_| ())?;
+        let mut value = String::new();
+        io::stdin().read_line(&mut value).map_err(|_| ())?;
+        parse_first_run_provider(&value).ok_or(())
+    })
+    .await
+    .map_err(|_| "provider selection failed")?
+    .map_err(|_| "provider selection is invalid")?;
+    if matches!(
+        selection,
+        ProviderKind::OpenAiApi | ProviderKind::OpenRouter
+    ) {
+        let label = if selection == ProviderKind::OpenAiApi {
+            "OpenAI"
+        } else {
+            "OpenRouter"
+        };
+        let secret = tokio::task::spawn_blocking(move || {
+            rpassword::prompt_password(format!("{label} API key: "))
+        })
+        .await
+        .map_err(|_| "secure credential input failed")?
+        .map_err(|_| "secure credential input failed")?;
+        let credential = SecretCredential::new(secret.into_bytes())
+            .map_err(|_| "the provider credential is invalid")?;
+        CredentialVault::store(selection, credential)
+            .map_err(|_| "the OS credential vault is unavailable")?;
+    }
+    store_provider_preference(data_root, selection)
+        .map_err(|_| "the provider preference could not be saved")
+}
+
+#[doc(hidden)]
+#[must_use]
+pub fn parse_first_run_provider(input: &str) -> Option<ProviderKind> {
+    match input.trim().to_ascii_lowercase().as_str() {
+        "" | "1" | "subscription" => Some(ProviderKind::OpenAiSubscription),
+        "2" | "openai" => Some(ProviderKind::OpenAiApi),
+        "3" | "openrouter" => Some(ProviderKind::OpenRouter),
+        _ => None,
+    }
 }
 
 fn apply_events(state: &mut TuiState, events: Vec<TuiEvent>) -> Result<(), &'static str> {

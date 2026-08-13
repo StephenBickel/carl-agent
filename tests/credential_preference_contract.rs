@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use carl::credentials::{CredentialVault, load_provider_preference, store_provider_preference};
 use carl::providers::catalog::ProviderKind;
+use carl::tui::parse_first_run_provider;
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 static SERIAL: AtomicU64 = AtomicU64::new(0);
@@ -45,4 +46,21 @@ fn vault_diagnostics_are_opaque() {
         format!("{:?}", CredentialVault),
         "CredentialVault(<os-managed>)"
     );
+}
+
+#[test]
+fn first_run_provider_choice_is_closed_and_defaults_to_subscription() {
+    for (input, expected) in [
+        ("", ProviderKind::OpenAiSubscription),
+        ("1", ProviderKind::OpenAiSubscription),
+        ("subscription", ProviderKind::OpenAiSubscription),
+        ("2", ProviderKind::OpenAiApi),
+        ("openai", ProviderKind::OpenAiApi),
+        ("3", ProviderKind::OpenRouter),
+        ("openrouter", ProviderKind::OpenRouter),
+    ] {
+        assert_eq!(parse_first_run_provider(input), Some(expected));
+    }
+    assert_eq!(parse_first_run_provider("4"), None);
+    assert_eq!(parse_first_run_provider("open ai"), None);
 }
