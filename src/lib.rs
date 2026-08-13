@@ -3,6 +3,7 @@ pub mod artifacts;
 pub mod auth;
 pub mod buzz_mcp;
 pub mod cli;
+pub mod credentials;
 pub mod delegates;
 pub mod error;
 pub mod evals;

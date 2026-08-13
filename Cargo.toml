@@ -79,6 +79,7 @@ clap = { version = "4.5", features = ["derive"] }
 crossterm = { version = "0.28", features = ["event-stream"] }
 futures-core = "0.3"
 futures-util = "0.3"
+keyring = { version = "4.1", features = ["v1"] }
 # Dependency review: process-wrap is pinned to 9.1.0 with only Tokio, Unix process
 # groups, and its reviewed Windows Job Object code enabled. Do not enable its
 # kill-on-drop or creation-flags wrappers until watchexec/process-wrap#35 is
@@ -103,6 +104,7 @@ reqwest = { version = "0.12", default-features = false, features = [
     "stream",
 ] }
 regex = "1.12"
+rpassword = "7.4"
 sha2 = "0.10"
 thiserror = "2.0"
 tokio = { version = "1.47", features = [

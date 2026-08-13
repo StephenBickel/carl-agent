@@ -25,6 +25,7 @@ use crate::auth::{
     SubscriptionAuthBroker, SubscriptionPlan, SubscriptionService,
 };
 use crate::buzz_mcp;
+use crate::credentials::{CredentialVault, load_provider_preference, store_provider_preference};
 use crate::delegates::codex::{
     CodexAppServer, CodexExecAdapter, DirectBaselineErrorCode, DirectCodexBaseline,
     DirectCodexBaselineRequest,
@@ -385,6 +386,50 @@ pub enum AuthCommand {
         #[arg(value_enum)]
         service: AuthService,
     },
+    Key {
+        #[arg(value_enum)]
+        provider: NativeProviderArgument,
+    },
+    RemoveKey {
+        #[arg(value_enum)]
+        provider: NativeProviderArgument,
+    },
+    Use {
+        #[arg(value_enum)]
+        provider: ProviderArgument,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum NativeProviderArgument {
+    Openai,
+    Openrouter,
+}
+
+impl NativeProviderArgument {
+    const fn provider_kind(self) -> ProviderKind {
+        match self {
+            Self::Openai => ProviderKind::OpenAiApi,
+            Self::Openrouter => ProviderKind::OpenRouter,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum ProviderArgument {
+    Subscription,
+    Openai,
+    Openrouter,
+}
+
+impl ProviderArgument {
+    const fn provider_kind(self) -> ProviderKind {
+        match self {
+            Self::Subscription => ProviderKind::OpenAiSubscription,
+            Self::Openai => ProviderKind::OpenAiApi,
+            Self::Openrouter => ProviderKind::OpenRouter,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -1028,9 +1073,19 @@ where
 async fn configured_service_port(
     configuration: &CommonConfiguration,
 ) -> Result<Box<dyn AgentPort>, ()> {
-    match env::var("CARL_PROVIDER").as_deref() {
-        Ok("openai") => {
-            let credential = environment_credential("OPENAI_API_KEY")?;
+    let selected = match env::var("CARL_PROVIDER").as_deref() {
+        Ok("openai") => ProviderKind::OpenAiApi,
+        Ok("openrouter") => ProviderKind::OpenRouter,
+        Ok("subscription") => ProviderKind::OpenAiSubscription,
+        Err(env::VarError::NotPresent) => load_provider_preference(&configuration.data_root)
+            .map_err(|_| ())?
+            .unwrap_or(ProviderKind::OpenAiSubscription),
+        Ok(_) | Err(env::VarError::NotUnicode(_)) => return Err(()),
+    };
+    match selected {
+        ProviderKind::OpenAiApi => {
+            let credential = environment_credential("OPENAI_API_KEY")
+                .or_else(|_| CredentialVault::load(ProviderKind::OpenAiApi).map_err(|_| ()))?;
             let catalog = native_openai_catalog()?;
             let provider = OpenAiProvider::new(
                 ProviderHttpClient::new(ProviderEndpoint::openai()).map_err(|_| ())?,
@@ -1040,8 +1095,9 @@ async fn configured_service_port(
             .map_err(|_| ())?;
             Ok(Box::new(NativeAgentPort::new(Arc::new(provider), catalog)))
         }
-        Ok("openrouter") => {
-            let credential = environment_credential("OPENROUTER_API_KEY")?;
+        ProviderKind::OpenRouter => {
+            let credential = environment_credential("OPENROUTER_API_KEY")
+                .or_else(|_| CredentialVault::load(ProviderKind::OpenRouter).map_err(|_| ()))?;
             let provider = OpenRouterProvider::discover(
                 ProviderHttpClient::new(ProviderEndpoint::openrouter()).map_err(|_| ())?,
                 credential,
@@ -1052,7 +1108,7 @@ async fn configured_service_port(
             let catalog = provider.catalog().clone();
             Ok(Box::new(NativeAgentPort::new(Arc::new(provider), catalog)))
         }
-        Ok("subscription") | Err(env::VarError::NotPresent) => {
+        ProviderKind::OpenAiSubscription => {
             let (executable, home) =
                 prepare_provider(AuthService::Openai, configuration).map_err(|_| ())?;
             let codex = CodexAppServer::connect(&executable, home, SidecarLimits::default())
@@ -1060,7 +1116,6 @@ async fn configured_service_port(
                 .map_err(|_| ())?;
             Ok(Box::new(codex))
         }
-        Ok(_) | Err(env::VarError::NotUnicode(_)) => Err(()),
     }
 }
 
@@ -1529,6 +1584,77 @@ where
                 return operation_error(service, AuthErrorCode::ProviderRejected);
             };
             run_logout(service, &configuration, cancellation).await
+        }
+        AuthCommand::Key { provider } => {
+            if !local_foreground_terminal_available() {
+                return service_cli_result(
+                    ExitClassification::Failure,
+                    "carl auth key: an interactive terminal is required",
+                );
+            }
+            let Ok(configuration) = load_common_configuration() else {
+                return service_cli_result(
+                    ExitClassification::Failure,
+                    "carl auth key: invalid Carl data directory",
+                );
+            };
+            let prompt = format!(
+                "{} API key: ",
+                match provider {
+                    NativeProviderArgument::Openai => "OpenAI",
+                    NativeProviderArgument::Openrouter => "OpenRouter",
+                }
+            );
+            let Ok(Ok(secret)) =
+                tokio::task::spawn_blocking(move || rpassword::prompt_password(prompt)).await
+            else {
+                return service_cli_result(
+                    ExitClassification::Failure,
+                    "carl auth key: secure input failed",
+                );
+            };
+            let Ok(credential) = SecretCredential::new(secret.into_bytes()) else {
+                return service_cli_result(
+                    ExitClassification::Failure,
+                    "carl auth key: credential is invalid",
+                );
+            };
+            if CredentialVault::store(provider.provider_kind(), credential).is_err()
+                || store_provider_preference(&configuration.data_root, provider.provider_kind())
+                    .is_err()
+            {
+                return service_cli_result(
+                    ExitClassification::Failure,
+                    "carl auth key: OS credential storage failed",
+                );
+            }
+            service_cli_result(ExitClassification::Success, "")
+        }
+        AuthCommand::RemoveKey { provider } => {
+            if CredentialVault::delete(provider.provider_kind()).is_err() {
+                return service_cli_result(
+                    ExitClassification::Failure,
+                    "carl auth remove-key: credential was unavailable",
+                );
+            }
+            service_cli_result(ExitClassification::Success, "")
+        }
+        AuthCommand::Use { provider } => {
+            let Ok(configuration) = load_common_configuration() else {
+                return service_cli_result(
+                    ExitClassification::Failure,
+                    "carl auth use: invalid Carl data directory",
+                );
+            };
+            if store_provider_preference(&configuration.data_root, provider.provider_kind())
+                .is_err()
+            {
+                return service_cli_result(
+                    ExitClassification::Failure,
+                    "carl auth use: provider preference could not be saved",
+                );
+            }
+            service_cli_result(ExitClassification::Success, "")
         }
     }
 }
