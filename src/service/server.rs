@@ -1,7 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -36,7 +35,11 @@ use super::protocol::{
 };
 
 #[cfg(unix)]
+use std::fs;
+#[cfg(unix)]
 use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _};
+#[cfg(unix)]
+use std::path::PathBuf;
 #[cfg(unix)]
 use tokio::net::UnixListener;
 
@@ -236,7 +239,9 @@ pub(crate) fn windows_pipe_name(data_root: &Path) -> String {
 }
 
 #[cfg(any(windows, test))]
-pub(crate) const WINDOWS_PIPE_ACCESS: u32 = 0xC000_0000;
+pub(crate) const WINDOWS_PIPE_DACL_ACCESS: u32 = 0x0012_019F;
+#[cfg(windows)]
+pub(crate) const WINDOWS_PIPE_CLIENT_ACCESS: u32 = 0xC002_0000;
 
 #[cfg(windows)]
 pub(crate) fn create_owner_pipe(
@@ -246,7 +251,7 @@ pub(crate) fn create_owner_pipe(
     use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 
     let descriptor = crate::sidecar::windows_security::owner_only_security_descriptor_for_access(
-        WINDOWS_PIPE_ACCESS,
+        WINDOWS_PIPE_DACL_ACCESS,
     )
     .map_err(|()| endpoint_error(EndpointErrorCode::Unavailable))?;
     let mut attributes = SECURITY_ATTRIBUTES {

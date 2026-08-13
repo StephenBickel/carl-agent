@@ -17,8 +17,10 @@ fn main() {
     if let Some(status) = dispatch_fixture(&arguments) {
         std::process::exit(status);
     }
+    let mut arguments = Arguments::from_args();
+    arguments.test_threads.get_or_insert(1);
     libtest_mimic::run(
-        &Arguments::from_args(),
+        &arguments,
         vec![
             Trial::test(
                 "Buzz admission rejects untrusted ambiguous and replayed work before execution",

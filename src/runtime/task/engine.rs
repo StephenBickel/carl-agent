@@ -6007,10 +6007,8 @@ fn postcondition_directory_is_safe(metadata: &cap_std::fs::Metadata) -> bool {
 
 #[cfg(windows)]
 fn postcondition_directory_is_safe(metadata: &cap_std::fs::Metadata) -> bool {
-    use cap_std::fs::MetadataExt as _;
-
     metadata.is_dir()
-        && metadata.file_attributes()
+        && cap_std::fs::MetadataExt::file_attributes(metadata)
             & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
             == 0
 }
@@ -6058,10 +6056,8 @@ fn postcondition_metadata_is_safe(metadata: &cap_std::fs::Metadata) -> bool {
 
 #[cfg(windows)]
 fn postcondition_metadata_is_safe(metadata: &cap_std::fs::Metadata) -> bool {
-    use cap_std::fs::MetadataExt as _;
-
     metadata.is_file()
-        && metadata.file_attributes()
+        && cap_std::fs::MetadataExt::file_attributes(metadata)
             & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
             == 0
         && metadata.number_of_links() == Some(1)

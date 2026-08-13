@@ -15,6 +15,7 @@ const QUALITY_RUN_COMMANDS: &[&str] = &[
 const TEST_RUN_COMMANDS: &[&str] = &[
     r#""CARGO_TARGET_DIR=$env:USERPROFILE\carl-ci-target" >> $env:GITHUB_ENV"#,
     "cargo test --locked --test buzz_acp_contract --test buzz_end_to_end",
+    "cargo test --locked --lib service::client::tests::owner_pipe_created_for_the_current_user_passes_client_verification -- --exact",
     "cargo test --locked --test long_horizon_eval",
     APPROVED_ALL_FEATURES_TEST,
 ];

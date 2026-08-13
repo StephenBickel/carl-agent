@@ -45,6 +45,9 @@ jobs:
       - name: Select a private Windows target directory
         if: runner.os == 'Windows'
         run: '"CARGO_TARGET_DIR=$env:USERPROFILE\carl-ci-target" >> $env:GITHUB_ENV'
+      - name: Verify the private Windows service endpoint
+        if: runner.os == 'Windows'
+        run: cargo test --locked --lib service::client::tests::owner_pipe_created_for_the_current_user_passes_client_verification -- --exact
       - name: Test pinned Buzz ACP compatibility
         run: cargo test --locked --test buzz_acp_contract --test buzz_end_to_end
       - name: Test deterministic long-horizon evaluation
