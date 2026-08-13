@@ -1,3 +1,4 @@
+pub mod catalog;
 pub mod scripted;
 
 use std::future::Future;

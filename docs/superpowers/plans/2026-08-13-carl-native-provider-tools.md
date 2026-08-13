@@ -28,6 +28,7 @@
 **Files:**
 - Modify: `src/providers/mod.rs`
 - Create: `src/providers/catalog.rs`
+- Modify: `src/delegates/settings.rs`
 - Modify: `src/lib.rs`
 - Test: `tests/provider_catalog_contract.rs`
 
@@ -52,25 +53,11 @@ Add validated types with these public shapes:
 ```rust
 pub enum ProviderKind { OpenAiSubscription, OpenAiApi, OpenRouter }
 
-pub struct ProviderModel {
-    pub id: ModelId,
-    pub display_name: String,
-    pub context_window: u64,
-    pub supported_efforts: Vec<ReasoningEffort>,
-    pub default_effort: ReasoningEffort,
-    pub structured_tools: bool,
-    pub text_input: bool,
-    pub text_output: bool,
-}
-
-pub struct ProviderCatalog {
-    pub provider: ProviderKind,
-    pub models: Vec<ProviderModel>,
-    pub default_model: ModelId,
-}
+pub struct ProviderModel { /* private validated fields with read-only accessors */ }
+pub struct ProviderCatalog { /* private validated fields with read-only accessors */ }
 ```
 
-Construct catalogs only through `ProviderCatalog::new`, validate all bounds and uniqueness there, and use `#[serde(deny_unknown_fields)]` on wire-safe structs. `ProviderSelection::validate_against(&ProviderCatalog)` must reject an unknown model or effort rather than substituting a default.
+Construct models/catalogs only through `ProviderModel::new` and `ProviderCatalog::new`, validate all bounds and uniqueness there, and use `#[serde(deny_unknown_fields)]` on wire-safe structs. Extend `ModelId` for slash-separated OpenRouter IDs while rejecting empty, `.` and `..` segments. `ProviderSelection::validate_against(&ProviderCatalog)` must reject an unknown model or effort rather than substituting a default.
 
 - [ ] **Step 4: Run and commit**
 

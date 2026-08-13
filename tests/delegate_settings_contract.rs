@@ -69,16 +69,23 @@ fn unset_settings_preserve_the_provider_default_instead_of_guessing() {
 
 #[test]
 fn model_ids_are_bounded_provider_owned_strings() {
-    for invalid in ["", "gpt 5.6", "gpt/5.6", "gpt-5.6\n", &"x".repeat(129)] {
+    for invalid in [
+        "",
+        "gpt 5.6",
+        "openai//gpt-5.6",
+        "openai/../gpt-5.6",
+        "gpt-5.6\n",
+        &"x".repeat(129),
+    ] {
         let error = ModelId::parse(invalid).expect_err("invalid model must be rejected");
         assert_eq!(error.code(), ErrorCode::Validation);
     }
 
     assert_eq!(
-        ModelId::parse("openai:gpt-5.6")
+        ModelId::parse("openai/gpt-5.6")
             .expect("provider model is valid")
             .as_str(),
-        "openai:gpt-5.6"
+        "openai/gpt-5.6"
     );
 }
 

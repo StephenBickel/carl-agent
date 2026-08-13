@@ -17,8 +17,12 @@ impl ModelId {
         let value = value.into();
         let valid = !value.is_empty()
             && value.len() <= MAX_MODEL_ID_BYTES
-            && value.bytes().all(|byte| {
-                byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':')
+            && value.split('/').all(|segment| {
+                !segment.is_empty()
+                    && !matches!(segment, "." | "..")
+                    && segment.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':')
+                    })
             });
         if !valid {
             return Err(validation_error("delegate model identifier is invalid"));
