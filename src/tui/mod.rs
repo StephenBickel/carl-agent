@@ -1,6 +1,7 @@
 use crate::cli::{ExitClassification, TuiArgs};
 
 pub mod command;
+pub mod controller;
 pub mod state;
 
 /// Run Carl's interactive terminal frontend.
