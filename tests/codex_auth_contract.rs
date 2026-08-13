@@ -217,6 +217,15 @@ fn notification_bound_timeouts() -> CodexAuthTimeouts {
     )
 }
 
+fn account_mapping_timeouts() -> CodexAuthTimeouts {
+    CodexAuthTimeouts::new(
+        Duration::from_secs(2),
+        Duration::from_millis(120),
+        Duration::from_millis(250),
+        Duration::from_millis(10),
+    )
+}
+
 fn codex_launch_and_handshake_are_exact() -> TestResult {
     run_async(async {
         let fixture = Fixture::connect("signed-out").await?;
@@ -544,7 +553,11 @@ fn account_plans_use_exact_mapping() -> TestResult {
             ("unknown", SubscriptionPlan::Unknown),
         ];
         for (wire, expected) in plans {
-            let fixture = Fixture::connect(&format!("account-plan-{wire}")).await?;
+            let fixture = Fixture::connect_with_timeouts(
+                &format!("account-plan-{wire}"),
+                account_mapping_timeouts(),
+            )
+            .await?;
             assert_eq!(
                 fixture.broker.cached_state(),
                 AuthState::SignedIn {
@@ -555,7 +568,11 @@ fn account_plans_use_exact_mapping() -> TestResult {
             assert_contains_no_secret(&format!("{:?}", fixture.broker));
         }
         for wire in ["pro_lite", "education", "future_plan"] {
-            let result = Fixture::connect(&format!("account-plan-{wire}")).await;
+            let result = Fixture::connect_with_timeouts(
+                &format!("account-plan-{wire}"),
+                account_mapping_timeouts(),
+            )
+            .await;
             let error = match result {
                 Ok(_) => return Err(format!("unrecognized plan {wire} was accepted").into()),
                 Err(error) => error,

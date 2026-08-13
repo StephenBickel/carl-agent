@@ -797,10 +797,10 @@ fn initialize_session(
     let mut session = fixture("session_new", &layout.workspace, None)?;
     session["id"] = json!(session_id);
     client.send(&session)?;
-    let response = client.read_id(session_id)?;
-    Ok(response["result"]["sessionId"]
+    let created = client.read_id(session_id)?;
+    Ok(created["result"]["sessionId"]
         .as_str()
-        .ok_or_else(|| format!("session ID missing: {response}"))?
+        .ok_or_else(|| format!("session ID missing: {created}"))?
         .to_owned())
 }
 

@@ -190,6 +190,17 @@ cargo build --locked --release
 Start with [CONTRIBUTING.md](CONTRIBUTING.md). Security reports follow
 [SECURITY.md](SECURITY.md), and notable changes are in [CHANGELOG.md](CHANGELOG.md).
 
+## Benchmark lab
+
+The [benchmark lab](docs/benchmarks.md) now provides reproducible coding,
+workflow-automation, and safety tasks, same-model Carl/Codex comparisons, and an owner-private
+append-only experiment graph. The phase-three operator can prepare and seal a disposable candidate,
+bind paired and independent-review evidence, explicitly open a draft PR, and safely dispose the
+clean worktree while retaining the sealed branch. These are the first three layers
+of the approved [improvement-factory design](docs/superpowers/specs/2026-08-10-codex-carl-improvement-factory-design.md),
+but they do not run protected validation, autonomously promote, or merge changes. The deterministic
+promotion controller, protected runner, merge queue, soak, and rollback remain separate gates.
+
 ## Roadmap
 
 - [x] Durable provider-neutral domain, storage, and event contracts

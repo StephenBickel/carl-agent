@@ -1866,7 +1866,6 @@ digest proof. Performance work may not bypass canonical validation, reconciliati
 or the exact durable-sequence restart semantics. This follow-on is a mandatory
 Task 13 release dependency, not optional Task 14 soak tuning, and requires an
 independent review before live OAuth work starts.
-
 - [ ] **Step 6: Verify and commit**
 
 Run the global Rust checks, then:

@@ -21,3 +21,12 @@
 # Operating systems
 .DS_Store
 Thumbs.db
+
+# Benchmark lab generated state
+benchmarks/.venv/
+benchmarks/.pytest_cache/
+benchmarks/.ruff_cache/
+benchmarks/results/private/
+benchmarks/results/public/*.json
+__pycache__/
+*.pyc

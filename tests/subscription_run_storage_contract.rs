@@ -256,7 +256,7 @@ fn simultaneous_compare_and_transition_has_exactly_one_winner() -> TestResult {
     let stores = [Store::open(database.path())?, Store::open(database.path())?];
     let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
     let mut workers = Vec::new();
-    for (second, mut store) in [2, 3].into_iter().zip(stores) {
+    for (mut store, second) in stores.into_iter().zip([2, 3]) {
         let barrier = std::sync::Arc::clone(&barrier);
         workers.push(std::thread::spawn(move || {
             barrier.wait();

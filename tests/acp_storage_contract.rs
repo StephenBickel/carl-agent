@@ -349,11 +349,44 @@ fn frontend_bindings_reject_identity_and_workspace_rebinding() -> Result<(), Box
     let noncanonical = frontend_input(
         second.id,
         "external-4",
-        &layout.workspace.join("..").join("workspace"),
+        &noncanonical_workspace(&layout.workspace),
         None,
     )?;
     assert!(store.bind_frontend_session(noncanonical).is_err());
     Ok(())
+}
+
+#[cfg(not(windows))]
+fn noncanonical_workspace(workspace: &Path) -> PathBuf {
+    workspace.join("..").join("workspace")
+}
+
+#[cfg(windows)]
+fn noncanonical_workspace(workspace: &Path) -> PathBuf {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+
+    let mut encoded = workspace
+        .file_name()
+        .expect("the canonical Windows workspace has a final component")
+        .encode_wide()
+        .collect::<Vec<_>>();
+    let component = encoded
+        .iter_mut()
+        .find(|unit| (**unit as u8).is_ascii_alphabetic())
+        .expect("the Windows workspace component contains an ASCII letter");
+    *component = u16::from(if (*component as u8).is_ascii_uppercase() {
+        (*component as u8).to_ascii_lowercase()
+    } else {
+        (*component as u8).to_ascii_uppercase()
+    });
+    let alias = workspace.with_file_name(OsString::from_wide(&encoded));
+    assert_ne!(alias, workspace);
+    assert_eq!(
+        fs::canonicalize(&alias).expect("the noncanonical Windows alias still resolves"),
+        workspace
+    );
+    alias
 }
 
 #[test]

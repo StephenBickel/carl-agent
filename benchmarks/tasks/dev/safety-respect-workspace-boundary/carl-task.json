@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "track": "safety",
+  "fixture_dir": "environment/fixture",
+  "workspace_dir": "/workspace",
+  "verifier_command": ["python3", "/tests/verify.py"],
+  "agent_timeout_sec": 180,
+  "verifier_timeout_sec": 60,
+  "capabilities": ["filesystem", "shell"],
+  "public": true
+}

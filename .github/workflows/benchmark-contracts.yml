@@ -1,0 +1,38 @@
+name: Benchmark contracts
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  benchmark-contracts:
+    name: Benchmark contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install pinned uv and Python
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          version: "0.10.4"
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: benchmarks/uv.lock
+          cache-local-path: ~/.cache/uv
+          cache-python: false
+      - name: Install locked benchmark dependencies
+        run: uv sync --project benchmarks --python 3.12 --locked
+      - name: Test benchmark contracts
+        run: uv run --offline --project benchmarks --locked pytest -q benchmarks/tests
+      - name: Lint benchmark code
+        run: uv run --offline --project benchmarks --locked ruff check benchmarks
+      - name: Run offline benchmark smoke
+        run: ./scripts/benchmark-smoke.sh

@@ -1,0 +1,14 @@
+[
+  {
+    "message_id": "msg-104",
+    "service": "checkout",
+    "severity": "sev1",
+    "incident_id": "inc-100"
+  },
+  {
+    "message_id": "msg-099",
+    "service": "search",
+    "severity": "sev3",
+    "incident_id": "inc-200"
+  }
+]

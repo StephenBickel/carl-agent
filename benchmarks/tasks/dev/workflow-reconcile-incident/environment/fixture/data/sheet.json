@@ -1,0 +1,14 @@
+[
+  {
+    "service": "checkout",
+    "status": "healthy",
+    "incident_id": null,
+    "owner": null
+  },
+  {
+    "service": "search",
+    "status": "healthy",
+    "incident_id": null,
+    "owner": "bob"
+  }
+]
