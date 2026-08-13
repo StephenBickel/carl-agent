@@ -28,7 +28,9 @@
 - Carl may declare a stall only after three materially distinct recovery strategies fail.
 - A successful terminal task requires evidence for every required completion clause.
 - Preserve compatibility with event schema versions 1–3 and migrations 1–7.
-- Run `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test --all-features` after every Rust task.
+- After every Rust task, run its focused behavior/compatibility tests plus `cargo fmt --all -- --check` and `cargo clippy --all-targets --all-features -- -D warnings`.
+- Run `cargo test --all-features` at the integration gates after Tasks 6, 10, 12, 13, and 15, and once more before merge if the final gate is not already at the branch head.
+- Also run `cargo test --all-features` after any reviewed fix that changes shared kernel/provider routing, the event schema, or database migrations, or when a reviewer identifies a concrete cross-cutting regression risk.
 - Do not edit `SECURITY.md` until the exact diff has been previewed and approved under the repository security-policy process.
 
 ---
@@ -1748,11 +1750,12 @@ git commit -m "feat: keep tasks alive across frontend reconnects"
 - Modify: `src/lib.rs`
 - Create: `tests/long_horizon_eval.rs`
 - Create: `tests/fixtures/long_horizon/needle/README.md`
+- Create: `tests/fixtures/long_horizon/needle/Cargo.toml`
 - Create: `tests/fixtures/long_horizon/needle/src/lib.rs`
 - Create: `tests/fixtures/long_horizon/needle/tests/contract.rs`
 
 **Interfaces:**
-- Consumes: `TaskEngine` with scripted `AgentPort`, fake clock, and disposable workspace.
+- Consumes: `TaskEngine` with scripted `AgentPort`, paused Tokio time, and disposable workspace.
 - Produces: `EvaluationResult`, sanitized metrics, and deterministic release-gate failures.
 
 - [ ] **Step 1: Define the scenario and metric contracts**
@@ -1769,6 +1772,9 @@ pub struct EvaluationScenario {
 
 pub struct EvaluationMetrics {
     pub completed: bool,
+    pub work_epochs: u32,
+    pub provider_requests: u32,
+    pub tool_calls: u32,
     pub required_clauses_passed: u32,
     pub duplicate_effects: u32,
     pub lost_identifiers: u32,
@@ -1777,6 +1783,7 @@ pub struct EvaluationMetrics {
     pub compactions: u32,
     pub strategy_changes: u32,
     pub orphan_processes: u32,
+    pub secret_policy_violations: u32,
     pub replay_digest: String,
 }
 
@@ -1791,11 +1798,32 @@ pub struct EvaluationResult {
 Serialization denies unknown fields and never includes assistant text, raw tool output,
 credentials, or absolute user paths.
 
+The replay digest is computed from normalized durable semantics only: status,
+completion-clause states, semantic operation request digests and outcomes, required
+exact identifiers, and a sorted relative fixture manifest. It excludes UUIDs,
+timestamps, absolute paths, provider context/request IDs, assistant prose, diffs, and
+raw tool output. Metrics are derived from durable `TaskEvent` history and the final
+checkpoint, never from assistant claims.
+
 - [ ] **Step 2: Implement the 100-epoch scripted scenario**
 
-Force compaction every third epoch, provider loss every seventeenth epoch, steering at
-epochs 11 and 61, and storage reopen after every operation lifecycle state. The exact
-identifier `needle_7f3a91c2` originates in epoch 1 and is required by the final test.
+Run exactly 100 work epochs after planning. Force compaction every third work epoch by
+scripted `UsageUpdated` pressure (33 completed compactions), provider loss every
+seventeenth work epoch, and steering at work epochs 11 and 61. The exact identifier
+`needle_7f3a91c2` originates in work epoch 1 and must remain in the final committed
+checkpoint.
+
+`restart_after_events` means durable task-event sequence numbers, not provider-event
+counts. Reopen `RuntimeStore`, construct a fresh `TaskEngine`, call startup
+reconciliation, and continue from the durable checkpoint at each exact committed safe
+cut. The normalized 100-epoch success digest covers those committed process-death
+schedules. Exhaustive operation-lifecycle semantics remain owned by
+`tests/epoch_engine_contract.rs::every_required_engine_restart_cut_restarts_from_real_engine_state`;
+Task 13 must pin that real-engine matrix and all required cuts as a release dependency
+rather than duplicate it. Cuts with an unresolved `Started` operation are
+intentionally unsafe: assert deterministic fail-closed reconciliation and never force
+them to complete. Use paused Tokio time; timestamps are excluded from the digest, so
+no injected production clock is needed.
 
 - [ ] **Step 3: Add repository scenarios**
 
@@ -1803,6 +1831,8 @@ Cover regression-first bug fix, multi-file refactor, command failure recovery, s
 strategy replacement, provider loss, long-running command cancellation, hostile
 instructions, secret rejection, out-of-scope write, and ambiguous external effect.
 Every scenario uses a new copied fixture beneath an owner-private temporary directory.
+Keep this as one bounded table-driven release-gate matrix plus the single 100-epoch
+engine scenario, rather than a Cartesian suite of full engine runs.
 
 - [ ] **Step 4: Enforce deterministic release gates**
 
@@ -1818,6 +1848,24 @@ Add this exact command to the existing test job; do not create a secret-bearing 
 cargo test --locked --test long_horizon_eval
 ```
 
+Extend `tests/workflow_contract.rs` to require that exact locked command. The
+deterministic evaluation must use no credentials, network, subprocess, or wall-clock
+sleeps. The bounded ten-case repository matrix should complete in under ten seconds
+locally. The dedicated gate, including the two real 100-epoch runs and authoritative
+startup reconciliation, has a reference-host target below 45 seconds and must run
+exactly once in CI. The all-features step must skip the named 100-epoch test so it does
+not silently execute the heavy proof a second time.
+
+Before Task 14 begins, complete a separately reviewed incremental
+checkpoint-authority/startup performance follow-on. It must reduce repeated startup
+and checkpoint-validation work by consuming the latest authenticated canonical
+checkpoint plus its task-local durable tail. It must preserve the append-only journal
+as authority, validate checkpoint lineage and digests, fail closed on corruption or an
+unresolved `Started` operation, and retain the uninterrupted-versus-restarted replay
+digest proof. Performance work may not bypass canonical validation, reconciliation,
+or the exact durable-sequence restart semantics. This follow-on is a mandatory
+Task 13 release dependency, not optional Task 14 soak tuning, and requires an
+independent review before live OAuth work starts.
 - [ ] **Step 6: Verify and commit**
 
 Run the global Rust checks, then:

@@ -21,6 +21,10 @@ fn main() {
                 fixture_hashes,
             ),
             trial(
+                "file change fixture declares stable paths before and after approval",
+                file_change_fixture_paths_are_stable,
+            ),
+            trial(
                 "real Carl process conforms at the Buzz ACP boundary",
                 process_boundary_conforms,
             ),
@@ -33,6 +37,16 @@ fn trial(name: &'static str, test: fn() -> TestResult) -> Trial {
     Trial::test(name, move || {
         test().map_err(|error| Failed::from(error.to_string()))
     })
+}
+
+fn file_change_fixture_paths_are_stable() -> TestResult {
+    let started = support::file_change_fixture_item("file-item", "inProgress");
+    let completed = support::file_change_fixture_item("file-item", "completed");
+    let expected = json!([{"path":"target.txt","kind":"update"}]);
+
+    assert_eq!(started["changes"], expected);
+    assert_eq!(completed["changes"], started["changes"]);
+    Ok(())
 }
 
 fn fixture_hashes() -> TestResult {
@@ -75,6 +89,7 @@ fn fixture_hashes() -> TestResult {
 
 fn process_boundary_conforms() -> TestResult {
     let layout = Layout::new("contract")?;
+    layout.trust_owner()?;
     let mut client = Client::spawn(&layout, false)?;
     client.send_partial(&fixture("initialize", &layout.workspace, None)?)?;
     assert_eq!(client.read_id(0)?["result"]["protocolVersion"], 2);
@@ -120,18 +135,34 @@ fn process_boundary_conforms() -> TestResult {
     assert_eq!(client.read_id(24)?["error"]["code"], -32601);
 
     client.send_partial(&fixture("prompt", &layout.workspace, Some(&session))?)?;
-    assert_eq!(client.read_id(2)?["result"]["stopReason"], "end_turn");
+    let prompt_response = client.read_id(2)?;
+    assert_eq!(
+        prompt_response["result"]["stopReason"], "end_turn",
+        "{prompt_response}"
+    );
 
     client.send(&prompt_frame_for_channel(
         30,
         &second_session,
         "wait for cancel",
         'd',
-        "22222222-2222-4222-8222-222222222222",
+        support::CHANNEL_ID,
     ))?;
     layout.wait_for_provider_method("turn/start", 2)?;
     let mut steer = fixture("steer", &layout.workspace, Some(&second_session))?;
     steer["id"] = json!(31);
+    steer["params"]["prompt"]
+        .as_array_mut()
+        .ok_or("steering prompt blocks missing")?
+        .push(json!({
+            "type":"text",
+            "text":format!(
+                "Event ID: {}\nChannel: Carl Test (#{})\nKind: 1\nFrom: Owner (hex: {})\nTime: 2026-08-10T12:00:00Z\nContent: command",
+                "e".repeat(64),
+                support::CHANNEL_ID,
+                support::ACTOR_HEX
+            )
+        }));
     client.send_partial(&steer)?;
     let steered = client.read_id(31)?;
     assert_eq!(steered["result"]["outcome"], "injected", "{steered}");

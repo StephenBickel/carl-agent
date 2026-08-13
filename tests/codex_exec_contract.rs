@@ -2,18 +2,24 @@
 #[path = "support/sidecar.rs"]
 mod support;
 
+use std::collections::VecDeque;
 use std::env;
 use std::error::Error;
 use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, Write};
 use std::path::PathBuf;
 use std::process::{self, Command, Stdio};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
+use carl::cli::{AcpEffort, BaselineCodexArgs, ExitClassification, run_baseline_codex_with_input};
 use carl::delegates::codex::{
     CodexEventNormalizer, CodexExecAdapter, CodexExecRequest, CodexProtocolErrorCode,
     DelegateActivityKind, DelegateErrorCode, DelegateEvent, DelegateItemPhase, DelegateTerminal,
-    DelegateUsage,
+    DelegateUsage, DirectBaselineClock, DirectBaselineDeadline, DirectBaselineErrorCode,
+    DirectBaselineProvider, DirectCodexBaseline, DirectCodexBaselineRequest,
+    DirectCodexBaselineResult,
 };
 use carl::delegates::{
     BoundedDelegateTask, DelegateSettings, DelegateSettingsLayers, ModelId, ReasoningEffort,
@@ -27,14 +33,77 @@ use libtest_mimic::{Arguments, Failed, Trial};
 use semver::VersionReq;
 use serde_json::json;
 use support::{
-    SECRET_SENTINEL, TestLayout, short_limits, wait_for_fixture_pids, wait_until_processes_exit,
-    wait_until_processes_reaped,
+    SECRET_SENTINEL, TestLayout, processes_have_been_reaped, short_limits, wait_for_fixture_pids,
+    wait_until_processes_exit, wait_until_processes_reaped,
 };
+use tokio::sync::Semaphore;
+use tokio_util::sync::CancellationToken;
 
 type TestResult = Result<(), Box<dyn Error + Send + Sync>>;
 
 const EXEC_FIXTURE_ARGUMENT: &str = "--carl-private-codex-exec-fixture";
 const EXEC_FIXTURE_VERSION: &str = "1.2.3";
+static CLI_ENVIRONMENT: Mutex<()> = Mutex::new(());
+
+struct FixtureBaselineClock {
+    instants: Mutex<VecDeque<Instant>>,
+}
+
+impl FixtureBaselineClock {
+    fn new(instants: impl IntoIterator<Item = Instant>) -> Self {
+        Self {
+            instants: Mutex::new(instants.into_iter().collect()),
+        }
+    }
+}
+
+impl DirectBaselineClock for FixtureBaselineClock {
+    fn now(&self) -> Instant {
+        self.instants
+            .lock()
+            .expect("fixture clock lock is available")
+            .pop_front()
+            .expect("fixture clock has an instant")
+    }
+}
+
+struct FixtureBaselineDeadline {
+    permits: Arc<Semaphore>,
+    observed: Mutex<Vec<Duration>>,
+}
+
+impl FixtureBaselineDeadline {
+    fn new() -> Self {
+        Self {
+            permits: Arc::new(Semaphore::new(0)),
+            observed: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn fire(&self) {
+        self.permits.add_permits(1);
+    }
+}
+
+impl DirectBaselineDeadline for FixtureBaselineDeadline {
+    fn wait(
+        &self,
+        timeout: Duration,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        self.observed
+            .lock()
+            .expect("deadline observation lock is available")
+            .push(timeout);
+        let permits = Arc::clone(&self.permits);
+        Box::pin(async move {
+            permits
+                .acquire_owned()
+                .await
+                .expect("fixture deadline semaphore stays open")
+                .forget();
+        })
+    }
+}
 
 fn main() {
     let arguments: Vec<OsString> = env::args_os().skip(1).collect();
@@ -47,6 +116,9 @@ fn main() {
     unsafe {
         env::set_var("OPENAI_API_KEY", SECRET_SENTINEL);
         env::set_var("CODEX_API_KEY", SECRET_SENTINEL);
+        env::set_var("AZURE_OPENAI_API_KEY", SECRET_SENTINEL);
+        env::set_var("BUZZ_SECRET_SENTINEL", SECRET_SENTINEL);
+        env::set_var("XAI_SECRET_SENTINEL", SECRET_SENTINEL);
     }
 
     let trials = vec![
@@ -145,6 +217,54 @@ fn main() {
         test(
             "adapter cancellation is stable and redacted",
             adapter_cancellation_is_stable_and_redacted,
+        ),
+        test(
+            "direct baseline result is strict bounded and sanitized",
+            direct_baseline_result_is_strict_bounded_and_sanitized,
+        ),
+        test(
+            "direct baseline counts only completed bounded activity",
+            direct_baseline_counts_only_completed_bounded_activity,
+        ),
+        test(
+            "direct baseline validates timeout before provider spawn",
+            direct_baseline_validates_timeout_before_provider_spawn,
+        ),
+        test(
+            "direct baseline maps closed provider failures without partial success",
+            direct_baseline_maps_closed_provider_failures_without_partial_success,
+        ),
+        test(
+            "direct baseline rejects executable replacement after completion",
+            direct_baseline_rejects_executable_replacement_after_completion,
+        ),
+        test(
+            "direct baseline rejects same-inode mutation before task spawn",
+            direct_baseline_rejects_same_inode_mutation_before_task_spawn,
+        ),
+        test(
+            "direct baseline cancellation reaps descendants",
+            direct_baseline_cancellation_reaps_descendants,
+        ),
+        test(
+            "direct baseline timeout reaps descendants without partial success",
+            direct_baseline_timeout_reaps_descendants_without_partial_success,
+        ),
+        test(
+            "direct baseline timeout awaits bounded start cleanup and reaps version descendants",
+            direct_baseline_timeout_awaits_bounded_start_cleanup_and_reaps_version_descendants,
+        ),
+        test(
+            "direct baseline cancellation awaits start cleanup and reaps version descendants",
+            direct_baseline_cancellation_awaits_start_cleanup_and_reaps_version_descendants,
+        ),
+        test(
+            "direct baseline CLI emits one sanitized JSON line",
+            direct_baseline_cli_emits_one_sanitized_json_line,
+        ),
+        test(
+            "direct baseline CLI rejects invalid task bytes before provider input",
+            direct_baseline_cli_rejects_invalid_task_bytes_before_provider_input,
         ),
     ];
     libtest_mimic::run(&Arguments::from_iter(env::args_os().skip(1)), trials).exit();
@@ -834,6 +954,665 @@ fn adapter_cancellation_is_stable_and_redacted() -> TestResult {
     })
 }
 
+fn direct_baseline_result_is_strict_bounded_and_sanitized() -> TestResult {
+    let value = json!({
+        "schema_version": 1,
+        "provider": "codex",
+        "codex_version": "0.146.0",
+        "model": "gpt-5.6-terra",
+        "effort": "low",
+        "completed": true,
+        "elapsed_milliseconds": 25,
+        "input_tokens": 10,
+        "cached_input_tokens": 2,
+        "output_tokens": 3,
+        "command_executions": 1,
+        "file_changes": 1,
+        "mcp_tool_calls": 1,
+        "web_searches": 1,
+        "compatibility_events": 2
+    });
+    let result: DirectCodexBaselineResult = serde_json::from_value(value.clone())?;
+    assert_eq!(result.schema_version, 1);
+    assert_eq!(result.provider, DirectBaselineProvider::Codex);
+    assert_eq!(result.codex_version, "0.146.0");
+    let encoded = serde_json::to_vec(&result)?;
+    assert!(encoded.len() < 4 * 1_024);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&encoded)?,
+        value
+    );
+
+    for (field, invalid) in [
+        ("schema_version", json!(2)),
+        ("provider", json!("other")),
+        ("codex_version", json!("0.145.0")),
+    ] {
+        let mut invalid_value = value.clone();
+        invalid_value[field] = invalid;
+        assert!(serde_json::from_value::<DirectCodexBaselineResult>(invalid_value).is_err());
+    }
+    let mut unknown = value;
+    unknown["agent_text"] = json!("SECRET_AGENT_TEXT_SENTINEL");
+    assert!(serde_json::from_value::<DirectCodexBaselineResult>(unknown).is_err());
+    let mut invalid_result = result.clone();
+    invalid_result.schema_version = 2;
+    assert!(serde_json::to_vec(&invalid_result).is_err());
+    invalid_result.schema_version = 1;
+    invalid_result.codex_version = "0.145.0".to_owned();
+    assert!(serde_json::to_vec(&invalid_result).is_err());
+    assert!(!format!("{result:?}").contains("SECRET_AGENT_TEXT_SENTINEL"));
+    Ok(())
+}
+
+fn direct_baseline_counts_only_completed_bounded_activity() -> TestResult {
+    run_async(async {
+        let layout = TestLayout::new()?;
+        fs::write(
+            layout.workspace.join(".fixture-scenario"),
+            b"baseline-success",
+        )?;
+        let adapter = codex_adapter_fixture(&layout, ProviderEnvironmentProfile::Codex)?;
+        let start = Instant::now();
+        let baseline = DirectCodexBaseline::with_clock(
+            adapter,
+            Arc::new(FixtureBaselineClock::new([
+                start,
+                start + Duration::from_millis(1_234),
+            ])),
+        );
+        let workspace = ExecutionWorkspace::open(&layout.workspace)?;
+        let task = "SECRET_DIRECT_BASELINE_TASK_SENTINEL";
+        let request = DirectCodexBaselineRequest {
+            workspace,
+            task: BoundedDelegateTask::parse(task)?,
+            model: ModelId::parse("gpt-5.6-terra")?,
+            effort: ReasoningEffort::Low,
+            timeout: Duration::from_secs(60),
+        };
+        assert!(!format!("{request:?}").contains(task));
+
+        let result = baseline.run(request, CancellationToken::new()).await?;
+        assert_eq!(
+            result,
+            DirectCodexBaselineResult {
+                schema_version: 1,
+                provider: DirectBaselineProvider::Codex,
+                codex_version: "0.146.0".to_owned(),
+                model: ModelId::parse("gpt-5.6-terra")?,
+                effort: ReasoningEffort::Low,
+                completed: true,
+                elapsed_milliseconds: 1_234,
+                input_tokens: 120,
+                cached_input_tokens: 100,
+                output_tokens: 30,
+                command_executions: 1,
+                file_changes: 1,
+                mcp_tool_calls: 1,
+                web_searches: 1,
+                compatibility_events: 2,
+            }
+        );
+        assert_eq!(result.elapsed_milliseconds, 1_234);
+        let rendered = serde_json::to_string(&result)?;
+        for forbidden in [
+            task,
+            "SECRET_AGENT_TEXT_SENTINEL",
+            layout.workspace.to_string_lossy().as_ref(),
+            "cargo test --secret",
+        ] {
+            assert!(!rendered.contains(forbidden));
+            assert!(!format!("{result:?}").contains(forbidden));
+        }
+
+        let record: serde_json::Value =
+            serde_json::from_slice(&fs::read(layout.home.join("exec-record.json"))?)?;
+        assert_eq!(record["openai_api_key"], serde_json::Value::Null);
+        assert_eq!(record["codex_api_key"], serde_json::Value::Null);
+        assert_eq!(record["azure_openai_api_key"], serde_json::Value::Null);
+        assert_eq!(record["buzz_secret"], serde_json::Value::Null);
+        assert_eq!(record["xai_secret"], serde_json::Value::Null);
+        let arguments = record["arguments"].as_array().ok_or("missing arguments")?;
+        assert_eq!(
+            arguments,
+            &[
+                json!("--strict-config"),
+                json!("--model"),
+                json!("gpt-5.6-terra"),
+                json!("-c"),
+                json!("model_reasoning_effort=\"low\""),
+                json!("--ask-for-approval"),
+                json!("never"),
+                json!("exec"),
+                json!("--json"),
+                json!("--ephemeral"),
+                json!("--sandbox"),
+                json!("workspace-write"),
+                json!("--skip-git-repo-check"),
+                json!("-"),
+            ]
+        );
+        assert!(arguments.iter().all(|argument| argument != task));
+        assert!(
+            record["stdin"]
+                .as_str()
+                .is_some_and(|stdin| stdin.contains(task))
+        );
+        Ok(())
+    })
+}
+
+fn direct_baseline_validates_timeout_before_provider_spawn() -> TestResult {
+    run_async(async {
+        for timeout in [Duration::from_secs(59), Duration::from_secs(28_801)] {
+            let layout = TestLayout::new()?;
+            let adapter = codex_adapter_fixture(&layout, ProviderEnvironmentProfile::Codex)?;
+            let baseline = DirectCodexBaseline::new(adapter);
+            let error = baseline
+                .run(
+                    DirectCodexBaselineRequest {
+                        workspace: ExecutionWorkspace::open(&layout.workspace)?,
+                        task: BoundedDelegateTask::parse("bounded task")?,
+                        model: ModelId::parse("gpt-5.6-terra")?,
+                        effort: ReasoningEffort::Low,
+                        timeout,
+                    },
+                    CancellationToken::new(),
+                )
+                .await
+                .expect_err("out-of-range timeout must fail");
+            assert_eq!(error.code(), DirectBaselineErrorCode::InvalidRequest);
+            assert!(!layout.home.join("exec-record.json").exists());
+        }
+        let layout = TestLayout::new()?;
+        let adapter = codex_adapter_fixture(&layout, ProviderEnvironmentProfile::Codex)?;
+        let baseline = DirectCodexBaseline::new(adapter);
+        let error = baseline
+            .run(
+                DirectCodexBaselineRequest {
+                    workspace: ExecutionWorkspace::open(&layout.workspace)?,
+                    task: BoundedDelegateTask::parse("x".repeat(16 * 1_024 + 1))?,
+                    model: ModelId::parse("gpt-5.6-terra")?,
+                    effort: ReasoningEffort::Low,
+                    timeout: Duration::from_secs(60),
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("oversized direct task must fail before spawn");
+        assert_eq!(error.code(), DirectBaselineErrorCode::InvalidRequest);
+        assert!(!layout.home.join("exec-record.json").exists());
+        Ok(())
+    })
+}
+
+fn direct_baseline_maps_closed_provider_failures_without_partial_success() -> TestResult {
+    run_async(async {
+        for (scenario, expected) in [
+            ("missing-terminal", DirectBaselineErrorCode::ProtocolFailed),
+            (
+                "duplicate-terminal",
+                DirectBaselineErrorCode::ProtocolFailed,
+            ),
+            ("malformed", DirectBaselineErrorCode::ProtocolFailed),
+            ("oversized", DirectBaselineErrorCode::ProtocolFailed),
+            (
+                "auth-failure",
+                DirectBaselineErrorCode::AuthenticationRequired,
+            ),
+            ("nonzero", DirectBaselineErrorCode::ProviderFailed),
+        ] {
+            let layout = TestLayout::new()?;
+            fs::write(layout.workspace.join(".fixture-scenario"), scenario)?;
+            let adapter = codex_adapter_fixture(&layout, ProviderEnvironmentProfile::Codex)?;
+            let baseline = DirectCodexBaseline::new(adapter);
+            let error = baseline
+                .run(
+                    DirectCodexBaselineRequest {
+                        workspace: ExecutionWorkspace::open(&layout.workspace)?,
+                        task: BoundedDelegateTask::parse("exercise closed failure mapping")?,
+                        model: ModelId::parse("gpt-5.6-terra")?,
+                        effort: ReasoningEffort::Low,
+                        timeout: Duration::from_secs(60),
+                    },
+                    CancellationToken::new(),
+                )
+                .await
+                .expect_err("provider failure must not produce partial success");
+            assert_eq!(error.code(), expected, "scenario: {scenario}");
+            assert!(!format!("{error:?}").contains("exercise closed failure mapping"));
+        }
+        Ok(())
+    })
+}
+
+fn direct_baseline_rejects_executable_replacement_after_completion() -> TestResult {
+    run_async(async {
+        let layout = TestLayout::new()?;
+        fs::write(
+            layout.workspace.join(".fixture-scenario"),
+            b"replace-executable",
+        )?;
+        let copied_executable = layout.data.join("codex-fixture-copy");
+        fs::copy(env::current_exe()?, &copied_executable)?;
+        let specification = SidecarCommand {
+            executable: copied_executable,
+            arguments: Vec::new(),
+            version_arguments: Vec::new(),
+            version_output: VersionOutputFormat::SingleSemverToken,
+            isolated_home: layout.home.clone(),
+            supported_versions: VersionReq::parse("=0.146.0")?,
+        };
+        let trusted = specification
+            .resolve_executable()?
+            .trust(ExecutableTrustDecision::TrustCanonicalPath)?;
+        let home = ProviderHome::prepare(
+            ProviderEnvironmentProfile::Codex,
+            &layout.data,
+            &layout.workspace,
+            &layout.home,
+        )?;
+        home.write_static_file("auth.json", b"fixture subscription auth")?;
+        let baseline =
+            DirectCodexBaseline::new(CodexExecAdapter::new(trusted, home, short_limits())?);
+        let error = baseline
+            .run(
+                DirectCodexBaselineRequest {
+                    workspace: ExecutionWorkspace::open(&layout.workspace)?,
+                    task: BoundedDelegateTask::parse("replace after terminal")?,
+                    model: ModelId::parse("gpt-5.6-terra")?,
+                    effort: ReasoningEffort::Low,
+                    timeout: Duration::from_secs(60),
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("post-completion executable replacement must fail closed");
+        assert_eq!(error.code(), DirectBaselineErrorCode::Incompatible);
+        Ok(())
+    })
+}
+
+fn direct_baseline_rejects_same_inode_mutation_before_task_spawn() -> TestResult {
+    run_async(async {
+        let layout = TestLayout::new()?;
+        fs::write(layout.data.join("fixture-mutate-after-version"), b"mutate")?;
+        let copied_executable = layout.data.join("codex-fixture-mutation-copy");
+        fs::copy(env::current_exe()?, &copied_executable)?;
+        let specification = SidecarCommand {
+            executable: copied_executable,
+            arguments: Vec::new(),
+            version_arguments: Vec::new(),
+            version_output: VersionOutputFormat::SingleSemverToken,
+            isolated_home: layout.home.clone(),
+            supported_versions: VersionReq::parse("=0.146.0")?,
+        };
+        let trusted = specification
+            .resolve_executable()?
+            .trust(ExecutableTrustDecision::TrustCanonicalPath)?;
+        let home = ProviderHome::prepare(
+            ProviderEnvironmentProfile::Codex,
+            &layout.data,
+            &layout.workspace,
+            &layout.home,
+        )?;
+        home.write_static_file("auth.json", b"fixture subscription auth")?;
+        let baseline =
+            DirectCodexBaseline::new(CodexExecAdapter::new(trusted, home, short_limits())?);
+        let error = baseline
+            .run(
+                DirectCodexBaselineRequest {
+                    workspace: ExecutionWorkspace::open(&layout.workspace)?,
+                    task: BoundedDelegateTask::parse("must not reach mutated executable")?,
+                    model: ModelId::parse("gpt-5.6-terra")?,
+                    effort: ReasoningEffort::Low,
+                    timeout: Duration::from_secs(60),
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("same-inode mutation before exec spawn must fail closed");
+        assert_eq!(error.code(), DirectBaselineErrorCode::Incompatible);
+        assert!(!layout.home.join("exec-record.json").exists());
+        Ok(())
+    })
+}
+
+fn direct_baseline_cancellation_reaps_descendants() -> TestResult {
+    run_async(async {
+        let layout = TestLayout::new()?;
+        fs::write(layout.workspace.join(".fixture-scenario"), b"hanging-child")?;
+        let adapter = codex_adapter_fixture(&layout, ProviderEnvironmentProfile::Codex)?;
+        let baseline = DirectCodexBaseline::new(adapter);
+        let cancellation = CancellationToken::new();
+        let cancelled = cancellation.clone();
+        let run = baseline.run(
+            DirectCodexBaselineRequest {
+                workspace: ExecutionWorkspace::open(&layout.workspace)?,
+                task: BoundedDelegateTask::parse("cancel this direct baseline")?,
+                model: ModelId::parse("gpt-5.6-terra")?,
+                effort: ReasoningEffort::Low,
+                timeout: Duration::from_secs(60),
+            },
+            cancellation,
+        );
+        tokio::pin!(run);
+        let (leader, grandchild) = tokio::select! {
+            pids = wait_for_fixture_pids(&layout.home) => pids?,
+            result = &mut run => return Err(format!("baseline ended before cancellation: {result:?}").into()),
+        };
+        cancelled.cancel();
+        let error = run.await.expect_err("cancelled baseline must not succeed");
+        assert_eq!(error.code(), DirectBaselineErrorCode::Cancelled);
+        wait_until_processes_exit(&[leader, grandchild]).await?;
+        wait_until_processes_reaped(&[leader]).await?;
+        Ok(())
+    })
+}
+
+fn direct_baseline_timeout_reaps_descendants_without_partial_success() -> TestResult {
+    run_async(async {
+        let layout = TestLayout::new()?;
+        fs::write(layout.workspace.join(".fixture-scenario"), b"hanging-child")?;
+        let adapter = codex_adapter_fixture(&layout, ProviderEnvironmentProfile::Codex)?;
+        let start = Instant::now();
+        let deadline = Arc::new(FixtureBaselineDeadline::new());
+        let baseline = DirectCodexBaseline::with_clock_and_deadline(
+            adapter,
+            Arc::new(FixtureBaselineClock::new([start])),
+            deadline.clone(),
+        );
+        let run = baseline.run(
+            DirectCodexBaselineRequest {
+                workspace: ExecutionWorkspace::open(&layout.workspace)?,
+                task: BoundedDelegateTask::parse("time out this direct baseline")?,
+                model: ModelId::parse("gpt-5.6-terra")?,
+                effort: ReasoningEffort::Low,
+                timeout: Duration::from_secs(60),
+            },
+            CancellationToken::new(),
+        );
+        tokio::pin!(run);
+        let (leader, grandchild) = tokio::select! {
+            pids = wait_for_fixture_pids(&layout.home) => pids?,
+            result = &mut run => return Err(format!("baseline ended before timeout: {result:?}").into()),
+        };
+        deadline.fire();
+        let error = run
+            .await
+            .expect_err("timed-out baseline must not return partial success");
+        assert_eq!(error.code(), DirectBaselineErrorCode::TimedOut);
+        assert_eq!(
+            deadline
+                .observed
+                .lock()
+                .expect("deadline observation lock is available")
+                .as_slice(),
+            &[Duration::from_secs(60)]
+        );
+        wait_until_processes_exit(&[leader, grandchild]).await?;
+        wait_until_processes_reaped(&[leader]).await?;
+        Ok(())
+    })
+}
+
+fn direct_baseline_timeout_awaits_bounded_start_cleanup_and_reaps_version_descendants() -> TestResult
+{
+    run_async(async {
+        let layout = TestLayout::new()?;
+        fs::write(layout.data.join("fixture-version-hang"), b"hang")?;
+        let adapter = codex_adapter_fixture(&layout, ProviderEnvironmentProfile::Codex)?;
+        let start = Instant::now();
+        let deadline = Arc::new(FixtureBaselineDeadline::new());
+        let baseline = DirectCodexBaseline::with_clock_and_deadline(
+            adapter,
+            Arc::new(FixtureBaselineClock::new([start])),
+            deadline.clone(),
+        );
+        let run = baseline.run(
+            DirectCodexBaselineRequest {
+                workspace: ExecutionWorkspace::open(&layout.workspace)?,
+                task: BoundedDelegateTask::parse("time out during version probe")?,
+                model: ModelId::parse("gpt-5.6-terra")?,
+                effort: ReasoningEffort::Low,
+                timeout: Duration::from_secs(60),
+            },
+            CancellationToken::new(),
+        );
+        tokio::pin!(run);
+        let (leader, grandchild) = tokio::select! {
+            pids = wait_for_fixture_pids(&layout.home) => pids?,
+            result = &mut run => return Err(format!("baseline ended before start timeout: {result:?}").into()),
+        };
+        deadline.fire();
+        let error = run
+            .await
+            .expect_err("start-phase timeout must not return partial success");
+        assert_eq!(error.code(), DirectBaselineErrorCode::TimedOut);
+        let leader_was_reaped_when_run_resolved = processes_have_been_reaped(&[leader]);
+        assert_eq!(
+            deadline
+                .observed
+                .lock()
+                .expect("deadline observation lock is available")
+                .as_slice(),
+            &[Duration::from_secs(60)]
+        );
+        wait_until_processes_exit(&[leader, grandchild]).await?;
+        wait_until_processes_reaped(&[leader]).await?;
+        assert!(
+            leader_was_reaped_when_run_resolved,
+            "the start-phase leader must already be reaped when the baseline resolves"
+        );
+        assert!(!layout.home.join("exec-record.json").exists());
+        Ok(())
+    })
+}
+
+fn direct_baseline_cancellation_awaits_start_cleanup_and_reaps_version_descendants() -> TestResult {
+    run_async(async {
+        let layout = TestLayout::new()?;
+        fs::write(layout.data.join("fixture-version-hang"), b"hang")?;
+        let adapter = codex_adapter_fixture(&layout, ProviderEnvironmentProfile::Codex)?;
+        let baseline = DirectCodexBaseline::new(adapter);
+        let cancellation = CancellationToken::new();
+        let cancelled = cancellation.clone();
+        let run = baseline.run(
+            DirectCodexBaselineRequest {
+                workspace: ExecutionWorkspace::open(&layout.workspace)?,
+                task: BoundedDelegateTask::parse("cancel during version probe")?,
+                model: ModelId::parse("gpt-5.6-terra")?,
+                effort: ReasoningEffort::Low,
+                timeout: Duration::from_secs(60),
+            },
+            cancellation,
+        );
+        tokio::pin!(run);
+        let (leader, grandchild) = tokio::select! {
+            pids = wait_for_fixture_pids(&layout.home) => pids?,
+            result = &mut run => return Err(format!("baseline ended before start cancellation: {result:?}").into()),
+        };
+        cancelled.cancel();
+        let error = run
+            .await
+            .expect_err("start-phase cancellation must not return partial success");
+        assert_eq!(error.code(), DirectBaselineErrorCode::Cancelled);
+        let leader_was_reaped_when_run_resolved = processes_have_been_reaped(&[leader]);
+        wait_until_processes_exit(&[leader, grandchild]).await?;
+        wait_until_processes_reaped(&[leader]).await?;
+        assert!(
+            leader_was_reaped_when_run_resolved,
+            "the cancelled start-phase leader must already be reaped when the baseline resolves"
+        );
+        assert!(!layout.home.join("exec-record.json").exists());
+        Ok(())
+    })
+}
+
+fn direct_baseline_cli_emits_one_sanitized_json_line() -> TestResult {
+    let _environment = CLI_ENVIRONMENT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    run_async(async {
+        let layout = TestLayout::new()?;
+        prepare_cli_baseline_fixture(&layout, true)?;
+        fs::write(
+            layout.workspace.join(".fixture-scenario"),
+            b"baseline-success",
+        )?;
+        let task = " \nSECRET_CLI_TASK_SENTINEL\n ";
+        let result = run_baseline_codex_with_input(
+            BaselineCodexArgs {
+                workspace: layout.workspace.clone(),
+                model: "gpt-5.6-terra".to_owned(),
+                effort: AcpEffort::Low,
+                timeout_seconds: 60,
+            },
+            task.as_bytes(),
+            CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(
+            result.exit_classification(),
+            ExitClassification::Success,
+            "{}",
+            result.stderr()
+        );
+        assert!(result.stderr().is_empty());
+        assert_eq!(result.stdout().lines().count(), 1);
+        assert!(result.stdout().ends_with('\n'));
+        let output: DirectCodexBaselineResult = serde_json::from_str(result.stdout())?;
+        assert!(output.completed);
+        for forbidden in [
+            task,
+            SECRET_SENTINEL,
+            "SECRET_AGENT_TEXT_SENTINEL",
+            layout.workspace.to_string_lossy().as_ref(),
+        ] {
+            assert!(!result.stdout().contains(forbidden));
+            assert!(!result.stderr().contains(forbidden));
+        }
+        let record: serde_json::Value =
+            serde_json::from_slice(&fs::read(cli_codex_home(&layout).join("exec-record.json"))?)?;
+        assert!(
+            record["stdin"]
+                .as_str()
+                .is_some_and(|stdin| stdin.contains(task))
+        );
+        assert!(record["arguments"].as_array().is_some_and(|arguments| {
+            arguments
+                .iter()
+                .all(|argument| argument.as_str() != Some(task))
+        }));
+        Ok(())
+    })
+}
+
+fn direct_baseline_cli_rejects_invalid_task_bytes_before_provider_input() -> TestResult {
+    let _environment = CLI_ENVIRONMENT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    run_async(async {
+        for input in [Vec::new(), vec![0xff], vec![b'x'; 16 * 1_024 + 1]] {
+            let layout = TestLayout::new()?;
+            prepare_cli_baseline_fixture(&layout, true)?;
+            let result = run_baseline_codex_with_input(
+                BaselineCodexArgs {
+                    workspace: layout.workspace.clone(),
+                    model: "gpt-5.6-terra".to_owned(),
+                    effort: AcpEffort::Low,
+                    timeout_seconds: 60,
+                },
+                &input,
+                CancellationToken::new(),
+            )
+            .await;
+            assert_eq!(result.exit_classification(), ExitClassification::Failure);
+            assert!(result.stdout().is_empty());
+            assert!(!cli_codex_home(&layout).join("exec-record.json").exists());
+            assert!(!result.stderr().contains(SECRET_SENTINEL));
+            assert!(
+                !result
+                    .stderr()
+                    .contains(layout.workspace.to_string_lossy().as_ref())
+            );
+        }
+
+        let layout = TestLayout::new()?;
+        prepare_cli_baseline_fixture(&layout, true)?;
+        let noncanonical_workspace = layout.workspace.join("..").join("workspace");
+        let result = run_baseline_codex_with_input(
+            BaselineCodexArgs {
+                workspace: noncanonical_workspace,
+                model: "gpt-5.6-terra".to_owned(),
+                effort: AcpEffort::Low,
+                timeout_seconds: 60,
+            },
+            b"valid task bytes",
+            CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(result.exit_classification(), ExitClassification::Failure);
+        assert!(result.stdout().is_empty());
+        assert!(!cli_codex_home(&layout).join("exec-record.json").exists());
+
+        let layout = TestLayout::new()?;
+        prepare_cli_baseline_fixture(&layout, false)?;
+        let task = b"SECRET_MISSING_AUTH_TASK_SENTINEL";
+        let result = run_baseline_codex_with_input(
+            BaselineCodexArgs {
+                workspace: layout.workspace.clone(),
+                model: "gpt-5.6-terra".to_owned(),
+                effort: AcpEffort::Low,
+                timeout_seconds: 60,
+            },
+            task,
+            CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(result.exit_classification(), ExitClassification::Failure);
+        assert!(result.stdout().is_empty());
+        assert!(
+            !result
+                .stderr()
+                .contains("SECRET_MISSING_AUTH_TASK_SENTINEL")
+        );
+        assert!(!cli_codex_home(&layout).join("exec-record.json").exists());
+        Ok(())
+    })
+}
+
+fn prepare_cli_baseline_fixture(layout: &TestLayout, authenticated: bool) -> TestResult {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        fs::set_permissions(&layout.data, fs::Permissions::from_mode(0o700))?;
+    }
+    if authenticated {
+        let home = ProviderHome::prepare(
+            ProviderEnvironmentProfile::Codex,
+            &layout.data,
+            &layout.workspace,
+            cli_codex_home(layout),
+        )?;
+        home.write_static_file("auth.json", b"fixture subscription auth")?;
+    }
+    // SAFETY: codex_exec_contract is a single-process, serial libtest-mimic harness.
+    unsafe {
+        env::set_var("CARL_DATA_DIR", &layout.data);
+        env::set_var("CARL_CODEX_EXECUTABLE", env::current_exe()?);
+        env::remove_var("OPENAI_API_KEY");
+        env::remove_var("CODEX_API_KEY");
+        env::remove_var("AZURE_OPENAI_API_KEY");
+    }
+    Ok(())
+}
+
+fn cli_codex_home(layout: &TestLayout) -> PathBuf {
+    layout.data.join("providers").join("codex")
+}
+
 fn codex_adapter_fixture(
     layout: &TestLayout,
     profile: ProviderEnvironmentProfile,
@@ -850,6 +1629,9 @@ fn codex_adapter_fixture(
         .resolve_executable()?
         .trust(ExecutableTrustDecision::TrustCanonicalPath)?;
     let home = ProviderHome::prepare(profile, &layout.data, &layout.workspace, &layout.home)?;
+    if profile == ProviderEnvironmentProfile::Codex {
+        home.write_static_file("auth.json", b"fixture subscription auth")?;
+    }
     Ok(CodexExecAdapter::new(trusted, home, short_limits())?)
 }
 
@@ -908,6 +1690,38 @@ fn drain_fixture_stdin() -> io::Result<()> {
 
 fn dispatch_exec_fixture(arguments: &[OsString]) -> Option<i32> {
     if arguments == [OsString::from("--version")] {
+        if let Some(home) = env::var_os("CODEX_HOME").map(PathBuf::from)
+            && home
+                .parent()
+                .and_then(std::path::Path::parent)
+                .is_some_and(|data| data.join("fixture-version-hang").is_file())
+        {
+            let child = match Command::new(env::current_exe().expect("fixture executable exists"))
+                .args([EXEC_FIXTURE_ARGUMENT, "child-loop"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+            {
+                Ok(child) => child,
+                Err(_) => return Some(71),
+            };
+            if fs::write(
+                home.join("fixture-pids.json"),
+                serde_json::to_vec(&json!({
+                    "leader": process::id(),
+                    "grandchild": child.id(),
+                }))
+                .expect("fixture PID JSON serializes"),
+            )
+            .is_err()
+            {
+                return Some(73);
+            }
+            loop {
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        }
         let version = env::var_os("CODEX_HOME")
             .map(PathBuf::from)
             .and_then(|home| {
@@ -922,6 +1736,36 @@ fn dispatch_exec_fixture(arguments: &[OsString]) -> Option<i32> {
             })
             .unwrap_or_else(|| "0.146.0".to_owned());
         println!("codex-cli {}", version.trim());
+        if let Some(home) = env::var_os("CODEX_HOME").map(PathBuf::from)
+            && home
+                .parent()
+                .and_then(std::path::Path::parent)
+                .is_some_and(|data| data.join("fixture-mutate-after-version").is_file())
+        {
+            let executable = match env::current_exe() {
+                Ok(executable) => executable,
+                Err(_) => return Some(74),
+            };
+            let mut file = match fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(executable)
+            {
+                Ok(file) => file,
+                Err(_) => return Some(73),
+            };
+            if file.seek(io::SeekFrom::End(-1)).is_err() {
+                return Some(74);
+            }
+            let mut byte = [0_u8; 1];
+            if file.read_exact(&mut byte).is_err()
+                || file.seek(io::SeekFrom::End(-1)).is_err()
+                || file.write_all(&[byte[0] ^ 1]).is_err()
+                || file.sync_all().is_err()
+            {
+                return Some(74);
+            }
+        }
         return Some(0);
     }
     if arguments
@@ -1038,6 +1882,9 @@ fn adapter_exec_fixture(arguments: &[OsString]) -> i32 {
         "stdin": input,
         "openai_api_key": env::var("OPENAI_API_KEY").ok(),
         "codex_api_key": env::var("CODEX_API_KEY").ok(),
+        "azure_openai_api_key": env::var("AZURE_OPENAI_API_KEY").ok(),
+        "buzz_secret": env::var("BUZZ_SECRET_SENTINEL").ok(),
+        "xai_secret": env::var("XAI_SECRET_SENTINEL").ok(),
     });
     if fs::write(
         home.join("exec-record.json"),
@@ -1097,6 +1944,115 @@ fn adapter_exec_fixture(arguments: &[OsString]) -> i32 {
             println!("{}", json!({"type": "turn.started"}));
             0
         }
+        "duplicate-terminal" => {
+            println!(
+                "{}",
+                json!({
+                    "type": "thread.started",
+                    "thread_id": "0199a213-81c0-7800-8aa1-bbab2a035a53"
+                })
+            );
+            println!("{}", json!({"type": "turn.started"}));
+            println!("{}", completed_event());
+            println!("{}", completed_event());
+            0
+        }
+        "baseline-success" => {
+            println!(
+                "{}",
+                json!({
+                    "type": "thread.started",
+                    "thread_id": "0199a213-81c0-7800-8aa1-bbab2a035a53"
+                })
+            );
+            println!("{}", json!({"type": "turn.started"}));
+            for (phase, id, kind) in [
+                ("started", "command_1", "command_execution"),
+                ("updated", "command_1", "command_execution"),
+                ("completed", "command_1", "command_execution"),
+                ("completed", "file_1", "file_change"),
+                ("completed", "mcp_1", "mcp_tool_call"),
+                ("completed", "web_1", "web_search"),
+                ("completed", "reasoning_1", "reasoning"),
+            ] {
+                println!(
+                    "{}",
+                    json!({
+                        "type": format!("item.{phase}"),
+                        "item": {
+                            "id": id,
+                            "type": kind,
+                            "text": "SECRET_REASONING_SENTINEL",
+                            "command": "cargo test --secret",
+                            "output": "SECRET_COMMAND_OUTPUT_SENTINEL"
+                        }
+                    })
+                );
+            }
+            println!(
+                "{}",
+                json!({
+                    "type": "item.completed",
+                    "item": {
+                        "id": "message_1",
+                        "type": "agent_message",
+                        "text": "SECRET_AGENT_TEXT_SENTINEL"
+                    }
+                })
+            );
+            println!("{}", json!({"type": "future.event", "secret": "SECRET"}));
+            println!(
+                "{}",
+                json!({
+                    "type": "item.completed",
+                    "item": {"id": "future_1", "type": "future_item", "secret": "SECRET"}
+                })
+            );
+            println!(
+                "{}",
+                json!({
+                    "type": "turn.completed",
+                    "usage": {
+                        "input_tokens": 120,
+                        "cached_input_tokens": 100,
+                        "output_tokens": 30
+                    }
+                })
+            );
+            0
+        }
+        "replace-executable" => {
+            println!(
+                "{}",
+                json!({
+                    "type": "thread.started",
+                    "thread_id": "0199a213-81c0-7800-8aa1-bbab2a035a53"
+                })
+            );
+            println!("{}", json!({"type": "turn.started"}));
+            println!(
+                "{}",
+                json!({
+                    "type": "turn.completed",
+                    "usage": {
+                        "input_tokens": 1,
+                        "cached_input_tokens": 0,
+                        "output_tokens": 1
+                    }
+                })
+            );
+            let executable = match env::current_exe() {
+                Ok(executable) => executable,
+                Err(_) => return 74,
+            };
+            let replacement = executable.with_extension("replacement");
+            if fs::copy(&executable, &replacement).is_err()
+                || fs::rename(&replacement, &executable).is_err()
+            {
+                return 73;
+            }
+            0
+        }
         "auth-failure" => {
             println!(
                 "{}",
@@ -1122,6 +2078,33 @@ fn adapter_exec_fixture(arguments: &[OsString]) -> i32 {
         "hanging" => loop {
             std::thread::sleep(std::time::Duration::from_secs(1));
         },
+        "hanging-child" => {
+            let child = match Command::new(env::current_exe().expect("fixture executable exists"))
+                .args([EXEC_FIXTURE_ARGUMENT, "child-loop"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+            {
+                Ok(child) => child,
+                Err(_) => return 71,
+            };
+            if fs::write(
+                home.join("fixture-pids.json"),
+                serde_json::to_vec(&json!({
+                    "leader": process::id(),
+                    "grandchild": child.id(),
+                }))
+                .expect("fixture PID JSON serializes"),
+            )
+            .is_err()
+            {
+                return 73;
+            }
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+        }
         _ => 64,
     }
 }

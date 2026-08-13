@@ -9,7 +9,7 @@ use carl::policy::{ActorId, Frontend, Sha256Digest};
 use carl::storage::{
     BoundApprovalBinding, ChannelId, ClientName, DeliveryKind, DeliveryStatus, ExternalSessionId,
     NewDelivery, NewFrontendSession, NewRemoteCode, ProviderRequestId, RemoteCodeClaim,
-    RemoteCodeKind, Store,
+    RemoteCodeKind, Store, TrustedFrontendOwnerInput,
 };
 use chrono::{Duration, TimeZone, Utc};
 use rusqlite::Connection;
@@ -49,9 +49,21 @@ fn migration_six_binds_and_recovers_frontend_sessions() -> Result<(), Box<dyn Er
     assert_eq!(
         connection.query_row("SELECT COUNT(*) FROM migrations", [], |row| row
             .get::<_, u64>(0))?,
-        7
+        12
     );
-    for table in ["frontend_sessions", "remote_codes", "frontend_deliveries"] {
+    for table in [
+        "frontend_sessions",
+        "remote_codes",
+        "frontend_deliveries",
+        "trusted_frontend_owners",
+        "trusted_frontend_events",
+        "task_control_receipts",
+        "task_configuration_state",
+        "task_control_markers",
+        "service_task_receipts",
+        "service_command_receipts",
+        "service_configuration_controls",
+    ] {
         assert_eq!(
             connection.query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
@@ -66,15 +78,227 @@ fn migration_six_binds_and_recovers_frontend_sessions() -> Result<(), Box<dyn Er
 }
 
 #[test]
-fn migration_six_database_upgrades_to_seven_and_reopens() -> Result<(), Box<dyn Error>> {
+fn migration_nine_preserves_legacy_wire_values_and_adds_canonical_profiles()
+-> Result<(), Box<dyn Error>> {
+    let layout = TestLayout::new()?;
+    prepare_version_eight_database(&layout.database, &layout.workspace)?;
+
+    let store = Store::open(&layout.database)?;
+    let legacy = store
+        .get_frontend_session("legacy-bypass")?
+        .ok_or("legacy binding missing")?;
+    assert_eq!(legacy.permission_mode, PermissionMode::FullAccess);
+    let approval = store
+        .get_frontend_session("legacy-default")?
+        .ok_or("approval binding missing")?;
+    assert_eq!(approval.permission_mode, PermissionMode::Default);
+
+    let connection = Connection::open(&layout.database)?;
+    assert_eq!(
+        connection.query_row(
+            "SELECT permission_mode FROM frontend_sessions WHERE external_session_id = 'legacy-bypass'",
+            [],
+            |row| row.get::<_, String>(0),
+        )?,
+        "bypassPermissions"
+    );
+    assert_eq!(
+        connection.query_row(
+            "SELECT permission_profile FROM frontend_sessions WHERE external_session_id = 'legacy-bypass'",
+            [],
+            |row| row.get::<_, String>(0),
+        )?,
+        "full_access"
+    );
+    assert_eq!(
+        connection.query_row(
+            "SELECT permission_profile FROM frontend_sessions WHERE external_session_id = 'legacy-default'",
+            [],
+            |row| row.get::<_, String>(0),
+        )?,
+        "approval"
+    );
+    Ok(())
+}
+
+#[test]
+fn migration_ten_backfills_existing_epoch_interruptions_truthfully() -> Result<(), Box<dyn Error>> {
+    let layout = TestLayout::new()?;
+    prepare_version_eight_database(&layout.database, &layout.workspace)?;
+    let connection = Connection::open(&layout.database)?;
+    connection.execute_batch(include_str!(
+        "../migrations/0009_trusted_frontend_owners.sql"
+    ))?;
+    let session_id =
+        connection.query_row("SELECT id FROM sessions ORDER BY id LIMIT 1", [], |row| {
+            row.get::<_, String>(0)
+        })?;
+    let task_id = "11111111-1111-4111-8111-111111111111";
+    let epoch_id = "22222222-2222-4222-8222-222222222222";
+    connection.execute(
+        "INSERT INTO agent_tasks (
+            id, session_id, status, contract_json, budget_json, snapshot_json,
+            canonical_workspace, model, effort, permission_mode, revision,
+            created_at, updated_at
+         ) VALUES (?1, ?2, 'active', '{}', '{}', '{}', ?3,
+                   'gpt-5.6-codex', 'ultra', 'default', 3, ?4, ?4)",
+        rusqlite::params![
+            task_id,
+            session_id,
+            layout.workspace.to_str(),
+            fixed_time().to_rfc3339(),
+        ],
+    )?;
+    connection.execute(
+        "INSERT INTO task_epochs (
+            id, task_id, objective, status, started_sequence,
+            created_at, updated_at
+         ) VALUES (?1, ?2, 'tighten permissions', 'active', 2, ?3, ?3)",
+        rusqlite::params![epoch_id, task_id, fixed_time().to_rfc3339()],
+    )?;
+    connection.execute(
+        "INSERT INTO task_epoch_interruptions (
+            task_id, epoch_id, reason, event_sequence, interrupted_at
+         ) VALUES (?1, ?2, 'permission_tightening', 3, ?3)",
+        rusqlite::params![task_id, epoch_id, fixed_time().to_rfc3339()],
+    )?;
+    drop(connection);
+
+    let connection = Connection::open(&layout.database)?;
+    connection.execute_batch(include_str!("../migrations/0010_durable_task_controls.sql"))?;
+    assert_eq!(
+        connection.query_row(
+            "SELECT status, finished_sequence, report_digest
+             FROM task_epochs WHERE id = ?1",
+            [epoch_id],
+            |row| Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Option<String>>(2)?
+            )),
+        )?,
+        ("interrupted".to_owned(), 3, None),
+    );
+    Ok(())
+}
+
+#[test]
+fn canonical_full_access_storage_and_trusted_owner_channel_fill_are_exact()
+-> Result<(), Box<dyn Error>> {
+    let layout = TestLayout::new()?;
+    let store = Store::open(&layout.database)?;
+    let session = store.create_session()?;
+    let mut input = frontend_input(session.id, "canonical-full", &layout.workspace, None)?;
+    input.permission_mode = PermissionMode::FullAccess;
+    assert_eq!(
+        store.bind_frontend_session(input)?.permission_mode,
+        PermissionMode::FullAccess
+    );
+    let connection = Connection::open(&layout.database)?;
+    assert_eq!(
+        connection.query_row(
+            "SELECT permission_mode || ':' || permission_profile FROM frontend_sessions WHERE external_session_id = 'canonical-full'",
+            [],
+            |row| row.get::<_, String>(0),
+        )?,
+        "bypassPermissions:full_access"
+    );
+    drop(connection);
+
+    let actor = ActorId::parse("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")?;
+    let trusted = store.trust_frontend_owner(TrustedFrontendOwnerInput {
+        frontend: Frontend::Buzz,
+        actor_id: actor.clone(),
+        workspace: layout.workspace.clone(),
+        permission_mode: PermissionMode::FullAccess,
+        trusted_at: fixed_time(),
+    })?;
+    assert_eq!(trusted.channel_id, None);
+    assert_eq!(trusted.permission_mode, PermissionMode::FullAccess);
+
+    let channel = ChannelId::try_from("123e4567-e89b-12d3-a456-426614174000")?;
+    let admitted = store.admit_trusted_frontend_owner(
+        Frontend::Buzz,
+        &actor,
+        &channel,
+        &layout.workspace,
+        fixed_time() + Duration::seconds(1),
+    )?;
+    assert_eq!(admitted.channel_id.as_ref(), Some(&channel));
+    store.admit_trusted_frontend_message(
+        Frontend::Buzz,
+        &actor,
+        &channel,
+        &layout.workspace,
+        "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        fixed_time() + Duration::seconds(1),
+    )?;
+    assert!(
+        store
+            .admit_trusted_frontend_message(
+                Frontend::Buzz,
+                &actor,
+                &channel,
+                &layout.workspace,
+                "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                fixed_time() + Duration::seconds(2),
+            )
+            .is_err(),
+        "signed event replay must be rejected"
+    );
+    assert!(
+        store
+            .admit_trusted_frontend_owner(
+                Frontend::Buzz,
+                &actor,
+                &ChannelId::try_from("123e4567-e89b-12d3-a456-426614174001")?,
+                &layout.workspace,
+                fixed_time() + Duration::seconds(2),
+            )
+            .is_err()
+    );
+    assert!(
+        store
+            .admit_trusted_frontend_owner(
+                Frontend::Buzz,
+                &ActorId::parse(
+                    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                )?,
+                &channel,
+                &layout.workspace,
+                fixed_time() + Duration::seconds(2),
+            )
+            .is_err()
+    );
+    Ok(())
+}
+
+#[test]
+fn migration_six_database_upgrades_through_current_and_reopens() -> Result<(), Box<dyn Error>> {
     let layout = TestLayout::new()?;
     drop(Store::open(&layout.database)?);
     let connection = Connection::open(&layout.database)?;
     connection.execute_batch(
-        "DROP TABLE frontend_deliveries;
+        "DROP TABLE task_control_markers;
+         DROP TABLE task_configuration_state;
+         DROP TABLE task_control_receipts;
+         DROP TABLE service_configuration_controls;
+         DROP TABLE service_command_receipts;
+         DROP TABLE service_task_receipts;
+         DROP TABLE trusted_frontend_events;
+         DROP TABLE trusted_frontend_owners;
+         DROP TABLE task_epoch_interruptions;
+         ALTER TABLE frontend_sessions DROP COLUMN permission_profile;
+         DROP TABLE task_steering;
+         DROP TABLE task_context_packages;
+         DROP TABLE task_checkpoints;
+         DROP TABLE task_operations;
+         DROP TABLE task_epochs;
+         DROP TABLE agent_tasks;
+         DROP TABLE frontend_deliveries;
          DROP TABLE remote_codes;
          DROP TABLE frontend_sessions;
-         DELETE FROM migrations WHERE version = 7;",
+         DELETE FROM migrations WHERE version >= 7;",
     )?;
     drop(connection);
 
@@ -410,6 +634,97 @@ fn digest(character: char) -> Result<Sha256Digest, Box<dyn Error>> {
 
 fn fixed_time() -> chrono::DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 8, 10, 12, 0, 0).unwrap()
+}
+
+fn prepare_version_eight_database(database: &Path, workspace: &Path) -> Result<(), Box<dyn Error>> {
+    use sha2::{Digest, Sha256};
+
+    let mut connection = Connection::open(database)?;
+    connection.execute_batch(
+        "PRAGMA foreign_keys = ON;
+         CREATE TABLE migrations (
+             version INTEGER PRIMARY KEY,
+             name TEXT NOT NULL,
+             applied_at TEXT NOT NULL,
+             checksum TEXT NOT NULL
+         );",
+    )?;
+    let migrations = [
+        (
+            1_i64,
+            "initial schema",
+            include_str!("../migrations/0001_init.sql"),
+        ),
+        (
+            2,
+            "bound approvals",
+            include_str!("../migrations/0002_bound_approvals.sql"),
+        ),
+        (
+            3,
+            "subscription runs",
+            include_str!("../migrations/0003_subscription_runs.sql"),
+        ),
+        (
+            4,
+            "proposal artifacts",
+            include_str!("../migrations/0004_proposal_artifacts.sql"),
+        ),
+        (
+            5,
+            "verifications",
+            include_str!("../migrations/0005_verifications.sql"),
+        ),
+        (
+            6,
+            "memory system",
+            include_str!("../migrations/0006_memory_system.sql"),
+        ),
+        (
+            7,
+            "ACP frontends",
+            include_str!("../migrations/0007_acp_frontends.sql"),
+        ),
+        (
+            8,
+            "long-horizon tasks",
+            include_str!("../migrations/0008_long_horizon_tasks.sql"),
+        ),
+    ];
+    let transaction = connection.transaction()?;
+    for (version, name, sql) in migrations {
+        transaction.execute_batch(sql)?;
+        let normalized = sql.replace("\r\n", "\n");
+        let checksum = format!("{:x}", Sha256::digest(normalized.as_bytes()));
+        transaction.execute(
+            "INSERT INTO migrations(version, name, applied_at, checksum) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![version, name, fixed_time().to_rfc3339(), checksum],
+        )?;
+    }
+    for (session_id, external, mode) in [
+        (SessionId::new(), "legacy-bypass", "bypassPermissions"),
+        (SessionId::new(), "legacy-default", "default"),
+    ] {
+        transaction.execute(
+            "INSERT INTO sessions(id, created_at, updated_at) VALUES (?1, ?2, ?2)",
+            rusqlite::params![session_id.to_string(), fixed_time().to_rfc3339()],
+        )?;
+        transaction.execute(
+            "INSERT INTO frontend_sessions(
+                external_session_id, frontend, session_id, client_name, protocol_version,
+                cwd, channel_id, provider_thread_id, permission_mode, created_at, updated_at
+             ) VALUES (?1, 'buzz', ?2, 'fixture', 2, ?3, NULL, NULL, ?4, ?5, ?5)",
+            rusqlite::params![
+                external,
+                session_id.to_string(),
+                workspace.to_str(),
+                mode,
+                fixed_time().to_rfc3339(),
+            ],
+        )?;
+    }
+    transaction.commit()?;
+    Ok(())
 }
 
 struct TestLayout {

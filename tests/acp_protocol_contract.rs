@@ -2,8 +2,8 @@ use std::str::FromStr;
 
 use carl::acp::{
     AcpErrorCode, ConfigChange, ConfigErrorCode, IncomingFrame, JsonRpcId, ModeActivation,
-    ModelCatalog, ModelDescriptor, OutgoingFrame, PermissionMode, SessionConfiguration,
-    config_options, read_frame, write_frame,
+    ModelCatalog, ModelDescriptor, OutgoingFrame, PermissionMode, PermissionProfile, Prompt,
+    SessionConfiguration, config_options, read_frame, write_frame,
 };
 use carl::delegates::{ModelId, ReasoningEffort};
 use serde_json::json;
@@ -154,11 +154,25 @@ fn permission_modes_have_exact_buzz_wire_values() {
         ("default", PermissionMode::Default),
         ("acceptEdits", PermissionMode::AcceptEdits),
         ("dontAsk", PermissionMode::DontAsk),
+        ("fullAccess", PermissionMode::FullAccess),
         ("bypassPermissions", PermissionMode::BypassPermissions),
     ] {
         assert_eq!(PermissionMode::from_str(wire).unwrap(), mode);
         assert_eq!(mode.as_wire_str(), wire);
+        assert_eq!(
+            serde_json::from_str::<PermissionMode>(&format!("\"{wire}\"")).unwrap(),
+            mode
+        );
+        assert_eq!(serde_json::to_string(&mode).unwrap(), format!("\"{wire}\""));
     }
+    assert_eq!(
+        PermissionMode::FullAccess.profile(),
+        PermissionProfile::FullAccess
+    );
+    assert_eq!(
+        PermissionMode::BypassPermissions.profile(),
+        PermissionProfile::FullAccess
+    );
     assert!(PermissionMode::from_str("bypass").is_err());
 }
 
@@ -172,6 +186,14 @@ fn provider_catalog_drives_model_effort_and_config_options() {
     assert_eq!(options[2]["configId"], "mode");
     assert_eq!(options[0]["options"][0]["value"], "gpt-5.6-codex");
     assert_eq!(options[1]["options"][1]["value"], "high");
+    let permission_values = options[2]["options"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|option| option["value"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert!(permission_values.contains(&"fullAccess"));
+    assert!(!permission_values.contains(&"bypassPermissions"));
 
     assert!(ModelId::parse("").is_err());
     assert!(ModelId::parse("x".repeat(129)).is_err());
@@ -221,6 +243,33 @@ fn session_configuration_rejects_unsupported_effort_and_guards_remote_bypass() {
         configuration.set_mode(PermissionMode::Default, ModeActivation::RemoteUnconfirmed),
         ConfigChange::Applied
     );
+}
+
+#[test]
+fn autonomous_task_slashes_require_an_exact_whole_leading_block() {
+    for command in [
+        "/status",
+        "/context",
+        "/resume",
+        "/cancel",
+        "/permissions fullAccess",
+        "/permissions approval",
+        "/permissions readOnly",
+    ] {
+        let prompt = Prompt::new(vec![command.to_owned()]).expect("valid prompt");
+        assert_eq!(prompt.task_slash_command(), Some(command));
+    }
+
+    for blocks in [
+        vec!["/status extra".to_owned()],
+        vec!["please run /status".to_owned()],
+        vec!["A user quoted this:\n/status".to_owned()],
+        vec!["context".to_owned(), "/status".to_owned()],
+        vec!["/permissions fullAccess now".to_owned()],
+    ] {
+        let prompt = Prompt::new(blocks).expect("valid ordinary prompt");
+        assert_eq!(prompt.task_slash_command(), None);
+    }
 }
 
 fn fixture_catalog() -> ModelCatalog {

@@ -1,11 +1,17 @@
-use std::collections::HashSet;
+#[cfg(test)]
+use std::cell::Cell;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, HashSet};
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 use std::{fs, io};
 
 use chrono::{DateTime, SecondsFormat, Utc};
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{
+    Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -27,6 +33,12 @@ use crate::policy::{ActorId, Frontend, Sha256Digest};
 use crate::runtime::subscription::{
     ProviderReported, RunConfigSnapshot, RunFailureCode, RunId, RunState, RunTransition,
     RunTrustLabel, VerificationId,
+};
+use crate::runtime::task::{
+    CanonicalCheckpoint, CompletionContract, ContextPackage, EffectClass, EpochInterruptReason,
+    OperationCheckpoint, OperationEvidenceState, OperationStatus, TaskBudget, TaskControlKind,
+    TaskEvent, TaskId, TaskMetrics, TaskMetricsErrorCode, TaskMetricsReducer, TaskSnapshot,
+    TaskStatus, reduce_task,
 };
 use crate::security::SecretFilter;
 use crate::sidecar::DataRootLock;
@@ -130,6 +142,63 @@ pub struct FrontendSessionRecord {
     pub provider_thread_id: Option<ProviderThreadId>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TrustedFrontendOwnerInput {
+    pub frontend: Frontend,
+    pub actor_id: ActorId,
+    pub workspace: PathBuf,
+    pub permission_mode: PermissionMode,
+    pub trusted_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TrustedFrontendOwnerRecord {
+    pub frontend: Frontend,
+    pub actor_id: ActorId,
+    pub channel_id: Option<ChannelId>,
+    pub workspace_digest: Sha256Digest,
+    pub permission_mode: PermissionMode,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaskControlMutationInput {
+    pub external_session_id: ExternalSessionId,
+    pub idempotency_key: String,
+    pub task_id: TaskId,
+    pub method: String,
+    pub request_digest: Sha256Digest,
+    pub result_json: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TaskControlMutationClaim {
+    Fresh,
+    Pending,
+    Replay {
+        result_json: String,
+        failure_code: Option<i64>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServiceCommandReceiptInput {
+    pub idempotency_key: String,
+    pub command_digest: Sha256Digest,
+    pub command_kind: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ServiceCommandReceiptClaim {
+    Fresh,
+    Pending,
+    Replay { result_json: String },
+    Conflict,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -269,6 +338,58 @@ pub struct SessionRecord {
     pub id: SessionId,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NewTask {
+    pub session_id: SessionId,
+    pub workspace: PathBuf,
+    pub contract: CompletionContract,
+    pub model: ModelId,
+    pub effort: ReasoningEffort,
+    pub permission_mode: PermissionMode,
+    pub budget: TaskBudget,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaskRecord {
+    pub snapshot: TaskSnapshot,
+    pub revision: u64,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaskConfigurationRecord {
+    pub active_model: ModelId,
+    pub active_effort: ReasoningEffort,
+    pub active_permission_mode: PermissionMode,
+    pub effective_permission_mode: PermissionMode,
+    pub pending_control_id: Option<String>,
+    pub pending_model: Option<ModelId>,
+    pub pending_effort: Option<ReasoningEffort>,
+    pub pending_permission_mode: Option<PermissionMode>,
+    pub queued_sequence: Option<u64>,
+    pub applied_sequence: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NewCheckpoint {
+    pub task_id: TaskId,
+    pub checkpoint: CanonicalCheckpoint,
+    pub checkpoint_digest: String,
+    pub context_package: ContextPackage,
+    pub context_package_digest: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CheckpointRecord {
+    pub checkpoint: CanonicalCheckpoint,
+    pub checkpoint_digest: String,
+    pub context_package_digest: String,
+    pub created_at: DateTime<Utc>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -691,6 +812,37 @@ struct StoredVerificationResult {
 
 pub struct Store {
     connection: Connection,
+    authenticated_checkpoint_authority: BTreeMap<TaskId, Arc<AuthenticatedCheckpointAuthority>>,
+    validated_startup_tasks: RefCell<Option<ValidatedStartupTasks>>,
+    #[cfg(test)]
+    checkpoint_authority_full_validations: Cell<u64>,
+    #[cfg(test)]
+    checkpoint_authority_incremental_validations: Cell<u64>,
+    #[cfg(test)]
+    checkpoint_full_prefix_scans: Cell<u64>,
+    #[cfg(test)]
+    startup_authority_scans: Cell<u64>,
+}
+
+struct AuthenticatedCheckpointAuthority {
+    checkpoint_id: crate::runtime::task::CheckpointId,
+    task_id: TaskId,
+    source_sequence_start: u64,
+    source_sequence_end: u64,
+    compaction_generation: u32,
+    operations: Arc<[OperationCheckpoint]>,
+    observed_total_tokens: Option<u64>,
+    observed_context_window: Option<u64>,
+    task_snapshot: Arc<TaskSnapshot>,
+    configuration: TaskConfigurationRecord,
+    digest: String,
+    data_version: i64,
+}
+
+struct ValidatedStartupTasks {
+    records: Vec<TaskRecord>,
+    data_version: i64,
+    total_changes: u64,
 }
 
 impl Store {
@@ -698,9 +850,6 @@ impl Store {
         let mut connection = Connection::open(path).map_err(storage_error)?;
         connection
             .busy_timeout(BUSY_TIMEOUT)
-            .map_err(storage_error)?;
-        connection
-            .pragma_update(None, "foreign_keys", "ON")
             .map_err(storage_error)?;
         connection
             .pragma_update(None, "secure_delete", "ON")
@@ -721,9 +870,44 @@ impl Store {
             });
         }
         schema::migrate(&mut connection)?;
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .map_err(storage_error)?;
+        if connection
+            .prepare("PRAGMA foreign_key_check")
+            .map_err(storage_error)?
+            .exists([])
+            .map_err(storage_error)?
+        {
+            return Err(storage_invariant(
+                "database contains a foreign key violation after migration",
+            ));
+        }
+        let validation_data_version = sqlite_data_version(&connection)?;
+        let validated_tasks = validate_task_projection_completeness(&connection)?;
+        validate_task_canonical_payloads(&connection)?;
         checkpoint_for_secure_deletion(&connection)?;
+        let validated_startup_tasks = (sqlite_data_version(&connection)?
+            == validation_data_version)
+            .then(|| ValidatedStartupTasks {
+                records: validated_tasks,
+                data_version: validation_data_version,
+                total_changes: connection.total_changes(),
+            });
 
-        Ok(Self { connection })
+        Ok(Self {
+            connection,
+            authenticated_checkpoint_authority: BTreeMap::new(),
+            validated_startup_tasks: RefCell::new(validated_startup_tasks),
+            #[cfg(test)]
+            checkpoint_authority_full_validations: Cell::new(0),
+            #[cfg(test)]
+            checkpoint_authority_incremental_validations: Cell::new(0),
+            #[cfg(test)]
+            checkpoint_full_prefix_scans: Cell::new(0),
+            #[cfg(test)]
+            startup_authority_scans: Cell::new(1),
+        })
     }
 
     pub(crate) fn open_locked(data_root_lock: &DataRootLock) -> Result<Self, CarlError> {
@@ -759,6 +943,52 @@ impl Store {
         self.connection
             .pragma_query_value(None, "foreign_keys", |row| row.get::<_, bool>(0))
             .map_err(storage_error)
+    }
+
+    fn take_validated_startup_tasks(&self) -> Result<Option<ValidatedStartupTasks>, CarlError> {
+        let data_version = sqlite_data_version(&self.connection)?;
+        let total_changes = self.connection.total_changes();
+        let mut cached = self.validated_startup_tasks.borrow_mut();
+        if cached.as_ref().is_some_and(|cached| {
+            cached.data_version == data_version && cached.total_changes == total_changes
+        }) {
+            return Ok(cached.take());
+        }
+        *cached = None;
+        Ok(None)
+    }
+
+    fn cache_validated_startup_tasks(
+        &self,
+        records: Vec<TaskRecord>,
+        expected_data_version: i64,
+    ) -> Result<(), CarlError> {
+        let data_version = sqlite_data_version(&self.connection)?;
+        let mut cached = self.validated_startup_tasks.borrow_mut();
+        *cached = (data_version == expected_data_version).then(|| ValidatedStartupTasks {
+            records,
+            data_version,
+            total_changes: self.connection.total_changes(),
+        });
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn checkpoint_authority_validation_counts(&self) -> (u64, u64) {
+        (
+            self.checkpoint_authority_full_validations.get(),
+            self.checkpoint_authority_incremental_validations.get(),
+        )
+    }
+
+    #[cfg(test)]
+    fn startup_authority_scan_count(&self) -> u64 {
+        self.startup_authority_scans.get()
+    }
+
+    #[cfg(test)]
+    fn checkpoint_full_prefix_scan_count(&self) -> u64 {
+        self.checkpoint_full_prefix_scans.get()
     }
 
     pub fn busy_timeout_millis(&self) -> Result<u64, CarlError> {
@@ -857,8 +1087,9 @@ impl Store {
             .execute(
                 "INSERT INTO frontend_sessions (
                     external_session_id, frontend, session_id, client_name, protocol_version,
-                    cwd, channel_id, provider_thread_id, permission_mode, created_at, updated_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8, ?9, ?9)",
+                    cwd, channel_id, provider_thread_id, permission_mode, permission_profile,
+                    created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8, ?9, ?10, ?10)",
                 params![
                     record.external_session_id.as_str(),
                     record.frontend.as_str(),
@@ -867,7 +1098,8 @@ impl Store {
                     i64::from(record.protocol_version),
                     record.cwd.to_str(),
                     record.channel_id.as_ref().map(ChannelId::as_str),
-                    record.permission_mode.as_wire_str(),
+                    stored_permission_mode(record.permission_mode),
+                    permission_profile_str(record.permission_mode),
                     format_timestamp(record.created_at),
                 ],
             )
@@ -883,7 +1115,7 @@ impl Store {
             .connection
             .query_row(
                 "SELECT frontend, session_id, client_name, protocol_version, cwd, channel_id,
-                        provider_thread_id, permission_mode, created_at, updated_at
+                        provider_thread_id, permission_profile, created_at, updated_at
                  FROM frontend_sessions
                  WHERE external_session_id = ?1",
                 [external_session_id],
@@ -919,9 +1151,7 @@ impl Store {
             )| {
                 let protocol_version = u32::try_from(protocol_version)
                     .map_err(|_| invalid_stored_value("protocol version", "out of range"))?;
-                let permission_mode = permission_mode
-                    .parse()
-                    .map_err(|_| invalid_stored_value("permission mode", &permission_mode))?;
+                let permission_mode = permission_mode_from_profile(&permission_mode)?;
                 Ok(FrontendSessionRecord {
                     frontend: Frontend::parse(&frontend)?,
                     external_session_id: ExternalSessionId::try_from(external_session_id)?,
@@ -942,6 +1172,34 @@ impl Store {
         .transpose()
     }
 
+    pub fn get_frontend_session_for_session(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<FrontendSessionRecord>, CarlError> {
+        let external_session_id = self
+            .connection
+            .query_row(
+                "SELECT external_session_id FROM frontend_sessions WHERE session_id = ?1",
+                [session_id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(storage_error)?;
+        external_session_id
+            .map(|external| self.get_frontend_session(&external))
+            .transpose()
+            .map(Option::flatten)
+    }
+
+    pub fn get_trusted_frontend_owner_for_workspace(
+        &self,
+        frontend: Frontend,
+        workspace: &Path,
+    ) -> Result<Option<TrustedFrontendOwnerRecord>, CarlError> {
+        validate_canonical_frontend_cwd(workspace)?;
+        self.get_trusted_frontend_owner(frontend, frontend_workspace_digest(workspace))
+    }
+
     pub fn configure_frontend_session(
         &self,
         external_session_id: &ExternalSessionId,
@@ -953,12 +1211,14 @@ impl Store {
             .connection
             .execute(
                 "UPDATE frontend_sessions
-                 SET provider_thread_id = ?2, permission_mode = ?3, updated_at = ?4
-                 WHERE external_session_id = ?1 AND updated_at <= ?4",
+                 SET provider_thread_id = ?2, permission_mode = ?3,
+                     permission_profile = ?4, updated_at = ?5
+                 WHERE external_session_id = ?1 AND updated_at <= ?5",
                 params![
                     external_session_id.as_str(),
                     provider_thread_id.map(ProviderThreadId::as_str),
-                    permission_mode.as_wire_str(),
+                    stored_permission_mode(permission_mode),
+                    permission_profile_str(permission_mode),
                     format_timestamp(updated_at),
                 ],
             )
@@ -1074,6 +1334,603 @@ impl Store {
         transaction.commit().map_err(storage_error)?;
         self.get_frontend_session(external_session_id.as_str())?
             .ok_or_else(|| storage_invariant("claimed frontend session disappeared"))
+    }
+
+    pub fn trust_frontend_owner(
+        &self,
+        input: TrustedFrontendOwnerInput,
+    ) -> Result<TrustedFrontendOwnerRecord, CarlError> {
+        if input.frontend != Frontend::Buzz
+            || input.permission_mode.profile() != crate::acp::PermissionProfile::FullAccess
+        {
+            return Err(policy_error("trusted frontend owner binding is invalid"));
+        }
+        validate_canonical_frontend_cwd(&input.workspace)?;
+        let workspace_digest = frontend_workspace_digest(&input.workspace);
+        if let Some(existing) = self.get_trusted_frontend_owner(input.frontend, workspace_digest)?
+            && existing.actor_id == input.actor_id
+            && existing.permission_mode.profile() == crate::acp::PermissionProfile::FullAccess
+        {
+            return Ok(existing);
+        }
+        self.connection
+            .execute(
+                "INSERT INTO trusted_frontend_owners (
+                    frontend, actor_id, channel_id, workspace_digest, permission_mode,
+                    created_at, updated_at
+                 ) VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?5)
+                 ON CONFLICT(frontend, workspace_digest) DO UPDATE SET
+                    actor_id = excluded.actor_id,
+                    channel_id = NULL,
+                    permission_mode = excluded.permission_mode,
+                    created_at = excluded.created_at,
+                    updated_at = excluded.updated_at",
+                params![
+                    input.frontend.as_str(),
+                    input.actor_id.as_str(),
+                    workspace_digest.to_string(),
+                    stored_permission_mode(input.permission_mode),
+                    format_timestamp(input.trusted_at),
+                ],
+            )
+            .map_err(storage_error)?;
+        self.get_trusted_frontend_owner(input.frontend, workspace_digest)?
+            .ok_or_else(|| storage_invariant("trusted frontend owner disappeared"))
+    }
+
+    pub fn get_trusted_frontend_owner(
+        &self,
+        frontend: Frontend,
+        workspace_digest: Sha256Digest,
+    ) -> Result<Option<TrustedFrontendOwnerRecord>, CarlError> {
+        let raw = self
+            .connection
+            .query_row(
+                "SELECT actor_id, channel_id, permission_mode, created_at, updated_at
+                 FROM trusted_frontend_owners
+                 WHERE frontend = ?1 AND workspace_digest = ?2",
+                params![frontend.as_str(), workspace_digest.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(storage_error)?;
+        raw.map(
+            |(actor_id, channel_id, permission_mode, created_at, updated_at)| {
+                let stored = permission_mode
+                    .parse::<PermissionMode>()
+                    .map_err(|_| invalid_stored_value("permission mode", &permission_mode))?;
+                if stored.profile() != crate::acp::PermissionProfile::FullAccess {
+                    return Err(invalid_stored_value(
+                        "trusted frontend permission mode",
+                        &permission_mode,
+                    ));
+                }
+                Ok(TrustedFrontendOwnerRecord {
+                    frontend,
+                    actor_id: ActorId::parse(actor_id)?,
+                    channel_id: channel_id.map(ChannelId::try_from).transpose()?,
+                    workspace_digest,
+                    permission_mode: PermissionMode::FullAccess,
+                    created_at: parse_timestamp(&created_at)?,
+                    updated_at: parse_timestamp(&updated_at)?,
+                })
+            },
+        )
+        .transpose()
+    }
+
+    pub fn admit_trusted_frontend_owner(
+        &self,
+        frontend: Frontend,
+        actor_id: &ActorId,
+        channel_id: &ChannelId,
+        workspace: &Path,
+        admitted_at: DateTime<Utc>,
+    ) -> Result<TrustedFrontendOwnerRecord, CarlError> {
+        if frontend != Frontend::Buzz {
+            return Err(policy_error("trusted frontend admission is invalid"));
+        }
+        validate_canonical_frontend_cwd(workspace)?;
+        let workspace_digest = frontend_workspace_digest(workspace);
+        let existing = self
+            .get_trusted_frontend_owner(frontend, workspace_digest)?
+            .ok_or_else(|| policy_error("trusted frontend owner is unavailable"))?;
+        if existing.actor_id != *actor_id
+            || existing
+                .channel_id
+                .as_ref()
+                .is_some_and(|bound| bound != channel_id)
+        {
+            return Err(policy_error("trusted frontend owner does not match"));
+        }
+        if existing.channel_id.is_none() {
+            let changed = self
+                .connection
+                .execute(
+                    "UPDATE trusted_frontend_owners
+                     SET channel_id = ?3, updated_at = ?4
+                     WHERE frontend = ?1 AND workspace_digest = ?2
+                       AND actor_id = ?5 AND channel_id IS NULL AND updated_at <= ?4",
+                    params![
+                        frontend.as_str(),
+                        workspace_digest.to_string(),
+                        channel_id.as_str(),
+                        format_timestamp(admitted_at),
+                        actor_id.as_str(),
+                    ],
+                )
+                .map_err(storage_error)?;
+            if changed != 1 {
+                return Err(policy_error(
+                    "trusted frontend channel fill was not applied",
+                ));
+            }
+        }
+        self.get_trusted_frontend_owner(frontend, workspace_digest)?
+            .ok_or_else(|| storage_invariant("admitted trusted frontend owner disappeared"))
+    }
+
+    pub fn admit_trusted_frontend_message(
+        &self,
+        frontend: Frontend,
+        actor_id: &ActorId,
+        channel_id: &ChannelId,
+        workspace: &Path,
+        event_id: &str,
+        admitted_at: DateTime<Utc>,
+    ) -> Result<TrustedFrontendOwnerRecord, CarlError> {
+        if event_id.len() != 64
+            || !event_id
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(policy_error("trusted frontend event is invalid"));
+        }
+        validate_canonical_frontend_cwd(workspace)?;
+        let workspace_digest = frontend_workspace_digest(workspace);
+        let transaction = self
+            .connection
+            .unchecked_transaction()
+            .map_err(storage_error)?;
+        let binding = transaction
+            .query_row(
+                "SELECT actor_id, channel_id, permission_mode, created_at, updated_at
+                 FROM trusted_frontend_owners
+                 WHERE frontend = ?1 AND workspace_digest = ?2",
+                params![frontend.as_str(), workspace_digest.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(storage_error)?
+            .ok_or_else(|| policy_error("trusted frontend owner is unavailable"))?;
+        if binding.0 != actor_id.as_str()
+            || binding
+                .1
+                .as_deref()
+                .is_some_and(|bound| bound != channel_id.as_str())
+        {
+            return Err(policy_error("trusted frontend owner does not match"));
+        }
+        if binding.1.is_none() {
+            let changed = transaction
+                .execute(
+                    "UPDATE trusted_frontend_owners
+                     SET channel_id = ?3, updated_at = ?4
+                     WHERE frontend = ?1 AND workspace_digest = ?2
+                       AND actor_id = ?5 AND channel_id IS NULL AND updated_at <= ?4",
+                    params![
+                        frontend.as_str(),
+                        workspace_digest.to_string(),
+                        channel_id.as_str(),
+                        format_timestamp(admitted_at),
+                        actor_id.as_str(),
+                    ],
+                )
+                .map_err(storage_error)?;
+            if changed != 1 {
+                return Err(policy_error(
+                    "trusted frontend channel fill was not applied",
+                ));
+            }
+        }
+        transaction
+            .execute(
+                "INSERT INTO trusted_frontend_events (
+                    event_id, frontend, workspace_digest, actor_id, channel_id, admitted_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    event_id,
+                    frontend.as_str(),
+                    workspace_digest.to_string(),
+                    actor_id.as_str(),
+                    channel_id.as_str(),
+                    format_timestamp(admitted_at),
+                ],
+            )
+            .map_err(|_| policy_error("trusted frontend event is unavailable"))?;
+        transaction.commit().map_err(storage_error)?;
+        self.get_trusted_frontend_owner(frontend, workspace_digest)?
+            .ok_or_else(|| storage_invariant("admitted trusted frontend owner disappeared"))
+    }
+
+    pub fn recover_or_admit_trusted_frontend_message(
+        &self,
+        frontend: Frontend,
+        actor_id: &ActorId,
+        channel_id: &ChannelId,
+        workspace: &Path,
+        event_id: &str,
+        admitted_at: DateTime<Utc>,
+    ) -> Result<TrustedFrontendOwnerRecord, CarlError> {
+        validate_canonical_frontend_cwd(workspace)?;
+        let workspace_digest = frontend_workspace_digest(workspace);
+        let existing = self
+            .connection
+            .query_row(
+                "SELECT frontend, workspace_digest, actor_id, channel_id
+                 FROM trusted_frontend_events WHERE event_id = ?1",
+                [event_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(storage_error)?;
+        if let Some((stored_frontend, stored_workspace, stored_actor, stored_channel)) = existing {
+            if stored_frontend != frontend.as_str()
+                || stored_workspace != workspace_digest.to_string()
+                || stored_actor != actor_id.as_str()
+                || stored_channel != channel_id.as_str()
+            {
+                return Err(policy_error("trusted frontend event binding is invalid"));
+            }
+            return self
+                .get_trusted_frontend_owner(frontend, workspace_digest)?
+                .ok_or_else(|| storage_invariant("trusted frontend event lost its owner"));
+        }
+        self.admit_trusted_frontend_message(
+            frontend,
+            actor_id,
+            channel_id,
+            workspace,
+            event_id,
+            admitted_at,
+        )
+    }
+
+    pub fn claim_task_control_mutation(
+        &self,
+        input: TaskControlMutationInput,
+    ) -> Result<TaskControlMutationClaim, CarlError> {
+        if input.idempotency_key.is_empty()
+            || input.idempotency_key.len() > 128
+            || input.idempotency_key.chars().any(char::is_control)
+            || !matches!(input.method.as_str(), "resume" | "cancel" | "steer")
+            || input.result_json.len() > 65_536
+            || !serde_json::from_str::<serde_json::Value>(&input.result_json)
+                .is_ok_and(|value| value.is_object())
+        {
+            return Err(policy_error("task control mutation binding is invalid"));
+        }
+        let transaction = self
+            .connection
+            .unchecked_transaction()
+            .map_err(storage_error)?;
+        let expected_session = transaction
+            .query_row(
+                "SELECT session_id FROM frontend_sessions WHERE external_session_id = ?1",
+                [input.external_session_id.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(storage_error)?
+            .ok_or_else(|| policy_error("task control frontend session is unavailable"))?;
+        let (task_session, starting_revision) = transaction
+            .query_row(
+                "SELECT session_id, revision FROM agent_tasks WHERE id = ?1",
+                [input.task_id.to_string()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()
+            .map_err(storage_error)?
+            .ok_or_else(|| policy_error("task control task is unavailable"))?;
+        if expected_session != task_session {
+            return Err(policy_error("task control session binding is invalid"));
+        }
+        let existing = transaction
+            .query_row(
+                "SELECT task_id, method, request_digest, state, result_json, failure_code
+                 FROM task_control_receipts
+                 WHERE external_session_id = ?1 AND idempotency_key = ?2",
+                params![input.external_session_id.as_str(), input.idempotency_key],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<i64>>(5)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(storage_error)?;
+        if let Some((task_id, method, request_digest, state, result_json, failure_code)) = existing
+        {
+            if task_id != input.task_id.to_string()
+                || method != input.method
+                || request_digest != input.request_digest.to_string()
+            {
+                return Err(policy_error("task control idempotency key was rebound"));
+            }
+            return match (state.as_str(), result_json, failure_code) {
+                ("pending", None, None) => Ok(TaskControlMutationClaim::Pending),
+                ("completed", Some(result_json), failure_code) => {
+                    Ok(TaskControlMutationClaim::Replay {
+                        result_json,
+                        failure_code,
+                    })
+                }
+                _ => Err(storage_invariant("task control receipt state is invalid")),
+            };
+        }
+        let receipt_count = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM task_control_receipts WHERE external_session_id = ?1",
+                [input.external_session_id.as_str()],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(storage_error)?;
+        if receipt_count >= 256 {
+            return Err(policy_error("task control receipt capacity is exhausted"));
+        }
+        transaction
+            .execute(
+                "INSERT INTO task_control_receipts (
+                    external_session_id, idempotency_key, task_id, method,
+                    request_digest, state, starting_revision, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6, ?7)",
+                params![
+                    input.external_session_id.as_str(),
+                    input.idempotency_key,
+                    input.task_id.to_string(),
+                    input.method,
+                    input.request_digest.to_string(),
+                    starting_revision,
+                    format_timestamp(input.created_at),
+                ],
+            )
+            .map_err(storage_error)?;
+        transaction.commit().map_err(storage_error)?;
+        Ok(TaskControlMutationClaim::Fresh)
+    }
+
+    pub fn claim_service_command(
+        &self,
+        input: ServiceCommandReceiptInput,
+    ) -> Result<ServiceCommandReceiptClaim, CarlError> {
+        validate_service_command_receipt(&input)?;
+        let transaction = self
+            .connection
+            .unchecked_transaction()
+            .map_err(storage_error)?;
+        let existing = transaction
+            .query_row(
+                "SELECT command_digest, state, result_json
+                 FROM service_command_receipts WHERE idempotency_key = ?1",
+                [input.idempotency_key.as_str()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(storage_error)?;
+        if let Some((digest, state, result_json)) = existing {
+            if digest != input.command_digest.to_string() {
+                return Ok(ServiceCommandReceiptClaim::Conflict);
+            }
+            return match (state.as_str(), result_json) {
+                ("pending", None) => Ok(ServiceCommandReceiptClaim::Pending),
+                ("completed", Some(result_json)) => {
+                    Ok(ServiceCommandReceiptClaim::Replay { result_json })
+                }
+                _ => Err(storage_invariant(
+                    "service command receipt state is invalid",
+                )),
+            };
+        }
+        transaction
+            .execute(
+                "INSERT INTO service_command_receipts (
+                    idempotency_key, command_digest, command_kind, state, created_at
+                 ) VALUES (?1, ?2, ?3, 'pending', ?4)",
+                params![
+                    input.idempotency_key,
+                    input.command_digest.to_string(),
+                    input.command_kind,
+                    format_timestamp(input.created_at),
+                ],
+            )
+            .map_err(storage_error)?;
+        transaction.commit().map_err(storage_error)?;
+        Ok(ServiceCommandReceiptClaim::Fresh)
+    }
+
+    pub fn complete_service_command(
+        &self,
+        input: &ServiceCommandReceiptInput,
+        result_json: &str,
+        completed_at: DateTime<Utc>,
+    ) -> Result<String, CarlError> {
+        validate_service_command_receipt(input)?;
+        if result_json.is_empty()
+            || result_json.len() > 262_144
+            || !serde_json::from_str::<serde_json::Value>(result_json)
+                .is_ok_and(|value| value.is_object())
+        {
+            return Err(policy_error("service command result is invalid"));
+        }
+        let changed = self
+            .connection
+            .execute(
+                "UPDATE service_command_receipts
+                 SET state = 'completed', result_json = ?3, completed_at = ?4
+                 WHERE idempotency_key = ?1 AND command_digest = ?2 AND state = 'pending'",
+                params![
+                    input.idempotency_key,
+                    input.command_digest.to_string(),
+                    result_json,
+                    format_timestamp(completed_at),
+                ],
+            )
+            .map_err(storage_error)?;
+        if changed == 1 {
+            return Ok(result_json.to_owned());
+        }
+        self.connection
+            .query_row(
+                "SELECT result_json FROM service_command_receipts
+                 WHERE idempotency_key = ?1 AND command_digest = ?2 AND state = 'completed'",
+                params![input.idempotency_key, input.command_digest.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(storage_error)?
+            .ok_or_else(|| policy_error("service command was not durably completed"))
+    }
+
+    pub fn complete_task_control_mutation(
+        &self,
+        input: TaskControlMutationInput,
+    ) -> Result<String, CarlError> {
+        let transaction = self
+            .connection
+            .unchecked_transaction()
+            .map_err(storage_error)?;
+        let current_revision = transaction
+            .query_row(
+                "SELECT revision FROM agent_tasks WHERE id = ?1",
+                [input.task_id.to_string()],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(storage_error)?
+            .ok_or_else(|| policy_error("task control task is unavailable"))?;
+        let changed = transaction
+            .execute(
+                "UPDATE task_control_receipts
+                 SET state = 'completed', applied_revision = ?6, result_json = ?7,
+                     completed_at = ?8
+                 WHERE external_session_id = ?1 AND idempotency_key = ?2
+                   AND task_id = ?3 AND method = ?4 AND request_digest = ?5
+                   AND state = 'pending' AND starting_revision <= ?6",
+                params![
+                    input.external_session_id.as_str(),
+                    input.idempotency_key,
+                    input.task_id.to_string(),
+                    input.method,
+                    input.request_digest.to_string(),
+                    current_revision,
+                    input.result_json,
+                    format_timestamp(input.created_at),
+                ],
+            )
+            .map_err(storage_error)?;
+        if changed != 1 {
+            let existing = transaction
+                .query_row(
+                    "SELECT result_json FROM task_control_receipts
+                     WHERE external_session_id = ?1 AND idempotency_key = ?2
+                       AND task_id = ?3 AND method = ?4 AND request_digest = ?5
+                       AND state = 'completed'",
+                    params![
+                        input.external_session_id.as_str(),
+                        input.idempotency_key,
+                        input.task_id.to_string(),
+                        input.method,
+                        input.request_digest.to_string(),
+                    ],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(storage_error)?;
+            return existing
+                .ok_or_else(|| policy_error("task control mutation was not durably applied"));
+        }
+        transaction.commit().map_err(storage_error)?;
+        Ok(input.result_json)
+    }
+
+    pub fn fail_task_control_mutation(
+        &self,
+        input: TaskControlMutationInput,
+        failure_code: i64,
+    ) -> Result<(), CarlError> {
+        if failure_code != -32602 {
+            return Err(policy_error("task control failure code is invalid"));
+        }
+        let transaction = self
+            .connection
+            .unchecked_transaction()
+            .map_err(storage_error)?;
+        let current_revision = transaction
+            .query_row(
+                "SELECT revision FROM agent_tasks WHERE id = ?1",
+                [input.task_id.to_string()],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(storage_error)?
+            .ok_or_else(|| policy_error("task control task is unavailable"))?;
+        let changed = transaction
+            .execute(
+                "UPDATE task_control_receipts
+                 SET state = 'completed', applied_revision = ?6, result_json = ?7,
+                     completed_at = ?8, failure_code = ?9
+                 WHERE external_session_id = ?1 AND idempotency_key = ?2
+                   AND task_id = ?3 AND method = ?4 AND request_digest = ?5
+                   AND state = 'pending' AND starting_revision <= ?6",
+                params![
+                    input.external_session_id.as_str(),
+                    input.idempotency_key,
+                    input.task_id.to_string(),
+                    input.method,
+                    input.request_digest.to_string(),
+                    current_revision,
+                    input.result_json,
+                    format_timestamp(input.created_at),
+                    failure_code,
+                ],
+            )
+            .map_err(storage_error)?;
+        require_projection_change(changed, "task control failure was not durably recorded")?;
+        transaction.commit().map_err(storage_error)
     }
 
     pub fn create_remote_code(
@@ -1427,6 +2284,11 @@ impl Store {
                 detail: "subscription run events require the transactional run API".to_owned(),
             });
         }
+        if matches!(event, Event::TaskLifecycle { .. }) {
+            return Err(CarlError::Validation {
+                detail: "task lifecycle events require the transactional task API".to_owned(),
+            });
+        }
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -1466,6 +2328,714 @@ impl Store {
         rows.into_iter()
             .map(|row| row.into_envelope(session_id))
             .collect()
+    }
+
+    pub fn create_task(&mut self, input: NewTask) -> Result<TaskRecord, CarlError> {
+        self.create_task_inner(input, None)
+    }
+
+    pub fn create_task_idempotent(
+        &mut self,
+        input: NewTask,
+        idempotency_key: &str,
+        command_digest: [u8; 32],
+    ) -> Result<TaskRecord, CarlError> {
+        if idempotency_key.is_empty()
+            || idempotency_key.len() > 128
+            || idempotency_key.chars().any(char::is_control)
+        {
+            return Err(policy_error("service task idempotency key is invalid"));
+        }
+        self.create_task_inner(input, Some((idempotency_key, command_digest)))
+    }
+
+    fn create_task_inner(
+        &mut self,
+        input: NewTask,
+        receipt: Option<(&str, [u8; 32])>,
+    ) -> Result<TaskRecord, CarlError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage_error)?;
+        if let Some((idempotency_key, command_digest)) = receipt {
+            let existing = transaction
+                .query_row(
+                    "SELECT command_digest, task_id FROM service_task_receipts
+                     WHERE idempotency_key = ?1",
+                    [idempotency_key],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()
+                .map_err(storage_error)?;
+            if let Some((stored_digest, task_id)) = existing {
+                if stored_digest != hex_bytes(command_digest) {
+                    return Err(policy_error("service task idempotency key was rebound"));
+                }
+                let task_id = task_id
+                    .parse::<TaskId>()
+                    .map_err(|_| storage_invariant("service task receipt is corrupt"))?;
+                return load_task_record(&transaction, task_id)?
+                    .ok_or_else(|| storage_invariant("service task receipt lost its task"));
+            }
+        }
+        let workspace = fs::canonicalize(&input.workspace).map_err(|_| CarlError::Validation {
+            detail: "task workspace is unavailable".to_owned(),
+        })?;
+        if !workspace.is_dir() {
+            return Err(CarlError::Validation {
+                detail: "task workspace is not a directory".to_owned(),
+            });
+        }
+        let task_id = TaskId::new();
+        let created_event = TaskEvent::Created {
+            session_id: input.session_id,
+            workspace: workspace.clone(),
+            contract: input.contract,
+            budget: input.budget,
+            model: input.model.clone(),
+            effort: input.effort,
+            permission_mode: input.permission_mode,
+        };
+        let envelope = append_event_in_transaction(
+            &transaction,
+            input.session_id,
+            None,
+            Event::TaskLifecycle {
+                task_id,
+                event: created_event,
+            },
+            input.created_at,
+        )?;
+        let snapshot = reduce_task(None, &envelope).map_err(task_reduce_error)?;
+        insert_task_projection(
+            &transaction,
+            &snapshot,
+            &workspace,
+            &input.model,
+            input.effort,
+            input.permission_mode,
+            input.created_at,
+        )?;
+        if let Some((idempotency_key, command_digest)) = receipt {
+            transaction
+                .execute(
+                    "INSERT INTO service_task_receipts (
+                        idempotency_key, command_digest, task_id, created_at
+                     ) VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        idempotency_key,
+                        hex_bytes(command_digest),
+                        task_id.to_string(),
+                        format_timestamp(input.created_at),
+                    ],
+                )
+                .map_err(storage_error)?;
+        }
+        transaction.commit().map_err(storage_error)?;
+        Ok(TaskRecord {
+            revision: snapshot.revision,
+            snapshot,
+            created_at: input.created_at,
+            updated_at: input.created_at,
+        })
+    }
+
+    pub fn append_task_event(
+        &mut self,
+        task_id: TaskId,
+        expected_revision: u64,
+        event: TaskEvent,
+        at: DateTime<Utc>,
+    ) -> Result<Option<TaskRecord>, CarlError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage_error)?;
+        let Some(current) = load_task_record(&transaction, task_id)? else {
+            return Ok(None);
+        };
+        if current.revision != expected_revision {
+            return Ok(None);
+        }
+        let envelope = append_event_in_transaction(
+            &transaction,
+            current.snapshot.session_id,
+            None,
+            Event::TaskLifecycle { task_id, event },
+            at,
+        )?;
+        let snapshot = reduce_task(Some(current.snapshot), &envelope).map_err(task_reduce_error)?;
+        apply_task_child_projection(&transaction, task_id, &envelope, &snapshot)?;
+        update_task_projection(&transaction, &snapshot, at)?;
+        transaction.commit().map_err(storage_error)?;
+        Ok(Some(TaskRecord {
+            revision: snapshot.revision,
+            snapshot,
+            created_at: current.created_at,
+            updated_at: at,
+        }))
+    }
+
+    pub fn append_controlled_task_steering(
+        &mut self,
+        task_id: TaskId,
+        expected_revision: u64,
+        steering_sequence: u64,
+        text_digest: String,
+        control_id: &str,
+        at: DateTime<Utc>,
+    ) -> Result<Option<TaskRecord>, CarlError> {
+        if control_id.len() != 64
+            || !control_id
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(policy_error("task steering control ID is invalid"));
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage_error)?;
+        let Some(current) = load_task_record(&transaction, task_id)? else {
+            return Ok(None);
+        };
+        if current.revision != expected_revision {
+            return Ok(None);
+        }
+        let (record, event_sequence) = append_task_event_in_transaction(
+            &transaction,
+            current,
+            TaskEvent::SteeringQueued {
+                steering_sequence,
+                text_digest,
+            },
+            at,
+        )?;
+        let changed = transaction
+            .execute(
+                "UPDATE task_steering SET control_id = ?3
+                 WHERE task_id = ?1 AND event_sequence = ?2 AND control_id IS NULL",
+                params![task_id.to_string(), event_sequence, control_id],
+            )
+            .map_err(storage_error)?;
+        require_projection_change(changed, "task steering control binding was not applied")?;
+        transaction.commit().map_err(storage_error)?;
+        Ok(Some(record))
+    }
+
+    pub fn commit_checkpoint(
+        &mut self,
+        input: NewCheckpoint,
+        expected_task_revision: u64,
+    ) -> Result<Option<CheckpointRecord>, CarlError> {
+        validate_checkpoint_input(&input)?;
+        let checkpoint_json = String::from_utf8(
+            input
+                .checkpoint
+                .canonical_bytes()
+                .map_err(checkpoint_validation_error)?,
+        )
+        .map_err(|_| checkpoint_validation("canonical checkpoint is not UTF-8"))?;
+        let package_json = String::from_utf8(
+            input
+                .context_package
+                .canonical_bytes()
+                .map_err(context_validation_error)?,
+        )
+        .map_err(|_| checkpoint_validation("canonical context package is not UTF-8"))?;
+
+        let cached_authority = self
+            .authenticated_checkpoint_authority
+            .get(&input.task_id)
+            .cloned();
+
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage_error)?;
+        let Some(mut current) = load_task_record(&transaction, input.task_id)? else {
+            return Ok(None);
+        };
+        if current.revision != expected_task_revision {
+            return Ok(None);
+        }
+        let data_version = sqlite_data_version(&transaction)?;
+        let incremental_anchor = match cached_authority.as_deref() {
+            Some(authority)
+                if authority.data_version == data_version
+                    && authenticated_checkpoint_matches_database(
+                        &transaction,
+                        &current,
+                        authority,
+                    )? =>
+            {
+                Some(authority)
+            }
+            _ => None,
+        };
+        let (validated_authority, used_incremental_path) = if let Some(authority) =
+            incremental_anchor
+        {
+            (
+                validate_checkpoint_authority_incremental(
+                    &transaction,
+                    &current,
+                    &input.checkpoint,
+                    authority,
+                )?,
+                true,
+            )
+        } else {
+            let authoritative = validate_task_authority_from_journal(&transaction, input.task_id)
+                .map_err(checkpoint_fallback_authority_error)?;
+            current = authoritative.record;
+            validate_task_canonical_payloads_filtered(&transaction, Some(input.task_id))?;
+            #[cfg(test)]
+            self.checkpoint_full_prefix_scans
+                .set(self.checkpoint_full_prefix_scans.get().saturating_add(1));
+            validate_checkpoint_history(&transaction, &current, &input)?;
+            (
+                validate_checkpoint_authority(
+                    &transaction,
+                    &current,
+                    &authoritative.configuration,
+                    &input.checkpoint,
+                )?,
+                false,
+            )
+        };
+        validate_checkpoint_artifacts(&transaction, &input.checkpoint)?;
+
+        let envelope = append_event_in_transaction(
+            &transaction,
+            current.snapshot.session_id,
+            None,
+            Event::TaskLifecycle {
+                task_id: input.task_id,
+                event: TaskEvent::CheckpointCommitted {
+                    checkpoint_id: input.checkpoint.checkpoint_id,
+                    digest: input.checkpoint_digest.clone(),
+                },
+            },
+            input.created_at,
+        )?;
+        let snapshot = reduce_task(Some(current.snapshot), &envelope).map_err(task_reduce_error)?;
+        let event_sequence = revision_to_sql(envelope.sequence)?;
+        let timestamp = format_timestamp(input.created_at);
+        transaction
+            .execute(
+                "INSERT INTO task_checkpoints (
+                    id, task_id, digest, event_sequence, checkpoint_json, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    input.checkpoint.checkpoint_id.to_string(),
+                    input.task_id.to_string(),
+                    input.checkpoint_digest,
+                    event_sequence,
+                    checkpoint_json,
+                    timestamp,
+                ],
+            )
+            .map_err(storage_error)?;
+        transaction
+            .execute(
+                "INSERT INTO task_context_packages (
+                    id, task_id, checkpoint_id, generation, event_sequence,
+                    package_json, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    input.context_package.package_id.to_string(),
+                    input.task_id.to_string(),
+                    input.checkpoint.checkpoint_id.to_string(),
+                    i64::from(input.checkpoint.compaction_generation),
+                    event_sequence,
+                    package_json,
+                    timestamp,
+                ],
+            )
+            .map_err(storage_error)?;
+        update_task_projection(&transaction, &snapshot, input.created_at)?;
+        transaction.commit().map_err(storage_error)?;
+        #[cfg(test)]
+        if used_incremental_path {
+            self.checkpoint_authority_incremental_validations.set(
+                self.checkpoint_authority_incremental_validations
+                    .get()
+                    .saturating_add(1),
+            );
+        } else {
+            self.checkpoint_authority_full_validations.set(
+                self.checkpoint_authority_full_validations
+                    .get()
+                    .saturating_add(1),
+            );
+        }
+        #[cfg(not(test))]
+        let _ = used_incremental_path;
+        let record = CheckpointRecord {
+            checkpoint: input.checkpoint,
+            checkpoint_digest: input.checkpoint_digest,
+            context_package_digest: input.context_package_digest,
+            created_at: input.created_at,
+        };
+        self.authenticated_checkpoint_authority.insert(
+            input.task_id,
+            Arc::new(AuthenticatedCheckpointAuthority {
+                checkpoint_id: record.checkpoint.checkpoint_id,
+                task_id: record.checkpoint.task_id,
+                source_sequence_start: record.checkpoint.source_sequence_start,
+                source_sequence_end: record.checkpoint.source_sequence_end,
+                compaction_generation: record.checkpoint.compaction_generation,
+                operations: Arc::from(record.checkpoint.operations.clone()),
+                observed_total_tokens: record.checkpoint.provider.observed_total_tokens,
+                observed_context_window: record.checkpoint.provider.observed_context_window,
+                task_snapshot: Arc::new(validated_authority.task_snapshot),
+                configuration: validated_authority.configuration,
+                digest: record.checkpoint_digest.clone(),
+                data_version,
+            }),
+        );
+        Ok(Some(record))
+    }
+
+    pub fn get_task(&self, task_id: TaskId) -> Result<Option<TaskRecord>, CarlError> {
+        load_task_record(&self.connection, task_id)
+    }
+
+    pub fn get_service_task_receipt(
+        &self,
+        idempotency_key: &str,
+        command_digest: Sha256Digest,
+    ) -> Result<Option<TaskId>, CarlError> {
+        let existing = self
+            .connection
+            .query_row(
+                "SELECT command_digest, task_id FROM service_task_receipts
+                 WHERE idempotency_key = ?1",
+                [idempotency_key],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(storage_error)?;
+        let Some((digest, task_id)) = existing else {
+            return Ok(None);
+        };
+        if digest != command_digest.to_string() {
+            return Err(policy_error("service task idempotency key was rebound"));
+        }
+        task_id
+            .parse()
+            .map(Some)
+            .map_err(|_| storage_invariant("service task receipt is corrupt"))
+    }
+
+    pub fn get_task_configuration(
+        &self,
+        task_id: TaskId,
+    ) -> Result<Option<TaskConfigurationRecord>, CarlError> {
+        load_task_configuration_record(&self.connection, task_id)
+    }
+
+    pub fn task_has_control_marker(
+        &self,
+        task_id: TaskId,
+        control_id: &str,
+        kind: TaskControlKind,
+    ) -> Result<bool, CarlError> {
+        validate_task_control_id(control_id)?;
+        self.connection
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM task_control_markers
+                    WHERE task_id = ?1 AND control_id = ?2 AND kind = ?3
+                 )",
+                params![task_id.to_string(), control_id, task_control_kind_str(kind)],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(storage_error)
+    }
+
+    pub fn task_has_configuration_control(
+        &self,
+        task_id: TaskId,
+        control_id: &str,
+    ) -> Result<bool, CarlError> {
+        validate_task_control_id(control_id)?;
+        self.connection
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM service_configuration_controls
+                    WHERE task_id = ?1 AND control_id = ?2
+                 )",
+                params![task_id.to_string(), control_id],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(storage_error)
+    }
+
+    pub fn list_tasks_for_session(
+        &self,
+        session_id: SessionId,
+        limit: usize,
+    ) -> Result<Vec<TaskRecord>, CarlError> {
+        let limit = limit.min(64);
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT id FROM agent_tasks
+                 WHERE session_id = ?1
+                 ORDER BY updated_at DESC, id ASC
+                 LIMIT ?2",
+            )
+            .map_err(storage_error)?;
+        let task_ids = statement
+            .query_map(params![session_id.to_string(), limit as i64], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(storage_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(storage_error)?;
+        task_ids
+            .into_iter()
+            .map(|task_id| {
+                let task_id = task_id
+                    .parse::<TaskId>()
+                    .map_err(|_| storage_invariant("stored task ID is invalid"))?;
+                load_task_record(&self.connection, task_id)?
+                    .ok_or_else(|| storage_invariant("listed task disappeared"))
+            })
+            .collect()
+    }
+
+    pub fn task_has_steering_control(
+        &self,
+        task_id: TaskId,
+        control_id: &str,
+    ) -> Result<bool, CarlError> {
+        self.connection
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM task_steering
+                    WHERE task_id = ?1 AND control_id = ?2
+                 )",
+                params![task_id.to_string(), control_id],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(storage_error)
+    }
+
+    pub fn get_latest_task_checkpoint(
+        &self,
+        task_id: TaskId,
+    ) -> Result<Option<CanonicalCheckpoint>, CarlError> {
+        let Some(record) = self.get_task(task_id)? else {
+            return Ok(None);
+        };
+        let Some(checkpoint_id) = record.snapshot.latest_checkpoint else {
+            return Ok(None);
+        };
+        let raw = self
+            .connection
+            .query_row(
+                "SELECT digest, checkpoint_json FROM task_checkpoints
+                 WHERE task_id = ?1 AND id = ?2",
+                params![task_id.to_string(), checkpoint_id.to_string()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .optional()
+            .map_err(storage_error)?;
+        let Some((stored_digest, Some(checkpoint_json))) = raw else {
+            return Err(storage_invariant(
+                "latest task checkpoint has no canonical payload",
+            ));
+        };
+        let checkpoint = serde_json::from_str::<CanonicalCheckpoint>(&checkpoint_json)
+            .map_err(|_| storage_invariant("latest task checkpoint is invalid"))?;
+        if checkpoint.task_id != task_id
+            || checkpoint.checkpoint_id != checkpoint_id
+            || checkpoint
+                .digest()
+                .map_err(|_| storage_invariant("latest task checkpoint is invalid"))?
+                != stored_digest
+        {
+            return Err(storage_invariant(
+                "latest task checkpoint does not match its projection",
+            ));
+        }
+        Ok(Some(checkpoint))
+    }
+
+    pub fn list_resumable_tasks(&self) -> Result<Vec<TaskRecord>, CarlError> {
+        let mut records = if let Some(cached) = self.take_validated_startup_tasks()? {
+            cached.records
+        } else {
+            #[cfg(test)]
+            self.startup_authority_scans
+                .set(self.startup_authority_scans.get().saturating_add(1));
+            let mut records = Vec::new();
+            visit_authoritative_task_records(&self.connection, |record| {
+                records.push(record);
+                Ok(())
+            })?;
+            records
+        };
+        records.retain(|record| !record.snapshot.status.is_terminal());
+        records.sort_by(|left, right| {
+            left.updated_at
+                .cmp(&right.updated_at)
+                .then_with(|| left.snapshot.task_id.cmp(&right.snapshot.task_id))
+        });
+        Ok(records)
+    }
+
+    pub fn list_tasks(&self, limit: u16) -> Result<Vec<TaskRecord>, CarlError> {
+        if !(1..=64).contains(&limit) {
+            return Err(CarlError::Validation {
+                detail: "task list limit must be between 1 and 64".to_owned(),
+            });
+        }
+        let mut records = Vec::new();
+        visit_authoritative_task_records(&self.connection, |record| {
+            records.push(record);
+            Ok(())
+        })?;
+        records.sort_by(|left, right| {
+            right
+                .updated_at
+                .cmp(&left.updated_at)
+                .then_with(|| right.snapshot.task_id.cmp(&left.snapshot.task_id))
+        });
+        records.truncate(usize::from(limit));
+        Ok(records)
+    }
+
+    fn reconcile_abandoned_task_operations(
+        &mut self,
+        startup_at: DateTime<Utc>,
+    ) -> Result<(), CarlError> {
+        let cached_records = self.take_validated_startup_tasks()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage_error)?;
+        let validation_data_version = sqlite_data_version(&transaction)?;
+        let mut records = if let Some(cached) =
+            cached_records.filter(|cached| cached.data_version == validation_data_version)
+        {
+            cached.records
+        } else {
+            #[cfg(test)]
+            self.startup_authority_scans
+                .set(self.startup_authority_scans.get().saturating_add(1));
+            let mut records = Vec::new();
+            visit_authoritative_task_records(&transaction, |record| {
+                records.push(record);
+                Ok(())
+            })?;
+            records
+        };
+        let result_digest = format!(
+            "{:x}",
+            Sha256::digest(b"carl-startup-abandoned-operation-v1")
+        );
+        for record in &mut records {
+            if record.snapshot.status.is_terminal() {
+                continue;
+            }
+            for operation_id in record.snapshot.started_operation_ids() {
+                let (updated, evidence_sequence) = append_task_event_in_transaction(
+                    &transaction,
+                    record.clone(),
+                    TaskEvent::OperationEvidenceRecorded {
+                        operation_id,
+                        result_digest: result_digest.clone(),
+                    },
+                    startup_at,
+                )?;
+                *record = updated;
+                let (updated, _) = append_task_event_in_transaction(
+                    &transaction,
+                    record.clone(),
+                    TaskEvent::OperationTransitioned {
+                        operation_id,
+                        from: OperationStatus::Started,
+                        to: OperationStatus::Uncertain,
+                        evidence_sequences: vec![evidence_sequence],
+                    },
+                    startup_at,
+                )?;
+                *record = updated;
+            }
+        }
+        transaction.commit().map_err(storage_error)?;
+        self.cache_validated_startup_tasks(records, validation_data_version)
+    }
+
+    pub fn read_task_events(&self, task_id: TaskId) -> Result<Vec<EventEnvelope>, CarlError> {
+        self.read_task_events_after(task_id, 0)
+    }
+
+    pub fn read_task_events_after(
+        &self,
+        task_id: TaskId,
+        exclusive_sequence: u64,
+    ) -> Result<Vec<EventEnvelope>, CarlError> {
+        let mut events = Vec::new();
+        let mut after_sequence = Some(exclusive_sequence);
+        loop {
+            let page = self.read_task_event_page(task_id, after_sequence, 512)?;
+            if page.is_empty() {
+                break;
+            }
+            after_sequence = page.last().map(|event| event.sequence);
+            events.extend(page);
+        }
+        Ok(events)
+    }
+
+    pub fn read_task_event_page(
+        &self,
+        task_id: TaskId,
+        after_sequence: Option<u64>,
+        limit: u16,
+    ) -> Result<Vec<EventEnvelope>, CarlError> {
+        read_task_event_page_from_connection(&self.connection, task_id, after_sequence, limit)
+    }
+
+    pub fn task_metrics(&self, task_id: TaskId) -> Result<Option<TaskMetrics>, CarlError> {
+        let transaction = self
+            .connection
+            .unchecked_transaction()
+            .map_err(storage_error)?;
+        let projection = load_task_record(&transaction, task_id)?;
+        let mut reducer = TaskMetricsReducer::new(task_id);
+        let mut after_sequence = None;
+        let mut found = false;
+        loop {
+            let page =
+                read_task_event_page_from_connection(&transaction, task_id, after_sequence, 512)?;
+            if page.is_empty() {
+                break;
+            }
+            found = true;
+            after_sequence = page.last().map(|event| event.sequence);
+            for envelope in &page {
+                reducer.push(envelope).map_err(task_metrics_error)?;
+            }
+        }
+        let metrics = match (found, projection) {
+            (false, None) => Ok(None),
+            (false, Some(_)) | (true, None) => {
+                Err(storage_invariant("task metrics authority is incomplete"))
+            }
+            (true, Some(projection)) => reducer
+                .finish(&projection.snapshot)
+                .map(Some)
+                .map_err(task_metrics_error),
+        }?;
+        transaction.commit().map_err(storage_error)?;
+        Ok(metrics)
     }
 
     pub fn set_session_delegate_settings(
@@ -3207,6 +4777,7 @@ impl RuntimeStore {
             ));
         }
         reconcile_runtime_artifacts(&mut store, &artifacts)?;
+        store.reconcile_abandoned_task_operations(startup_at)?;
         let startup_recoveries = store
             .interrupt_abandoned_subscription_runs(startup_at)?
             .into_iter()
@@ -3223,6 +4794,69 @@ impl RuntimeStore {
     #[must_use]
     pub fn store(&self) -> &Store {
         &self.store
+    }
+
+    pub(crate) fn open_peer_store(&self) -> Result<Store, CarlError> {
+        let path = self
+            .store
+            .connection
+            .path()
+            .ok_or_else(|| storage_invariant("runtime database path is unavailable"))?;
+        let connection = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(storage_error)?;
+        connection
+            .busy_timeout(BUSY_TIMEOUT)
+            .map_err(storage_error)?;
+        connection
+            .pragma_update(None, "query_only", true)
+            .map_err(storage_error)?;
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .map_err(storage_error)?;
+        let journal_mode = connection
+            .pragma_query_value(None, "journal_mode", |row| row.get::<_, String>(0))
+            .map_err(storage_error)?;
+        if !journal_mode.eq_ignore_ascii_case("wal") {
+            return Err(storage_invariant(
+                "runtime peer requires the owner's WAL database",
+            ));
+        }
+        if connection
+            .prepare("PRAGMA foreign_key_check")
+            .map_err(storage_error)?
+            .exists([])
+            .map_err(storage_error)?
+        {
+            return Err(storage_invariant(
+                "database contains a foreign key violation for the runtime peer",
+            ));
+        }
+        let validation_data_version = sqlite_data_version(&connection)?;
+        let validated_tasks = validate_task_projection_completeness(&connection)?;
+        validate_task_canonical_payloads(&connection)?;
+        let validated_startup_tasks = (sqlite_data_version(&connection)?
+            == validation_data_version)
+            .then(|| ValidatedStartupTasks {
+                records: validated_tasks,
+                data_version: validation_data_version,
+                total_changes: connection.total_changes(),
+            });
+        Ok(Store {
+            connection,
+            authenticated_checkpoint_authority: BTreeMap::new(),
+            validated_startup_tasks: RefCell::new(validated_startup_tasks),
+            #[cfg(test)]
+            checkpoint_authority_full_validations: Cell::new(0),
+            #[cfg(test)]
+            checkpoint_authority_incremental_validations: Cell::new(0),
+            #[cfg(test)]
+            checkpoint_full_prefix_scans: Cell::new(0),
+            #[cfg(test)]
+            startup_authority_scans: Cell::new(1),
+        })
     }
 
     #[must_use]
@@ -3493,23 +5127,22 @@ fn reconcile_runtime_artifacts(
     artifacts
         .retain_only(&referenced)
         .map_err(artifact_storage_error)?;
-    transaction
-        .execute(
-            "DELETE FROM artifact_objects
-             WHERE id NOT IN (
-                 SELECT manifest_artifact_id FROM subscription_run_baselines
-                 UNION
-                 SELECT source_preconditions_artifact_id FROM subscription_run_baselines
-                 UNION
-                 SELECT content_artifact_id FROM subscription_run_baseline_entries
-                 UNION
-                 SELECT proposal_artifact_id FROM subscription_run_proposals
-                 UNION
-                 SELECT payload_sha256 FROM subscription_run_proposals
-             )",
-            [],
-        )
+    let registered = transaction
+        .prepare("SELECT id FROM artifact_objects ORDER BY id")
+        .map_err(storage_error)?
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(storage_error)?
+        .collect::<Result<Vec<_>, _>>()
         .map_err(storage_error)?;
+    for identifier in registered {
+        let artifact_id = ArtifactId::parse(&identifier)
+            .map_err(|_| storage_invariant("registered artifact identifier is invalid"))?;
+        if !referenced.contains(&artifact_id) {
+            transaction
+                .execute("DELETE FROM artifact_objects WHERE id = ?1", [identifier])
+                .map_err(storage_error)?;
+        }
+    }
     transaction.commit().map_err(storage_error)
 }
 
@@ -3533,13 +5166,46 @@ fn referenced_artifact_ids(connection: &Connection) -> Result<HashSet<ArtifactId
         .map_err(storage_error)?
         .collect::<Result<Vec<_>, _>>()
         .map_err(storage_error)?;
-    identifiers
+    let mut referenced = identifiers
         .into_iter()
         .map(|identifier| {
             ArtifactId::parse(identifier)
                 .map_err(|_| storage_invariant("durable artifact identifier is invalid"))
         })
-        .collect()
+        .collect::<Result<HashSet<_>, _>>()?;
+    let checkpoints = connection
+        .prepare(
+            "SELECT checkpoint_json, digest
+             FROM task_checkpoints
+             WHERE checkpoint_json IS NOT NULL
+             ORDER BY task_id, event_sequence",
+        )
+        .map_err(storage_error)?
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(storage_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(storage_error)?;
+    for (checkpoint_json, stored_digest) in checkpoints {
+        let checkpoint = serde_json::from_str::<CanonicalCheckpoint>(&checkpoint_json)
+            .map_err(|_| storage_invariant("stored canonical checkpoint is invalid"))?;
+        let canonical_digest = checkpoint
+            .digest()
+            .map_err(|_| storage_invariant("stored canonical checkpoint is invalid"))?;
+        if canonical_digest != stored_digest {
+            return Err(storage_invariant(
+                "stored canonical checkpoint digest does not match",
+            ));
+        }
+        for digest in checkpoint.artifact_digests() {
+            referenced.insert(
+                ArtifactId::parse(digest)
+                    .map_err(|_| storage_invariant("checkpoint artifact identifier is invalid"))?,
+            );
+        }
+    }
+    Ok(referenced)
 }
 
 impl Deref for RuntimeStore {
@@ -5092,6 +6758,1896 @@ fn stored_u64(value: i64, kind: &str) -> Result<u64, CarlError> {
     u64::try_from(value).map_err(|_| storage_invariant(&format!("stored {kind} is invalid")))
 }
 
+fn sqlite_data_version(connection: &Connection) -> Result<i64, CarlError> {
+    connection
+        .pragma_query_value(None, "data_version", |row| row.get(0))
+        .map_err(storage_error)
+}
+
+fn validate_checkpoint_input(input: &NewCheckpoint) -> Result<(), CarlError> {
+    if input.checkpoint.task_id != input.task_id
+        || input.context_package.checkpoint_id != input.checkpoint.checkpoint_id
+        || input.context_package.source_sequence_start != input.checkpoint.source_sequence_start
+        || input.context_package.source_sequence_end != input.checkpoint.source_sequence_end
+    {
+        return Err(checkpoint_validation(
+            "checkpoint and context package metadata do not match",
+        ));
+    }
+    let checkpoint_digest = input
+        .checkpoint
+        .digest()
+        .map_err(checkpoint_validation_error)?;
+    if checkpoint_digest != input.checkpoint_digest {
+        return Err(checkpoint_validation(
+            "canonical checkpoint digest does not match",
+        ));
+    }
+    let package_digest = input
+        .context_package
+        .digest()
+        .map_err(context_validation_error)?;
+    if package_digest != input.context_package_digest {
+        return Err(checkpoint_validation(
+            "canonical context package digest does not match",
+        ));
+    }
+    Ok(())
+}
+
+fn authenticated_checkpoint_matches_database(
+    transaction: &Transaction<'_>,
+    current: &TaskRecord,
+    authority: &AuthenticatedCheckpointAuthority,
+) -> Result<bool, CarlError> {
+    let Some(checkpoint_id) = current.snapshot.latest_checkpoint else {
+        return Ok(false);
+    };
+    if checkpoint_id != authority.checkpoint_id || current.snapshot.task_id != authority.task_id {
+        return Ok(false);
+    }
+    let stored = transaction
+        .query_row(
+            "SELECT digest, checkpoint_json
+             FROM task_checkpoints
+             WHERE task_id = ?1 AND id = ?2",
+            params![
+                current.snapshot.task_id.to_string(),
+                checkpoint_id.to_string()
+            ],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+        )
+        .optional()
+        .map_err(storage_error)?;
+    let Some((stored_digest, Some(checkpoint_json))) = stored else {
+        return Ok(false);
+    };
+    let raw_digest = format!("{:x}", Sha256::digest(checkpoint_json.as_bytes()));
+    Ok(stored_digest == authority.digest && raw_digest == authority.digest)
+}
+
+fn validate_checkpoint_authority(
+    transaction: &Transaction<'_>,
+    current: &TaskRecord,
+    configuration: &TaskConfigurationRecord,
+    checkpoint: &CanonicalCheckpoint,
+) -> Result<ValidatedCheckpointAuthority, CarlError> {
+    validate_checkpoint_authority_from_anchor(transaction, current, configuration, checkpoint, None)
+}
+
+fn validate_checkpoint_authority_incremental(
+    transaction: &Transaction<'_>,
+    current: &TaskRecord,
+    checkpoint: &CanonicalCheckpoint,
+    authority: &AuthenticatedCheckpointAuthority,
+) -> Result<ValidatedCheckpointAuthority, CarlError> {
+    if checkpoint.previous_digest.as_deref() != Some(authority.digest.as_str())
+        || checkpoint.source_sequence_start != authority.source_sequence_start
+    {
+        return Err(checkpoint_validation(
+            "checkpoint does not extend its authenticated authority",
+        ));
+    }
+    validate_checkpoint_authority_from_anchor(
+        transaction,
+        current,
+        &authority.configuration,
+        checkpoint,
+        Some(authority),
+    )
+}
+
+struct ValidatedCheckpointAuthority {
+    task_snapshot: TaskSnapshot,
+    configuration: TaskConfigurationRecord,
+}
+
+fn validate_checkpoint_authority_from_anchor(
+    transaction: &Transaction<'_>,
+    current: &TaskRecord,
+    configuration: &TaskConfigurationRecord,
+    checkpoint: &CanonicalCheckpoint,
+    anchor: Option<&AuthenticatedCheckpointAuthority>,
+) -> Result<ValidatedCheckpointAuthority, CarlError> {
+    let mut observed_total_tokens = anchor.and_then(|authority| authority.observed_total_tokens);
+    let mut observed_context_window =
+        anchor.and_then(|authority| authority.observed_context_window);
+    let mut journal_operations = anchor.map_or_else(BTreeMap::new, |authority| {
+        authority
+            .operations
+            .iter()
+            .map(|operation| {
+                (
+                    operation.operation_id,
+                    JournalOperationState {
+                        status: operation.status,
+                        effect_class: operation.effect_class,
+                        request_digest: operation.request_digest.clone(),
+                        last_transition_sequence: authority.source_sequence_end,
+                        evidence: OperationEvidenceState::from_consumed(
+                            operation.evidence_sequences.clone(),
+                        ),
+                    },
+                )
+            })
+            .collect()
+    });
+    let mut replayed_snapshot = anchor.map(|authority| authority.task_snapshot.as_ref().clone());
+    let mut replayed_configuration = anchor.map(|authority| authority.configuration.clone());
+    let mut replayed_control_markers = Vec::new();
+    let mut after_sequence = anchor.map(|authority| authority.source_sequence_end);
+    let mut last_tail_sequence = after_sequence;
+    loop {
+        let page = match anchor {
+            Some(authority) => read_task_event_page_for_known_session_from_connection(
+                transaction,
+                authority.task_snapshot.session_id,
+                checkpoint.task_id,
+                after_sequence,
+                512,
+            )?,
+            None => read_task_event_page_from_connection(
+                transaction,
+                checkpoint.task_id,
+                after_sequence,
+                512,
+            )?,
+        };
+        if page.is_empty() {
+            break;
+        }
+        for envelope in &page {
+            if let Some(snapshot) = replayed_snapshot.take() {
+                replayed_snapshot =
+                    Some(reduce_task(Some(snapshot), envelope).map_err(task_replay_error)?);
+                replay_task_child_projections(
+                    &mut replayed_configuration,
+                    &mut replayed_control_markers,
+                    envelope,
+                )?;
+            }
+            let Event::TaskLifecycle { event, .. } = &envelope.event else {
+                return Err(storage_invariant(
+                    "task event page returned a non-task event",
+                ));
+            };
+            match event {
+                TaskEvent::UsageObserved {
+                    total_tokens,
+                    context_window,
+                    ..
+                } => {
+                    observed_total_tokens = Some(*total_tokens);
+                    if context_window.is_some() {
+                        observed_context_window = *context_window;
+                    }
+                }
+                TaskEvent::OperationIntentRecorded {
+                    operation_id,
+                    effect_class,
+                    request_digest,
+                    ..
+                } => {
+                    if journal_operations
+                        .insert(
+                            *operation_id,
+                            JournalOperationState {
+                                status: OperationStatus::IntentRecorded,
+                                effect_class: *effect_class,
+                                request_digest: request_digest.clone(),
+                                last_transition_sequence: envelope.sequence,
+                                evidence: OperationEvidenceState::default(),
+                            },
+                        )
+                        .is_some()
+                    {
+                        return Err(storage_invariant(
+                            "task journal contains a duplicate operation",
+                        ));
+                    }
+                }
+                TaskEvent::OperationTransitioned {
+                    operation_id,
+                    from,
+                    to,
+                    evidence_sequences,
+                } => {
+                    let operation = journal_operations.get_mut(operation_id).ok_or_else(|| {
+                        storage_invariant("task journal operation transition has no intent")
+                    })?;
+                    operation
+                        .evidence
+                        .transition(
+                            operation.status,
+                            *from,
+                            *to,
+                            operation.last_transition_sequence,
+                            envelope.sequence,
+                            evidence_sequences,
+                        )
+                        .map_err(|_| {
+                            storage_invariant(
+                                "task journal operation transition has invalid evidence",
+                            )
+                        })?;
+                    operation.status = *to;
+                    operation.last_transition_sequence = envelope.sequence;
+                }
+                TaskEvent::OperationEvidenceRecorded { operation_id, .. } => {
+                    let operation = journal_operations.get_mut(operation_id).ok_or_else(|| {
+                        storage_invariant("task journal operation evidence has no intent")
+                    })?;
+                    operation
+                        .evidence
+                        .record(
+                            operation.status,
+                            operation.last_transition_sequence,
+                            envelope.sequence,
+                        )
+                        .map_err(|_| {
+                            storage_invariant("task journal operation evidence is invalid")
+                        })?;
+                }
+                _ => {}
+            }
+        }
+        after_sequence = page.last().map(|event| event.sequence);
+        last_tail_sequence = after_sequence;
+    }
+    if last_tail_sequence != Some(checkpoint.source_sequence_end) {
+        return Err(checkpoint_validation(
+            "checkpoint authority tail is incomplete",
+        ));
+    }
+    let (authoritative_snapshot, authoritative_configuration) = if let Some(replayed_snapshot) =
+        replayed_snapshot
+    {
+        let replayed_configuration = replayed_configuration
+            .ok_or_else(|| storage_invariant("incremental task configuration is missing"))?;
+        if replayed_snapshot != current.snapshot {
+            return Err(storage_invariant(
+                "task projection disagrees with authenticated journal tail replay",
+            ));
+        }
+        let stored_configuration = load_task_configuration_record(transaction, checkpoint.task_id)?
+            .ok_or_else(|| storage_invariant("task configuration projection is missing"))?;
+        if replayed_configuration != stored_configuration {
+            return Err(storage_invariant(
+                "task configuration projection disagrees with authenticated journal tail replay",
+            ));
+        }
+        (replayed_snapshot, replayed_configuration)
+    } else {
+        (current.snapshot.clone(), configuration.clone())
+    };
+    if authoritative_snapshot.active_epoch.is_some()
+        || authoritative_snapshot.has_unresolved_operations()
+    {
+        return Err(checkpoint_validation(
+            "checkpoint requires an authoritative safe boundary",
+        ));
+    }
+    if checkpoint.contract != authoritative_snapshot.contract
+        || checkpoint.provider.context_id != authoritative_snapshot.provider_context
+    {
+        return Err(checkpoint_validation(
+            "checkpoint contract or provider context does not match the authoritative journal",
+        ));
+    }
+    if checkpoint.provider.provider != "codex"
+        || checkpoint.provider.model != authoritative_configuration.active_model.as_str()
+        || checkpoint.provider.effort != authoritative_configuration.active_effort.as_codex_value()
+    {
+        return Err(checkpoint_validation(
+            "checkpoint provider metadata does not match the authoritative journal",
+        ));
+    }
+    if checkpoint.provider.observed_total_tokens != observed_total_tokens
+        || checkpoint.provider.observed_context_window != observed_context_window
+    {
+        return Err(checkpoint_validation(
+            "checkpoint usage metadata does not match the task journal",
+        ));
+    }
+
+    let mut checkpoint_operations = checkpoint
+        .operations
+        .iter()
+        .map(|operation| {
+            (
+                operation.operation_id,
+                operation.status,
+                operation.effect_class,
+                operation.request_digest.clone(),
+                operation.evidence_sequences.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    checkpoint_operations.sort_by_key(|operation| operation.0);
+    let authoritative_operations = journal_operations
+        .into_iter()
+        .map(|(operation_id, operation)| {
+            (
+                operation_id,
+                operation.status,
+                operation.effect_class,
+                operation.request_digest,
+                operation.evidence.consumed_sequences().to_vec(),
+            )
+        })
+        .collect::<Vec<_>>();
+    if checkpoint_operations != authoritative_operations {
+        return Err(checkpoint_validation(
+            "checkpoint operations do not match the authoritative projection",
+        ));
+    }
+
+    let expected_generation = match anchor {
+        Some(anchor) => anchor
+            .compaction_generation
+            .checked_add(1)
+            .ok_or_else(|| checkpoint_validation("checkpoint generation overflowed"))?,
+        None => match current.snapshot.latest_checkpoint {
+            None => 0,
+            Some(checkpoint_id) => {
+                let json = transaction
+                    .query_row(
+                        "SELECT checkpoint_json
+                     FROM task_checkpoints
+                     WHERE task_id = ?1 AND id = ?2",
+                        params![checkpoint.task_id.to_string(), checkpoint_id.to_string()],
+                        |row| row.get::<_, Option<String>>(0),
+                    )
+                    .map_err(storage_error)?
+                    .ok_or_else(|| {
+                        checkpoint_validation("previous checkpoint has no canonical payload")
+                    })?;
+                let previous =
+                    serde_json::from_str::<CanonicalCheckpoint>(&json).map_err(|_| {
+                        checkpoint_validation("previous canonical checkpoint is invalid")
+                    })?;
+                previous
+                    .compaction_generation
+                    .checked_add(1)
+                    .ok_or_else(|| checkpoint_validation("checkpoint generation overflowed"))?
+            }
+        },
+    };
+    if checkpoint.compaction_generation != expected_generation {
+        return Err(checkpoint_validation(
+            "checkpoint generation does not match durable history",
+        ));
+    }
+    Ok(ValidatedCheckpointAuthority {
+        task_snapshot: authoritative_snapshot,
+        configuration: authoritative_configuration,
+    })
+}
+
+struct JournalOperationState {
+    status: OperationStatus,
+    effect_class: EffectClass,
+    request_digest: String,
+    last_transition_sequence: u64,
+    evidence: OperationEvidenceState,
+}
+
+fn validate_checkpoint_history(
+    transaction: &Transaction<'_>,
+    current: &TaskRecord,
+    input: &NewCheckpoint,
+) -> Result<(), CarlError> {
+    let task_id = input.task_id.to_string();
+    let bounds = transaction
+        .query_row(
+            "SELECT MIN(sequence), MAX(sequence)
+             FROM events
+             WHERE session_id = ?1
+               AND json_extract(event_json, '$.type') = 'task_lifecycle'
+               AND json_extract(event_json, '$.task_id') = ?2",
+            params![current.snapshot.session_id.to_string(), task_id],
+            |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?)),
+        )
+        .map_err(storage_error)?;
+    let (Some(start), Some(end)) = bounds else {
+        return Err(storage_invariant(
+            "checkpoint task has no authoritative journal",
+        ));
+    };
+    let start = stored_u64(start, "checkpoint source start")?;
+    let end = stored_u64(end, "checkpoint source end")?;
+    if input.checkpoint.source_sequence_start != start
+        || input.checkpoint.source_sequence_end != end
+    {
+        return Err(checkpoint_validation(
+            "checkpoint source range does not match the task journal",
+        ));
+    }
+
+    let expected_previous = current
+        .snapshot
+        .latest_checkpoint
+        .map(|checkpoint_id| {
+            transaction
+                .query_row(
+                    "SELECT digest
+                     FROM task_checkpoints
+                     WHERE task_id = ?1 AND id = ?2",
+                    params![input.task_id.to_string(), checkpoint_id.to_string()],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(storage_error)?
+                .ok_or_else(|| storage_invariant("latest task checkpoint projection is missing"))
+        })
+        .transpose()?;
+    if input.checkpoint.previous_digest != expected_previous {
+        return Err(checkpoint_validation(
+            "checkpoint previous digest does not match durable history",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_checkpoint_artifacts(
+    transaction: &Connection,
+    checkpoint: &CanonicalCheckpoint,
+) -> Result<(), CarlError> {
+    for digest in checkpoint.artifact_digests() {
+        let registered = transaction
+            .query_row(
+                "SELECT 1 FROM artifact_objects WHERE id = ?1",
+                [&digest],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(storage_error)?;
+        if registered.is_none() {
+            return Err(checkpoint_validation(
+                "checkpoint references an unknown artifact",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_task_canonical_payloads(connection: &Connection) -> Result<(), CarlError> {
+    validate_task_canonical_payloads_filtered(connection, None)
+}
+
+fn validate_task_canonical_payloads_filtered(
+    connection: &Connection,
+    task_id: Option<TaskId>,
+) -> Result<(), CarlError> {
+    let task_id = task_id.map(|task_id| task_id.to_string());
+    let rows = connection
+        .prepare(
+            "SELECT checkpoint.id, checkpoint.task_id, checkpoint.digest,
+                    checkpoint.event_sequence, checkpoint.checkpoint_json,
+                    package.id, package.generation, package.event_sequence,
+                    package.package_json
+             FROM task_checkpoints AS checkpoint
+             LEFT JOIN task_context_packages AS package
+               ON package.task_id = checkpoint.task_id
+              AND package.checkpoint_id = checkpoint.id
+             WHERE (?1 IS NULL OR checkpoint.task_id = ?1)
+               AND (
+                   checkpoint.checkpoint_json IS NOT NULL
+                   OR package.package_json IS NOT NULL
+               )
+             ORDER BY checkpoint.task_id, checkpoint.event_sequence, package.generation",
+        )
+        .map_err(storage_error)?
+        .query_map([task_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<i64>>(6)?,
+                row.get::<_, Option<i64>>(7)?,
+                row.get::<_, Option<String>>(8)?,
+            ))
+        })
+        .map_err(storage_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(storage_error)?;
+
+    for (
+        checkpoint_id,
+        task_id,
+        stored_digest,
+        checkpoint_event_sequence,
+        checkpoint_json,
+        package_id,
+        package_generation,
+        package_event_sequence,
+        package_json,
+    ) in rows
+    {
+        let (
+            Some(checkpoint_json),
+            Some(package_id),
+            Some(package_generation),
+            Some(package_event_sequence),
+            Some(package_json),
+        ) = (
+            checkpoint_json,
+            package_id,
+            package_generation,
+            package_event_sequence,
+            package_json,
+        )
+        else {
+            return Err(storage_invariant(
+                "canonical checkpoint and context package are not atomic",
+            ));
+        };
+        let checkpoint = serde_json::from_str::<CanonicalCheckpoint>(&checkpoint_json)
+            .map_err(|_| storage_invariant("stored canonical checkpoint is invalid"))?;
+        let context_package = serde_json::from_str::<ContextPackage>(&package_json)
+            .map_err(|_| storage_invariant("stored canonical context package is invalid"))?;
+        let stored_task_id = task_id
+            .parse::<TaskId>()
+            .map_err(|_| storage_invariant("stored checkpoint task identifier is invalid"))?;
+        let stored_checkpoint_id = checkpoint_id
+            .parse()
+            .map_err(|_| storage_invariant("stored checkpoint identifier is invalid"))?;
+        let stored_package_id = package_id
+            .parse()
+            .map_err(|_| storage_invariant("stored context package identifier is invalid"))?;
+        let stored_generation = u32::try_from(stored_u64(
+            package_generation,
+            "context package generation",
+        )?)
+        .map_err(|_| storage_invariant("stored context package generation is too large"))?;
+        if checkpoint.task_id != stored_task_id
+            || checkpoint.checkpoint_id != stored_checkpoint_id
+            || context_package.package_id != stored_package_id
+            || context_package.checkpoint_id != stored_checkpoint_id
+            || checkpoint.compaction_generation != stored_generation
+            || package_event_sequence != checkpoint_event_sequence
+            || context_package.source_sequence_start != checkpoint.source_sequence_start
+            || context_package.source_sequence_end != checkpoint.source_sequence_end
+        {
+            return Err(storage_invariant(
+                "stored canonical checkpoint metadata is inconsistent",
+            ));
+        }
+        let checkpoint_bytes = checkpoint
+            .canonical_bytes()
+            .map_err(|_| storage_invariant("stored canonical checkpoint is invalid"))?;
+        let canonical_digest = format!("{:x}", Sha256::digest(&checkpoint_bytes));
+        if checkpoint_bytes != checkpoint_json.as_bytes() || canonical_digest != stored_digest {
+            return Err(storage_invariant(
+                "stored canonical checkpoint bytes or digest do not match",
+            ));
+        }
+        let package_bytes = context_package
+            .canonical_bytes()
+            .map_err(|_| storage_invariant("stored canonical context package is invalid"))?;
+        if package_bytes != package_json.as_bytes() {
+            return Err(storage_invariant(
+                "stored canonical context package bytes do not match",
+            ));
+        }
+        validate_canonical_source_bounds(
+            connection,
+            &checkpoint,
+            checkpoint_event_sequence,
+            &canonical_digest,
+        )?;
+        let expected_previous = connection
+            .query_row(
+                "SELECT digest
+                 FROM task_checkpoints
+                 WHERE task_id = ?1 AND event_sequence < ?2
+                 ORDER BY event_sequence DESC
+                 LIMIT 1",
+                params![task_id, checkpoint_event_sequence],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(storage_error)?;
+        if checkpoint.previous_digest != expected_previous {
+            return Err(storage_invariant(
+                "stored canonical checkpoint previous digest does not match",
+            ));
+        }
+        validate_checkpoint_artifacts(connection, &checkpoint).map_err(|_| {
+            storage_invariant("stored canonical checkpoint references an unknown artifact")
+        })?;
+    }
+    Ok(())
+}
+
+fn validate_canonical_source_bounds(
+    connection: &Connection,
+    checkpoint: &CanonicalCheckpoint,
+    checkpoint_event_sequence: i64,
+    canonical_digest: &str,
+) -> Result<(), CarlError> {
+    let bounds = connection
+        .query_row(
+            "SELECT MIN(sequence), MAX(sequence)
+             FROM events
+             WHERE json_extract(event_json, '$.type') = 'task_lifecycle'
+               AND json_extract(event_json, '$.task_id') = ?1
+               AND sequence < ?2",
+            params![checkpoint.task_id.to_string(), checkpoint_event_sequence],
+            |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?)),
+        )
+        .map_err(storage_error)?;
+    let (Some(start), Some(end)) = bounds else {
+        return Err(storage_invariant(
+            "stored canonical checkpoint has no source journal",
+        ));
+    };
+    if checkpoint.source_sequence_start != stored_u64(start, "checkpoint source start")?
+        || checkpoint.source_sequence_end != stored_u64(end, "checkpoint source end")?
+    {
+        return Err(storage_invariant(
+            "stored canonical checkpoint source range does not match the journal",
+        ));
+    }
+    let committed = connection
+        .query_row(
+            "SELECT 1
+             FROM events
+             WHERE sequence = ?1
+               AND json_extract(event_json, '$.type') = 'task_lifecycle'
+               AND json_extract(event_json, '$.task_id') = ?2
+               AND json_extract(event_json, '$.event.task_event') = 'checkpoint_committed'
+               AND json_extract(event_json, '$.event.checkpoint_id') = ?3
+               AND json_extract(event_json, '$.event.digest') = ?4",
+            params![
+                checkpoint_event_sequence,
+                checkpoint.task_id.to_string(),
+                checkpoint.checkpoint_id.to_string(),
+                canonical_digest,
+            ],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(storage_error)?;
+    if committed.is_none() {
+        return Err(storage_invariant(
+            "stored canonical checkpoint has no matching journal event",
+        ));
+    }
+    Ok(())
+}
+
+fn checkpoint_validation_error(_error: crate::runtime::task::CheckpointError) -> CarlError {
+    checkpoint_validation("canonical checkpoint is invalid")
+}
+
+fn context_validation_error(_error: crate::runtime::task::ContextError) -> CarlError {
+    checkpoint_validation("canonical context package is invalid")
+}
+
+fn checkpoint_validation(detail: &str) -> CarlError {
+    CarlError::Validation {
+        detail: detail.to_owned(),
+    }
+}
+
+fn checkpoint_fallback_authority_error(error: CarlError) -> CarlError {
+    match error {
+        CarlError::Storage { detail } if detail.ends_with("disagrees with journal replay") => {
+            CarlError::Validation { detail }
+        }
+        error => error,
+    }
+}
+
+fn insert_task_projection(
+    transaction: &Transaction<'_>,
+    snapshot: &TaskSnapshot,
+    workspace: &Path,
+    model: &ModelId,
+    effort: ReasoningEffort,
+    permission_mode: PermissionMode,
+    created_at: DateTime<Utc>,
+) -> Result<(), CarlError> {
+    let workspace = workspace.to_str().ok_or_else(|| CarlError::Validation {
+        detail: "task workspace is not UTF-8".to_owned(),
+    })?;
+    let contract_json = serde_json::to_string(&snapshot.contract).map_err(storage_error)?;
+    let budget_json = serde_json::to_string(&snapshot.budget).map_err(storage_error)?;
+    let snapshot_json = serde_json::to_string(snapshot).map_err(storage_error)?;
+    transaction
+        .execute(
+            "INSERT INTO agent_tasks (
+                id, session_id, status, contract_json, budget_json, snapshot_json,
+                canonical_workspace, provider, model, effort, permission_mode,
+                revision, current_epoch_id, latest_checkpoint_id, provider_context,
+                created_at, updated_at
+             ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, 'codex', ?8, ?9, ?10,
+                ?11, NULL, NULL, NULL, ?12, ?12
+             )",
+            params![
+                snapshot.task_id.to_string(),
+                snapshot.session_id.to_string(),
+                task_status_str(snapshot.status),
+                contract_json,
+                budget_json,
+                snapshot_json,
+                workspace,
+                model.as_str(),
+                effort.as_codex_value(),
+                stored_permission_mode(permission_mode),
+                revision_to_sql(snapshot.revision)?,
+                format_timestamp(created_at),
+            ],
+        )
+        .map_err(storage_error)?;
+    transaction
+        .execute(
+            "INSERT INTO task_configuration_state (
+                task_id, active_model, active_effort, active_permission_mode,
+                effective_permission_mode
+             ) VALUES (?1, ?2, ?3, ?4, ?4)",
+            params![
+                snapshot.task_id.to_string(),
+                model.as_str(),
+                effort.as_codex_value(),
+                permission_mode.as_wire_str(),
+            ],
+        )
+        .map_err(storage_error)?;
+    Ok(())
+}
+
+fn update_task_projection(
+    transaction: &Transaction<'_>,
+    snapshot: &TaskSnapshot,
+    updated_at: DateTime<Utc>,
+) -> Result<(), CarlError> {
+    let changed = transaction
+        .execute(
+            "UPDATE agent_tasks SET
+                status = ?2,
+                contract_json = ?3,
+                budget_json = ?4,
+                snapshot_json = ?5,
+                revision = ?6,
+                current_epoch_id = ?7,
+                latest_checkpoint_id = ?8,
+                provider_context = ?9,
+                updated_at = ?10
+             WHERE id = ?1 AND revision = ?11",
+            params![
+                snapshot.task_id.to_string(),
+                task_status_str(snapshot.status),
+                serde_json::to_string(&snapshot.contract).map_err(storage_error)?,
+                serde_json::to_string(&snapshot.budget).map_err(storage_error)?,
+                serde_json::to_string(snapshot).map_err(storage_error)?,
+                revision_to_sql(snapshot.revision)?,
+                snapshot.active_epoch.map(|id| id.to_string()),
+                snapshot.latest_checkpoint.map(|id| id.to_string()),
+                snapshot.provider_context.as_deref(),
+                format_timestamp(updated_at),
+                revision_to_sql(snapshot.revision.saturating_sub(1))?,
+            ],
+        )
+        .map_err(storage_error)?;
+    if changed != 1 {
+        return Err(storage_invariant(
+            "task projection revision changed during transactional append",
+        ));
+    }
+    Ok(())
+}
+
+fn apply_task_child_projection(
+    transaction: &Transaction<'_>,
+    task_id: TaskId,
+    envelope: &EventEnvelope,
+    _snapshot: &TaskSnapshot,
+) -> Result<(), CarlError> {
+    let Event::TaskLifecycle { event, .. } = &envelope.event else {
+        return Err(storage_invariant(
+            "task projection received a non-task event",
+        ));
+    };
+    let task_id = task_id.to_string();
+    let event_sequence = revision_to_sql(envelope.sequence)?;
+    let timestamp = format_timestamp(envelope.timestamp);
+    match event {
+        TaskEvent::EpochStarted {
+            epoch_id,
+            objective,
+        } => {
+            transaction
+                .execute(
+                    "INSERT INTO task_epochs (
+                        id, task_id, objective, status, started_sequence,
+                        finished_sequence, report_digest, created_at, updated_at
+                     ) VALUES (?1, ?2, ?3, 'active', ?4, NULL, NULL, ?5, ?5)",
+                    params![
+                        epoch_id.to_string(),
+                        task_id,
+                        objective,
+                        event_sequence,
+                        timestamp,
+                    ],
+                )
+                .map_err(storage_error)?;
+        }
+        TaskEvent::EpochFinished {
+            epoch_id,
+            report_digest,
+        } => {
+            let changed = transaction
+                .execute(
+                    "UPDATE task_epochs
+                     SET status = 'finished', finished_sequence = ?3,
+                         report_digest = ?4, updated_at = ?5
+                     WHERE id = ?1 AND task_id = ?2 AND status = 'active'",
+                    params![
+                        epoch_id.to_string(),
+                        task_id,
+                        event_sequence,
+                        report_digest,
+                        timestamp,
+                    ],
+                )
+                .map_err(storage_error)?;
+            require_projection_change(changed, "active task epoch projection is missing")?;
+        }
+        TaskEvent::EpochInterrupted { epoch_id, reason } => {
+            let changed = transaction
+                .execute(
+                    "UPDATE task_epochs
+                     SET status = 'interrupted', finished_sequence = ?3,
+                         report_digest = NULL, updated_at = ?4
+                     WHERE id = ?1 AND task_id = ?2 AND status = 'active'",
+                    params![epoch_id.to_string(), task_id, event_sequence, timestamp],
+                )
+                .map_err(storage_error)?;
+            require_projection_change(
+                changed,
+                "active interrupted task epoch projection is missing",
+            )?;
+            transaction
+                .execute(
+                    "INSERT INTO task_epoch_interruptions (
+                        task_id, epoch_id, reason, event_sequence, interrupted_at
+                     ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        task_id,
+                        epoch_id.to_string(),
+                        epoch_interrupt_reason_str(*reason),
+                        event_sequence,
+                        timestamp,
+                    ],
+                )
+                .map_err(storage_error)?;
+        }
+        TaskEvent::ConfigurationQueued {
+            control_id,
+            model,
+            effort,
+            permission_mode,
+        } => {
+            let effective = transaction
+                .query_row(
+                    "SELECT effective_permission_mode FROM task_configuration_state
+                     WHERE task_id = ?1",
+                    [&task_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .map_err(storage_error)?;
+            let effective_mode = effective
+                .parse::<PermissionMode>()
+                .map_err(|_| invalid_stored_value("effective task permission mode", &effective))?;
+            let effective_mode =
+                if permission_strength(*permission_mode) < permission_strength(effective_mode) {
+                    *permission_mode
+                } else {
+                    effective_mode
+                };
+            let changed = transaction
+                .execute(
+                    "UPDATE task_configuration_state
+                     SET pending_control_id = ?2, pending_model = ?3,
+                         pending_effort = ?4, pending_permission_mode = ?5,
+                         effective_permission_mode = ?6, queued_sequence = ?7
+                     WHERE task_id = ?1",
+                    params![
+                        task_id,
+                        control_id,
+                        model.as_str(),
+                        effort.as_codex_value(),
+                        permission_mode.as_wire_str(),
+                        effective_mode.as_wire_str(),
+                        event_sequence,
+                    ],
+                )
+                .map_err(storage_error)?;
+            require_projection_change(changed, "task configuration projection is missing")?;
+            transaction
+                .execute(
+                    "INSERT INTO service_configuration_controls (
+                        task_id, control_id, event_sequence
+                     ) VALUES (?1, ?2, ?3)",
+                    params![task_id, control_id, event_sequence],
+                )
+                .map_err(storage_error)?;
+        }
+        TaskEvent::ConfigurationApplied { control_id } => {
+            let changed = transaction
+                .execute(
+                    "UPDATE task_configuration_state
+                     SET active_model = pending_model, active_effort = pending_effort,
+                         active_permission_mode = pending_permission_mode,
+                         effective_permission_mode = pending_permission_mode,
+                         pending_control_id = NULL, pending_model = NULL,
+                         pending_effort = NULL, pending_permission_mode = NULL,
+                         queued_sequence = NULL, applied_sequence = ?3
+                     WHERE task_id = ?1 AND pending_control_id = ?2",
+                    params![task_id, control_id, event_sequence],
+                )
+                .map_err(storage_error)?;
+            require_projection_change(
+                changed,
+                "queued task configuration control identity is missing",
+            )?;
+        }
+        TaskEvent::ControlRequested { control_id, kind } => {
+            transaction
+                .execute(
+                    "INSERT INTO task_control_markers (
+                        task_id, control_id, kind, event_sequence, created_at
+                     ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        task_id,
+                        control_id,
+                        task_control_kind_str(*kind),
+                        event_sequence,
+                        timestamp,
+                    ],
+                )
+                .map_err(storage_error)?;
+        }
+        TaskEvent::OperationIntentRecorded {
+            operation_id,
+            epoch_id,
+            item_id,
+            effect_class,
+            request_digest,
+        } => {
+            transaction
+                .execute(
+                    "INSERT INTO task_operations (
+                        id, task_id, epoch_id, item_id, effect_class, request_digest,
+                        status, intent_sequence, last_transition_sequence,
+                        evidence_sequences_json, created_at, updated_at
+                     ) VALUES (
+                        ?1, ?2, ?3, ?4, ?5, ?6, 'intent_recorded', ?7, ?7, '[]', ?8, ?8
+                     )",
+                    params![
+                        operation_id.to_string(),
+                        task_id,
+                        epoch_id.to_string(),
+                        item_id,
+                        effect_class_str(*effect_class),
+                        request_digest,
+                        event_sequence,
+                        timestamp,
+                    ],
+                )
+                .map_err(storage_error)?;
+        }
+        TaskEvent::OperationTransitioned {
+            operation_id,
+            from,
+            to,
+            evidence_sequences,
+        } => {
+            let changed = transaction
+                .execute(
+                    "UPDATE task_operations
+                     SET status = ?4, last_transition_sequence = ?5,
+                         evidence_sequences_json = ?6, updated_at = ?7
+                     WHERE id = ?1 AND task_id = ?2 AND status = ?3",
+                    params![
+                        operation_id.to_string(),
+                        task_id,
+                        operation_status_str(*from),
+                        operation_status_str(*to),
+                        event_sequence,
+                        serde_json::to_string(evidence_sequences).map_err(storage_error)?,
+                        timestamp,
+                    ],
+                )
+                .map_err(storage_error)?;
+            require_projection_change(changed, "task operation projection is missing")?;
+        }
+        TaskEvent::CheckpointCommitted {
+            checkpoint_id,
+            digest,
+        } => {
+            transaction
+                .execute(
+                    "INSERT INTO task_checkpoints (
+                        id, task_id, digest, event_sequence, checkpoint_json, created_at
+                     ) VALUES (?1, ?2, ?3, ?4, NULL, ?5)",
+                    params![
+                        checkpoint_id.to_string(),
+                        task_id,
+                        digest,
+                        event_sequence,
+                        timestamp,
+                    ],
+                )
+                .map_err(storage_error)?;
+        }
+        TaskEvent::CompactionCompleted {
+            generation,
+            checkpoint_id,
+            context_package_id,
+        } => {
+            let existing = transaction
+                .query_row(
+                    "SELECT task_id, checkpoint_id, generation, package_json
+                     FROM task_context_packages WHERE id = ?1",
+                    [context_package_id.to_string()],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, Option<String>>(3)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(storage_error)?;
+            if let Some((stored_task, stored_checkpoint, stored_generation, package_json)) =
+                existing
+            {
+                if stored_task != task_id
+                    || stored_checkpoint != checkpoint_id.to_string()
+                    || stored_generation != i64::from(*generation)
+                    || package_json.is_none()
+                {
+                    return Err(storage_invariant(
+                        "completed compaction does not match its atomic context package",
+                    ));
+                }
+            } else {
+                transaction
+                    .execute(
+                        "INSERT INTO task_context_packages (
+                            id, task_id, checkpoint_id, generation, event_sequence,
+                            package_json, created_at
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6)",
+                        params![
+                            context_package_id.to_string(),
+                            task_id,
+                            checkpoint_id.to_string(),
+                            i64::from(*generation),
+                            event_sequence,
+                            timestamp,
+                        ],
+                    )
+                    .map_err(storage_error)?;
+            }
+        }
+        TaskEvent::SteeringQueued {
+            steering_sequence,
+            text_digest,
+        } => {
+            transaction
+                .execute(
+                    "INSERT INTO task_steering (
+                        task_id, steering_sequence, text_digest, event_sequence, created_at
+                     ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        task_id,
+                        revision_to_sql(*steering_sequence)?,
+                        text_digest,
+                        event_sequence,
+                        timestamp,
+                    ],
+                )
+                .map_err(storage_error)?;
+        }
+        TaskEvent::Created { .. }
+        | TaskEvent::StateTransitioned { .. }
+        | TaskEvent::ContractRevised { .. }
+        | TaskEvent::ProviderRequestRecorded { .. }
+        | TaskEvent::ProviderEpochBound { .. }
+        | TaskEvent::UsageObserved { .. }
+        | TaskEvent::OperationEvidenceRecorded { .. }
+        | TaskEvent::NormalizedOperationEvidenceRecorded { .. }
+        | TaskEvent::OperationPostconditionBound { .. }
+        | TaskEvent::OperationFilePostconditionBound { .. }
+        | TaskEvent::ProgressAssessed { .. }
+        | TaskEvent::RecoveryAttemptStarted { .. }
+        | TaskEvent::RecoveryAttemptRecorded { .. }
+        | TaskEvent::CompactionRequested { .. }
+        | TaskEvent::ProviderContextBound { .. }
+        | TaskEvent::ProviderContextLost { .. }
+        | TaskEvent::BackgroundProcessTerminationRecorded { .. }
+        | TaskEvent::CancellationRequested
+        | TaskEvent::Blocked { .. }
+        | TaskEvent::Completed => {}
+    }
+    Ok(())
+}
+
+fn append_task_event_in_transaction(
+    transaction: &Transaction<'_>,
+    current: TaskRecord,
+    event: TaskEvent,
+    at: DateTime<Utc>,
+) -> Result<(TaskRecord, u64), CarlError> {
+    let task_id = current.snapshot.task_id;
+    let envelope = append_event_in_transaction(
+        transaction,
+        current.snapshot.session_id,
+        None,
+        Event::TaskLifecycle { task_id, event },
+        at,
+    )?;
+    let sequence = envelope.sequence;
+    let snapshot = reduce_task(Some(current.snapshot), &envelope).map_err(task_reduce_error)?;
+    apply_task_child_projection(transaction, task_id, &envelope, &snapshot)?;
+    update_task_projection(transaction, &snapshot, at)?;
+    Ok((
+        TaskRecord {
+            revision: snapshot.revision,
+            snapshot,
+            created_at: current.created_at,
+            updated_at: at,
+        },
+        sequence,
+    ))
+}
+
+fn require_projection_change(changed: usize, detail: &str) -> Result<(), CarlError> {
+    if changed == 1 {
+        Ok(())
+    } else {
+        Err(storage_invariant(detail))
+    }
+}
+
+fn load_task_record(
+    connection: &Connection,
+    task_id: TaskId,
+) -> Result<Option<TaskRecord>, CarlError> {
+    let raw = connection
+        .query_row(
+            "SELECT session_id, status, contract_json, budget_json, snapshot_json,
+                    revision, current_epoch_id, latest_checkpoint_id, provider_context,
+                    created_at, updated_at
+             FROM agent_tasks WHERE id = ?1",
+            [task_id.to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, String>(9)?,
+                    row.get::<_, String>(10)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(storage_error)?;
+    raw.map(
+        |(
+            session_id,
+            status,
+            contract_json,
+            budget_json,
+            snapshot_json,
+            revision,
+            current_epoch_id,
+            latest_checkpoint_id,
+            provider_context,
+            created_at,
+            updated_at,
+        )| {
+            let snapshot: TaskSnapshot =
+                serde_json::from_str(&snapshot_json).map_err(storage_error)?;
+            let contract: CompletionContract =
+                serde_json::from_str(&contract_json).map_err(storage_error)?;
+            let budget: TaskBudget = serde_json::from_str(&budget_json).map_err(storage_error)?;
+            let stored_revision = stored_u64(revision, "task revision")?;
+            let stored_status = parse_task_status(&status)?;
+            let stored_session_id = parse_id("task session ID", &session_id)?;
+            let stored_epoch = current_epoch_id
+                .as_deref()
+                .map(|value| parse_id("task epoch ID", value))
+                .transpose()?;
+            let stored_checkpoint = latest_checkpoint_id
+                .as_deref()
+                .map(|value| parse_id("task checkpoint ID", value))
+                .transpose()?;
+            if snapshot.task_id != task_id
+                || snapshot.session_id != stored_session_id
+                || snapshot.status != stored_status
+                || snapshot.contract != contract
+                || snapshot.budget != budget
+                || snapshot.revision != stored_revision
+                || snapshot.active_epoch != stored_epoch
+                || snapshot.latest_checkpoint != stored_checkpoint
+                || snapshot.provider_context != provider_context
+            {
+                return Err(storage_invariant(
+                    "stored task projection is internally inconsistent",
+                ));
+            }
+            Ok(TaskRecord {
+                snapshot,
+                revision: stored_revision,
+                created_at: parse_timestamp(&created_at)?,
+                updated_at: parse_timestamp(&updated_at)?,
+            })
+        },
+    )
+    .transpose()
+}
+
+fn load_task_configuration_record(
+    connection: &Connection,
+    task_id: TaskId,
+) -> Result<Option<TaskConfigurationRecord>, CarlError> {
+    connection
+        .query_row(
+            "SELECT active_model, active_effort, active_permission_mode,
+                    effective_permission_mode, pending_control_id, pending_model,
+                    pending_effort, pending_permission_mode, queued_sequence,
+                    applied_sequence
+             FROM task_configuration_state WHERE task_id = ?1",
+            [task_id.to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<i64>>(8)?,
+                    row.get::<_, Option<i64>>(9)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(storage_error)?
+        .map(
+            |(
+                active_model,
+                active_effort,
+                active_permission_mode,
+                effective_permission_mode,
+                pending_control_id,
+                pending_model,
+                pending_effort,
+                pending_permission_mode,
+                queued_sequence,
+                applied_sequence,
+            )| {
+                Ok(TaskConfigurationRecord {
+                    active_model: ModelId::parse(active_model)?,
+                    active_effort: parse_reasoning_effort(&active_effort)?,
+                    active_permission_mode: active_permission_mode.parse().map_err(|_| {
+                        invalid_stored_value("task permission mode", &active_permission_mode)
+                    })?,
+                    effective_permission_mode: effective_permission_mode.parse().map_err(|_| {
+                        invalid_stored_value(
+                            "effective task permission mode",
+                            &effective_permission_mode,
+                        )
+                    })?,
+                    pending_control_id,
+                    pending_model: pending_model.map(ModelId::parse).transpose()?,
+                    pending_effort: pending_effort
+                        .as_deref()
+                        .map(parse_reasoning_effort)
+                        .transpose()?,
+                    pending_permission_mode: pending_permission_mode
+                        .as_deref()
+                        .map(|mode| {
+                            mode.parse().map_err(|_| {
+                                invalid_stored_value("pending task permission mode", mode)
+                            })
+                        })
+                        .transpose()?,
+                    queued_sequence: queued_sequence
+                        .map(|value| stored_u64(value, "task configuration queued sequence"))
+                        .transpose()?,
+                    applied_sequence: applied_sequence
+                        .map(|value| stored_u64(value, "task configuration applied sequence"))
+                        .transpose()?,
+                })
+            },
+        )
+        .transpose()
+}
+
+#[cfg(test)]
+thread_local! {
+    static TASK_EVENT_SESSION_DISCOVERY_QUERIES: Cell<u64> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+fn reset_task_event_session_discovery_queries() {
+    TASK_EVENT_SESSION_DISCOVERY_QUERIES.set(0);
+}
+
+#[cfg(test)]
+fn task_event_session_discovery_queries() -> u64 {
+    TASK_EVENT_SESSION_DISCOVERY_QUERIES.get()
+}
+
+fn read_task_event_page_from_connection(
+    connection: &Connection,
+    task_id: TaskId,
+    after_sequence: Option<u64>,
+    limit: u16,
+) -> Result<Vec<EventEnvelope>, CarlError> {
+    if !(1..=512).contains(&limit) {
+        return Err(CarlError::Validation {
+            detail: "task event page limit must be between 1 and 512".to_owned(),
+        });
+    }
+    let after_sequence = match after_sequence {
+        Some(sequence) => i64::try_from(sequence).map_err(|_| CarlError::Validation {
+            detail: "task event page cursor is too large".to_owned(),
+        })?,
+        None => 0,
+    };
+    let task_id_text = task_id.to_string();
+    #[cfg(test)]
+    TASK_EVENT_SESSION_DISCOVERY_QUERIES
+        .set(TASK_EVENT_SESSION_DISCOVERY_QUERIES.get().saturating_add(1));
+    let session_ids = connection
+        .prepare(
+            "SELECT DISTINCT session_id
+             FROM events
+             WHERE json_extract(event_json, '$.type') = 'task_lifecycle'
+               AND json_extract(event_json, '$.task_id') = ?1
+             ORDER BY session_id ASC
+             LIMIT 2",
+        )
+        .map_err(storage_error)?
+        .query_map([&task_id_text], |row| row.get::<_, String>(0))
+        .map_err(storage_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(storage_error)?;
+    let [session_id] = session_ids.as_slice() else {
+        if session_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        return Err(storage_invariant(
+            "task journal identifier appears in multiple sessions",
+        ));
+    };
+    let session_id: SessionId = session_id
+        .parse()
+        .map_err(|_| storage_invariant("task journal contains an invalid session identifier"))?;
+    read_task_event_page_for_known_session_from_connection(
+        connection,
+        session_id,
+        task_id,
+        Some(stored_u64(after_sequence, "task event page cursor")?),
+        limit,
+    )
+}
+
+fn read_task_event_page_for_known_session_from_connection(
+    connection: &Connection,
+    session_id: SessionId,
+    task_id: TaskId,
+    after_sequence: Option<u64>,
+    limit: u16,
+) -> Result<Vec<EventEnvelope>, CarlError> {
+    if !(1..=512).contains(&limit) {
+        return Err(CarlError::Validation {
+            detail: "task event page limit must be between 1 and 512".to_owned(),
+        });
+    }
+    let after_sequence = match after_sequence {
+        Some(sequence) => i64::try_from(sequence).map_err(|_| CarlError::Validation {
+            detail: "task event page cursor is too large".to_owned(),
+        })?,
+        None => 0,
+    };
+    let task_id_text = task_id.to_string();
+    let rows = connection
+        .prepare(
+            "SELECT id, turn_id, sequence, timestamp, schema_version, event_json
+             FROM events
+             WHERE session_id = ?1
+               AND sequence > ?2
+               AND json_extract(event_json, '$.type') = 'task_lifecycle'
+               AND json_extract(event_json, '$.task_id') = ?3
+             ORDER BY sequence ASC
+             LIMIT ?4",
+        )
+        .map_err(storage_error)?
+        .query_map(
+            params![
+                session_id.to_string(),
+                after_sequence,
+                task_id_text,
+                i64::from(limit),
+            ],
+            |row| {
+                Ok(RawEvent {
+                    id: row.get(0)?,
+                    turn_id: row.get(1)?,
+                    sequence: row.get(2)?,
+                    timestamp: row.get(3)?,
+                    schema_version: row.get(4)?,
+                    event_json: row.get(5)?,
+                })
+            },
+        )
+        .map_err(storage_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(storage_error)?;
+    rows.into_iter()
+        .map(|row| row.into_envelope(session_id))
+        .collect()
+}
+
+fn validate_task_projection_completeness(
+    connection: &Connection,
+) -> Result<Vec<TaskRecord>, CarlError> {
+    let mut records = Vec::new();
+    visit_authoritative_task_records(connection, |record| {
+        records.push(record);
+        Ok(())
+    })?;
+    Ok(records)
+}
+
+fn visit_authoritative_task_records(
+    connection: &Connection,
+    mut visitor: impl FnMut(TaskRecord) -> Result<(), CarlError>,
+) -> Result<(), CarlError> {
+    let mut after_task_id = None;
+    loop {
+        let task_ids = read_journal_task_id_page(connection, after_task_id.as_deref())?;
+        if task_ids.is_empty() {
+            break;
+        }
+        after_task_id = task_ids.last().cloned();
+        for stored_task_id in task_ids {
+            let task_id = stored_task_id.parse::<TaskId>().map_err(|_| {
+                storage_invariant("task journal contains an invalid task identifier")
+            })?;
+            visitor(validate_task_projection_from_journal(connection, task_id)?)?;
+        }
+    }
+
+    let orphan_projection = connection
+        .query_row(
+            "SELECT 1
+             FROM agent_tasks AS task
+             WHERE NOT EXISTS (
+                SELECT 1
+                FROM events AS event
+                WHERE json_extract(event.event_json, '$.type') = 'task_lifecycle'
+                  AND json_extract(event.event_json, '$.task_id') = task.id
+             )
+             LIMIT 1",
+            [],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(storage_error)?;
+    if orphan_projection.is_some() {
+        return Err(storage_invariant(
+            "task projection has no authoritative journal",
+        ));
+    }
+    Ok(())
+}
+
+fn read_journal_task_id_page(
+    connection: &Connection,
+    after_task_id: Option<&str>,
+) -> Result<Vec<String>, CarlError> {
+    connection
+        .prepare(
+            "SELECT json_extract(event_json, '$.task_id') AS task_id
+             FROM events
+             WHERE json_extract(event_json, '$.type') = 'task_lifecycle'
+               AND (?1 IS NULL OR json_extract(event_json, '$.task_id') > ?1)
+             GROUP BY json_extract(event_json, '$.task_id')
+             ORDER BY json_extract(event_json, '$.task_id') ASC
+             LIMIT 512",
+        )
+        .map_err(storage_error)?
+        .query_map([after_task_id], |row| row.get::<_, String>(0))
+        .map_err(storage_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| storage_invariant("task journal contains invalid task metadata"))
+}
+
+struct ValidatedTaskAuthority {
+    record: TaskRecord,
+    configuration: TaskConfigurationRecord,
+}
+
+fn validate_task_projection_from_journal(
+    connection: &Connection,
+    task_id: TaskId,
+) -> Result<TaskRecord, CarlError> {
+    Ok(validate_task_authority_from_journal(connection, task_id)?.record)
+}
+
+fn validate_task_authority_from_journal(
+    connection: &Connection,
+    task_id: TaskId,
+) -> Result<ValidatedTaskAuthority, CarlError> {
+    let projection = load_task_record(connection, task_id)?
+        .ok_or_else(|| storage_invariant("task journal has no matching task projection"))?;
+    let mut replayed = None;
+    let mut configuration = None;
+    let mut control_markers = Vec::new();
+    let mut after_sequence = None;
+    loop {
+        let page = read_task_event_page_from_connection(connection, task_id, after_sequence, 512)?;
+        if page.is_empty() {
+            break;
+        }
+        after_sequence = page.last().map(|event| event.sequence);
+        for envelope in page {
+            replay_task_child_projections(&mut configuration, &mut control_markers, &envelope)?;
+            replayed = Some(reduce_task(replayed, &envelope).map_err(task_replay_error)?);
+        }
+    }
+    let replayed = replayed
+        .ok_or_else(|| storage_invariant("task projection has no authoritative journal"))?;
+    if replayed.revision != projection.revision
+        || replayed.status != projection.snapshot.status
+        || replayed.active_epoch != projection.snapshot.active_epoch
+        || replayed.latest_checkpoint != projection.snapshot.latest_checkpoint
+        || replayed != projection.snapshot
+    {
+        return Err(storage_invariant(
+            "task projection disagrees with journal replay",
+        ));
+    }
+    let expected_configuration =
+        configuration.ok_or_else(|| storage_invariant("task configuration journal is missing"))?;
+    let Some(stored_configuration) = load_task_configuration_record(connection, task_id)? else {
+        return Err(storage_invariant(
+            "task configuration projection is missing",
+        ));
+    };
+    if stored_configuration != expected_configuration {
+        return Err(storage_invariant(
+            "task configuration projection disagrees with journal replay",
+        ));
+    }
+    let stored_control_markers = load_task_control_marker_projections(connection, task_id)?;
+    if stored_control_markers != control_markers {
+        return Err(storage_invariant(
+            "task control marker projection disagrees with journal replay",
+        ));
+    }
+    Ok(ValidatedTaskAuthority {
+        record: TaskRecord {
+            snapshot: replayed,
+            revision: projection.revision,
+            created_at: projection.created_at,
+            updated_at: projection.updated_at,
+        },
+        configuration: expected_configuration,
+    })
+}
+
+fn replay_task_child_projections(
+    configuration: &mut Option<TaskConfigurationRecord>,
+    control_markers: &mut Vec<(String, TaskControlKind, u64)>,
+    envelope: &EventEnvelope,
+) -> Result<(), CarlError> {
+    let Event::TaskLifecycle { event, .. } = &envelope.event else {
+        return Err(storage_invariant(
+            "task journal contains a non-task lifecycle event",
+        ));
+    };
+    match event {
+        TaskEvent::Created {
+            model,
+            effort,
+            permission_mode,
+            ..
+        } => {
+            if configuration.is_some() {
+                return Err(storage_invariant(
+                    "task configuration journal contains duplicate creation",
+                ));
+            }
+            *configuration = Some(TaskConfigurationRecord {
+                active_model: model.clone(),
+                active_effort: *effort,
+                active_permission_mode: *permission_mode,
+                effective_permission_mode: *permission_mode,
+                pending_control_id: None,
+                pending_model: None,
+                pending_effort: None,
+                pending_permission_mode: None,
+                queued_sequence: None,
+                applied_sequence: None,
+            });
+        }
+        TaskEvent::ConfigurationQueued {
+            control_id,
+            model,
+            effort,
+            permission_mode,
+        } => {
+            let configuration = configuration.as_mut().ok_or_else(|| {
+                storage_invariant("task configuration was queued before task creation")
+            })?;
+            if permission_strength(*permission_mode)
+                < permission_strength(configuration.effective_permission_mode)
+            {
+                configuration.effective_permission_mode = *permission_mode;
+            }
+            configuration.pending_control_id = Some(control_id.clone());
+            configuration.pending_model = Some(model.clone());
+            configuration.pending_effort = Some(*effort);
+            configuration.pending_permission_mode = Some(*permission_mode);
+            configuration.queued_sequence = Some(envelope.sequence);
+        }
+        TaskEvent::ConfigurationApplied { control_id } => {
+            let configuration = configuration.as_mut().ok_or_else(|| {
+                storage_invariant("task configuration was applied before task creation")
+            })?;
+            if configuration.pending_control_id.as_deref() != Some(control_id) {
+                return Err(storage_invariant(
+                    "applied task configuration control identity disagrees with its queue",
+                ));
+            }
+            configuration.active_model = configuration
+                .pending_model
+                .take()
+                .ok_or_else(|| storage_invariant("queued task model is missing"))?;
+            configuration.active_effort = configuration
+                .pending_effort
+                .take()
+                .ok_or_else(|| storage_invariant("queued task effort is missing"))?;
+            configuration.active_permission_mode = configuration
+                .pending_permission_mode
+                .take()
+                .ok_or_else(|| storage_invariant("queued task permission is missing"))?;
+            configuration.effective_permission_mode = configuration.active_permission_mode;
+            configuration.pending_control_id = None;
+            configuration.queued_sequence = None;
+            configuration.applied_sequence = Some(envelope.sequence);
+        }
+        TaskEvent::ControlRequested { control_id, kind } => {
+            if control_markers
+                .iter()
+                .any(|(existing, _, _)| existing == control_id)
+            {
+                return Err(storage_invariant(
+                    "task control marker identity is duplicated in the journal",
+                ));
+            }
+            control_markers.push((control_id.clone(), *kind, envelope.sequence));
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn load_task_control_marker_projections(
+    connection: &Connection,
+    task_id: TaskId,
+) -> Result<Vec<(String, TaskControlKind, u64)>, CarlError> {
+    connection
+        .prepare(
+            "SELECT control_id, kind, event_sequence
+             FROM task_control_markers
+             WHERE task_id = ?1
+             ORDER BY event_sequence ASC",
+        )
+        .map_err(storage_error)?
+        .query_map([task_id.to_string()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })
+        .map_err(storage_error)?
+        .map(|row| {
+            let (control_id, kind, sequence) = row.map_err(storage_error)?;
+            Ok((
+                control_id,
+                parse_task_control_kind(&kind)?,
+                stored_u64(sequence, "task control marker event sequence")?,
+            ))
+        })
+        .collect()
+}
+
+const fn task_status_str(status: TaskStatus) -> &'static str {
+    match status {
+        TaskStatus::Queued => "queued",
+        TaskStatus::Active => "active",
+        TaskStatus::Checkpointing => "checkpointing",
+        TaskStatus::Paused => "paused",
+        TaskStatus::Blocked => "blocked",
+        TaskStatus::Cancelling => "cancelling",
+        TaskStatus::Cancelled => "cancelled",
+        TaskStatus::Completing => "completing",
+        TaskStatus::Completed => "completed",
+        TaskStatus::Failed => "failed",
+    }
+}
+
+const fn epoch_interrupt_reason_str(reason: EpochInterruptReason) -> &'static str {
+    match reason {
+        EpochInterruptReason::PermissionTightening => "permission_tightening",
+    }
+}
+
+const fn task_control_kind_str(kind: TaskControlKind) -> &'static str {
+    match kind {
+        TaskControlKind::Resume => "resume",
+        TaskControlKind::Cancel => "cancel",
+    }
+}
+
+fn parse_task_control_kind(value: &str) -> Result<TaskControlKind, CarlError> {
+    match value {
+        "resume" => Ok(TaskControlKind::Resume),
+        "cancel" => Ok(TaskControlKind::Cancel),
+        _ => Err(invalid_stored_value("task control marker kind", value)),
+    }
+}
+
+fn validate_task_control_id(control_id: &str) -> Result<(), CarlError> {
+    if control_id.len() == 64
+        && control_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        Ok(())
+    } else {
+        Err(policy_error("task control ID is invalid"))
+    }
+}
+
+fn validate_service_command_receipt(input: &ServiceCommandReceiptInput) -> Result<(), CarlError> {
+    let kind_valid = matches!(
+        input.command_kind.as_str(),
+        "start_task"
+            | "start_trusted_task"
+            | "configure_trusted_session"
+            | "resolve_approval"
+            | "resume"
+            | "steer"
+            | "steer_trusted"
+            | "cancel"
+            | "compact"
+            | "configure"
+            | "prepare_maintenance"
+            | "shutdown"
+    );
+    if input.idempotency_key.is_empty()
+        || input.idempotency_key.len() > 128
+        || input.idempotency_key.chars().any(char::is_control)
+        || !kind_valid
+    {
+        return Err(policy_error("service command receipt binding is invalid"));
+    }
+    Ok(())
+}
+
+const fn permission_strength(mode: PermissionMode) -> u8 {
+    match mode.profile() {
+        crate::acp::PermissionProfile::ReadOnly => 0,
+        crate::acp::PermissionProfile::Approval => 1,
+        crate::acp::PermissionProfile::FullAccess => 2,
+    }
+}
+
+fn parse_task_status(value: &str) -> Result<TaskStatus, CarlError> {
+    match value {
+        "queued" => Ok(TaskStatus::Queued),
+        "active" => Ok(TaskStatus::Active),
+        "checkpointing" => Ok(TaskStatus::Checkpointing),
+        "paused" => Ok(TaskStatus::Paused),
+        "blocked" => Ok(TaskStatus::Blocked),
+        "cancelling" => Ok(TaskStatus::Cancelling),
+        "cancelled" => Ok(TaskStatus::Cancelled),
+        "completing" => Ok(TaskStatus::Completing),
+        "completed" => Ok(TaskStatus::Completed),
+        "failed" => Ok(TaskStatus::Failed),
+        other => Err(invalid_stored_value("task status", other)),
+    }
+}
+
+const fn operation_status_str(status: OperationStatus) -> &'static str {
+    match status {
+        OperationStatus::IntentRecorded => "intent_recorded",
+        OperationStatus::Started => "started",
+        OperationStatus::Succeeded => "succeeded",
+        OperationStatus::Failed => "failed",
+        OperationStatus::Cancelled => "cancelled",
+        OperationStatus::Uncertain => "uncertain",
+        OperationStatus::Reconciled => "reconciled",
+    }
+}
+
+const fn effect_class_str(effect_class: EffectClass) -> &'static str {
+    match effect_class {
+        EffectClass::Observation => "observation",
+        EffectClass::IdempotentMutation => "idempotent_mutation",
+        EffectClass::AmbiguousConsequential => "ambiguous_consequential",
+    }
+}
+
+fn task_reduce_error(error: crate::runtime::task::TaskReduceError) -> CarlError {
+    CarlError::Validation {
+        detail: format!("task event cannot be applied: {}", error.code().as_str()),
+    }
+}
+
+fn task_metrics_error(error: crate::runtime::task::TaskMetricsError) -> CarlError {
+    let detail = match error.code() {
+        TaskMetricsErrorCode::Storage => "task metrics storage failed",
+        TaskMetricsErrorCode::InvalidHistory => "task metrics history is invalid",
+        TaskMetricsErrorCode::ArithmeticOverflow => "task metrics arithmetic overflowed",
+    };
+    CarlError::Storage {
+        detail: detail.to_owned(),
+    }
+}
+
+fn task_replay_error(error: crate::runtime::task::TaskReduceError) -> CarlError {
+    CarlError::Storage {
+        detail: format!("task journal replay failed: {}", error.code().as_str()),
+    }
+}
+
 fn append_event_in_transaction(
     transaction: &Transaction<'_>,
     session_id: SessionId,
@@ -6275,6 +9831,47 @@ fn validate_canonical_frontend_cwd(cwd: &Path) -> Result<(), CarlError> {
     Ok(())
 }
 
+fn frontend_workspace_digest(workspace: &Path) -> Sha256Digest {
+    let mut hasher = Sha256::new();
+    hasher.update(b"carl.trusted-frontend-workspace.v1\0");
+    hasher.update(workspace.as_os_str().as_encoded_bytes());
+    Sha256Digest::from_bytes(hasher.finalize().into())
+}
+
+fn hex_bytes(bytes: [u8; 32]) -> String {
+    use std::fmt::Write as _;
+
+    let mut encoded = String::with_capacity(64);
+    for byte in bytes {
+        write!(&mut encoded, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    encoded
+}
+
+const fn stored_permission_mode(mode: PermissionMode) -> &'static str {
+    match mode {
+        PermissionMode::FullAccess => PermissionMode::BypassPermissions.as_wire_str(),
+        _ => mode.as_wire_str(),
+    }
+}
+
+const fn permission_profile_str(mode: PermissionMode) -> &'static str {
+    match mode.profile() {
+        crate::acp::PermissionProfile::ReadOnly => "read_only",
+        crate::acp::PermissionProfile::Approval => "approval",
+        crate::acp::PermissionProfile::FullAccess => "full_access",
+    }
+}
+
+fn permission_mode_from_profile(profile: &str) -> Result<PermissionMode, CarlError> {
+    match profile {
+        "read_only" => Ok(PermissionMode::Plan),
+        "approval" => Ok(PermissionMode::Default),
+        "full_access" => Ok(PermissionMode::FullAccess),
+        other => Err(invalid_stored_value("permission profile", other)),
+    }
+}
+
 fn validate_remote_display_code(display_code: &str) -> Result<(), CarlError> {
     if display_code.len() != 10
         || !display_code
@@ -6418,6 +10015,866 @@ fn storage_error(error: impl std::fmt::Display) -> CarlError {
     }
 }
 
+#[cfg(test)]
+mod checkpoint_authority_tests {
+    use std::error::Error;
+
+    use chrono::TimeDelta;
+
+    use super::*;
+    use crate::runtime::task::{
+        CheckpointBuildInput, CheckpointId, ClauseStatus, CompletionClause, ContextBudget,
+        ContextEngine, ContextInput, RepositoryCheckpoint, canonical_checkpoint_serializations,
+        reset_canonical_checkpoint_serializations,
+    };
+
+    type TestResult<T = ()> = Result<T, Box<dyn Error>>;
+
+    struct TemporaryTaskDatabase {
+        root: PathBuf,
+        database: PathBuf,
+        workspace: PathBuf,
+    }
+
+    impl TemporaryTaskDatabase {
+        fn new() -> TestResult<Self> {
+            let root = std::env::temp_dir()
+                .join(format!("carl-checkpoint-authority-unit-{}", Uuid::new_v4()));
+            let database = root.join(RUNTIME_DATABASE_FILENAME);
+            let workspace = root.join("workspace");
+            fs::create_dir_all(&workspace)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
+                fs::set_permissions(&workspace, fs::Permissions::from_mode(0o700))?;
+            }
+            Ok(Self {
+                root,
+                database,
+                workspace,
+            })
+        }
+    }
+
+    impl Drop for TemporaryTaskDatabase {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn test_instant(offset: i64) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-08-11T12:00:00Z")
+            .expect("valid test timestamp")
+            .with_timezone(&Utc)
+            + TimeDelta::seconds(offset)
+    }
+
+    fn test_digest(value: impl AsRef<[u8]>) -> String {
+        format!("{:x}", Sha256::digest(value.as_ref()))
+    }
+
+    fn test_contract() -> CompletionContract {
+        CompletionContract {
+            version: 1,
+            goal: "Authenticate incremental checkpoints".to_owned(),
+            constraints: vec!["Keep the journal authoritative".to_owned()],
+            clauses: vec![CompletionClause {
+                id: "authority".to_owned(),
+                description: "Checkpoint authority remains fail closed".to_owned(),
+                required: false,
+                status: ClauseStatus::Pending,
+                evidence: Vec::new(),
+            }],
+        }
+    }
+
+    fn test_task(session_id: SessionId, workspace: &Path) -> NewTask {
+        NewTask {
+            session_id,
+            workspace: workspace.to_owned(),
+            contract: test_contract(),
+            model: ModelId::parse("gpt-5.6").expect("valid model"),
+            effort: ReasoningEffort::High,
+            permission_mode: PermissionMode::Default,
+            budget: TaskBudget::default(),
+            created_at: test_instant(0),
+        }
+    }
+
+    fn checkpoint_input(
+        task: &TaskRecord,
+        events: Vec<EventEnvelope>,
+        previous_checkpoint: Option<CanonicalCheckpoint>,
+    ) -> CheckpointBuildInput {
+        let generation = previous_checkpoint
+            .as_ref()
+            .map_or(0, |checkpoint| checkpoint.compaction_generation + 1);
+        CheckpointBuildInput {
+            checkpoint_id: CheckpointId::new(),
+            snapshot: task.snapshot.clone(),
+            events,
+            completed_work: Vec::new(),
+            decisions: Vec::new(),
+            exact_identifiers: Vec::new(),
+            required_identifiers: Vec::new(),
+            repository: RepositoryCheckpoint {
+                workspace_digest: test_digest(b"workspace"),
+                git_head: None,
+                git_status_digest: None,
+                diff_artifact_digest: None,
+                file_hashes: BTreeMap::new(),
+            },
+            running_processes: Vec::new(),
+            pending_approval_digests: Vec::new(),
+            pending_steering_digests: Vec::new(),
+            uncertain_delivery_digests: Vec::new(),
+            next_objective: "continue from authenticated authority".to_owned(),
+            blockers: Vec::new(),
+            provider: crate::runtime::task::ProviderCheckpoint {
+                provider: "codex".to_owned(),
+                model: "gpt-5.6".to_owned(),
+                effort: "high".to_owned(),
+                context_id: task.snapshot.provider_context.clone(),
+                observed_total_tokens: None,
+                observed_context_window: None,
+            },
+            compaction_generation: generation,
+            previous_checkpoint,
+            artifact_contents: BTreeMap::new(),
+            model_narrative: None,
+        }
+    }
+
+    fn checkpoint_package(checkpoint: CanonicalCheckpoint) -> TestResult<ContextPackage> {
+        Ok(ContextEngine::new(ContextBudget {
+            context_window: 20_000,
+            trigger_percent: 80,
+            target_percent: 60,
+        })?
+        .assemble(ContextInput {
+            runtime_instructions: "Follow the durable runtime".to_owned(),
+            owner_instructions: "Preserve checkpoint authority".to_owned(),
+            project_instructions: "Use the append-only journal".to_owned(),
+            contract: checkpoint.contract.clone(),
+            checkpoint,
+            recent_tail: Vec::new(),
+            retrieved_evidence: Vec::new(),
+            epoch_objective: "Continue safely".to_owned(),
+        })?)
+    }
+
+    fn build_next_checkpoint(
+        store: &Store,
+        task_id: TaskId,
+        previous: Option<CanonicalCheckpoint>,
+    ) -> TestResult<(TaskRecord, CanonicalCheckpoint)> {
+        let task = store.get_task(task_id)?.expect("task exists");
+        let events = match &previous {
+            Some(checkpoint) => {
+                store.read_task_events_after(task_id, checkpoint.source_sequence_end)?
+            }
+            None => store.read_task_events(task_id)?,
+        };
+        let checkpoint = CanonicalCheckpoint::build(checkpoint_input(&task, events, previous))?;
+        Ok((task, checkpoint))
+    }
+
+    fn commit_checkpoint(
+        store: &mut Store,
+        task: &TaskRecord,
+        checkpoint: CanonicalCheckpoint,
+        offset: i64,
+    ) -> TestResult<CanonicalCheckpoint> {
+        let package = checkpoint_package(checkpoint.clone())?;
+        let committed = store
+            .commit_checkpoint(
+                NewCheckpoint {
+                    task_id: task.snapshot.task_id,
+                    checkpoint_digest: checkpoint.digest()?,
+                    context_package_digest: package.digest()?,
+                    checkpoint,
+                    context_package: package,
+                    created_at: test_instant(offset),
+                },
+                task.revision,
+            )?
+            .expect("checkpoint revision matches");
+        Ok(committed.checkpoint)
+    }
+
+    fn setup_authenticated_anchor()
+    -> TestResult<(TemporaryTaskDatabase, Store, CanonicalCheckpoint)> {
+        let fixture = TemporaryTaskDatabase::new()?;
+        let mut store = Store::open(&fixture.database)?;
+        let session = store.create_session()?;
+        let task = store.create_task(test_task(session.id, &fixture.workspace))?;
+        let (task, checkpoint) = build_next_checkpoint(&store, task.snapshot.task_id, None)?;
+        let checkpoint = commit_checkpoint(&mut store, &task, checkpoint, 1)?;
+        Ok((fixture, store, checkpoint))
+    }
+
+    #[test]
+    fn startup_canonical_validation_serializes_each_checkpoint_once() -> TestResult {
+        let (fixture, mut store, first) = setup_authenticated_anchor()?;
+        let task_id = first.task_id;
+        let (task, second) = build_next_checkpoint(&store, task_id, Some(first))?;
+        commit_checkpoint(&mut store, &task, second, 2)?;
+        drop(store);
+
+        reset_canonical_checkpoint_serializations();
+        let _reopened = Store::open(&fixture.database)?;
+
+        assert_eq!(canonical_checkpoint_serializations(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn first_checkpoint_uses_full_authority_then_incremental_tail_crosses_page_boundary()
+    -> TestResult {
+        let (_fixture, mut store, first) = setup_authenticated_anchor()?;
+        assert_eq!(store.checkpoint_authority_validation_counts(), (1, 0));
+        assert_eq!(store.checkpoint_full_prefix_scan_count(), 1);
+
+        let task_id = first.task_id;
+        let session_id = store
+            .get_task(task_id)?
+            .expect("task exists")
+            .snapshot
+            .session_id;
+        let isolated_task = store.create_task(test_task(session_id, &_fixture.workspace))?;
+        store
+            .append_task_event(
+                isolated_task.snapshot.task_id,
+                isolated_task.revision,
+                TaskEvent::ProgressAssessed {
+                    fingerprint: "other-task-event".to_owned(),
+                    stalled: false,
+                },
+                test_instant(2),
+            )?
+            .expect("other task revision matches");
+        let mut task = store.get_task(task_id)?.expect("task exists");
+        for index in 0..513_u32 {
+            task = store
+                .append_task_event(
+                    task_id,
+                    task.revision,
+                    TaskEvent::ProgressAssessed {
+                        fingerprint: format!("tail-progress-{index}"),
+                        stalled: false,
+                    },
+                    test_instant(i64::from(index) + 2),
+                )?
+                .expect("task revision matches");
+        }
+        let tail = store.read_task_events_after(task_id, first.source_sequence_end)?;
+        assert_eq!(tail.len(), 514);
+        assert!(
+            tail.iter()
+                .all(|event| event.sequence > first.source_sequence_end)
+        );
+        assert!(
+            tail.windows(2)
+                .all(|pair| pair[0].sequence < pair[1].sequence)
+        );
+        assert!(tail.iter().all(|event| matches!(
+            &event.event,
+            Event::TaskLifecycle {
+                task_id: event_task_id,
+                ..
+            } if *event_task_id == task_id
+        )));
+
+        let (task, second) = build_next_checkpoint(&store, task_id, Some(first))?;
+        reset_task_event_session_discovery_queries();
+        let second = commit_checkpoint(&mut store, &task, second, 516)?;
+        assert_eq!(second.source_sequence_end, tail.last().unwrap().sequence);
+        assert_eq!(store.checkpoint_authority_validation_counts(), (1, 1));
+        assert_eq!(store.checkpoint_full_prefix_scan_count(), 1);
+        assert_eq!(task_event_session_discovery_queries(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn separate_connection_commit_invalidates_anchor_and_refreshes_full_authority() -> TestResult {
+        let (fixture, mut store, first) = setup_authenticated_anchor()?;
+        let external = Connection::open(&fixture.database)?;
+        external.execute("CREATE TABLE authority_external_commit (id INTEGER)", [])?;
+        drop(external);
+
+        let task_id = first.task_id;
+        let (task, second) = build_next_checkpoint(&store, task_id, Some(first))?;
+        let second = commit_checkpoint(&mut store, &task, second, 2)?;
+        assert_eq!(store.checkpoint_authority_validation_counts(), (2, 0));
+
+        let (task, third) = build_next_checkpoint(&store, task_id, Some(second))?;
+        commit_checkpoint(&mut store, &task, third, 3)?;
+        assert_eq!(store.checkpoint_authority_validation_counts(), (2, 1));
+        Ok(())
+    }
+
+    #[test]
+    fn full_fallback_rejects_a_projection_rolled_back_to_a_non_latest_predecessor() -> TestResult {
+        let (_fixture, mut store, first) = setup_authenticated_anchor()?;
+        let task_id = first.task_id;
+        let (task, second) = build_next_checkpoint(&store, task_id, Some(first.clone()))?;
+        commit_checkpoint(&mut store, &task, second, 2)?;
+
+        let task = store.get_task(task_id)?.expect("task exists");
+        let fork_events = store.read_task_events_after(task_id, first.source_sequence_end)?;
+        let fork =
+            CanonicalCheckpoint::build(checkpoint_input(&task, fork_events, Some(first.clone())))?;
+        let package = checkpoint_package(fork.clone())?;
+        let before_events = store.read_task_events(task_id)?.len();
+        let before_counts = store.checkpoint_authority_validation_counts();
+
+        store.connection.execute(
+            "UPDATE agent_tasks
+             SET latest_checkpoint_id = ?2,
+                 snapshot_json = json_set(snapshot_json, '$.latest_checkpoint', ?2)
+             WHERE id = ?1",
+            params![task_id.to_string(), first.checkpoint_id.to_string()],
+        )?;
+
+        assert_eq!(
+            store
+                .get_task(task_id)?
+                .expect("rolled-back projection remains internally consistent")
+                .snapshot
+                .latest_checkpoint,
+            Some(first.checkpoint_id)
+        );
+        let rejected = store.commit_checkpoint(
+            NewCheckpoint {
+                task_id,
+                checkpoint_digest: fork.digest()?,
+                context_package_digest: package.digest()?,
+                checkpoint: fork,
+                context_package: package,
+                created_at: test_instant(3),
+            },
+            task.revision,
+        );
+        assert!(matches!(rejected, Err(CarlError::Validation { .. })));
+        assert_eq!(store.read_task_events(task_id)?.len(), before_events);
+        assert_eq!(
+            store.get_task(task_id)?.expect("task exists").revision,
+            task.revision
+        );
+        assert_eq!(
+            store.checkpoint_authority_validation_counts(),
+            before_counts
+        );
+        assert_eq!(
+            store.connection.query_row(
+                "SELECT COUNT(*) FROM task_checkpoints WHERE task_id = ?1",
+                [task_id.to_string()],
+                |row| row.get::<_, u64>(0),
+            )?,
+            2
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn late_checkpoint_insert_failure_rolls_back_without_advancing_cache_or_counters() -> TestResult
+    {
+        let (_fixture, mut store, first) = setup_authenticated_anchor()?;
+        let task_id = first.task_id;
+        let task = store.get_task(task_id)?.expect("task exists");
+        store
+            .append_task_event(
+                task_id,
+                task.revision,
+                TaskEvent::ProgressAssessed {
+                    fingerprint: "late-failure-tail".to_owned(),
+                    stalled: false,
+                },
+                test_instant(2),
+            )?
+            .expect("task revision matches");
+        let (task, candidate) = build_next_checkpoint(&store, task_id, Some(first))?;
+        let package = checkpoint_package(candidate.clone())?;
+        let input = NewCheckpoint {
+            task_id,
+            checkpoint_digest: candidate.digest()?,
+            context_package_digest: package.digest()?,
+            checkpoint: candidate,
+            context_package: package,
+            created_at: test_instant(3),
+        };
+        let before_events = store.read_task_events(task_id)?.len();
+        let before_revision = task.revision;
+        let before_counts = store.checkpoint_authority_validation_counts();
+        let before_rows = store.connection.query_row(
+            "SELECT COUNT(*) FROM task_checkpoints WHERE task_id = ?1",
+            [task_id.to_string()],
+            |row| row.get::<_, u64>(0),
+        )?;
+        let authority_before = Arc::clone(
+            store
+                .authenticated_checkpoint_authority
+                .get(&task_id)
+                .expect("authenticated authority exists"),
+        );
+        store.connection.execute_batch(
+            "CREATE TRIGGER test_reject_checkpoint_insert
+             BEFORE INSERT ON task_checkpoints
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected checkpoint insert failure');
+             END;",
+        )?;
+
+        let rejected = store.commit_checkpoint(input.clone(), before_revision);
+        assert!(matches!(rejected, Err(CarlError::Storage { .. })));
+        store
+            .connection
+            .execute_batch("DROP TRIGGER test_reject_checkpoint_insert;")?;
+        assert_eq!(store.read_task_events(task_id)?.len(), before_events);
+        assert_eq!(
+            store.get_task(task_id)?.expect("task exists").revision,
+            before_revision
+        );
+        assert_eq!(
+            store.connection.query_row(
+                "SELECT COUNT(*) FROM task_checkpoints WHERE task_id = ?1",
+                [task_id.to_string()],
+                |row| row.get::<_, u64>(0),
+            )?,
+            before_rows
+        );
+        assert_eq!(
+            store.checkpoint_authority_validation_counts(),
+            before_counts
+        );
+        assert!(Arc::ptr_eq(
+            &authority_before,
+            store
+                .authenticated_checkpoint_authority
+                .get(&task_id)
+                .expect("failed commit preserves authority")
+        ));
+
+        store
+            .commit_checkpoint(input, before_revision)?
+            .expect("same candidate commits after removing failure trigger");
+        assert_eq!(store.checkpoint_authority_validation_counts(), (1, 1));
+        assert_eq!(store.read_task_events(task_id)?.len(), before_events + 1);
+        assert_eq!(
+            store.get_task(task_id)?.expect("task exists").revision,
+            before_revision + 1
+        );
+        assert_eq!(
+            store.connection.query_row(
+                "SELECT COUNT(*) FROM task_checkpoints WHERE task_id = ?1",
+                [task_id.to_string()],
+                |row| row.get::<_, u64>(0),
+            )?,
+            before_rows + 1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn full_fallback_rejects_corruption_in_an_older_canonical_checkpoint() -> TestResult {
+        let (fixture, mut store, first) = setup_authenticated_anchor()?;
+        let task_id = first.task_id;
+        let (task, second) = build_next_checkpoint(&store, task_id, Some(first.clone()))?;
+        let second = commit_checkpoint(&mut store, &task, second, 2)?;
+        let (task, candidate) = build_next_checkpoint(&store, task_id, Some(second))?;
+        let package = checkpoint_package(candidate.clone())?;
+        let before_events = store.read_task_events(task_id)?.len();
+        let before_revision = task.revision;
+        let before_counts = store.checkpoint_authority_validation_counts();
+
+        let external = Connection::open(&fixture.database)?;
+        assert_eq!(
+            external.execute(
+                "UPDATE task_checkpoints
+                 SET checkpoint_json = ' ' || checkpoint_json
+                 WHERE id = ?1",
+                [first.checkpoint_id.to_string()],
+            )?,
+            1
+        );
+        drop(external);
+
+        let rejected = store.commit_checkpoint(
+            NewCheckpoint {
+                task_id,
+                checkpoint_digest: candidate.digest()?,
+                context_package_digest: package.digest()?,
+                checkpoint: candidate,
+                context_package: package,
+                created_at: test_instant(3),
+            },
+            before_revision,
+        );
+        assert!(rejected.is_err());
+        assert_eq!(store.read_task_events(task_id)?.len(), before_events);
+        assert_eq!(
+            store.get_task(task_id)?.expect("task exists").revision,
+            before_revision
+        );
+        assert_eq!(
+            store.checkpoint_authority_validation_counts(),
+            before_counts
+        );
+        assert_eq!(
+            store.connection.query_row(
+                "SELECT COUNT(*) FROM task_checkpoints WHERE task_id = ?1",
+                [task_id.to_string()],
+                |row| row.get::<_, u64>(0),
+            )?,
+            2
+        );
+        Ok(())
+    }
+
+    fn active_epoch_candidate(
+        store: &mut Store,
+        first: CanonicalCheckpoint,
+    ) -> TestResult<(TaskRecord, CanonicalCheckpoint, ContextPackage)> {
+        let task_id = first.task_id;
+        let task = store.get_task(task_id)?.expect("task exists");
+        let task = store
+            .append_task_event(
+                task_id,
+                task.revision,
+                TaskEvent::StateTransitioned {
+                    from: TaskStatus::Queued,
+                    to: TaskStatus::Active,
+                    reason: "begin unsafe epoch".to_owned(),
+                },
+                test_instant(2),
+            )?
+            .expect("task revision matches");
+        let task = store
+            .append_task_event(
+                task_id,
+                task.revision,
+                TaskEvent::EpochStarted {
+                    epoch_id: crate::runtime::task::EpochId::new(),
+                    objective: "remain active across the attempted checkpoint".to_owned(),
+                },
+                test_instant(3),
+            )?
+            .expect("task revision matches");
+        let events = store.read_task_events_after(task_id, first.source_sequence_end)?;
+        let candidate = CanonicalCheckpoint::build(checkpoint_input(&task, events, Some(first)))?;
+        let package = checkpoint_package(candidate.clone())?;
+        Ok((task, candidate, package))
+    }
+
+    fn forge_safe_boundary_projection(connection: &Connection, task_id: TaskId) -> TestResult {
+        assert_eq!(
+            connection.execute(
+                "UPDATE agent_tasks
+                 SET current_epoch_id = NULL,
+                     snapshot_json = json_set(snapshot_json, '$.active_epoch', NULL)
+                 WHERE id = ?1",
+                [task_id.to_string()],
+            )?,
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn full_fallback_rejects_an_externally_forged_safe_boundary() -> TestResult {
+        let (fixture, mut store, first) = setup_authenticated_anchor()?;
+        let task_id = first.task_id;
+        let (task, candidate, package) = active_epoch_candidate(&mut store, first)?;
+        let before_events = store.read_task_events(task_id)?.len();
+        let before_counts = store.checkpoint_authority_validation_counts();
+        let external = Connection::open(&fixture.database)?;
+        forge_safe_boundary_projection(&external, task_id)?;
+        drop(external);
+
+        let rejected = store.commit_checkpoint(
+            NewCheckpoint {
+                task_id,
+                checkpoint_digest: candidate.digest()?,
+                context_package_digest: package.digest()?,
+                checkpoint: candidate,
+                context_package: package,
+                created_at: test_instant(4),
+            },
+            task.revision,
+        );
+        assert!(rejected.is_err());
+        assert_eq!(store.read_task_events(task_id)?.len(), before_events);
+        assert_eq!(
+            store.get_task(task_id)?.expect("task exists").revision,
+            task.revision
+        );
+        assert_eq!(
+            store.checkpoint_authority_validation_counts(),
+            before_counts
+        );
+        assert_eq!(
+            store.connection.query_row(
+                "SELECT COUNT(*) FROM task_checkpoints WHERE task_id = ?1",
+                [task_id.to_string()],
+                |row| row.get::<_, u64>(0),
+            )?,
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn incremental_cache_rejects_same_connection_safe_boundary_tampering() -> TestResult {
+        let (_fixture, mut store, first) = setup_authenticated_anchor()?;
+        let task_id = first.task_id;
+        let (task, candidate, package) = active_epoch_candidate(&mut store, first)?;
+        let before_events = store.read_task_events(task_id)?.len();
+        let before_counts = store.checkpoint_authority_validation_counts();
+        forge_safe_boundary_projection(&store.connection, task_id)?;
+
+        let rejected = store.commit_checkpoint(
+            NewCheckpoint {
+                task_id,
+                checkpoint_digest: candidate.digest()?,
+                context_package_digest: package.digest()?,
+                checkpoint: candidate,
+                context_package: package,
+                created_at: test_instant(4),
+            },
+            task.revision,
+        );
+        assert!(rejected.is_err());
+        assert_eq!(store.read_task_events(task_id)?.len(), before_events);
+        assert_eq!(
+            store.get_task(task_id)?.expect("task exists").revision,
+            task.revision
+        );
+        assert_eq!(
+            store.checkpoint_authority_validation_counts(),
+            before_counts
+        );
+        assert_eq!(
+            store.connection.query_row(
+                "SELECT COUNT(*) FROM task_checkpoints WHERE task_id = ?1",
+                [task_id.to_string()],
+                |row| row.get::<_, u64>(0),
+            )?,
+            1
+        );
+        Ok(())
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum AnchorTamper {
+        CanonicalJson,
+        Digest,
+        SourceRange,
+        PreviousDigest,
+        TaskIdentity,
+    }
+
+    #[test]
+    fn corrupted_authenticated_anchor_falls_back_and_fails_closed() -> TestResult {
+        for tamper in [
+            AnchorTamper::CanonicalJson,
+            AnchorTamper::Digest,
+            AnchorTamper::SourceRange,
+            AnchorTamper::PreviousDigest,
+            AnchorTamper::TaskIdentity,
+        ] {
+            let (fixture, mut store, first) = setup_authenticated_anchor()?;
+            let task_id = first.task_id;
+            let (task, candidate) = build_next_checkpoint(&store, task_id, Some(first.clone()))?;
+            let package = checkpoint_package(candidate.clone())?;
+            let before_events = store.read_task_events(task_id)?.len();
+            let before_counts = store.checkpoint_authority_validation_counts();
+            let external = Connection::open(&fixture.database)?;
+            match tamper {
+                AnchorTamper::CanonicalJson => {
+                    external.execute(
+                        "UPDATE task_checkpoints
+                         SET checkpoint_json = ' ' || checkpoint_json",
+                        [],
+                    )?;
+                }
+                AnchorTamper::Digest => {
+                    external
+                        .execute("UPDATE task_checkpoints SET digest = ?1", ["0".repeat(64)])?;
+                }
+                AnchorTamper::SourceRange
+                | AnchorTamper::PreviousDigest
+                | AnchorTamper::TaskIdentity => {
+                    let mut stored = first.clone();
+                    match tamper {
+                        AnchorTamper::SourceRange => {
+                            stored.source_sequence_end += 1;
+                        }
+                        AnchorTamper::PreviousDigest => {
+                            stored.previous_digest = Some("1".repeat(64));
+                        }
+                        AnchorTamper::TaskIdentity => {
+                            stored.task_id = TaskId::new();
+                        }
+                        AnchorTamper::CanonicalJson | AnchorTamper::Digest => unreachable!(),
+                    }
+                    external.execute(
+                        "UPDATE task_checkpoints SET checkpoint_json = ?1, digest = ?2",
+                        params![
+                            String::from_utf8(stored.canonical_bytes()?)?,
+                            stored.digest()?
+                        ],
+                    )?;
+                }
+            }
+            drop(external);
+
+            let result = store.commit_checkpoint(
+                NewCheckpoint {
+                    task_id,
+                    checkpoint_digest: candidate.digest()?,
+                    context_package_digest: package.digest()?,
+                    checkpoint: candidate,
+                    context_package: package,
+                    created_at: test_instant(2),
+                },
+                task.revision,
+            );
+            assert!(result.is_err(), "{tamper:?} must fail closed");
+            assert_eq!(
+                store.checkpoint_authority_validation_counts(),
+                before_counts
+            );
+            assert_eq!(store.read_task_events(task_id)?.len(), before_events);
+            assert_eq!(
+                store.get_task(task_id)?.expect("task exists").revision,
+                task.revision
+            );
+            assert_eq!(
+                store.connection.query_row(
+                    "SELECT COUNT(*) FROM task_checkpoints WHERE task_id = ?1",
+                    [task_id.to_string()],
+                    |row| row.get::<_, u64>(0),
+                )?,
+                1
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn tampered_relevant_tail_event_fails_closed_after_data_version_change() -> TestResult {
+        let (fixture, mut store, first) = setup_authenticated_anchor()?;
+        let task_id = first.task_id;
+        let mut task = store.get_task(task_id)?.expect("task exists");
+        task = store
+            .append_task_event(
+                task_id,
+                task.revision,
+                TaskEvent::StateTransitioned {
+                    from: TaskStatus::Queued,
+                    to: TaskStatus::Active,
+                    reason: "exercise usage authority".to_owned(),
+                },
+                test_instant(2),
+            )?
+            .expect("task revision matches");
+        let epoch_id = crate::runtime::task::EpochId::new();
+        task = store
+            .append_task_event(
+                task_id,
+                task.revision,
+                TaskEvent::EpochStarted {
+                    epoch_id,
+                    objective: "record usage".to_owned(),
+                },
+                test_instant(3),
+            )?
+            .expect("task revision matches");
+        task = store
+            .append_task_event(
+                task_id,
+                task.revision,
+                TaskEvent::UsageObserved {
+                    epoch_id,
+                    total_tokens: 100,
+                    context_window: Some(1_000),
+                },
+                test_instant(4),
+            )?
+            .expect("task revision matches");
+        task = store
+            .append_task_event(
+                task_id,
+                task.revision,
+                TaskEvent::EpochFinished {
+                    epoch_id,
+                    report_digest: test_digest(b"usage report"),
+                },
+                test_instant(5),
+            )?
+            .expect("task revision matches");
+        let events = store.read_task_events_after(task_id, first.source_sequence_end)?;
+        let mut input = checkpoint_input(&task, events, Some(first));
+        input.provider.observed_total_tokens = Some(100);
+        input.provider.observed_context_window = Some(1_000);
+        let candidate = CanonicalCheckpoint::build(input)?;
+        let package = checkpoint_package(candidate.clone())?;
+        let before_events = store.read_task_events(task_id)?.len();
+
+        let external = Connection::open(&fixture.database)?;
+        assert_eq!(
+            external.execute(
+                "UPDATE events
+                 SET event_json = json_set(event_json, '$.event.total_tokens', 101)
+                 WHERE instr(event_json, 'usage_observed') > 0",
+                [],
+            )?,
+            1
+        );
+        drop(external);
+
+        assert!(
+            store
+                .commit_checkpoint(
+                    NewCheckpoint {
+                        task_id,
+                        checkpoint_digest: candidate.digest()?,
+                        context_package_digest: package.digest()?,
+                        checkpoint: candidate,
+                        context_package: package,
+                        created_at: test_instant(6),
+                    },
+                    task.revision,
+                )
+                .is_err()
+        );
+        assert_eq!(store.read_task_events(task_id)?.len(), before_events);
+        assert_eq!(
+            store.get_task(task_id)?.expect("task exists").revision,
+            task.revision
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn startup_reconciliation_and_resumable_listing_reuse_open_validation_scan() -> TestResult {
+        let fixture = TemporaryTaskDatabase::new()?;
+        let mut initial = Store::open(&fixture.database)?;
+        let session = initial.create_session()?;
+        initial.create_task(test_task(session.id, &fixture.workspace))?;
+        drop(initial);
+
+        let mut reopened = Store::open(&fixture.database)?;
+        assert_eq!(reopened.startup_authority_scan_count(), 1);
+        reopened.reconcile_abandoned_task_operations(test_instant(1))?;
+        assert_eq!(reopened.startup_authority_scan_count(), 1);
+        assert_eq!(reopened.list_resumable_tasks()?.len(), 1);
+        assert_eq!(reopened.startup_authority_scan_count(), 1);
+        Ok(())
+    }
+}
+
 #[cfg(all(test, unix))]
 mod verification_persistence_tests {
     use std::error::Error;
@@ -6469,6 +10926,24 @@ mod verification_persistence_tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
         }
+    }
+
+    #[test]
+    fn runtime_peer_store_is_query_only() -> TestResult {
+        let layout = VerificationLayout::new()?;
+        let runtime = RuntimeStore::open(DataRootLock::acquire(&layout.root)?, test_instant(0))?;
+        let peer = runtime.open_peer_store()?;
+        let write = peer.claim_service_command(ServiceCommandReceiptInput {
+            idempotency_key: "peer-write-must-fail".to_owned(),
+            command_digest: Sha256Digest::parse("1".repeat(64))?,
+            command_kind: "shutdown".to_owned(),
+            created_at: test_instant(1),
+        });
+        assert!(
+            write.is_err(),
+            "runtime peer connection accepted a mutation"
+        );
+        Ok(())
     }
 
     #[test]

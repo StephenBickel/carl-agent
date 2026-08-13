@@ -14,6 +14,9 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use carl::policy::{ActorId, Frontend};
+use carl::storage::{ChannelId, Store};
+use chrono::Utc;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -68,8 +71,12 @@ pub struct Layout {
 
 impl Layout {
     pub fn new(name: &str) -> TestResult<Self> {
-        let requested_root =
-            std::env::temp_dir().join(format!("carl-buzz-{name}-{}", Uuid::new_v4()));
+        let serial = Uuid::new_v4().simple().to_string();
+        let requested_root = PathBuf::from("/tmp").join(format!(
+            "carl-buzz-{}-{}",
+            &name[..name.len().min(12)],
+            &serial[..12]
+        ));
         let data = requested_root.join("data");
         let workspace = requested_root.join("workspace");
         fs::create_dir_all(&data)?;
@@ -107,6 +114,155 @@ impl Layout {
         }
     }
 
+    pub fn trust_owner(&self) -> TestResult {
+        let output = Command::new(assert_cmd::cargo::cargo_bin!("carl"))
+            .current_dir(&self.workspace)
+            .env_clear()
+            .env("CARL_DATA_DIR", fs::canonicalize(&self.data)?)
+            .args(["trust", "buzz", "--actor", ACTOR_HEX, "--workspace"])
+            .arg(fs::canonicalize(&self.workspace)?)
+            .output()?;
+        if !output.status.success() {
+            return Err(format!(
+                "owner trust failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    pub fn seed_admitted_event(&self, event_id: &str, channel_id: &str) -> TestResult {
+        let store = Store::open(self.data.join("carl.sqlite3"))?;
+        store.admit_trusted_frontend_message(
+            Frontend::Buzz,
+            &ActorId::parse(ACTOR_HEX)?,
+            &ChannelId::try_from(channel_id)?,
+            &fs::canonicalize(&self.workspace)?,
+            event_id,
+            Utc::now(),
+        )?;
+        Ok(())
+    }
+
+    pub fn provider_work_count(&self) -> TestResult<usize> {
+        Ok(self
+            .provider_requests()?
+            .iter()
+            .filter(|request| {
+                matches!(
+                    request["method"].as_str(),
+                    Some("thread/start" | "turn/start")
+                )
+            })
+            .count())
+    }
+
+    pub fn provider_requests(&self) -> TestResult<Vec<Value>> {
+        let path = self.workspace.join(".provider-requests.jsonl");
+        let requests = match fs::read_to_string(path) {
+            Ok(contents) => contents
+                .get(..=contents.rfind('\n').unwrap_or(0))
+                .unwrap_or_default()
+                .lines()
+                .map(serde_json::from_str::<Value>)
+                .collect::<Result<Vec<_>, _>>()?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => return Err(error.into()),
+        };
+        Ok(requests)
+    }
+
+    pub fn provider_method_count(&self, method: &str) -> TestResult<usize> {
+        Ok(self
+            .provider_requests()?
+            .iter()
+            .filter(|request| request["method"] == method)
+            .count())
+    }
+
+    pub fn task_count(&self) -> TestResult<i64> {
+        let connection = rusqlite::Connection::open(self.data.join("carl.sqlite3"))?;
+        Ok(connection.query_row("SELECT COUNT(*) FROM agent_tasks", [], |row| row.get(0))?)
+    }
+
+    pub fn latest_task_id(&self) -> TestResult<String> {
+        let connection = rusqlite::Connection::open(self.data.join("carl.sqlite3"))?;
+        Ok(connection.query_row(
+            "SELECT id FROM agent_tasks ORDER BY updated_at DESC, id ASC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub fn started_operation_count(&self) -> TestResult<i64> {
+        self.operation_status_count("started")
+    }
+
+    pub fn operation_status_count(&self, status: &str) -> TestResult<i64> {
+        let connection = rusqlite::Connection::open(self.data.join("carl.sqlite3"))?;
+        Ok(connection.query_row(
+            "SELECT COUNT(*) FROM task_operations WHERE status = ?1",
+            [status],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub fn task_lifecycle_event_count(&self, event: &str) -> TestResult<i64> {
+        let connection = rusqlite::Connection::open(self.data.join("carl.sqlite3"))?;
+        Ok(connection.query_row(
+            "SELECT COUNT(*) FROM events
+             WHERE json_extract(event_json, '$.type') = 'task_lifecycle'
+               AND json_extract(event_json, '$.event.task_event') = ?1",
+            [event],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub fn permission_tightening_interrupt_count(&self) -> TestResult<i64> {
+        let connection = rusqlite::Connection::open(self.data.join("carl.sqlite3"))?;
+        Ok(connection.query_row(
+            "SELECT COUNT(*) FROM events
+             WHERE json_extract(event_json, '$.type') = 'task_lifecycle'
+               AND json_extract(event_json, '$.event.task_event') = 'epoch_interrupted'
+               AND json_extract(event_json, '$.event.reason') = 'permission_tightening'",
+            [],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub fn task_control_marker_count(&self, task_id: &str) -> TestResult<i64> {
+        let connection = rusqlite::Connection::open(self.data.join("carl.sqlite3"))?;
+        Ok(connection.query_row(
+            "SELECT COUNT(*) FROM task_control_markers WHERE task_id = ?1",
+            [task_id],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub fn task_lifecycle_events(&self) -> TestResult<Vec<Value>> {
+        let connection = rusqlite::Connection::open(self.data.join("carl.sqlite3"))?;
+        let mut statement = connection.prepare(
+            "SELECT event_json FROM events
+             WHERE json_extract(event_json, '$.type') = 'task_lifecycle'
+             ORDER BY sequence",
+        )?;
+        Ok(statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .map(|event| {
+                event.and_then(|event| {
+                    serde_json::from_str(&event).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+
     pub fn wait_for_provider_method(&self, method: &str, minimum: usize) -> TestResult {
         let path = self.workspace.join(".provider-requests.jsonl");
         for _ in 0..400 {
@@ -126,7 +282,11 @@ impl Layout {
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        Err(format!("provider method {method} was not observed {minimum} times").into())
+        let requests = fs::read_to_string(&path).unwrap_or_default();
+        Err(format!(
+            "provider method {method} was not observed {minimum} times; requests: {requests}"
+        )
+        .into())
     }
 }
 
@@ -138,6 +298,7 @@ impl Drop for Layout {
 
 pub struct Client {
     child: Child,
+    service: Child,
     stdin: Option<ChildStdin>,
     frames: mpsc::Receiver<Result<Value, String>>,
     raw_stdout: Arc<Mutex<Vec<u8>>>,
@@ -146,15 +307,70 @@ pub struct Client {
     stderr_worker: Option<JoinHandle<()>>,
 }
 
+impl Drop for Client {
+    fn drop(&mut self) {
+        self.stdin.take();
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = self.child.kill();
+        }
+        let _ = self.child.wait();
+        if let Some(worker) = self.stdout_worker.take() {
+            let _ = worker.join();
+        }
+        if let Some(worker) = self.stderr_worker.take() {
+            let _ = worker.join();
+        }
+        if self.service.try_wait().ok().flatten().is_none() {
+            let _ = self.service.kill();
+        }
+        let _ = self.service.wait();
+    }
+}
+
 impl Client {
     pub fn spawn(layout: &Layout, bypass: bool) -> TestResult<Self> {
         let binary = assert_cmd::cargo::cargo_bin!("carl");
         let fixture = fs::canonicalize(std::env::current_exe()?)?;
+        let data_root = fs::canonicalize(&layout.data)?;
+        let mut service = Command::new(binary)
+            .current_dir(&layout.workspace)
+            .env_clear()
+            .env("CARL_DATA_DIR", &data_root)
+            .env("CARL_CODEX_EXECUTABLE", &fixture)
+            .env("CARL_BUZZ_EXECUTABLE", &fixture)
+            .arg("serve")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let endpoint = data_root.join("carl.sock");
+        for _ in 0..500 {
+            if endpoint.exists() {
+                break;
+            }
+            if let Some(status) = service.try_wait()? {
+                let mut stderr = String::new();
+                if let Some(mut output) = service.stderr.take() {
+                    let _ = output.read_to_string(&mut stderr);
+                }
+                return Err(format!(
+                    "Carl service exited before startup at {}: {status}: {stderr}",
+                    data_root.display()
+                )
+                .into());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if !endpoint.exists() {
+            let _ = service.kill();
+            let _ = service.wait();
+            return Err("Carl service endpoint was not created".into());
+        }
         let mut command = Command::new(binary);
         command
             .current_dir(&layout.workspace)
             .env_clear()
-            .env("CARL_DATA_DIR", fs::canonicalize(&layout.data)?)
+            .env("CARL_DATA_DIR", data_root)
             .env("CARL_CODEX_EXECUTABLE", &fixture)
             .env("CARL_BUZZ_EXECUTABLE", &fixture)
             .env("BUZZ_ACP_AGENTS", "1")
@@ -205,6 +421,7 @@ impl Client {
         });
         Ok(Self {
             child,
+            service,
             stdin: Some(stdin),
             frames,
             raw_stdout,
@@ -260,13 +477,20 @@ impl Client {
     }
 
     pub fn read_id(&self, expected: i64) -> TestResult<Value> {
+        self.read_id_with_updates(expected)
+            .map(|(response, _)| response)
+    }
+
+    pub fn read_id_with_updates(&self, expected: i64) -> TestResult<(Value, Vec<Value>)> {
+        let mut updates = Vec::new();
         for _ in 0..128 {
             let frame = self.read()?;
             if frame.get("id").and_then(Value::as_i64) == Some(expected) {
-                return Ok(frame);
+                return Ok((frame, updates));
             }
+            updates.push(frame);
         }
-        Err("Carl response ID was not observed".into())
+        Err(format!("Carl response ID {expected} was not observed; frames={updates:?}").into())
     }
 
     pub fn finish(mut self) -> TestResult<CapturedProcess> {
@@ -281,6 +505,8 @@ impl Client {
         let stdout = self.raw_stdout.lock().unwrap().clone();
         let stderr = self.raw_stderr.lock().unwrap().clone();
         if !status.success() {
+            let _ = self.service.kill();
+            let _ = self.service.wait();
             return Err(format!(
                 "Carl exited {:?}: {}",
                 status.code(),
@@ -288,6 +514,8 @@ impl Client {
             )
             .into());
         }
+        let _ = self.service.kill();
+        let _ = self.service.wait();
         Ok(CapturedProcess { stdout, stderr })
     }
 }
@@ -340,6 +568,28 @@ pub fn prompt_frame_for_channel(
     })
 }
 
+pub fn prompt_frame_for_identity(
+    id: i64,
+    session: &str,
+    text: &str,
+    event_id: &str,
+    channel_id: &str,
+    actor_hex: &str,
+    kind: u32,
+) -> Value {
+    json!({
+        "jsonrpc":"2.0", "id":id, "method":"session/prompt", "params":{
+            "sessionId":session,
+            "prompt":[
+                {"type":"text","text":text},
+                {"type":"text","text":format!(
+                    "Event ID: {event_id}\nChannel: Carl Test (#{channel_id})\nKind: {kind}\nFrom: Owner (hex: {actor_hex})\nTime: 2026-08-10T12:00:00Z\nContent: command"
+                )}
+            ]
+        }
+    })
+}
+
 fn replace_string(value: &mut Value, needle: &str, replacement: &str) {
     match value {
         Value::String(text) if text == needle => *text = replacement.to_owned(),
@@ -365,6 +615,7 @@ fn app_server_fixture() -> i32 {
     let mut thread_count = 0_u64;
     let mut turn_count = 0_u64;
     let mut pending: Option<PendingApproval> = None;
+    let mut operation_ids = HashMap::<String, String>::new();
     for line in std::io::stdin().lock().lines() {
         let Ok(line) = line else {
             return 74;
@@ -459,11 +710,26 @@ fn app_server_fixture() -> i32 {
                 {
                     return 74;
                 }
+                if input.contains("Read-only contract planning")
+                    || input.contains("Repair the prior invalid contract")
+                {
+                    if agent_delta(
+                        thread_id,
+                        &turn_id,
+                        "<carl-completion-contract>{\"version\":1,\"goal\":\"Report repository verification\",\"constraints\":[],\"clauses\":[{\"id\":\"report\",\"description\":\"Report the observed verification\",\"required\":false,\"status\":\"pending\",\"evidence\":[]}]}</carl-completion-contract>",
+                    )
+                    .and_then(|()| turn_completed(thread_id, &turn_id))
+                    .is_err()
+                    {
+                        return 74;
+                    }
+                    continue;
+                }
                 if input.contains("wait for cancel") {
                     continue;
                 }
                 if input.contains("approval scenario") {
-                    if item_started(thread_id, &turn_id, "file-item")
+                    if item_started(thread_id, &turn_id, "file-item", "fileChange")
                         .and_then(|()| agent_delta(thread_id, &turn_id, "Preparing fix. "))
                         .and_then(|()| {
                             approval_request(
@@ -487,30 +753,89 @@ fn app_server_fixture() -> i32 {
                     continue;
                 }
                 if input.contains("bypass scenario") {
-                    if fs::write(workspace.join("target.txt"), "fixed\n")
+                    if item_started(thread_id, &turn_id, "bypass-item", "commandExecution")
                         .and_then(|()| {
-                            append_line(&workspace.join(".fixture-actions"), "approved-command")
+                            approval_request(
+                                "approval-bypass",
+                                "item/commandExecution/requestApproval",
+                                thread_id,
+                                &turn_id,
+                                "bypass-item",
+                                json!({
+                                    "command":"cargo test", "reason":"Verify the patch",
+                                    "cwd":null
+                                }),
+                            )
                         })
-                        .and_then(|()| diff_update(thread_id, &turn_id))
-                        .and_then(|()| {
-                            agent_delta(thread_id, &turn_id, "Bypass verification completed.")
-                        })
-                        .and_then(|()| turn_completed(thread_id, &turn_id))
                         .is_err()
                     {
                         return 74;
                     }
+                    pending = Some(PendingApproval {
+                        stage: ApprovalStage::Bypass,
+                        thread_id: thread_id.to_owned(),
+                        turn_id,
+                    });
                     continue;
                 }
-                if agent_delta(thread_id, &turn_id, "Repository verification complete.")
-                    .and_then(|()| turn_completed(thread_id, &turn_id))
+                if item_started(thread_id, &turn_id, "observation-item", "commandExecution")
+                    .and_then(|()| {
+                        approval_request(
+                            "approval-observation",
+                            "item/commandExecution/requestApproval",
+                            thread_id,
+                            &turn_id,
+                            "observation-item",
+                            json!({
+                                "command":"cargo test", "reason":"Verify the repository",
+                                "cwd":null
+                            }),
+                        )
+                    })
                     .is_err()
                 {
                     return 74;
                 }
+                pending = Some(PendingApproval {
+                    stage: ApprovalStage::Observation,
+                    thread_id: thread_id.to_owned(),
+                    turn_id,
+                });
             }
             Some("turn/steer") => {
+                let steering = request
+                    .pointer("/params/input/0/text")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if let Some(operation_id) = steering.strip_prefix("carl-operation-id: ")
+                    && let Some(turn_id) = request["params"]["expectedTurnId"].as_str()
+                {
+                    operation_ids.insert(turn_id.to_owned(), operation_id.to_owned());
+                }
+                let boundary_configuration = request
+                    .pointer("/params/input/0/text")
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| text.starts_with("boundary configuration\n\nEvent ID: "));
                 if respond(id, json!({"turnId":request["params"]["expectedTurnId"]})).is_err() {
+                    return 74;
+                }
+                if boundary_configuration {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                if boundary_configuration
+                    && agent_delta(
+                        request["params"]["threadId"].as_str().unwrap_or_default(),
+                        request["params"]["expectedTurnId"].as_str().unwrap_or_default(),
+                        "Reached a safe boundary. <carl-epoch-report>{\"schema_version\":1,\"disposition\":\"continue\",\"summary\":\"Apply queued configuration\",\"next_objective\":\"Verify queued configuration\",\"clause_evidence\":[],\"exact_identifiers\":[]}</carl-epoch-report>",
+                    )
+                    .and_then(|()| {
+                        turn_completed(
+                            request["params"]["threadId"].as_str().unwrap_or_default(),
+                            request["params"]["expectedTurnId"].as_str().unwrap_or_default(),
+                        )
+                    })
+                    .is_err()
+                {
                     return 74;
                 }
             }
@@ -529,21 +854,36 @@ fn app_server_fixture() -> i32 {
                         if accepted && fs::write(workspace.join("target.txt"), "fixed\n").is_err() {
                             return 73;
                         }
-                        if diff_update(&approval.thread_id, &approval.turn_id)
-                            .and_then(|()| {
-                                approval_request(
-                                    "approval-command",
-                                    "item/commandExecution/requestApproval",
-                                    &approval.thread_id,
-                                    &approval.turn_id,
-                                    "command-item",
-                                    json!({
-                                        "command":"cargo test", "reason":"Verify the patch",
-                                        "cwd":null
-                                    }),
-                                )
-                            })
-                            .is_err()
+                        if item_completed(
+                            &approval.thread_id,
+                            &approval.turn_id,
+                            "file-item",
+                            "fileChange",
+                            accepted,
+                        )
+                        .and_then(|()| diff_update(&approval.thread_id, &approval.turn_id))
+                        .and_then(|()| {
+                            item_started(
+                                &approval.thread_id,
+                                &approval.turn_id,
+                                "command-item",
+                                "commandExecution",
+                            )
+                        })
+                        .and_then(|()| {
+                            approval_request(
+                                "approval-command",
+                                "item/commandExecution/requestApproval",
+                                &approval.thread_id,
+                                &approval.turn_id,
+                                "command-item",
+                                json!({
+                                    "command":"cargo test", "reason":"Verify the patch",
+                                    "cwd":null
+                                }),
+                            )
+                        })
+                        .is_err()
                         {
                             return 74;
                         }
@@ -558,13 +898,80 @@ fn app_server_fixture() -> i32 {
                             return 73;
                         }
                         let message = if accepted {
-                            "Verification completed successfully."
+                            let Some(operation_id) = operation_ids.get(&approval.turn_id) else {
+                                return 65;
+                            };
+                            completion_report("Verification completed successfully.", operation_id)
                         } else {
-                            "Verification denied safely."
+                            "Verification denied safely.".to_owned()
                         };
-                        if agent_delta(&approval.thread_id, &approval.turn_id, message)
+                        if item_completed(
+                            &approval.thread_id,
+                            &approval.turn_id,
+                            "command-item",
+                            "commandExecution",
+                            accepted,
+                        )
+                        .and_then(|()| {
+                            agent_delta(&approval.thread_id, &approval.turn_id, &message)
+                        })
+                        .and_then(|()| turn_completed(&approval.thread_id, &approval.turn_id))
+                        .is_err()
+                        {
+                            return 74;
+                        }
+                    }
+                    ApprovalStage::Bypass => {
+                        if !accepted {
+                            return 65;
+                        }
+                        let Some(operation_id) = operation_ids.get(&approval.turn_id) else {
+                            return 65;
+                        };
+                        let report =
+                            completion_report("Bypass verification completed.", operation_id);
+                        if fs::write(workspace.join("target.txt"), "fixed\n")
+                            .and_then(|()| {
+                                append_line(&workspace.join(".fixture-actions"), "approved-command")
+                            })
+                            .and_then(|()| {
+                                item_completed(
+                                    &approval.thread_id,
+                                    &approval.turn_id,
+                                    "bypass-item",
+                                    "commandExecution",
+                                    true,
+                                )
+                            })
+                            .and_then(|()| diff_update(&approval.thread_id, &approval.turn_id))
+                            .and_then(|()| {
+                                agent_delta(&approval.thread_id, &approval.turn_id, &report)
+                            })
                             .and_then(|()| turn_completed(&approval.thread_id, &approval.turn_id))
                             .is_err()
+                        {
+                            return 74;
+                        }
+                    }
+                    ApprovalStage::Observation => {
+                        if !accepted {
+                            return 65;
+                        }
+                        let Some(operation_id) = operation_ids.get(&approval.turn_id) else {
+                            return 65;
+                        };
+                        let report =
+                            completion_report("Repository verification complete.", operation_id);
+                        if item_completed(
+                            &approval.thread_id,
+                            &approval.turn_id,
+                            "observation-item",
+                            "commandExecution",
+                            true,
+                        )
+                        .and_then(|()| agent_delta(&approval.thread_id, &approval.turn_id, &report))
+                        .and_then(|()| turn_completed(&approval.thread_id, &approval.turn_id))
+                        .is_err()
                         {
                             return 74;
                         }
@@ -577,10 +984,28 @@ fn app_server_fixture() -> i32 {
     0
 }
 
+fn completion_report(summary: &str, operation_id: &str) -> String {
+    format!(
+        "{summary} <carl-epoch-report>{}</carl-epoch-report>",
+        json!({
+            "schema_version":1,
+            "disposition":"complete",
+            "summary":summary,
+            "clause_evidence":[
+                {"clause_id":"requested-outcome","operation_ids":[operation_id],"event_sequences":[],"artifact_digests":[]},
+                {"clause_id":"explicit-verification","operation_ids":[operation_id],"event_sequences":[],"artifact_digests":[]}
+            ],
+            "exact_identifiers":[]
+        })
+    )
+}
+
 #[derive(Clone, Copy)]
 enum ApprovalStage {
     File,
     Command,
+    Bypass,
+    Observation,
 }
 
 struct PendingApproval {
@@ -650,13 +1075,58 @@ fn turn_started(thread_id: &str, turn_id: &str) -> std::io::Result<()> {
     }))
 }
 
-fn item_started(thread_id: &str, turn_id: &str, item_id: &str) -> std::io::Result<()> {
+fn item_started(
+    thread_id: &str,
+    turn_id: &str,
+    item_id: &str,
+    item_type: &str,
+) -> std::io::Result<()> {
+    let item = match item_type {
+        "commandExecution" => json!({
+            "type":"commandExecution","id":item_id,"command":"cargo test",
+            "cwd":"/workspace","status":"inProgress","commandActions":[]
+        }),
+        "fileChange" => file_change_fixture_item(item_id, "inProgress"),
+        _ => return Err(std::io::Error::other("unsupported fixture item type")),
+    };
     notify(json!({
         "method":"item/started", "params":{
             "threadId":thread_id,"turnId":turn_id,"startedAtMs":1,
-            "item":{"type":"agentMessage","id":item_id,"text":""}
+            "item":item
         }
     }))
+}
+
+fn item_completed(
+    thread_id: &str,
+    turn_id: &str,
+    item_id: &str,
+    item_type: &str,
+    succeeded: bool,
+) -> std::io::Result<()> {
+    let status = if succeeded { "completed" } else { "failed" };
+    let item = match item_type {
+        "commandExecution" => json!({
+            "type":"commandExecution","id":item_id,"command":"cargo test",
+            "cwd":"/workspace","status":status,"commandActions":[],
+            "exitCode":succeeded.then_some(0),"aggregatedOutput":"ok"
+        }),
+        "fileChange" => file_change_fixture_item(item_id, status),
+        _ => return Err(std::io::Error::other("unsupported fixture item type")),
+    };
+    notify(json!({
+        "method":"item/completed", "params":{
+            "threadId":thread_id,"turnId":turn_id,"completedAtMs":3,
+            "item":item
+        }
+    }))
+}
+
+pub fn file_change_fixture_item(item_id: &str, status: &str) -> Value {
+    json!({
+        "type":"fileChange","id":item_id,"status":status,
+        "changes":[{"path":"target.txt","kind":"update"}]
+    })
 }
 
 fn agent_delta(thread_id: &str, turn_id: &str, text: &str) -> std::io::Result<()> {

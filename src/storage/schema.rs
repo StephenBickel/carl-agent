@@ -50,6 +50,31 @@ const MIGRATIONS: &[Migration] = &[
         name: "ACP frontends",
         sql: include_str!("../../migrations/0007_acp_frontends.sql"),
     },
+    Migration {
+        version: 8,
+        name: "long-horizon tasks",
+        sql: include_str!("../../migrations/0008_long_horizon_tasks.sql"),
+    },
+    Migration {
+        version: 9,
+        name: "trusted frontend owners",
+        sql: include_str!("../../migrations/0009_trusted_frontend_owners.sql"),
+    },
+    Migration {
+        version: 10,
+        name: "durable task controls",
+        sql: include_str!("../../migrations/0010_durable_task_controls.sql"),
+    },
+    Migration {
+        version: 11,
+        name: "service task receipts",
+        sql: include_str!("../../migrations/0011_service_task_receipts.sql"),
+    },
+    Migration {
+        version: 12,
+        name: "service command receipts",
+        sql: include_str!("../../migrations/0012_service_command_receipts.sql"),
+    },
 ];
 
 pub(crate) fn migrate(connection: &mut Connection) -> Result<(), CarlError> {

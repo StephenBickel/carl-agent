@@ -34,6 +34,10 @@ fn main() {
                 "ACP isolates Codex and enforces one data-root owner",
                 acp_isolates_codex_and_enforces_one_owner,
             ),
+            trial(
+                "local Buzz trust persists an exact full-access owner binding",
+                local_buzz_trust_persists_exact_owner,
+            ),
         ],
     )
     .exit();
@@ -145,61 +149,114 @@ fn acp_isolates_codex_and_enforces_one_owner() -> TestResult {
     let layout = Layout::new()?;
     let binary = assert_cmd::cargo::cargo_bin!("carl");
     let provider = fs::canonicalize(std::env::current_exe()?)?;
-    let mut first = Command::new(binary)
+    let mut service = Command::new(binary)
         .current_dir(&layout.workspace)
         .env_clear()
         .env("CARL_DATA_DIR", fs::canonicalize(&layout.data)?)
-        .env("CARL_CODEX_EXECUTABLE", provider)
+        .env("CARL_CODEX_EXECUTABLE", &provider)
         .env("BUZZ_PRIVATE_KEY", "must-not-reach-codex")
         .env("BUZZ_RELAY_URL", "wss://must-not-reach-codex.invalid")
-        .arg("acp")
+        .arg("serve")
         .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
+        .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()?;
     let marker = layout.data.join("providers/codex/environment-check");
+    let mut marker_contents = None;
     for _ in 0..200 {
-        if marker.exists() {
+        if let Ok(contents) = fs::read_to_string(&marker)
+            && matches!(contents.as_str(), "isolated\n" | "leaked\n")
+        {
+            marker_contents = Some(contents);
             break;
         }
-        if first.try_wait()?.is_some() {
+        if service.try_wait()?.is_some() {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
-    if !marker.exists() {
-        drop(first.stdin.take());
-        let output = first.wait_with_output()?;
+    let Some(marker_contents) = marker_contents else {
+        let _ = service.kill();
+        let output = service.wait_with_output()?;
         return Err(format!(
-            "first ACP process exited {:?}: {}",
+            "owner service did not finish its environment marker and exited {:?}: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    };
+    if marker_contents != "isolated\n" {
+        let _ = service.kill();
+        let output = service.wait_with_output()?;
+        return Err(format!(
+            "provider environment isolation failed; owner service exited {:?}: {}",
             output.status.code(),
             String::from_utf8_lossy(&output.stderr)
         )
         .into());
     }
-    assert_eq!(fs::read_to_string(&marker)?, "isolated\n");
 
-    let second = Command::new(binary)
+    let second_owner = Command::new(binary)
         .current_dir(&layout.workspace)
         .env_clear()
         .env("CARL_DATA_DIR", fs::canonicalize(&layout.data)?)
-        .env(
-            "CARL_CODEX_EXECUTABLE",
-            fs::canonicalize(std::env::current_exe()?)?,
-        )
-        .arg("acp")
+        .env("CARL_CODEX_EXECUTABLE", &provider)
+        .arg("serve")
         .output()?;
-    assert_eq!(second.status.code(), Some(1));
-    assert!(second.stdout.is_empty());
+    assert_eq!(second_owner.status.code(), Some(1));
+    assert!(second_owner.stdout.is_empty());
 
-    drop(first.stdin.take());
-    let output = first.wait_with_output()?;
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
+    for _ in 0..2 {
+        let adapter = Command::new(binary)
+            .current_dir(&layout.workspace)
+            .env_clear()
+            .env("CARL_DATA_DIR", fs::canonicalize(&layout.data)?)
+            .arg("acp")
+            .output()?;
+        assert!(
+            adapter.status.success(),
+            "{}",
+            String::from_utf8_lossy(&adapter.stderr)
+        );
+        assert!(adapter.stdout.is_empty());
+    }
+
+    let _ = service.kill();
+    let _ = service.wait();
+    Ok(())
+}
+
+fn local_buzz_trust_persists_exact_owner() -> TestResult {
+    let layout = Layout::new()?;
+    let actor = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    for _ in 0..2 {
+        let output = Command::new(assert_cmd::cargo::cargo_bin!("carl"))
+            .current_dir(&layout.workspace)
+            .env_clear()
+            .env("CARL_DATA_DIR", fs::canonicalize(&layout.data)?)
+            .args(["trust", "buzz", "--actor", actor, "--workspace"])
+            .arg(fs::canonicalize(&layout.workspace)?)
+            .output()?;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value: Value = serde_json::from_slice(&output.stdout)?;
+        assert_eq!(value["trusted"], true);
+        assert_eq!(value["permission_mode"], "fullAccess");
+        assert_eq!(value["channel_bound"], false);
+    }
+    let connection = rusqlite::Connection::open(layout.data.join("carl.sqlite3"))?;
+    assert_eq!(
+        connection.query_row(
+            "SELECT actor_id || ':' || permission_mode || ':' || COALESCE(channel_id, 'null')
+             FROM trusted_frontend_owners WHERE frontend = 'buzz'",
+            [],
+            |row| row.get::<_, String>(0),
+        )?,
+        format!("{actor}:bypassPermissions:null")
     );
-    assert!(output.stdout.is_empty());
     Ok(())
 }
 
@@ -293,16 +350,17 @@ struct Layout {
 
 impl Layout {
     fn new() -> TestResult<Self> {
-        let root = std::env::temp_dir().join(format!("carl-acp-cli-{}", Uuid::new_v4()));
+        let serial = Uuid::new_v4().simple().to_string();
+        let root = PathBuf::from("/tmp").join(format!("carl-acp-cli-{}", &serial[..12]));
         let data = root.join("data");
         let workspace = root.join("workspace");
         fs::create_dir_all(&data)?;
         fs::create_dir_all(&workspace)?;
         private_dir::make_owner_only_directory(&data)?;
         Ok(Self {
-            root,
-            data,
-            workspace,
+            root: fs::canonicalize(root)?,
+            data: fs::canonicalize(data)?,
+            workspace: fs::canonicalize(workspace)?,
         })
     }
 

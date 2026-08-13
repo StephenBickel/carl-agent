@@ -1,0 +1,542 @@
+# Task 12 report: Keep tasks alive behind a persistent owner service
+
+## Implementation
+
+- Added a versioned, strict newline-JSON service protocol with bounded frames, task
+  input and event pagination, unknown-field denial, duplicate-request protection,
+  and durable idempotency-key binding.
+- Added the persistent `TaskService` owner. It alone owns SQLite, the task engine,
+  provider lifetime, task actors, control delivery, and cancellation. Client EOF
+  drops only the frontend subscriber; active work continues.
+- Added owner-private local transport: a canonical-data-root Unix socket with
+  symlink/type rejection and mode `0600`, plus a data-root-hashed Windows named-pipe
+  implementation restricted to the current owner.
+- Added startup reconciliation for every resumable durable task before the service
+  accepts frontend commands. A restarted owner resumes from the journal/checkpoint
+  rather than duplicating a committed effect.
+- Added `carl serve`, authenticated shutdown, OS-signal cancellation, service
+  capability/model negotiation, and a reconnecting client with durable event
+  cursors.
+- Made `carl acp` a thin service client. It no longer opens SQLite or owns a provider;
+  ACP disconnects leave the service and task running, and reconnect/load resumes
+  strictly after the acknowledged durable sequence.
+- Preserved trusted Buzz admission at the sole-writer boundary. Generic Buzz task
+  steering fails closed, while the structural trusted route preserves exact
+  actor/channel/session and replay checks before provider work.
+- Added migration 11 for durable start receipts so the same start idempotency key
+  returns the original task after service restart and rejects command-digest
+  rebinding.
+- Added bounded ACP output and cancellation-aware writes so a non-reading frontend
+  cannot stall the owner or interrupt its task.
+
+## RED / GREEN evidence
+
+1. The first cancellation regression hung before provider interruption because an
+   active-task mutex guard survived into a nested mutation. Scoping the guard before
+   mutation now records one interrupt, one shutdown, and a durable cancelled state.
+2. Start replay initially depended on process memory. The receipt migration and
+   atomic store API now return the same task across owner restart and deny key reuse
+   with a different digest.
+3. A three-epoch ACP continuity test disconnects after the first committed effect,
+   reconnects from its exact cursor during epoch 2, and completes epoch 3 with one
+   effect, one completion report, no interrupt, and strictly increasing replay.
+4. Startup initially prepared only the selected task. A two-task restart test now
+   proves every resumable task is prepared before the replacement service accepts a
+   client.
+5. A slow ACP reader initially blocked forever after bounded-queue eviction. The
+   writer now selects cancellation against frame writes; the frontend exits while
+   the owner stays active with zero provider interrupts.
+6. The Buzz end-to-end fixture initially launched an in-process ACP owner. It now
+   launches a real `carl serve` process plus thin `carl acp`, proves trusted
+   auto-dispatch, terminal-task replacement, structural steering, replay denial,
+   generic-route denial, and single cancellation.
+7. The ACP CLI contract now proves provider isolation, second-owner rejection, and
+   independent clean EOF for two thin frontend processes.
+
+## Verification
+
+Focused implementation suites and broad static gates were used during development:
+
+```text
+cargo test --test service_protocol_contract
+PASS: 7 passed, 0 failed
+
+cargo test --test service_end_to_end
+PASS: 12 passed, 0 failed
+
+cargo test --test acp_server_contract
+PASS: 4 passed, 0 failed
+
+cargo test --test acp_protocol_contract
+PASS: 8 passed, 0 failed
+
+cargo test --test acp_kernel_contract
+PASS: 32 passed, 0 failed
+
+cargo test --test cli_contract
+PASS: 5 passed, 0 failed
+
+cargo test --test acp_cli_contract
+PASS: 4 passed, 0 failed
+
+cargo test --test buzz_end_to_end Buzz
+PASS: 2 passed, 0 failed
+
+cargo clippy --all-targets --all-features -- -D warnings
+PASS: exit 0, no warnings
+
+cargo fmt --all -- --check
+PASS: exit 0
+
+git diff --check
+PASS: exit 0
+```
+
+The root agent owns the single final `cargo test --all-features` milestone run. This
+task used change-focused RED/GREEN tests instead of repeating the full suite after
+each Rust edit.
+
+The attempted Windows GNU cross-check reached the bundled SQLite C build and stopped
+because `x86_64-w64-mingw32-gcc` is not installed in this environment. Host Rust
+compilation and all gates above pass; this is a toolchain limitation, not a reported
+Windows Rust diagnostic.
+
+## Self-review
+
+- Slow or disconnected clients cannot own, cancel, pause, or retain an active task.
+- Event replay is durable and cursor-based; no completion is synthesized by the ACP
+  adapter and no provider effect is replayed merely because a frontend reconnects.
+- Start idempotency is committed with task creation rather than acknowledged from an
+  in-memory cache.
+- The local endpoint derives identity from the canonical data root and is never
+  accepted through a symlink alias.
+- No service process remains after the focused process tests. `SECURITY.md` was not
+  modified.
+
+## Commit
+
+- `1a5fe3a feat: keep tasks alive across frontend reconnects`
+
+## Fix round 1/5
+
+The first review round closed every reported Task 12 issue:
+
+- Replaced process-local mutation replay with globally durable service-command
+  receipts (migration 12), including safe pending-receipt reconciliation,
+  command/payload rebinding rejection, and replayed owner shutdown.
+- Bounded per-connection ledgers and per-task live-update storage. Live updates
+  now carry exact task attribution, use cursor-based reconnect, and fall back to a
+  snapshot after source or ring overflow instead of retaining unbounded history.
+- Bridged approval-mode operations through typed service updates and exact,
+  durable, single-use `/approve CODE` and `/deny CODE` commands. A pending
+  approval survives frontend reconnect at the acknowledged live cursor and stops
+  replaying after resolution.
+- Preserved explicit permission modes for trusted starts and added durable,
+  taskless trusted-session permission configuration. Owner Full Access remains
+  the default ceiling while explicit Plan and Approval choices stay narrower.
+- Kept trusted Buzz admission, actor/channel/session binding, and replay defense
+  on steering, permission changes, and approval resolution. Plain steering is
+  accepted only for an already bound session.
+- Added stream generations so a replacement ACP subscriber owns delivery, made
+  Buzz publication live-prompt-only, and prevented replay subscribers from
+  duplicating pending approval messages.
+- Required deterministic completion verification before accepting provider
+  completion, retained marker-only cancel recovery, and made failed work-control
+  journaling transition durably to `Failed` before acknowledgement.
+- Hardened the Windows named-pipe endpoint with current-owner identity, DACL, and
+  server-PID checks. The host could not complete the GNU cross-build because the
+  MinGW C compiler required by bundled SQLite is not installed.
+- Corrected the provider fixtures to emit truthful item completion/report events
+  and made Buzz test teardown reap both ACP and service processes after failures.
+
+Verification after the final reconnect fix:
+
+```text
+cargo test --locked --lib
+PASS: 56 passed, 0 failed
+
+cargo test --locked --test buzz_end_to_end
+PASS: 6 passed, 0 failed
+
+cargo test --locked --test service_end_to_end
+PASS: 16 passed, 0 failed
+
+cargo test --locked --test service_protocol_contract
+PASS: 8 passed, 0 failed
+
+cargo test --locked --test storage_contract
+PASS: 21 passed, 0 failed
+
+cargo test --locked --test task_storage_contract
+PASS: 21 passed, 0 failed
+
+cargo test --locked --test acp_server_contract
+PASS: 4 passed, 0 failed
+
+cargo clippy --locked --all-targets --all-features -- -D warnings
+PASS: exit 0, no warnings
+
+cargo fmt --all -- --check
+PASS: exit 0
+
+git diff --check
+PASS: exit 0
+```
+
+No Task 12 review findings remain open. No service process remained after the
+process-level tests, and `SECURITY.md` was not changed.
+
+### Fix commit
+
+- `6cf7453 fix: harden persistent task service`
+
+## Fix round 2/5
+
+The second review round closed all five remaining blockers:
+
+- Buzz steering now requires one fresh, exact structural owner metadata block.
+  Missing, malformed, foreign actor/channel, group-shaped, ambiguous, and replayed
+  metadata all fail before a task control marker or provider steer is emitted.
+- Every service owner instance publishes a UUID live generation. Service and ACP
+  cursors are accepted only with their matching generation; reconnecting to a
+  replacement owner resets a stale numeric cursor and delivers replacement
+  assistant output, diff, and approval exactly once.
+- Timed-out live subscribers are removed immediately. A paused-time 10,000-poll
+  stress regression leaves zero subscriber senders and still delivers the next
+  publication to a real waiter.
+- Windows named pipes now use the actual current-user SID, a protected DACL, and
+  exactly one non-inherited allow ACE with the exact generic read/write mask. The
+  client verifies the server process SID, descriptor owner, DACL protection, ACE
+  count/type/flags/mask, and ACE SID. The host security-shape matrix rejects foreign
+  owners and SIDs, unprotected or inherited ACLs, extra/deny ACEs, and insufficient
+  or excessive masks.
+- The runtime peer SQLite connection is read-only from connection creation via
+  `SQLITE_OPEN_READ_ONLY`, then additionally uses `query_only`; it performs only
+  read validations. Durable mutation receipt claim/completion now runs through the
+  owner `TaskEngine` actor, and ordinary and trusted approval mutation receipts are
+  asserted canonical, completed, JSON-valid, replay-stable, and never pending.
+
+### RED / GREEN and debugging evidence
+
+- The strict Buzz matrix was RED because missing metadata fell back to generic
+  steering; removing that fallback made the full admission matrix GREEN with zero
+  mutation delta on every rejection.
+- The live-generation protocol, service page, ACP binding, and real owner-restart
+  regressions were RED before generation ownership existed. The real restart test
+  now crosses a nonzero old cursor and verifies assistant, diff, and approval once
+  through both ACP and the service API, then completes truthfully after approval.
+- The subscriber stress regression was RED with 10,000 retained senders and GREEN
+  with explicit subscriber IDs and unregister-on-return.
+- The peer-store regression was RED when a peer could claim a receipt. It is GREEN
+  with a read-only SQLite open, and all successful service mutation paths retain
+  their durable canonical receipts through the owner writer.
+- Systematic debugging of the three-epoch reconnect timeout found a test-ordering
+  race: the fixture released its final epoch after writing the prompt but before
+  provider steer acknowledgement. The new owner-actor receipt round trip exposed
+  that invalid timing assumption, so the task could finish and reject the steer.
+  Boundary tracing showed Active status followed by a rejected steer and terminal
+  fake-provider state. Holding release until the provider observed the steer made
+  the request apply; the final regression uses that condition instead of a sleep.
+  All temporary diagnostic logging was removed.
+
+### Verification
+
+```text
+cargo test --locked --lib \
+  --test service_protocol_contract --test service_end_to_end \
+  --test buzz_end_to_end --test acp_server_contract \
+  --test buzz_acp_contract --test storage_contract \
+  --test task_storage_contract
+PASS: 144 passed, 0 failed
+
+cargo fmt --all -- --check
+PASS: exit 0
+
+cargo clippy --locked --all-targets --all-features -- -D warnings
+PASS: exit 0, no warnings
+
+git diff --check
+PASS: exit 0
+```
+
+After the final peer read-only refinement, the peer mutation, ordinary service
+mutation receipt, and Buzz approval receipt regressions all passed again, followed
+by the strict formatting, clippy, and diff gates.
+
+The installed `x86_64-pc-windows-gnu` target reached `libsqlite3-sys` and stopped
+because `x86_64-w64-mingw32-gcc` is not installed. This is the expected external C
+toolchain limitation; no Windows Rust diagnostic was reported before it. The host
+Windows descriptor/ACE validation matrix passed. No Carl service process remained,
+no migration or `Cargo.lock` changed, and `SECURITY.md` was not modified.
+
+### Fix commit
+
+- `1fa6d20 fix: enforce persistent service ownership boundaries`
+
+## Fix round 3/5
+
+The independent shutdown-ordering blocker is closed:
+
+- `shutdown_owner` queues `ShutdownProvider` before cancelling the active task, so
+  terminal intent is already visible when the active engine run exits.
+- The owner actor polls queued actor commands before any durable-task refill or
+  scheduled start. A successful `ShutdownProvider` clears scheduled work and
+  disables future refills.
+- The actor remains alive with the provider shut down and no runnable work, allowing
+  the owner `TaskEngine` control receiver to claim and complete the canonical
+  shutdown receipt before the service exits.
+- Existing cancel, steer, resume, configure, provider-error, channel-close, and
+  receipt-completion behavior remains on the same command handler.
+
+### RED / GREEN evidence
+
+The focused active-A/queued-B regression first failed exactly at the reported race:
+
+```text
+provider before=(1 context, 1 epoch)
+provider after=(2 contexts, 2 epochs, 0 shutdowns)
+shutdown receipt=pending
+pending receipts=1
+shutdown response=timeout
+```
+
+After command preemption and early shutdown-intent queueing, the same regression
+returns `Applied` promptly, B never creates or resumes a provider context and never
+starts an epoch, provider shutdown occurs exactly once, the shutdown receipt is
+completed with valid JSON, and zero pending receipts remain.
+
+### Verification
+
+```text
+cargo test --locked --test service_end_to_end \
+  shutdown_preempts_queued_work_and_completes_its_receipt
+PASS: 1 passed, 0 failed
+
+cargo test --locked --test service_end_to_end
+PASS: 20 passed, 0 failed
+
+cargo fmt --all -- --check
+PASS: exit 0
+
+cargo clippy --locked --all-targets --all-features -- -D warnings
+PASS: exit 0, no warnings
+
+git diff --check
+PASS: exit 0
+```
+
+This actor scheduling change is platform-neutral and does not touch the Windows
+named-pipe transport or security descriptor code. No Carl process remained after
+the process tests. No migration, `Cargo.lock`, or `SECURITY.md` changed, and no full
+all-features test run was performed.
+
+### Fix commit
+
+- `6cd31b7 fix: preempt queued work on service shutdown`
+
+## Fix round 4/5
+
+The multithreaded shutdown/start TOCTOU is closed with one shared actor lifecycle
+state:
+
+- A task start now holds the active-task mutex while it checks the acquired
+  `shutdown_requested` flag and publishes `Some(task_id)`. Shutdown holds that
+  same mutex while it release-publishes terminal intent and reads the active task.
+  The two operations therefore have a total order: shutdown-first refuses the
+  start without popping it, while start-first makes the task visible for owner
+  cancellation.
+- Durable refill, scheduled-pop, and resumed-task enqueue all stop when shutdown
+  intent is published. Successful provider shutdown also clears the schedule and
+  independently rejects resume.
+- Non-shutdown mutations that were waiting behind the shutdown mutation gate are
+  rejected before claiming a durable receipt. A `Resume` command already at the
+  actor rechecks shutdown before both its control marker and its queue insertion,
+  so it cannot restart work after shutdown.
+- The owner actor still services engine controls after provider shutdown, preserving
+  canonical shutdown receipt completion and idempotent shutdown retry behavior.
+
+### RED / GREEN evidence
+
+The ordering tests were written before the lifecycle coordinator. The focused RED
+failed because production had no shared `TaskActorState` (`E0433` at all three new
+tests) and no guarded resume enqueue operation (`E0425`), which is the missing
+coordination the tests require.
+
+For each ordering, the GREEN test holds the real active-task mutex, polls both
+contenders into the mutex wait queue in the selected order, and only then releases
+the lock. No sleep or scheduler timing is involved:
+
+- shutdown-first returns no active task; the following start claim is false and
+  active state remains `None`;
+- start-first claims exactly the selected task; shutdown observes that same task;
+- after published shutdown, resume returns `Stopped` and the schedule stays empty.
+
+The existing active-A/queued-B service regression remains canonical: shutdown
+returns `Applied`, B makes no provider start/resume/epoch call, provider shutdown
+occurs exactly once, its receipt is completed with valid JSON, and zero receipts
+remain pending.
+
+### Verification
+
+```text
+cargo test --locked --lib service::server::tests
+PASS: 7 passed, 0 failed
+
+cargo test --locked --test service_end_to_end \
+  shutdown_preempts_queued_work_and_completes_its_receipt
+PASS: 1 passed, 0 failed
+
+cargo test --locked --test service_end_to_end
+PASS: 20 passed, 0 failed
+
+cargo fmt --all -- --check
+PASS: exit 0
+
+cargo clippy --locked --all-targets --all-features -- -D warnings
+PASS: exit 0, no warnings
+
+git diff --check
+PASS: exit 0
+```
+
+This lifecycle synchronization is platform-neutral and does not change the Unix
+socket or Windows named-pipe transport/security implementation. No cross-build was
+needed. No Carl process remained, no migration, `Cargo.lock`, or `SECURITY.md`
+changed, and no full all-features test suite was run.
+
+### Fix commit
+
+- `fe2ad37 fix: linearize service shutdown with task starts`
+
+## Fix round 5/5
+
+The final start-first cancellation handoff blocker is closed:
+
+- Shutdown still release-publishes terminal intent under the task-start mutex, but
+  it now quiesces the task observed by that publication before it sends
+  `ShutdownProvider`.
+- Canonical durable state plus the actor's active claim classifies the handoff as
+  already terminal, still active, or nonterminal idle. Terminal state is safely
+  quiesced; active state receives the normal owner control; paused, blocked, or
+  otherwise inactive nonterminal state is cancelled through the idle actor while
+  the provider remains alive.
+- An active-control completion race is followed by a canonical state reread. If
+  the task naturally became terminal, shutdown succeeds; if it handed off to idle,
+  the idle actor completes cancellation; a genuinely unresolved cancellation
+  error stops shutdown before any provider shutdown call.
+- The task first observed by shutdown is retained across a failed shutdown request,
+  so a retry can finish cancellation even after the actor clears its active claim.
+- Only after cancellation or terminal quiescence succeeds does the actor shut down
+  the provider. Successful provider shutdown still leaves the owner actor alive to
+  complete the canonical shutdown receipt, and durable queued tasks remain
+  untouched for a replacement owner.
+
+### RED / GREEN evidence
+
+The deterministic real-service harness uses the actual dispatcher, owner engine,
+active-task mutex, durable SQLite store, and provider port. It holds the actor mutex,
+polls shutdown through its durable receipt claim into the blocked publication,
+releases provider task B to complete, then advances publication so shutdown observes
+B while the actor clears the claim before cancellation continues. It uses mutex
+ordering and explicit polling only, with no sleep.
+
+Before the production reorder, the regression failed exactly at the reported
+handoff:
+
+```text
+outcome=Ok(Err(TaskServiceError { code: InvalidRequest }))
+provider=(shutdowns 1, operations-after-shutdown 0)
+shutdown receipt=pending
+pending receipts=1
+queued C status=queued
+```
+
+The transition table was also RED on missing `classify_shutdown_cancel` (`E0425`)
+and `ShutdownCancelRoute` (`E0433`). After the fix, the real handoff returns
+`Applied` promptly, provider shutdown occurs exactly once, zero provider operations
+occur afterward, the receipt is completed with valid JSON, and no receipts remain
+pending. C remains durably queued, and binding a replacement owner identifies C as
+its sole resumable initial task and prepares its provider context. The retained
+target retry and terminal/active/idle transition tests also pass.
+
+### Verification
+
+```text
+cargo test --locked --lib service::server::tests
+PASS: 10 passed, 0 failed
+
+cargo test --locked --test service_end_to_end \
+  shutdown_preempts_queued_work_and_completes_its_receipt
+PASS: 1 passed, 0 failed
+
+cargo test --locked --test service_end_to_end
+PASS: 20 passed, 0 failed
+
+cargo fmt --all -- --check
+PASS: exit 0
+
+cargo clippy --locked --all-targets --all-features -- -D warnings
+PASS: exit 0, no warnings
+
+git diff --check
+PASS: exit 0
+```
+
+The real private-endpoint handoff harness is explicitly Unix-gated; the ordering,
+transition, retry, and resume proofs are platform-neutral. Production changes do
+not touch Unix sockets, Windows named pipes, or Windows security descriptors, so no
+cross-build was needed. No Carl process remained, no migration, `Cargo.lock`, or
+`SECURITY.md` changed, and no full all-features test suite was run.
+
+### Fix commit
+
+- `ab3b4c7 fix: quiesce tasks before provider shutdown`
+
+## Integration-gate stabilization
+
+The final independent review and required all-features milestone gate found and closed
+four issues beyond the fifth implementation fix round:
+
+- OS-signal shutdown now acquires the same mutation gate as authenticated service
+  mutations. An admitted mutation completes its acknowledgement and durable receipt
+  before provider shutdown; later mutations fail closed. A deterministic RED/GREEN
+  harness proved the old signal path could shut the provider down while a receipt was
+  pending, and now proves one shutdown, zero post-shutdown provider operations, a
+  completed receipt, and zero pending receipts.
+- A work-control cancellation that already durably recorded uncertain operation
+  evidence and transitioned the task to `Blocked` is no longer overwritten by the
+  generic `Failed` escalation. Genuine control failures that have not established a
+  canonical blocked state still use the existing failure path.
+- ACP migration fixtures now advance version-six databases through the current twelve
+  migrations, remove every post-version-six service table before replay, and verify
+  the three Task 12 receipt/control tables.
+- The ACP CLI provider-isolation fixture waits for a complete closed marker value,
+  rather than file existence, and kills/reaps the child on every timeout or failure
+  path. The memory migration expectation also tracks the current twelve migrations.
+
+### Integration-gate commits
+
+- `3863d02 fix: serialize signal shutdown with mutations`
+- `adc0550 fix: preserve blocked cancellation outcomes`
+- `3d41120 test: advance ACP migration fixtures`
+- `e26402b test: wait for complete provider marker`
+- `0abe383 test: advance memory migration expectation`
+
+### Final milestone verification
+
+```text
+cargo test --locked --all-features
+PASS: all unit, integration, contract, workflow, and documentation tests; 0 failed
+
+cargo fmt --check
+PASS: exit 0
+
+cargo clippy --locked --all-targets --all-features -- -D warnings
+PASS: exit 0, no warnings
+
+git diff --check
+PASS: exit 0
+```
+
+Every stabilization diff received a fresh independent review. No migration file,
+`Cargo.lock`, or `SECURITY.md` changed, and no Carl service or ACP process remained.

@@ -1,6 +1,8 @@
 # Security Policy
 
-Carl is pre-alpha foundation software and is not ready to execute end-user agent workloads. The runtime, production providers, tools, policy engine, TUI, and Telegram gateway described by the v1 design are not implemented.
+Carl is pre-alpha software with an implemented subscription-backed Codex coding path,
+durable task runtime, tool mediation, and Buzz integration. It can execute consequential
+code under the current operating-system account. Review the boundaries below before use.
 
 ## Supported versions
 
@@ -12,10 +14,36 @@ Use the repository's private **Report a vulnerability** / private vulnerability 
 
 If private vulnerability reporting is unavailable, open a public issue containing only a request for a private maintainer contact. Do not disclose exploit details in that issue. Maintainers will acknowledge reports and coordinate validation, remediation, and disclosure as capacity permits; pre-alpha status means no response-time guarantee is offered.
 
-## Security boundaries
+## Implemented security boundaries
 
-The durable foundation currently provides versioned event contracts, typed sanitized user-facing errors, checksum-verified SQLite migrations, and deterministic provider tests without live credentials. These properties do not create a sandbox.
+Local ACP uses owner-default full access because Carl is designed to make routine coding
+decisions for its owner. This is an accepted-risk mode, not an assertion that generated
+commands are safe. Every consequential provider effect must still cross Carl's
+pre-dispatch mediation boundary, with durable intent, policy classification, path and
+secret checks, and an allow or deny decision before dispatch.
 
-The planned threat model and enforcement boundaries are documented in [docs/security.md](docs/security.md). In particular, future shell execution will be constrained by policy and process controls, not a complete security sandbox. Never use Carl to execute code you would not trust under the host account.
+Untrusted remote requests remain denied by default. Buzz admission is owner-bound, and
+remote bypass requires a separate explicit trusted configuration. Approval codes are
+single-use and bound to the actor, channel, session, turn, request, working directory,
+and request digest.
 
-Credential values must never be committed, placed in issues, or included in fixtures. OpenAI support will use an OpenAI Platform API key; copying Codex or ChatGPT credentials or using undocumented OAuth is out of scope.
+Carl delegates ChatGPT subscription login and credential storage to the pinned Codex
+executable. It does not implement undocumented OAuth, accept an OpenAI API-key fallback
+for ACP, or read subscription bearer and refresh tokens. Credentials, provider
+transcripts, prompts, command output, and live-run workspaces must never be committed.
+
+Durable checkpoints, idempotency, process-tree cleanup, and fail-closed recovery reduce
+duplicate effects and improve auditability. An unresolved `Started` operation is not
+automatically replayed after a crash.
+
+## Out of scope
+
+Carl is not a complete security sandbox. It cannot defend secrets from other same-user
+processes, a compromised provider executable, malicious host tooling, kernel-level
+attackers, or code already authorized to run with the owner's ambient authority.
+Use a disposable workspace or a stronger operating-system/container boundary for
+hostile repositories. Never use Carl to execute code you would not trust under the host
+account.
+
+The complete trust model, remote-channel boundary, and current limitations are in
+[docs/security.md](docs/security.md).

@@ -141,6 +141,35 @@ promotion into a live workspace remains unimplemented. The ACP coding path inste
 uses the Codex app-server's coding capabilities under Carl's mode and exact approval
 boundary.
 
+## Long-horizon task lifecycle
+
+The private task service owns one durable task actor at a time. ACP admission records
+the immutable workspace, budget, completion contract, provider/model selection, and
+initial context binding before provider work begins. Each consequential tool request
+is represented by a durable operation intent and state transition; the journal is the
+authority and the task snapshot is a checked projection.
+
+At a safe epoch boundary the engine verifies operation evidence and the structured
+epoch report, commits a canonical checkpoint, performs context compaction when needed,
+and returns the task to `active`. The checkpoint carries its event-source range,
+previous-checkpoint lineage, completion clauses, exact identifiers, operation summaries,
+usage, and next objective. Startup validates that lineage and replays the journal tail
+instead of trusting checkpoint JSON or a mutable projection by itself.
+
+Recoverable maintenance asks the actor to quiesce at the next committed boundary,
+publishes a `ready` task/checkpoint binding, and then stops the provider once. A fresh
+service and ACP connection use `session/load` to bind the same task. If the provider
+cannot resume its context, provider context replacement records the loss, constructs a
+new context from the canonical checkpoint package, and continues without redispatching
+successful effects. An unresolved `Started` operation is reconciled as uncertain and
+blocks automatic replay.
+
+Metrics are reduced from the task journal in bounded pages and compared with the final
+snapshot. They expose counts, status, contract progress, budget usage, and checkpoint
+progress without assistant text or command output. See the
+[long-horizon task guide](long-horizon-tasks.md) for the frontend methods and the
+[benchmark methodology](benchmarks.md) for tested limits.
+
 ## Remaining product work
 
 There is no interactive TUI, Telegram gateway, Grok execution port, native HTTP

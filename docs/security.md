@@ -242,6 +242,31 @@ future promotion must independently re-check live path identity, ownership, cont
 preconditions, the committed verification result, and the exact proposal immediately
 before applying bytes.
 
+## Long-horizon full-access boundary
+
+Local owner-selected full access is an accepted risk mode. It allows Carl to make
+routine effect decisions without pausing for a new interactive prompt, but it does not
+remove the pre-dispatch mediation invariant: a consequential provider request must be
+normalized, policy-checked, durably recorded, and allowed before Carl dispatches it.
+Secret rejection, workspace path validation, operation idempotency, and uncertain-effect
+recovery still apply.
+
+Untrusted remote requests do not inherit local full access. Buzz remains owner-bound,
+and remote bypass requires an explicit separately configured trusted binding. A denied
+request is not dispatched merely because the provider or repository text asks Carl to
+ignore policy.
+
+This is not a complete security sandbox. Carl cannot protect credentials from another
+same-user process that can inspect files, memory, process arguments, or provider-owned
+state. Full access also cannot make arbitrary third-party build scripts safe. Use a
+disposable workspace or an operating-system/container boundary for hostile repositories,
+and keep high-value credentials out of the agent's user account.
+
+Durable checkpoints improve recovery and auditability, not confinement. After a crash,
+an unresolved `Started` operation becomes uncertain and is not automatically replayed.
+Provider context replacement reconstructs only from validated canonical task state; it
+does not trust an old transcript as authority.
+
 ## Remote channel boundary
 
 The implemented Buzz integration relies on Buzz for signed identity, membership,

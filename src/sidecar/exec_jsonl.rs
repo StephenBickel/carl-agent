@@ -15,9 +15,10 @@ use super::jsonl::read_bounded_line;
 use super::{
     DirectoryIdentity, ProviderHome, REDACTED_STDERR, STATE_CANCELLING, STATE_RUNNING,
     STATE_STOPPED, SidecarCommand, SidecarError, SidecarErrorCode, SidecarLimits,
-    SidecarProcessGuard, StderrCapture, TrustedExecutable, detect_version, directory_identity,
-    force_kill_and_reap, is_link_or_reparse, lock, open_identity_directory,
-    set_owner_only_child_umask, spawn_trusted_grouped, stderr_worker, terminate_process,
+    SidecarProcessGuard, StderrCapture, TrustedExecutable, TrustedExecutableAttestation,
+    detect_version, directory_identity, force_kill_and_reap, is_link_or_reparse, lock,
+    open_identity_directory, set_owner_only_child_umask, spawn_trusted_grouped, stderr_worker,
+    terminate_process,
 };
 
 const EVENT_CHANNEL_CAPACITY: usize = 64;
@@ -151,6 +152,49 @@ impl JsonlEventProcess {
         stdin_payload: &[u8],
         limits: SidecarLimits,
     ) -> Result<Self, SidecarError> {
+        Self::spawn_in_home_inner(
+            specification,
+            executable,
+            home,
+            workspace,
+            stdin_payload,
+            limits,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn spawn_in_home_with_attestation(
+        specification: SidecarCommand,
+        executable: &TrustedExecutable,
+        home: &ProviderHome,
+        workspace: &ExecutionWorkspace,
+        stdin_payload: &[u8],
+        limits: SidecarLimits,
+        executable_attestation: &TrustedExecutableAttestation,
+    ) -> Result<Self, SidecarError> {
+        Self::spawn_in_home_inner(
+            specification,
+            executable,
+            home,
+            workspace,
+            stdin_payload,
+            limits,
+            Some(executable_attestation),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn spawn_in_home_inner(
+        specification: SidecarCommand,
+        executable: &TrustedExecutable,
+        home: &ProviderHome,
+        workspace: &ExecutionWorkspace,
+        stdin_payload: &[u8],
+        limits: SidecarLimits,
+        executable_attestation: Option<&TrustedExecutableAttestation>,
+    ) -> Result<Self, SidecarError> {
         let limits = limits.validate()?;
         if stdin_payload.len() > MAX_STDIN_BYTES
             || !workspace.matches_path(&home.canonical_workspace)?
@@ -160,6 +204,9 @@ impl JsonlEventProcess {
             ));
         }
         detect_version(&specification, executable, home, limits).await?;
+        if let Some(executable_attestation) = executable_attestation {
+            executable.revalidate_verification_attestation(executable_attestation)?;
+        }
 
         let mut command = Command::new(executable.canonical_path());
         command

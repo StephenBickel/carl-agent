@@ -44,9 +44,29 @@ supported by the selected provider model. `<mode>` is `plan`, `default`,
 Session-level ACP configuration may override these process defaults but cannot
 silently select an unknown model, unsupported effort, or remote bypass.
 
+Every newly admitted durable task receives explicit hard and soft budgets. Their ACP
+flags and current admission ranges are:
+
+| Flag | Range | Purpose |
+| --- | ---: | --- |
+| `--max-wall-time-seconds` | 1–86,400 | Hard total wall-time budget. |
+| `--max-provider-requests` | 1–10,000 | Hard provider-request budget. |
+| `--max-tool-calls` | 1–100,000 | Hard tool-operation budget. |
+| `--soft-epoch-seconds` | 30–3,600 | Request a safe checkpoint after a bounded epoch. |
+| `--soft-epoch-tool-calls` | 1–1,000 | Request a safe checkpoint after this many tool calls. |
+
+The defaults are printed by `carl acp --help` and are applied once at task admission.
+Reconnecting with different flags does not rewrite an existing task's persisted budget;
+the new values apply to the next task.
+
 `carl acp` is the implemented subscription-backed execution path. The older
-`codex exec --json` adapter remains a separate inert library boundary; the live ACP
-path uses Codex app-server `0.146.0`.
+`codex exec --json` adapter is exposed only through the explicit `carl baseline codex`
+comparison command; normal ACP work uses Codex app-server `0.146.0`.
+
+`carl maintenance status` is read-only. `carl maintenance prepare` drains an active
+task to a canonical checkpoint, reports the bound task/checkpoint, and stops the
+provider. Emergency process shutdown remains destructive and is not an alias for
+recoverable maintenance.
 
 ## Buzz settings
 

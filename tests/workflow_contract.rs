@@ -4,6 +4,20 @@ use serde_yaml_ng::{Mapping, Value};
 
 const CHECKOUT_ACTION: &str = "actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683";
 const CHECKOUT_TAG: &str = "v4.2.2";
+const APPROVED_ALL_FEATURES_TEST: &str = "cargo test --all-features -- --skip actual_engine_survives_one_hundred_epochs_and_normalizes_replay";
+const QUALITY_RUN_COMMANDS: &[&str] = &[
+    "cargo fmt --check",
+    "cargo clippy --all-targets --all-features -- -D warnings",
+    "cargo test --doc",
+    "cargo install cargo-deny --locked --version 0.20.2",
+    "cargo deny check",
+];
+const TEST_RUN_COMMANDS: &[&str] = &[
+    r#""CARGO_TARGET_DIR=$env:USERPROFILE\carl-ci-target" >> $env:GITHUB_ENV"#,
+    "cargo test --locked --test buzz_acp_contract --test buzz_end_to_end",
+    "cargo test --locked --test long_horizon_eval",
+    APPROVED_ALL_FEATURES_TEST,
+];
 const SETUP_UV_ACTION: &str = "astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990";
 const SETUP_UV_TAG: &str = "v8.3.2";
 
@@ -66,6 +80,28 @@ fn run_commands<'a>(job: &'a Mapping, context: &str) -> Result<Vec<&'a str>, Str
                 .ok_or_else(|| format!("{context} step `run` must be a string"))
         })
         .collect()
+}
+
+fn validate_run_command_allowlist(jobs: &Mapping) -> Result<(), String> {
+    for (name, value) in jobs {
+        let name = name
+            .as_str()
+            .ok_or_else(|| "job names must be strings".to_owned())?;
+        let allowed = match name {
+            "quality" => QUALITY_RUN_COMMANDS,
+            "test" => TEST_RUN_COMMANDS,
+            _ => &[],
+        };
+        let job = value_map(value, &format!("jobs.{name}"))?;
+        for command in run_commands(job, &format!("jobs.{name}"))? {
+            if !allowed.contains(&command) {
+                return Err(format!(
+                    "jobs.{name} contains unapproved run command `{command}`"
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_common(
@@ -389,7 +425,8 @@ fn validate_ci_workflow(workflow: &str) -> Result<(), String> {
             ),
             ("cargo test --doc", "quality"),
             ("cargo deny check", "quality"),
-            ("cargo test --all-features", "test"),
+            ("cargo test --locked --test long_horizon_eval", "test"),
+            (APPROVED_ALL_FEATURES_TEST, "test"),
         ],
     )?;
     let quality = job(jobs, "quality")?;
@@ -446,7 +483,14 @@ fn validate_ci_workflow(workflow: &str) -> Result<(), String> {
             ));
         }
     }
-    require_commands(test, "jobs.test", &["cargo test --all-features"])?;
+    require_commands(
+        test,
+        "jobs.test",
+        &[
+            "cargo test --locked --test long_horizon_eval",
+            APPROVED_ALL_FEATURES_TEST,
+        ],
+    )?;
     validate_required_job_steps(test, "jobs.test")?;
 
     let all_feature_test_count = jobs
@@ -456,7 +500,7 @@ fn validate_ci_workflow(workflow: &str) -> Result<(), String> {
             let job = value_map(value, &format!("jobs.{name}"))?;
             Ok(run_commands(job, &format!("jobs.{name}"))?
                 .into_iter()
-                .filter(|command| *command == "cargo test --all-features")
+                .filter(|command| *command == APPROVED_ALL_FEATURES_TEST)
                 .count())
         })
         .collect::<Result<Vec<usize>, String>>()?
@@ -464,7 +508,27 @@ fn validate_ci_workflow(workflow: &str) -> Result<(), String> {
         .sum::<usize>();
     if all_feature_test_count != 1 {
         return Err(format!(
-            "CI must run `cargo test --all-features` exactly once per matrix expansion, found {all_feature_test_count} step definitions"
+            "CI must run the filtered all-features command exactly once per matrix expansion, found {all_feature_test_count} step definitions"
+        ));
+    }
+    validate_run_command_allowlist(jobs)?;
+
+    let long_horizon_test_count = jobs
+        .iter()
+        .map(|(name, value)| {
+            let name = name.as_str().unwrap_or("<non-string-job>");
+            let job = value_map(value, &format!("jobs.{name}"))?;
+            Ok(run_commands(job, &format!("jobs.{name}"))?
+                .into_iter()
+                .filter(|command| *command == "cargo test --locked --test long_horizon_eval")
+                .count())
+        })
+        .collect::<Result<Vec<usize>, String>>()?
+        .into_iter()
+        .sum::<usize>();
+    if long_horizon_test_count != 1 {
+        return Err(format!(
+            "CI must run `cargo test --locked --test long_horizon_eval` exactly once per matrix expansion, found {long_horizon_test_count} step definitions"
         ));
     }
 
@@ -1053,6 +1117,50 @@ fn checker_rejects_required_command_in_nonrequired_job() {
         &workflow,
         "required command `cargo fmt --check` must appear only in jobs.quality",
     );
+}
+
+#[test]
+fn checker_rejects_duplicate_long_horizon_release_gate_steps() {
+    let workflow = replace_in_workflow(
+        "ci.yml",
+        "      - name: Test deterministic long-horizon evaluation\n        run: cargo test --locked --test long_horizon_eval\n",
+        "      - name: Test deterministic long-horizon evaluation\n        run: cargo test --locked --test long_horizon_eval\n      - name: Duplicate deterministic long-horizon evaluation\n        run: cargo test --locked --test long_horizon_eval\n",
+    );
+
+    assert_ci_rejected(
+        &workflow,
+        "CI must run `cargo test --locked --test long_horizon_eval` exactly once per matrix expansion, found 2 step definitions",
+    );
+}
+
+#[test]
+fn checker_rejects_every_run_command_outside_the_job_allowlist() {
+    for command in [
+        "command env cargo test --all-features",
+        "env --chdir . cargo test --all-features",
+        "exec -a carl cargo test --all-features",
+        "bash -c 'exec cargo test --all-features'",
+        "cargo test --locked --all-features",
+        "cargo test --workspace --all-features",
+        "cargo --manifest-path Cargo.toml test --all-features",
+        "echo 'cargo test --all-features'",
+    ] {
+        let replacement = format!(
+            "      - name: Test all features\n        run: {APPROVED_ALL_FEATURES_TEST}\n      - name: Unapproved command\n        run: {command}\n"
+        );
+        let workflow = replace_in_workflow(
+            "ci.yml",
+            &format!(
+                "      - name: Test all features\n        run: {APPROVED_ALL_FEATURES_TEST}\n"
+            ),
+            &replacement,
+        );
+
+        assert_ci_rejected(
+            &workflow,
+            &format!("jobs.test contains unapproved run command `{command}`"),
+        );
+    }
 }
 
 #[test]

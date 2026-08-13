@@ -9,6 +9,9 @@ use crate::policy::Sha256Digest;
 const MAX_PROVIDER_ID_BYTES: usize = 128;
 const MAX_ITEM_ID_BYTES: usize = 128;
 const MAX_EVENT_TEXT_BYTES: usize = 1_048_576;
+const MAX_COMMAND_BYTES: usize = 256 * 1_024;
+const MAX_AGGREGATED_OUTPUT_BYTES: usize = 512 * 1_024;
+const MAX_ITEM_PAYLOAD_BYTES: usize = 1_048_576;
 
 #[derive(Clone, Eq, Hash, PartialEq)]
 pub struct CodexThreadId(String);
@@ -158,6 +161,93 @@ impl fmt::Debug for CodexApprovalRequest {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CodexTokenUsage {
+    pub last_total_tokens: u64,
+    pub total_tokens: u64,
+    pub model_context_window: Option<u64>,
+}
+
+#[derive(Clone, PartialEq)]
+pub enum CodexItem {
+    Command {
+        item_id: String,
+        command: String,
+        cwd: String,
+        status: String,
+        exit_code: Option<i32>,
+        aggregated_output: Option<String>,
+        process_id: Option<String>,
+    },
+    FileChange {
+        item_id: String,
+        status: String,
+        changes: Value,
+    },
+    ContextCompaction {
+        item_id: String,
+    },
+    Other {
+        item_id: String,
+        item_type: String,
+    },
+}
+
+impl fmt::Debug for CodexItem {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Command {
+                status,
+                exit_code,
+                aggregated_output,
+                process_id,
+                ..
+            } => formatter
+                .debug_struct("CodexItem::Command")
+                .field("item_id", &"<redacted>")
+                .field("command", &"<redacted>")
+                .field("cwd", &"<redacted>")
+                .field("status", status)
+                .field("exit_code", exit_code)
+                .field("has_aggregated_output", &aggregated_output.is_some())
+                .field("has_process_id", &process_id.is_some())
+                .finish(),
+            Self::FileChange {
+                status, changes, ..
+            } => formatter
+                .debug_struct("CodexItem::FileChange")
+                .field("item_id", &"<redacted>")
+                .field("status", status)
+                .field(
+                    "change_count",
+                    &changes.as_array().map_or(0, std::vec::Vec::len),
+                )
+                .finish(),
+            Self::ContextCompaction { .. } => formatter
+                .debug_struct("CodexItem::ContextCompaction")
+                .field("item_id", &"<redacted>")
+                .finish(),
+            Self::Other { .. } => formatter
+                .debug_struct("CodexItem::Other")
+                .field("item_id", &"<redacted>")
+                .field("item_type", &"<redacted>")
+                .finish(),
+        }
+    }
+}
+
+impl CodexItem {
+    #[must_use]
+    pub fn item_id(&self) -> &str {
+        match self {
+            Self::Command { item_id, .. }
+            | Self::FileChange { item_id, .. }
+            | Self::ContextCompaction { item_id }
+            | Self::Other { item_id, .. } => item_id,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum CodexEvent {
     ThreadStarted {
@@ -170,7 +260,7 @@ pub enum CodexEvent {
     ItemStarted {
         thread_id: CodexThreadId,
         turn_id: CodexTurnId,
-        item_id: String,
+        item: CodexItem,
     },
     AgentMessageDelta {
         thread_id: CodexThreadId,
@@ -181,7 +271,12 @@ pub enum CodexEvent {
     ItemCompleted {
         thread_id: CodexThreadId,
         turn_id: CodexTurnId,
-        item_id: String,
+        item: CodexItem,
+    },
+    TokenUsageUpdated {
+        thread_id: CodexThreadId,
+        turn_id: CodexTurnId,
+        usage: CodexTokenUsage,
     },
     DiffUpdated {
         thread_id: CodexThreadId,
@@ -237,18 +332,11 @@ pub(crate) fn parse_notification(value: Value) -> Result<CodexEvent, DelegateErr
                 return Err(protocol_error());
             }
             let (thread_id, turn_id) = parse_turn_binding(params)?;
-            let item = params
-                .get("item")
-                .and_then(Value::as_object)
-                .ok_or_else(protocol_error)?;
-            let item_id = parse_bounded_string(
-                item.get("id").ok_or_else(protocol_error)?,
-                MAX_ITEM_ID_BYTES,
-            )?;
+            let item = parse_item(params.get("item").ok_or_else(protocol_error)?)?;
             Ok(CodexEvent::ItemStarted {
                 thread_id,
                 turn_id,
-                item_id,
+                item,
             })
         }
         "item/agentMessage/delta" => {
@@ -283,18 +371,21 @@ pub(crate) fn parse_notification(value: Value) -> Result<CodexEvent, DelegateErr
                 return Err(protocol_error());
             }
             let (thread_id, turn_id) = parse_turn_binding(params)?;
-            let item = params
-                .get("item")
-                .and_then(Value::as_object)
-                .ok_or_else(protocol_error)?;
-            let item_id = parse_bounded_string(
-                item.get("id").ok_or_else(protocol_error)?,
-                MAX_ITEM_ID_BYTES,
-            )?;
+            let item = parse_item(params.get("item").ok_or_else(protocol_error)?)?;
             Ok(CodexEvent::ItemCompleted {
                 thread_id,
                 turn_id,
-                item_id,
+                item,
+            })
+        }
+        "thread/tokenUsage/updated" => {
+            require_keys(params, &["threadId", "turnId", "tokenUsage"], &[])?;
+            let (thread_id, turn_id) = parse_turn_binding(params)?;
+            let usage = parse_token_usage(params.get("tokenUsage").ok_or_else(protocol_error)?)?;
+            Ok(CodexEvent::TokenUsageUpdated {
+                thread_id,
+                turn_id,
+                usage,
             })
         }
         "turn/diff/updated" => {
@@ -345,6 +436,224 @@ pub(crate) fn parse_notification(value: Value) -> Result<CodexEvent, DelegateErr
             })
         }
         _ => Err(protocol_error()),
+    }
+}
+
+fn parse_item(value: &Value) -> Result<CodexItem, DelegateError> {
+    let item = value.as_object().ok_or_else(protocol_error)?;
+    let item_id = parse_bounded_string(
+        item.get("id").ok_or_else(protocol_error)?,
+        MAX_ITEM_ID_BYTES,
+    )?;
+    let item_type = parse_bounded_string(
+        item.get("type").ok_or_else(protocol_error)?,
+        MAX_PROVIDER_ID_BYTES,
+    )?;
+    match item_type.as_str() {
+        "commandExecution" => {
+            require_keys(
+                item,
+                &["type", "id", "command", "cwd", "status", "commandActions"],
+                &[
+                    "aggregatedOutput",
+                    "durationMs",
+                    "exitCode",
+                    "pluginId",
+                    "processId",
+                    "scriptPath",
+                    "source",
+                ],
+            )?;
+            let command = parse_bounded_string(
+                item.get("command").ok_or_else(protocol_error)?,
+                MAX_COMMAND_BYTES,
+            )?;
+            let cwd = parse_bounded_string(
+                item.get("cwd").ok_or_else(protocol_error)?,
+                MAX_COMMAND_BYTES,
+            )?;
+            let status = parse_item_status(item.get("status").ok_or_else(protocol_error)?)?;
+            let actions = item
+                .get("commandActions")
+                .and_then(Value::as_array)
+                .ok_or_else(protocol_error)?;
+            if actions.len() > 256 || serialized_len(actions)? > MAX_ITEM_PAYLOAD_BYTES {
+                return Err(protocol_error());
+            }
+            for action in actions {
+                validate_command_action(action)?;
+            }
+            let exit_code = optional_i32(item.get("exitCode"))?;
+            let aggregated_output =
+                optional_string(item.get("aggregatedOutput"), MAX_AGGREGATED_OUTPUT_BYTES)?;
+            let process_id = optional_string(item.get("processId"), MAX_PROVIDER_ID_BYTES)?;
+            optional_i64(item.get("durationMs"))?;
+            optional_string(item.get("pluginId"), MAX_PROVIDER_ID_BYTES)?;
+            optional_string(item.get("scriptPath"), MAX_COMMAND_BYTES)?;
+            if let Some(source) = item.get("source") {
+                parse_bounded_string(source, MAX_PROVIDER_ID_BYTES)?;
+            }
+            Ok(CodexItem::Command {
+                item_id,
+                command,
+                cwd,
+                status,
+                exit_code,
+                aggregated_output,
+                process_id,
+            })
+        }
+        "fileChange" => {
+            require_keys(item, &["type", "id", "changes", "status"], &[])?;
+            let status = parse_item_status(item.get("status").ok_or_else(protocol_error)?)?;
+            let changes = item.get("changes").ok_or_else(protocol_error)?;
+            if !changes.is_array() || serialized_len(changes)? > MAX_ITEM_PAYLOAD_BYTES {
+                return Err(protocol_error());
+            }
+            Ok(CodexItem::FileChange {
+                item_id,
+                status,
+                changes: changes.clone(),
+            })
+        }
+        "contextCompaction" => {
+            require_keys(item, &["type", "id"], &[])?;
+            Ok(CodexItem::ContextCompaction { item_id })
+        }
+        _ => {
+            if serialized_len(value)? > MAX_ITEM_PAYLOAD_BYTES {
+                return Err(protocol_error());
+            }
+            Ok(CodexItem::Other { item_id, item_type })
+        }
+    }
+}
+
+fn validate_command_action(value: &Value) -> Result<(), DelegateError> {
+    let action = value.as_object().ok_or_else(protocol_error)?;
+    let action_type = parse_bounded_string(
+        action.get("type").ok_or_else(protocol_error)?,
+        MAX_PROVIDER_ID_BYTES,
+    )?;
+    match action_type.as_str() {
+        "read" => {
+            require_keys(action, &["type", "command", "name", "path"], &[])?;
+            parse_bounded_string(
+                action.get("command").ok_or_else(protocol_error)?,
+                MAX_COMMAND_BYTES,
+            )?;
+            parse_bounded_string(
+                action.get("name").ok_or_else(protocol_error)?,
+                MAX_PROVIDER_ID_BYTES,
+            )?;
+            parse_bounded_string(
+                action.get("path").ok_or_else(protocol_error)?,
+                MAX_COMMAND_BYTES,
+            )?;
+        }
+        "listFiles" => {
+            require_keys(action, &["type", "command"], &["path"])?;
+            parse_bounded_string(
+                action.get("command").ok_or_else(protocol_error)?,
+                MAX_COMMAND_BYTES,
+            )?;
+            optional_string(action.get("path"), MAX_COMMAND_BYTES)?;
+        }
+        "search" => {
+            require_keys(action, &["type", "command"], &["path", "query"])?;
+            parse_bounded_string(
+                action.get("command").ok_or_else(protocol_error)?,
+                MAX_COMMAND_BYTES,
+            )?;
+            optional_string(action.get("path"), MAX_COMMAND_BYTES)?;
+            optional_string(action.get("query"), MAX_COMMAND_BYTES)?;
+        }
+        "unknown" => {
+            require_keys(action, &["type", "command"], &[])?;
+            parse_bounded_string(
+                action.get("command").ok_or_else(protocol_error)?,
+                MAX_COMMAND_BYTES,
+            )?;
+        }
+        _ => return Err(protocol_error()),
+    }
+    Ok(())
+}
+
+fn parse_token_usage(value: &Value) -> Result<CodexTokenUsage, DelegateError> {
+    let usage = value.as_object().ok_or_else(protocol_error)?;
+    require_keys(usage, &["total", "last"], &["modelContextWindow"])?;
+    let total_tokens = parse_token_total(usage.get("total").ok_or_else(protocol_error)?)?;
+    let last_total_tokens = parse_token_total(usage.get("last").ok_or_else(protocol_error)?)?;
+    let model_context_window = optional_u64(usage.get("modelContextWindow"))?;
+    Ok(CodexTokenUsage {
+        last_total_tokens,
+        total_tokens,
+        model_context_window,
+    })
+}
+
+fn parse_token_total(value: &Value) -> Result<u64, DelegateError> {
+    let usage = value.as_object().ok_or_else(protocol_error)?;
+    require_keys(
+        usage,
+        &[
+            "totalTokens",
+            "inputTokens",
+            "cachedInputTokens",
+            "outputTokens",
+            "reasoningOutputTokens",
+        ],
+        &["cacheWriteInputTokens"],
+    )?;
+    if usage.values().any(|value| value.as_u64().is_none()) {
+        return Err(protocol_error());
+    }
+    usage
+        .get("totalTokens")
+        .and_then(Value::as_u64)
+        .ok_or_else(protocol_error)
+}
+
+fn parse_item_status(value: &Value) -> Result<String, DelegateError> {
+    let status = parse_bounded_string(value, MAX_PROVIDER_ID_BYTES)?;
+    if !matches!(
+        status.as_str(),
+        "inProgress" | "completed" | "failed" | "declined"
+    ) {
+        return Err(protocol_error());
+    }
+    Ok(status)
+}
+
+fn serialized_len<T: serde::Serialize + ?Sized>(value: &T) -> Result<usize, DelegateError> {
+    serde_json::to_vec(value)
+        .map(|encoded| encoded.len())
+        .map_err(|_| protocol_error())
+}
+
+fn optional_i32(value: Option<&Value>) -> Result<Option<i32>, DelegateError> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_i64()
+            .and_then(|value| i32::try_from(value).ok())
+            .map(Some)
+            .ok_or_else(protocol_error),
+    }
+}
+
+fn optional_i64(value: Option<&Value>) -> Result<Option<i64>, DelegateError> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value.as_i64().map(Some).ok_or_else(protocol_error),
+    }
+}
+
+fn optional_u64(value: Option<&Value>) -> Result<Option<u64>, DelegateError> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value.as_u64().map(Some).ok_or_else(protocol_error),
     }
 }
 

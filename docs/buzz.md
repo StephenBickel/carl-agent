@@ -119,16 +119,32 @@ The retained provider turn resumes only after a valid decision.
 
 ## Steering, cancellation, and restart
 
-Buzz's `_session/steering` request injects guidance into the currently active Codex
-turn using its exact thread and turn IDs. `session/cancel` interrupts that turn and
-its supervised process tree. Cancellation does not publish a false successful final
-message.
+The exact owner-bound task controls are:
+
+- `/status` — durable lifecycle state, contract progress, active epoch, provider
+  context, and latest checkpoint;
+- `/metrics` — sanitized journal-derived requests, tools, compactions, operation
+  outcomes, clause counts, and budget usage;
+- `/resume` — idempotently resume the bound queued or recoverable task;
+- `/steer <text>` — inject owner guidance into the current provider turn;
+- `/cancel` — cancel the task and its supervised process tree.
+
+Buzz's `/steer` control maps to `_session/steering`, using the exact thread and turn
+IDs. `/cancel` maps to the task/session cancellation boundary. Cancellation does not
+publish a false successful final message. Exact raw slash parsing is required: quoted,
+embedded, whitespace-prefixed, multi-block, wrong-actor, and wrong-channel commands do
+not gain control authority.
 
 Carl durably binds an ACP session and stable Buzz channel to a workspace. A restart
 can claim that stable channel for a new process branch and invalidates obsolete
 remote approval codes. In-flight or ambiguous consequential work is never replayed
 automatically. An ambiguous outbound delivery is recorded as uncertain rather than
 blindly retried.
+
+After a recoverable service restart, the owner-bound session is loaded against the
+same durable task and canonical checkpoint. Provider context replacement is visible in
+`/metrics`; a successful prior effect is not dispatched again. An unresolved `Started`
+operation blocks rather than being guessed safe.
 
 ## Credential isolation
 

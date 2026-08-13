@@ -90,9 +90,12 @@ impl BuzzContext {
         validate_lower_hex(event_id, 64)?;
         let channel = exact_field(lines[1], "Channel: ")?;
         let channel_id = parse_channel_id(channel)?;
-        exact_field(lines[2], "Kind: ")?
+        let kind = exact_field(lines[2], "Kind: ")?
             .parse::<u32>()
             .map_err(|_| invalid_context())?;
+        if kind != 1 {
+            return Err(invalid_context());
+        }
         let actor_hex = parse_actor_hex(exact_field(lines[3], "From: ")?)?;
         if !lines[4].starts_with("Time: ") && !lines[4].starts_with("Content: ") {
             return Err(invalid_context());

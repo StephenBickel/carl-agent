@@ -1,0 +1,1446 @@
+use std::error::Error;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use carl::acp::PermissionMode;
+use carl::delegates::{ModelId, ReasoningEffort};
+use carl::error::CarlError;
+use carl::policy::{Frontend, Sha256Digest};
+use carl::runtime::task::{
+    CheckpointId, ClauseStatus, CompletionClause, CompletionContract, ContextPackageId,
+    EffectClass, EpochId, EpochInterruptReason, OperationId, OperationStatus, TaskBudget,
+    TaskControlKind, TaskEvent, TaskId, TaskSnapshot, TaskStatus, reduce_task,
+};
+use carl::sidecar::DataRootLock;
+use carl::storage::{
+    ClientName, ExternalSessionId, NewFrontendSession, NewTask, RuntimeStore,
+    ServiceCommandReceiptClaim, ServiceCommandReceiptInput, Store, TaskControlMutationClaim,
+    TaskControlMutationInput,
+};
+use chrono::{DateTime, Utc};
+use rusqlite::Connection;
+use uuid::Uuid;
+
+struct TemporaryTaskDatabase {
+    root: PathBuf,
+    database: PathBuf,
+    workspace: PathBuf,
+}
+
+#[test]
+fn permission_tightening_interrupts_an_epoch_without_provider_report_evidence()
+-> Result<(), Box<dyn Error>> {
+    let fixture = TemporaryTaskDatabase::new()?;
+    let mut store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let created = store.create_task(new_task(session.id, &fixture.workspace))?;
+    let task_id = created.snapshot.task_id;
+    let epoch_id = EpochId::new();
+    let active = store
+        .append_task_event(
+            task_id,
+            created.revision,
+            TaskEvent::StateTransitioned {
+                from: TaskStatus::Queued,
+                to: TaskStatus::Active,
+                reason: "execution started".to_owned(),
+            },
+            timestamp(1),
+        )?
+        .expect("revision matches");
+    let started = store
+        .append_task_event(
+            task_id,
+            active.revision,
+            TaskEvent::EpochStarted {
+                epoch_id,
+                objective: "apply safer permissions".to_owned(),
+            },
+            timestamp(2),
+        )?
+        .expect("revision matches");
+    let interrupted = store
+        .append_task_event(
+            task_id,
+            started.revision,
+            TaskEvent::EpochInterrupted {
+                epoch_id,
+                reason: EpochInterruptReason::PermissionTightening,
+            },
+            timestamp(3),
+        )?
+        .expect("revision matches");
+
+    assert_eq!(interrupted.snapshot.status, TaskStatus::Active);
+    assert_eq!(interrupted.snapshot.active_epoch, None);
+    let events = store.read_task_events(task_id)?;
+    assert_eq!(interrupted.snapshot, replay(&events)?);
+    let wire = serde_json::to_value(&events.last().expect("interrupt event").event)?;
+    assert_eq!(wire["event"]["task_event"], "epoch_interrupted");
+    assert_eq!(wire["event"]["reason"], "permission_tightening");
+
+    let connection = Connection::open(&fixture.database)?;
+    let projection = connection.query_row(
+        "SELECT reason, event_sequence FROM task_epoch_interruptions
+         WHERE task_id = ?1 AND epoch_id = ?2",
+        [task_id.to_string(), epoch_id.to_string()],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+    )?;
+    assert_eq!(projection.0, "permission_tightening");
+    assert!(projection.1 > 0);
+    let epoch_projection = connection.query_row(
+        "SELECT status, finished_sequence, report_digest FROM task_epochs
+         WHERE task_id = ?1 AND id = ?2",
+        [task_id.to_string(), epoch_id.to_string()],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<i64>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        },
+    )?;
+    assert_eq!(epoch_projection.0, "interrupted");
+    assert!(epoch_projection.1.is_some());
+    assert_eq!(epoch_projection.2, None);
+    Ok(())
+}
+
+#[test]
+fn queued_configuration_and_receipt_control_markers_survive_reopen() -> Result<(), Box<dyn Error>> {
+    let fixture = TemporaryTaskDatabase::new()?;
+    let mut store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let created = store.create_task(new_task(session.id, &fixture.workspace))?;
+    let task_id = created.snapshot.task_id;
+    let configuration_control = "a".repeat(64);
+    let resume_control = "b".repeat(64);
+    let queued = store
+        .append_task_event(
+            task_id,
+            created.revision,
+            TaskEvent::ConfigurationQueued {
+                control_id: configuration_control.clone(),
+                model: ModelId::parse("gpt-5.6-codex")?,
+                effort: ReasoningEffort::Ultra,
+                permission_mode: PermissionMode::Plan,
+            },
+            timestamp(1),
+        )?
+        .expect("configuration queue revision matches");
+    let marked = store
+        .append_task_event(
+            task_id,
+            queued.revision,
+            TaskEvent::ControlRequested {
+                control_id: resume_control.clone(),
+                kind: TaskControlKind::Resume,
+            },
+            timestamp(2),
+        )?
+        .expect("control marker revision matches");
+    drop(store);
+
+    let mut reopened = Store::open(&fixture.database)?;
+    let configuration = reopened
+        .get_task_configuration(task_id)?
+        .ok_or("task configuration projection missing")?;
+    assert_eq!(
+        configuration.pending_control_id.as_deref(),
+        Some(configuration_control.as_str())
+    );
+    assert_eq!(
+        configuration.pending_model.as_ref().map(ModelId::as_str),
+        Some("gpt-5.6-codex")
+    );
+    assert_eq!(configuration.pending_effort, Some(ReasoningEffort::Ultra));
+    assert_eq!(
+        configuration.pending_permission_mode,
+        Some(PermissionMode::Plan)
+    );
+    assert_eq!(
+        configuration.effective_permission_mode,
+        PermissionMode::Plan
+    );
+    assert!(reopened.task_has_control_marker(task_id, &resume_control, TaskControlKind::Resume)?);
+
+    let applied = reopened
+        .append_task_event(
+            task_id,
+            marked.revision,
+            TaskEvent::ConfigurationApplied {
+                control_id: configuration_control,
+            },
+            timestamp(3),
+        )?
+        .expect("configuration application revision matches");
+    let configuration = reopened
+        .get_task_configuration(task_id)?
+        .ok_or("task configuration projection missing after apply")?;
+    assert_eq!(configuration.active_model.as_str(), "gpt-5.6-codex");
+    assert_eq!(configuration.active_effort, ReasoningEffort::Ultra);
+    assert_eq!(configuration.active_permission_mode, PermissionMode::Plan);
+    assert_eq!(
+        configuration.effective_permission_mode,
+        PermissionMode::Plan
+    );
+    assert!(configuration.pending_control_id.is_none());
+    assert_eq!(
+        applied.snapshot,
+        replay(&reopened.read_task_events(task_id)?)?
+    );
+    Ok(())
+}
+
+impl TemporaryTaskDatabase {
+    fn new() -> Result<Self, Box<dyn Error>> {
+        let root = std::env::temp_dir().join(format!("carl-task-storage-{}", Uuid::new_v4()));
+        let database = root.join("carl.sqlite3");
+        let workspace = root.join("workspace");
+        fs::create_dir_all(&workspace)?;
+        make_owner_only(&root)?;
+        Ok(Self {
+            root,
+            database,
+            workspace,
+        })
+    }
+}
+
+#[cfg(unix)]
+fn make_owner_only(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+}
+
+#[cfg(windows)]
+fn make_owner_only(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+impl Drop for TemporaryTaskDatabase {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+fn timestamp(second: u32) -> DateTime<Utc> {
+    DateTime::parse_from_rfc3339(&format!("2026-08-10T12:00:{second:02}Z"))
+        .unwrap()
+        .with_timezone(&Utc)
+}
+
+fn contract() -> CompletionContract {
+    CompletionContract {
+        version: 1,
+        goal: "Persist the long-running task".to_owned(),
+        constraints: vec!["Keep the journal authoritative".to_owned()],
+        clauses: vec![CompletionClause {
+            id: "durable".to_owned(),
+            description: "The task survives restart".to_owned(),
+            required: false,
+            status: ClauseStatus::Pending,
+            evidence: Vec::new(),
+        }],
+    }
+}
+
+fn new_task(session_id: carl::events::SessionId, workspace: &Path) -> NewTask {
+    NewTask {
+        session_id,
+        workspace: workspace.to_owned(),
+        contract: contract(),
+        model: ModelId::parse("gpt-5.6").unwrap(),
+        effort: ReasoningEffort::High,
+        permission_mode: PermissionMode::Default,
+        budget: TaskBudget::default(),
+        created_at: timestamp(0),
+    }
+}
+
+fn replay(events: &[carl::events::EventEnvelope]) -> Result<TaskSnapshot, Box<dyn Error>> {
+    let mut snapshot = None;
+    for event in events {
+        snapshot = Some(reduce_task(snapshot, event)?);
+    }
+    Ok(snapshot.expect("task has a creation event"))
+}
+
+#[test]
+fn task_control_receipts_survive_both_crash_windows_without_key_rebinding()
+-> Result<(), Box<dyn Error>> {
+    let fixture = TemporaryTaskDatabase::new()?;
+    let mut store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let external_session_id = ExternalSessionId::try_from("task-control-session")?;
+    store.bind_frontend_session(NewFrontendSession {
+        frontend: Frontend::Acp,
+        external_session_id: external_session_id.clone(),
+        session_id: session.id,
+        cwd: fs::canonicalize(&fixture.workspace)?,
+        protocol_version: 2,
+        client_name: ClientName::try_from("task-control-test")?,
+        permission_mode: PermissionMode::FullAccess,
+        channel_id: None,
+        created_at: timestamp(0),
+    })?;
+    let created = store.create_task(new_task(session.id, &fixture.workspace))?;
+    let task_id = created.snapshot.task_id;
+    let request_digest =
+        Sha256Digest::parse("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")?;
+    let input = TaskControlMutationInput {
+        external_session_id,
+        idempotency_key: "receipt-1".to_owned(),
+        task_id,
+        method: "steer".to_owned(),
+        request_digest,
+        result_json: format!(r#"{{"outcome":"accepted","taskId":"{task_id}"}}"#),
+        created_at: timestamp(1),
+    };
+    assert_eq!(
+        store.claim_task_control_mutation(input.clone())?,
+        TaskControlMutationClaim::Fresh
+    );
+    drop(store);
+
+    let mut store = Store::open(&fixture.database)?;
+    assert_eq!(
+        store.claim_task_control_mutation(input.clone())?,
+        TaskControlMutationClaim::Pending,
+        "a reservation-only crash must not replay false success"
+    );
+    let text_digest = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let first_control = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    let second_control = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+    let first_steering = store
+        .append_controlled_task_steering(
+            task_id,
+            created.revision,
+            0,
+            text_digest.to_owned(),
+            first_control,
+            timestamp(2),
+        )?
+        .ok_or("first controlled steering was not stored")?;
+    store
+        .append_controlled_task_steering(
+            task_id,
+            first_steering.revision,
+            1,
+            text_digest.to_owned(),
+            second_control,
+            timestamp(2),
+        )?
+        .ok_or("second controlled steering was not stored")?;
+    assert!(store.task_has_steering_control(task_id, first_control)?);
+    assert!(store.task_has_steering_control(task_id, second_control)?);
+    assert_eq!(
+        rusqlite::Connection::open(&fixture.database)?.query_row(
+            "SELECT COUNT(*) FROM task_steering WHERE task_id = ?1 AND text_digest = ?2",
+            rusqlite::params![task_id.to_string(), text_digest],
+            |row| row.get::<_, i64>(0),
+        )?,
+        2,
+        "identical text under distinct control identities is two mutation intents"
+    );
+    let completed = store.complete_task_control_mutation(TaskControlMutationInput {
+        created_at: timestamp(3),
+        ..input.clone()
+    })?;
+    drop(store);
+
+    let store = Store::open(&fixture.database)?;
+    assert_eq!(
+        store.claim_task_control_mutation(input.clone())?,
+        TaskControlMutationClaim::Replay {
+            result_json: completed,
+            failure_code: None,
+        }
+    );
+    assert!(
+        store
+            .claim_task_control_mutation(TaskControlMutationInput {
+                method: "cancel".to_owned(),
+                ..input
+            })
+            .is_err(),
+        "method or payload reuse must never rebind an idempotency key"
+    );
+    Ok(())
+}
+
+#[test]
+fn service_command_receipts_are_global_durable_and_canonical() -> Result<(), Box<dyn Error>> {
+    let fixture = TemporaryTaskDatabase::new()?;
+    let store = Store::open(&fixture.database)?;
+    let input = ServiceCommandReceiptInput {
+        idempotency_key: "global-command-key".to_owned(),
+        command_digest: Sha256Digest::parse(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )?,
+        command_kind: "configure".to_owned(),
+        created_at: timestamp(0),
+    };
+    assert_eq!(
+        store.claim_service_command(input.clone())?,
+        ServiceCommandReceiptClaim::Fresh
+    );
+    drop(store);
+
+    let store = Store::open(&fixture.database)?;
+    assert_eq!(
+        store.claim_service_command(input.clone())?,
+        ServiceCommandReceiptClaim::Pending
+    );
+    let result = r#"{"type":"applied"}"#;
+    store.complete_service_command(&input, result, timestamp(1))?;
+    drop(store);
+
+    let store = Store::open(&fixture.database)?;
+    assert_eq!(
+        store.claim_service_command(input.clone())?,
+        ServiceCommandReceiptClaim::Replay {
+            result_json: result.to_owned()
+        }
+    );
+    assert_eq!(
+        store.claim_service_command(ServiceCommandReceiptInput {
+            command_digest: Sha256Digest::parse(
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            )?,
+            command_kind: "cancel".to_owned(),
+            ..input
+        })?,
+        ServiceCommandReceiptClaim::Conflict,
+        "one global key cannot be rebound to another method or digest"
+    );
+    Ok(())
+}
+
+#[test]
+fn explicit_compaction_has_a_durable_service_command_receipt() -> Result<(), Box<dyn Error>> {
+    let fixture = TemporaryTaskDatabase::new()?;
+    let store = Store::open(&fixture.database)?;
+    let input = ServiceCommandReceiptInput {
+        idempotency_key: "explicit-compaction-key".to_owned(),
+        command_digest: Sha256Digest::parse(
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        )?,
+        command_kind: "compact".to_owned(),
+        created_at: timestamp(0),
+    };
+
+    assert_eq!(
+        store.claim_service_command(input)?,
+        ServiceCommandReceiptClaim::Fresh
+    );
+    Ok(())
+}
+
+#[test]
+fn startup_rejects_a_stale_task_configuration_projection() -> Result<(), Box<dyn Error>> {
+    let (fixture, _) = queued_plan_configuration_fixture()?;
+    Connection::open(&fixture.database)?.execute(
+        "UPDATE task_configuration_state
+         SET pending_permission_mode = 'fullAccess', effective_permission_mode = 'fullAccess'",
+        [],
+    )?;
+
+    let error = match Store::open(&fixture.database) {
+        Ok(_) => panic!("a stale task configuration projection must not be trusted"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        CarlError::Storage { ref detail }
+            if detail.contains("task configuration projection disagrees")
+    ));
+    Ok(())
+}
+
+#[test]
+fn startup_rejects_a_missing_task_configuration_projection() -> Result<(), Box<dyn Error>> {
+    let (fixture, task_id) = queued_plan_configuration_fixture()?;
+    Connection::open(&fixture.database)?.execute(
+        "DELETE FROM task_configuration_state WHERE task_id = ?1",
+        [task_id.to_string()],
+    )?;
+
+    let error = match Store::open(&fixture.database) {
+        Ok(_) => panic!("a missing task configuration projection must not be trusted"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        CarlError::Storage { ref detail }
+            if detail.contains("task configuration projection is missing")
+    ));
+    Ok(())
+}
+
+#[test]
+fn startup_rejects_a_missing_task_control_marker_projection() -> Result<(), Box<dyn Error>> {
+    let fixture = TemporaryTaskDatabase::new()?;
+    let mut store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let created = store.create_task(new_task(session.id, &fixture.workspace))?;
+    let task_id = created.snapshot.task_id;
+    store
+        .append_task_event(
+            task_id,
+            created.revision,
+            TaskEvent::ControlRequested {
+                control_id: "c".repeat(64),
+                kind: TaskControlKind::Cancel,
+            },
+            timestamp(1),
+        )?
+        .expect("control marker setup appends");
+    drop(store);
+    Connection::open(&fixture.database)?.execute(
+        "DELETE FROM task_control_markers WHERE task_id = ?1",
+        [task_id.to_string()],
+    )?;
+
+    let error = match Store::open(&fixture.database) {
+        Ok(_) => panic!("a missing task control marker projection must not be trusted"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        CarlError::Storage { ref detail }
+            if detail.contains("task control marker projection disagrees")
+    ));
+    Ok(())
+}
+
+fn queued_plan_configuration_fixture() -> Result<(TemporaryTaskDatabase, TaskId), Box<dyn Error>> {
+    let fixture = TemporaryTaskDatabase::new()?;
+    let mut store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let mut input = new_task(session.id, &fixture.workspace);
+    input.permission_mode = PermissionMode::FullAccess;
+    let created = store.create_task(input)?;
+    let task_id = created.snapshot.task_id;
+    store
+        .append_task_event(
+            task_id,
+            created.revision,
+            TaskEvent::ConfigurationQueued {
+                control_id: "d".repeat(64),
+                model: ModelId::parse("gpt-5.6")?,
+                effort: ReasoningEffort::High,
+                permission_mode: PermissionMode::Plan,
+            },
+            timestamp(1),
+        )?
+        .expect("queued Plan configuration setup appends");
+    drop(store);
+    Ok((fixture, task_id))
+}
+
+#[test]
+fn deterministic_task_control_failure_is_completed_and_replayed() -> Result<(), Box<dyn Error>> {
+    let fixture = TemporaryTaskDatabase::new()?;
+    let mut store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let external_session_id = ExternalSessionId::try_from("failed-task-control-session")?;
+    store.bind_frontend_session(NewFrontendSession {
+        frontend: Frontend::Acp,
+        external_session_id: external_session_id.clone(),
+        session_id: session.id,
+        cwd: fs::canonicalize(&fixture.workspace)?,
+        protocol_version: 2,
+        client_name: ClientName::try_from("failed-task-control-test")?,
+        permission_mode: PermissionMode::Default,
+        channel_id: None,
+        created_at: timestamp(0),
+    })?;
+    let task_id = store
+        .create_task(new_task(session.id, &fixture.workspace))?
+        .snapshot
+        .task_id;
+    let input = TaskControlMutationInput {
+        external_session_id,
+        idempotency_key: "terminal-resume".to_owned(),
+        task_id,
+        method: "resume".to_owned(),
+        request_digest: Sha256Digest::parse("c".repeat(64))?,
+        result_json: format!(r#"{{"outcome":"rejected","taskId":"{task_id}"}}"#),
+        created_at: timestamp(1),
+    };
+    assert_eq!(
+        store.claim_task_control_mutation(input.clone())?,
+        TaskControlMutationClaim::Fresh
+    );
+    store.fail_task_control_mutation(input.clone(), -32602)?;
+    assert_eq!(
+        store.claim_task_control_mutation(input.clone())?,
+        TaskControlMutationClaim::Replay {
+            result_json: input.result_json,
+            failure_code: Some(-32602),
+        }
+    );
+    Ok(())
+}
+
+#[test]
+fn task_projection_reopens_and_matches_journal_replay_for_every_transition()
+-> Result<(), Box<dyn Error>> {
+    let fixture = TemporaryTaskDatabase::new()?;
+    let mut store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let created = store.create_task(new_task(session.id, &fixture.workspace))?;
+    let task_id = created.snapshot.task_id;
+    assert_eq!(created.revision, 1);
+
+    let epoch_id = EpochId::new();
+    let operation_id = OperationId::new();
+    let transitions = [
+        TaskEvent::StateTransitioned {
+            from: TaskStatus::Queued,
+            to: TaskStatus::Active,
+            reason: "execution started".to_owned(),
+        },
+        TaskEvent::EpochStarted {
+            epoch_id,
+            objective: "exercise durable projections".to_owned(),
+        },
+        TaskEvent::OperationIntentRecorded {
+            operation_id,
+            epoch_id,
+            item_id: "tool-item-1".to_owned(),
+            effect_class: EffectClass::IdempotentMutation,
+            request_digest: "request-digest".to_owned(),
+        },
+        TaskEvent::OperationTransitioned {
+            operation_id,
+            from: OperationStatus::IntentRecorded,
+            to: OperationStatus::Started,
+            evidence_sequences: Vec::new(),
+        },
+        TaskEvent::OperationEvidenceRecorded {
+            operation_id,
+            result_digest: "operation-result".to_owned(),
+        },
+        TaskEvent::OperationTransitioned {
+            operation_id,
+            from: OperationStatus::Started,
+            to: OperationStatus::Succeeded,
+            evidence_sequences: vec![6],
+        },
+        TaskEvent::EpochFinished {
+            epoch_id,
+            report_digest: "epoch-report".to_owned(),
+        },
+    ];
+
+    let mut revision = created.revision;
+    for (index, event) in transitions.into_iter().enumerate() {
+        let updated = store
+            .append_task_event(task_id, revision, event, timestamp(index as u32 + 1))?
+            .expect("revision matches");
+        revision = updated.revision;
+        drop(store);
+
+        store = Store::open(&fixture.database)?;
+        let projected = store.get_task(task_id)?.expect("task projection exists");
+        let replayed = replay(&store.read_task_events(task_id)?)?;
+        assert_eq!(projected.snapshot, replayed);
+        assert_eq!(projected.revision, replayed.revision);
+    }
+
+    let reopened = store.get_task(task_id)?.expect("task survives restart");
+    assert_eq!(reopened.snapshot.active_epoch, None);
+    assert_eq!(
+        reopened.snapshot.operation_status(operation_id),
+        Some(OperationStatus::Succeeded)
+    );
+    Ok(())
+}
+
+#[test]
+fn task_event_pages_are_bounded_stable_and_isolated() -> Result<(), Box<dyn Error>> {
+    let fixture = TemporaryTaskDatabase::new()?;
+    let mut store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let first = store.create_task(new_task(session.id, &fixture.workspace))?;
+    let second = store.create_task(new_task(session.id, &fixture.workspace))?;
+    let other_session = store.create_session()?;
+    let other_session_task = store.create_task(new_task(other_session.id, &fixture.workspace))?;
+
+    let mut revision = first.revision;
+    for index in 0..513_u32 {
+        revision = store
+            .append_task_event(
+                first.snapshot.task_id,
+                revision,
+                TaskEvent::ProgressAssessed {
+                    fingerprint: format!("progress-{index}"),
+                    stalled: false,
+                },
+                timestamp(1),
+            )?
+            .expect("revision matches")
+            .revision;
+    }
+
+    let first_page = store.read_task_event_page(first.snapshot.task_id, None, 512)?;
+    assert_eq!(first_page.len(), 512);
+    let single_event = store.read_task_event_page(first.snapshot.task_id, None, 1)?;
+    assert_eq!(single_event, first_page[..1]);
+    assert!(
+        first_page
+            .windows(2)
+            .all(|pair| pair[0].sequence < pair[1].sequence)
+    );
+    assert!(first_page.iter().all(|envelope| {
+        matches!(
+            envelope.event,
+            carl::events::Event::TaskLifecycle { task_id, .. }
+                if task_id == first.snapshot.task_id
+        )
+    }));
+
+    let final_page = store.read_task_event_page(
+        first.snapshot.task_id,
+        Some(first_page.last().unwrap().sequence),
+        512,
+    )?;
+    assert_eq!(final_page.len(), 2);
+    let tail = store
+        .read_task_events_after(first.snapshot.task_id, first_page.last().unwrap().sequence)?;
+    assert_eq!(tail, final_page);
+    assert!(
+        tail.iter()
+            .all(|event| event.sequence > first_page.last().unwrap().sequence)
+    );
+    assert_eq!(
+        store
+            .read_task_events_after(first.snapshot.task_id, 0)?
+            .len(),
+        514
+    );
+    assert!(
+        store
+            .read_task_events_after(first.snapshot.task_id, final_page.last().unwrap().sequence,)?
+            .is_empty()
+    );
+    let second_events = store.read_task_events_after(second.snapshot.task_id, 0)?;
+    assert_eq!(second_events.len(), 1);
+    assert!(matches!(
+        second_events[0].event,
+        carl::events::Event::TaskLifecycle { task_id, .. }
+            if task_id == second.snapshot.task_id
+    ));
+    assert!(matches!(
+        store
+            .read_task_events_after(first.snapshot.task_id, u64::MAX)
+            .expect_err("an unrepresentable cursor must be rejected"),
+        CarlError::Validation { .. }
+    ));
+    assert!(
+        store
+            .read_task_event_page(
+                first.snapshot.task_id,
+                Some(final_page.last().unwrap().sequence),
+                1,
+            )?
+            .is_empty()
+    );
+    assert_eq!(store.read_task_events(second.snapshot.task_id)?.len(), 1);
+    assert_eq!(
+        store
+            .read_task_events(other_session_task.snapshot.task_id)?
+            .len(),
+        1
+    );
+
+    for invalid in [0, 513] {
+        let error = store
+            .read_task_event_page(first.snapshot.task_id, None, invalid)
+            .expect_err("invalid limits are rejected");
+        assert!(matches!(error, CarlError::Validation { .. }));
+    }
+    Ok(())
+}
+
+#[test]
+fn checkpoint_context_and_steering_projections_commit_with_their_events()
+-> Result<(), Box<dyn Error>> {
+    let fixture = TemporaryTaskDatabase::new()?;
+    let mut store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let created = store.create_task(new_task(session.id, &fixture.workspace))?;
+    let task_id = created.snapshot.task_id;
+    let epoch_id = EpochId::new();
+    let checkpoint_id = CheckpointId::new();
+    let context_package_id = ContextPackageId::new();
+    let events = [
+        TaskEvent::StateTransitioned {
+            from: TaskStatus::Queued,
+            to: TaskStatus::Active,
+            reason: "execution started".to_owned(),
+        },
+        TaskEvent::ProviderContextBound {
+            context_id: "provider-context".to_owned(),
+        },
+        TaskEvent::SteeringQueued {
+            steering_sequence: 0,
+            text_digest: "steering-digest".to_owned(),
+        },
+        TaskEvent::EpochStarted {
+            epoch_id,
+            objective: "reach a safe checkpoint".to_owned(),
+        },
+        TaskEvent::EpochFinished {
+            epoch_id,
+            report_digest: "epoch-report".to_owned(),
+        },
+        TaskEvent::CheckpointCommitted {
+            checkpoint_id,
+            digest: "checkpoint-digest".to_owned(),
+        },
+        TaskEvent::CompactionCompleted {
+            generation: 0,
+            checkpoint_id,
+            context_package_id,
+        },
+        TaskEvent::ProviderContextLost {
+            context_id: "provider-context".to_owned(),
+            reason: "provider thread ended".to_owned(),
+        },
+    ];
+    let mut revision = created.revision;
+    for (index, event) in events.into_iter().enumerate() {
+        revision = store
+            .append_task_event(task_id, revision, event, timestamp(index as u32 + 1))?
+            .expect("revision matches")
+            .revision;
+    }
+    drop(store);
+
+    let store = Store::open(&fixture.database)?;
+    let record = store.get_task(task_id)?.expect("task projection exists");
+    assert_eq!(record.snapshot.latest_checkpoint, Some(checkpoint_id));
+    assert_eq!(record.snapshot.provider_context, None);
+    assert_eq!(record.snapshot, replay(&store.read_task_events(task_id)?)?);
+    assert_eq!(store.list_resumable_tasks()?.len(), 1);
+
+    let connection = Connection::open(&fixture.database)?;
+    for table in [
+        "task_epochs",
+        "task_checkpoints",
+        "task_context_packages",
+        "task_steering",
+    ] {
+        assert_eq!(
+            connection.query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE task_id = ?1"),
+                [task_id.to_string()],
+                |row| row.get::<_, u64>(0),
+            )?,
+            1,
+            "missing {table} projection"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn revision_conflict_and_projection_write_failure_append_nothing() -> Result<(), Box<dyn Error>> {
+    let fixture = TemporaryTaskDatabase::new()?;
+    let mut store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let created = store.create_task(new_task(session.id, &fixture.workspace))?;
+    let task_id = created.snapshot.task_id;
+
+    assert!(
+        store
+            .append_task_event(
+                task_id,
+                99,
+                TaskEvent::ProgressAssessed {
+                    fingerprint: "wrong-revision".to_owned(),
+                    stalled: false,
+                },
+                timestamp(1),
+            )?
+            .is_none()
+    );
+    assert_eq!(store.read_task_events(task_id)?.len(), 1);
+
+    let connection = Connection::open(&fixture.database)?;
+    connection.execute_batch(
+        "CREATE TRIGGER abort_task_projection_update
+         BEFORE UPDATE OF revision ON agent_tasks
+         BEGIN
+             SELECT RAISE(ABORT, 'injected projection failure');
+         END;",
+    )?;
+    drop(connection);
+
+    let error = store
+        .append_task_event(
+            task_id,
+            1,
+            TaskEvent::ProgressAssessed {
+                fingerprint: "must-roll-back".to_owned(),
+                stalled: false,
+            },
+            timestamp(2),
+        )
+        .expect_err("projection failure aborts the transaction");
+    assert!(matches!(error, CarlError::Storage { .. }));
+    assert_eq!(store.read_task_events(task_id)?.len(), 1);
+    assert_eq!(store.get_task(task_id)?.unwrap().revision, 1);
+    Ok(())
+}
+
+#[test]
+fn startup_rejects_a_resumable_projection_that_disagrees_with_replay() -> Result<(), Box<dyn Error>>
+{
+    let fixture = TemporaryTaskDatabase::new()?;
+    let mut store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let task = store.create_task(new_task(session.id, &fixture.workspace))?;
+    drop(store);
+
+    let connection = Connection::open(&fixture.database)?;
+    connection.execute(
+        "UPDATE agent_tasks SET status = 'active' WHERE id = ?1",
+        [task.snapshot.task_id.to_string()],
+    )?;
+    drop(connection);
+
+    let error = match Store::open(&fixture.database) {
+        Ok(_) => panic!("projection mismatch is rejected"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        CarlError::Storage { ref detail } if detail.contains("task projection")
+    ));
+    Ok(())
+}
+
+#[test]
+fn startup_rejects_a_journal_task_hidden_by_a_terminal_projection_status()
+-> Result<(), Box<dyn Error>> {
+    let fixture = TemporaryTaskDatabase::new()?;
+    let mut store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let task = store.create_task(new_task(session.id, &fixture.workspace))?;
+
+    let connection = Connection::open(&fixture.database)?;
+    connection.execute(
+        "UPDATE agent_tasks SET status = 'completed' WHERE id = ?1",
+        [task.snapshot.task_id.to_string()],
+    )?;
+    drop(connection);
+
+    let list_error = store
+        .list_resumable_tasks()
+        .expect_err("terminal status must not hide a resumable journal task from listing");
+    assert!(matches!(list_error, CarlError::Storage { .. }));
+    drop(store);
+
+    let error = match Store::open(&fixture.database) {
+        Ok(_) => panic!("terminal status must not hide a resumable journal task"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        CarlError::Storage { ref detail }
+            if detail.contains("task projection") && !detail.contains(&task.snapshot.task_id.to_string())
+    ));
+    Ok(())
+}
+
+#[test]
+fn startup_rejects_a_journal_task_with_a_missing_projection() -> Result<(), Box<dyn Error>> {
+    let fixture = TemporaryTaskDatabase::new()?;
+    let mut store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let task = store.create_task(new_task(session.id, &fixture.workspace))?;
+
+    let connection = Connection::open(&fixture.database)?;
+    connection.execute(
+        "DELETE FROM agent_tasks WHERE id = ?1",
+        [task.snapshot.task_id.to_string()],
+    )?;
+    drop(connection);
+
+    let list_error = store
+        .list_resumable_tasks()
+        .expect_err("missing projection must not hide an authoritative journal task");
+    assert!(matches!(list_error, CarlError::Storage { .. }));
+    drop(store);
+
+    let error = match Store::open(&fixture.database) {
+        Ok(_) => panic!("authoritative journal task must have a projection"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        CarlError::Storage { ref detail }
+            if detail.contains("task projection") && !detail.contains(&task.snapshot.task_id.to_string())
+    ));
+    Ok(())
+}
+
+#[test]
+fn startup_discovery_checks_tasks_beyond_the_first_candidate_page() -> Result<(), Box<dyn Error>> {
+    let fixture = TemporaryTaskDatabase::new()?;
+    let mut store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let mut task_ids = Vec::with_capacity(513);
+    for _ in 0..513 {
+        task_ids.push(
+            store
+                .create_task(new_task(session.id, &fixture.workspace))?
+                .snapshot
+                .task_id,
+        );
+    }
+    drop(store);
+
+    let last_candidate = task_ids.into_iter().max().expect("tasks were created");
+    let connection = Connection::open(&fixture.database)?;
+    connection.execute(
+        "UPDATE agent_tasks SET status = 'completed' WHERE id = ?1",
+        [last_candidate.to_string()],
+    )?;
+    drop(connection);
+
+    let error = match Store::open(&fixture.database) {
+        Ok(_) => panic!("startup must validate journal task candidate pages after the first"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        CarlError::Storage { ref detail }
+            if detail.contains("task projection") && !detail.contains(&last_candidate.to_string())
+    ));
+    Ok(())
+}
+
+#[test]
+fn runtime_startup_atomically_marks_every_abandoned_started_operation_uncertain()
+-> Result<(), Box<dyn Error>> {
+    let fixture = TemporaryTaskDatabase::new()?;
+    let mut store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let created = store.create_task(new_task(session.id, &fixture.workspace))?;
+    let task_id = created.snapshot.task_id;
+    let epoch_id = EpochId::new();
+    let operation_ids = [OperationId::new(), OperationId::new()];
+    let mut revision = created.revision;
+    for event in [
+        TaskEvent::StateTransitioned {
+            from: TaskStatus::Queued,
+            to: TaskStatus::Active,
+            reason: "execution started".to_owned(),
+        },
+        TaskEvent::ProviderContextBound {
+            context_id: "provider-context".to_owned(),
+        },
+        TaskEvent::EpochStarted {
+            epoch_id,
+            objective: "exercise startup reconciliation".to_owned(),
+        },
+    ] {
+        revision = store
+            .append_task_event(task_id, revision, event, timestamp(1))?
+            .expect("the setup event appends")
+            .revision;
+    }
+    for (index, operation_id) in operation_ids.into_iter().enumerate() {
+        for event in [
+            TaskEvent::OperationIntentRecorded {
+                operation_id,
+                epoch_id,
+                item_id: format!("item-{index}"),
+                effect_class: if index == 0 {
+                    EffectClass::Observation
+                } else {
+                    EffectClass::AmbiguousConsequential
+                },
+                request_digest: format!("request-{index}"),
+            },
+            TaskEvent::OperationTransitioned {
+                operation_id,
+                from: OperationStatus::IntentRecorded,
+                to: OperationStatus::Started,
+                evidence_sequences: Vec::new(),
+            },
+        ] {
+            revision = store
+                .append_task_event(task_id, revision, event, timestamp(2))?
+                .expect("the operation setup event appends")
+                .revision;
+        }
+    }
+    drop(store);
+
+    let runtime = RuntimeStore::open(DataRootLock::acquire(&fixture.root)?, timestamp(3))?;
+    let record = runtime.get_task(task_id)?.expect("task remains durable");
+    for operation_id in operation_ids {
+        assert_eq!(
+            record.snapshot.operation_status(operation_id),
+            Some(OperationStatus::Uncertain)
+        );
+    }
+    assert_eq!(
+        record.snapshot,
+        replay(&runtime.read_task_events(task_id)?)?,
+        "the reconciled journal remains authoritative for its projection"
+    );
+    Ok(())
+}
+
+#[test]
+fn runtime_reopens_literal_legacy_v4_postcondition_and_preserves_projection_digest()
+-> Result<(), Box<dyn Error>> {
+    let fixture = TemporaryTaskDatabase::new()?;
+    let mut store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let created = store.create_task(new_task(session.id, &fixture.workspace))?;
+    let task_id = created.snapshot.task_id;
+    let epoch_id = EpochId::new();
+    let operation_id = OperationId::new();
+    let legacy_digest =
+        Sha256Digest::parse("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")?;
+    let mut revision = created.revision;
+    for event in [
+        TaskEvent::StateTransitioned {
+            from: TaskStatus::Queued,
+            to: TaskStatus::Active,
+            reason: "legacy task activated".to_owned(),
+        },
+        TaskEvent::ProviderContextBound {
+            context_id: "legacy-provider-context".to_owned(),
+        },
+        TaskEvent::EpochStarted {
+            epoch_id,
+            objective: "reopen a legacy mutation".to_owned(),
+        },
+        TaskEvent::OperationIntentRecorded {
+            operation_id,
+            epoch_id,
+            item_id: "legacy-file-change".to_owned(),
+            effect_class: EffectClass::IdempotentMutation,
+            request_digest: "legacy-request-digest".to_owned(),
+        },
+        TaskEvent::OperationPostconditionBound {
+            operation_id,
+            postcondition_digest: legacy_digest,
+        },
+        TaskEvent::OperationTransitioned {
+            operation_id,
+            from: OperationStatus::IntentRecorded,
+            to: OperationStatus::Started,
+            evidence_sequences: Vec::new(),
+        },
+    ] {
+        revision = store
+            .append_task_event(task_id, revision, event, timestamp(1))?
+            .expect("legacy setup event appends")
+            .revision;
+    }
+    let legacy_sequence = store
+        .read_task_events(task_id)?
+        .into_iter()
+        .find(|envelope| {
+            matches!(
+                envelope.event,
+                carl::events::Event::TaskLifecycle {
+                    event: TaskEvent::OperationPostconditionBound { .. },
+                    ..
+                }
+            )
+        })
+        .expect("legacy event is present")
+        .sequence;
+    let projection = serde_json::to_value(store.get_task(task_id)?.unwrap().snapshot)?;
+    assert_eq!(
+        projection["operations"][operation_id.to_string()]["postcondition_digest"],
+        legacy_digest.to_string()
+    );
+    drop(store);
+
+    let literal_old_v4 = format!(
+        r#"{{"schema_version":4,"type":"task_lifecycle","task_id":"{task_id}","event":{{"task_event":"operation_postcondition_bound","operation_id":"{operation_id}","postcondition_digest":"{legacy_digest}"}}}}"#
+    );
+    let connection = Connection::open(&fixture.database)?;
+    connection.execute(
+        "UPDATE events SET event_json = ?1 WHERE session_id = ?2 AND sequence = ?3",
+        (
+            literal_old_v4,
+            session.id.to_string(),
+            i64::try_from(legacy_sequence)?,
+        ),
+    )?;
+    let snapshot_json = connection.query_row(
+        "SELECT snapshot_json FROM agent_tasks WHERE id = ?1",
+        [task_id.to_string()],
+        |row| row.get::<_, String>(0),
+    )?;
+    let mut old_projection = serde_json::from_str::<serde_json::Value>(&snapshot_json)?;
+    old_projection["operations"][operation_id.to_string()]
+        .as_object_mut()
+        .expect("operation projection is an object")
+        .remove("file_postcondition");
+    connection.execute(
+        "UPDATE agent_tasks SET snapshot_json = ?1 WHERE id = ?2",
+        (serde_json::to_string(&old_projection)?, task_id.to_string()),
+    )?;
+    drop(connection);
+
+    let runtime = RuntimeStore::open(DataRootLock::acquire(&fixture.root)?, timestamp(3))?;
+    let record = runtime
+        .get_task(task_id)?
+        .expect("legacy task remains durable");
+    assert_eq!(
+        record.snapshot.operation_status(operation_id),
+        Some(OperationStatus::Uncertain)
+    );
+    assert_eq!(
+        record.snapshot,
+        replay(&runtime.read_task_events(task_id)?)?
+    );
+    let reopened_projection = serde_json::to_value(record.snapshot)?;
+    assert_eq!(
+        reopened_projection["operations"][operation_id.to_string()]["postcondition_digest"],
+        legacy_digest.to_string()
+    );
+    Ok(())
+}
+
+#[test]
+fn runtime_startup_rolls_back_all_task_reconciliation_when_one_projection_write_fails()
+-> Result<(), Box<dyn Error>> {
+    let fixture = TemporaryTaskDatabase::new()?;
+    let mut store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let created = store.create_task(new_task(session.id, &fixture.workspace))?;
+    let task_id = created.snapshot.task_id;
+    let epoch_id = EpochId::new();
+    let operation_ids = [OperationId::new(), OperationId::new()];
+    let mut revision = created.revision;
+    for event in [
+        TaskEvent::StateTransitioned {
+            from: TaskStatus::Queued,
+            to: TaskStatus::Active,
+            reason: "execution started".to_owned(),
+        },
+        TaskEvent::EpochStarted {
+            epoch_id,
+            objective: "prove transactional startup".to_owned(),
+        },
+    ] {
+        revision = store
+            .append_task_event(task_id, revision, event, timestamp(1))?
+            .expect("the setup event appends")
+            .revision;
+    }
+    for (index, operation_id) in operation_ids.into_iter().enumerate() {
+        for event in [
+            TaskEvent::OperationIntentRecorded {
+                operation_id,
+                epoch_id,
+                item_id: format!("item-{index}"),
+                effect_class: EffectClass::AmbiguousConsequential,
+                request_digest: format!("request-{index}"),
+            },
+            TaskEvent::OperationTransitioned {
+                operation_id,
+                from: OperationStatus::IntentRecorded,
+                to: OperationStatus::Started,
+                evidence_sequences: Vec::new(),
+            },
+        ] {
+            revision = store
+                .append_task_event(task_id, revision, event, timestamp(2))?
+                .expect("the operation setup event appends")
+                .revision;
+        }
+    }
+    drop(store);
+
+    Connection::open(&fixture.database)?.execute_batch(&format!(
+        "CREATE TRIGGER abort_second_startup_operation
+         BEFORE UPDATE OF status ON task_operations
+         WHEN NEW.id = '{}' AND NEW.status = 'uncertain'
+         BEGIN SELECT RAISE(ABORT, 'injected startup reconciliation failure'); END;",
+        operation_ids[1]
+    ))?;
+    let error = match RuntimeStore::open(DataRootLock::acquire(&fixture.root)?, timestamp(3)) {
+        Ok(_) => panic!("the injected startup reconciliation failure must abort open"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, CarlError::Storage { .. }));
+
+    Connection::open(&fixture.database)?
+        .execute_batch("DROP TRIGGER abort_second_startup_operation;")?;
+    let store = Store::open(&fixture.database)?;
+    let record = store.get_task(task_id)?.expect("task remains durable");
+    for operation_id in operation_ids {
+        assert_eq!(
+            record.snapshot.operation_status(operation_id),
+            Some(OperationStatus::Started),
+            "no partial startup transition may commit"
+        );
+    }
+    assert_eq!(record.snapshot, replay(&store.read_task_events(task_id)?)?);
+    Ok(())
+}
+
+#[test]
+fn representative_journal_prefixes_reconstruct_the_same_snapshot_as_authoritative_replay()
+-> Result<(), Box<dyn Error>> {
+    for (label, cut) in [
+        ("task created", 0_usize),
+        ("epoch started", 3),
+        ("operation intent recorded", 4),
+        ("effect authorized", 5),
+        ("item started", 5),
+        ("workspace mutation observed", 5),
+        ("item completed", 7),
+        ("checkpoint candidate built", 9),
+        ("checkpoint committed", 10),
+        ("compaction requested", 11),
+        ("provider replacement started", 12),
+        ("provider binding committed", 13),
+    ] {
+        let fixture = TemporaryTaskDatabase::new()?;
+        let mut store = Store::open(&fixture.database)?;
+        let session = store.create_session()?;
+        let created = store.create_task(new_task(session.id, &fixture.workspace))?;
+        let task_id = created.snapshot.task_id;
+        let epoch_id = EpochId::new();
+        let operation_id = OperationId::new();
+        let checkpoint_id = CheckpointId::new();
+        let events = vec![
+            TaskEvent::StateTransitioned {
+                from: TaskStatus::Queued,
+                to: TaskStatus::Active,
+                reason: "execution started".to_owned(),
+            },
+            TaskEvent::ProviderContextBound {
+                context_id: "provider-context".to_owned(),
+            },
+            TaskEvent::EpochStarted {
+                epoch_id,
+                objective: "exercise every restart cut".to_owned(),
+            },
+            TaskEvent::OperationIntentRecorded {
+                operation_id,
+                epoch_id,
+                item_id: "item-1".to_owned(),
+                effect_class: EffectClass::AmbiguousConsequential,
+                request_digest: "request-digest".to_owned(),
+            },
+            TaskEvent::OperationTransitioned {
+                operation_id,
+                from: OperationStatus::IntentRecorded,
+                to: OperationStatus::Started,
+                evidence_sequences: Vec::new(),
+            },
+            TaskEvent::OperationEvidenceRecorded {
+                operation_id,
+                result_digest: "result-digest".to_owned(),
+            },
+            TaskEvent::OperationTransitioned {
+                operation_id,
+                from: OperationStatus::Started,
+                to: OperationStatus::Succeeded,
+                evidence_sequences: vec![7],
+            },
+            TaskEvent::EpochFinished {
+                epoch_id,
+                report_digest: "report-digest".to_owned(),
+            },
+            TaskEvent::StateTransitioned {
+                from: TaskStatus::Active,
+                to: TaskStatus::Checkpointing,
+                reason: "checkpoint candidate built".to_owned(),
+            },
+            TaskEvent::CheckpointCommitted {
+                checkpoint_id,
+                digest: "checkpoint-digest".to_owned(),
+            },
+            TaskEvent::CompactionRequested {
+                generation: 0,
+                reason: "context pressure".to_owned(),
+            },
+            TaskEvent::ProviderContextLost {
+                context_id: "provider-context".to_owned(),
+                reason: "provider replacement started".to_owned(),
+            },
+            TaskEvent::ProviderContextBound {
+                context_id: "replacement-context".to_owned(),
+            },
+        ];
+        let mut revision = created.revision;
+        for event in events.into_iter().take(cut) {
+            revision = store
+                .append_task_event(task_id, revision, event, timestamp(1))?
+                .unwrap_or_else(|| panic!("{label}: setup revision remains current"))
+                .revision;
+        }
+        drop(store);
+
+        let reopened = Store::open(&fixture.database)?;
+        let projected = reopened.get_task(task_id)?.expect("task remains projected");
+        assert_eq!(
+            projected.snapshot,
+            replay(&reopened.read_task_events(task_id)?)?,
+            "restart cut {label}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn background_termination_boolean_is_durable_and_replay_stable() -> Result<(), Box<dyn Error>> {
+    let fixture = TemporaryTaskDatabase::new()?;
+    let mut store = Store::open(&fixture.database)?;
+    let session = store.create_session()?;
+    let created = store.create_task(new_task(session.id, &fixture.workspace))?;
+    let task_id = created.snapshot.task_id;
+    let updated = store
+        .append_task_event(
+            task_id,
+            created.revision,
+            TaskEvent::BackgroundProcessTerminationRecorded {
+                process_id: "process-123".to_owned(),
+                item_id: "verification-item".to_owned(),
+                terminated: false,
+            },
+            timestamp(1),
+        )?
+        .expect("the typed termination audit event appends");
+    drop(store);
+
+    let reopened = Store::open(&fixture.database)?;
+    let events = reopened.read_task_events(task_id)?;
+    assert!(events.iter().any(|envelope| matches!(
+        &envelope.event,
+        carl::events::Event::TaskLifecycle {
+            event: TaskEvent::BackgroundProcessTerminationRecorded {
+                process_id,
+                item_id,
+                terminated: false,
+            },
+            ..
+        } if process_id == "process-123" && item_id == "verification-item"
+    )));
+    assert_eq!(updated.snapshot, replay(&events)?);
+    assert_eq!(
+        reopened.get_task(task_id)?.unwrap().snapshot,
+        updated.snapshot
+    );
+    Ok(())
+}

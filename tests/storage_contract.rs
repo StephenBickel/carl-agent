@@ -53,6 +53,7 @@ fn fresh_database_is_migrated_and_configured_for_durable_use() -> Result<(), Box
         .query_map([], |row| row.get::<_, String>(0))?
         .collect::<Result<BTreeSet<_>, _>>()?;
     let required = BTreeSet::from([
+        "agent_tasks".to_owned(),
         "approvals".to_owned(),
         "artifact_objects".to_owned(),
         "events".to_owned(),
@@ -66,6 +67,9 @@ fn fresh_database_is_migrated_and_configured_for_durable_use() -> Result<(), Box
         "processed_telegram_updates".to_owned(),
         "remote_codes".to_owned(),
         "sessions".to_owned(),
+        "service_command_receipts".to_owned(),
+        "service_configuration_controls".to_owned(),
+        "service_task_receipts".to_owned(),
         "session_delegate_settings".to_owned(),
         "subscription_run_baseline_entries".to_owned(),
         "subscription_run_baseline_directories".to_owned(),
@@ -77,7 +81,17 @@ fn fresh_database_is_migrated_and_configured_for_durable_use() -> Result<(), Box
         "subscription_run_verification_requests".to_owned(),
         "subscription_run_verification_results".to_owned(),
         "subscription_runs".to_owned(),
+        "task_checkpoints".to_owned(),
+        "task_configuration_state".to_owned(),
+        "task_control_markers".to_owned(),
+        "task_control_receipts".to_owned(),
+        "task_context_packages".to_owned(),
+        "task_epochs".to_owned(),
+        "task_operations".to_owned(),
+        "task_steering".to_owned(),
         "telegram_state".to_owned(),
+        "trusted_frontend_events".to_owned(),
+        "trusted_frontend_owners".to_owned(),
         "usage_observations".to_owned(),
     ]);
     assert!(
@@ -88,12 +102,12 @@ fn fresh_database_is_migrated_and_configured_for_durable_use() -> Result<(), Box
     let migrations = connection.query_row("SELECT COUNT(*) FROM migrations", [], |row| {
         row.get::<_, u64>(0)
     })?;
-    assert_eq!(migrations, 7);
+    assert_eq!(migrations, 12);
     let checksums = connection
         .prepare("SELECT checksum FROM migrations ORDER BY version")?
         .query_map([], |row| row.get::<_, String>(0))?
         .collect::<Result<Vec<_>, _>>()?;
-    assert_eq!(checksums.len(), 7);
+    assert_eq!(checksums.len(), 12);
     assert_eq!(
         &checksums[..3],
         [
@@ -118,6 +132,14 @@ fn fresh_database_is_migrated_and_configured_for_durable_use() -> Result<(), Box
         checksums[6],
         "67f18d5ed69b66f7fc0d40a578c59c0f61ea923ec172df919960ad4fe1f90158"
     );
+    assert_eq!(
+        checksums[7],
+        "c5202d503ebce6e60ef5807779e1750e252b25fdeff9df195a79a0c48971778b"
+    );
+    assert_eq!(
+        checksums[8],
+        "93a3bcfa21bcec9ec54698e7290499f7e52c49796f03535dd95c8de3eb08e9a2"
+    );
     assert!(checksums.iter().all(|checksum| {
         checksum.len() == 64
             && checksum
@@ -133,8 +155,191 @@ fn fresh_database_is_migrated_and_configured_for_durable_use() -> Result<(), Box
     let migrations = connection.query_row("SELECT COUNT(*) FROM migrations", [], |row| {
         row.get::<_, u64>(0)
     })?;
-    assert_eq!(migrations, 7);
+    assert_eq!(migrations, 12);
 
+    Ok(())
+}
+
+#[test]
+fn every_pre_task_schema_version_upgrades_without_rewriting_its_ledger()
+-> Result<(), Box<dyn Error>> {
+    let migrations = [
+        (
+            "initial schema",
+            include_str!("../migrations/0001_init.sql"),
+            "82b335d14e7368e3eef97384e97f74cfac926f21e24c78f495ef90134c41c582",
+        ),
+        (
+            "bound approvals",
+            include_str!("../migrations/0002_bound_approvals.sql"),
+            "1dfd44f6bb2bc3f0f05f6263c6446eaa9e7974d96b86052d0d9bc74dc43c271d",
+        ),
+        (
+            "subscription runs",
+            include_str!("../migrations/0003_subscription_runs.sql"),
+            "bb944b6783aae22313498e4ad388db36c48863182c3abae6e87ba4204bd8a691",
+        ),
+        (
+            "proposal artifacts",
+            include_str!("../migrations/0004_proposal_artifacts.sql"),
+            "081dbc079c7cb22c3eb55771092ad6a924b0273f1c34f2328adaaec670f4014e",
+        ),
+        (
+            "verifications",
+            include_str!("../migrations/0005_verifications.sql"),
+            "b16563bec8020c47e4b8aa81fdf0ec28a1b6aa0841959c4a15455be1cca5f391",
+        ),
+        (
+            "memory system",
+            include_str!("../migrations/0006_memory_system.sql"),
+            "8df8be30bb866a214021a89107ac6248c9ba9970789f04918c8b56f5a593b092",
+        ),
+        (
+            "ACP frontends",
+            include_str!("../migrations/0007_acp_frontends.sql"),
+            "67f18d5ed69b66f7fc0d40a578c59c0f61ea923ec172df919960ad4fe1f90158",
+        ),
+    ];
+
+    for prefix_length in 1..=migrations.len() {
+        let database = TemporaryDatabase::new();
+        let connection = Connection::open(database.path())?;
+        for (index, (name, sql, checksum)) in migrations[..prefix_length].iter().enumerate() {
+            connection.execute_batch(sql)?;
+            connection.execute(
+                "INSERT INTO migrations (version, name, applied_at, checksum)
+                 VALUES (?1, ?2, '2026-08-10T12:00:00Z', ?3)",
+                params![i64::try_from(index + 1)?, name, checksum],
+            )?;
+        }
+        drop(connection);
+
+        drop(Store::open(database.path())?);
+        let connection = Connection::open(database.path())?;
+        assert_eq!(
+            connection.query_row("SELECT COUNT(*) FROM migrations", [], |row| {
+                row.get::<_, u64>(0)
+            })?,
+            12,
+            "migration prefix {prefix_length} did not upgrade"
+        );
+        assert_eq!(
+            connection.query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'agent_tasks'",
+                [],
+                |row| row.get::<_, u64>(0),
+            )?,
+            1
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn long_horizon_task_schema_enforces_projection_boundaries() -> Result<(), Box<dyn Error>> {
+    let database = TemporaryDatabase::new();
+    let store = Store::open(database.path())?;
+    let session = store.create_session()?;
+    drop(store);
+
+    let connection = Connection::open(database.path())?;
+    connection.execute_batch("PRAGMA foreign_keys = ON;")?;
+    let task_one = "10000000-0000-0000-0000-000000000001";
+    let task_two = "10000000-0000-0000-0000-000000000002";
+    insert_raw_task(&connection, task_one, session.id)?;
+    insert_raw_task(&connection, task_two, session.id)?;
+
+    for table in [
+        "task_epochs",
+        "task_operations",
+        "task_checkpoints",
+        "task_context_packages",
+        "task_steering",
+    ] {
+        assert_eq!(
+            connection.query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM pragma_foreign_key_list('{table}')
+                     WHERE \"table\" = 'agent_tasks' AND on_delete = 'CASCADE'"
+                ),
+                [],
+                |row| row.get::<_, u64>(0),
+            )?,
+            1,
+            "{table} must cascade with its task"
+        );
+    }
+
+    assert_constraint_violation(connection.execute(
+        "UPDATE agent_tasks SET status = 'running' WHERE id = ?1",
+        [task_one],
+    ));
+    assert_constraint_violation(connection.execute(
+        "UPDATE agent_tasks SET revision = -1 WHERE id = ?1",
+        [task_one],
+    ));
+    let oversized_json = format!(r#"{{"value":"{}"}}"#, "x".repeat(4_194_304));
+    assert_constraint_violation(connection.execute(
+        "UPDATE agent_tasks SET contract_json = ?2 WHERE id = ?1",
+        params![task_one, oversized_json],
+    ));
+    assert_constraint_violation(connection.execute(
+        "INSERT INTO task_epochs (
+            id, task_id, objective, status, started_sequence,
+            finished_sequence, report_digest, created_at, updated_at
+         ) VALUES (
+            '20000000-0000-0000-0000-000000000000',
+            'missing-task', 'objective', 'active', 1, NULL, NULL, 't', 't'
+         )",
+        [],
+    ));
+
+    let epoch_one = "20000000-0000-0000-0000-000000000001";
+    let epoch_two = "20000000-0000-0000-0000-000000000002";
+    for (epoch, task) in [(epoch_one, task_one), (epoch_two, task_two)] {
+        connection.execute(
+            "INSERT INTO task_epochs (
+                id, task_id, objective, status, started_sequence,
+                finished_sequence, report_digest, created_at, updated_at
+             ) VALUES (?1, ?2, 'objective', 'active', 1, NULL, NULL, 't', 't')",
+            params![epoch, task],
+        )?;
+    }
+
+    let operation = "30000000-0000-0000-0000-000000000001";
+    connection.execute(
+        "INSERT INTO task_operations (
+            id, task_id, epoch_id, item_id, effect_class, request_digest,
+            status, intent_sequence, last_transition_sequence,
+            evidence_sequences_json, created_at, updated_at
+         ) VALUES (?1, ?2, ?3, 'item', 'observation', 'digest',
+                   'intent_recorded', 2, 2, '[]', 't', 't')",
+        params![operation, task_one, epoch_one],
+    )?;
+    assert_constraint_violation(connection.execute(
+        "INSERT INTO task_operations (
+            id, task_id, epoch_id, item_id, effect_class, request_digest,
+            status, intent_sequence, last_transition_sequence,
+            evidence_sequences_json, created_at, updated_at
+         ) VALUES (?1, ?2, ?3, 'item', 'observation', 'digest',
+                   'intent_recorded', 2, 2, '[]', 't', 't')",
+        params![operation, task_two, epoch_two],
+    ));
+
+    let checkpoint = "40000000-0000-0000-0000-000000000001";
+    connection.execute(
+        "INSERT INTO task_checkpoints (
+            id, task_id, digest, event_sequence, checkpoint_json, created_at
+         ) VALUES (?1, ?2, 'digest', 3, NULL, 't')",
+        params![checkpoint, task_one],
+    )?;
+    assert_constraint_violation(connection.execute(
+        "INSERT INTO task_checkpoints (
+            id, task_id, digest, event_sequence, checkpoint_json, created_at
+         ) VALUES (?1, ?2, 'digest', 3, NULL, 't')",
+        params![checkpoint, task_two],
+    ));
     Ok(())
 }
 
@@ -181,7 +386,7 @@ fn store_open_rejects_a_future_database_migration() -> Result<(), Box<dyn Error>
     ensure_checksum_column(&connection)?;
     connection.execute(
         "INSERT INTO migrations (version, name, applied_at, checksum)
-         VALUES (8, 'future migration', '2026-07-13T12:00:00Z', ?1)",
+         VALUES (13, 'future migration', '2026-07-13T12:00:00Z', ?1)",
         ["ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"],
     )?;
     drop(connection);
@@ -190,7 +395,7 @@ fn store_open_rejects_a_future_database_migration() -> Result<(), Box<dyn Error>
     assert!(matches!(
         error,
         CarlError::Storage { ref detail }
-            if detail.contains("unsupported database migration version 8")
+            if detail.contains("unsupported database migration version 13")
     ));
     Ok(())
 }
@@ -213,6 +418,27 @@ fn store_open_rejects_a_tampered_migration_checksum() -> Result<(), Box<dyn Erro
         error,
         CarlError::Storage { ref detail }
             if detail.contains("migration 1 checksum mismatch")
+    ));
+    Ok(())
+}
+
+#[test]
+fn store_open_rejects_a_tampered_task_migration_checksum() -> Result<(), Box<dyn Error>> {
+    let database = TemporaryDatabase::new();
+    drop(Store::open(database.path())?);
+
+    let connection = Connection::open(database.path())?;
+    connection.execute(
+        "UPDATE migrations SET checksum = ?1 WHERE version = 8",
+        ["0000000000000000000000000000000000000000000000000000000000000000"],
+    )?;
+    drop(connection);
+
+    let error = open_error(database.path());
+    assert!(matches!(
+        error,
+        CarlError::Storage { ref detail }
+            if detail.contains("migration 8 checksum mismatch")
     ));
     Ok(())
 }
@@ -287,13 +513,13 @@ fn pre_subscription_run_database_upgrades_without_rewriting_old_migrations()
         connection.query_row("SELECT COUNT(*) FROM migrations", [], |row| {
             row.get::<_, u64>(0)
         })?,
-        7
+        12
     );
     let checksums = connection
         .prepare("SELECT checksum FROM migrations ORDER BY version")?
         .query_map([], |row| row.get::<_, String>(0))?
         .collect::<Result<Vec<_>, _>>()?;
-    assert_eq!(checksums.len(), 7);
+    assert_eq!(checksums.len(), 12);
     assert_eq!(
         &checksums[..3],
         [
@@ -340,7 +566,7 @@ fn pre_subscription_run_database_upgrades_without_rewriting_old_migrations()
 }
 
 #[test]
-fn pre_proposal_artifact_database_upgrades_through_migration_seven_and_reopens()
+fn pre_proposal_artifact_database_upgrades_through_migration_eight_and_reopens()
 -> Result<(), Box<dyn Error>> {
     let database = TemporaryDatabase::new();
     let connection = Connection::open(database.path())?;
@@ -367,7 +593,7 @@ fn pre_proposal_artifact_database_upgrades_through_migration_seven_and_reopens()
         connection.query_row("SELECT COUNT(*) FROM migrations", [], |row| {
             row.get::<_, u64>(0)
         })?,
-        7
+        12
     );
     let tables = connection
         .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")?
@@ -386,7 +612,7 @@ fn pre_proposal_artifact_database_upgrades_through_migration_seven_and_reopens()
     ]);
     assert!(
         artifact_tables.is_subset(&tables),
-        "missing migration-4/5/6/7 tables: {artifact_tables:?} vs {tables:?}"
+        "missing migration-4/5/6/7/8 tables: {artifact_tables:?} vs {tables:?}"
     );
     drop(connection);
 
@@ -396,14 +622,14 @@ fn pre_proposal_artifact_database_upgrades_through_migration_seven_and_reopens()
         connection.query_row("SELECT COUNT(*) FROM migrations", [], |row| {
             row.get::<_, u64>(0)
         })?,
-        7
+        12
     );
 
     Ok(())
 }
 
 #[test]
-fn pre_verification_database_applies_migrations_five_through_seven_and_reopens()
+fn pre_verification_database_applies_migrations_five_through_eight_and_reopens()
 -> Result<(), Box<dyn Error>> {
     let database = TemporaryDatabase::new();
     let connection = Connection::open(database.path())?;
@@ -433,7 +659,7 @@ fn pre_verification_database_applies_migrations_five_through_seven_and_reopens()
         connection.query_row("SELECT COUNT(*) FROM migrations", [], |row| {
             row.get::<_, u64>(0)
         })?,
-        7
+        12
     );
     assert_eq!(
         connection.query_row(
@@ -774,7 +1000,7 @@ fn reading_rejects_a_future_event_schema_as_a_typed_storage_error() -> Result<()
     assert!(matches!(
         error,
         CarlError::Storage { ref detail }
-            if detail.contains("unsupported event schema version 4")
+            if detail.contains("unsupported event schema version 5")
     ));
 
     Ok(())
@@ -812,12 +1038,12 @@ fn inject_future_event(path: &Path, session_id: SessionId) -> Result<(), Box<dyn
     connection.execute(
         "INSERT INTO events (
             id, session_id, turn_id, sequence, timestamp, schema_version, event_json
-         ) VALUES (?1, ?2, NULL, 1, ?3, 4, ?4)",
+         ) VALUES (?1, ?2, NULL, 1, ?3, 5, ?4)",
         params![
             EventId::new().to_string(),
             session_id.to_string(),
             "2026-07-13T12:00:00Z",
-            r#"{"schema_version":4,"type":"user_input","text":"future"}"#,
+            r#"{"schema_version":5,"type":"user_input","text":"future"}"#,
         ],
     )?;
     Ok(())
@@ -835,6 +1061,26 @@ fn ensure_checksum_column(connection: &Connection) -> Result<(), Box<dyn Error>>
         connection.execute_batch("ALTER TABLE migrations ADD COLUMN checksum TEXT;")?;
     }
     Ok(())
+}
+
+fn insert_raw_task(
+    connection: &Connection,
+    task_id: &str,
+    session_id: SessionId,
+) -> rusqlite::Result<usize> {
+    connection.execute(
+        "INSERT INTO agent_tasks (
+            id, session_id, status, contract_json, budget_json, snapshot_json,
+            canonical_workspace, provider, model, effort, permission_mode,
+            revision, current_epoch_id, latest_checkpoint_id, provider_context,
+            created_at, updated_at
+         ) VALUES (
+            ?1, ?2, 'queued', '{}', '{}', '{}', '/tmp/workspace',
+            'codex', 'gpt-5.6', 'high', 'default', 1,
+            NULL, NULL, NULL, 't', 't'
+         )",
+        params![task_id, session_id.to_string()],
+    )
 }
 
 fn open_error(path: impl AsRef<Path>) -> CarlError {

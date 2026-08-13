@@ -16,6 +16,14 @@ model and reasoning choices, plan/default/edit/don't-ask/bypass permission modes
 exact single-use approvals, steering, cancellation, diffs, and final publication.
 The ACP path is CLI-reachable and covered by process-level offline tests.
 
+The coding path now includes a durable long-horizon task engine: immutable admission
+budgets, completion contracts, operation evidence, canonical checkpoints, structured
+context compaction, recoverable service maintenance, task metrics, and provider-context
+replacement. Owner-selected full access is accepted risk; consequential effects still
+cross Carl's pre-dispatch mediation boundary, but same-user host processes remain
+outside that protection. See the [long-horizon task guide](docs/long-horizon-tasks.md)
+and [benchmark methodology](docs/benchmarks.md).
+
 Carl also includes curated local profile, preference, fact, goal, and expiring
 episode memory with scoped isolation, bounded lexical retrieval, proposal approval,
 versioned export, hard deletion, and no external service dependency. Memory is
@@ -23,12 +31,9 @@ managed through the implemented `carl memory` command tree.
 
 This remains pre-alpha. TUI interaction, the Telegram gateway, Grok execution,
 native HTTP/OpenAI adapters, Carl's native tool loop, stale-safe live-workspace
-promotion, and broader consumer packaging are incomplete. The four placeholder
-commands `serve`, `pair`, `doctor`, and `sessions` return not-implemented errors;
-Clap's built-in `help` command displays help.
-
-Only the four placeholder commands remain unavailable as inert CLI shells; `auth`,
-`memory`, and `acp` have implemented behavior.
+promotion, and broader consumer packaging are incomplete. `serve`, `acp`, `auth`, `memory`, `maintenance`, and the
+direct Codex baseline have implemented behavior; `pair`, `doctor`, and `sessions`
+remain inert CLI shells.
 
 ## Try Carl locally
 
@@ -47,6 +52,11 @@ Use `--model <id>` and `--effort low|medium|high|xhigh|max|ultra` to select valu
 reported by the active provider. A local operator can explicitly launch unrestricted
 execution with `carl acp --dangerously-bypass-permissions`; see the
 [Buzz guide](docs/buzz.md) before enabling bypass remotely.
+
+For long tasks, run `carl serve` in one local process and connect with `carl acp`.
+Status, sanitized metrics, resume, steering, cancellation, checkpoint inspection, and
+recoverable maintenance are documented in the
+[long-horizon task guide](docs/long-horizon-tasks.md).
 
 ## Use Carl from Buzz
 
@@ -166,6 +176,9 @@ single-process decision is recorded in
 Normal tests are deterministic, offline, credential-free, and include the pinned
 Buzz ACP fixtures and real-process end-to-end path. The opt-in subscription smoke is
 documented in the [Buzz guide](docs/buzz.md) and is excluded from public CI.
+The deterministic long-horizon gate and the opt-in paired endurance methodology are
+documented in [docs/benchmarks.md](docs/benchmarks.md); one paired run is never treated
+as evidence of superiority.
 
 ```sh
 cargo fmt --all -- --check
@@ -195,6 +208,7 @@ promotion controller, protected runner, merge queue, soak, and rollback remain s
 - [x] Subscription-backed Codex ACP execution
 - [x] Buzz-compatible ACP frontend and restricted publication adapter
 - [x] Exact remote approvals, model/effort modes, steering, and cancellation
+- [x] Durable long-horizon tasks, checkpoints, compaction, metrics, and restart recovery
 - [x] Local curated-memory storage, retrieval, settings, and CLI controls
 - [ ] Interactive local TUI
 - [ ] Owner-only Telegram gateway

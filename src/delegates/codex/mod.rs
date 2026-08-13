@@ -1,5 +1,6 @@
 mod app_events;
 mod app_server;
+mod direct_baseline;
 mod events;
 
 use std::ffi::OsString;
@@ -12,15 +13,20 @@ use thiserror::Error;
 use super::{BoundedDelegateTask, ResolvedDelegateSettings};
 use crate::sidecar::{
     ExecutionWorkspace, JsonlEventProcess, JsonlProcessOutcome, ProviderEnvironmentProfile,
-    ProviderHome, SidecarCommand, SidecarError, SidecarErrorCode, SidecarLimits, TrustedExecutable,
-    VersionOutputFormat,
+    ProviderFileMetadata, ProviderHome, SidecarCommand, SidecarError, SidecarErrorCode,
+    SidecarLimits, TrustedExecutable, TrustedExecutableAttestation, VersionOutputFormat,
 };
 
 pub use app_events::{
-    CodexApprovalDecision, CodexApprovalKind, CodexApprovalRequest, CodexEvent, CodexThreadId,
-    CodexTurnId,
+    CodexApprovalDecision, CodexApprovalKind, CodexApprovalRequest, CodexEvent, CodexItem,
+    CodexThreadId, CodexTokenUsage, CodexTurnId,
 };
 pub use app_server::{CodexAppServer, CodexModel, StartThread, StartTurn};
+pub use direct_baseline::{
+    DirectBaselineClock, DirectBaselineDeadline, DirectBaselineError, DirectBaselineErrorCode,
+    DirectBaselineProvider, DirectCodexBaseline, DirectCodexBaselineRequest,
+    DirectCodexBaselineResult,
+};
 pub use events::{
     CodexEventNormalizer, CodexProtocolError, CodexProtocolErrorCode, DelegateActivityKind,
     DelegateEvent, DelegateItemPhase, DelegateTerminal, DelegateUsage,
@@ -122,8 +128,15 @@ impl CodexExecAdapter {
     ) -> Result<Self, DelegateError> {
         home.require_profile(ProviderEnvironmentProfile::Codex)
             .map_err(map_sidecar_error)?;
-        home.inspect_owner_only_file(CREDENTIAL_FILENAME, MAX_CREDENTIAL_FILE_BYTES)
-            .map_err(map_sidecar_error)?;
+        if home
+            .inspect_owner_only_file(CREDENTIAL_FILENAME, MAX_CREDENTIAL_FILE_BYTES)
+            .map_err(map_sidecar_error)?
+            != ProviderFileMetadata::Safe
+        {
+            return Err(DelegateError::new(
+                DelegateErrorCode::AuthenticationRequired,
+            ));
+        }
         home.write_static_file("config.toml", CODEX_CONFIG)
             .map_err(map_sidecar_error)?;
         Ok(Self {
@@ -138,6 +151,23 @@ impl CodexExecAdapter {
         workspace: &ExecutionWorkspace,
         request: CodexExecRequest,
     ) -> Result<CodexExecRun, DelegateError> {
+        if self
+            .home
+            .inspect_owner_only_file(CREDENTIAL_FILENAME, MAX_CREDENTIAL_FILE_BYTES)
+            .map_err(map_sidecar_error)?
+            != ProviderFileMetadata::Safe
+        {
+            return Err(DelegateError::new(
+                DelegateErrorCode::AuthenticationRequired,
+            ));
+        }
+        self.home
+            .write_static_file("config.toml", CODEX_CONFIG)
+            .map_err(map_sidecar_error)?;
+        let executable_attestation = self
+            .executable
+            .verification_attestation()
+            .map_err(map_sidecar_error)?;
         let mut arguments = vec![OsString::from("--strict-config")];
         if let Some(model) = request.settings.model() {
             arguments.push(OsString::from("--model"));
@@ -177,19 +207,22 @@ impl CodexExecAdapter {
                 .expect("the pinned Codex version requirement is valid"),
         };
         let task = format!("{DELEGATE_PREAMBLE}{}\n", request.task.as_str());
-        let process = JsonlEventProcess::spawn_in_home(
+        let process = JsonlEventProcess::spawn_in_home_with_attestation(
             specification,
             &self.executable,
             &self.home,
             workspace,
             task.as_bytes(),
             self.limits,
+            &executable_attestation,
         )
         .await
         .map_err(map_sidecar_error)?;
 
         Ok(CodexExecRun {
             process,
+            executable: self.executable.clone(),
+            executable_attestation,
             normalizer: CodexEventNormalizer::new(),
             terminal: None,
             stream_exhausted: false,
@@ -200,6 +233,8 @@ impl CodexExecAdapter {
 
 pub struct CodexExecRun {
     process: JsonlEventProcess,
+    executable: TrustedExecutable,
+    executable_attestation: TrustedExecutableAttestation,
     normalizer: CodexEventNormalizer,
     terminal: Option<DelegateTerminal>,
     stream_exhausted: bool,
@@ -250,12 +285,19 @@ impl CodexExecRun {
     }
 
     pub async fn finish(mut self) -> Result<DelegateUsage, DelegateError> {
+        self.finish_in_place().await
+    }
+
+    pub async fn finish_in_place(&mut self) -> Result<DelegateUsage, DelegateError> {
         while self.next_event().await?.is_some() {}
         if let Some(code) = self.failure {
             return Err(DelegateError::new(code));
         }
 
         let outcome = self.process.wait().await.map_err(map_sidecar_error)?;
+        self.executable
+            .revalidate_verification_attestation(&self.executable_attestation)
+            .map_err(map_sidecar_error)?;
         match (&self.terminal, outcome) {
             (Some(DelegateTerminal::Completed { usage }), JsonlProcessOutcome::Succeeded) => {
                 Ok(*usage)
@@ -283,12 +325,24 @@ impl CodexExecRun {
 
     pub async fn cancel(&mut self) -> Result<(), DelegateError> {
         self.process.cancel().await.map_err(map_sidecar_error)?;
+        self.executable
+            .revalidate_verification_attestation(&self.executable_attestation)
+            .map_err(map_sidecar_error)?;
         self.failure = Some(DelegateErrorCode::Cancelled);
         Ok(())
     }
 
     async fn fail_process(&mut self, code: DelegateErrorCode) -> DelegateError {
         let _ = self.process.cancel().await;
+        let code = if self
+            .executable
+            .revalidate_verification_attestation(&self.executable_attestation)
+            .is_err()
+        {
+            DelegateErrorCode::Incompatible
+        } else {
+            code
+        };
         self.failure = Some(code);
         DelegateError::new(code)
     }
@@ -308,14 +362,15 @@ fn map_sidecar_error(error: SidecarError) -> DelegateError {
         SidecarErrorCode::InvalidProviderHome | SidecarErrorCode::InvalidConfiguration => {
             DelegateErrorCode::Configuration
         }
-        SidecarErrorCode::UnsupportedVersion => DelegateErrorCode::Incompatible,
+        SidecarErrorCode::UnsupportedVersion | SidecarErrorCode::UnsafeExecutable => {
+            DelegateErrorCode::Incompatible
+        }
         SidecarErrorCode::ProtocolViolation => DelegateErrorCode::ProtocolFailed,
         SidecarErrorCode::Cancelled => DelegateErrorCode::Cancelled,
         SidecarErrorCode::TimedOut => DelegateErrorCode::BudgetExhausted,
         SidecarErrorCode::SidecarExited => DelegateErrorCode::ProviderFailed,
         SidecarErrorCode::ExecutableMissing
         | SidecarErrorCode::ExecutableUnavailable
-        | SidecarErrorCode::UnsafeExecutable
         | SidecarErrorCode::SpawnFailed
         | SidecarErrorCode::ForegroundRequired
         | SidecarErrorCode::UnsafeProviderFile

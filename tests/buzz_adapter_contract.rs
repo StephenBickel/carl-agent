@@ -84,12 +84,14 @@ fn context_is_structural() -> Result<(), Box<dyn Error + Send + Sync>> {
 
 fn context_rejects_ambiguity() -> Result<(), Box<dyn Error + Send + Sync>> {
     let event = event_block();
+    let group_shaped = event.replace("Kind: 1", "Kind: 9");
     let conflicting = event.replace(
         "123e4567-e89b-12d3-a456-426614174000",
         "123e4567-e89b-12d3-a456-426614174001",
     );
     for blocks in [
         vec![event.as_str(), conflicting.as_str()],
+        vec![group_shaped.as_str()],
         vec![
             "[Context]\nEvent ID: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         ],
@@ -208,7 +210,7 @@ fn descriptor() -> serde_json::Value {
 fn event_block() -> String {
     "Event ID: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n\
      Channel: engineering (#123e4567-e89b-12d3-a456-426614174000)\n\
-     Kind: 9\n\
+     Kind: 1\n\
      From: Stephen (npub: npub1example, hex: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb)\n\
      Content: @Carl fix the test\n\
      Tags: []"

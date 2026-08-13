@@ -1,4 +1,4 @@
-use std::{collections::BTreeSet, fs, path::PathBuf};
+use std::{collections::BTreeSet, fs, path::PathBuf, process::Command};
 
 use carl::cli::Cli;
 use clap::{CommandFactory, Parser, error::ErrorKind};
@@ -14,6 +14,8 @@ const PUBLIC_DOCS: &[&str] = &[
     "docs/security.md",
     "docs/configuration.md",
     "docs/buzz.md",
+    "docs/long-horizon-tasks.md",
+    "docs/benchmarks.md",
     "docs/memory.md",
     "docs/telegram.md",
     "docs/adr/0001-event-sourced-runtime.md",
@@ -233,6 +235,141 @@ fn readme_and_buzz_guide_publish_the_safe_operational_settings() {
     );
 }
 
+#[test]
+fn long_horizon_runner_self_test_enforces_the_offline_contract() {
+    let script = repository_root().join("scripts/live-codex-long-horizon.mjs");
+    assert!(script.is_file(), "the opt-in endurance runner must exist");
+
+    let output = Command::new("node")
+        .arg(&script)
+        .arg("--self-test")
+        .current_dir(repository_root())
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .output()
+        .expect("the offline endurance self-test must start");
+    assert!(
+        output.status.success(),
+        "offline endurance self-test failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.stderr.is_empty(),
+        "successful self-test must be quiet"
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("self-test stdout must be UTF-8"),
+        "{\"schema_version\":1,\"passed\":true,\"checks\":7}\n"
+    );
+
+    let source = read_document("scripts/live-codex-long-horizon.mjs");
+    for required in [
+        "CARL_DATA_DIR=/absolute/private/root",
+        "CARL_CODEX_EXECUTABLE=/absolute/path/to/codex",
+        "CARL_BIN=/absolute/path/to/release/carl",
+        "CARL_LIVE_MODEL=gpt-5.6-terra",
+        "CARL_LIVE_EFFORT=low",
+        "CARL_LIVE_DURATION_HOURS=2",
+        "node scripts/live-codex-long-horizon.mjs",
+        "--self-test",
+        "thirty independent paired runs",
+        "no result artifact",
+    ] {
+        assert!(
+            source.contains(required),
+            "endurance runner is missing pinned contract text: {required:?}"
+        );
+    }
+}
+
+#[test]
+fn long_horizon_runtime_guarantees_and_benchmark_limits_are_documented() {
+    assert_document_contains(
+        "README.md",
+        &[
+            "owner-selected full access is accepted risk",
+            "[long-horizon task guide](docs/long-horizon-tasks.md)",
+            "[benchmark methodology](docs/benchmarks.md)",
+        ],
+    );
+    assert_document_contains(
+        "SECURITY.md",
+        &[
+            "owner-default full access",
+            "pre-dispatch mediation",
+            "untrusted remote requests remain denied",
+            "same-user processes",
+            "not a complete security sandbox",
+        ],
+    );
+    assert_document_contains(
+        "docs/security.md",
+        &[
+            "accepted risk",
+            "pre-dispatch mediation invariant",
+            "same-user process",
+            "not a complete security sandbox",
+        ],
+    );
+    assert_document_contains(
+        "docs/architecture.md",
+        &[
+            "canonical checkpoint",
+            "context compaction",
+            "provider context replacement",
+            "unresolved `started` operation",
+        ],
+    );
+    assert_document_contains(
+        "docs/configuration.md",
+        &[
+            "`--max-wall-time-seconds`",
+            "`--max-provider-requests`",
+            "`--max-tool-calls`",
+            "`--soft-epoch-seconds`",
+            "`--soft-epoch-tool-calls`",
+        ],
+    );
+    assert_document_contains(
+        "docs/buzz.md",
+        &[
+            "`/status`",
+            "`/metrics`",
+            "`/resume`",
+            "`/steer`",
+            "`/cancel`",
+        ],
+    );
+    assert_document_contains(
+        "docs/long-horizon-tasks.md",
+        &[
+            "`session/load`",
+            "`_task/status`",
+            "`_task/metrics`",
+            "`_task/resume`",
+            "`_session/steering`",
+            "`session/cancel`",
+            "`latest_checkpoint`",
+            "compaction thresholds",
+            "provider context replacement",
+            "unresolved `started` operation",
+        ],
+    );
+    assert_document_contains(
+        "docs/benchmarks.md",
+        &[
+            "deterministic ten-case repository matrix",
+            "100-epoch",
+            "sanitized metadata",
+            "at least thirty independent paired runs",
+            "do not claim superiority",
+            "completion rate",
+            "interventions",
+            "safety violations",
+        ],
+    );
+}
+
 fn validate_fenced_carl_commands(markdown: &str) -> Result<(), String> {
     let mut command = Cli::command();
     let clap_commands: BTreeSet<_> = command
@@ -314,15 +451,15 @@ fn readme_states_the_current_status_and_security_boundaries() {
             "native tool loop",
             "tui interaction",
             "telegram gateway",
-            "only the four placeholder commands",
-            "`serve`, `pair`, `doctor`, and `sessions` return not-implemented errors",
-            "clap's built-in `help` command displays help",
+            "`serve`, `acp`, `auth`, `memory`, `maintenance`, and the direct codex baseline have implemented behavior",
+            "`pair`, `doctor`, and `sessions` remain inert cli shells",
         ],
     );
 
     assert!(
-        !normalized_document("README.md").contains("only the five placeholder commands"),
-        "README must not describe `auth` as a fifth placeholder command"
+        !normalized_document("README.md")
+            .contains("`serve`, `pair`, `doctor`, and `sessions` return not-implemented errors"),
+        "README must not describe the implemented service as a placeholder"
     );
 }
 

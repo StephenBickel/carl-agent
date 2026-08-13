@@ -4,17 +4,18 @@ use std::fs;
 use std::future::{Future, pending};
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::time::Duration;
 
 use chrono::{TimeDelta, Utc};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
-use tokio::io::BufReader;
+use tokio::io::{AsyncReadExt, BufReader};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::acp::{
-    AcpServer, AcpServerConfig, AcpServerErrorCode, BuzzPublisher, BuzzPublisherBootstrap,
-    BuzzPublisherConfig, Kernel, PermissionMode,
+    AcpServerConfig, BuzzPublisher, BuzzPublisherBootstrap, BuzzPublisherConfig, PermissionMode,
+    ServiceAcpServer,
 };
 use crate::auth::codex::{CODEX_LOGOUT_WARNING, CodexAuth, CodexAuthTimeouts};
 use crate::auth::grok::{GrokAuth, GrokAuthTimeouts};
@@ -23,21 +24,31 @@ use crate::auth::{
     SubscriptionAuthBroker, SubscriptionPlan, SubscriptionService,
 };
 use crate::buzz_mcp;
-use crate::delegates::codex::CodexAppServer;
-use crate::delegates::{ModelId, ReasoningEffort};
+use crate::delegates::codex::{
+    CodexAppServer, CodexExecAdapter, DirectBaselineErrorCode, DirectCodexBaseline,
+    DirectCodexBaselineRequest,
+};
+use crate::delegates::{BoundedDelegateTask, ModelId, ReasoningEffort};
 use crate::error::{CarlError, ErrorCode};
 use crate::events::SessionId;
 use crate::memory::{
     MemoryKind, MemoryPartition, MemoryQuery, MemoryScope, MemorySettings, MemoryWrite,
 };
 use crate::policy::Frontend;
+use crate::runtime::task::TaskBudget;
+use crate::service::client::TaskServiceClient;
+use crate::service::protocol::{
+    MaintenancePhase, SERVICE_PROTOCOL_VERSION, ServiceCommand, ServiceMaintenanceStatus,
+    ServiceRequest, ServiceResult,
+};
+use crate::service::server::TaskService;
 use crate::sidecar::{
     DataRootLock, DataRootLockErrorCode, ExecutableTrustDecision, ExecutionWorkspace,
     ProviderEnvironmentProfile, ProviderHome, ResolvedExecutable, SidecarError, SidecarErrorCode,
     SidecarLimits, TrustedExecutable, authorize_local_foreground,
     local_foreground_terminal_available, write_local_foreground_stderr,
 };
-use crate::storage::Store;
+use crate::storage::{Store, TrustedFrontendOwnerInput};
 
 #[derive(Debug, Parser)]
 #[command(name = "carl")]
@@ -58,9 +69,48 @@ pub enum Command {
         #[command(subcommand)]
         command: MemoryCommand,
     },
+    Trust {
+        #[command(subcommand)]
+        command: TrustCommand,
+    },
+    Maintenance {
+        #[command(subcommand)]
+        command: MaintenanceCommand,
+    },
+    Baseline {
+        #[command(subcommand)]
+        command: BaselineCommand,
+    },
     Pair,
     Doctor,
     Sessions,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Subcommand)]
+pub enum BaselineCommand {
+    Codex(BaselineCodexArgs),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Args)]
+pub struct BaselineCodexArgs {
+    #[arg(long)]
+    pub workspace: PathBuf,
+    #[arg(long)]
+    pub model: String,
+    #[arg(long, value_enum)]
+    pub effort: AcpEffort,
+    #[arg(long, default_value_t = 7_200, value_parser = parse_baseline_timeout_seconds)]
+    pub timeout_seconds: u64,
+}
+
+fn parse_baseline_timeout_seconds(value: &str) -> Result<u64, String> {
+    let parsed = value
+        .parse::<u64>()
+        .map_err(|_| "value must be an unsigned 64-bit integer".to_owned())?;
+    if !(60..=28_800).contains(&parsed) {
+        return Err("value must be between 60 and 28800 seconds".to_owned());
+    }
+    Ok(parsed)
 }
 
 #[derive(Clone, Debug, Args)]
@@ -73,6 +123,79 @@ pub struct AcpArgs {
     pub permission_mode: Option<AcpPermissionMode>,
     #[arg(long, conflicts_with = "permission_mode")]
     pub dangerously_bypass_permissions: bool,
+    #[arg(long, value_parser = parse_max_wall_time_seconds)]
+    pub max_wall_time_seconds: Option<u64>,
+    #[arg(long, value_parser = parse_max_provider_requests)]
+    pub max_provider_requests: Option<u64>,
+    #[arg(long, value_parser = parse_max_tool_calls)]
+    pub max_tool_calls: Option<u64>,
+    #[arg(long, default_value_t = 900, value_parser = parse_soft_epoch_seconds)]
+    pub soft_epoch_seconds: u64,
+    #[arg(long, default_value_t = 40, value_parser = parse_soft_epoch_tool_calls)]
+    pub soft_epoch_tool_calls: u32,
+}
+
+impl AcpArgs {
+    #[must_use]
+    pub const fn task_budget(&self) -> TaskBudget {
+        TaskBudget {
+            max_wall_time_seconds: self.max_wall_time_seconds,
+            max_provider_requests: self.max_provider_requests,
+            max_tool_calls: self.max_tool_calls,
+            soft_epoch_seconds: self.soft_epoch_seconds,
+            soft_epoch_tool_calls: self.soft_epoch_tool_calls,
+        }
+    }
+}
+
+fn parse_max_wall_time_seconds(value: &str) -> Result<u64, String> {
+    parse_budget_u64(value, |budget, parsed| {
+        budget.max_wall_time_seconds = Some(parsed);
+    })
+}
+
+fn parse_max_provider_requests(value: &str) -> Result<u64, String> {
+    parse_budget_u64(value, |budget, parsed| {
+        budget.max_provider_requests = Some(parsed);
+    })
+}
+
+fn parse_max_tool_calls(value: &str) -> Result<u64, String> {
+    parse_budget_u64(value, |budget, parsed| {
+        budget.max_tool_calls = Some(parsed);
+    })
+}
+
+fn parse_soft_epoch_seconds(value: &str) -> Result<u64, String> {
+    parse_budget_u64(value, |budget, parsed| {
+        budget.soft_epoch_seconds = parsed;
+    })
+}
+
+fn parse_soft_epoch_tool_calls(value: &str) -> Result<u32, String> {
+    let parsed = value
+        .parse::<u32>()
+        .map_err(|_| "value must be an unsigned 32-bit integer".to_owned())?;
+    let budget = TaskBudget {
+        soft_epoch_tool_calls: parsed,
+        ..TaskBudget::default()
+    };
+    budget
+        .validate_for_admission()
+        .map_err(|error| error.to_string())?;
+    Ok(parsed)
+}
+
+fn parse_budget_u64(value: &str, assign: impl FnOnce(&mut TaskBudget, u64)) -> Result<u64, String> {
+    let parsed = value
+        .parse::<u64>()
+        .map_err(|_| "value must be an unsigned 64-bit integer".to_owned())?;
+    let mut budget = TaskBudget::default();
+    assign(&mut budget, parsed);
+    budget
+        .validate_for_admission()
+        .map_err(|error| error.to_string())?;
+    Ok(parsed)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -157,6 +280,22 @@ pub enum MemoryCommand {
     },
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Subcommand)]
+pub enum TrustCommand {
+    Buzz {
+        #[arg(long)]
+        actor: String,
+        #[arg(long)]
+        workspace: PathBuf,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Subcommand)]
+pub enum MaintenanceCommand {
+    Status,
+    Prepare,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub enum MemoryKindArgument {
     Profile,
@@ -186,8 +325,8 @@ pub enum AcpPermissionMode {
     AcceptEdits,
     #[value(name = "dontAsk")]
     DontAsk,
-    #[value(name = "bypassPermissions")]
-    BypassPermissions,
+    #[value(name = "fullAccess")]
+    FullAccess,
 }
 
 impl From<AcpPermissionMode> for PermissionMode {
@@ -197,7 +336,7 @@ impl From<AcpPermissionMode> for PermissionMode {
             AcpPermissionMode::Default => Self::Default,
             AcpPermissionMode::AcceptEdits => Self::AcceptEdits,
             AcpPermissionMode::DontAsk => Self::DontAsk,
-            AcpPermissionMode::BypassPermissions => Self::BypassPermissions,
+            AcpPermissionMode::FullAccess => Self::FullAccess,
         }
     }
 }
@@ -384,6 +523,14 @@ struct MemoryMutationOutput {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+struct TrustOutput {
+    trusted: bool,
+    frontend: Frontend,
+    channel_bound: bool,
+    permission_mode: PermissionMode,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum AuthAvailability {
     Available,
@@ -521,10 +668,426 @@ where
         Command::Auth { command } => run_auth(command, cancellation.as_mut()).await,
         Command::Acp(_) => CliRunResult::not_implemented("acp streaming dispatch"),
         Command::Memory { command } => run_memory(command),
-        Command::Serve => CliRunResult::not_implemented("serve"),
+        Command::Trust { command } => run_trust(command),
+        Command::Maintenance { command } => run_maintenance(command, cancellation.as_mut()).await,
+        Command::Baseline { command } => run_baseline(command, cancellation.as_mut()).await,
+        Command::Serve => run_serve(cancellation.as_mut()).await,
         Command::Pair => CliRunResult::not_implemented("pair"),
         Command::Doctor => CliRunResult::not_implemented("doctor"),
         Command::Sessions => CliRunResult::not_implemented("sessions"),
+    }
+}
+
+async fn run_baseline<C>(command: BaselineCommand, mut cancellation: Pin<&mut C>) -> CliRunResult
+where
+    C: Future<Output = ()> + ?Sized,
+{
+    match command {
+        BaselineCommand::Codex(args) => {
+            let prepared = match prepare_direct_codex_baseline(&args) {
+                Ok(prepared) => prepared,
+                Err(code) => return direct_baseline_error(code),
+            };
+            let mut task_bytes = Vec::with_capacity(16 * 1_024 + 1);
+            let mut stdin = tokio::io::stdin().take(16 * 1_024 + 1);
+            let read = stdin.read_to_end(&mut task_bytes);
+            tokio::pin!(read);
+            tokio::select! {
+                result = &mut read => {
+                    if result.is_err() {
+                        return direct_baseline_error(DirectBaselineErrorCode::InvalidRequest);
+                    }
+                }
+                () = cancellation.as_mut() => {
+                    return direct_baseline_cancelled();
+                }
+            }
+            run_prepared_direct_codex_baseline(prepared, &task_bytes, cancellation.as_mut()).await
+        }
+    }
+}
+
+/// Run the direct baseline with explicit bytes after performing the same production
+/// trust, provider-home, and credential bootstrap used by the stdin command.
+#[doc(hidden)]
+pub async fn run_baseline_codex_with_input(
+    args: BaselineCodexArgs,
+    input: &[u8],
+    cancellation: CancellationToken,
+) -> CliRunResult {
+    let prepared = match prepare_direct_codex_baseline(&args) {
+        Ok(prepared) => prepared,
+        Err(code) => return direct_baseline_error(code),
+    };
+    let cancellation_future = cancellation.cancelled_owned();
+    tokio::pin!(cancellation_future);
+    run_prepared_direct_codex_baseline(prepared, input, cancellation_future.as_mut()).await
+}
+
+struct PreparedDirectCodexBaseline {
+    baseline: DirectCodexBaseline,
+    workspace: ExecutionWorkspace,
+    model: ModelId,
+    effort: ReasoningEffort,
+    timeout: Duration,
+    _data_root_lock: DataRootLock,
+}
+
+fn prepare_direct_codex_baseline(
+    args: &BaselineCodexArgs,
+) -> Result<PreparedDirectCodexBaseline, DirectBaselineErrorCode> {
+    if ["OPENAI_API_KEY", "CODEX_API_KEY", "AZURE_OPENAI_API_KEY"]
+        .into_iter()
+        .any(|variable| env::var_os(variable).is_some())
+    {
+        return Err(DirectBaselineErrorCode::InvalidRequest);
+    }
+    let data_root = env::var_os("CARL_DATA_DIR")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .ok_or(DirectBaselineErrorCode::StartFailed)?;
+    let data_root =
+        fs::canonicalize(data_root).map_err(|_| DirectBaselineErrorCode::StartFailed)?;
+    let data_root_lock =
+        DataRootLock::acquire(&data_root).map_err(|_| DirectBaselineErrorCode::StartFailed)?;
+    let canonical_workspace =
+        fs::canonicalize(&args.workspace).map_err(|_| DirectBaselineErrorCode::InvalidRequest)?;
+    if canonical_workspace != args.workspace {
+        return Err(DirectBaselineErrorCode::InvalidRequest);
+    }
+    let workspace = ExecutionWorkspace::open(&canonical_workspace)
+        .map_err(|_| DirectBaselineErrorCode::InvalidRequest)?;
+    let provider_home = data_root.join("providers").join("codex");
+    let home = ProviderHome::prepare(
+        ProviderEnvironmentProfile::Codex,
+        &data_root,
+        &canonical_workspace,
+        provider_home,
+    )
+    .map_err(|_| DirectBaselineErrorCode::StartFailed)?;
+    let (candidate, explicit_override) = configured_executable(AuthService::Openai)
+        .map_err(|_| DirectBaselineErrorCode::StartFailed)?;
+    let resolved = ResolvedExecutable::resolve(&candidate)
+        .map_err(|_| DirectBaselineErrorCode::StartFailed)?;
+    let decision = if resolved.metadata_risk().is_none() {
+        ExecutableTrustDecision::TrustCanonicalPath
+    } else if explicit_override && candidate == resolved.canonical_path() {
+        ExecutableTrustDecision::TrustCanonicalPathWithMetadataRisk
+    } else {
+        ExecutableTrustDecision::TrustCanonicalPath
+    };
+    let executable = resolved
+        .trust(decision)
+        .map_err(|_| DirectBaselineErrorCode::StartFailed)?;
+    let adapter =
+        CodexExecAdapter::new(executable, home, SidecarLimits::default()).map_err(|error| {
+            match error.code() {
+                crate::delegates::codex::DelegateErrorCode::AuthenticationRequired => {
+                    DirectBaselineErrorCode::AuthenticationRequired
+                }
+                crate::delegates::codex::DelegateErrorCode::Incompatible => {
+                    DirectBaselineErrorCode::Incompatible
+                }
+                _ => DirectBaselineErrorCode::StartFailed,
+            }
+        })?;
+    Ok(PreparedDirectCodexBaseline {
+        baseline: DirectCodexBaseline::new(adapter),
+        workspace,
+        model: ModelId::parse(args.model.clone())
+            .map_err(|_| DirectBaselineErrorCode::InvalidRequest)?,
+        effort: args.effort.into(),
+        timeout: Duration::from_secs(args.timeout_seconds),
+        _data_root_lock: data_root_lock,
+    })
+}
+
+async fn run_prepared_direct_codex_baseline<C>(
+    prepared: PreparedDirectCodexBaseline,
+    input: &[u8],
+    mut cancellation: Pin<&mut C>,
+) -> CliRunResult
+where
+    C: Future<Output = ()> + ?Sized,
+{
+    let task = match std::str::from_utf8(input) {
+        Ok(task) if !task.is_empty() && input.len() <= 16 * 1_024 => task,
+        _ => return direct_baseline_error(DirectBaselineErrorCode::InvalidRequest),
+    };
+    let task = match BoundedDelegateTask::parse(task.to_owned()) {
+        Ok(task) => task,
+        Err(_) => return direct_baseline_error(DirectBaselineErrorCode::InvalidRequest),
+    };
+    let token = CancellationToken::new();
+    let run = prepared.baseline.run(
+        DirectCodexBaselineRequest {
+            workspace: prepared.workspace,
+            task,
+            model: prepared.model,
+            effort: prepared.effort,
+            timeout: prepared.timeout,
+        },
+        token.clone(),
+    );
+    tokio::pin!(run);
+    let result = tokio::select! {
+        result = &mut run => result,
+        () = cancellation.as_mut() => {
+            token.cancel();
+            run.await
+        }
+    };
+    match result {
+        Ok(result) => CliRunResult::json_success(&result),
+        Err(error) if error.code() == DirectBaselineErrorCode::Cancelled => {
+            direct_baseline_cancelled()
+        }
+        Err(error) => direct_baseline_error(error.code()),
+    }
+}
+
+fn direct_baseline_error(code: DirectBaselineErrorCode) -> CliRunResult {
+    CliRunResult {
+        stdout: String::new(),
+        stderr: format!("carl baseline codex: failed ({})\n", code.as_str()),
+        exit: ExitClassification::Failure,
+    }
+}
+
+fn direct_baseline_cancelled() -> CliRunResult {
+    CliRunResult {
+        stdout: String::new(),
+        stderr: "carl baseline codex: cancelled\n".to_owned(),
+        exit: ExitClassification::Cancelled,
+    }
+}
+
+async fn run_maintenance<C>(
+    command: MaintenanceCommand,
+    mut cancellation: Pin<&mut C>,
+) -> CliRunResult
+where
+    C: Future<Output = ()> + ?Sized,
+{
+    let Ok(configuration) = load_common_configuration() else {
+        return service_cli_result(
+            ExitClassification::Failure,
+            "carl maintenance: invalid Carl data directory or workspace",
+        );
+    };
+    let connected = TaskServiceClient::connect(&configuration.data_root);
+    tokio::pin!(connected);
+    let mut client = tokio::select! {
+        result = &mut connected => match result {
+            Ok(client) => client,
+            Err(_) => return service_cli_result(
+                ExitClassification::Failure,
+                "carl maintenance: persistent task service unavailable",
+            ),
+        },
+        () = cancellation.as_mut() => {
+            return service_cli_result(ExitClassification::Cancelled, "");
+        }
+    };
+    let first_command = match command {
+        MaintenanceCommand::Status => ServiceCommand::MaintenanceStatus,
+        MaintenanceCommand::Prepare => ServiceCommand::PrepareMaintenance,
+    };
+    let mut status = {
+        let initial = maintenance_request(&mut client, first_command);
+        tokio::pin!(initial);
+        tokio::select! {
+            result = &mut initial => match result {
+                Some(status) => status,
+                None => return service_cli_result(
+                    ExitClassification::Failure,
+                    "carl maintenance: service command failed",
+                ),
+            },
+            () = cancellation.as_mut() => {
+                return service_cli_result(ExitClassification::Cancelled, "");
+            }
+        }
+    };
+    let mut poll = maintenance_poll_interval();
+    while command == MaintenanceCommand::Prepare && status.phase != MaintenancePhase::Ready {
+        tokio::select! {
+            _ = poll.tick() => {}
+            () = cancellation.as_mut() => {
+                return service_cli_result(ExitClassification::Cancelled, "");
+            }
+        }
+        let requested = maintenance_request(&mut client, ServiceCommand::MaintenanceStatus);
+        tokio::pin!(requested);
+        status = tokio::select! {
+            result = &mut requested => match result {
+                Some(status) => status,
+                None => return service_cli_result(
+                    ExitClassification::Failure,
+                    "carl maintenance: status polling failed",
+                ),
+            },
+            () = cancellation.as_mut() => {
+                return service_cli_result(ExitClassification::Cancelled, "");
+            }
+        };
+    }
+    CliRunResult::json_success(&status)
+}
+
+fn maintenance_poll_interval() -> tokio::time::Interval {
+    let period = Duration::from_millis(100);
+    let start = tokio::time::Instant::now() + period;
+    let mut interval = tokio::time::interval_at(start, period);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    interval
+}
+
+async fn maintenance_request(
+    client: &mut TaskServiceClient,
+    command: ServiceCommand,
+) -> Option<ServiceMaintenanceStatus> {
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let result = client
+        .request(ServiceRequest {
+            protocol_version: SERVICE_PROTOCOL_VERSION,
+            idempotency_key: format!("maintenance-{request_id}"),
+            request_id,
+            command,
+        })
+        .await
+        .ok()?;
+    match result {
+        ServiceResult::Maintenance(status) => Some(status),
+        _ => None,
+    }
+}
+
+async fn run_serve<C>(mut cancellation: Pin<&mut C>) -> CliRunResult
+where
+    C: Future<Output = ()> + ?Sized,
+{
+    if env::var_os("OPENAI_API_KEY").is_some() {
+        return service_cli_result(
+            ExitClassification::Failure,
+            "carl serve: API-key authentication is not supported",
+        );
+    }
+    let Ok(configuration) = load_common_configuration() else {
+        return service_cli_result(
+            ExitClassification::Failure,
+            "carl serve: invalid Carl data directory or workspace",
+        );
+    };
+    let Ok((codex_executable, codex_home)) = prepare_provider(AuthService::Openai, &configuration)
+    else {
+        return service_cli_result(
+            ExitClassification::Failure,
+            "carl serve: Codex executable or provider home is invalid",
+        );
+    };
+    let Ok(codex) =
+        CodexAppServer::connect(&codex_executable, codex_home, SidecarLimits::default()).await
+    else {
+        return service_cli_result(
+            ExitClassification::Failure,
+            "carl serve: Codex app-server startup failed",
+        );
+    };
+    let Ok(service) = TaskService::bind(&configuration.data_root, codex).await else {
+        return service_cli_result(
+            ExitClassification::Failure,
+            "carl serve: Carl data directory is unsafe or already owned",
+        );
+    };
+    let stop = CancellationToken::new();
+    let serve = service.serve(stop.clone());
+    tokio::pin!(serve);
+    let (result, cancelled) = tokio::select! {
+        result = &mut serve => (result, false),
+        () = cancellation.as_mut() => {
+            stop.cancel();
+            (serve.await, true)
+        }
+    };
+    match (result, cancelled) {
+        (Ok(()), false) => service_cli_result(ExitClassification::Success, ""),
+        (Ok(()), true) => service_cli_result(ExitClassification::Cancelled, ""),
+        (Err(_), _) => service_cli_result(
+            ExitClassification::Failure,
+            "carl serve: persistent task service failed",
+        ),
+    }
+}
+
+fn service_cli_result(exit: ExitClassification, message: &'static str) -> CliRunResult {
+    CliRunResult {
+        stdout: String::new(),
+        stderr: if message.is_empty() {
+            String::new()
+        } else {
+            format!("{message}\n")
+        },
+        exit,
+    }
+}
+
+fn run_trust(command: TrustCommand) -> CliRunResult {
+    let configuration = match load_common_configuration() {
+        Ok(configuration) => configuration,
+        Err(_) => {
+            return CliRunResult::memory_error(&CarlError::Configuration {
+                detail: "trust commands require a trusted CARL_DATA_DIR".to_owned(),
+            });
+        }
+    };
+    let data_root_lock = match DataRootLock::acquire(&configuration.data_root) {
+        Ok(lock) => lock,
+        Err(_) => {
+            return CliRunResult::memory_error(&CarlError::Storage {
+                detail: "the Carl data directory is unavailable".to_owned(),
+            });
+        }
+    };
+    let store = match Store::open_locked(&data_root_lock) {
+        Ok(store) => store,
+        Err(error) => return CliRunResult::memory_error(&error),
+    };
+    let result = match command {
+        TrustCommand::Buzz { actor, workspace } => {
+            if actor.len() != 64
+                || !actor
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                Err(CarlError::Validation {
+                    detail: "Buzz owner actor ID is invalid".to_owned(),
+                })
+            } else {
+                crate::policy::ActorId::parse(actor)
+                    .map_err(|_| CarlError::Validation {
+                        detail: "Buzz owner actor ID is invalid".to_owned(),
+                    })
+                    .and_then(|actor_id| {
+                        store.trust_frontend_owner(TrustedFrontendOwnerInput {
+                            frontend: Frontend::Buzz,
+                            actor_id,
+                            workspace,
+                            permission_mode: PermissionMode::FullAccess,
+                            trusted_at: Utc::now(),
+                        })
+                    })
+            }
+        }
+    };
+    match result {
+        Ok(record) => CliRunResult::json_success(&TrustOutput {
+            trusted: true,
+            frontend: record.frontend,
+            channel_bound: record.channel_id.is_some(),
+            permission_mode: record.permission_mode,
+        }),
+        Err(error) => CliRunResult::memory_error(&error),
     }
 }
 
@@ -536,89 +1099,74 @@ pub async fn run_acp_stdio(args: AcpArgs) -> ExitClassification {
     let Ok(configuration) = load_common_configuration() else {
         return acp_failure("carl acp: invalid Carl data directory or workspace");
     };
-    let Ok(data_root_lock) = acquire_data_root_lock(&configuration) else {
-        return acp_failure("carl acp: Carl data directory is unsafe or already in use");
-    };
-    let Ok((codex_executable, codex_home)) = prepare_provider(AuthService::Openai, &configuration)
-    else {
-        return acp_failure("carl acp: Codex executable or provider home is invalid");
-    };
     let frontend = if env::var_os("BUZZ_ACP_AGENTS").as_deref() == Some(std::ffi::OsStr::new("1")) {
         Frontend::Buzz
     } else {
         Frontend::Acp
     };
-    let buzz_publisher = if frontend == Frontend::Buzz {
-        let Ok(executable) = prepare_buzz_executable() else {
-            return acp_failure("carl acp: Buzz executable is unavailable or untrusted");
-        };
-        let Ok(workspace) = ExecutionWorkspace::open(&configuration.workspace) else {
-            return acp_failure("carl acp: workspace is invalid");
-        };
-        Some(BuzzPublisherBootstrap::new(executable, workspace))
-    } else {
-        None
-    };
-    let Ok(runtime_store) = crate::storage::RuntimeStore::open(data_root_lock, Utc::now()) else {
-        return acp_failure("carl acp: durable state failed to open");
-    };
-    let Ok(codex) =
-        CodexAppServer::connect(&codex_executable, codex_home, SidecarLimits::default()).await
-    else {
-        return acp_failure("carl acp: Codex app-server startup failed");
-    };
-    let Ok(kernel) = Kernel::start(runtime_store, codex, None).await else {
-        return acp_failure("carl acp: Codex model discovery failed");
-    };
+    try_run_service_acp(&configuration, args, frontend)
+        .await
+        .unwrap_or_else(|| {
+            acp_failure("carl acp: persistent service unavailable; run `carl serve`")
+        })
+}
+
+async fn try_run_service_acp(
+    configuration: &CommonConfiguration,
+    args: AcpArgs,
+    frontend: Frontend,
+) -> Option<ExitClassification> {
+    let budget = args.task_budget();
     let model = match args.model {
         Some(model) => match ModelId::parse(model) {
             Ok(model) => Some(model),
-            Err(_) => return shutdown_failure(kernel, "carl acp: model ID is invalid").await,
+            Err(_) => return Some(acp_failure("carl acp: model ID is invalid")),
         },
         None => None,
     };
     let permission_mode = if args.dangerously_bypass_permissions {
-        PermissionMode::BypassPermissions
+        PermissionMode::FullAccess
     } else {
         args.permission_mode
             .map(Into::into)
-            .unwrap_or(PermissionMode::Default)
+            .unwrap_or(if frontend == Frontend::Acp {
+                PermissionMode::FullAccess
+            } else {
+                PermissionMode::Default
+            })
     };
-    let server = AcpServer::configured(
-        kernel.clone(),
+    let buzz_publisher = if frontend == Frontend::Buzz {
+        let executable = prepare_buzz_executable().ok()?;
+        let workspace = ExecutionWorkspace::open(&configuration.workspace).ok()?;
+        Some(BuzzPublisherBootstrap::new(executable, workspace))
+    } else {
+        None
+    };
+    let Ok(server) = ServiceAcpServer::new(
+        &configuration.data_root,
         AcpServerConfig {
             frontend,
             model,
             effort: args.effort.map(Into::into),
             permission_mode,
+            budget,
             buzz_publisher,
         },
-    );
-    let cancellation = CancellationToken::new();
-    let signal = cancellation.clone();
-    tokio::spawn(async move {
-        registered_ctrl_c().await;
-        signal.cancel();
-    });
+    )
+    .await
+    else {
+        return None;
+    };
     let input = BufReader::new(tokio::io::stdin());
-    match server
-        .serve_with_cancellation(input, tokio::io::stdout(), cancellation)
-        .await
-    {
-        Ok(()) => ExitClassification::Success,
-        Err(error) if error.code() == AcpServerErrorCode::Cancelled => {
-            ExitClassification::Cancelled
-        }
-        Err(_) => acp_failure("carl acp: ACP transport failed"),
-    }
-}
-
-async fn shutdown_failure(
-    kernel: crate::acp::KernelHandle,
-    message: &'static str,
-) -> ExitClassification {
-    let _ = kernel.shutdown().await;
-    acp_failure(message)
+    let serving = server.serve(input, tokio::io::stdout());
+    tokio::pin!(serving);
+    Some(tokio::select! {
+        result = &mut serving => match result {
+            Ok(()) => ExitClassification::Success,
+            Err(_) => acp_failure("carl acp: ACP transport failed"),
+        },
+        () = registered_ctrl_c() => ExitClassification::Cancelled,
+    })
 }
 
 fn acp_failure(message: &'static str) -> ExitClassification {
@@ -1452,6 +2000,46 @@ mod tests {
         fn drop(&mut self) {
             self.dropped.store(true, Ordering::Release);
         }
+    }
+
+    #[test]
+    fn maintenance_output_is_one_bounded_closed_json_object() {
+        let status = ServiceMaintenanceStatus {
+            schema_version: 1,
+            phase: MaintenancePhase::Ready,
+            task_id: None,
+            checkpoint_id: None,
+        };
+        let result = CliRunResult::json_success(&status);
+        assert_eq!(
+            result.stdout(),
+            "{\"schema_version\":1,\"phase\":\"ready\",\"task_id\":null,\"checkpoint_id\":null}\n"
+        );
+        assert!(result.stdout().len() < 1024);
+        assert!(result.stderr().is_empty());
+        for ambient in ["OPENAI_API_KEY", "CARL_DATA_DIR", "/provider/home"] {
+            assert!(!result.stdout().contains(ambient));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn maintenance_polling_is_capped_while_draining() {
+        let mut poll = maintenance_poll_interval();
+        tokio::select! {
+            biased;
+            _ = poll.tick() => panic!("maintenance polled before its bounded interval"),
+            () = tokio::task::yield_now() => {}
+        }
+        tokio::time::advance(Duration::from_millis(99)).await;
+        tokio::select! {
+            biased;
+            _ = poll.tick() => panic!("maintenance polled before 100 ms elapsed"),
+            () = tokio::task::yield_now() => {}
+        }
+        tokio::time::advance(Duration::from_millis(1)).await;
+        poll.tick().await;
+        tokio::time::advance(Duration::from_millis(100)).await;
+        poll.tick().await;
     }
 
     struct CancellationBroker {

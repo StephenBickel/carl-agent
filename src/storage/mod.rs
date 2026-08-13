@@ -4,11 +4,14 @@ mod schema;
 pub(crate) use repository::VerificationResultRehydrationAuthority;
 pub use repository::{
     ApprovalRecord, ApprovalStatus, BoundApprovalBinding, BoundApprovalRecord, ChannelId,
-    ClientName, ConsumedApproval, DeliveryKind, DeliveryRecord, DeliveryStatus, ExternalSessionId,
-    FrontendSessionRecord, NewDelivery, NewFrontendSession, NewRemoteCode, NewSubscriptionRun,
-    ProviderRequestId, ProviderThreadId, RemoteCodeClaim, RemoteCodeKind, RemoteCodeRecord,
-    RuntimeStore, SessionDelegateSettingsRecord, SessionRecord, Store,
+    CheckpointRecord, ClientName, ConsumedApproval, DeliveryKind, DeliveryRecord, DeliveryStatus,
+    ExternalSessionId, FrontendSessionRecord, NewCheckpoint, NewDelivery, NewFrontendSession,
+    NewRemoteCode, NewSubscriptionRun, NewTask, ProviderRequestId, ProviderThreadId,
+    RemoteCodeClaim, RemoteCodeKind, RemoteCodeRecord, RuntimeStore, ServiceCommandReceiptClaim,
+    ServiceCommandReceiptInput, SessionDelegateSettingsRecord, SessionRecord, Store,
     SubscriptionRunBaselineEntryRecord, SubscriptionRunBaselineRecord,
     SubscriptionRunInspectionOutcome, SubscriptionRunInspectionRecord,
-    SubscriptionRunProposalRecord, SubscriptionRunRecord, VerificationCompletionRecord,
+    SubscriptionRunProposalRecord, SubscriptionRunRecord, TaskConfigurationRecord,
+    TaskControlMutationClaim, TaskControlMutationInput, TaskRecord, TrustedFrontendOwnerInput,
+    TrustedFrontendOwnerRecord, VerificationCompletionRecord,
 };

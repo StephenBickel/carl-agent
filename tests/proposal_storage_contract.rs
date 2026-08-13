@@ -753,12 +753,10 @@ fn proposal_load_rejects_tampered_candidate_digest_and_orphaned_rows() -> TestRe
     );
     drop(connection);
 
-    let reopened = RuntimeStore::open(DataRootLock::acquire(&layout.root)?, instant(9))?;
     assert!(
-        reopened.get_subscription_run_proposal(run_id).is_err(),
-        "a proposal whose registered payload object was deleted must be reported as corruption"
+        RuntimeStore::open(DataRootLock::acquire(&layout.root)?, instant(9)).is_err(),
+        "a proposal whose registered payload object was deleted must be rejected at startup"
     );
-    drop(reopened);
 
     let connection = Connection::open(&layout.database)?;
     connection.pragma_update(None, "foreign_keys", "OFF")?;
@@ -776,10 +774,9 @@ fn proposal_load_rejects_tampered_candidate_digest_and_orphaned_rows() -> TestRe
     );
     drop(connection);
 
-    let reopened = RuntimeStore::open(DataRootLock::acquire(&layout.root)?, instant(10))?;
     assert!(
-        reopened.get_subscription_run_inspection(run_id).is_err(),
-        "an orphaned proposal row must be reported as corruption"
+        RuntimeStore::open(DataRootLock::acquire(&layout.root)?, instant(10)).is_err(),
+        "an orphaned proposal row must be rejected at startup"
     );
     Ok(())
 }

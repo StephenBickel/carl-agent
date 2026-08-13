@@ -1,16 +1,86 @@
 use std::fmt;
 use std::path::PathBuf;
 
+use serde::Serialize;
 use thiserror::Error;
 
 use super::{BuzzContext, PermissionMode, SessionConfiguration};
 use crate::delegates::{ModelId, ReasoningEffort};
 use crate::events::SessionId;
 use crate::policy::{ActorId, Frontend};
+use crate::runtime::task::TaskBudget;
+use crate::runtime::task::{
+    CheckpointId, CompletionClause, EpochId, RecoveryStrategy, TaskId, TaskSnapshot, TaskStatus,
+};
 use crate::storage::{ChannelId, ClientName, ExternalSessionId};
 
 const MAX_PROMPT_BLOCKS: usize = 12;
 const MAX_PROMPT_BYTES: usize = 256 * 1_024;
+const MAX_TASK_CONTEXT_TEXT_BYTES: usize = 4 * 1_024;
+const MAX_TASK_CONTEXT_CONSTRAINTS: usize = 16;
+
+pub(crate) fn exact_task_metrics_command(blocks: &[String]) -> bool {
+    matches!(blocks, [block] if block == "/metrics")
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskView {
+    pub task_id: TaskId,
+    pub session_id: SessionId,
+    pub status: TaskStatus,
+    pub revision: u64,
+    pub active_epoch: Option<EpochId>,
+    pub latest_checkpoint: Option<CheckpointId>,
+}
+
+impl From<&TaskSnapshot> for TaskView {
+    fn from(snapshot: &TaskSnapshot) -> Self {
+        Self {
+            task_id: snapshot.task_id,
+            session_id: snapshot.session_id,
+            status: snapshot.status,
+            revision: snapshot.revision,
+            active_epoch: snapshot.active_epoch,
+            latest_checkpoint: snapshot.latest_checkpoint,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskContextView {
+    pub task: TaskView,
+    pub goal: String,
+    pub constraints: Vec<String>,
+}
+
+impl From<&TaskSnapshot> for TaskContextView {
+    fn from(snapshot: &TaskSnapshot) -> Self {
+        Self {
+            task: TaskView::from(snapshot),
+            goal: bounded_task_context_text(&snapshot.contract.goal),
+            constraints: snapshot
+                .contract
+                .constraints
+                .iter()
+                .take(MAX_TASK_CONTEXT_CONSTRAINTS)
+                .map(|constraint| bounded_task_context_text(constraint))
+                .collect(),
+        }
+    }
+}
+
+fn bounded_task_context_text(value: &str) -> String {
+    if value.len() <= MAX_TASK_CONTEXT_TEXT_BYTES {
+        return value.to_owned();
+    }
+    let mut end = MAX_TASK_CONTEXT_TEXT_BYTES;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_owned()
+}
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum KernelErrorCode {
@@ -67,6 +137,7 @@ pub struct NewSessionRequest {
     pub model: Option<ModelId>,
     pub effort: Option<ReasoningEffort>,
     pub mode: PermissionMode,
+    pub budget: TaskBudget,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -157,6 +228,25 @@ impl Prompt {
         (command.starts_with('/') && command.len() <= 1_024 && !command.contains(['\n', '\r']))
             .then_some(command)
     }
+
+    #[must_use]
+    pub fn task_slash_command(&self) -> Option<&str> {
+        if exact_task_metrics_command(&self.blocks) {
+            return Some("/metrics");
+        }
+        self.leading_slash_command().filter(|command| {
+            matches!(
+                *command,
+                "/status"
+                    | "/resume"
+                    | "/cancel"
+                    | "/context"
+                    | "/permissions fullAccess"
+                    | "/permissions approval"
+                    | "/permissions readOnly"
+            )
+        })
+    }
 }
 
 impl fmt::Debug for Prompt {
@@ -205,11 +295,51 @@ pub enum ToolStatus {
 #[derive(Clone, Debug, PartialEq)]
 pub enum KernelUpdate {
     AgentMessageChunk(String),
-    ToolStarted { title: String, kind: ToolKind },
-    ToolCompleted { title: String, status: ToolStatus },
+    ToolStarted {
+        title: String,
+        kind: ToolKind,
+    },
+    ToolCompleted {
+        title: String,
+        status: ToolStatus,
+    },
     DiffUpdated(String),
     AvailableCommandsChanged,
-    SessionInfoChanged { configuration: SessionConfiguration },
+    SessionInfoChanged {
+        configuration: SessionConfiguration,
+    },
+    TaskStatus {
+        task_id: TaskId,
+        status: TaskStatus,
+    },
+    EpochObjective {
+        task_id: TaskId,
+        epoch_id: EpochId,
+        objective: String,
+    },
+    CheckpointCommitted {
+        task_id: TaskId,
+        checkpoint_id: CheckpointId,
+        digest: String,
+    },
+    ContextUsage {
+        task_id: TaskId,
+        total_tokens: u64,
+        context_window: Option<u64>,
+    },
+    Compaction {
+        task_id: TaskId,
+        generation: u32,
+        replaced_provider: bool,
+    },
+    RecoveryStrategy {
+        task_id: TaskId,
+        strategy: RecoveryStrategy,
+    },
+    CompletionClauses {
+        task_id: TaskId,
+        clauses: Vec<CompletionClause>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
