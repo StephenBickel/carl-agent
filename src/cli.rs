@@ -4,6 +4,7 @@ use std::fs;
 use std::future::{Future, pending};
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{TimeDelta, Utc};
@@ -35,6 +36,12 @@ use crate::memory::{
     MemoryKind, MemoryPartition, MemoryQuery, MemoryScope, MemorySettings, MemoryWrite,
 };
 use crate::policy::Frontend;
+use crate::providers::catalog::{ProviderCatalog, ProviderKind, ProviderModel};
+use crate::providers::http::{ProviderEndpoint, ProviderHttpClient, SecretCredential};
+use crate::providers::openai::OpenAiProvider;
+use crate::providers::openrouter::OpenRouterProvider;
+use crate::runtime::agent_port::AgentPort;
+use crate::runtime::native_port::NativeAgentPort;
 use crate::runtime::task::TaskBudget;
 use crate::service::client::TaskServiceClient;
 use crate::service::protocol::{
@@ -980,34 +987,19 @@ async fn run_serve<C>(mut cancellation: Pin<&mut C>) -> CliRunResult
 where
     C: Future<Output = ()> + ?Sized,
 {
-    if env::var_os("OPENAI_API_KEY").is_some() {
-        return service_cli_result(
-            ExitClassification::Failure,
-            "carl serve: API-key authentication is not supported",
-        );
-    }
     let Ok(configuration) = load_common_configuration() else {
         return service_cli_result(
             ExitClassification::Failure,
             "carl serve: invalid Carl data directory or workspace",
         );
     };
-    let Ok((codex_executable, codex_home)) = prepare_provider(AuthService::Openai, &configuration)
-    else {
+    let Ok(port) = configured_service_port(&configuration).await else {
         return service_cli_result(
             ExitClassification::Failure,
-            "carl serve: Codex executable or provider home is invalid",
+            "carl serve: configured provider startup failed",
         );
     };
-    let Ok(codex) =
-        CodexAppServer::connect(&codex_executable, codex_home, SidecarLimits::default()).await
-    else {
-        return service_cli_result(
-            ExitClassification::Failure,
-            "carl serve: Codex app-server startup failed",
-        );
-    };
-    let Ok(service) = TaskService::bind(&configuration.data_root, codex).await else {
+    let Ok(service) = TaskService::bind(&configuration.data_root, port).await else {
         return service_cli_result(
             ExitClassification::Failure,
             "carl serve: Carl data directory is unsafe or already owned",
@@ -1031,6 +1023,75 @@ where
             "carl serve: persistent task service failed",
         ),
     }
+}
+
+async fn configured_service_port(
+    configuration: &CommonConfiguration,
+) -> Result<Box<dyn AgentPort>, ()> {
+    match env::var("CARL_PROVIDER").as_deref() {
+        Ok("openai") => {
+            let credential = environment_credential("OPENAI_API_KEY")?;
+            let catalog = native_openai_catalog()?;
+            let provider = OpenAiProvider::new(
+                ProviderHttpClient::new(ProviderEndpoint::openai()).map_err(|_| ())?,
+                credential,
+                catalog.clone(),
+            )
+            .map_err(|_| ())?;
+            Ok(Box::new(NativeAgentPort::new(Arc::new(provider), catalog)))
+        }
+        Ok("openrouter") => {
+            let credential = environment_credential("OPENROUTER_API_KEY")?;
+            let provider = OpenRouterProvider::discover(
+                ProviderHttpClient::new(ProviderEndpoint::openrouter()).map_err(|_| ())?,
+                credential,
+                CancellationToken::new(),
+            )
+            .await
+            .map_err(|_| ())?;
+            let catalog = provider.catalog().clone();
+            Ok(Box::new(NativeAgentPort::new(Arc::new(provider), catalog)))
+        }
+        Ok("subscription") | Err(env::VarError::NotPresent) => {
+            let (executable, home) =
+                prepare_provider(AuthService::Openai, configuration).map_err(|_| ())?;
+            let codex = CodexAppServer::connect(&executable, home, SidecarLimits::default())
+                .await
+                .map_err(|_| ())?;
+            Ok(Box::new(codex))
+        }
+        Ok(_) | Err(env::VarError::NotUnicode(_)) => Err(()),
+    }
+}
+
+fn environment_credential(name: &'static str) -> Result<SecretCredential, ()> {
+    let value = env::var(name).map_err(|_| ())?;
+    SecretCredential::new(value.into_bytes()).map_err(|_| ())
+}
+
+fn native_openai_catalog() -> Result<ProviderCatalog, ()> {
+    let model = ProviderModel::new(
+        ModelId::parse("gpt-5.2-codex").map_err(|_| ())?,
+        "GPT 5.2 Codex".to_owned(),
+        400_000,
+        vec![
+            ReasoningEffort::Low,
+            ReasoningEffort::Medium,
+            ReasoningEffort::High,
+            ReasoningEffort::XHigh,
+        ],
+        ReasoningEffort::High,
+        true,
+        true,
+        true,
+    )
+    .map_err(|_| ())?;
+    ProviderCatalog::new(
+        ProviderKind::OpenAiApi,
+        vec![model.clone()],
+        model.id().clone(),
+    )
+    .map_err(|_| ())
 }
 
 fn service_cli_result(exit: ExitClassification, message: &'static str) -> CliRunResult {
