@@ -1,6 +1,6 @@
 # Carl Native TUI and Provider Runtime Design
 
-Status: awaiting final user review
+Status: approved for implementation
 Date: 2026-08-13
 
 ## Product thesis
@@ -368,4 +368,3 @@ The feature is complete when:
 - OpenAI Codex app-server protocol: explicit session/control and approval semantics — <https://github.com/openai/codex/blob/main/codex-rs/app-server/README.md>
 - OpenAI Codex configuration schema: explicit provider, reasoning, credential-store, compaction, sandbox, and tool configuration — <https://github.com/openai/codex/blob/main/codex-rs/core/config.schema.json>
 - OpenRouter quickstart and model/tool capability documentation — <https://openrouter.ai/docs/quickstart>, <https://openrouter.ai/docs/guides/overview/models>, <https://openrouter.ai/docs/guides/features/tool-calling>
-
