@@ -186,6 +186,45 @@ impl TuiState {
         &self.input
     }
 
+    pub fn set_input(&mut self, input: String) {
+        self.input = input;
+    }
+
+    #[must_use]
+    pub fn external_session_id(&self) -> Option<&str> {
+        self.external_session_id.as_deref()
+    }
+
+    #[must_use]
+    pub fn model(&self) -> Option<&ModelId> {
+        self.model.as_ref()
+    }
+
+    #[must_use]
+    pub const fn effort(&self) -> Option<ReasoningEffort> {
+        self.effort
+    }
+
+    #[must_use]
+    pub const fn permission_mode(&self) -> PermissionMode {
+        self.permission_mode
+    }
+
+    #[must_use]
+    pub const fn connected(&self) -> bool {
+        self.connected
+    }
+
+    #[must_use]
+    pub fn overlay(&self) -> Option<&Overlay> {
+        self.overlay.as_ref()
+    }
+
+    #[must_use]
+    pub const fn exit_requested(&self) -> bool {
+        self.exit_requested
+    }
+
     fn apply_snapshot(&mut self, snapshot: &TaskSnapshot) {
         self.task_id = Some(snapshot.task_id);
         self.status = Some(snapshot.status);
