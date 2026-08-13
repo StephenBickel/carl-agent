@@ -49,7 +49,7 @@ use crate::service::protocol::{
     MaintenancePhase, SERVICE_PROTOCOL_VERSION, ServiceCommand, ServiceMaintenanceStatus,
     ServiceRequest, ServiceResult,
 };
-use crate::service::server::TaskService;
+use crate::service::server::{TaskService, TaskServiceErrorCode};
 use crate::sidecar::{
     DataRootLock, DataRootLockErrorCode, ExecutableTrustDecision, ExecutionWorkspace,
     ProviderEnvironmentProfile, ProviderHome, ResolvedExecutable, SidecarError, SidecarErrorCode,
@@ -1044,11 +1044,25 @@ where
             "carl serve: configured provider startup failed",
         );
     };
-    let Ok(service) = TaskService::bind(&configuration.data_root, port).await else {
-        return service_cli_result(
-            ExitClassification::Failure,
-            "carl serve: Carl data directory is unsafe or already owned",
-        );
+    let service = match TaskService::bind(&configuration.data_root, port).await {
+        Ok(service) => service,
+        Err(error) => {
+            let message = match error.code() {
+                TaskServiceErrorCode::Endpoint => {
+                    "carl serve: Carl data directory is unsafe or already owned"
+                }
+                TaskServiceErrorCode::Storage => "carl serve: durable task state failed validation",
+                TaskServiceErrorCode::Engine => {
+                    "carl serve: provider model catalog failed validation"
+                }
+                TaskServiceErrorCode::Transport
+                | TaskServiceErrorCode::InvalidRequest
+                | TaskServiceErrorCode::Busy
+                | TaskServiceErrorCode::Stopped
+                | TaskServiceErrorCode::IdempotencyConflict => "carl serve: service startup failed",
+            };
+            return service_cli_result(ExitClassification::Failure, message);
+        }
     };
     let stop = CancellationToken::new();
     let serve = service.serve(stop.clone());
