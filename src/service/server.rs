@@ -1,7 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -36,7 +35,11 @@ use super::protocol::{
 };
 
 #[cfg(unix)]
+use std::fs;
+#[cfg(unix)]
 use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _};
+#[cfg(unix)]
+use std::path::PathBuf;
 #[cfg(unix)]
 use tokio::net::UnixListener;
 

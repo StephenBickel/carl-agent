@@ -304,11 +304,12 @@ fn verify_windows_pipe_server(
     use windows_sys::Win32::Foundation::{CloseHandle, ERROR_SUCCESS, LocalFree};
     use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_KERNEL_OBJECT};
     use windows_sys::Win32::Security::{
-        ACCESS_ALLOWED_ACE, ACCESS_ALLOWED_ACE_TYPE, ACE_HEADER, ACL, DACL_SECURITY_INFORMATION,
-        EqualSid, GetAce, GetSecurityDescriptorControl, OWNER_SECURITY_INFORMATION,
-        PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED,
+        ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, DACL_SECURITY_INFORMATION, EqualSid, GetAce,
+        GetSecurityDescriptorControl, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+        SE_DACL_PROTECTED,
     };
     use windows_sys::Win32::System::Pipes::GetNamedPipeServerProcessId;
+    use windows_sys::Win32::System::SystemServices::ACCESS_ALLOWED_ACE_TYPE;
     use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
 
     let current = current_process_user_sid()?;
@@ -359,7 +360,7 @@ fn verify_windows_pipe_server(
     // SAFETY: descriptor is live and both outputs are writable.
     let protected = unsafe {
         GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) != 0
-            && u32::from(control) & SE_DACL_PROTECTED != 0
+            && control & SE_DACL_PROTECTED != 0
     };
     // SAFETY: owner and current SID remain live.
     let owner_matches = unsafe { EqualSid(owner, current.sid()) != 0 };
@@ -376,7 +377,7 @@ fn verify_windows_pipe_server(
             // SAFETY: GetAce returned a live ACE_HEADER and the declared allow
             // ACE layout contains its mask and SID.
             let header = unsafe { &*(ace.cast::<ACE_HEADER>()) };
-            let allow = header.AceType == ACCESS_ALLOWED_ACE_TYPE;
+            let allow = u32::from(header.AceType) == ACCESS_ALLOWED_ACE_TYPE;
             let (mask, current_user) = if allow {
                 // SAFETY: the ACE type is ACCESS_ALLOWED_ACE and SidStart begins its SID.
                 let allowed = unsafe { &*(ace.cast::<ACCESS_ALLOWED_ACE>()) };
