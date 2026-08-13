@@ -55,6 +55,7 @@ fn request(cancellation: CancellationToken) -> ModelRequest {
             model: "fixture-model".into(),
             temperature: Some(0.2),
             max_output_tokens: Some(512),
+            reasoning_effort: None,
         },
         cancellation,
     }
@@ -90,6 +91,7 @@ fn normalized_request_has_an_exact_provider_neutral_wire_contract() -> Result<()
                 "model": "fixture-model",
                 "temperature": 0.2,
                 "max_output_tokens": 512,
+                "reasoning_effort": null,
             },
         })
     );
@@ -110,6 +112,7 @@ fn normalized_message_content_carries_tool_calls_and_results() -> Result<(), Box
             role: Role::Assistant,
             content: vec![MessageContent::ToolCall {
                 tool_call_id: tool_call_id(),
+                provider_call_id: None,
                 name: "fs.read".into(),
                 arguments: json!({"path": "README.md"}),
             }],
@@ -179,6 +182,7 @@ fn capabilities_and_events_have_exact_serializable_contracts() -> Result<(), Box
         (
             ProviderEvent::ToolCall {
                 tool_call_id: tool_call_id(),
+                provider_call_id: None,
                 name: "fs.read".into(),
                 arguments: json!({"path": "README.md"}),
             },
@@ -258,6 +262,7 @@ async fn scripted_provider_replays_complete_responses_and_records_complete_reque
         vec![
             ProviderEvent::ToolCall {
                 tool_call_id: tool_call_id(),
+                provider_call_id: None,
                 name: "fs.read".into(),
                 arguments: json!({"path": "README.md"}),
             },

@@ -1,5 +1,6 @@
 pub mod catalog;
 pub mod http;
+pub mod openai;
 pub mod scripted;
 
 use std::future::Future;
@@ -11,6 +12,7 @@ use serde_json::Value;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
+use crate::delegates::ReasoningEffort;
 use crate::error::ErrorCode;
 use crate::events::ToolCallId;
 
@@ -69,6 +71,8 @@ pub enum MessageContent {
     },
     ToolCall {
         tool_call_id: ToolCallId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_call_id: Option<String>,
         name: String,
         arguments: Value,
     },
@@ -92,6 +96,7 @@ pub struct ModelSettings {
     pub model: String,
     pub temperature: Option<f64>,
     pub max_output_tokens: Option<u32>,
+    pub reasoning_effort: Option<ReasoningEffort>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -102,6 +107,8 @@ pub enum ProviderEvent {
     },
     ToolCall {
         tool_call_id: ToolCallId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_call_id: Option<String>,
         name: String,
         arguments: Value,
     },
