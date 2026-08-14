@@ -13,7 +13,15 @@ allow = [
     # cap-std's Windows support reaches winx under Apache-2.0 with the
     # standard LLVM exception; both terms are permissive and compatible.
     "Apache-2.0 WITH LLVM-exception",
+    # subtle's constant-time cryptographic primitives use this permissive,
+    # attribution-preserving license.
+    "BSD-3-Clause",
+    # ring's reviewed untrusted implementation uses the permissive ISC license.
+    "ISC",
     "MIT",
+    # webpki-roots distributes Mozilla's public trust-anchor data under this
+    # permissive, attribution-preserving data license.
+    "CDLA-Permissive-2.0",
     "Unicode-3.0",
     "Zlib",
 ]
