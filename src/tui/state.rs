@@ -67,6 +67,7 @@ pub enum TuiEvent {
     CompactionRequested,
     Notice(String),
     Disconnected,
+    ConnectionRestored,
     Reconnected {
         live_generation: String,
         cursor: Option<u64>,
@@ -214,6 +215,7 @@ impl TuiState {
             TuiEvent::CompactionRequested => self.compaction_requested = true,
             TuiEvent::Notice(notice) => self.transcript.push(TranscriptItem::Notice(notice)),
             TuiEvent::Disconnected => self.connected = false,
+            TuiEvent::ConnectionRestored => self.connected = true,
             TuiEvent::Reconnected {
                 live_generation,
                 cursor,

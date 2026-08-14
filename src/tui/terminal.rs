@@ -106,6 +106,11 @@ impl InputEditor {
         }
     }
 
+    pub fn restore_submission(&mut self, text: String) {
+        self.cursor = text.len();
+        self.text = text;
+    }
+
     fn insert(&mut self, character: char) {
         self.text.insert(self.cursor, character);
         self.cursor += character.len_utf8();

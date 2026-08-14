@@ -13,8 +13,11 @@ use carl::service::protocol::{
 };
 use carl::tui::command::SubmittedInput;
 use carl::tui::controller::{TuiBackend, TuiController, TuiError};
-use carl::tui::runtime::{RuntimeIntent, RuntimeOutput, run_controller_worker};
-use carl::tui::state::TuiEvent;
+use carl::tui::runtime::{
+    FrameScheduler, LocalAction, LocalTui, RuntimeIntent, RuntimeOutput, run_controller_worker,
+};
+use carl::tui::state::{TuiEvent, TuiState};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tokio::sync::{Mutex, Notify, mpsc};
 
 #[tokio::test(start_paused = true)]
@@ -38,11 +41,14 @@ async fn delayed_poll_is_single_flight_and_queued_command_precedes_the_next_poll
         )))
         .await
         .unwrap();
+    let bound_output = output_rx.recv().await.unwrap();
     assert!(matches!(
-        output_rx.recv().await,
-        Some(RuntimeOutput::Events(events))
+        &bound_output,
+        RuntimeOutput::Events(events)
             if events.iter().any(|event| matches!(event, TuiEvent::TaskBound { task_id: bound, .. } if *bound == task_id))
     ));
+    let mut local = LocalTui::new();
+    local.apply_output(bound_output).unwrap();
 
     tokio::time::advance(Duration::from_millis(49)).await;
     tokio::task::yield_now().await;
@@ -50,6 +56,17 @@ async fn delayed_poll_is_single_flight_and_queued_command_precedes_the_next_poll
     tokio::time::advance(Duration::from_millis(1)).await;
     wait_for_count(&shared.live_started, 1).await;
     assert_eq!(shared.maximum_inflight.load(Ordering::SeqCst), 1);
+    for character in ['a', 'b', 'c'] {
+        assert_eq!(
+            local
+                .handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE,))
+                .unwrap(),
+            LocalAction::None
+        );
+    }
+    local.tick(Duration::from_millis(80)).unwrap();
+    assert_eq!(local.state().input(), "abc");
+    assert_eq!(local.state().activity().symbol, "⠙");
 
     tokio::time::advance(Duration::from_secs(1)).await;
     tokio::task::yield_now().await;
@@ -127,6 +144,38 @@ async fn bounded_output_backpressure_preserves_the_complete_event_batch() {
 
     intent_tx.send(RuntimeIntent::Shutdown).await.unwrap();
     worker.await.unwrap();
+}
+
+#[test]
+fn render_gate_coalesces_streamed_deltas_and_draws_only_when_dirty() {
+    let mut state = TuiState::default();
+    let mut frames = FrameScheduler::new();
+    assert!(frames.take_draw(Duration::ZERO));
+    assert!(!frames.take_draw(Duration::from_millis(1)));
+
+    for delta in ["s", "t", "r", "e", "a", "m", "i", "n", "g", "!"] {
+        state
+            .apply(TuiEvent::TaskUpdate(TaskUpdate::AssistantDelta(
+                delta.to_owned(),
+            )))
+            .unwrap();
+        frames.mark_dirty();
+    }
+    assert!(!frames.take_draw(Duration::from_millis(32)));
+    assert!(frames.take_draw(Duration::from_millis(33)));
+    assert_eq!(state.last_assistant_text(), Some("streaming!"));
+    assert!(!frames.take_draw(Duration::from_millis(66)));
+}
+
+#[test]
+fn first_successful_worker_output_restores_connection_state() {
+    let mut local = LocalTui::new();
+    local.apply_output(RuntimeOutput::Disconnected).unwrap();
+    assert!(!local.state().connected());
+    local
+        .apply_output(RuntimeOutput::Events(Vec::new()))
+        .unwrap();
+    assert!(local.state().connected());
 }
 
 struct FakeBackend {

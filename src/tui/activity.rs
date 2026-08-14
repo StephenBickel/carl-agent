@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-const PULSE_INTERVAL_MILLIS: u128 = 80;
+pub const ACTIVITY_INTERVAL: Duration = Duration::from_millis(80);
 const PULSE_FRAMES: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
 const ELAPSED_THRESHOLD_SECONDS: u64 = 3;
 const STALE_THRESHOLD_SECONDS: u64 = 10;
@@ -73,7 +73,7 @@ pub(crate) fn activity_view(
     let animated = phase.is_animated();
     let symbol = if animated {
         let frame = usize::try_from(
-            phase_elapsed.as_millis() / PULSE_INTERVAL_MILLIS
+            phase_elapsed.as_millis() / ACTIVITY_INTERVAL.as_millis()
                 % u128::try_from(PULSE_FRAMES.len()).unwrap_or(1),
         )
         .unwrap_or(0);
