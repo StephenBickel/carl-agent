@@ -538,7 +538,7 @@ async function selfTest() {
     const livePrompt = buildTaskInput(admitted.cargo);
     expect(
       livePrompt.toString("utf8").includes(
-        `PATH=${dirname(fakeCargo)}:/usr/bin:/bin:/usr/sbin:/sbin`,
+        `PATH=${dirname(admitted.cargo)}:/usr/bin:/bin:/usr/sbin:/sbin`,
       ),
       "task input must make the admitted Rust toolchain discoverable without ambient PATH",
     );
