@@ -326,19 +326,35 @@ async function selfTest() {
     const carl = join(root, "carl");
     const direct = join(root, "direct");
     const sourceDigest = await createFixture(source);
-    expect((await copyFixture(source, carl, repository)) === sourceDigest);
-    expect((await copyFixture(source, direct, repository)) === sourceDigest);
+    const supportsOwnerPrivateModes = process.platform !== "win32" &&
+      typeof process.getuid === "function";
+    if (supportsOwnerPrivateModes) {
+      expect((await copyFixture(source, carl, repository)) === sourceDigest);
+      expect((await copyFixture(source, direct, repository)) === sourceDigest);
+    } else {
+      // Windows exposes synthetic POSIX mode bits through Node, so the live
+      // runner deliberately refuses the owner-private production boundary.
+      // The offline test must prove that refusal while still checking that
+      // independently materialized fixtures have identical bytes.
+      await expectCode(() => validateFixture(source, repository), "invalid_fixture");
+      expect((await createFixture(carl)) === sourceDigest);
+      expect((await createFixture(direct)) === sourceDigest);
+    }
     expect((await fixtureManifest(carl)) === (await fixtureManifest(direct)));
-    const linked = join(root, "linked");
-    await symlink(source, linked);
-    await expectCode(() => validateFixture(linked, repository), "invalid_fixture");
+    if (supportsOwnerPrivateModes) {
+      const linked = join(root, "linked");
+      await symlink(source, linked);
+      await expectCode(() => validateFixture(linked, repository), "invalid_fixture");
+    }
     await expectCode(() => Promise.resolve(assertOutsideRepository(join(repository, "fixture"), repository)), "active_repository_refused");
     const unexpected = join(root, "unexpected");
-    await copyFixture(source, unexpected, repository);
+    if (supportsOwnerPrivateModes) await copyFixture(source, unexpected, repository);
+    else await createFixture(unexpected);
     await writeFile(join(unexpected, "extra.txt"), "unexpected\n", { mode: 0o600 });
     await expectCode(() => validateFixture(unexpected, repository), "invalid_fixture");
     const publicFixture = join(root, "public-fixture");
-    await copyFixture(source, publicFixture, repository);
+    if (supportsOwnerPrivateModes) await copyFixture(source, publicFixture, repository);
+    else await createFixture(publicFixture);
     await chmod(publicFixture, 0o755);
     await expectCode(() => validateFixture(publicFixture, repository), "invalid_fixture");
 
