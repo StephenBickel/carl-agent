@@ -1919,7 +1919,7 @@ async fn hard_tool_budget_interrupts_the_current_stream_before_a_second_effect_d
     Ok(())
 }
 
-#[tokio::test(flavor = "current_thread")]
+#[tokio::test(start_paused = true)]
 async fn hard_wall_budget_interrupts_a_pending_effect_inside_the_provider_stream() -> TestResult {
     let fixture = EngineFixture::new()?;
     let store = Store::open(&fixture.database)?;
@@ -1928,9 +1928,9 @@ async fn hard_wall_budget_interrupts_a_pending_effect_inside_the_provider_stream
     let shared = port.shared();
     let mut engine = TaskEngine::new(store, port);
     let mut input = start_task(session.id, &fixture.workspace)?;
-    input.budget.max_wall_time_seconds = Some(1);
+    input.budget.max_wall_time_seconds = Some(60);
 
-    let error = tokio::time::timeout(std::time::Duration::from_secs(2), engine.start(input))
+    let error = tokio::time::timeout(std::time::Duration::from_secs(65), engine.start(input))
         .await
         .expect("hard wall budget must wake a pending provider read")
         .unwrap_err();
@@ -1949,7 +1949,7 @@ async fn hard_wall_budget_interrupts_a_pending_effect_inside_the_provider_stream
     Ok(())
 }
 
-#[tokio::test(flavor = "current_thread")]
+#[tokio::test(start_paused = true)]
 async fn hard_wall_budget_covers_pending_allow_resolution_and_closes_the_epoch() -> TestResult {
     let fixture = EngineFixture::new()?;
     let store = Store::open(&fixture.database)?;
@@ -1958,9 +1958,9 @@ async fn hard_wall_budget_covers_pending_allow_resolution_and_closes_the_epoch()
     let shared = port.shared();
     let mut engine = TaskEngine::new(store, port);
     let mut input = start_task(session.id, &fixture.workspace)?;
-    input.budget.max_wall_time_seconds = Some(1);
+    input.budget.max_wall_time_seconds = Some(60);
 
-    let error = tokio::time::timeout(std::time::Duration::from_secs(2), engine.start(input))
+    let error = tokio::time::timeout(std::time::Duration::from_secs(65), engine.start(input))
         .await
         .expect("hard wall budget must wake a pending allow resolution")
         .unwrap_err();
@@ -1982,7 +1982,7 @@ async fn hard_wall_budget_covers_pending_allow_resolution_and_closes_the_epoch()
     Ok(())
 }
 
-#[tokio::test(flavor = "current_thread")]
+#[tokio::test(start_paused = true)]
 async fn hard_wall_budget_interrupts_a_pending_contract_planning_stream() -> TestResult {
     let fixture = EngineFixture::new()?;
     let store = Store::open(&fixture.database)?;
@@ -1991,9 +1991,9 @@ async fn hard_wall_budget_interrupts_a_pending_contract_planning_stream() -> Tes
     let shared = port.shared();
     let mut engine = TaskEngine::new(store, port);
     let mut input = start_task(session.id, &fixture.workspace)?;
-    input.budget.max_wall_time_seconds = Some(1);
+    input.budget.max_wall_time_seconds = Some(60);
 
-    let error = tokio::time::timeout(std::time::Duration::from_secs(2), engine.start(input))
+    let error = tokio::time::timeout(std::time::Duration::from_secs(65), engine.start(input))
         .await
         .expect("hard wall budget must wake a pending planning read")
         .unwrap_err();
