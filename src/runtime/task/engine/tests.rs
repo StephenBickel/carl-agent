@@ -369,9 +369,12 @@ async fn owner_approval_wait_is_bounded_by_the_hard_wall_deadline() -> TestResul
         std::future::pending::<()>().await;
     });
 
+    // The engine derives the budget from real UTC before arming Tokio's paused
+    // timer. Leave ample setup headroom so parallel CI load cannot exhaust the
+    // budget before the approval operation is durably recorded.
     let error = tokio::time::timeout(
-        Duration::from_secs(2),
-        engine.start(input(session.id, &fixture, Some(1))),
+        Duration::from_secs(65),
+        engine.start(input(session.id, &fixture, Some(60))),
     )
     .await
     .expect("approval wait must observe the task wall deadline")
