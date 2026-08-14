@@ -26,6 +26,7 @@ pub mod bootstrap;
 pub mod command;
 pub mod controller;
 pub mod render;
+pub mod runtime;
 pub mod state;
 pub mod terminal;
 
