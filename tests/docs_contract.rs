@@ -479,7 +479,9 @@ fn configuration_documents_the_implemented_auth_boundary() {
         &[
             "accepts exactly four non-secret carl process variables",
             "`carl_data_dir`",
-            "required absolute path to a pre-existing, trusted carl data directory",
+            "optional absolute path to a pre-existing, trusted carl data directory",
+            "owner-private `$home/.carl`",
+            "explicit overrides are never created, replaced, or weakened",
             "`carl_codex_executable`",
             "`carl_grok_executable`",
             "`carl_buzz_executable`",

@@ -9,6 +9,7 @@ use thiserror::Error;
 use tokio::process::{Child, Command};
 
 use crate::service::client::{ServiceClientErrorCode, TaskServiceClient};
+use crate::sidecar::{canonical_private_data_root, prepare_default_data_root};
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum BootstrapError {
@@ -51,6 +52,23 @@ pub fn service_launch_environment(
 #[must_use]
 pub const fn should_launch_service(code: ServiceClientErrorCode) -> bool {
     matches!(code, ServiceClientErrorCode::Unavailable)
+}
+
+pub fn resolve_or_create_data_root(
+    ambient: &BTreeMap<OsString, OsString>,
+) -> Result<PathBuf, BootstrapError> {
+    if let Some(configured) = ambient.get(&OsString::from("CARL_DATA_DIR")) {
+        return canonical_private_data_root(&PathBuf::from(configured))
+            .map_err(|_| BootstrapError::InvalidConfiguration);
+    }
+
+    let home_variable = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+    let home = ambient
+        .get(&OsString::from(home_variable))
+        .map(PathBuf::from)
+        .ok_or(BootstrapError::InvalidConfiguration)?;
+    let home = canonical_directory(&home)?;
+    prepare_default_data_root(&home.join(".carl")).map_err(|_| BootstrapError::InvalidConfiguration)
 }
 
 pub async fn connect_or_launch(

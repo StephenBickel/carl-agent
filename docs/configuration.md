@@ -9,7 +9,7 @@ typed local SQLite projection managed through `carl memory settings`.
 
 | Variable | Contract |
 | --- | --- |
-| `CARL_DATA_DIR` | Required absolute path to a pre-existing, trusted Carl data directory. Carl does not create, replace, or weaken this root. |
+| `CARL_DATA_DIR` | Optional absolute path to a pre-existing, trusted Carl data directory. When omitted by the TUI, Carl creates and uses an owner-private `$HOME/.carl`; explicit overrides are never created, replaced, or weakened. Other command families still require the explicit variable. |
 | `CARL_CODEX_EXECUTABLE` | Optional absolute Codex path. When absent, Carl discovers `codex` on `PATH`. |
 | `CARL_GROK_EXECUTABLE` | Optional absolute Grok path. When absent, Carl discovers `grok` on `PATH`. |
 | `CARL_BUZZ_EXECUTABLE` | Optional absolute Buzz CLI path for Buzz publication. When absent, Carl discovers `buzz` on `PATH`. |
@@ -147,7 +147,8 @@ model catalog when it starts.
 ## What is not configurable yet
 
 No general profile configuration is accepted today. Apart from the strict provider
-preference above, there is no configuration file for endpoint URLs, native tool budgets, Telegram, TUI layout,
-memory policy, or promotion. The current working directory becomes the canonical ACP
-workspace, and `CARL_DATA_DIR` must be supplied explicitly. Do not place secrets in
-guessed profile files or non-secret Carl variables.
+preference above, there is no configuration file for endpoint URLs, native tool budgets,
+Telegram, TUI layout, memory policy, or promotion. The current working directory becomes
+the canonical ACP workspace. Non-TUI command families require `CARL_DATA_DIR` explicitly;
+the TUI alone may prepare the fixed owner-private default. Do not place secrets in guessed
+profile files or non-secret Carl variables.

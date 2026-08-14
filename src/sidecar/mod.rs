@@ -1237,6 +1237,88 @@ impl DataRootLock {
     }
 }
 
+pub(crate) fn canonical_private_data_root(data_root: &Path) -> Result<PathBuf, DataRootLockError> {
+    if !data_root.is_absolute() {
+        return Err(DataRootLockError::from_code(
+            DataRootLockErrorCode::InvalidDataRoot,
+        ));
+    }
+    let metadata = fs::symlink_metadata(data_root)
+        .map_err(|_| DataRootLockError::from_code(DataRootLockErrorCode::InvalidDataRoot))?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(DataRootLockError::from_code(
+            DataRootLockErrorCode::InvalidDataRoot,
+        ));
+    }
+    let canonical = fs::canonicalize(data_root)
+        .map_err(|_| DataRootLockError::from_code(DataRootLockErrorCode::InvalidDataRoot))?;
+    open_private_data_root(&canonical)?;
+    Ok(canonical)
+}
+
+pub(crate) fn prepare_default_data_root(data_root: &Path) -> Result<PathBuf, DataRootLockError> {
+    if !data_root.is_absolute() {
+        return Err(DataRootLockError::from_code(
+            DataRootLockErrorCode::InvalidDataRoot,
+        ));
+    }
+    match fs::symlink_metadata(data_root) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            create_owner_private_data_root(data_root)?;
+        }
+        Err(_) => {
+            return Err(DataRootLockError::from_code(
+                DataRootLockErrorCode::InvalidDataRoot,
+            ));
+        }
+    }
+    canonical_private_data_root(data_root)
+}
+
+#[cfg(unix)]
+fn create_owner_private_data_root(data_root: &Path) -> Result<(), DataRootLockError> {
+    use std::os::unix::fs::DirBuilderExt as _;
+
+    let invalid = || DataRootLockError::from_code(DataRootLockErrorCode::InvalidDataRoot);
+    let mut builder = fs::DirBuilder::new();
+    builder.mode(0o700);
+    match builder.create(data_root) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(_) => Err(invalid()),
+    }
+}
+
+#[cfg(windows)]
+fn create_owner_private_data_root(data_root: &Path) -> Result<(), DataRootLockError> {
+    use std::os::windows::ffi::OsStrExt as _;
+
+    use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+    use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
+
+    let invalid = || DataRootLockError::from_code(DataRootLockErrorCode::InvalidDataRoot);
+    let security =
+        windows_security::owner_only_directory_security_descriptor().map_err(|()| invalid())?;
+    let attributes = SECURITY_ATTRIBUTES {
+        nLength: u32::try_from(std::mem::size_of::<SECURITY_ATTRIBUTES>())
+            .map_err(|_| invalid())?,
+        lpSecurityDescriptor: security.as_ptr().cast_mut().cast(),
+        bInheritHandle: 0,
+    };
+    let mut wide_path: Vec<u16> = data_root.as_os_str().encode_wide().collect();
+    wide_path.push(0);
+    // SAFETY: wide_path is NUL-terminated and attributes references a live,
+    // owner-only security descriptor for the duration of the call.
+    if unsafe { CreateDirectoryW(wide_path.as_ptr(), &attributes) } == 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::AlreadyExists {
+            return Err(invalid());
+        }
+    }
+    Ok(())
+}
+
 impl Drop for DataRootLock {
     fn drop(&mut self) {
         // Explicitly unlock before close so a concurrently forked pre-exec child
