@@ -240,12 +240,20 @@ fn long_horizon_runner_self_test_enforces_the_offline_contract() {
     let script = repository_root().join("scripts/live-codex-long-horizon.mjs");
     assert!(script.is_file(), "the opt-in endurance runner must exist");
 
-    let output = Command::new("node")
+    let mut command = Command::new("node");
+    command
         .arg(&script)
         .arg("--self-test")
         .current_dir(repository_root())
         .env_clear()
-        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default());
+    #[cfg(windows)]
+    for key in ["SystemRoot", "WINDIR", "TEMP", "TMP"] {
+        if let Some(value) = std::env::var_os(key) {
+            command.env(key, value);
+        }
+    }
+    let output = command
         .output()
         .expect("the offline endurance self-test must start");
     assert!(

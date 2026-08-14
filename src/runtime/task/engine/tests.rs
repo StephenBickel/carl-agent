@@ -350,7 +350,7 @@ fn assert_safely_blocked(engine: &mut TaskEngine<ApprovalPort>) -> TestResult {
     Ok(())
 }
 
-#[tokio::test(flavor = "current_thread")]
+#[tokio::test(start_paused = true)]
 async fn owner_approval_wait_is_bounded_by_the_hard_wall_deadline() -> TestResult {
     let fixture = Fixture::new()?;
     let store = Store::open(&fixture.database)?;
@@ -572,6 +572,16 @@ impl QuiescePort {
         self.state.lock().unwrap().boundary_released = true;
         self.changed.notify_waiters();
     }
+
+    async fn wait_for_effect(&self) {
+        loop {
+            let changed = self.changed.notified();
+            if self.state.lock().unwrap().effect_count == 1 {
+                return;
+            }
+            changed.await;
+        }
+    }
 }
 
 impl AgentPort for QuiescePort {
@@ -777,14 +787,14 @@ impl AgentPort for QuiescePort {
     }
 }
 
-#[tokio::test(flavor = "current_thread")]
+#[tokio::test(start_paused = true)]
 async fn repeated_quiesce_coalesces_one_boundary_and_returns_the_committed_active_snapshot()
 -> TestResult {
     let fixture = Fixture::new()?;
     let store = Store::open(&fixture.database)?;
     let session = store.create_session()?;
     let port = QuiescePort::new(fixture.workspace.clone());
-    let observed = Arc::clone(&port.state);
+    let observed = port.clone();
     let release = port.clone();
     let mut engine = TaskEngine::new(store, port);
     install_frontend(&mut engine, session.id, fixture.workspace.clone());
@@ -798,12 +808,7 @@ async fn repeated_quiesce_coalesces_one_boundary_and_returns_the_committed_activ
     engine.install_controls(control_receiver, acknowledgement_sender, permission_sender);
 
     let controls = tokio::spawn(async move {
-        loop {
-            if observed.lock().unwrap().effect_count == 1 {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
+        observed.wait_for_effect().await;
         control_sender
             .send(TaskEngineControl::Quiesce {
                 task_id,
@@ -845,14 +850,14 @@ async fn repeated_quiesce_coalesces_one_boundary_and_returns_the_committed_activ
     Ok(())
 }
 
-#[tokio::test(flavor = "current_thread")]
+#[tokio::test(start_paused = true)]
 async fn explicit_compaction_waits_for_one_safe_checkpoint_and_compacts_below_pressure()
 -> TestResult {
     let fixture = Fixture::new()?;
     let store = Store::open(&fixture.database)?;
     let session = store.create_session()?;
     let port = QuiescePort::new(fixture.workspace.clone());
-    let observed = Arc::clone(&port.state);
+    let observed = port.clone();
     let release = port.clone();
     let mut engine = TaskEngine::new(store, port);
     install_frontend(&mut engine, session.id, fixture.workspace.clone());
@@ -866,12 +871,7 @@ async fn explicit_compaction_waits_for_one_safe_checkpoint_and_compacts_below_pr
     engine.install_controls(control_receiver, acknowledgement_sender, permission_sender);
 
     let controls = tokio::spawn(async move {
-        loop {
-            if observed.lock().unwrap().effect_count == 1 {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
+        observed.wait_for_effect().await;
         control_sender
             .send(TaskEngineControl::Compact {
                 task_id,

@@ -958,6 +958,12 @@ fn codex_auth_jsonl_fixture(home: &Path, scenario: &str) -> i32 {
 
         match method {
             "initialize" => {
+                if scenario == "healthy-slow-initialize" {
+                    // A healthy child can be scheduled well after spawn on shared
+                    // Windows runners. This delay keeps the contract honest without
+                    // changing production's five-second request deadline.
+                    thread::sleep(Duration::from_millis(350));
+                }
                 let codex_home = if scenario == "wrong-codex-home" {
                     home.join("different-home")
                 } else {

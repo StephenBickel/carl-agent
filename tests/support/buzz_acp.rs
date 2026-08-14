@@ -25,7 +25,11 @@ pub type TestResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
 pub const PRIVATE_KEY: &str = "fixture-private-key";
 pub const CHANNEL_ID: &str = "11111111-1111-4111-8111-111111111111";
 pub const ACTOR_HEX: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-const CARL_FRAME_TIMEOUT: Duration = Duration::from_secs(30);
+// The Ubuntu CI runner has produced healthy, fully durable Buzz flows that take
+// just under two minutes between ACP frames while SQLite checkpoint work is
+// contending for the shared runner's disk. Keep the bound above that observed
+// healthy runtime while remaining well inside the job-level deadline.
+const CARL_FRAME_TIMEOUT: Duration = Duration::from_secs(150);
 const CARL_STDERR_DIAGNOSTIC_LIMIT: usize = 4 * 1_024;
 
 pub fn dispatch_fixture(arguments: &[OsString]) -> Option<i32> {

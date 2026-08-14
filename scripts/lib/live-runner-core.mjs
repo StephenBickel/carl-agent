@@ -110,7 +110,11 @@ async function canonicalPrivateDirectory(path, code) {
 }
 
 function ownerPrivate(info) {
-  return (info.mode & 0o077) === 0 &&
+  // Node exposes synthetic POSIX mode bits on Windows; they are not evidence
+  // of an owner-only ACL. The live runner has no Windows ACL verifier, so that
+  // production boundary is deliberately unsupported and fails closed.
+  return process.platform !== "win32" &&
+    (info.mode & 0o077) === 0 &&
     (typeof process.getuid !== "function" || info.uid === process.getuid());
 }
 

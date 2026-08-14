@@ -1,3 +1,6 @@
+#[path = "support/private_dir.rs"]
+mod private_dir;
+
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::error::Error;
@@ -58,25 +61,13 @@ impl EngineFixture {
         let workspace = root.join("workspace");
         let database = root.join("carl.sqlite3");
         fs::create_dir_all(&workspace)?;
-        make_owner_only(&root)?;
+        private_dir::make_owner_only_directory(&root)?;
         Ok(Self {
             root,
             workspace,
             database,
         })
     }
-}
-
-#[cfg(unix)]
-fn make_owner_only(path: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-}
-
-#[cfg(windows)]
-fn make_owner_only(_path: &Path) -> std::io::Result<()> {
-    Ok(())
 }
 
 fn install_postcondition_crash_cut(database: &Path) -> TestResult {
