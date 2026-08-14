@@ -57,6 +57,10 @@ fn main() {
             codex_launch_and_handshake_are_exact,
         ),
         test(
+            "healthy slow Codex responses survive the contract request bound",
+            healthy_slow_codex_response_survives_contract_bound,
+        ),
+        test(
             "Codex rejects a Grok provider home before launch",
             codex_rejects_grok_provider_home_before_launch,
         ),
@@ -201,11 +205,20 @@ fn trusted_fixture_executable(
 
 fn contract_timeouts() -> CodexAuthTimeouts {
     CodexAuthTimeouts::new(
-        Duration::from_millis(300),
+        Duration::from_secs(2),
         Duration::from_millis(120),
         Duration::from_millis(250),
         Duration::from_millis(10),
     )
+}
+
+fn healthy_slow_codex_response_survives_contract_bound() -> TestResult {
+    run_async(async {
+        let mut fixture = Fixture::connect("healthy-slow-initialize").await?;
+        assert_eq!(fixture.broker.service(), SubscriptionService::OpenAiCodex);
+        assert_eq!(fixture.broker.auth_state().await?, AuthState::SignedOut);
+        Ok(())
+    })
 }
 
 fn notification_bound_timeouts() -> CodexAuthTimeouts {
