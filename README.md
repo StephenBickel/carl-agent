@@ -58,6 +58,9 @@ carl
 
 `carl tui` opens the same interface explicitly. Type a prompt and press Enter;
 Shift+Enter inserts a newline. Ctrl+C cancels an active task and Ctrl+D exits.
+The activity row above the input pulses independently of service polling, names the
+current authoritative phase or tool, and reports how long it has been since Carl's
+last durable update without pretending to know provider-side progress.
 The terminal supports these commands:
 
 - `/model [id]` and `/effort <level>` inspect or change model configuration.

@@ -234,7 +234,7 @@ impl<B: TuiBackend> TuiController<B> {
             SlashCommand::Compact => {
                 let task_id = self.task_id.ok_or(TuiError::InvalidState)?;
                 self.expect_applied(ServiceCommand::Compact { task_id }).await?;
-                Ok(vec![TuiEvent::Notice("compaction requested".to_owned())])
+                Ok(vec![TuiEvent::CompactionRequested])
             }
             SlashCommand::New => {
                 self.external_session_id = None;

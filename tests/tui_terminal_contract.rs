@@ -53,6 +53,23 @@ fn terminal_owner_restores_exactly_once_on_drop_or_explicit_restore() {
     assert_eq!(&*log.lock().unwrap(), &["enter", "restore"]);
 }
 
+#[test]
+fn rejected_submission_restores_exact_unicode_input_and_end_cursor() {
+    let mut editor = InputEditor::default();
+    for character in "fix café ☕".chars() {
+        editor.handle(key(KeyCode::Char(character), KeyModifiers::NONE), false);
+    }
+    let EditorAction::Submit(submitted) =
+        editor.handle(key(KeyCode::Enter, KeyModifiers::NONE), false)
+    else {
+        panic!("enter must submit the input");
+    };
+    editor.restore_submission(submitted);
+    assert_eq!(editor.text(), "fix café ☕");
+    editor.handle(key(KeyCode::Backspace, KeyModifiers::NONE), false);
+    assert_eq!(editor.text(), "fix café ");
+}
+
 fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
     KeyEvent::new(code, modifiers)
 }

@@ -79,10 +79,11 @@ async fn prompt_and_configuration_are_exact_service_commands() {
         )))
         .await
         .unwrap();
-    controller
+    let compact_events = controller
         .submit(SubmittedInput::Command(SlashCommand::Compact))
         .await
         .unwrap();
+    assert_eq!(compact_events, vec![TuiEvent::CompactionRequested]);
 
     let backend = controller.into_backend();
     assert!(matches!(

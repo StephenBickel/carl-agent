@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::time::Duration;
 
 use thiserror::Error;
 
@@ -6,6 +7,8 @@ use crate::acp::PermissionMode;
 use crate::delegates::{ModelId, ReasoningEffort};
 use crate::runtime::task::{TaskId, TaskSnapshot, TaskStatus};
 use crate::service::protocol::{ServiceSessionSummary, TaskUpdate};
+
+use super::activity::{ActivityPhase, ActivityView, activity_view, tool_label};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum TranscriptItem {
@@ -41,7 +44,9 @@ pub enum Overlay {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum TuiEvent {
-    Tick,
+    Tick {
+        elapsed: Duration,
+    },
     UserSubmitted(String),
     TaskBound {
         external_session_id: String,
@@ -59,8 +64,10 @@ pub enum TuiEvent {
     AuthoritativeSnapshot(TaskSnapshot),
     SessionsLoaded(Vec<ServiceSessionSummary>),
     SessionCleared,
+    CompactionRequested,
     Notice(String),
     Disconnected,
+    ConnectionRestored,
     Reconnected {
         live_generation: String,
         cursor: Option<u64>,
@@ -76,6 +83,8 @@ pub enum TuiStateError {
     CursorRegression,
     #[error("TUI context measurement is invalid")]
     InvalidContextUsage,
+    #[error("TUI activity clock regressed")]
+    ClockRegression,
 }
 
 #[derive(Clone, Debug)]
@@ -97,6 +106,10 @@ pub struct TuiState {
     last_cursor: Option<u64>,
     exit_requested: bool,
     approval_pending: bool,
+    now: Duration,
+    phase_started_at: Duration,
+    last_authoritative_at: Duration,
+    compaction_requested: bool,
 }
 
 impl Default for TuiState {
@@ -119,14 +132,25 @@ impl Default for TuiState {
             last_cursor: None,
             exit_requested: false,
             approval_pending: false,
+            now: Duration::ZERO,
+            phase_started_at: Duration::ZERO,
+            last_authoritative_at: Duration::ZERO,
+            compaction_requested: false,
         }
     }
 }
 
 impl TuiState {
     pub fn apply(&mut self, event: TuiEvent) -> Result<(), TuiStateError> {
+        let previous_phase = self.activity_phase();
+        let mut authoritative = false;
         match event {
-            TuiEvent::Tick => {}
+            TuiEvent::Tick { elapsed } => {
+                if elapsed < self.now {
+                    return Err(TuiStateError::ClockRegression);
+                }
+                self.now = elapsed;
+            }
             TuiEvent::UserSubmitted(text) => self.transcript.push(TranscriptItem::User(text)),
             TuiEvent::TaskBound {
                 external_session_id,
@@ -140,9 +164,13 @@ impl TuiState {
                 self.model = Some(model);
                 self.effort = Some(effort);
                 self.permission_mode = permission_mode;
+                self.status = None;
                 self.overlay = None;
             }
-            TuiEvent::TaskUpdate(update) => self.apply_update(update)?,
+            TuiEvent::TaskUpdate(update) => {
+                self.apply_update(update)?;
+                authoritative = true;
+            }
             TuiEvent::DurableUpdate {
                 live_generation,
                 cursor,
@@ -162,8 +190,12 @@ impl TuiState {
                 }
                 self.apply_update(update)?;
                 self.last_cursor = Some(cursor);
+                authoritative = true;
             }
-            TuiEvent::AuthoritativeSnapshot(snapshot) => self.apply_snapshot(&snapshot),
+            TuiEvent::AuthoritativeSnapshot(snapshot) => {
+                self.apply_snapshot(&snapshot);
+                authoritative = true;
+            }
             TuiEvent::SessionsLoaded(sessions) => {
                 self.overlay = Some(Overlay::Sessions(sessions));
             }
@@ -178,9 +210,12 @@ impl TuiState {
                 self.tools.clear();
                 self.transcript.clear();
                 self.approval_pending = false;
+                self.compaction_requested = false;
             }
+            TuiEvent::CompactionRequested => self.compaction_requested = true,
             TuiEvent::Notice(notice) => self.transcript.push(TranscriptItem::Notice(notice)),
             TuiEvent::Disconnected => self.connected = false,
+            TuiEvent::ConnectionRestored => self.connected = true,
             TuiEvent::Reconnected {
                 live_generation,
                 cursor,
@@ -192,9 +227,16 @@ impl TuiState {
                 if let Some(snapshot) = snapshot {
                     self.apply_snapshot(&snapshot);
                 }
+                authoritative = true;
             }
             TuiEvent::ExitRequested => self.exit_requested = true,
             TuiEvent::ApprovalResolved => self.approval_pending = false,
+        }
+        if authoritative {
+            self.last_authoritative_at = self.now;
+        }
+        if self.activity_phase() != previous_phase {
+            self.phase_started_at = self.now;
         }
         Ok(())
     }
@@ -294,9 +336,11 @@ impl TuiState {
                     summary,
                 });
             }
-            TaskUpdate::Checkpoint(checkpoint) => self
-                .transcript
-                .push(TranscriptItem::Notice(format!("checkpoint {checkpoint}"))),
+            TaskUpdate::Checkpoint(checkpoint) => {
+                self.compaction_requested = false;
+                self.transcript
+                    .push(TranscriptItem::Notice(format!("checkpoint {checkpoint}")));
+            }
             TaskUpdate::ContextUsage { used, window } => {
                 if window == 0 || used > window {
                     return Err(TuiStateError::InvalidContextUsage);
@@ -304,6 +348,7 @@ impl TuiState {
                 self.context = Some((used, window));
             }
             TaskUpdate::Compaction { generation } => {
+                self.compaction_requested = false;
                 self.compaction_generation = generation;
                 self.transcript.push(TranscriptItem::Compaction(generation));
             }
@@ -363,6 +408,61 @@ impl TuiState {
     pub const fn last_cursor(&self) -> Option<u64> {
         self.last_cursor
     }
+
+    #[must_use]
+    pub fn activity(&self) -> ActivityView {
+        activity_view(
+            self.activity_phase(),
+            self.now,
+            self.phase_started_at,
+            self.last_authoritative_at,
+        )
+    }
+
+    #[must_use]
+    pub fn activity_is_animated(&self) -> bool {
+        self.activity_phase().is_animated()
+    }
+
+    fn activity_phase(&self) -> ActivityPhase {
+        if !self.connected {
+            return ActivityPhase::Reconnecting;
+        }
+        match self.status {
+            Some(TaskStatus::Cancelled) => return ActivityPhase::Cancelled,
+            Some(TaskStatus::Completed) => return ActivityPhase::Completed,
+            Some(TaskStatus::Failed) => return ActivityPhase::Failed,
+            Some(TaskStatus::Paused) => return ActivityPhase::Paused,
+            Some(TaskStatus::Blocked) => return ActivityPhase::Blocked,
+            Some(TaskStatus::Cancelling) => return ActivityPhase::Cancelling,
+            Some(TaskStatus::Completing) => return ActivityPhase::Finishing,
+            Some(TaskStatus::Queued) => return ActivityPhase::Queued,
+            Some(TaskStatus::Checkpointing) => return ActivityPhase::Compacting,
+            Some(TaskStatus::Active) | None => {}
+        }
+        if self.approval_pending {
+            return ActivityPhase::WaitingApproval;
+        }
+        if self.compaction_requested {
+            return ActivityPhase::Compacting;
+        }
+        if self.status == Some(TaskStatus::Active)
+            && let Some(tool) = self
+                .tools
+                .iter()
+                .rev()
+                .find(|tool| tool.status == ToolPresentationStatus::Running)
+        {
+            return ActivityPhase::Tool(tool_label(&tool.summary));
+        }
+        if self.status == Some(TaskStatus::Active) {
+            ActivityPhase::Thinking
+        } else if self.task_id.is_some() {
+            ActivityPhase::Starting
+        } else {
+            ActivityPhase::Ready
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
@@ -421,7 +521,7 @@ impl TuiInbox {
 fn is_replaceable(event: &TuiEvent) -> bool {
     matches!(
         event,
-        TuiEvent::Tick
+        TuiEvent::Tick { .. }
             | TuiEvent::TaskUpdate(TaskUpdate::Status(_) | TaskUpdate::ContextUsage { .. })
             | TuiEvent::DurableUpdate {
                 update: TaskUpdate::Status(_) | TaskUpdate::ContextUsage { .. },

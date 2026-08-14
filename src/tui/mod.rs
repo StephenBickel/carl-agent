@@ -4,27 +4,32 @@ use std::io::IsTerminal as _;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crossterm::event::{self, Event, KeyEventKind};
+use crossterm::event::{Event, EventStream, KeyEventKind};
+use futures_util::StreamExt as _;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
+use tokio::sync::mpsc;
+use tokio::time::{Instant, MissedTickBehavior};
 
+use self::bootstrap::connect_or_launch;
+use self::controller::{ServiceTuiBackend, TuiController};
+use self::render::render;
+use self::runtime::{
+    INTENT_CHANNEL_CAPACITY, LocalAction, LocalTui, OUTPUT_CHANNEL_CAPACITY, RuntimeIntent,
+    run_controller_worker,
+};
+use self::terminal::{CrosstermControl, TerminalOwner};
 use crate::cli::{ExitClassification, TuiArgs};
 use crate::credentials::{CredentialVault, load_provider_preference, store_provider_preference};
 use crate::providers::catalog::ProviderKind;
 use crate::providers::http::SecretCredential;
-use crate::service::protocol::ServiceApprovalDecision;
 
-use self::bootstrap::connect_or_launch;
-use self::command::{SlashCommand, SubmittedInput, parse_submission};
-use self::controller::{ServiceTuiBackend, TuiController};
-use self::render::render;
-use self::state::{TuiEvent, TuiState};
-use self::terminal::{CrosstermControl, EditorAction, InputEditor, TerminalOwner};
-
+pub mod activity;
 pub mod bootstrap;
 pub mod command;
 pub mod controller;
 pub mod render;
+pub mod runtime;
 pub mod state;
 pub mod terminal;
 
@@ -51,92 +56,92 @@ async fn run_inner() -> Result<(), &'static str> {
         .await
         .map_err(|_| "the persistent task service is unavailable")?;
     let backend = ServiceTuiBackend::new(client);
-    let mut controller = TuiController::new(backend, workspace);
-    let mut state = TuiState::default();
-    apply_events(
-        &mut state,
-        controller
-            .initialize()
-            .await
-            .map_err(|_| "the persistent task service returned invalid session state")?,
-    )?;
+    let controller = TuiController::new(backend, workspace);
+    let (intent_tx, intent_rx) = mpsc::channel(INTENT_CHANNEL_CAPACITY);
+    let (output_tx, mut output_rx) = mpsc::channel(OUTPUT_CHANNEL_CAPACITY);
+    let mut worker = tokio::spawn(run_controller_worker(controller, intent_rx, output_tx));
 
     let mut owner = TerminalOwner::enter(CrosstermControl::default())
         .map_err(|_| "the terminal could not enter interactive mode")?;
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend).map_err(|_| "the terminal could not initialize")?;
-    let mut editor = InputEditor::default();
+    let mut terminal_events = EventStream::new();
+    let mut local = LocalTui::new();
+    let runtime_start = Instant::now();
+    let mut animation = tokio::time::interval_at(
+        runtime_start + activity::ACTIVITY_INTERVAL,
+        activity::ACTIVITY_INTERVAL,
+    );
+    animation.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut render_gate = tokio::time::interval_at(runtime_start, runtime::RENDER_INTERVAL);
+    render_gate.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let loop_result = async {
         loop {
-            state.set_input(editor.text().to_owned());
-            terminal
-                .draw(|frame| render(frame, &state))
-                .map_err(|_| "the terminal could not render")?;
-            if state.exit_requested() {
+            if local.state().exit_requested() {
                 break;
             }
-
-            if event::poll(Duration::ZERO).map_err(|_| "terminal input failed")?
-                && let Event::Key(key) = event::read().map_err(|_| "terminal input failed")?
-                && key.kind == KeyEventKind::Press
-            {
-                let task_active = state.status().is_some_and(|status| !status.is_terminal());
-                match editor.handle(key, task_active) {
-                    EditorAction::None => {}
-                    EditorAction::Exit => state
-                        .apply(TuiEvent::ExitRequested)
-                        .map_err(|_| "the terminal state became invalid")?,
-                    EditorAction::CancelTask => {
-                        let events = controller
-                            .submit(SubmittedInput::Command(SlashCommand::Cancel))
-                            .await
-                            .map_err(|_| "the active task could not be cancelled")?;
-                        apply_events(&mut state, events)?;
-                    }
-                    EditorAction::Submit(text) => {
-                        let events = if state.approval_pending() {
-                            match text.trim().to_ascii_lowercase().as_str() {
-                                "y" | "yes" => controller
-                                    .resolve_approval(ServiceApprovalDecision::Approve)
-                                    .await
-                                    .map_err(|_| "the approval could not be applied")?,
-                                "n" | "no" => controller
-                                    .resolve_approval(ServiceApprovalDecision::Deny)
-                                    .await
-                                    .map_err(|_| "the denial could not be applied")?,
-                                _ => vec![TuiEvent::Notice(
-                                    "approval requires y/yes or n/no".to_owned(),
-                                )],
+            tokio::select! {
+                biased;
+                terminal_event = terminal_events.next() => {
+                    match terminal_event {
+                        Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
+                            match local
+                                .handle_key(key)
+                                .map_err(|_| "the terminal state became invalid")?
+                            {
+                                LocalAction::None => {}
+                                LocalAction::Exit => continue,
+                                LocalAction::Intent {
+                                    intent,
+                                    original_submission,
+                                } => {
+                                    if intent_tx.try_send(intent).is_err() {
+                                        local
+                                            .reject_intent(original_submission)
+                                            .map_err(|_| "the terminal state became invalid")?;
+                                    }
+                                }
                             }
-                        } else {
-                            match parse_submission(&text) {
-                                Ok(input) => controller
-                                    .submit(input)
-                                    .await
-                                    .map_err(|_| "the TUI command was rejected")?,
-                                Err(_) => vec![TuiEvent::Notice(
-                                    "invalid input; use /help for commands".to_owned(),
-                                )],
-                            }
-                        };
-                        apply_events(&mut state, events)?;
+                        }
+                        Some(Ok(Event::Resize(_, _))) => local.mark_dirty(),
+                        Some(Ok(_)) => {}
+                        Some(Err(_)) | None => return Err("terminal input failed"),
                     }
                 }
-            }
-
-            match controller.poll_updates().await {
-                Ok(events) => apply_events(&mut state, events)?,
-                Err(_) => {
-                    state
-                        .apply(TuiEvent::Disconnected)
+                _ = animation.tick() => {
+                    local
+                        .tick(runtime_start.elapsed())
                         .map_err(|_| "the terminal state became invalid")?;
                 }
+                output = output_rx.recv() => {
+                    let Some(output) = output else {
+                        return Err("the persistent task service became unavailable");
+                    };
+                    local
+                        .apply_output(output)
+                        .map_err(|_| "the terminal state became invalid")?;
+                }
+                _ = render_gate.tick() => {
+                    let elapsed = runtime_start.elapsed();
+                    if local.take_draw(elapsed) {
+                        terminal
+                            .draw(|frame| render(frame, local.state()))
+                            .map_err(|_| "the terminal could not render")?;
+                    }
+                }
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
         }
         Ok::<(), &'static str>(())
     }
     .await;
+    let _ = intent_tx.try_send(RuntimeIntent::Shutdown);
+    if tokio::time::timeout(Duration::from_millis(500), &mut worker)
+        .await
+        .is_err()
+    {
+        worker.abort();
+        let _ = worker.await;
+    }
     drop(terminal);
     owner
         .restore()
@@ -201,13 +206,4 @@ pub fn parse_first_run_provider(input: &str) -> Option<ProviderKind> {
         "3" | "openrouter" => Some(ProviderKind::OpenRouter),
         _ => None,
     }
-}
-
-fn apply_events(state: &mut TuiState, events: Vec<TuiEvent>) -> Result<(), &'static str> {
-    for event in events {
-        state
-            .apply(event)
-            .map_err(|_| "the terminal state became invalid")?;
-    }
-    Ok(())
 }
