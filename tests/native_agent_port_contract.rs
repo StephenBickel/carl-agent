@@ -129,7 +129,7 @@ async fn multi_step_coding_task_reads_patches_verifies_and_finishes() -> TestRes
         fixture.path.join("src/lib.rs"),
         "pub fn add(left: i32, right: i32) -> i32 { left - right }\n",
     )?;
-    let provider = Arc::new(ScriptedProvider::from_json(&multi_step_script())?);
+    let provider = Arc::new(ScriptedProvider::from_json(&multi_step_script()?)?);
     let mut port = NativeAgentPort::new(provider.clone(), catalog());
     let context_id = port
         .start_context(StartAgentContext {
@@ -203,34 +203,66 @@ fn script(tool: &str, arguments: &str) -> String {
     )
 }
 
-fn multi_step_script() -> String {
-    r#"{
+fn multi_step_script() -> TestResult<String> {
+    let verification_argv = serde_json::to_string(&verification_argv()?)?;
+    Ok(format!(
+        r#"{{
       "schema_version":1,
-      "capabilities":{"streaming":true,"structured_tool_calls":true,"parallel_tool_calls":true,"usage_reporting":true,"context_window":131072},
+      "capabilities":{{"streaming":true,"structured_tool_calls":true,"parallel_tool_calls":true,"usage_reporting":true,"context_window":131072}},
       "responses":[
-        {"events":[
-          {"type":"tool_call","tool_call_id":"11111111-1111-4111-8111-111111111111","provider_call_id":"call_read","name":"read_file","arguments":{"path":"src/lib.rs"}},
-          {"type":"usage","input_tokens":20,"output_tokens":5},
-          {"type":"finish","reason":"tool_calls"}
-        ]},
-        {"events":[
-          {"type":"tool_call","tool_call_id":"22222222-2222-4222-8222-222222222222","provider_call_id":"call_patch","name":"apply_patch","arguments":{"changes":[{"path":"src/lib.rs","find":"left - right","replace":"left + right"}]}},
-          {"type":"usage","input_tokens":30,"output_tokens":8},
-          {"type":"finish","reason":"tool_calls"}
-        ]},
-        {"events":[
-          {"type":"tool_call","tool_call_id":"33333333-3333-4333-8333-333333333333","provider_call_id":"call_verify","name":"run_command","arguments":{"argv":["/usr/bin/grep","left + right","src/lib.rs"],"timeout_seconds":5}},
-          {"type":"usage","input_tokens":40,"output_tokens":6},
-          {"type":"finish","reason":"tool_calls"}
-        ]},
-        {"events":[
-          {"type":"text_delta","text":"Fixed add() and verified the implementation."},
-          {"type":"usage","input_tokens":50,"output_tokens":9},
-          {"type":"finish","reason":"stop"}
-        ]}
+        {{"events":[
+          {{"type":"tool_call","tool_call_id":"11111111-1111-4111-8111-111111111111","provider_call_id":"call_read","name":"read_file","arguments":{{"path":"src/lib.rs"}}}},
+          {{"type":"usage","input_tokens":20,"output_tokens":5}},
+          {{"type":"finish","reason":"tool_calls"}}
+        ]}},
+        {{"events":[
+          {{"type":"tool_call","tool_call_id":"22222222-2222-4222-8222-222222222222","provider_call_id":"call_patch","name":"apply_patch","arguments":{{"changes":[{{"path":"src/lib.rs","find":"left - right","replace":"left + right"}}]}}}},
+          {{"type":"usage","input_tokens":30,"output_tokens":8}},
+          {{"type":"finish","reason":"tool_calls"}}
+        ]}},
+        {{"events":[
+          {{"type":"tool_call","tool_call_id":"33333333-3333-4333-8333-333333333333","provider_call_id":"call_verify","name":"run_command","arguments":{{"argv":{verification_argv},"timeout_seconds":5}}}},
+          {{"type":"usage","input_tokens":40,"output_tokens":6}},
+          {{"type":"finish","reason":"tool_calls"}}
+        ]}},
+        {{"events":[
+          {{"type":"text_delta","text":"Fixed add() and verified the implementation."}},
+          {{"type":"usage","input_tokens":50,"output_tokens":9}},
+          {{"type":"finish","reason":"stop"}}
+        ]}}
       ]
-    }"#
-    .to_owned()
+    }}"#
+    ))
+}
+
+#[cfg(unix)]
+fn verification_argv() -> TestResult<Vec<String>> {
+    let executable = std::path::Path::new("/usr/bin/grep");
+    if !executable.is_file() {
+        return Err("the native-agent fixture requires /usr/bin/grep".into());
+    }
+    Ok(vec![
+        executable.display().to_string(),
+        "left + right".to_owned(),
+        "src/lib.rs".to_owned(),
+    ])
+}
+
+#[cfg(windows)]
+fn verification_argv() -> TestResult<Vec<String>> {
+    let system_root =
+        std::env::var_os("SystemRoot").ok_or("the native-agent fixture requires SystemRoot")?;
+    let executable = std::path::PathBuf::from(system_root)
+        .join("System32")
+        .join("findstr.exe");
+    if !executable.is_file() {
+        return Err("the native-agent fixture requires findstr.exe".into());
+    }
+    Ok(vec![
+        executable.display().to_string(),
+        "/C:left + right".to_owned(),
+        "src\\lib.rs".to_owned(),
+    ])
 }
 
 fn model() -> ModelId {
