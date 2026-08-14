@@ -6,6 +6,7 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use crate::acp::PermissionMode;
 
+use super::activity::ActivityTone;
 use super::state::{Overlay, ToolPresentationStatus, TranscriptItem, TuiState};
 
 pub fn render(frame: &mut Frame<'_>, state: &TuiState) {
@@ -118,19 +119,24 @@ pub fn render(frame: &mut Frame<'_>, state: &TuiState) {
     }
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), areas[1]);
 
-    let connection = if state.connected() {
-        state.status().map_or("ready".to_owned(), |status| {
-            format!("{status:?}").to_lowercase()
-        })
-    } else {
-        "disconnected · mutations paused".to_owned()
+    let activity = state.activity();
+    let mut activity_line = format!("{} {}", activity.symbol, activity.label);
+    if let Some(elapsed) = activity.elapsed_seconds {
+        activity_line.push_str(&format!(" · {elapsed}s"));
+    }
+    if let Some(stale) = activity.stale_seconds {
+        activity_line.push_str(&format!(" · last update {stale}s ago"));
+    }
+    let activity_line = truncate_chars(&activity_line, usize::from(areas[2].width));
+    let activity_color = match activity.tone {
+        ActivityTone::Active => Color::Cyan,
+        ActivityTone::Idle => Color::DarkGray,
+        ActivityTone::Waiting => Color::Yellow,
+        ActivityTone::Success => Color::Green,
+        ActivityTone::Error => Color::Red,
     };
     frame.render_widget(
-        Paragraph::new(connection).style(Style::default().fg(if state.connected() {
-            Color::DarkGray
-        } else {
-            Color::Red
-        })),
+        Paragraph::new(activity_line).style(Style::default().fg(activity_color)),
         areas[2],
     );
 
@@ -140,6 +146,10 @@ pub fn render(frame: &mut Frame<'_>, state: &TuiState) {
             .wrap(Wrap { trim: false }),
         areas[3],
     );
+}
+
+fn truncate_chars(value: &str, maximum: usize) -> String {
+    value.chars().take(maximum).collect()
 }
 
 fn short_session(session: &str) -> String {
