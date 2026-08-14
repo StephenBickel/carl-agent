@@ -44,17 +44,17 @@ remain inert CLI shells.
 
 ## Try Carl locally
 
-Carl requires the Rust toolchain in `rust-toolchain.toml` and an absolute
-pre-existing private data directory. The default subscription path additionally
-requires Codex CLI `0.146.0` and a local ChatGPT subscription login.
+Carl requires the Rust toolchain in `rust-toolchain.toml`. The default subscription
+path additionally requires Codex CLI `0.146.0` and a local ChatGPT subscription
+login. On first launch, Carl securely creates its owner-private default data root at
+`$HOME/.carl`; `CARL_DATA_DIR` remains available as an explicit advanced override.
 
 ```sh
-cargo build --locked --release
-mkdir -m 700 "$HOME/.carl"
-export CARL_DATA_DIR="$HOME/.carl"
-carl auth login openai
-carl
+cargo run --locked --release
 ```
+
+To install the `carl` command into Cargo's binary directory, run
+`cargo install --locked --path .` once and then launch it with `carl`.
 
 `carl tui` opens the same interface explicitly. Type a prompt and press Enter;
 Shift+Enter inserts a newline. Ctrl+C cancels an active task and Ctrl+D exits.

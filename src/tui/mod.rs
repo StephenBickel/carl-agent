@@ -1,7 +1,6 @@
 use std::env;
 use std::io;
 use std::io::IsTerminal as _;
-use std::path::PathBuf;
 use std::time::Duration;
 
 use crossterm::event::{Event, EventStream, KeyEventKind};
@@ -11,7 +10,7 @@ use ratatui::backend::CrosstermBackend;
 use tokio::sync::mpsc;
 use tokio::time::{Instant, MissedTickBehavior};
 
-use self::bootstrap::connect_or_launch;
+use self::bootstrap::{connect_or_launch, resolve_or_create_data_root};
 use self::controller::{ServiceTuiBackend, TuiController};
 use self::render::render;
 use self::runtime::{
@@ -45,9 +44,9 @@ pub async fn run(_args: TuiArgs) -> ExitClassification {
 }
 
 async fn run_inner() -> Result<(), &'static str> {
-    let data_root = env::var_os("CARL_DATA_DIR")
-        .map(PathBuf::from)
-        .ok_or("CARL_DATA_DIR must name a private absolute directory")?;
+    let ambient = env::vars_os().collect();
+    let data_root = resolve_or_create_data_root(&ambient)
+        .map_err(|_| "the Carl data directory is unavailable or unsafe")?;
     let workspace = env::current_dir()
         .and_then(std::fs::canonicalize)
         .map_err(|_| "the current workspace is unavailable")?;

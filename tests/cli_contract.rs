@@ -34,16 +34,16 @@ fn no_subcommand_and_tui_alias_select_the_interactive_tui() {
 }
 
 #[test]
-fn tui_fails_closed_before_terminal_takeover_without_a_data_root() {
+fn tui_fails_closed_before_terminal_takeover_with_a_relative_data_root() {
     for arguments in [vec![], vec!["tui"]] {
         let mut command = assert_cmd::Command::cargo_bin("carl").unwrap();
         command
             .args(arguments)
-            .env_remove("CARL_DATA_DIR")
+            .env("CARL_DATA_DIR", "relative")
             .assert()
             .failure()
             .stderr(predicates::str::contains(
-                "CARL_DATA_DIR must name a private absolute directory",
+                "the Carl data directory is unavailable or unsafe",
             ));
     }
 }
