@@ -213,6 +213,7 @@ pub async fn run_controller_worker<B>(
     B: TuiBackend + Send,
 {
     let mut fast_poll = false;
+    let mut disconnected = false;
     match controller.initialize().await {
         Ok(events) => {
             update_poll_mode(&events, &mut fast_poll);
@@ -221,6 +222,7 @@ pub async fn run_controller_worker<B>(
             }
         }
         Err(_) => {
+            disconnected = true;
             if !send_output(&output_tx, RuntimeOutput::Disconnected).await {
                 return;
             }
@@ -253,35 +255,50 @@ pub async fn run_controller_worker<B>(
                 match result {
                     Ok(events) => {
                         update_poll_mode(&events, &mut fast_poll);
+                        disconnected = false;
                         if !send_output(&output_tx, RuntimeOutput::Events(events)).await {
                             break;
                         }
                     }
                     Err(_) => {
+                        disconnected = true;
                         if !send_output(&output_tx, RuntimeOutput::Disconnected).await {
                             break;
                         }
                     }
                 }
-                next_poll = Instant::now() + poll_interval(fast_poll);
+                next_poll = Instant::now()
+                    + if disconnected {
+                        IDLE_POLL_INTERVAL
+                    } else {
+                        poll_interval(fast_poll)
+                    };
             }
             () = &mut poll_delay => {
                 match controller.poll_updates().await {
                     Ok(events) => {
                         update_poll_mode(&events, &mut fast_poll);
-                        if !events.is_empty()
+                        let publish = disconnected || !events.is_empty();
+                        disconnected = false;
+                        if publish
                             && !send_output(&output_tx, RuntimeOutput::Events(events)).await
                         {
                             break;
                         }
                     }
                     Err(_) => {
+                        disconnected = true;
                         if !send_output(&output_tx, RuntimeOutput::Disconnected).await {
                             break;
                         }
                     }
                 }
-                next_poll = Instant::now() + poll_interval(fast_poll);
+                next_poll = Instant::now()
+                    + if disconnected {
+                        IDLE_POLL_INTERVAL
+                    } else {
+                        poll_interval(fast_poll)
+                    };
             }
         }
     }

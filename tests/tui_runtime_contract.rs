@@ -146,6 +146,51 @@ async fn bounded_output_backpressure_preserves_the_complete_event_batch() {
     worker.await.unwrap();
 }
 
+#[tokio::test(start_paused = true)]
+async fn quiet_poll_after_disconnect_publishes_connection_recovery() {
+    let task_id = TaskId::new();
+    let shared = Arc::new(FakeShared::new(false));
+    let backend = FakeBackend::new(task_id, Arc::clone(&shared));
+    let controller = TuiController::new(backend, PathBuf::from("/workspace"));
+    let (intent_tx, intent_rx) = mpsc::channel(32);
+    let (output_tx, mut output_rx) = mpsc::channel(256);
+    let worker = tokio::spawn(run_controller_worker(controller, intent_rx, output_tx));
+
+    assert!(matches!(
+        output_rx.recv().await,
+        Some(RuntimeOutput::Events(_))
+    ));
+    intent_tx
+        .send(RuntimeIntent::Submit(SubmittedInput::Prompt(
+            "stay responsive".to_owned(),
+        )))
+        .await
+        .unwrap();
+    assert!(matches!(
+        output_rx.recv().await,
+        Some(RuntimeOutput::Events(_))
+    ));
+
+    shared.fail_next_poll.store(true, Ordering::SeqCst);
+    shared.empty_next_poll.store(true, Ordering::SeqCst);
+    tokio::time::advance(Duration::from_millis(50)).await;
+    wait_for_count(&shared.live_started, 1).await;
+    assert!(matches!(
+        output_rx.recv().await,
+        Some(RuntimeOutput::Disconnected)
+    ));
+
+    tokio::time::advance(Duration::from_millis(250)).await;
+    wait_for_count(&shared.live_started, 2).await;
+    assert!(matches!(
+        output_rx.recv().await,
+        Some(RuntimeOutput::Events(events)) if events.is_empty()
+    ));
+
+    intent_tx.send(RuntimeIntent::Shutdown).await.unwrap();
+    worker.await.unwrap();
+}
+
 #[test]
 fn render_gate_coalesces_streamed_deltas_and_draws_only_when_dirty() {
     let mut state = TuiState::default();
@@ -216,6 +261,19 @@ impl TuiBackend for FakeBackend {
                         .maximum_inflight
                         .fetch_max(inflight, Ordering::SeqCst);
                     shared.live_started.fetch_add(1, Ordering::SeqCst);
+                    if shared.fail_next_poll.swap(false, Ordering::SeqCst) {
+                        shared.inflight.fetch_sub(1, Ordering::SeqCst);
+                        return Err(TuiError::ServiceUnavailable);
+                    }
+                    if shared.empty_next_poll.swap(false, Ordering::SeqCst) {
+                        shared.inflight.fetch_sub(1, Ordering::SeqCst);
+                        return Ok(ServiceResult::LiveUpdates(LiveUpdatePage {
+                            live_generation: "11111111-1111-4111-8111-111111111111".to_owned(),
+                            updates: Vec::new(),
+                            cursor: Some(2),
+                            snapshot: None,
+                        }));
+                    }
                     if shared.delay_poll.load(Ordering::SeqCst) {
                         shared.poll_release.notified().await;
                     }
@@ -254,6 +312,8 @@ struct FakeShared {
     live_started: AtomicUsize,
     inflight: AtomicUsize,
     maximum_inflight: AtomicUsize,
+    fail_next_poll: AtomicBool,
+    empty_next_poll: AtomicBool,
 }
 
 impl FakeShared {
@@ -265,6 +325,8 @@ impl FakeShared {
             live_started: AtomicUsize::new(0),
             inflight: AtomicUsize::new(0),
             maximum_inflight: AtomicUsize::new(0),
+            fail_next_poll: AtomicBool::new(false),
+            empty_next_poll: AtomicBool::new(false),
         }
     }
 }
