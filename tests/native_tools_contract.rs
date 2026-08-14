@@ -85,9 +85,10 @@ async fn structured_patch_and_argv_command_execute_without_a_shell() -> TestResu
         "new two\n"
     );
 
+    let (shell_argv, command_argv, expected_stdout) = host_command_fixtures()?;
     let command = runtime.prepare(
         "run_command",
-        json!({"argv":["/bin/sh","-c","printf should-not-run"],"timeout_seconds":5}),
+        json!({"argv":shell_argv,"timeout_seconds":5}),
     );
     assert_eq!(
         command.unwrap_err().code(),
@@ -95,13 +96,70 @@ async fn structured_patch_and_argv_command_execute_without_a_shell() -> TestResu
     );
     let command = runtime.prepare(
         "run_command",
-        json!({"argv":["/usr/bin/printf","hello %s","Carl"],"timeout_seconds":5}),
+        json!({"argv":command_argv,"timeout_seconds":5}),
     )?;
     assert_eq!(command.effect_kind(), ToolEffectKind::Command);
     let output = command.execute(CancellationToken::new()).await?;
     assert_eq!(output["exit_code"], 0);
-    assert_eq!(output["stdout"], "hello Carl");
+    assert_eq!(
+        output["stdout"]
+            .as_str()
+            .expect("command output is text")
+            .trim_end_matches(['\r', '\n']),
+        expected_stdout
+    );
     Ok(())
+}
+
+#[cfg(unix)]
+fn host_command_fixtures() -> TestResult<(Vec<String>, Vec<String>, &'static str)> {
+    for executable in ["/bin/sh", "/usr/bin/printf"] {
+        if !std::path::Path::new(executable).is_file() {
+            return Err(format!("the native-tools fixture requires {executable}").into());
+        }
+    }
+    Ok((
+        vec![
+            "/bin/sh".to_owned(),
+            "-c".to_owned(),
+            "printf should-not-run".to_owned(),
+        ],
+        vec![
+            "/usr/bin/printf".to_owned(),
+            "hello %s".to_owned(),
+            "Carl".to_owned(),
+        ],
+        "hello Carl",
+    ))
+}
+
+#[cfg(windows)]
+fn host_command_fixtures() -> TestResult<(Vec<String>, Vec<String>, &'static str)> {
+    let system_root =
+        std::env::var_os("SystemRoot").ok_or("the native-tools fixture requires SystemRoot")?;
+    let system32 = std::path::PathBuf::from(system_root).join("System32");
+    let shell = system32.join("cmd.exe");
+    let command = system32.join("findstr.exe");
+    for executable in [&shell, &command] {
+        if !executable.is_file() {
+            return Err(
+                format!("the native-tools fixture requires {}", executable.display()).into(),
+            );
+        }
+    }
+    Ok((
+        vec![
+            shell.display().to_string(),
+            "/C".to_owned(),
+            "echo should-not-run".to_owned(),
+        ],
+        vec![
+            command.display().to_string(),
+            "/C:new one".to_owned(),
+            "one.txt".to_owned(),
+        ],
+        "new one",
+    ))
 }
 
 #[tokio::test]
