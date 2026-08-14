@@ -100,7 +100,11 @@ fn disconnect_freezes_mutations_and_reconnect_rejects_cursor_regression() {
 #[test]
 fn bounded_inbox_coalesces_replaceable_progress_without_losing_outcomes() {
     let mut inbox = TuiInbox::new(3).unwrap();
-    inbox.push(TuiEvent::Tick).unwrap();
+    inbox
+        .push(TuiEvent::Tick {
+            elapsed: std::time::Duration::ZERO,
+        })
+        .unwrap();
     inbox
         .push(TuiEvent::TaskUpdate(TaskUpdate::ContextUsage {
             used: 1,

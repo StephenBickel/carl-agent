@@ -21,6 +21,7 @@ use self::render::render;
 use self::state::{TuiEvent, TuiState};
 use self::terminal::{CrosstermControl, EditorAction, InputEditor, TerminalOwner};
 
+pub mod activity;
 pub mod bootstrap;
 pub mod command;
 pub mod controller;
