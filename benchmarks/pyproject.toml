@@ -7,7 +7,9 @@ name = "carl-bench"
 version = "0.1.0"
 description = "Reproducible benchmark lab for the Carl agent harness"
 requires-python = ">=3.12,<3.13"
-dependencies = []
+dependencies = [
+    "cryptography==46.0.5",
+]
 
 [project.scripts]
 carl-bench = "carl_bench.cli:main"
