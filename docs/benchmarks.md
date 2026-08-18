@@ -85,6 +85,37 @@ is not implemented: paired/review authority events and every publication operati
 disabled, so this control plane cannot push a candidate, open a draft PR, claim protected validation,
 merge, auto-merge, release, deploy, or revert changes.
 
+## Protected-main and Phase 4 bootstrap
+
+As of 2026-08-18, the remote `main` branch is protected and requires an up-to-date pull request plus
+`Quality`, `Benchmark contracts`, and the Ubuntu, macOS, and Windows test jobs. The rule applies to
+administrators, requires linear history and resolved conversations, and disables force-push and
+deletion. The repository permits squash merges only, enables auto-merge, and deletes merged branches.
+Zero human approvals are required because routine promotion is intended to be governed by immutable
+machine evidence rather than operator availability.
+
+The repository now contains two Phase 4 building blocks:
+
+- `carl_bench.promotion` verifies externally signed Ed25519 protected-validation receipts and binds
+  them to the exact production parent, candidate commit/tree, policy, executable, adapter, task set,
+  metric pack, model, effort, environment, reviews, tests, benchmark statistics, holdout aggregate,
+  cost, latency, and expiry. It rejects constitutional changes in an ordinary candidate.
+- `carl_bench.github_promotion` deterministically reconciles one exact PR, strict required checks,
+  squash auto-merge, resulting tree identity, soak entry, and one exact revert. The companion
+  outcome monitor detects stale automations, leases, evidence, soak observations, and rollback.
+
+These contracts do not make the current graph a promotion authority by themselves. The private
+validator/signing boundary, protected status reporter, append-only Phase 4 event integration, and
+credentialed GitHub operation gateway must still be provisioned outside candidate authority and
+adversarially verified. Until that happens, experimental publication remains the maximum candidate
+authority and production review must fail closed. The full contract and bootstrap order are in the
+[autonomous-main promotion design](superpowers/specs/2026-08-18-carl-autonomous-main-promotion-design.md).
+
+GitHub's native merge queue is unavailable for this public personal-account repository. The approved
+substitute is a single durable promotion lease, strict up-to-date checks, and exact post-merge tree
+reconciliation. Moving the repository to an eligible organization can replace that serialization
+layer with the native queue later without weakening evidence requirements.
+
 The command reference and isolation details live in the
 [benchmark package guide](../benchmarks/README.md). This page defines the operator loop that Codex
 can execute today.
