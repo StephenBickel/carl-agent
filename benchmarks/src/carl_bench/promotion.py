@@ -20,12 +20,24 @@ from carl_bench.canonical import canonical_json_bytes
 _DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 _OBJECT_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
-_CONSTITUTIONAL_EXACT = frozenset({"SECURITY.md"})
+_CONSTITUTIONAL_EXACT = frozenset(
+    {
+        "AGENTS.md",
+        "Cargo.lock",
+        "Cargo.toml",
+        "SECURITY.md",
+        "docs/benchmarks.md",
+    }
+)
 _CONSTITUTIONAL_PREFIXES = (
+    ".codex/",
     ".github/",
-    "benchmarks/tasks/protected/",
-    "benchmarks/src/carl_bench/promotion",
-    "benchmarks/src/carl_bench/run_attestation.py",
+    "benchmarks/",
+    "docs/superpowers/plans/2026-08-18-carl-autonomous-main-promotion",
+    "docs/superpowers/specs/2026-08-10-codex-carl-improvement-factory-design",
+    "docs/superpowers/specs/2026-08-18-carl-autonomous-main-promotion",
+    "scripts/benchmark",
+    "scripts/live-codex",
 )
 
 

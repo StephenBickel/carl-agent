@@ -136,3 +136,29 @@ def test_started_revert_satisfies_rollback_start_sla() -> None:
 
     assert "rollback_start_sla_missed" not in report.findings
 
+
+def test_future_automation_completion_is_critical() -> None:
+    future = replace(
+        observation(),
+        last_started_at="2026-08-18T19:00:00Z",
+        last_completed_at="2026-08-18T19:30:00Z",
+    )
+
+    report = evaluate_promotion_health(
+        replace(snapshot(), automations=(future, snapshot().automations[1])), now=NOW
+    )
+
+    assert "automation_completion_in_future:daily-carl-production-review" in report.findings
+
+
+def test_revert_start_before_hard_failure_is_critical() -> None:
+    report = evaluate_promotion_health(
+        replace(
+            snapshot(),
+            hard_failure_at="2026-08-18T16:00:00Z",
+            revert_started_at="2026-08-18T15:59:59Z",
+        ),
+        now=NOW,
+    )
+
+    assert "revert_precedes_hard_failure" in report.findings

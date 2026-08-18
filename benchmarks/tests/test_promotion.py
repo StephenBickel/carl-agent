@@ -189,9 +189,17 @@ def test_failed_protected_gates_cannot_be_promoted(
     "path",
     [
         ".github/workflows/ci.yml",
+        "benchmarks/pyproject.toml",
+        "benchmarks/src/carl_bench/experiment.py",
+        "benchmarks/uv.lock",
+        "Cargo.lock",
+        "Cargo.toml",
+        "docs/benchmarks.md",
+        "docs/superpowers/specs/2026-08-10-codex-carl-improvement-factory-design.md",
         "benchmarks/src/carl_bench/promotion.py",
         "SECURITY.md",
         "benchmarks/tasks/protected/task.toml",
+        "scripts/benchmark-smoke.sh",
     ],
 )
 def test_ordinary_candidate_cannot_modify_constitutional_surfaces(path: str) -> None:
@@ -206,3 +214,16 @@ def test_ordinary_candidate_cannot_modify_constitutional_surfaces(path: str) -> 
             changed_paths=(path,),
         )
 
+
+def test_ordinary_product_source_is_not_misclassified_as_constitutional() -> None:
+    envelope, public_key = signed(receipt())
+
+    verified = verify_protected_validation(
+        envelope,
+        public_key_pem=public_key,
+        expected=expectation(),
+        now=datetime(2026, 8, 18, 13, tzinfo=UTC),
+        changed_paths=("src/runtime/task.rs",),
+    )
+
+    assert verified.candidate_commit == "4" * 40

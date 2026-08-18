@@ -113,8 +113,15 @@ def evaluate_promotion_health(
         "weekly": (timedelta(days=8), "weekly_automation_stale"),
     }
     for automation in snapshot.automations:
+        started = _time("last_started_at", automation.last_started_at)
         completed = _time("last_completed_at", automation.last_completed_at)
         threshold, code = thresholds[automation.cadence]
+        if started is not None and started > now:
+            findings.append(f"automation_start_in_future:{automation.automation_id}")
+        if completed is not None and completed > now:
+            findings.append(f"automation_completion_in_future:{automation.automation_id}")
+        if started is not None and completed is not None and completed < started:
+            findings.append(f"automation_completion_precedes_start:{automation.automation_id}")
         if completed is None or now - completed > threshold:
             findings.append(f"{code}:{automation.automation_id}")
         if automation.last_outcome == "failed":
@@ -126,12 +133,32 @@ def evaluate_promotion_health(
         findings.append("promotion_receipts_incomplete")
     soaking_since = _time("soaking_since", snapshot.soaking_since)
     soak_observed = _time("last_soak_observation_at", snapshot.last_soak_observation_at)
+    if soaking_since is not None and soaking_since > now:
+        findings.append("soak_start_in_future")
+    if soak_observed is not None and soak_observed > now:
+        findings.append("soak_observation_in_future")
+    if (
+        soaking_since is not None
+        and soak_observed is not None
+        and soak_observed < soaking_since
+    ):
+        findings.append("soak_observation_precedes_start")
     if soaking_since is not None:
         latest = soak_observed or soaking_since
         if now - latest > timedelta(hours=26):
             findings.append("soak_observation_stale")
     hard_failure = _time("hard_failure_at", snapshot.hard_failure_at)
     revert_started = _time("revert_started_at", snapshot.revert_started_at)
+    if hard_failure is not None and hard_failure > now:
+        findings.append("hard_failure_in_future")
+    if revert_started is not None and revert_started > now:
+        findings.append("revert_start_in_future")
+    if (
+        hard_failure is not None
+        and revert_started is not None
+        and revert_started < hard_failure
+    ):
+        findings.append("revert_precedes_hard_failure")
     if (
         hard_failure is not None
         and revert_started is None

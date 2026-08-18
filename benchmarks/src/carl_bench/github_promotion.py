@@ -11,8 +11,9 @@ _OBJECT_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 _DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 _REPOSITORY_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
-_SUCCESS = frozenset({"SUCCESS", "NEUTRAL", "SKIPPED"})
+_SUCCESS = frozenset({"SUCCESS"})
 _PENDING = frozenset({"", "PENDING", "QUEUED", "IN_PROGRESS"})
+_GITHUB_ACTIONS_APP_ID = 15368
 
 
 def _id(name: str, value: str) -> None:
@@ -31,12 +32,15 @@ def _object(name: str, value: str) -> None:
 class CheckRun:
     name: str
     conclusion: str
+    app_id: int
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str) or not self.name or len(self.name.encode()) > 256:
             raise PromotionContractError("invalid_check_name")
         if not isinstance(self.conclusion, str) or len(self.conclusion) > 32:
             raise PromotionContractError("invalid_check_conclusion")
+        if isinstance(self.app_id, bool) or not isinstance(self.app_id, int) or self.app_id <= 0:
+            raise PromotionContractError("invalid_check_app_id")
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,6 +139,7 @@ class RevertSnapshot:
     merge_commit: str
     hard_failure: bool
     revert_pull_request: PullRequestSnapshot | None
+    revert_candidate_commit: str | None
     reverted_commit: str | None
 
     def __post_init__(self) -> None:
@@ -146,6 +151,8 @@ class RevertSnapshot:
             self.revert_pull_request, PullRequestSnapshot
         ):
             raise PromotionContractError("invalid_revert_pull_request")
+        if self.revert_candidate_commit is not None:
+            _object("revert_candidate_commit", self.revert_candidate_commit)
         if self.reverted_commit is not None:
             _object("reverted_commit", self.reverted_commit)
 
@@ -156,9 +163,14 @@ def _check_decision(
     if not required_checks or len(set(required_checks)) != len(required_checks):
         raise PromotionContractError("invalid_required_checks")
     checks = {check.name: check.conclusion.upper() for check in pull_request.checks}
+    check_apps = {check.name: check.app_id for check in pull_request.checks}
     missing = set(required_checks) - set(checks)
     if missing or any(checks[name] in _PENDING for name in required_checks if name in checks):
         return PromotionDecision("await_checks", "required_checks_incomplete", pull_request.number)
+    if any(check_apps[name] != _GITHUB_ACTIONS_APP_ID for name in required_checks):
+        return PromotionDecision(
+            "blocked", "required_check_app_mismatch", pull_request.number
+        )
     if any(checks[name] not in _SUCCESS for name in required_checks):
         return PromotionDecision("blocked", "required_check_failed", pull_request.number)
     return None
@@ -170,7 +182,9 @@ def reconcile_promotion(
     required_checks: tuple[str, ...],
 ) -> PromotionDecision:
     """Choose one idempotent action without performing GitHub mutations."""
-    if snapshot.active_promotion_id not in {None, request.promotion_id}:
+    if snapshot.active_promotion_id is None:
+        return PromotionDecision("blocked", "promotion_lease_required")
+    if snapshot.active_promotion_id != request.promotion_id:
         return PromotionDecision("blocked", "promotion_lease_conflict")
     pull_request = snapshot.pull_request
     if pull_request is None:
@@ -227,10 +241,19 @@ def reconcile_revert(snapshot: RevertSnapshot) -> PromotionDecision:
     if not snapshot.hard_failure:
         return PromotionDecision("continue_soak", "no_hard_failure")
     if snapshot.revert_pull_request is not None:
+        pull_request = snapshot.revert_pull_request
+        if pull_request.base_branch != "main":
+            raise PromotionContractError("revert_pr_base_mismatch")
+        if pull_request.head_branch != f"revert/{snapshot.promotion_id}":
+            raise PromotionContractError("revert_pr_head_mismatch")
+        if snapshot.revert_candidate_commit is None:
+            raise PromotionContractError("revert_candidate_identity_missing")
+        if pull_request.head_commit != snapshot.revert_candidate_commit:
+            raise PromotionContractError("revert_pr_commit_mismatch")
         return PromotionDecision(
             "await_revert",
             "revert_pull_request_exists",
-            snapshot.revert_pull_request.number,
+            pull_request.number,
             revert_commit=snapshot.merge_commit,
         )
     return PromotionDecision(

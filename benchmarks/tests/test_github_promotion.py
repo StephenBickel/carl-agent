@@ -48,7 +48,10 @@ def pull_request() -> PullRequestSnapshot:
         head_branch="experimental/exp-001",
         head_commit="2" * 40,
         merge_state="CLEAN",
-        checks=tuple(CheckRun(name=name, conclusion="SUCCESS") for name in REQUIRED_CHECKS),
+        checks=tuple(
+            CheckRun(name=name, conclusion="SUCCESS", app_id=15368)
+            for name in REQUIRED_CHECKS
+        ),
         merge_commit=None,
         merge_tree=None,
     )
@@ -104,6 +107,15 @@ def test_stale_base_or_concurrent_promotion_fails_closed(
     assert decision.reason == reason
 
 
+def test_missing_promotion_lease_fails_closed() -> None:
+    decision = reconcile_promotion(
+        request(), snapshot(active_promotion_id=None), REQUIRED_CHECKS
+    )
+
+    assert decision.action == "blocked"
+    assert decision.reason == "promotion_lease_required"
+
+
 @pytest.mark.parametrize(
     ("field", "value", "error"),
     [
@@ -126,7 +138,7 @@ def test_missing_or_failed_check_never_enables_auto_merge() -> None:
     failed = replace(
         pull_request(),
         checks=tuple(
-            CheckRun(name=check.name, conclusion="FAILURE")
+            CheckRun(name=check.name, conclusion="FAILURE", app_id=check.app_id)
             if check.name == "Quality"
             else check
             for check in pull_request().checks
@@ -141,6 +153,43 @@ def test_missing_or_failed_check_never_enables_auto_merge() -> None:
     )
     assert failed_decision.action == "blocked"
     assert failed_decision.reason == "required_check_failed"
+
+
+@pytest.mark.parametrize("conclusion", ["SKIPPED", "NEUTRAL"])
+def test_nonexecuted_required_check_never_enables_auto_merge(conclusion: str) -> None:
+    current = replace(
+        pull_request(),
+        checks=tuple(
+            CheckRun(name=check.name, conclusion=conclusion, app_id=check.app_id)
+            if check.name == "Quality"
+            else check
+            for check in pull_request().checks
+        ),
+    )
+
+    decision = reconcile_promotion(
+        request(), snapshot(pull_request=current), REQUIRED_CHECKS
+    )
+
+    assert decision.action == "blocked"
+    assert decision.reason == "required_check_failed"
+
+
+def test_required_check_from_untrusted_app_never_enables_auto_merge() -> None:
+    current = replace(
+        pull_request(),
+        checks=tuple(
+            replace(check, app_id=999) if check.name == "Quality" else check
+            for check in pull_request().checks
+        ),
+    )
+
+    decision = reconcile_promotion(
+        request(), snapshot(pull_request=current), REQUIRED_CHECKS
+    )
+
+    assert decision.action == "blocked"
+    assert decision.reason == "required_check_app_mismatch"
 
 
 def test_merged_pr_requires_exact_resulting_tree() -> None:
@@ -185,6 +234,7 @@ def test_hard_soak_failure_opens_one_exact_revert() -> None:
         merge_commit="5" * 40,
         hard_failure=True,
         revert_pull_request=None,
+        revert_candidate_commit=None,
         reverted_commit=None,
     )
 
@@ -206,6 +256,7 @@ def test_existing_revert_pr_is_reconciled_not_duplicated() -> None:
         merge_commit="5" * 40,
         hard_failure=True,
         revert_pull_request=revert_pr,
+        revert_candidate_commit="6" * 40,
         reverted_commit=None,
     )
 
@@ -213,3 +264,23 @@ def test_existing_revert_pr_is_reconciled_not_duplicated() -> None:
 
     assert decision.action == "await_revert"
     assert decision.pull_request_number == 82
+
+
+def test_unrelated_pull_request_cannot_suppress_exact_revert() -> None:
+    unrelated = replace(
+        pull_request(),
+        number=82,
+        head_branch="experimental/unrelated",
+        head_commit="6" * 40,
+    )
+    state = RevertSnapshot(
+        promotion_id=request().promotion_id,
+        merge_commit="5" * 40,
+        hard_failure=True,
+        revert_pull_request=unrelated,
+        revert_candidate_commit="6" * 40,
+        reverted_commit=None,
+    )
+
+    with pytest.raises(PromotionContractError, match="revert_pr_head_mismatch"):
+        reconcile_revert(state)
