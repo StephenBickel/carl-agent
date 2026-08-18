@@ -47,6 +47,7 @@ def pull_request() -> PullRequestSnapshot:
         base_branch="main",
         head_branch="experimental/exp-001",
         head_commit="2" * 40,
+        head_tree="3" * 40,
         merge_state="CLEAN",
         checks=tuple(
             CheckRun(name=name, conclusion="SUCCESS", app_id=15368)
@@ -130,6 +131,13 @@ def test_pull_request_identity_mismatch_is_integrity_error(
     current = replace(pull_request(), **{field: value})
 
     with pytest.raises(PromotionContractError, match=error):
+        reconcile_promotion(request(), snapshot(pull_request=current), REQUIRED_CHECKS)
+
+
+def test_pull_request_tree_mismatch_is_integrity_error() -> None:
+    current = replace(pull_request(), head_tree="0" * 40)
+
+    with pytest.raises(PromotionContractError, match="promotion_pr_tree_mismatch"):
         reconcile_promotion(request(), snapshot(pull_request=current), REQUIRED_CHECKS)
 
 
@@ -235,6 +243,9 @@ def test_hard_soak_failure_opens_one_exact_revert() -> None:
         hard_failure=True,
         revert_pull_request=None,
         revert_candidate_commit=None,
+        expected_restored_tree="7" * 40,
+        production_commit="5" * 40,
+        production_tree="3" * 40,
         reverted_commit=None,
     )
 
@@ -250,6 +261,7 @@ def test_existing_revert_pr_is_reconciled_not_duplicated() -> None:
         number=82,
         head_branch="revert/promotion-exp-001-1",
         head_commit="6" * 40,
+        head_tree="7" * 40,
     )
     state = RevertSnapshot(
         promotion_id=request().promotion_id,
@@ -257,6 +269,9 @@ def test_existing_revert_pr_is_reconciled_not_duplicated() -> None:
         hard_failure=True,
         revert_pull_request=revert_pr,
         revert_candidate_commit="6" * 40,
+        expected_restored_tree="7" * 40,
+        production_commit="5" * 40,
+        production_tree="3" * 40,
         reverted_commit=None,
     )
 
@@ -279,8 +294,57 @@ def test_unrelated_pull_request_cannot_suppress_exact_revert() -> None:
         hard_failure=True,
         revert_pull_request=unrelated,
         revert_candidate_commit="6" * 40,
+        expected_restored_tree="7" * 40,
+        production_commit="5" * 40,
+        production_tree="3" * 40,
         reverted_commit=None,
     )
 
     with pytest.raises(PromotionContractError, match="revert_pr_head_mismatch"):
         reconcile_revert(state)
+
+
+def test_arbitrary_reverted_commit_cannot_claim_restoration() -> None:
+    state = RevertSnapshot(
+        promotion_id=request().promotion_id,
+        merge_commit="5" * 40,
+        hard_failure=False,
+        revert_pull_request=None,
+        revert_candidate_commit=None,
+        expected_restored_tree="7" * 40,
+        production_commit="8" * 40,
+        production_tree="0" * 40,
+        reverted_commit="8" * 40,
+    )
+
+    with pytest.raises(PromotionContractError, match="revert_without_hard_failure"):
+        reconcile_revert(state)
+
+
+def test_exact_merged_revert_restores_the_preceding_tree() -> None:
+    reverted_pr = replace(
+        pull_request(),
+        number=82,
+        state="MERGED",
+        head_branch="revert/promotion-exp-001-1",
+        head_commit="6" * 40,
+        head_tree="7" * 40,
+        merge_commit="8" * 40,
+        merge_tree="7" * 40,
+    )
+    state = RevertSnapshot(
+        promotion_id=request().promotion_id,
+        merge_commit="5" * 40,
+        hard_failure=True,
+        revert_pull_request=reverted_pr,
+        revert_candidate_commit="6" * 40,
+        expected_restored_tree="7" * 40,
+        production_commit="8" * 40,
+        production_tree="7" * 40,
+        reverted_commit="8" * 40,
+    )
+
+    decision = reconcile_revert(state)
+
+    assert decision.action == "record_reverted"
+    assert decision.merge_commit == "8" * 40

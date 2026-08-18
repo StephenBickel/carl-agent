@@ -52,6 +52,7 @@ class PullRequestSnapshot:
     base_branch: str
     head_branch: str
     head_commit: str
+    head_tree: str
     merge_state: str
     checks: tuple[CheckRun, ...]
     merge_commit: str | None
@@ -70,6 +71,7 @@ class PullRequestSnapshot:
         _id("base_branch", self.base_branch)
         _id("head_branch", self.head_branch)
         _object("head_commit", self.head_commit)
+        _object("head_tree", self.head_tree)
         if not isinstance(self.merge_state, str) or len(self.merge_state) > 32:
             raise PromotionContractError("invalid_merge_state")
         if not isinstance(self.checks, tuple) or any(
@@ -140,6 +142,9 @@ class RevertSnapshot:
     hard_failure: bool
     revert_pull_request: PullRequestSnapshot | None
     revert_candidate_commit: str | None
+    expected_restored_tree: str
+    production_commit: str
+    production_tree: str
     reverted_commit: str | None
 
     def __post_init__(self) -> None:
@@ -153,6 +158,9 @@ class RevertSnapshot:
             raise PromotionContractError("invalid_revert_pull_request")
         if self.revert_candidate_commit is not None:
             _object("revert_candidate_commit", self.revert_candidate_commit)
+        _object("expected_restored_tree", self.expected_restored_tree)
+        _object("production_commit", self.production_commit)
+        _object("production_tree", self.production_tree)
         if self.reverted_commit is not None:
             _object("reverted_commit", self.reverted_commit)
 
@@ -197,6 +205,8 @@ def reconcile_promotion(
         raise PromotionContractError("promotion_pr_head_mismatch")
     if pull_request.head_commit != request.candidate_commit:
         raise PromotionContractError("promotion_pr_commit_mismatch")
+    if pull_request.head_tree != request.candidate_tree:
+        raise PromotionContractError("promotion_pr_tree_mismatch")
     if pull_request.state == "MERGED":
         if pull_request.merge_commit is None or pull_request.merge_tree is None:
             raise PromotionContractError("promotion_merge_identity_missing")
@@ -232,24 +242,54 @@ def reconcile_promotion(
     )
 
 
+def _verify_revert_pull_request(snapshot: RevertSnapshot) -> PullRequestSnapshot:
+    pull_request = snapshot.revert_pull_request
+    if pull_request is None:
+        raise PromotionContractError("revert_pull_request_required")
+    if pull_request.base_branch != "main":
+        raise PromotionContractError("revert_pr_base_mismatch")
+    if pull_request.head_branch != f"revert/{snapshot.promotion_id}":
+        raise PromotionContractError("revert_pr_head_mismatch")
+    if snapshot.revert_candidate_commit is None:
+        raise PromotionContractError("revert_candidate_identity_missing")
+    if pull_request.head_commit != snapshot.revert_candidate_commit:
+        raise PromotionContractError("revert_pr_commit_mismatch")
+    if pull_request.head_tree != snapshot.expected_restored_tree:
+        raise PromotionContractError("revert_pr_tree_mismatch")
+    return pull_request
+
+
 def reconcile_revert(snapshot: RevertSnapshot) -> PromotionDecision:
     """Choose one exact-revert action, reconciling existing work before creating it."""
-    if snapshot.reverted_commit is not None:
-        return PromotionDecision(
-            "record_reverted", "exact_revert_reconciled", merge_commit=snapshot.reverted_commit
-        )
     if not snapshot.hard_failure:
+        if (
+            snapshot.revert_pull_request is not None
+            or snapshot.revert_candidate_commit is not None
+            or snapshot.reverted_commit is not None
+        ):
+            raise PromotionContractError("revert_without_hard_failure")
         return PromotionDecision("continue_soak", "no_hard_failure")
+    if snapshot.reverted_commit is not None:
+        pull_request = _verify_revert_pull_request(snapshot)
+        if pull_request.state != "MERGED":
+            raise PromotionContractError("revert_pr_not_merged")
+        if pull_request.merge_commit != snapshot.reverted_commit:
+            raise PromotionContractError("revert_merge_commit_mismatch")
+        if pull_request.merge_tree != snapshot.expected_restored_tree:
+            raise PromotionContractError("revert_merge_tree_mismatch")
+        if snapshot.production_commit != snapshot.reverted_commit:
+            raise PromotionContractError("revert_production_commit_mismatch")
+        if snapshot.production_tree != snapshot.expected_restored_tree:
+            raise PromotionContractError("revert_production_tree_mismatch")
+        return PromotionDecision(
+            "record_reverted",
+            "exact_revert_reconciled",
+            merge_commit=snapshot.reverted_commit,
+        )
+    if snapshot.production_commit != snapshot.merge_commit:
+        raise PromotionContractError("revert_production_identity_mismatch")
     if snapshot.revert_pull_request is not None:
-        pull_request = snapshot.revert_pull_request
-        if pull_request.base_branch != "main":
-            raise PromotionContractError("revert_pr_base_mismatch")
-        if pull_request.head_branch != f"revert/{snapshot.promotion_id}":
-            raise PromotionContractError("revert_pr_head_mismatch")
-        if snapshot.revert_candidate_commit is None:
-            raise PromotionContractError("revert_candidate_identity_missing")
-        if pull_request.head_commit != snapshot.revert_candidate_commit:
-            raise PromotionContractError("revert_pr_commit_mismatch")
+        pull_request = _verify_revert_pull_request(snapshot)
         return PromotionDecision(
             "await_revert",
             "revert_pull_request_exists",

@@ -297,6 +297,8 @@ def verify_protected_validation(
     for name, error in identity_errors:
         if getattr(receipt, name) != getattr(expected, name):
             raise PromotionContractError(error)
+    if now < _parse_utc("created_at", receipt.created_at):
+        raise PromotionContractError("protected_receipt_not_yet_valid")
     if now > _parse_utc("expires_at", receipt.expires_at):
         raise PromotionContractError("protected_receipt_expired")
     if receipt.decision != "pass":

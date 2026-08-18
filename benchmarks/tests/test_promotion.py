@@ -161,6 +161,23 @@ def test_expired_receipt_fails_closed() -> None:
         )
 
 
+def test_future_created_receipt_fails_closed() -> None:
+    future = replace(
+        receipt(),
+        created_at="2026-08-18T14:00:00Z",
+        expires_at="2026-08-18T20:00:00Z",
+    )
+    envelope, public_key = signed(future)
+
+    with pytest.raises(PromotionContractError, match="protected_receipt_not_yet_valid"):
+        verify_protected_validation(
+            envelope,
+            public_key_pem=public_key,
+            expected=expectation(),
+            now=datetime(2026, 8, 18, 13, tzinfo=UTC),
+        )
+
+
 @pytest.mark.parametrize(
     ("change", "error"),
     [

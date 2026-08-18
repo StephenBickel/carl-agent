@@ -122,6 +122,12 @@ def evaluate_promotion_health(
             findings.append(f"automation_completion_in_future:{automation.automation_id}")
         if started is not None and completed is not None and completed < started:
             findings.append(f"automation_completion_precedes_start:{automation.automation_id}")
+        if (
+            automation.last_outcome == "running"
+            and started is not None
+            and now - started > threshold
+        ):
+            findings.append(f"automation_running_overdue:{automation.automation_id}")
         if completed is None or now - completed > threshold:
             findings.append(f"{code}:{automation.automation_id}")
         if automation.last_outcome == "failed":

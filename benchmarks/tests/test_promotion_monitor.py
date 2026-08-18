@@ -162,3 +162,33 @@ def test_revert_start_before_hard_failure_is_critical() -> None:
     )
 
     assert "revert_precedes_hard_failure" in report.findings
+
+
+def test_running_watchdog_beyond_its_cadence_timeout_is_critical() -> None:
+    stuck = replace(
+        snapshot().automations[1],
+        last_started_at="2026-08-18T13:59:59Z",
+        last_completed_at="2026-08-18T17:00:00Z",
+        last_outcome="running",
+    )
+
+    report = evaluate_promotion_health(
+        replace(snapshot(), automations=(observation(), stuck)), now=NOW
+    )
+
+    assert "automation_running_overdue:carl-promotion-watchdog" in report.findings
+
+
+def test_recently_started_watchdog_is_not_overdue() -> None:
+    running = replace(
+        snapshot().automations[1],
+        last_started_at="2026-08-18T16:30:00Z",
+        last_completed_at="2026-08-18T17:00:00Z",
+        last_outcome="running",
+    )
+
+    report = evaluate_promotion_health(
+        replace(snapshot(), automations=(observation(), running)), now=NOW
+    )
+
+    assert "automation_running_overdue:carl-promotion-watchdog" not in report.findings
