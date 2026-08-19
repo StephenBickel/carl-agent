@@ -1,0 +1,185 @@
+name: Autonomous improvement evidence
+
+"on":
+  workflow_dispatch:
+    inputs:
+      experiment_digest:
+        description: Immutable experiment manifest SHA-256
+        required: true
+        type: string
+      parent_commit:
+        description: Exact parent commit
+        required: true
+        type: string
+      candidate_commit:
+        description: Exact candidate commit
+        required: true
+        type: string
+      task_set_digest:
+        description: Immutable task-set SHA-256
+        required: true
+        type: string
+      metric_pack_digest:
+        description: Immutable metric-pack SHA-256
+        required: true
+        type: string
+      policy_digest:
+        description: Immutable policy SHA-256
+        required: true
+        type: string
+      request_digest:
+        description: Canonical cloud request SHA-256
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: autonomous-improvement-${{ inputs.request_digest }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Autonomous improvement evidence
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Validate immutable dispatch
+        env:
+          CANDIDATE_COMMIT: ${{ inputs.candidate_commit }}
+          EXPERIMENT_DIGEST: ${{ inputs.experiment_digest }}
+          METRIC_PACK_DIGEST: ${{ inputs.metric_pack_digest }}
+          PARENT_COMMIT: ${{ inputs.parent_commit }}
+          POLICY_DIGEST: ${{ inputs.policy_digest }}
+          REPOSITORY: ${{ github.repository }}
+          REQUEST_DIGEST: ${{ inputs.request_digest }}
+          TASK_SET_DIGEST: ${{ inputs.task_set_digest }}
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import re
+
+          digest = re.compile(r"[0-9a-f]{64}\Z")
+          commit = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
+          for name in (
+              "EXPERIMENT_DIGEST",
+              "METRIC_PACK_DIGEST",
+              "POLICY_DIGEST",
+              "REQUEST_DIGEST",
+              "TASK_SET_DIGEST",
+          ):
+              if not digest.fullmatch(os.environ[name]):
+                  raise SystemExit(f"invalid {name.lower()}")
+          for name in ("PARENT_COMMIT", "CANDIDATE_COMMIT"):
+              if not commit.fullmatch(os.environ[name]):
+                  raise SystemExit(f"invalid {name.lower()}")
+          payload = {
+              "candidate_commit": os.environ["CANDIDATE_COMMIT"],
+              "experiment_digest": os.environ["EXPERIMENT_DIGEST"],
+              "metric_pack_digest": os.environ["METRIC_PACK_DIGEST"],
+              "parent_commit": os.environ["PARENT_COMMIT"],
+              "policy_digest": os.environ["POLICY_DIGEST"],
+              "repository": os.environ["REPOSITORY"],
+              "schema_version": 1,
+              "task_set_digest": os.environ["TASK_SET_DIGEST"],
+              "workflow_file": "autonomous-improvement.yml",
+          }
+          encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+          if hashlib.sha256(encoded).hexdigest() != os.environ["REQUEST_DIGEST"]:
+              raise SystemExit("request_digest mismatch")
+          PY
+      - name: Check out the exact candidate
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.candidate_commit }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify exact parent and candidate binding
+        env:
+          CANDIDATE_COMMIT: ${{ inputs.candidate_commit }}
+          PARENT_COMMIT: ${{ inputs.parent_commit }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_COMMIT"
+          git cat-file -e "$PARENT_COMMIT^{commit}"
+          git merge-base --is-ancestor "$PARENT_COMMIT" "$CANDIDATE_COMMIT"
+      - name: Install the pinned Rust toolchain
+        run: |
+          rustup toolchain install 1.97.0 --profile minimal --component clippy --component rustfmt --no-self-update
+          rustup override set 1.97.0
+          cargo fetch --locked
+      - name: Install pinned uv and Python
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          version: "0.10.4"
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: benchmarks/uv.lock
+          cache-local-path: ~/.cache/uv
+          cache-python: false
+      - name: Install locked Python dependencies
+        run: uv sync --project benchmarks --python 3.12 --locked
+      - name: Run deterministic repository suites
+        run: |
+          cargo test --locked --test workflow_contract --test docs_contract
+          uv run --offline --project benchmarks --locked pytest -q benchmarks/tests
+      - name: Run paired evaluation suites
+        run: |
+          uv run --offline --project benchmarks --locked pytest -q benchmarks/tests/test_report.py -k comparison
+          ./scripts/benchmark-smoke.sh
+      - name: Write bounded immutable evidence
+        env:
+          CANDIDATE_COMMIT: ${{ inputs.candidate_commit }}
+          EXPERIMENT_DIGEST: ${{ inputs.experiment_digest }}
+          METRIC_PACK_DIGEST: ${{ inputs.metric_pack_digest }}
+          PARENT_COMMIT: ${{ inputs.parent_commit }}
+          POLICY_DIGEST: ${{ inputs.policy_digest }}
+          REPOSITORY: ${{ github.repository }}
+          REQUEST_DIGEST: ${{ inputs.request_digest }}
+          TASK_SET_DIGEST: ${{ inputs.task_set_digest }}
+        run: |
+          mkdir -p cloud-evidence
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+          import subprocess
+
+          evidence = {
+              "candidate_commit": os.environ["CANDIDATE_COMMIT"],
+              "deterministic_suite": "passed",
+              "experiment_digest": os.environ["EXPERIMENT_DIGEST"],
+              "head_sha": subprocess.check_output(
+                  ["git", "rev-parse", "HEAD"], text=True
+              ).strip(),
+              "kind": "autonomous_improvement_evidence",
+              "metric_pack_digest": os.environ["METRIC_PACK_DIGEST"],
+              "paired_suite": "passed",
+              "parent_commit": os.environ["PARENT_COMMIT"],
+              "policy_digest": os.environ["POLICY_DIGEST"],
+              "repository": os.environ["REPOSITORY"],
+              "request_digest": os.environ["REQUEST_DIGEST"],
+              "schema_version": 1,
+              "task_set_digest": os.environ["TASK_SET_DIGEST"],
+              "workflow_file": "autonomous-improvement.yml",
+          }
+          target = pathlib.Path("cloud-evidence/autonomous-improvement.json")
+          target.write_text(
+              json.dumps(evidence, sort_keys=True, separators=(",", ":")) + "\n",
+              encoding="utf-8",
+          )
+          if target.stat().st_size > 1_048_576:
+              raise SystemExit("evidence exceeds bound")
+          PY
+      - name: Upload bounded improvement evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: autonomous-improvement-evidence-${{ inputs.request_digest }}
+          path: cloud-evidence/autonomous-improvement.json
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 9
+          overwrite: false
+          include-hidden-files: false

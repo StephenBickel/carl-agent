@@ -1,0 +1,180 @@
+name: Autonomous soak observation
+
+"on":
+  workflow_dispatch:
+    inputs:
+      experiment_digest:
+        description: Immutable experiment manifest SHA-256
+        required: true
+        type: string
+      parent_commit:
+        description: Exact pre-merge parent commit
+        required: true
+        type: string
+      candidate_commit:
+        description: Exact merge commit to observe
+        required: true
+        type: string
+      task_set_digest:
+        description: Immutable health task-set SHA-256
+        required: true
+        type: string
+      metric_pack_digest:
+        description: Immutable health metric-pack SHA-256
+        required: true
+        type: string
+      policy_digest:
+        description: Immutable soak policy SHA-256
+        required: true
+        type: string
+      request_digest:
+        description: Canonical cloud request SHA-256
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: autonomous-soak-${{ inputs.request_digest }}
+  cancel-in-progress: false
+
+jobs:
+  observe:
+    name: Autonomous soak observation
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Validate immutable dispatch
+        env:
+          CANDIDATE_COMMIT: ${{ inputs.candidate_commit }}
+          EXPERIMENT_DIGEST: ${{ inputs.experiment_digest }}
+          METRIC_PACK_DIGEST: ${{ inputs.metric_pack_digest }}
+          PARENT_COMMIT: ${{ inputs.parent_commit }}
+          POLICY_DIGEST: ${{ inputs.policy_digest }}
+          REPOSITORY: ${{ github.repository }}
+          REQUEST_DIGEST: ${{ inputs.request_digest }}
+          TASK_SET_DIGEST: ${{ inputs.task_set_digest }}
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import re
+
+          digest = re.compile(r"[0-9a-f]{64}\Z")
+          commit = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
+          for name in (
+              "EXPERIMENT_DIGEST",
+              "METRIC_PACK_DIGEST",
+              "POLICY_DIGEST",
+              "REQUEST_DIGEST",
+              "TASK_SET_DIGEST",
+          ):
+              if not digest.fullmatch(os.environ[name]):
+                  raise SystemExit(f"invalid {name.lower()}")
+          for name in ("PARENT_COMMIT", "CANDIDATE_COMMIT"):
+              if not commit.fullmatch(os.environ[name]):
+                  raise SystemExit(f"invalid {name.lower()}")
+          payload = {
+              "candidate_commit": os.environ["CANDIDATE_COMMIT"],
+              "experiment_digest": os.environ["EXPERIMENT_DIGEST"],
+              "metric_pack_digest": os.environ["METRIC_PACK_DIGEST"],
+              "parent_commit": os.environ["PARENT_COMMIT"],
+              "policy_digest": os.environ["POLICY_DIGEST"],
+              "repository": os.environ["REPOSITORY"],
+              "schema_version": 1,
+              "task_set_digest": os.environ["TASK_SET_DIGEST"],
+              "workflow_file": "autonomous-soak.yml",
+          }
+          encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+          if hashlib.sha256(encoded).hexdigest() != os.environ["REQUEST_DIGEST"]:
+              raise SystemExit("request_digest mismatch")
+          PY
+      - name: Check out the exact merge commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.candidate_commit }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify exact merge binding
+        env:
+          MERGE_COMMIT: ${{ inputs.candidate_commit }}
+          PARENT_COMMIT: ${{ inputs.parent_commit }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$MERGE_COMMIT"
+          git cat-file -e "$PARENT_COMMIT^{commit}"
+          git merge-base --is-ancestor "$PARENT_COMMIT" "$MERGE_COMMIT"
+      - name: Install the pinned Rust toolchain
+        run: |
+          rustup toolchain install 1.97.0 --profile minimal --component clippy --component rustfmt --no-self-update
+          rustup override set 1.97.0
+          cargo fetch --locked
+      - name: Install pinned uv and Python
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          version: "0.10.4"
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: benchmarks/uv.lock
+          cache-local-path: ~/.cache/uv
+          cache-python: false
+      - name: Install locked Python dependencies
+        run: uv sync --project benchmarks --python 3.12 --locked
+      - name: Run repository health probes
+        run: |
+          cargo test --locked --test workflow_contract --test docs_contract
+          uv run --offline --project benchmarks --locked pytest -q benchmarks/tests/test_integration_contract.py benchmarks/tests/test_cloud_execution.py
+      - name: Write bounded merge observation
+        env:
+          EXPERIMENT_DIGEST: ${{ inputs.experiment_digest }}
+          MERGE_COMMIT: ${{ inputs.candidate_commit }}
+          METRIC_PACK_DIGEST: ${{ inputs.metric_pack_digest }}
+          PARENT_COMMIT: ${{ inputs.parent_commit }}
+          POLICY_DIGEST: ${{ inputs.policy_digest }}
+          REPOSITORY: ${{ github.repository }}
+          REQUEST_DIGEST: ${{ inputs.request_digest }}
+          TASK_SET_DIGEST: ${{ inputs.task_set_digest }}
+        run: |
+          mkdir -p cloud-evidence
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+          import subprocess
+
+          evidence = {
+              "experiment_digest": os.environ["EXPERIMENT_DIGEST"],
+              "head_sha": subprocess.check_output(
+                  ["git", "rev-parse", "HEAD"], text=True
+              ).strip(),
+              "health_probes": "passed",
+              "kind": "autonomous_soak_observation",
+              "merge_commit": os.environ["MERGE_COMMIT"],
+              "metric_pack_digest": os.environ["METRIC_PACK_DIGEST"],
+              "parent_commit": os.environ["PARENT_COMMIT"],
+              "policy_digest": os.environ["POLICY_DIGEST"],
+              "repository": os.environ["REPOSITORY"],
+              "request_digest": os.environ["REQUEST_DIGEST"],
+              "schema_version": 1,
+              "task_set_digest": os.environ["TASK_SET_DIGEST"],
+              "workflow_file": "autonomous-soak.yml",
+          }
+          target = pathlib.Path("cloud-evidence/autonomous-soak.json")
+          target.write_text(
+              json.dumps(evidence, sort_keys=True, separators=(",", ":")) + "\n",
+              encoding="utf-8",
+          )
+          if target.stat().st_size > 1_048_576:
+              raise SystemExit("observation exceeds bound")
+          PY
+      - name: Upload bounded soak observation
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: autonomous-soak-observation-${{ inputs.request_digest }}
+          path: cloud-evidence/autonomous-soak.json
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 9
+          overwrite: false
+          include-hidden-files: false
