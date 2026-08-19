@@ -78,6 +78,8 @@ def outcome(
             "guard-task": "2" * 64,
             "held-out-task": "3" * 64,
             "fixture-probe-task": "4" * 64,
+            "unclaimed-task": "5" * 64,
+            "unit-contract-task": "6" * 64,
         }[task_id],
         evaluator_digest=evaluator_digest,
         score_basis_points=score_basis_points,
@@ -162,6 +164,15 @@ def test_aggregate_gain_cannot_hide_one_task_regression() -> None:
     assert "aggregate_hides_task_regression" in report.reasons
 
 
+def test_unclaimed_identity_matched_task_regression_is_rejected() -> None:
+    baseline = (*baseline_outcomes(), outcome("unclaimed-task", 8_000))
+    candidate = (*improved_outcomes(), outcome("unclaimed-task", 7_999))
+
+    report = evaluate_capability_validation(claim(), baseline, candidate, ())
+
+    assert "aggregate_hides_task_regression" in report.reasons
+
+
 def test_public_score_only_gain_requires_held_out_transfer() -> None:
     candidate = tuple(
         replace(item, score_basis_points=6_000)
@@ -221,6 +232,43 @@ def test_failed_fixture_probe_detects_hard_coding() -> None:
     assert "hard_coded_fixture_detected" in report.reasons
 
 
+def test_held_out_transfer_below_preregistered_threshold_is_rejected() -> None:
+    high_threshold = replace(
+        claim(),
+        transfer_checks=(
+            claim().transfer_checks[0],
+            transfer_check(minimum_candidate_basis_points=7_000),
+        ),
+    )
+
+    report = evaluate_capability_validation(
+        high_threshold, baseline_outcomes(), improved_outcomes(), ()
+    )
+
+    assert "transfer_check_threshold_not_met" in report.reasons
+
+
+def test_unit_contract_below_preregistered_threshold_is_rejected() -> None:
+    with_unit_contract = replace(
+        claim(),
+        transfer_checks=(
+            *claim().transfer_checks,
+            transfer_check(
+                "unit-contract",
+                "unit-contract-task",
+                check_type="unit_contract",
+                minimum_candidate_basis_points=9_000,
+            ),
+        ),
+    )
+    baseline = (*baseline_outcomes(), outcome("unit-contract-task", 8_000))
+    candidate = (*improved_outcomes(), outcome("unit-contract-task", 8_000))
+
+    report = evaluate_capability_validation(with_unit_contract, baseline, candidate, ())
+
+    assert "transfer_check_threshold_not_met" in report.reasons
+
+
 def test_missing_transfer_check_and_changed_identity_fail_closed() -> None:
     no_transfer = replace(claim(), transfer_checks=(claim().transfer_checks[0],))
     changed_identity = tuple(
@@ -239,6 +287,26 @@ def test_missing_transfer_check_and_changed_identity_fail_closed() -> None:
 
     assert "held_out_transfer_required" in no_transfer_report.reasons
     assert "evaluation_identity_changed" in identity_report.reasons
+
+
+def test_adversarial_only_transfer_evidence_does_not_satisfy_held_out_requirement() -> None:
+    adversarial_only = replace(
+        claim(),
+        transfer_checks=(
+            transfer_check(
+                "adversarial-transfer",
+                "held-out-task",
+                check_type="adversarial",
+            ),
+            claim().transfer_checks[0],
+        ),
+    )
+
+    report = evaluate_capability_validation(
+        adversarial_only, baseline_outcomes(), improved_outcomes(), ()
+    )
+
+    assert "held_out_transfer_required" in report.reasons
 
 
 def test_incomplete_trial_accounting_and_guard_regression_fail_closed() -> None:

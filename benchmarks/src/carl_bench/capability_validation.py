@@ -285,10 +285,7 @@ def evaluate_capability_validation(
     if any(_active_evaluator_path(path) for path in changed_paths):
         reasons.add("active_evaluator_modified")
 
-    behavioral_checks = tuple(
-        item for item in claim.transfer_checks if item.check_type in _BEHAVIORAL_TRANSFER_TYPES
-    )
-    if not behavioral_checks:
+    if not any(item.check_type == "held_out" for item in claim.transfer_checks):
         reasons.add("held_out_transfer_required")
 
     required_ids = set(claim.affected_task_ids) | set(claim.guard_task_ids) | {
@@ -312,6 +309,8 @@ def evaluate_capability_validation(
             reasons.add("incomplete_trial_accounting")
         if not set(before.failed_trials) <= set(after.valid_trials):
             reasons.add("selective_retry_detected")
+        if after.score_basis_points < before.score_basis_points:
+            reasons.add("aggregate_hides_task_regression")
 
     affected_pairs = tuple(
         (baseline_by_id[task_id], candidate_by_id[task_id])
@@ -325,11 +324,6 @@ def evaluate_capability_validation(
             after.score_basis_points > before.score_basis_points
             for before, after in affected_pairs
         )
-        if any(
-            after.score_basis_points < before.score_basis_points
-            for before, after in affected_pairs
-        ):
-            reasons.add("aggregate_hides_task_regression")
 
     guard_pairs = tuple(
         (baseline_by_id[task_id], candidate_by_id[task_id])
@@ -355,13 +349,11 @@ def evaluate_capability_validation(
             reasons.add("evaluation_identity_changed")
         if check.check_type in _BEHAVIORAL_TRANSFER_TYPES:
             transfer_deltas.append(after.score_basis_points - before.score_basis_points)
-            if after.score_basis_points < before.score_basis_points:
-                reasons.add("aggregate_hides_task_regression")
-        if (
-            check.check_type == "fixture_probe"
-            and after.score_basis_points < check.minimum_candidate_basis_points
-        ):
-            reasons.add("hard_coded_fixture_detected")
+        if after.score_basis_points < check.minimum_candidate_basis_points:
+            if check.check_type == "fixture_probe":
+                reasons.add("hard_coded_fixture_detected")
+            else:
+                reasons.add("transfer_check_threshold_not_met")
 
     transfer_gain = sum(transfer_deltas) // len(transfer_deltas) if transfer_deltas else 0
     contract_exception = (
