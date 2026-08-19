@@ -133,6 +133,7 @@ def publish_experimental_branch(
         "-C",
         str(repository),
         "push",
+        f"--force-with-lease={decision.ref}:",
         remote,
         f"{decision.candidate_commit}:{decision.ref}",
     )

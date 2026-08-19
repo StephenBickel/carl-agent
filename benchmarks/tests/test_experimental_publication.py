@@ -6,13 +6,16 @@ import subprocess
 from dataclasses import replace
 from pathlib import Path
 
+import pytest
 from test_candidate_git import _repository
 from test_experiment import manifest, sealed_candidate
 
 from carl_bench import cli
 from carl_bench.capability_validation import CapabilityValidationReport
 from carl_bench.experimental_publication import (
+    ExperimentalPublicationError,
     ExperimentalPublicationRequest,
+    publish_experimental_branch,
     reconcile_experimental_publication,
 )
 from carl_bench.ledger import ExperimentLedger
@@ -220,9 +223,10 @@ def test_publish_cli_records_one_immutable_branch_without_protected_validation(
     assert remote_main == parent
     assert json.loads(result.read_text(encoding="utf-8"))["tree"] == candidate_tree
     assert any(
-        command[-3:]
+        command[-4:]
         == [
             "push",
+            f"--force-with-lease=refs/heads/experimental/{selected.experiment_id}:",
             "origin",
             f"{candidate_commit}:refs/heads/experimental/{selected.experiment_id}",
         ]
@@ -233,3 +237,84 @@ def test_publish_cli_records_one_immutable_branch_without_protected_validation(
     assert ExperimentLedger(ledger_path).autonomy_projection(
         selected.experiment_id
     ).protected_validation is None
+
+
+def test_create_only_push_never_fast_forwards_a_ref_created_after_the_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository, origin, parent = _repository(tmp_path)
+    selected = replace(manifest(), experiment_id="exp-publication-race-001", parent_commit=parent)
+    candidate_file = repository / "src" / "runtime" / "task" / "value.txt"
+    candidate_file.write_text("candidate after concurrent ref\n", encoding="utf-8")
+    subprocess.run(("git", "add", "--all"), cwd=repository, check=True)
+    subprocess.run(
+        ("git", "commit", "-m", "candidate after concurrent ref"), cwd=repository, check=True
+    )
+    candidate_commit = subprocess.run(
+        ("git", "rev-parse", "HEAD"),
+        cwd=repository,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    candidate_tree = subprocess.run(
+        ("git", "rev-parse", "HEAD^{tree}"),
+        cwd=repository,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    request = ExperimentalPublicationRequest(
+        experiment_id=selected.experiment_id,
+        branch=f"experimental/{selected.experiment_id}",
+        candidate_packet=replace(
+            sealed_candidate(),
+            experiment_id=selected.experiment_id,
+            manifest_digest=selected.digest,
+            parent_commit=parent,
+            candidate_commit=candidate_commit,
+        ),
+        candidate_tree=candidate_tree,
+        capability_report=_report(),
+    )
+    ref = f"refs/heads/experimental/{selected.experiment_id}"
+    marker = tmp_path / "racer-ran"
+    fake_git = tmp_path / "racing-git.py"
+    fake_git.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os, subprocess, sys\n"
+        "if 'push' in sys.argv[1:] and not os.path.exists(os.environ['CARL_RACE_MARKER']):\n"
+        "    open(os.environ['CARL_RACE_MARKER'], 'x').close()\n"
+        "    subprocess.run([\n"
+        "        os.environ['CARL_TEST_REAL_GIT'], '-C', os.environ['CARL_RACE_REPOSITORY'],\n"
+        "        'push', 'origin',\n"
+        "        os.environ['CARL_RACE_COMMIT'] + ':' + os.environ['CARL_RACE_REF'],\n"
+        "    ], check=True)\n"
+        "result = subprocess.run([os.environ['CARL_TEST_REAL_GIT'], *sys.argv[1:]])\n"
+        "raise SystemExit(result.returncode)\n",
+        encoding="utf-8",
+    )
+    fake_git.chmod(0o700)
+    monkeypatch.setenv("CARL_TEST_REAL_GIT", "/usr/bin/git")
+    monkeypatch.setenv("CARL_RACE_MARKER", os.fspath(marker))
+    monkeypatch.setenv("CARL_RACE_REPOSITORY", os.fspath(repository))
+    monkeypatch.setenv("CARL_RACE_COMMIT", parent)
+    monkeypatch.setenv("CARL_RACE_REF", ref)
+
+    with pytest.raises(ExperimentalPublicationError, match="experimental_git_failed"):
+        publish_experimental_branch(
+            request,
+            repository=repository,
+            remote="origin",
+            git_executable=fake_git,
+        )
+
+    remote_commit = subprocess.run(
+        ("git", "ls-remote", "origin", ref),
+        cwd=repository,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.split()[0]
+    assert marker.exists()
+    assert remote_commit == parent
