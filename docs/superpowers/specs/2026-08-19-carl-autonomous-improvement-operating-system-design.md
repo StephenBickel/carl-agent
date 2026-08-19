@@ -1,6 +1,6 @@
 # Carl Autonomous Improvement Operating System Design
 
-Status: approved architecture, pending written-spec review
+Status: approved for implementation
 Date: 2026-08-19
 Decision owner: Stephen Bickel
 
@@ -122,11 +122,42 @@ Replaces the noisy two-hour watchdog with an event-focused recovery controller.
   accepted soaks, reverts, and retained learnings.
 - Produces one concise progress item; watchdog run count is not a success metric.
 
-### 5. Weekly product report
+### 5. Autonomous loop supervisor
+
+- Uses the strongest available coding model at its highest supported reasoning effort.
+- Runs after a critical outcome finding, after repeated failed recovery, or on a bounded daily
+  commissioning cadence while the factory is not yet healthy. It does not wake for healthy idle
+  watchdog ticks.
+- Reconstructs the end-to-end state from source evidence, diagnoses prompt, code, credential,
+  environment, evaluation, and GitHub-control failures, and makes routine reversible repairs within
+  the already-approved autonomy policy.
+- May rewrite operational automation prompts when they contradict this design, repair durable
+  orchestration state, rerun commissioning tests, and redispatch the exact next safe node.
+- It may not weaken product or production gates, edit candidate evidence, expose secrets, directly
+  push `main`, force-push, deploy, or release.
+- A supervisor run is successful only when it restores a progressing state or records a concrete
+  externally impossible boundary. Repeating a diagnosis without a changed action is a failure.
+
+### 6. Weekly product report
 
 - Summarizes user-visible experimental and production changes, evidence, commits, PRs, soaks,
   reverts, and next hypotheses.
 - Omits repetitive controller ticks unless they represent an incident or recovery.
+
+## Public project framing
+
+The repository README and contributor-facing documentation describe Carl as a self-improving
+project operated by this graph-engineering loop. The description names the autonomous builder,
+independent validator, protected promoter, soak/revert controller, and loop supervisor. It links to
+the responsibility graph and explains that routine experimental pushes, production PR promotion,
+evaluation, recovery, and rollback require no human approval.
+
+Public claims must remain verifiable. Before commissioning succeeds, the README labels the factory
+as commissioning and distinguishes autonomous infrastructure from proven autonomous product
+promotion. After the first end-to-end live acceptance, the supervisor may update the status to
+operational with exact experimental branch, PR, production commit, and accepted-soak evidence. The
+README must never claim that all updates are autonomous when Git history shows otherwise; it states
+which update stream is autonomous and preserves provenance for manual historical commits.
 
 ## Durable state and ownership
 
@@ -186,6 +217,27 @@ Experimental publication requires:
 - independent code review and security review;
 - a complete durable candidate packet.
 
+### Capability validity and anti-gaming
+
+The loop optimizes for transferable Carl capability and user outcomes, not benchmark score alone.
+
+- Primary hypotheses describe an observable user or system behavior before metrics are selected.
+- Every experiment includes at least one held-out or adversarial transfer check not edited by the
+  candidate mutation owner.
+- Candidate code cannot modify active tasks, expected outputs, graders, metric packs, thresholds,
+  review instructions, or protected evaluation infrastructure in the same experiment.
+- Evaluation reports task-level outcomes, invalid attempts, regressions, latency, cost, and safety;
+  aggregate score improvements cannot hide degraded tasks or removed coverage.
+- Deterministic unit tests prove contracts but cannot alone establish a capability improvement.
+- Benchmark-only changes are ineligible unless the benchmark itself is the product defect and the
+  experiment separately proves a user-relevant transfer outcome.
+- The validator probes for overfitting, hard-coded fixtures, test detection, selective retries,
+  narrowed inputs, altered defaults, and metric manipulation before promotion.
+- After merge, soak observations include real repository and workflow health. When available,
+  privacy-safe production behavior is compared with the preregistered claim.
+- Repeated metric gains without transferred behavioral gains terminalize the hypothesis as
+  benchmark gaming and force a different product target.
+
 Production promotion additionally requires:
 
 - independent reproduction from a clean checkout;
@@ -212,6 +264,10 @@ The synthetic exercise must prove:
 6. an injected hard regression creates one exact revert PR and restores the preceding tree;
 7. stale leases and infrastructure failures schedule changed retry actions;
 8. idle watchdog ticks do not create repeated progress reports.
+9. a deliberately benchmark-gamed candidate is rejected despite a higher public score;
+10. the loop supervisor repairs an injected orchestration failure and redispatches the blocked
+    state without human action;
+11. README commissioning/operational claims match exact durable and GitHub evidence.
 
 The first live acceptance criterion is one real, user-relevant Carl improvement that moves through
 baseline, implementation, paired evaluation, experimental push, independent review, protected PR,
@@ -220,11 +276,14 @@ factory as commissioning rather than healthy.
 
 ## Rollout
 
-1. Rewrite all five automation prompts around these responsibilities and remove the publication
+1. Rewrite the existing automation prompts around these responsibilities, add the loop supervisor,
+   and remove the publication
    deadlock.
 2. Reduce idle watchdog reporting and make recovery conditional on active durable work.
 3. Add durable retry and throughput fields required by the state machine.
 4. Run focused contract tests for prompt invariants and deterministic controller logic.
 5. Run the synthetic lifecycle and repair every failed stage.
 6. Dispatch one bounded real product experiment and follow it through GitHub and soak.
-7. Declare the factory healthy only after the live acceptance criterion passes.
+7. Update README and contributor-facing documentation with commissioning evidence.
+8. Declare the factory healthy and update README status only after the live acceptance criterion
+   passes.
