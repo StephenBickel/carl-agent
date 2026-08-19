@@ -134,6 +134,24 @@ class EventType(str, Enum):
     DRAFT_PR_REQUESTED = "draft_pr_requested"
     DRAFT_PR_RECORDED = "draft_pr_recorded"
     WORKSPACE_DISPOSED = "workspace_disposed"
+    RETRY_SCHEDULED = "retry_scheduled"
+    EXPERIMENTAL_PUBLISHED = "experimental_published"
+    PROTECTED_VALIDATION_RECORDED = "protected_validation_recorded"
+    PROMOTION_RECORDED = "promotion_recorded"
+    SOAK_OBSERVED = "soak_observed"
+    REVERT_RECORDED = "revert_recorded"
+
+
+_AUTONOMY_EVENT_TYPES = frozenset(
+    {
+        EventType.RETRY_SCHEDULED,
+        EventType.EXPERIMENTAL_PUBLISHED,
+        EventType.PROTECTED_VALIDATION_RECORDED,
+        EventType.PROMOTION_RECORDED,
+        EventType.SOAK_OBSERVED,
+        EventType.REVERT_RECORDED,
+    }
+)
 
 
 _ISOLATED_AUTHORITY_REQUIRED_EVENTS = frozenset(
@@ -144,6 +162,10 @@ _ISOLATED_AUTHORITY_REQUIRED_EVENTS = frozenset(
         EventType.DRAFT_PR_REQUESTED,
         EventType.DRAFT_PR_RECORDED,
         EventType.WORKSPACE_DISPOSED,
+        EventType.PROTECTED_VALIDATION_RECORDED,
+        EventType.PROMOTION_RECORDED,
+        EventType.SOAK_OBSERVED,
+        EventType.REVERT_RECORDED,
     }
 )
 
@@ -881,6 +903,8 @@ def reduce_events(
     for event in events:
         if event.experiment_id != manifest.experiment_id:
             raise GraphContractError("event_experiment_mismatch")
+        if event.event_type in _AUTONOMY_EVENT_TYPES:
+            continue
         if event.event_type in _ISOLATED_AUTHORITY_REQUIRED_EVENTS:
             raise GraphContractError("isolated_signer_required")
         if _parse_utc(event.occurred_at) < _parse_utc(manifest.registered_at):

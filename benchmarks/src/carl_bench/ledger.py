@@ -12,8 +12,10 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from carl_bench.autonomy import AutonomyProjection, reduce_autonomy_events
 from carl_bench.canonical import canonical_json_bytes
 from carl_bench.experiment import (
+    _ISOLATED_AUTHORITY_REQUIRED_EVENTS,
     EventType,
     ExperimentEvent,
     ExperimentManifest,
@@ -404,8 +406,11 @@ class ExperimentLedger:
                             raise LedgerIntegrityError(error.code) from error
                         if other_projection.lease is not None:
                             raise LedgerIntegrityError("mutable_lease_conflict")
+                if event.event_type in _ISOLATED_AUTHORITY_REQUIRED_EVENTS:
+                    raise LedgerIntegrityError("isolated_signer_required")
                 try:
                     reduce_events(manifest, (*events, event))
+                    reduce_autonomy_events(manifest, (*events, event))
                 except GraphContractError as error:
                     raise LedgerIntegrityError(error.code) from error
                 ordinal = len(events) + 1
@@ -461,6 +466,15 @@ class ExperimentLedger:
             events, _ = self._read_events(connection, manifest)
         try:
             return reduce_events(manifest, events)
+        except GraphContractError as error:
+            raise LedgerIntegrityError(error.code) from error
+
+    def autonomy_projection(self, experiment_id: str) -> AutonomyProjection:
+        with self._connect() as connection:
+            manifest = self._load_manifest(connection, experiment_id)
+            events, _ = self._read_events(connection, manifest)
+        try:
+            return reduce_autonomy_events(manifest, events)
         except GraphContractError as error:
             raise LedgerIntegrityError(error.code) from error
 

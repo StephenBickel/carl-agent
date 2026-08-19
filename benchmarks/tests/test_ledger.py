@@ -162,6 +162,27 @@ def test_hash_chain_tampering_blocks_projection_and_future_append(tmp_path: Path
         )
 
 
+def test_unknown_ledger_event_types_remain_rejected(tmp_path: Path) -> None:
+    path = tmp_path / "ledger.sqlite3"
+    ledger = ExperimentLedger(path)
+    ledger.register_manifest(manifest())
+    ledger.append(
+        transition(
+            attempt="stage-baseline-1",
+            source=ExperimentState.QUEUED,
+            target=ExperimentState.BASELINING,
+            second=1,
+        )
+    )
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "UPDATE experiment_events SET event_type = 'unknown_event' WHERE ordinal = 1"
+        )
+
+    with pytest.raises(LedgerIntegrityError, match="event_contract_invalid"):
+        ledger.projection(manifest().experiment_id)
+
+
 def test_missing_experiment_and_unsafe_existing_file_fail_closed(tmp_path: Path) -> None:
     ledger = ExperimentLedger(tmp_path / "ledger.sqlite3")
     with pytest.raises(LedgerIntegrityError, match="experiment_not_found"):
@@ -213,6 +234,40 @@ def test_event_for_unregistered_experiment_is_rejected(tmp_path: Path) -> None:
     )
     with pytest.raises(LedgerIntegrityError, match="experiment_not_found"):
         ledger.append(event)
+
+
+def test_ledger_replays_autonomy_facts_without_changing_legacy_projection(tmp_path: Path) -> None:
+    ledger = ExperimentLedger(tmp_path / "ledger.sqlite3")
+    ledger.register_manifest(manifest())
+    legacy = transition(
+        attempt="stage-baseline-1",
+        source=ExperimentState.QUEUED,
+        target=ExperimentState.BASELINING,
+        second=1,
+    )
+    retry = ExperimentEvent.create(
+        experiment_id=manifest().experiment_id,
+        stage_attempt_id="retry-cache-1",
+        event_type=EventType.RETRY_SCHEDULED,
+        occurred_at="2026-08-10T12:01:01Z",
+        payload={
+            "attempt": 1,
+            "changed_action": "rebuild the remote cache",
+            "failed_stage_attempt_id": "stage-cache-1",
+            "failure_class": "infrastructure",
+            "scheduled_at": "2026-08-10T12:01:01Z",
+        },
+    )
+
+    ledger.append(legacy)
+    before = ledger.projection(manifest().experiment_id)
+    ledger.append(retry)
+    after = ledger.projection(manifest().experiment_id)
+    autonomy = ledger.autonomy_projection(manifest().experiment_id)
+
+    assert after == before
+    assert autonomy.retry is not None
+    assert autonomy.retry.changed_action == "rebuild the remote cache"
 
 
 def _for_experiment(event: ExperimentEvent, experiment_id: str, attempt: str) -> ExperimentEvent:
