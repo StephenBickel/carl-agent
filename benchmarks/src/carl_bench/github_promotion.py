@@ -165,6 +165,20 @@ class RevertSnapshot:
             _object("reverted_commit", self.reverted_commit)
 
 
+def promotion_lease_reason(
+    snapshot: PromotionSnapshot, promotion_id: str
+) -> str | None:
+    """Return the stable fail-closed reason for unavailable serialized ownership."""
+    if not isinstance(snapshot, PromotionSnapshot):
+        raise PromotionContractError("invalid_promotion_snapshot")
+    _id("promotion_id", promotion_id)
+    if snapshot.active_promotion_id is None:
+        return "promotion_lease_required"
+    if snapshot.active_promotion_id != promotion_id:
+        return "promotion_lease_conflict"
+    return None
+
+
 def _check_decision(
     pull_request: PullRequestSnapshot, required_checks: tuple[str, ...]
 ) -> PromotionDecision | None:
@@ -190,10 +204,9 @@ def reconcile_promotion(
     required_checks: tuple[str, ...],
 ) -> PromotionDecision:
     """Choose one idempotent action without performing GitHub mutations."""
-    if snapshot.active_promotion_id is None:
-        return PromotionDecision("blocked", "promotion_lease_required")
-    if snapshot.active_promotion_id != request.promotion_id:
-        return PromotionDecision("blocked", "promotion_lease_conflict")
+    lease_reason = promotion_lease_reason(snapshot, request.promotion_id)
+    if lease_reason is not None:
+        return PromotionDecision("blocked", lease_reason)
     pull_request = snapshot.pull_request
     if pull_request is None:
         if snapshot.production_commit != request.parent_commit:

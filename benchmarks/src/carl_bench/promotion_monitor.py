@@ -10,6 +10,11 @@ from typing import Any
 from carl_bench.canonical import canonical_json_bytes
 from carl_bench.promotion import PromotionContractError
 
+_CONTROLLER_BLOCKERS = (
+    "mutable_lease_expired_unreconciled",
+    "promotion_receipts_incomplete",
+)
+
 
 def _time(name: str, value: str | None) -> datetime | None:
     if value is None:
@@ -98,6 +103,13 @@ class PromotionHealthReport:
     @property
     def digest(self) -> str:
         return hashlib.sha256(canonical_json_bytes(self.to_canonical_dict())).hexdigest()
+
+
+def promotion_controller_blocker(report: PromotionHealthReport) -> str | None:
+    """Return the stable integrity finding that must freeze controller mutation."""
+    if not isinstance(report, PromotionHealthReport):
+        raise PromotionContractError("invalid_promotion_health_report")
+    return next((finding for finding in _CONTROLLER_BLOCKERS if finding in report.findings), None)
 
 
 def evaluate_promotion_health(
