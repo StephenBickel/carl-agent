@@ -114,9 +114,11 @@ class ProtectedValidationReceipt:
     created_at: str
     expires_at: str
     decision: str
+    capability_report_digest: str | None = None
+    transfer_gain_basis_points: int | None = None
 
     def __post_init__(self) -> None:
-        if self.schema_version != 1:
+        if self.schema_version not in {1, 2}:
             raise PromotionContractError("invalid_protected_receipt_schema")
         _identifier("validation_id", self.validation_id)
         _identifier("experiment_id", self.experiment_id)
@@ -168,13 +170,35 @@ class ProtectedValidationReceipt:
                 raise PromotionContractError(f"invalid_{name}")
         if self.flake_rate_basis_points > 10_000:
             raise PromotionContractError("invalid_flake_rate_basis_points")
+        if self.schema_version == 1:
+            if (
+                self.capability_report_digest is not None
+                or self.transfer_gain_basis_points is not None
+            ):
+                raise PromotionContractError("invalid_protected_receipt_schema")
+        else:
+            _digest("capability_report_digest", self.capability_report_digest)
+            transfer_gain = self.transfer_gain_basis_points
+            if (
+                isinstance(transfer_gain, bool)
+                or not isinstance(transfer_gain, int)
+                or not -10_000 <= transfer_gain <= 10_000
+            ):
+                raise PromotionContractError("invalid_transfer_gain_basis_points")
         created = _parse_utc("created_at", self.created_at)
         expires = _parse_utc("expires_at", self.expires_at)
         if expires <= created:
             raise PromotionContractError("invalid_protected_receipt_window")
 
     def to_canonical_dict(self) -> dict[str, Any]:
-        return {name: getattr(self, name) for name in self.__dataclass_fields__}
+        fields = self.__dataclass_fields__
+        if self.schema_version == 1:
+            fields = {
+                name: field
+                for name, field in fields.items()
+                if name not in {"capability_report_digest", "transfer_gain_basis_points"}
+            }
+        return {name: getattr(self, name) for name in fields}
 
     @property
     def digest(self) -> str:
@@ -218,6 +242,11 @@ class PromotionExpectation:
     model: str
     effort: str
     environment_digest: str
+    capability_report_digest: str | None = None
+    transfer_gain_basis_points: int | None = None
+    capability_claim_type: str | None = None
+    affected_contract_cases_improved: bool | None = None
+    capability_guards_non_inferior: bool | None = None
 
     def __post_init__(self) -> None:
         _identifier("experiment_id", self.experiment_id)
@@ -235,6 +264,36 @@ class PromotionExpectation:
             _object_id(name, getattr(self, name))
         _identifier("model", self.model)
         _identifier("effort", self.effort)
+        capability_values = (
+            self.capability_report_digest,
+            self.transfer_gain_basis_points,
+            self.capability_claim_type,
+            self.affected_contract_cases_improved,
+            self.capability_guards_non_inferior,
+        )
+        if any(value is not None for value in capability_values):
+            if any(value is None for value in capability_values):
+                raise PromotionContractError("invalid_capability_expectation")
+            _digest("capability_report_digest", self.capability_report_digest)
+            transfer_gain = self.transfer_gain_basis_points
+            if (
+                isinstance(transfer_gain, bool)
+                or not isinstance(transfer_gain, int)
+                or not -10_000 <= transfer_gain <= 10_000
+            ):
+                raise PromotionContractError("invalid_transfer_gain_basis_points")
+            if self.capability_claim_type not in {
+                "capability",
+                "compatibility",
+                "correctness",
+            }:
+                raise PromotionContractError("invalid_capability_claim_type")
+            for name in (
+                "affected_contract_cases_improved",
+                "capability_guards_non_inferior",
+            ):
+                if not isinstance(getattr(self, name), bool):
+                    raise PromotionContractError(f"invalid_{name}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -297,6 +356,25 @@ def verify_protected_validation(
     for name, error in identity_errors:
         if getattr(receipt, name) != getattr(expected, name):
             raise PromotionContractError(error)
+    if receipt.schema_version == 1:
+        if expected.capability_report_digest is not None:
+            raise PromotionContractError("protected_capability_report_missing")
+    else:
+        if expected.capability_report_digest is None:
+            raise PromotionContractError("protected_capability_report_missing")
+        if receipt.capability_report_digest != expected.capability_report_digest:
+            raise PromotionContractError("protected_capability_report_mismatch")
+        if expected.transfer_gain_basis_points is None:
+            raise PromotionContractError("protected_transfer_gain_missing")
+        if receipt.transfer_gain_basis_points != expected.transfer_gain_basis_points:
+            raise PromotionContractError("protected_transfer_gain_mismatch")
+        contract_exception = (
+            expected.capability_claim_type in {"compatibility", "correctness"}
+            and expected.affected_contract_cases_improved is True
+            and expected.capability_guards_non_inferior is True
+        )
+        if receipt.transfer_gain_basis_points <= 0 and not contract_exception:
+            raise PromotionContractError("protected_transfer_gain_required")
     if now < _parse_utc("created_at", receipt.created_at):
         raise PromotionContractError("protected_receipt_not_yet_valid")
     if now > _parse_utc("expires_at", receipt.expires_at):
