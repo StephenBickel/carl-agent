@@ -60,6 +60,25 @@ flowchart LR
 
 ## Automation portfolio
 
+## Cloud-first execution
+
+The factory must not consume sustained CPU, memory, or container resources on the owner's Mac.
+GitHub-hosted runners execute repository builds, Rust and Python test suites, paired evaluations,
+protected validation, commissioning fixtures, and production soak probes. Local Codex automations
+are thin control-plane clients: they select or review work, dispatch immutable GitHub workflow
+requests, reconcile signed artifacts and GitHub state, and write concise durable receipts.
+
+No automation may silently fall back to a heavy local Cargo, pytest, benchmark, Docker, Colima, or
+soak workload. If cloud execution is unavailable, it records `cloud_execution_unavailable`, retries
+the remote dispatch with bounded backoff, and leaves the candidate queued. Lightweight local Git,
+GitHub API, ledger, prompt, and receipt verification remains permitted.
+
+Model-driven implementation also moves to a remote Codex execution target when one is configured
+for this repository. Until such a target or an owner-approved cloud model credential exists, the
+local builder may perform model reasoning and bounded source edits but must dispatch all heavy
+verification remotely. The outcome monitor reports this explicitly as `hybrid` rather than claiming
+full cloud execution.
+
 ### 1. Autonomous product builder
 
 Replaces the current daily self-improvement graph as the only product mutation owner.
@@ -268,6 +287,7 @@ The synthetic exercise must prove:
 10. the loop supervisor repairs an injected orchestration failure and redispatches the blocked
     state without human action;
 11. README commissioning/operational claims match exact durable and GitHub evidence.
+12. heavy verification runs on a GitHub-hosted runner and local fallback is rejected.
 
 The first live acceptance criterion is one real, user-relevant Carl improvement that moves through
 baseline, implementation, paired evaluation, experimental push, independent review, protected PR,
