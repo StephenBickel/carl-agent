@@ -25,6 +25,14 @@ from carl_bench.experiment import (
 )
 
 _ZERO_DIGEST = "0" * 64
+_TRUSTED_AUTONOMY_EVENT_TYPES = frozenset(
+    {
+        EventType.PROTECTED_VALIDATION_RECORDED,
+        EventType.PROMOTION_RECORDED,
+        EventType.SOAK_OBSERVED,
+        EventType.REVERT_RECORDED,
+    }
+)
 
 
 class LedgerIntegrityError(ValueError):
@@ -371,6 +379,16 @@ class ExperimentLedger:
         return tuple(events), tuple(chains)
 
     def append(self, event: ExperimentEvent) -> AppendResult:
+        """Append candidate-authority facts without bypassing isolation gates."""
+        return self._append(event, trusted_authority=False)
+
+    def append_trusted_authority(self, event: ExperimentEvent) -> AppendResult:
+        """Append a protected lifecycle fact from the isolated trusted authority."""
+        if event.event_type not in _TRUSTED_AUTONOMY_EVENT_TYPES:
+            raise LedgerIntegrityError("trusted_authority_event_required")
+        return self._append(event, trusted_authority=True)
+
+    def _append(self, event: ExperimentEvent, *, trusted_authority: bool) -> AppendResult:
         with self._connect() as connection:
             try:
                 connection.execute("BEGIN IMMEDIATE")
@@ -406,7 +424,10 @@ class ExperimentLedger:
                             raise LedgerIntegrityError(error.code) from error
                         if other_projection.lease is not None:
                             raise LedgerIntegrityError("mutable_lease_conflict")
-                if event.event_type in _ISOLATED_AUTHORITY_REQUIRED_EVENTS:
+                if (
+                    event.event_type in _ISOLATED_AUTHORITY_REQUIRED_EVENTS
+                    and not trusted_authority
+                ):
                     raise LedgerIntegrityError("isolated_signer_required")
                 try:
                     reduce_events(manifest, (*events, event))

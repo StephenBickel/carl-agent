@@ -77,6 +77,10 @@ def test_exact_stage_redelivery_is_a_noop_but_conflict_fails_closed(tmp_path: Pa
         EventType.DRAFT_PR_REQUESTED,
         EventType.DRAFT_PR_RECORDED,
         EventType.WORKSPACE_DISPOSED,
+        EventType.PROTECTED_VALIDATION_RECORDED,
+        EventType.PROMOTION_RECORDED,
+        EventType.SOAK_OBSERVED,
+        EventType.REVERT_RECORDED,
     ),
 )
 def test_raw_publication_event_injection_is_rejected_without_a_ledger_write(
@@ -268,6 +272,86 @@ def test_ledger_replays_autonomy_facts_without_changing_legacy_projection(tmp_pa
     assert after == before
     assert autonomy.retry is not None
     assert autonomy.retry.changed_action == "rebuild the remote cache"
+
+
+def test_trusted_authority_append_replays_a_complete_protected_lifecycle(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "ledger.sqlite3"
+    ledger = ExperimentLedger(path)
+    ledger.register_manifest(manifest())
+    publication = ExperimentEvent.create(
+        experiment_id=manifest().experiment_id,
+        stage_attempt_id="publication-1",
+        event_type=EventType.EXPERIMENTAL_PUBLISHED,
+        occurred_at="2026-08-10T12:02:01Z",
+        payload={
+            "branch": "experimental/exp-product-001",
+            "candidate_packet_digest": "d" * 64,
+            "commit": "a" * 40,
+            "tree": "a" * 40,
+        },
+    )
+    protected_events = (
+        ExperimentEvent.create(
+            experiment_id=manifest().experiment_id,
+            stage_attempt_id="protected-validation-1",
+            event_type=EventType.PROTECTED_VALIDATION_RECORDED,
+            occurred_at="2026-08-10T12:03:01Z",
+            payload={
+                "candidate_commit": "a" * 40,
+                "candidate_tree": "a" * 40,
+                "receipt_digest": "e" * 64,
+            },
+        ),
+        ExperimentEvent.create(
+            experiment_id=manifest().experiment_id,
+            stage_attempt_id="promotion-1",
+            event_type=EventType.PROMOTION_RECORDED,
+            occurred_at="2026-08-10T12:04:01Z",
+            payload={"merge_commit": "b" * 40, "merge_tree": "b" * 40},
+        ),
+        ExperimentEvent.create(
+            experiment_id=manifest().experiment_id,
+            stage_attempt_id="soak-failure-1",
+            event_type=EventType.SOAK_OBSERVED,
+            occurred_at="2026-08-10T12:05:01Z",
+            payload={
+                "evidence_digest": "f" * 64,
+                "healthy": False,
+                "merge_commit": "b" * 40,
+                "observed_at": "2026-08-10T12:05:01Z",
+            },
+        ),
+        ExperimentEvent.create(
+            experiment_id=manifest().experiment_id,
+            stage_attempt_id="revert-1",
+            event_type=EventType.REVERT_RECORDED,
+            occurred_at="2026-08-10T12:06:01Z",
+            payload={
+                "hard_failure_digest": "f" * 64,
+                "merge_commit": "b" * 40,
+                "restored_tree": "c" * 40,
+            },
+        ),
+    )
+
+    with pytest.raises(LedgerIntegrityError, match="trusted_authority_event_required"):
+        ledger.append_trusted_authority(publication)
+    ledger.append(publication)
+    appends = tuple(ledger.append_trusted_authority(event) for event in protected_events)
+    replayed = ExperimentLedger(path).autonomy_projection(manifest().experiment_id)
+
+    assert tuple(result.ordinal for result in appends) == (2, 3, 4, 5)
+    assert len({result.chain_digest for result in appends}) == 4
+    assert ledger.event_count(manifest().experiment_id) == 5
+    assert replayed.protected_validation is not None
+    assert replayed.protected_validation.receipt_digest == "e" * 64
+    assert replayed.promotion is not None
+    assert replayed.promotion.merge_commit == "b" * 40
+    assert replayed.soak_observations[-1].healthy is False
+    assert replayed.revert is not None
+    assert replayed.revert.restored_tree == "c" * 40
 
 
 def _for_experiment(event: ExperimentEvent, experiment_id: str, attempt: str) -> ExperimentEvent:
