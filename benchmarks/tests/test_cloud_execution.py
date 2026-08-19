@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from carl_bench.cloud_execution import (
+    CloudArtifact,
     CloudExecutionError,
     CloudRunRequest,
     CloudRunSnapshot,
@@ -21,7 +22,7 @@ NOW = "2026-08-19T12:00:00Z"
 LATER = "2026-08-26T12:00:00Z"
 PARENT = "1" * 40
 CANDIDATE = "2" * 40
-ARTIFACT_DIGESTS = ("a" * 64, "b" * 64)
+ARTIFACT_DIGEST = "a" * 64
 WORKFLOWS = (
     "autonomous-improvement.yml",
     "autonomous-soak.yml",
@@ -55,6 +56,16 @@ def request(workflow_file: str = WORKFLOWS[0]) -> CloudRunRequest:
     )
 
 
+def artifact(cloud_request: CloudRunRequest, *, downloaded: bool = True) -> CloudArtifact:
+    return CloudArtifact(
+        artifact_id=99,
+        name=cloud_request.expected_artifact_name,
+        run_id=42,
+        digest=ARTIFACT_DIGEST,
+        downloaded_digest=ARTIFACT_DIGEST if downloaded else None,
+    )
+
+
 def snapshot(
     cloud_request: CloudRunRequest | None = None, **changes: object
 ) -> CloudRunSnapshot:
@@ -70,9 +81,14 @@ def snapshot(
         head_sha=current.candidate_commit,
         status="completed",
         conclusion="success",
-        artifact_digests=ARTIFACT_DIGESTS,
-        downloaded_artifact_digests=ARTIFACT_DIGESTS,
+        attempt=1,
+        max_attempts=3,
+        attempt_key=current.attempt_key(1),
+        prior_run_ids=(),
+        artifacts=(artifact(current),),
         artifacts_expires_at=LATER,
+        commissioning_actionlint_passed=True,
+        commissioning_dry_run_id=7,
     )
     return replace(base, **changes)
 
@@ -96,13 +112,11 @@ def _parse_workflow(name: str) -> dict[str, object]:
     return value
 
 
-def _job(workflow: dict[str, object]) -> dict[str, object]:
+def _jobs(workflow: dict[str, object]) -> dict[str, dict[str, object]]:
     jobs = workflow["jobs"]
     assert isinstance(jobs, dict)
-    assert len(jobs) == 1
-    job = next(iter(jobs.values()))
-    assert isinstance(job, dict)
-    return job
+    assert all(isinstance(job, dict) for job in jobs.values())
+    return jobs  # type: ignore[return-value]
 
 
 def test_request_digest_and_dispatch_key_are_exact_and_idempotent() -> None:
@@ -132,10 +146,31 @@ def test_request_digest_and_dispatch_key_are_exact_and_idempotent() -> None:
         workflow_file=first.workflow_file,
         request_digest=first.request_digest,
         dispatch_key=first.dispatch_key,
+        attempt=1,
+        max_attempts=3,
+        attempt_key=first.attempt_key(1),
     )
     decision = reconcile_cloud_run(first, accepted_dispatch)
     assert decision.action == "await_run"
     assert decision.dispatch_key == first.dispatch_key
+
+
+def test_accepted_dispatch_without_durable_attempt_key_fails_closed() -> None:
+    cloud_request = request()
+    decision = reconcile_cloud_run(
+        cloud_request,
+        CloudRunSnapshot(
+            remote_available=True,
+            observed_at=NOW,
+            repository=cloud_request.repository,
+            workflow_file=cloud_request.workflow_file,
+            request_digest=cloud_request.request_digest,
+            dispatch_key=cloud_request.dispatch_key,
+        ),
+    )
+
+    assert decision.action == "blocked"
+    assert decision.reason == "cloud_attempt_key_missing"
 
 
 def test_only_the_two_cloud_workflows_can_be_requested() -> None:
@@ -169,20 +204,20 @@ def test_running_then_successful_run_downloads_and_records_exact_artifacts() -> 
             cloud_request,
             status="in_progress",
             conclusion=None,
-            artifact_digests=(),
-            downloaded_artifact_digests=(),
+            artifacts=(),
             artifacts_expires_at=None,
         ),
     )
     download = reconcile_cloud_run(
         cloud_request,
-        snapshot(cloud_request, downloaded_artifact_digests=()),
+        snapshot(cloud_request, artifacts=(artifact(cloud_request, downloaded=False),)),
     )
     success = reconcile_cloud_run(cloud_request, snapshot(cloud_request))
 
     assert running.action == "await_run"
     assert download.action == "download_artifacts"
-    assert download.artifact_digests == ARTIFACT_DIGESTS
+    assert download.artifact_name == cloud_request.expected_artifact_name
+    assert download.artifact_id == 99
     assert success.action == "record_success"
     assert success.repository == cloud_request.repository
     assert success.workflow_file == cloud_request.workflow_file
@@ -190,17 +225,64 @@ def test_running_then_successful_run_downloads_and_records_exact_artifacts() -> 
     assert success.run_id == 42
     assert success.head_sha == CANDIDATE
     assert success.conclusion == "success"
-    assert success.artifact_digests == ARTIFACT_DIGESTS
+    assert success.artifact_name == cloud_request.expected_artifact_name
+    assert success.artifact_id == 99
+    assert success.artifact_digest == ARTIFACT_DIGEST
 
 
 def test_downloaded_artifact_digest_mismatch_fails_closed() -> None:
+    cloud_request = request()
     decision = reconcile_cloud_run(
-        request(),
-        snapshot(downloaded_artifact_digests=("0" * 64, "b" * 64)),
+        cloud_request,
+        snapshot(
+            cloud_request,
+            artifacts=(replace(artifact(cloud_request), downloaded_digest="0" * 64),),
+        ),
     )
 
     assert decision.action == "blocked"
     assert decision.reason == "cloud_artifact_digest_mismatch"
+
+
+@pytest.mark.parametrize(
+    "artifacts",
+    (
+        (),
+        (
+            CloudArtifact(99, "wrong-name", 42, ARTIFACT_DIGEST, ARTIFACT_DIGEST),
+        ),
+        (
+            CloudArtifact(99, "placeholder", 41, ARTIFACT_DIGEST, ARTIFACT_DIGEST),
+        ),
+        (
+            CloudArtifact(99, "placeholder", 42, ARTIFACT_DIGEST, ARTIFACT_DIGEST),
+            CloudArtifact(100, "other", 42, "b" * 64, "b" * 64),
+        ),
+    ),
+)
+def test_exactly_one_request_named_artifact_must_belong_to_the_bound_run(
+    artifacts: tuple[CloudArtifact, ...],
+) -> None:
+    cloud_request = request()
+    normalized = tuple(
+        replace(value, name=cloud_request.expected_artifact_name)
+        if value.name == "placeholder"
+        else value
+        for value in artifacts
+    )
+
+    decision = reconcile_cloud_run(
+        cloud_request,
+        snapshot(cloud_request, artifacts=normalized),
+    )
+
+    assert decision.action == "blocked"
+    assert decision.reason in {
+        "cloud_artifact_identity_missing",
+        "cloud_artifact_count_mismatch",
+        "cloud_artifact_name_mismatch",
+        "cloud_artifact_run_mismatch",
+    }
 
 
 def test_expired_artifacts_are_never_downloaded_or_recorded() -> None:
@@ -247,6 +329,58 @@ def test_remote_unavailability_without_fallback_schedules_bounded_retry() -> Non
 
     assert decision.action == "schedule_retry"
     assert decision.reason == "cloud_execution_unavailable"
+    assert decision.next_attempt == 2
+    assert decision.next_attempt_key == request().attempt_key(2)
+
+
+def test_retry_budget_is_bounded_and_replay_is_idempotent() -> None:
+    cloud_request = request()
+    failed_attempt = snapshot(
+        cloud_request,
+        conclusion="timed_out",
+        artifacts=(),
+        artifacts_expires_at=None,
+    )
+    first = reconcile_cloud_run(cloud_request, failed_attempt)
+    replay = reconcile_cloud_run(cloud_request, failed_attempt)
+    exhausted = reconcile_cloud_run(
+        cloud_request,
+        replace(
+            failed_attempt,
+            attempt=3,
+            attempt_key=cloud_request.attempt_key(3),
+            prior_run_ids=(40, 41),
+        ),
+    )
+
+    assert first == replay
+    assert first.next_attempt == 2
+    assert first.next_attempt_key == cloud_request.attempt_key(2)
+    assert first.retry_not_before == "2026-08-19T12:05:00Z"
+    assert exhausted.action == "blocked"
+    assert exhausted.reason == "cloud_retry_budget_exhausted"
+
+
+def test_retry_attempt_rejects_reused_run_and_wrong_attempt_key() -> None:
+    cloud_request = request()
+    reused = reconcile_cloud_run(
+        cloud_request,
+        snapshot(
+            cloud_request,
+            attempt=2,
+            attempt_key=cloud_request.attempt_key(2),
+            prior_run_ids=(42,),
+        ),
+    )
+    wrong_key = reconcile_cloud_run(
+        cloud_request,
+        snapshot(cloud_request, attempt_key=cloud_request.attempt_key(2)),
+    )
+
+    assert reused.action == "blocked"
+    assert reused.reason == "cloud_run_id_reused"
+    assert wrong_key.action == "blocked"
+    assert wrong_key.reason == "cloud_attempt_key_mismatch"
 
 
 def test_completed_infrastructure_failure_schedules_retry_but_test_failure_blocks() -> None:
@@ -254,8 +388,7 @@ def test_completed_infrastructure_failure_schedules_retry_but_test_failure_block
         request(),
         snapshot(
             conclusion="timed_out",
-            artifact_digests=(),
-            downloaded_artifact_digests=(),
+            artifacts=(),
             artifacts_expires_at=None,
         ),
     )
@@ -263,8 +396,7 @@ def test_completed_infrastructure_failure_schedules_retry_but_test_failure_block
         request(),
         snapshot(
             conclusion="failure",
-            artifact_digests=(),
-            downloaded_artifact_digests=(),
+            artifacts=(),
             artifacts_expires_at=None,
         ),
     )
@@ -273,6 +405,22 @@ def test_completed_infrastructure_failure_schedules_retry_but_test_failure_block
     assert retry.reason == "cloud_run_infrastructure_failure"
     assert failed.action == "blocked"
     assert failed.reason == "cloud_run_failed"
+
+
+@pytest.mark.parametrize(
+    ("changes", "reason"),
+    [
+        ({"commissioning_actionlint_passed": False}, "cloud_actionlint_not_commissioned"),
+        ({"commissioning_dry_run_id": None}, "cloud_github_dry_run_not_commissioned"),
+    ],
+)
+def test_success_requires_actionlint_and_prior_github_hosted_dry_run(
+    changes: dict[str, object], reason: str
+) -> None:
+    decision = reconcile_cloud_run(request(), snapshot(**changes))
+
+    assert decision.action == "blocked"
+    assert decision.reason == reason
 
 
 @pytest.mark.parametrize("name", WORKFLOWS)
@@ -293,54 +441,130 @@ def test_workflow_dispatch_contract_is_parsed_and_immutable(name: str) -> None:
         assert "default" not in contract
 
     assert workflow["permissions"] == {"contents": "read"}
-    job = _job(workflow)
-    assert "permissions" not in job
-    assert job["runs-on"] == "ubuntu-latest"
-    assert isinstance(job["timeout-minutes"], int)
-    assert job["timeout-minutes"] <= 60
-    steps = job["steps"]
-    assert isinstance(steps, list)
-    actions = [step["uses"] for step in steps if isinstance(step, dict) and "uses" in step]
+    jobs = _jobs(workflow)
+    assert set(jobs) >= {"commission", "evaluate", "evidence"}
+    assert jobs["evidence"]["needs"] == ["commission", "evaluate"]
+    actions = [
+        step["uses"]
+        for job in jobs.values()
+        for step in job["steps"]
+        if isinstance(step, dict) and "uses" in step
+    ]
     assert set(actions) == PINNED_ACTIONS
     assert all(re.fullmatch(r"[\w.-]+/[\w.-]+@[0-9a-f]{40}", action) for action in actions)
+    for job in jobs.values():
+        assert "permissions" not in job
+        assert job["runs-on"] == "ubuntu-latest"
+        assert isinstance(job["timeout-minutes"], int)
+        assert job["timeout-minutes"] <= 60
+        for step in job["steps"]:
+            if str(step.get("uses", "")).startswith("actions/checkout@"):
+                assert step["with"]["persist-credentials"] is False
 
-    checkout = next(
-        step
-        for step in steps
-        if str(step.get("uses", "")).startswith("actions/checkout@")
+
+@pytest.mark.parametrize("name", WORKFLOWS)
+def test_candidate_execution_isolated_from_trusted_evidence_and_inputs(name: str) -> None:
+    jobs = _jobs(_parse_workflow(name))
+    evaluate = jobs["evaluate"]
+    evidence = jobs["evidence"]
+    evaluate_commands = "\n".join(
+        step["run"] for step in evaluate["steps"] if "run" in step
     )
-    assert checkout["with"]["ref"] == "${{ inputs.candidate_commit }}"
-    assert checkout["with"]["persist-credentials"] is False
-    assert checkout["with"]["fetch-depth"] == 0
+    evidence_serialized = json.dumps(evidence, sort_keys=True)
+
+    assert "sudo -u nobody env -i" in evaluate_commands
+    assert "GITHUB_ENV=" not in evaluate_commands
+    assert "PYTHONDONTWRITEBYTECODE=1" in evaluate_commands
+    assert "PYTEST_DISABLE_PLUGIN_AUTOLOAD=1" in evaluate_commands
+    assert "-p no:cacheprovider" in evaluate_commands
+    assert "sha256sum --check" in evaluate_commands
+    assert "immutable-inputs" in evaluate_commands
+    assert "actions/upload-artifact" not in json.dumps(evaluate)
+    assert "actions/checkout" not in evidence_serialized
+    assert evidence_serialized.count("actions/upload-artifact") == 1
+
+
+@pytest.mark.parametrize("name", WORKFLOWS)
+def test_candidate_cannot_guess_runner_file_command_endpoints(name: str) -> None:
+    evaluate = _jobs(_parse_workflow(name))["evaluate"]
+    commands = "\n".join(step["run"] for step in evaluate["steps"] if "run" in step)
+
+    assert 'chmod 700 "$(dirname "$GITHUB_ENV")"' in commands
+
+
+def test_improvement_workflow_runs_real_exact_parent_candidate_pair() -> None:
+    jobs = _jobs(_parse_workflow(WORKFLOWS[0]))
+    evaluate = jobs["evaluate"]
+    commands = "\n".join(step["run"] for step in evaluate["steps"] if "run" in step)
+
+    serialized = json.dumps(evaluate)
+    assert "subject-parent" in serialized
+    assert "subject-candidate" in serialized
+    assert "inputs.parent_commit" in serialized
+    assert "inputs.candidate_commit" in serialized
+    assert "rev-parse HEAD" in commands
+    assert "benchmark-smoke.sh" in commands
+    assert "carl-bench run" in commands
+    assert "--attempts 3" in commands
+    assert '--subject-commit "$EXPECTED_COMMIT"' in commands
+    assert "carl-bench compare" in commands
+    assert "paired-result" in commands
+    assert jobs["evidence"]["needs"] == ["commission", "evaluate"]
 
 
 def test_improvement_workflow_runs_locked_suites_and_uploads_bounded_evidence() -> None:
     workflow = _parse_workflow(WORKFLOWS[0])
-    job = _job(workflow)
+    jobs = _jobs(workflow)
+    job = jobs["evaluate"]
     steps = job["steps"]
     commands = "\n".join(step["run"] for step in steps if isinstance(step, dict) and "run" in step)
 
-    assert "git rev-parse HEAD" in commands
-    assert "cargo test --locked" in commands
+    assert "rev-parse HEAD" in commands
+    assert "test --locked" in commands
     assert "uv sync --project benchmarks --python 3.12 --locked" in commands
     assert "pytest -q" in commands
     assert "paired" in commands.casefold()
-    assert "request_digest" in commands
-    _assert_bounded_credential_free_artifact(job, "autonomous-improvement-evidence")
+    assert "request_digest" in json.dumps(jobs["evidence"])
+    _assert_bounded_credential_free_artifact(
+        jobs["evidence"], "autonomous-improvement-evidence"
+    )
 
 
 def test_soak_workflow_runs_merge_bound_health_probes() -> None:
     workflow = _parse_workflow(WORKFLOWS[1])
-    job = _job(workflow)
+    jobs = _jobs(workflow)
+    job = jobs["evaluate"]
     steps = job["steps"]
     commands = "\n".join(step["run"] for step in steps if isinstance(step, dict) and "run" in step)
 
-    assert "git rev-parse HEAD" in commands
-    assert "cargo test --locked" in commands
+    assert "rev-parse HEAD" in commands
+    assert "test --locked" in commands
     assert "pytest -q" in commands
-    assert "merge_commit" in commands
-    assert "request_digest" in commands
-    _assert_bounded_credential_free_artifact(job, "autonomous-soak-observation")
+    topology = "\n".join(
+        step["run"] for step in jobs["commission"]["steps"] if "run" in step
+    )
+    assert "rev-list --parents -n 1" in topology
+    assert "${#MERGE_TOPOLOGY[@]}" in topology
+    assert "MERGE_TOPOLOGY[1]" in topology
+    assert "merge_commit" in json.dumps(jobs["evidence"])
+    assert "request_digest" in json.dumps(jobs["evidence"])
+    _assert_bounded_credential_free_artifact(
+        jobs["evidence"], "autonomous-soak-observation"
+    )
+
+
+@pytest.mark.parametrize("name", WORKFLOWS)
+def test_commissioning_job_runs_actionlint_on_github_hosted_runner(name: str) -> None:
+    jobs = _jobs(_parse_workflow(name))
+    commission = jobs["commission"]
+    commands = "\n".join(
+        step["run"] for step in commission["steps"] if "run" in step
+    )
+
+    assert commission["runs-on"] == "ubuntu-latest"
+    assert "go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7" in commands
+    assert ".github/workflows/autonomous-improvement.yml" in commands
+    assert ".github/workflows/autonomous-soak.yml" in commands
 
 
 def _assert_bounded_credential_free_artifact(job: dict[str, object], artifact_name: str) -> None:
@@ -358,7 +582,7 @@ def _assert_bounded_credential_free_artifact(job: dict[str, object], artifact_na
         step for step in steps if str(step.get("uses", "")).startswith("actions/upload-artifact@")
     )
     options = upload["with"]
-    assert options["name"].startswith(artifact_name)
+    assert options["name"] == f"{artifact_name}-${{{{ inputs.request_digest }}}}"
     assert options["retention-days"] <= 7
     assert options["if-no-files-found"] == "error"
     assert options["include-hidden-files"] is False

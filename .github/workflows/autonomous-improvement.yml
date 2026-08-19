@@ -16,7 +16,7 @@ name: Autonomous improvement evidence
         required: true
         type: string
       task_set_digest:
-        description: Immutable task-set SHA-256
+        description: Immutable task-set archive SHA-256
         required: true
         type: string
       metric_pack_digest:
@@ -40,12 +40,21 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  verify:
-    name: Autonomous improvement evidence
+  commission:
+    name: Validate trusted workflow and immutable inputs
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 15
+    outputs:
+      trusted_inputs_digest: ${{ steps.inputs.outputs.trusted_inputs_digest }}
     steps:
-      - name: Validate immutable dispatch
+      - name: Check out the protected parent
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.parent_commit }}
+          path: trusted-source
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Validate canonical request
         env:
           CANDIDATE_COMMIT: ${{ inputs.candidate_commit }}
           EXPERIMENT_DIGEST: ${{ inputs.experiment_digest }}
@@ -65,11 +74,8 @@ jobs:
           digest = re.compile(r"[0-9a-f]{64}\Z")
           commit = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
           for name in (
-              "EXPERIMENT_DIGEST",
-              "METRIC_PACK_DIGEST",
-              "POLICY_DIGEST",
-              "REQUEST_DIGEST",
-              "TASK_SET_DIGEST",
+              "EXPERIMENT_DIGEST", "METRIC_PACK_DIGEST", "POLICY_DIGEST",
+              "REQUEST_DIGEST", "TASK_SET_DIGEST",
           ):
               if not digest.fullmatch(os.environ[name]):
                   raise SystemExit(f"invalid {name.lower()}")
@@ -91,89 +97,200 @@ jobs:
           if hashlib.sha256(encoded).hexdigest() != os.environ["REQUEST_DIGEST"]:
               raise SystemExit("request_digest mismatch")
           PY
-      - name: Check out the exact candidate
+      - name: Run actionlint commissioning gate
+        working-directory: trusted-source
+        run: |
+          go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7 \
+            .github/workflows/autonomous-improvement.yml \
+            .github/workflows/autonomous-soak.yml
+      - name: Resolve and verify protected immutable inputs
+        id: inputs
+        env:
+          EXPERIMENT_DIGEST: ${{ inputs.experiment_digest }}
+          METRIC_PACK_DIGEST: ${{ inputs.metric_pack_digest }}
+          POLICY_DIGEST: ${{ inputs.policy_digest }}
+          TASK_SET_DIGEST: ${{ inputs.task_set_digest }}
+        run: |
+          set -euo pipefail
+          resolved="$RUNNER_TEMP/immutable-inputs"
+          mkdir -p "$resolved"
+          resolve() {
+            kind="$1"; digest="$2"
+            source="trusted-source/benchmarks/immutable-inputs/$kind/$digest"
+            test -f "$source"; test ! -L "$source"
+            printf '%s  %s\n' "$digest" "$source" | sha256sum --check --strict -
+            cp -- "$source" "$resolved/$kind"
+          }
+          resolve experiment "$EXPERIMENT_DIGEST"
+          resolve task-set "$TASK_SET_DIGEST"
+          resolve metric-pack "$METRIC_PACK_DIGEST"
+          resolve policy "$POLICY_DIGEST"
+          aggregate="$(find "$resolved" -maxdepth 1 -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1)"
+          printf 'trusted_inputs_digest=%s\n' "$aggregate" >> "$GITHUB_OUTPUT"
+
+  evaluate:
+    name: Run exact parent and candidate pair
+    needs: [commission]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      paired_result_digest: ${{ steps.pair.outputs.paired_result_digest }}
+      parent_result_digest: ${{ steps.pair.outputs.parent_result_digest }}
+      candidate_result_digest: ${{ steps.pair.outputs.candidate_result_digest }}
+    steps:
+      - name: Check out trusted harness from protected parent
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.parent_commit }}
+          path: trusted-source
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Check out exact parent subject
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.parent_commit }}
+          path: subject-parent
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Check out exact candidate subject
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           ref: ${{ inputs.candidate_commit }}
-          fetch-depth: 0
+          path: subject-candidate
+          fetch-depth: 1
           persist-credentials: false
-      - name: Verify exact parent and candidate binding
-        env:
-          CANDIDATE_COMMIT: ${{ inputs.candidate_commit }}
-          PARENT_COMMIT: ${{ inputs.parent_commit }}
-        run: |
-          test "$(git rev-parse HEAD)" = "$CANDIDATE_COMMIT"
-          git cat-file -e "$PARENT_COMMIT^{commit}"
-          git merge-base --is-ancestor "$PARENT_COMMIT" "$CANDIDATE_COMMIT"
-      - name: Install the pinned Rust toolchain
-        run: |
-          rustup toolchain install 1.97.0 --profile minimal --component clippy --component rustfmt --no-self-update
-          rustup override set 1.97.0
-          cargo fetch --locked
       - name: Install pinned uv and Python
         uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
         with:
           version: "0.10.4"
           python-version: "3.12"
-          enable-cache: true
-          cache-dependency-glob: benchmarks/uv.lock
-          cache-local-path: ~/.cache/uv
-          cache-python: false
-      - name: Install locked Python dependencies
-        run: uv sync --project benchmarks --python 3.12 --locked
-      - name: Run deterministic repository suites
-        run: |
-          cargo test --locked --test workflow_contract --test docs_contract
-          uv run --offline --project benchmarks --locked pytest -q benchmarks/tests
-      - name: Run paired evaluation suites
-        run: |
-          uv run --offline --project benchmarks --locked pytest -q benchmarks/tests/test_report.py -k comparison
-          ./scripts/benchmark-smoke.sh
-      - name: Write bounded immutable evidence
+          enable-cache: false
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.97.0 --profile minimal --no-self-update
+      - name: Verify exact subjects and immutable inputs
         env:
           CANDIDATE_COMMIT: ${{ inputs.candidate_commit }}
           EXPERIMENT_DIGEST: ${{ inputs.experiment_digest }}
           METRIC_PACK_DIGEST: ${{ inputs.metric_pack_digest }}
           PARENT_COMMIT: ${{ inputs.parent_commit }}
           POLICY_DIGEST: ${{ inputs.policy_digest }}
+          TASK_SET_DIGEST: ${{ inputs.task_set_digest }}
+        run: |
+          set -euo pipefail
+          test "$(git -C subject-parent rev-parse HEAD)" = "$PARENT_COMMIT"
+          test "$(git -C subject-candidate rev-parse HEAD)" = "$CANDIDATE_COMMIT"
+          mkdir -p "$RUNNER_TEMP/immutable-inputs"
+          resolve() {
+            kind="$1"; digest="$2"
+            source="trusted-source/benchmarks/immutable-inputs/$kind/$digest"
+            test -f "$source"; test ! -L "$source"
+            printf '%s  %s\n' "$digest" "$source" | sha256sum --check --strict -
+            cp -- "$source" "$RUNNER_TEMP/immutable-inputs/$kind"
+          }
+          resolve experiment "$EXPERIMENT_DIGEST"
+          resolve task-set "$TASK_SET_DIGEST"
+          resolve metric-pack "$METRIC_PACK_DIGEST"
+          resolve policy "$POLICY_DIGEST"
+      - name: Run both subjects without workflow commands or credentials
+        id: pair
+        env:
+          CANDIDATE_COMMIT: ${{ inputs.candidate_commit }}
+          PARENT_COMMIT: ${{ inputs.parent_commit }}
+        run: |
+          set -euo pipefail
+          chmod 700 "$(dirname "$GITHUB_ENV")"
+          results="$RUNNER_TEMP/paired-results"
+          mkdir -p "$results"
+          uv sync --project trusted-source/benchmarks --python 3.12 --locked
+          for role in parent candidate; do
+            subject="subject-$role"; expected="$PARENT_COMMIT"
+            if [ "$role" = candidate ]; then expected="$CANDIDATE_COMMIT"; fi
+            eval_root="$RUNNER_TEMP/eval-$role"; sandbox="$RUNNER_TEMP/sandbox-$role"
+            cp -R -- "$subject" "$eval_root"
+            rm -rf -- "$eval_root/benchmarks/tests" "$eval_root/benchmarks/tasks/dev"
+            cp -R -- trusted-source/benchmarks/tests "$eval_root/benchmarks/tests"
+            mkdir -p "$eval_root/benchmarks/tasks/dev"
+            tar --extract --file "$RUNNER_TEMP/immutable-inputs/task-set" \
+              --directory "$eval_root/benchmarks/tasks/dev" --no-same-owner --no-same-permissions
+            cp -- trusted-source/scripts/benchmark-smoke.sh "$eval_root/scripts/benchmark-smoke.sh"
+            chmod -R a-w "$eval_root"
+            mkdir -p "$sandbox/home" "$sandbox/tmp" "$sandbox/cargo" "$sandbox/target" "$sandbox/uv"
+            chown -R nobody:nogroup "$sandbox"
+            sudo -u nobody env -i HOME="$sandbox/home" PATH="$PATH" TMPDIR="$sandbox/tmp" \
+              CARGO_HOME="$sandbox/cargo" CARGO_TARGET_DIR="$sandbox/target" \
+              RUSTUP_HOME="$RUSTUP_HOME" UV_CACHE_DIR="$sandbox/uv" \
+              PYTHONDONTWRITEBYTECODE=1 \
+              UV_PROJECT_ENVIRONMENT="$sandbox/venv" SUBJECT_ROOT="$eval_root" \
+              EXPECTED_COMMIT="$expected" RESULT_PATH="$sandbox/scorecard.json" \
+              bash --noprofile --norc -c '
+                set -euo pipefail; cd "$SUBJECT_ROOT"
+                cargo +1.97.0 test --locked --test workflow_contract --test docs_contract
+                uv sync --project benchmarks --python 3.12 --locked
+                PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 uv run --offline --project benchmarks --locked \
+                  pytest -q -c /dev/null -p no:cacheprovider benchmarks/tests
+                uv run --offline --project benchmarks --locked carl-bench run \
+                  --tasks "$SUBJECT_ROOT/benchmarks/tasks/dev" --adapter scripted \
+                  --attempts 3 --seed 20260819 --subject-commit "$EXPECTED_COMMIT" \
+                  --public-result "$RESULT_PATH"
+                ./scripts/benchmark-smoke.sh
+              '
+            test -f "$sandbox/scorecard.json"; test ! -L "$sandbox/scorecard.json"
+            cp -- "$sandbox/scorecard.json" "$results/$role.json"
+          done
+          uv run --offline --project trusted-source/benchmarks --locked carl-bench compare \
+            --baseline "$results/parent.json" --candidate "$results/candidate.json" \
+            --comparison-seed 20260819 --public-result "$results/paired-result.json"
+          printf 'parent_result_digest=%s\n' "$(sha256sum "$results/parent.json" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          printf 'candidate_result_digest=%s\n' "$(sha256sum "$results/candidate.json" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          printf 'paired_result_digest=%s\n' "$(sha256sum "$results/paired-result.json" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+  evidence:
+    name: Create trusted bounded evidence
+    needs: [commission, evaluate]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Write fresh trusted evidence
+        env:
+          CANDIDATE_COMMIT: ${{ inputs.candidate_commit }}
+          CANDIDATE_RESULT_DIGEST: ${{ needs.evaluate.outputs.candidate_result_digest }}
+          EXPERIMENT_DIGEST: ${{ inputs.experiment_digest }}
+          METRIC_PACK_DIGEST: ${{ inputs.metric_pack_digest }}
+          PAIRED_RESULT_DIGEST: ${{ needs.evaluate.outputs.paired_result_digest }}
+          PARENT_COMMIT: ${{ inputs.parent_commit }}
+          PARENT_RESULT_DIGEST: ${{ needs.evaluate.outputs.parent_result_digest }}
+          POLICY_DIGEST: ${{ inputs.policy_digest }}
           REPOSITORY: ${{ github.repository }}
           REQUEST_DIGEST: ${{ inputs.request_digest }}
+          RUN_ID: ${{ github.run_id }}
           TASK_SET_DIGEST: ${{ inputs.task_set_digest }}
+          TRUSTED_INPUTS_DIGEST: ${{ needs.commission.outputs.trusted_inputs_digest }}
         run: |
           mkdir -p cloud-evidence
           python3 - <<'PY'
-          import json
-          import os
-          import pathlib
-          import subprocess
-
+          import json, os, pathlib
           evidence = {
               "candidate_commit": os.environ["CANDIDATE_COMMIT"],
-              "deterministic_suite": "passed",
+              "candidate_result_digest": os.environ["CANDIDATE_RESULT_DIGEST"],
               "experiment_digest": os.environ["EXPERIMENT_DIGEST"],
-              "head_sha": subprocess.check_output(
-                  ["git", "rev-parse", "HEAD"], text=True
-              ).strip(),
               "kind": "autonomous_improvement_evidence",
               "metric_pack_digest": os.environ["METRIC_PACK_DIGEST"],
-              "paired_suite": "passed",
+              "paired_result_digest": os.environ["PAIRED_RESULT_DIGEST"],
               "parent_commit": os.environ["PARENT_COMMIT"],
+              "parent_result_digest": os.environ["PARENT_RESULT_DIGEST"],
               "policy_digest": os.environ["POLICY_DIGEST"],
               "repository": os.environ["REPOSITORY"],
               "request_digest": os.environ["REQUEST_DIGEST"],
-              "schema_version": 1,
+              "run_id": int(os.environ["RUN_ID"]), "schema_version": 2,
               "task_set_digest": os.environ["TASK_SET_DIGEST"],
+              "trusted_inputs_digest": os.environ["TRUSTED_INPUTS_DIGEST"],
               "workflow_file": "autonomous-improvement.yml",
           }
           target = pathlib.Path("cloud-evidence/autonomous-improvement.json")
-          target.write_text(
-              json.dumps(evidence, sort_keys=True, separators=(",", ":")) + "\n",
-              encoding="utf-8",
-          )
-          if target.stat().st_size > 1_048_576:
-              raise SystemExit("evidence exceeds bound")
+          target.write_text(json.dumps(evidence, sort_keys=True, separators=(",", ":")) + "\n")
+          if target.stat().st_size > 1_048_576: raise SystemExit("evidence exceeds bound")
           PY
-      - name: Upload bounded improvement evidence
+      - name: Upload the one request-named evidence artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: autonomous-improvement-evidence-${{ inputs.request_digest }}

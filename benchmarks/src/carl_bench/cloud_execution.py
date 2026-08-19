@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import re
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
 from carl_bench.canonical import canonical_json_bytes
@@ -184,6 +184,45 @@ class CloudRunRequest:
             dispatch_key=f"cloud-run-{request_digest}",
         )
 
+    @property
+    def expected_artifact_name(self) -> str:
+        prefix = (
+            "autonomous-improvement-evidence"
+            if self.workflow_file == "autonomous-improvement.yml"
+            else "autonomous-soak-observation"
+        )
+        return f"{prefix}-{self.request_digest}"
+
+    def attempt_key(self, attempt: int) -> str:
+        if isinstance(attempt, bool) or not isinstance(attempt, int) or not 1 <= attempt <= 5:
+            raise CloudExecutionError("invalid_cloud_attempt")
+        return f"{self.dispatch_key}-attempt-{attempt}"
+
+
+@dataclass(frozen=True, slots=True)
+class CloudArtifact:
+    artifact_id: int
+    name: str
+    run_id: int
+    digest: str
+    downloaded_digest: str | None = None
+
+    def __post_init__(self) -> None:
+        for field_name in ("artifact_id", "run_id"):
+            value = getattr(self, field_name)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise CloudExecutionError(f"invalid_cloud_{field_name}")
+        if (
+            not isinstance(self.name, str)
+            or not self.name
+            or len(self.name.encode("utf-8")) > 180
+            or not re.fullmatch(r"[A-Za-z0-9_.-]+", self.name)
+        ):
+            raise CloudExecutionError("invalid_cloud_artifact_name")
+        _digest("cloud_artifact_digest", self.digest)
+        if self.downloaded_digest is not None:
+            _digest("cloud_downloaded_artifact_digest", self.downloaded_digest)
+
 
 @dataclass(frozen=True, slots=True)
 class CloudRunSnapshot:
@@ -197,9 +236,14 @@ class CloudRunSnapshot:
     head_sha: str | None = None
     status: str | None = None
     conclusion: str | None = None
-    artifact_digests: tuple[str, ...] = ()
-    downloaded_artifact_digests: tuple[str, ...] = ()
+    attempt: int = 1
+    max_attempts: int = 3
+    attempt_key: str | None = None
+    prior_run_ids: tuple[int, ...] = ()
+    artifacts: tuple[CloudArtifact, ...] = ()
     artifacts_expires_at: str | None = None
+    commissioning_actionlint_passed: bool = False
+    commissioning_dry_run_id: int | None = None
     local_fallback_command: str | None = None
 
     def __post_init__(self) -> None:
@@ -229,17 +273,44 @@ class CloudRunSnapshot:
             raise CloudExecutionError("invalid_cloud_run_status")
         if self.conclusion is not None and self.conclusion not in _CONCLUSIONS:
             raise CloudExecutionError("invalid_cloud_run_conclusion")
-        if not isinstance(self.artifact_digests, tuple) or not isinstance(
-            self.downloaded_artifact_digests, tuple
+        if (
+            isinstance(self.attempt, bool)
+            or not isinstance(self.attempt, int)
+            or not 1 <= self.attempt <= 5
+            or isinstance(self.max_attempts, bool)
+            or not isinstance(self.max_attempts, int)
+            or not self.attempt <= self.max_attempts <= 5
         ):
-            raise CloudExecutionError("invalid_cloud_artifact_digests")
-        for values in (self.artifact_digests, self.downloaded_artifact_digests):
-            if tuple(sorted(set(values))) != values:
-                raise CloudExecutionError("invalid_cloud_artifact_digests")
-            for value in values:
-                _digest("cloud_artifact_digest", value)
+            raise CloudExecutionError("invalid_cloud_retry_state")
+        if self.attempt_key is not None and (
+            not isinstance(self.attempt_key, str)
+            or not re.fullmatch(r"cloud-run-[0-9a-f]{64}-attempt-[1-5]", self.attempt_key)
+        ):
+            raise CloudExecutionError("invalid_cloud_attempt_key")
+        if (
+            not isinstance(self.prior_run_ids, tuple)
+            or tuple(sorted(set(self.prior_run_ids))) != self.prior_run_ids
+            or any(
+                isinstance(value, bool) or not isinstance(value, int) or value <= 0
+                for value in self.prior_run_ids
+            )
+            or len(self.prior_run_ids) > self.attempt - 1
+        ):
+            raise CloudExecutionError("invalid_cloud_prior_runs")
+        if not isinstance(self.artifacts, tuple) or any(
+            not isinstance(value, CloudArtifact) for value in self.artifacts
+        ):
+            raise CloudExecutionError("invalid_cloud_artifacts")
         if self.artifacts_expires_at is not None:
             _utc("cloud_artifacts_expires_at", self.artifacts_expires_at)
+        if not isinstance(self.commissioning_actionlint_passed, bool):
+            raise CloudExecutionError("invalid_cloud_actionlint_commissioning")
+        if self.commissioning_dry_run_id is not None and (
+            isinstance(self.commissioning_dry_run_id, bool)
+            or not isinstance(self.commissioning_dry_run_id, int)
+            or self.commissioning_dry_run_id <= 0
+        ):
+            raise CloudExecutionError("invalid_cloud_dry_run_id")
         if self.local_fallback_command is not None and (
             not isinstance(self.local_fallback_command, str)
             or not self.local_fallback_command.strip()
@@ -259,7 +330,12 @@ class CloudRunDecision:
     run_id: int | None = None
     head_sha: str | None = None
     conclusion: str | None = None
-    artifact_digests: tuple[str, ...] = ()
+    artifact_id: int | None = None
+    artifact_name: str | None = None
+    artifact_digest: str | None = None
+    next_attempt: int | None = None
+    next_attempt_key: str | None = None
+    retry_not_before: str | None = None
 
 
 def _decision(
@@ -267,6 +343,10 @@ def _decision(
     reason: str,
     request: CloudRunRequest,
     snapshot: CloudRunSnapshot,
+    *,
+    artifact: CloudArtifact | None = None,
+    next_attempt: int | None = None,
+    retry_not_before: str | None = None,
 ) -> CloudRunDecision:
     return CloudRunDecision(
         action=action,
@@ -278,7 +358,32 @@ def _decision(
         run_id=snapshot.run_id,
         head_sha=snapshot.head_sha,
         conclusion=snapshot.conclusion,
-        artifact_digests=snapshot.artifact_digests,
+        artifact_id=artifact.artifact_id if artifact is not None else None,
+        artifact_name=artifact.name if artifact is not None else None,
+        artifact_digest=artifact.digest if artifact is not None else None,
+        next_attempt=next_attempt,
+        next_attempt_key=(request.attempt_key(next_attempt) if next_attempt is not None else None),
+        retry_not_before=retry_not_before,
+    )
+
+
+def _retry_decision(
+    reason: str, request: CloudRunRequest, snapshot: CloudRunSnapshot
+) -> CloudRunDecision:
+    if snapshot.attempt >= snapshot.max_attempts:
+        return _decision("blocked", "cloud_retry_budget_exhausted", request, snapshot)
+    observed = _utc("cloud_observed_at", snapshot.observed_at)
+    delay_minutes = 5 * snapshot.attempt
+    retry_at = (observed + timedelta(minutes=delay_minutes)).isoformat().replace(
+        "+00:00", "Z"
+    )
+    return _decision(
+        "schedule_retry",
+        reason,
+        request,
+        snapshot,
+        next_attempt=snapshot.attempt + 1,
+        retry_not_before=retry_at,
     )
 
 
@@ -316,11 +421,18 @@ def reconcile_cloud_run(
     ):
         return _decision("blocked", "local_heavy_fallback_forbidden", request, snapshot)
     if not snapshot.remote_available:
-        return _decision("schedule_retry", "cloud_execution_unavailable", request, snapshot)
+        return _retry_decision("cloud_execution_unavailable", request, snapshot)
+
+    if snapshot.attempt_key is not None and snapshot.attempt_key != request.attempt_key(
+        snapshot.attempt
+    ):
+        return _decision("blocked", "cloud_attempt_key_mismatch", request, snapshot)
 
     failure, bindings_complete = _binding_failure(request, snapshot)
     if failure is not None:
         return _decision("blocked", failure, request, snapshot)
+    if bindings_complete and snapshot.attempt_key is None:
+        return _decision("blocked", "cloud_attempt_key_missing", request, snapshot)
     if snapshot.run_id is None:
         if bindings_complete:
             return _decision("await_run", "cloud_dispatch_already_accepted", request, snapshot)
@@ -340,6 +452,10 @@ def reconcile_cloud_run(
         return _decision("dispatch", "cloud_dispatch_required", request, snapshot)
     if not bindings_complete:
         return _decision("blocked", "cloud_run_binding_incomplete", request, snapshot)
+    if snapshot.attempt_key is None:
+        return _decision("blocked", "cloud_attempt_key_missing", request, snapshot)
+    if snapshot.run_id in snapshot.prior_run_ids:
+        return _decision("blocked", "cloud_run_id_reused", request, snapshot)
     if snapshot.head_sha is None:
         return _decision("blocked", "cloud_run_head_missing", request, snapshot)
     if snapshot.status in _RUNNING_STATUSES:
@@ -347,19 +463,36 @@ def reconcile_cloud_run(
     if snapshot.status != "completed" or snapshot.conclusion is None:
         return _decision("blocked", "cloud_run_state_incomplete", request, snapshot)
     if snapshot.conclusion in _INFRASTRUCTURE_CONCLUSIONS:
-        return _decision("schedule_retry", "cloud_run_infrastructure_failure", request, snapshot)
+        return _retry_decision("cloud_run_infrastructure_failure", request, snapshot)
     if snapshot.conclusion != "success":
         return _decision("blocked", "cloud_run_failed", request, snapshot)
-    if not snapshot.artifact_digests or snapshot.artifacts_expires_at is None:
+    if not snapshot.commissioning_actionlint_passed:
+        return _decision("blocked", "cloud_actionlint_not_commissioned", request, snapshot)
+    if snapshot.commissioning_dry_run_id is None:
+        return _decision("blocked", "cloud_github_dry_run_not_commissioned", request, snapshot)
+    if not snapshot.artifacts or snapshot.artifacts_expires_at is None:
         return _decision("blocked", "cloud_artifact_identity_missing", request, snapshot)
+    if len(snapshot.artifacts) != 1:
+        return _decision("blocked", "cloud_artifact_count_mismatch", request, snapshot)
+    artifact = snapshot.artifacts[0]
+    if artifact.name != request.expected_artifact_name:
+        return _decision("blocked", "cloud_artifact_name_mismatch", request, snapshot)
+    if artifact.run_id != snapshot.run_id:
+        return _decision("blocked", "cloud_artifact_run_mismatch", request, snapshot)
     if _utc("cloud_artifacts_expires_at", snapshot.artifacts_expires_at) <= _utc(
         "cloud_observed_at", snapshot.observed_at
     ):
         return _decision("blocked", "cloud_artifact_expired", request, snapshot)
-    if not snapshot.downloaded_artifact_digests:
+    if artifact.downloaded_digest is None:
         return _decision(
-            "download_artifacts", "cloud_artifact_download_required", request, snapshot
+            "download_artifacts",
+            "cloud_artifact_download_required",
+            request,
+            snapshot,
+            artifact=artifact,
         )
-    if snapshot.downloaded_artifact_digests != snapshot.artifact_digests:
+    if artifact.downloaded_digest != artifact.digest:
         return _decision("blocked", "cloud_artifact_digest_mismatch", request, snapshot)
-    return _decision("record_success", "cloud_run_evidence_verified", request, snapshot)
+    return _decision(
+        "record_success", "cloud_run_evidence_verified", request, snapshot, artifact=artifact
+    )
