@@ -389,6 +389,11 @@ class ExperimentLedger:
         return self._append(event, trusted_authority=True)
 
     def _append(self, event: ExperimentEvent, *, trusted_authority: bool) -> AppendResult:
+        if (
+            event.event_type in _ISOLATED_AUTHORITY_REQUIRED_EVENTS
+            and not trusted_authority
+        ):
+            raise LedgerIntegrityError("isolated_signer_required")
         with self._connect() as connection:
             try:
                 connection.execute("BEGIN IMMEDIATE")
@@ -424,11 +429,6 @@ class ExperimentLedger:
                             raise LedgerIntegrityError(error.code) from error
                         if other_projection.lease is not None:
                             raise LedgerIntegrityError("mutable_lease_conflict")
-                if (
-                    event.event_type in _ISOLATED_AUTHORITY_REQUIRED_EVENTS
-                    and not trusted_authority
-                ):
-                    raise LedgerIntegrityError("isolated_signer_required")
                 try:
                     reduce_events(manifest, (*events, event))
                     reduce_autonomy_events(manifest, (*events, event))

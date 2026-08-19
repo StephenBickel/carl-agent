@@ -340,10 +340,16 @@ def test_trusted_authority_append_replays_a_complete_protected_lifecycle(
         ledger.append_trusted_authority(publication)
     ledger.append(publication)
     appends = tuple(ledger.append_trusted_authority(event) for event in protected_events)
+    with pytest.raises(LedgerIntegrityError, match="isolated_signer_required"):
+        ledger.append(protected_events[-1])
+    trusted_replay = ledger.append_trusted_authority(protected_events[-1])
     replayed = ExperimentLedger(path).autonomy_projection(manifest().experiment_id)
 
     assert tuple(result.ordinal for result in appends) == (2, 3, 4, 5)
     assert len({result.chain_digest for result in appends}) == 4
+    assert trusted_replay.appended is False
+    assert trusted_replay.ordinal == appends[-1].ordinal
+    assert trusted_replay.chain_digest == appends[-1].chain_digest
     assert ledger.event_count(manifest().experiment_id) == 5
     assert replayed.protected_validation is not None
     assert replayed.protected_validation.receipt_digest == "e" * 64
