@@ -63,10 +63,10 @@ PACKET_DIGEST = "a" * 64
 HEALTHY_DIGEST = "b" * 64
 FAILURE_DIGEST = "c" * 64
 REQUIRED_CHECKS = (
-    "Benchmark contracts",
     "Quality",
-    "Test (macos-latest)",
+    "Benchmark contracts",
     "Test (ubuntu-latest)",
+    "Test (macos-latest)",
     "Test (windows-latest)",
 )
 
@@ -189,8 +189,7 @@ def pull_request(**changes: object) -> PullRequestSnapshot:
         "head_tree": CANDIDATE_TREE,
         "merge_state": "CLEAN",
         "checks": tuple(
-            CheckRun(name=name, conclusion="SUCCESS", app_id=15368)
-            for name in REQUIRED_CHECKS
+            CheckRun(name=name, conclusion="SUCCESS", app_id=15368) for name in REQUIRED_CHECKS
         ),
         "merge_commit": None,
         "merge_tree": None,
@@ -339,7 +338,13 @@ def test_restart_safe_healthy_and_exact_revert_lifecycles() -> None:
     accepted = next_controller_action(snapshot, datetime(2026, 8, 20, 13, tzinfo=UTC))
     assert accepted.action == "accept"
     assert accepted.merge_commit == MERGE
-    assert next_controller_action(replace(snapshot, accepted=True), NOW).action == "idle"
+    assert (
+        next_controller_action(
+            replace(snapshot, accepted=True),
+            datetime(2026, 8, 20, 13, tzinfo=UTC),
+        ).action
+        == "idle"
+    )
 
     failed_result = SoakResult(
         merge_commit=MERGE,
@@ -349,9 +354,7 @@ def test_restart_safe_healthy_and_exact_revert_lifecycles() -> None:
     )
     failed = replace(snapshot, autonomy=replace(snapshot.autonomy, soak_observations=()))
     failed = replace(failed, soak_result=failed_result)
-    failure_observation = next_controller_action(
-        failed, datetime(2026, 8, 19, 13, tzinfo=UTC)
-    )
+    failure_observation = next_controller_action(failed, datetime(2026, 8, 19, 13, tzinfo=UTC))
     assert failure_observation.action == "observe_soak"
 
     hard_failure = SoakObservation(
@@ -379,6 +382,7 @@ def test_restart_safe_healthy_and_exact_revert_lifecycles() -> None:
     )
     create_revert = next_controller_action(failed, datetime(2026, 8, 19, 13, tzinfo=UTC))
     assert create_revert.action == "create_revert_pr"
+    assert create_revert.promotion_merge_commit == MERGE
     assert create_revert.restored_tree == RESTORED_TREE
 
     revert_pr = pull_request(
@@ -397,7 +401,12 @@ def test_restart_safe_healthy_and_exact_revert_lifecycles() -> None:
             revert_candidate_commit=REVERT_CANDIDATE,
         ),
     )
-    assert next_controller_action(failed, NOW).action == "idle"
+    continuing_revert = next_controller_action(failed, datetime(2026, 8, 19, 13, tzinfo=UTC))
+    assert continuing_revert.action == "idle"
+    assert continuing_revert.promotion_merge_commit == MERGE
+    assert continuing_revert.revert_pull_request_number == 82
+    assert continuing_revert.revert_candidate_commit == REVERT_CANDIDATE
+    assert continuing_revert.revert_merge_commit is None
 
     reverted_pr = replace(
         revert_pr,
@@ -415,10 +424,22 @@ def test_restart_safe_healthy_and_exact_revert_lifecycles() -> None:
             reverted_commit=REVERT_MERGE,
         ),
     )
-    reverted = next_controller_action(failed, NOW)
+    reverted = next_controller_action(failed, datetime(2026, 8, 19, 14, tzinfo=UTC))
     assert reverted.action == "record_reverted"
     assert reverted.event is not None
-    assert reverted.event.occurred_at == "2026-08-19T12:00:00Z"
+    assert reverted.event.occurred_at == "2026-08-19T14:00:00Z"
+    assert reverted.promotion_merge_commit == MERGE
+    assert reverted.revert_pull_request_number == 82
+    assert reverted.revert_candidate_commit == REVERT_CANDIDATE
+    assert reverted.revert_merge_commit == REVERT_MERGE
+    assert reverted.event.payload == {
+        "hard_failure_digest": FAILURE_DIGEST,
+        "merge_commit": MERGE,
+        "restored_tree": RESTORED_TREE,
+        "revert_candidate_commit": REVERT_CANDIDATE,
+        "revert_merge_commit": REVERT_MERGE,
+        "revert_pull_request_number": 82,
+    }
 
     failed = replace(
         failed,
@@ -428,6 +449,9 @@ def test_restart_safe_healthy_and_exact_revert_lifecycles() -> None:
                 merge_commit=MERGE,
                 hard_failure_digest=FAILURE_DIGEST,
                 restored_tree=RESTORED_TREE,
+                revert_pull_request_number=82,
+                revert_candidate_commit=REVERT_CANDIDATE,
+                revert_merge_commit=REVERT_MERGE,
                 reverted_at="2026-08-19T14:00:00Z",
             ),
         ),
@@ -475,9 +499,7 @@ def test_infrastructure_failure_allows_three_changed_retries_then_freezes() -> N
             failure_class="cloud_execution_unavailable",
             changed_action=changed_action,
         )
-        action = next_controller_action(
-            replace(snapshot, infrastructure_failure=failure), NOW
-        )
+        action = next_controller_action(replace(snapshot, infrastructure_failure=failure), NOW)
 
         assert action.action == "schedule_retry"
         assert action.event is not None
@@ -686,6 +708,32 @@ def test_ineligible_capability_report_is_rejected_before_signed_receipt_use() ->
         next_controller_action(snapshot, NOW)
 
 
+def test_protected_receipt_schema_v1_cannot_enter_production_validation() -> None:
+    snapshot = controller_snapshot()
+    legacy_receipt = replace(
+        snapshot.protected_validation.receipt,
+        schema_version=1,
+        capability_report_digest=None,
+        transfer_gain_basis_points=None,
+    )
+    legacy_envelope, public_key = signed_receipt(legacy_receipt)
+    legacy_request = replace(
+        snapshot.promotion_request,
+        protected_receipt_digest=legacy_receipt.digest,
+    )
+
+    with pytest.raises(PromotionContractError, match="protected_receipt_schema_v2_required"):
+        next_controller_action(
+            replace(
+                snapshot,
+                protected_validation=legacy_envelope,
+                protected_public_key_pem=public_key,
+                promotion_request=legacy_request,
+            ),
+            NOW,
+        )
+
+
 def test_tampered_protected_receipt_signature_is_rejected() -> None:
     snapshot = controller_snapshot()
     tampered = replace(
@@ -784,9 +832,7 @@ def test_protected_verification_receives_exact_changed_paths() -> None:
         changed_paths=("benchmarks/src/carl_bench/promotion.py",),
     )
 
-    with pytest.raises(
-        PromotionContractError, match="constitutional_change_requires_owner"
-    ):
+    with pytest.raises(PromotionContractError, match="constitutional_change_requires_owner"):
         next_controller_action(snapshot, NOW)
 
 
@@ -799,12 +845,8 @@ def test_different_eligible_report_cannot_reuse_an_exact_protected_receipt() -> 
     snapshot = controller_snapshot()
     substituted_report = replace(snapshot.capability_report, claim_id="claim-substitute")
 
-    with pytest.raises(
-        PromotionContractError, match="protected_capability_report_mismatch"
-    ):
-        next_controller_action(
-            replace(snapshot, capability_report=substituted_report), NOW
-        )
+    with pytest.raises(PromotionContractError, match="protected_capability_report_mismatch"):
+        next_controller_action(replace(snapshot, capability_report=substituted_report), NOW)
 
 
 def test_soak_rechecks_durable_validation_receipt_identity() -> None:
@@ -831,9 +873,7 @@ def test_soak_rechecks_durable_validation_receipt_identity() -> None:
         promotion_snapshot=replace(snapshot.promotion_snapshot, production_commit=MERGE),
     )
 
-    with pytest.raises(
-        PromotionContractError, match="promotion_recorded_validation_mismatch"
-    ):
+    with pytest.raises(PromotionContractError, match="promotion_recorded_validation_mismatch"):
         next_controller_action(snapshot, NOW)
 
 
@@ -870,3 +910,159 @@ def test_changed_main_during_soak_cancels_acceptance() -> None:
 
     with pytest.raises(PromotionContractError, match="promotion_main_identity_mismatch"):
         next_controller_action(snapshot, datetime(2026, 8, 20, 9, tzinfo=UTC))
+
+
+def test_durable_hard_failure_reconciliation_precedes_infrastructure_retry() -> None:
+    snapshot = controller_snapshot()
+    failure = SoakObservation(
+        merge_commit=MERGE,
+        observed_at="2026-08-19T09:00:00Z",
+        healthy=False,
+        evidence_digest=FAILURE_DIGEST,
+    )
+    revert = RevertSnapshot(
+        promotion_id=snapshot.promotion_request.promotion_id,
+        merge_commit=MERGE,
+        hard_failure=True,
+        revert_pull_request=None,
+        revert_candidate_commit=None,
+        expected_restored_tree=RESTORED_TREE,
+        production_commit=MERGE,
+        production_tree=CANDIDATE_TREE,
+        reverted_commit=None,
+    )
+    snapshot = replace(
+        snapshot,
+        autonomy=replace(
+            snapshot.autonomy,
+            protected_validation=ProtectedValidation(
+                candidate_commit=CANDIDATE,
+                candidate_tree=CANDIDATE_TREE,
+                receipt_digest=snapshot.promotion_request.protected_receipt_digest,
+            ),
+            promotion=PromotionRecord(
+                merge_commit=MERGE,
+                merge_tree=CANDIDATE_TREE,
+                merged_at="2026-08-19T08:00:00Z",
+            ),
+            soak_observations=(failure,),
+        ),
+        promotion_snapshot=replace(snapshot.promotion_snapshot, production_commit=MERGE),
+        revert_snapshot=revert,
+        infrastructure_failure=InfrastructureFailure(
+            failed_stage_attempt_id="revert-gateway-1",
+            failure_class="cloud_execution_unavailable",
+            changed_action="refetch exact revert state",
+        ),
+    )
+
+    create = next_controller_action(snapshot, NOW)
+    assert create.action == "create_revert_pr"
+
+    open_revert_pr = pull_request(
+        number=82,
+        url="https://github.com/StephenBickel/carl-agent/pull/82",
+        is_draft=False,
+        head_branch="revert/promotion-exp-001-1",
+        head_commit=REVERT_CANDIDATE,
+        head_tree=RESTORED_TREE,
+    )
+    continuing = next_controller_action(
+        replace(
+            snapshot,
+            revert_snapshot=replace(
+                revert,
+                revert_pull_request=open_revert_pr,
+                revert_candidate_commit=REVERT_CANDIDATE,
+            ),
+        ),
+        NOW,
+    )
+    assert continuing.action == "idle"
+    assert continuing.reason == "revert_pull_request_exists"
+
+    merged_revert_pr = replace(
+        open_revert_pr,
+        state="MERGED",
+        merge_commit=REVERT_MERGE,
+        merge_tree=RESTORED_TREE,
+    )
+    recorded = next_controller_action(
+        replace(
+            snapshot,
+            revert_snapshot=replace(
+                revert,
+                revert_pull_request=merged_revert_pr,
+                revert_candidate_commit=REVERT_CANDIDATE,
+                production_commit=REVERT_MERGE,
+                production_tree=RESTORED_TREE,
+                reverted_commit=REVERT_MERGE,
+            ),
+        ),
+        NOW,
+    )
+    assert recorded.action == "record_reverted"
+
+
+@pytest.mark.parametrize(
+    "required_checks",
+    (
+        REQUIRED_CHECKS[:-1],
+        ("Security", *REQUIRED_CHECKS[1:]),
+        (),
+    ),
+)
+def test_required_checks_cannot_be_reduced_or_substituted(
+    required_checks: tuple[str, ...],
+) -> None:
+    snapshot = controller_snapshot()
+    snapshot = replace(
+        snapshot,
+        autonomy=replace(
+            snapshot.autonomy,
+            protected_validation=ProtectedValidation(
+                candidate_commit=CANDIDATE,
+                candidate_tree=CANDIDATE_TREE,
+                receipt_digest=snapshot.promotion_request.protected_receipt_digest,
+            ),
+        ),
+        required_checks=required_checks,
+    )
+
+    with pytest.raises(PromotionContractError, match="required_checks_policy_mismatch"):
+        next_controller_action(snapshot, NOW)
+
+
+def test_future_dated_durable_soak_cannot_accept_or_replay_acceptance() -> None:
+    snapshot = controller_snapshot()
+    snapshot = replace(
+        snapshot,
+        autonomy=replace(
+            snapshot.autonomy,
+            protected_validation=ProtectedValidation(
+                candidate_commit=CANDIDATE,
+                candidate_tree=CANDIDATE_TREE,
+                receipt_digest=snapshot.promotion_request.protected_receipt_digest,
+            ),
+            promotion=PromotionRecord(
+                merge_commit=MERGE,
+                merge_tree=CANDIDATE_TREE,
+                merged_at="2026-08-19T08:00:00Z",
+            ),
+            soak_observations=(
+                SoakObservation(
+                    merge_commit=MERGE,
+                    observed_at="2026-08-20T09:00:00Z",
+                    healthy=True,
+                    evidence_digest=HEALTHY_DIGEST,
+                ),
+            ),
+        ),
+        promotion_snapshot=replace(snapshot.promotion_snapshot, production_commit=MERGE),
+    )
+    evaluated_at = datetime(2026, 8, 19, 9, tzinfo=UTC)
+
+    with pytest.raises(PromotionContractError, match="soak_observation_in_future"):
+        next_controller_action(snapshot, evaluated_at)
+    with pytest.raises(PromotionContractError, match="accepted_soak_evidence_required"):
+        next_controller_action(replace(snapshot, accepted=True), evaluated_at)

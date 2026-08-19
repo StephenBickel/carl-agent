@@ -188,19 +188,33 @@ class RevertRecord:
     merge_commit: str
     hard_failure_digest: str
     restored_tree: str
+    revert_pull_request_number: int
+    revert_candidate_commit: str
+    revert_merge_commit: str
     reverted_at: str
 
     def __post_init__(self) -> None:
         _object_id(self.merge_commit)
         _digest(self.hard_failure_digest)
         _object_id(self.restored_tree)
+        if (
+            not isinstance(self.revert_pull_request_number, int)
+            or isinstance(self.revert_pull_request_number, bool)
+            or self.revert_pull_request_number <= 0
+        ):
+            raise GraphContractError("invalid_revert_pull_request_number")
+        _object_id(self.revert_candidate_commit)
+        _object_id(self.revert_merge_commit)
         _utc(self.reverted_at)
 
-    def to_canonical_dict(self) -> dict[str, str]:
+    def to_canonical_dict(self) -> dict[str, Any]:
         return {
             "hard_failure_digest": self.hard_failure_digest,
             "merge_commit": self.merge_commit,
             "restored_tree": self.restored_tree,
+            "revert_candidate_commit": self.revert_candidate_commit,
+            "revert_merge_commit": self.revert_merge_commit,
+            "revert_pull_request_number": self.revert_pull_request_number,
             "reverted_at": self.reverted_at,
         }
 
@@ -384,7 +398,14 @@ def reduce_autonomy_events(
                 raise GraphContractError("revert_already_recorded")
             payload = _payload(
                 event,
-                {"hard_failure_digest", "merge_commit", "restored_tree"},
+                {
+                    "hard_failure_digest",
+                    "merge_commit",
+                    "restored_tree",
+                    "revert_candidate_commit",
+                    "revert_merge_commit",
+                    "revert_pull_request_number",
+                },
                 "invalid_revert_payload",
             )
             recorded_revert = _record(

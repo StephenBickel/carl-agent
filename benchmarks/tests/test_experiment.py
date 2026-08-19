@@ -942,6 +942,9 @@ def test_autonomy_projection_reverts_only_after_a_hard_failure() -> None:
             "hard_failure_digest": "f" * 64,
             "merge_commit": "b" * 40,
             "restored_tree": "c" * 40,
+            "revert_candidate_commit": "d" * 40,
+            "revert_merge_commit": "e" * 40,
+            "revert_pull_request_number": 82,
         },
     )
 
@@ -1067,6 +1070,9 @@ def test_autonomy_projection_fails_closed_for_invalid_lifecycle_ordering() -> No
             "hard_failure_digest": "f" * 64,
             "merge_commit": "b" * 40,
             "restored_tree": "c" * 40,
+            "revert_candidate_commit": "d" * 40,
+            "revert_merge_commit": "e" * 40,
+            "revert_pull_request_number": 82,
         },
     )
 

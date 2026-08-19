@@ -92,9 +92,7 @@ class SoakResult:
     evidence_digest: str
 
     def __post_init__(self) -> None:
-        if not isinstance(self.merge_commit, str) or not _OBJECT_RE.fullmatch(
-            self.merge_commit
-        ):
+        if not isinstance(self.merge_commit, str) or not _OBJECT_RE.fullmatch(self.merge_commit):
             raise PromotionContractError("invalid_soak_merge_commit")
         _utc("soak_observed_at", self.observed_at)
         if not isinstance(self.healthy, bool):
@@ -216,6 +214,10 @@ class ControllerAction:
     protected_receipt_digest: str | None = None
     pull_request_number: int | None = None
     merge_commit: str | None = None
+    promotion_merge_commit: str | None = None
+    revert_pull_request_number: int | None = None
+    revert_candidate_commit: str | None = None
+    revert_merge_commit: str | None = None
     restored_tree: str | None = None
     health_findings: tuple[str, ...] = ()
 
@@ -232,14 +234,17 @@ def _idle(reason: str) -> ControllerAction:
     return ControllerAction("idle", reason)
 
 
-def _accepted_evidence_is_bound(autonomy: AutonomyProjection) -> bool:
+def _accepted_evidence_is_bound(autonomy: AutonomyProjection, now: datetime) -> bool:
     promotion = autonomy.promotion
     if promotion is None or any(not item.healthy for item in autonomy.soak_observations):
         return False
     merged_at = _utc("promotion_merged_at", promotion.merged_at)
+    if now - merged_at < timedelta(hours=24):
+        return False
     return any(
         item.merge_commit == promotion.merge_commit
-        and _utc("soak_observed_at", item.observed_at) - merged_at >= timedelta(hours=24)
+        and (observed_at := _utc("soak_observed_at", item.observed_at)) <= now
+        and observed_at - merged_at >= timedelta(hours=24)
         for item in autonomy.soak_observations
     )
 
@@ -305,6 +310,8 @@ def _validation_action(snapshot: ControllerSnapshot, now: datetime) -> Controlle
     expected = snapshot.promotion_expectation
     if envelope is None or public_key is None or expected is None:
         return _idle("protected_validation_required")
+    if envelope.receipt.schema_version != 2:
+        raise PromotionContractError("protected_receipt_schema_v2_required")
     request, github = _request(snapshot)
     lease_reason = promotion_lease_reason(github, request.promotion_id)
     if lease_reason is not None:
@@ -363,9 +370,7 @@ def _validation_action(snapshot: ControllerSnapshot, now: datetime) -> Controlle
     )
 
 
-def _require_recorded_validation(
-    snapshot: ControllerSnapshot, request: PromotionRequest
-) -> None:
+def _require_recorded_validation(snapshot: ControllerSnapshot, request: PromotionRequest) -> None:
     validation = snapshot.autonomy.protected_validation
     if validation is None or (
         validation.candidate_commit != request.candidate_commit
@@ -439,18 +444,25 @@ def _revert_action(
             "create_revert_pr",
             decision.reason,
             promotion_id=request.promotion_id,
-            merge_commit=revert_snapshot.merge_commit,
+            merge_commit=decision.promotion_merge_commit,
+            promotion_merge_commit=decision.promotion_merge_commit,
             restored_tree=revert_snapshot.expected_restored_tree,
         )
     if decision.action == "record_reverted":
         failure = next(
             item for item in reversed(snapshot.autonomy.soak_observations) if not item.healthy
         )
-        assert decision.merge_commit is not None
+        assert decision.promotion_merge_commit is not None
+        assert decision.revert_pull_request_number is not None
+        assert decision.revert_candidate_commit is not None
+        assert decision.revert_merge_commit is not None
         event_payload = {
             "hard_failure_digest": failure.evidence_digest,
             "merge_commit": revert_snapshot.merge_commit,
             "restored_tree": revert_snapshot.expected_restored_tree,
+            "revert_candidate_commit": decision.revert_candidate_commit,
+            "revert_merge_commit": decision.revert_merge_commit,
+            "revert_pull_request_number": decision.revert_pull_request_number,
         }
         event = ExperimentEvent.create(
             experiment_id=request.experiment_id,
@@ -464,7 +476,20 @@ def _revert_action(
             decision.reason,
             event=event,
             promotion_id=request.promotion_id,
-            merge_commit=decision.merge_commit,
+            promotion_merge_commit=decision.promotion_merge_commit,
+            revert_pull_request_number=decision.revert_pull_request_number,
+            revert_candidate_commit=decision.revert_candidate_commit,
+            revert_merge_commit=decision.revert_merge_commit,
+            restored_tree=revert_snapshot.expected_restored_tree,
+        )
+    if decision.action == "await_revert":
+        return ControllerAction(
+            "idle",
+            decision.reason,
+            promotion_id=request.promotion_id,
+            promotion_merge_commit=decision.promotion_merge_commit,
+            revert_pull_request_number=decision.revert_pull_request_number,
+            revert_candidate_commit=decision.revert_candidate_commit,
             restored_tree=revert_snapshot.expected_restored_tree,
         )
     return _idle(decision.reason)
@@ -479,12 +504,12 @@ def _soak_action(
     assert promotion is not None
     if snapshot.promotion_snapshot is None:
         raise PromotionContractError("promotion_context_required")
-    lease_reason = promotion_lease_reason(
-        snapshot.promotion_snapshot, request.promotion_id
-    )
+    lease_reason = promotion_lease_reason(snapshot.promotion_snapshot, request.promotion_id)
     if lease_reason is not None:
         return _idle(lease_reason)
     observations = snapshot.autonomy.soak_observations
+    if any(_utc("soak_observed_at", item.observed_at) > now for item in observations):
+        raise PromotionContractError("soak_observation_in_future")
     if any(not item.healthy for item in observations):
         return _revert_action(snapshot, request, now)
     if snapshot.promotion_snapshot.production_commit != promotion.merge_commit:
@@ -499,8 +524,7 @@ def _soak_action(
         if observed_at > now:
             raise PromotionContractError("soak_observation_in_future")
         if any(
-            item.observed_at == result.observed_at
-            or item.evidence_digest == result.evidence_digest
+            item.observed_at == result.observed_at or item.evidence_digest == result.evidence_digest
             for item in observations
         ):
             raise PromotionContractError("duplicate_soak_observation")
@@ -524,7 +548,7 @@ def _soak_action(
             promotion_id=request.promotion_id,
             merge_commit=result.merge_commit,
         )
-    if any(
+    if now - _utc("promotion_merged_at", promotion.merged_at) >= timedelta(hours=24) and any(
         item.healthy
         and _utc("soak_observed_at", item.observed_at)
         - _utc("promotion_merged_at", promotion.merged_at)
@@ -551,17 +575,25 @@ def next_controller_action(snapshot: ControllerSnapshot, now: datetime) -> Contr
         raise PromotionContractError("invalid_controller_snapshot")
     _now(now)
     if snapshot.accepted:
-        if not _accepted_evidence_is_bound(snapshot.autonomy):
+        if not _accepted_evidence_is_bound(snapshot.autonomy, now):
             raise PromotionContractError("accepted_soak_evidence_required")
         return _idle("experiment_accepted")
     if snapshot.autonomy.revert is not None:
         return _idle("experiment_reverted")
-    if snapshot.infrastructure_failure is not None:
-        return _retry_action(snapshot, snapshot.infrastructure_failure, now)
     health_findings: tuple[str, ...] = ()
+    health_report = None
     if snapshot.promotion_health is not None:
         health_report = evaluate_promotion_health(snapshot.promotion_health, now=now)
         health_findings = health_report.findings
+    if snapshot.autonomy.promotion is not None and any(
+        not item.healthy for item in snapshot.autonomy.soak_observations
+    ):
+        request, _ = _request(snapshot)
+        _require_recorded_validation(snapshot, request)
+        return replace(_soak_action(snapshot, request, now), health_findings=health_findings)
+    if snapshot.infrastructure_failure is not None:
+        return _retry_action(snapshot, snapshot.infrastructure_failure, now)
+    if health_report is not None:
         blocker = promotion_controller_blocker(health_report)
         if blocker is not None:
             return replace(_idle(blocker), health_findings=health_findings)

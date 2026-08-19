@@ -332,6 +332,9 @@ def test_trusted_authority_append_replays_a_complete_protected_lifecycle(
                 "hard_failure_digest": "f" * 64,
                 "merge_commit": "b" * 40,
                 "restored_tree": "c" * 40,
+                "revert_candidate_commit": "d" * 40,
+                "revert_merge_commit": "e" * 40,
+                "revert_pull_request_number": 82,
             },
         ),
     )
@@ -357,6 +360,10 @@ def test_trusted_authority_append_replays_a_complete_protected_lifecycle(
     assert replayed.promotion.merge_commit == "b" * 40
     assert replayed.soak_observations[-1].healthy is False
     assert replayed.revert is not None
+    assert replayed.revert.merge_commit == "b" * 40
+    assert replayed.revert.revert_pull_request_number == 82
+    assert replayed.revert.revert_candidate_commit == "d" * 40
+    assert replayed.revert.revert_merge_commit == "e" * 40
     assert replayed.revert.restored_tree == "c" * 40
 
 
