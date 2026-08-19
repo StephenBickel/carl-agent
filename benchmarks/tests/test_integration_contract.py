@@ -86,6 +86,31 @@ def test_root_readme_links_the_lab_without_claiming_autonomous_promotion() -> No
     assert "append-only experiment graph" in section
 
 
+def test_public_autonomy_graph_is_commissioning_scoped_and_truthful() -> None:
+    readme = (REPOSITORY_ROOT / "README.md").read_text(encoding="utf-8")
+    guide = (REPOSITORY_ROOT / "docs" / "autonomous-improvement.md").read_text(
+        encoding="utf-8"
+    )
+    required = (
+        "Autonomous improvement: commissioning",
+        "experimental",
+        "protected main",
+        "independent validation",
+        "24-hour soak",
+        "exact revert",
+        "no routine human approval",
+        "capability transfer",
+    )
+
+    for document in (readme, guide):
+        normalized = " ".join(document.casefold().split())
+        for statement in required:
+            assert statement.casefold() in normalized
+
+    assert "[autonomous improvement graph](docs/autonomous-improvement.md)" in readme
+    assert "does not claim that all historical commits were autonomous" in readme.casefold()
+
+
 def test_public_dry_run_manifest_example_satisfies_the_strict_contract() -> None:
     value = json.loads(EXAMPLE_MANIFEST.read_text(encoding="utf-8"))
     parsed = ExperimentManifest.from_canonical_dict(value)

@@ -15,6 +15,7 @@ const PUBLIC_DOCS: &[&str] = &[
     "docs/configuration.md",
     "docs/buzz.md",
     "docs/long-horizon-tasks.md",
+    "docs/autonomous-improvement.md",
     "docs/benchmarks.md",
     "docs/memory.md",
     "docs/telegram.md",
@@ -689,6 +690,35 @@ fn readme_points_to_the_carl_design_and_public_contract() {
         carl_design
             .lines()
             .any(|line| line == "Status: approved for implementation")
+    );
+}
+
+#[test]
+fn public_autonomy_graph_is_commissioning_scoped_and_truthful() {
+    let readme = read_readme();
+
+    for relative_path in ["README.md", "docs/autonomous-improvement.md"] {
+        assert_document_contains(
+            relative_path,
+            &[
+                "autonomous improvement: commissioning",
+                "experimental",
+                "protected main",
+                "independent validation",
+                "24-hour soak",
+                "exact revert",
+                "no routine human approval",
+                "capability transfer",
+            ],
+        );
+    }
+
+    assert!(readme.contains("[autonomous improvement graph](docs/autonomous-improvement.md)"));
+    assert!(
+        readme
+            .to_lowercase()
+            .contains("does not claim that all historical commits were autonomous"),
+        "README must not claim all historical commits were autonomous"
     );
 }
 
