@@ -235,6 +235,254 @@ class ProtectedPairEvaluation:
     evidence_bundle_ref: ArtifactRef
 
 
+@dataclass(frozen=True, slots=True)
+class VerifiedProtectedPairEvaluation:
+    """A protected evaluation rebuilt from evaluator and command-output bytes."""
+
+    report: CapabilityValidationReport
+    baseline_commit: str
+    baseline_tree: str
+    candidate_commit: str
+    candidate_tree: str
+    changed_paths: tuple[str, ...]
+    artifact_refs: tuple[tuple[str, ArtifactRef], ...]
+
+
+def _typed_artifact_ref(
+    value: Any,
+    *,
+    evidence_kind: str,
+    media_type: str,
+    code: str,
+) -> ArtifactRef:
+    try:
+        ref = ArtifactRef.from_canonical_dict(value)
+    except (TypeError, ValueError) as error:
+        raise CommissioningArtifactError(code) from error
+    if ref.evidence_kind != evidence_kind or ref.media_type != media_type:
+        raise CommissioningArtifactError(code)
+    return ref
+
+
+def _json_object(content: bytes, expected: set[str], code: str) -> dict[str, Any]:
+    try:
+        value = json.loads(content)
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise CommissioningArtifactError(code) from error
+    if not isinstance(value, dict) or set(value) != expected:
+        raise CommissioningArtifactError(code)
+    return value
+
+
+def _rebuild_execution_side(
+    *,
+    artifacts: PrivateArtifactStore,
+    side_name: str,
+    value: Any,
+    evaluator: ProtectedEvaluator,
+    evaluator_ref: ArtifactRef,
+) -> tuple[tuple[TaskOutcome, ...], str, str, tuple[tuple[str, ArtifactRef], ...]]:
+    if not isinstance(value, dict) or set(value) != {
+        "outcomes",
+        "subject_commit",
+        "subject_tree",
+        "trials",
+    }:
+        raise CommissioningArtifactError("invalid_protected_execution_bundle")
+    commit = _object(value["subject_commit"], "invalid_synthetic_subject_commit")
+    tree = _object(value["subject_tree"], "invalid_synthetic_subject_tree")
+    trials = value["trials"]
+    if not isinstance(trials, list) or len(trials) != len(evaluator.tasks):
+        raise CommissioningArtifactError("invalid_protected_execution_trials")
+
+    outcomes: list[TaskOutcome] = []
+    refs: list[tuple[str, ArtifactRef]] = []
+    for task, trial in zip(evaluator.tasks, trials, strict=True):
+        if not isinstance(trial, dict) or set(trial) != {
+            "command_exit_code",
+            "evaluator_digest",
+            "expected",
+            "stderr_ref",
+            "stdout_ref",
+            "subject_commit",
+            "task_digest",
+            "task_id",
+            "valid",
+        }:
+            raise CommissioningArtifactError("invalid_protected_execution_trial")
+        exit_code = trial["command_exit_code"]
+        if isinstance(exit_code, bool) or not isinstance(exit_code, int):
+            raise CommissioningArtifactError("invalid_protected_execution_trial")
+        if (
+            trial["evaluator_digest"] != evaluator_ref.digest
+            or trial["expected"] != task.expected
+            or trial["subject_commit"] != commit
+            or trial["task_digest"] != task.digest
+            or trial["task_id"] != task.task_id
+            or not isinstance(trial["valid"], bool)
+        ):
+            raise CommissioningArtifactError("protected_execution_identity_mismatch")
+        stdout_ref = _typed_artifact_ref(
+            trial["stdout_ref"],
+            evidence_kind="command_stdout",
+            media_type="application/json",
+            code="invalid_protected_stdout_ref",
+        )
+        stderr_ref = _typed_artifact_ref(
+            trial["stderr_ref"],
+            evidence_kind="command_stderr",
+            media_type="text/plain",
+            code="invalid_protected_stderr_ref",
+        )
+        stdout = artifacts.read(stdout_ref)
+        stderr = artifacts.read(stderr_ref)
+        if b"commissioning_socket_denied" in stderr:
+            raise CommissioningArtifactError("synthetic_subject_network_denied")
+        parsed: Any = None
+        valid = exit_code == 0
+        if valid:
+            try:
+                parsed = json.loads(stdout)
+            except (UnicodeError, json.JSONDecodeError):
+                valid = False
+        if trial["valid"] is not valid:
+            raise CommissioningArtifactError("protected_execution_validity_mismatch")
+        passed = valid and parsed == task.expected
+        trial_id = f"trial-{task.task_id}"
+        outcomes.append(
+            TaskOutcome(
+                task_id=task.task_id,
+                task_digest=task.digest,
+                evaluator_digest=evaluator_ref.digest,
+                score_basis_points=10_000 if passed else 0,
+                valid_trials=(trial_id,) if valid else (),
+                invalid_trials=() if valid else (trial_id,),
+                passed_trials=(trial_id,) if passed else (),
+                failed_trials=(trial_id,) if valid and not passed else (),
+            )
+        )
+        refs.extend(
+            (
+                (f"{side_name}_{task.task_id}_stderr", stderr_ref),
+                (f"{side_name}_{task.task_id}_stdout", stdout_ref),
+            )
+        )
+    derived = tuple(outcomes)
+    if value["outcomes"] != [item.to_canonical_dict() for item in derived]:
+        raise CommissioningArtifactError("protected_execution_outcome_mismatch")
+    return derived, commit, tree, tuple(refs)
+
+
+def verify_protected_pair_evaluation(
+    *,
+    artifacts: PrivateArtifactStore,
+    evidence_bundle_ref: ArtifactRef,
+) -> VerifiedProtectedPairEvaluation:
+    """Recompute a paired report without trusting persisted scores or validity flags."""
+    if not isinstance(artifacts, PrivateArtifactStore):
+        raise CommissioningArtifactError("invalid_synthetic_artifact_store")
+    if (
+        not isinstance(evidence_bundle_ref, ArtifactRef)
+        or evidence_bundle_ref.evidence_kind != "capability_evidence_bundle"
+        or evidence_bundle_ref.media_type != "application/json"
+    ):
+        raise CommissioningArtifactError("invalid_capability_evidence_bundle_ref")
+    bundle = _json_object(
+        artifacts.read(evidence_bundle_ref),
+        {
+            "capability_report_ref",
+            "changed_paths",
+            "claim",
+            "evaluator_ref",
+            "execution_bundle_ref",
+            "schema_version",
+        },
+        "invalid_capability_evidence_bundle",
+    )
+    if bundle["schema_version"] != 1:
+        raise CommissioningArtifactError("invalid_capability_evidence_bundle")
+    evaluator_ref = _typed_artifact_ref(
+        bundle["evaluator_ref"],
+        evidence_kind="protected_evaluator",
+        media_type="application/json",
+        code="invalid_protected_evaluator_ref",
+    )
+    execution_ref = _typed_artifact_ref(
+        bundle["execution_bundle_ref"],
+        evidence_kind="protected_execution_bundle",
+        media_type="application/json",
+        code="invalid_protected_execution_bundle_ref",
+    )
+    report_ref = _typed_artifact_ref(
+        bundle["capability_report_ref"],
+        evidence_kind="capability_report",
+        media_type="application/json",
+        code="invalid_capability_report_ref",
+    )
+    evaluator = ProtectedEvaluator.from_bytes(artifacts.read(evaluator_ref))
+    claim = evaluator.capability_claim(evaluator_ref.digest)
+    if bundle["claim"] != claim.to_canonical_dict():
+        raise CommissioningArtifactError("protected_capability_claim_mismatch")
+    changed_paths_value = bundle["changed_paths"]
+    if not isinstance(changed_paths_value, list) or any(
+        not isinstance(path, str) for path in changed_paths_value
+    ):
+        raise CommissioningArtifactError("invalid_synthetic_changed_paths")
+    changed_paths = tuple(changed_paths_value)
+    execution = _json_object(
+        artifacts.read(execution_ref),
+        {"baseline", "candidate", "evaluator_ref", "schema_version"},
+        "invalid_protected_execution_bundle",
+    )
+    if execution["schema_version"] != 1 or execution["evaluator_ref"] != (
+        evaluator_ref.to_canonical_dict()
+    ):
+        raise CommissioningArtifactError("protected_execution_identity_mismatch")
+    baseline, baseline_commit, baseline_tree, baseline_refs = _rebuild_execution_side(
+        artifacts=artifacts,
+        side_name="baseline",
+        value=execution["baseline"],
+        evaluator=evaluator,
+        evaluator_ref=evaluator_ref,
+    )
+    candidate, candidate_commit, candidate_tree, candidate_refs = _rebuild_execution_side(
+        artifacts=artifacts,
+        side_name="candidate",
+        value=execution["candidate"],
+        evaluator=evaluator,
+        evaluator_ref=evaluator_ref,
+    )
+    report = evaluate_capability_validation(
+        claim,
+        baseline,
+        candidate,
+        changed_paths,
+    )
+    if artifacts.read(report_ref) != canonical_json_bytes(report.to_canonical_dict()):
+        raise CommissioningArtifactError("protected_capability_report_mismatch")
+    refs = tuple(
+        sorted(
+            (
+                ("capability_evidence_bundle", evidence_bundle_ref),
+                ("capability_report", report_ref),
+                ("protected_evaluator", evaluator_ref),
+                ("protected_execution_bundle", execution_ref),
+                *baseline_refs,
+                *candidate_refs,
+            )
+        )
+    )
+    return VerifiedProtectedPairEvaluation(
+        report=report,
+        baseline_commit=baseline_commit,
+        baseline_tree=baseline_tree,
+        candidate_commit=candidate_commit,
+        candidate_tree=candidate_tree,
+        changed_paths=changed_paths,
+        artifact_refs=refs,
+    )
+
+
 class ProtectedSyntheticRunner:
     """Run exact commits against protected tasks with Python socket access denied."""
 

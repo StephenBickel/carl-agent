@@ -18,7 +18,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from test_experiment import manifest as base_manifest
 
-from carl_bench.artifacts import PrivateArtifactStore
+from carl_bench.artifacts import ArtifactRef, PrivateArtifactStore
 from carl_bench.autonomy import (
     AutonomyProjection,
     ExperimentalPublication,
@@ -1256,6 +1256,12 @@ def test_controller_subprocess_recovers_two_effect_receipt_boundaries(
     tmp_path: Path,
     disposable_git: DisposableGitFixture,
 ) -> None:
+    from carl_bench.commissioning_controller import (
+        CommissioningEffectStore,
+        EffectRequest,
+        verify_effect_receipt_ref,
+    )
+
     automation_root = tmp_path / "automation-data"
     commissioning_store = CommissioningArtifactStore(
         automation_data_root=automation_root,
@@ -1455,6 +1461,33 @@ def test_controller_subprocess_recovers_two_effect_receipt_boundaries(
             "recovered": True,
         }
 
+    snapshot = CommissioningEffectStore(effect_store).validated_snapshot()
+    assert [item["request"]["kind"] for item in snapshot["effects"]] == [
+        "experimental_publish",
+        "promotion_merge",
+    ]
+    snapshot_by_key = {item["effect_key"]: item for item in snapshot["effects"]}
+    direct_artifacts = PrivateArtifactStore(
+        commissioning_store.objects_root,
+        disposable_git.builder,
+    )
+    for request_value in (publication_request, promotion_request):
+        request = EffectRequest.from_canonical_dict(request_value)
+        receipt_ref = ArtifactRef.from_canonical_dict(
+            snapshot_by_key[request.effect_key]["receipt_ref"]
+        )
+        assert verify_effect_receipt_ref(
+            artifacts=direct_artifacts,
+            receipt_ref=receipt_ref,
+            public_key_pem=protected_runner.public_key_pem,
+            request=request,
+        ) == {
+            "action": "verified_effect_receipt",
+            "effect_key": request.effect_key,
+            "receipt_digest": receipt_ref.digest,
+            "recovered": True,
+        }
+
 
 def _protected_evaluator_bytes() -> bytes:
     return canonical_json_bytes(
@@ -1510,7 +1543,10 @@ def test_protected_runner_derives_scores_from_commands_and_denies_sockets(
     tmp_path: Path,
     disposable_git: DisposableGitFixture,
 ) -> None:
-    from carl_bench.commissioning_runner import ProtectedSyntheticRunner
+    from carl_bench.commissioning_runner import (
+        ProtectedSyntheticRunner,
+        verify_protected_pair_evaluation,
+    )
 
     automation_root = tmp_path / "automation-data"
     commissioning_store = CommissioningArtifactStore(
@@ -1543,16 +1579,14 @@ def test_protected_runner_derives_scores_from_commands_and_denies_sockets(
     assert valid.report.reasons == ()
     assert valid.report.transfer_gain_basis_points == 10_000
     assert {
-        outcome.task_id: outcome.score_basis_points
-        for outcome in valid.report.baseline_outcomes
+        outcome.task_id: outcome.score_basis_points for outcome in valid.report.baseline_outcomes
     } == {
         "primary-recovery": 0,
         "transfer-recovery": 0,
         "unchanged-safety": 10_000,
     }
     assert {
-        outcome.task_id: outcome.score_basis_points
-        for outcome in valid.report.candidate_outcomes
+        outcome.task_id: outcome.score_basis_points for outcome in valid.report.candidate_outcomes
     } == {
         "primary-recovery": 10_000,
         "transfer-recovery": 10_000,
@@ -1566,6 +1600,13 @@ def test_protected_runner_derives_scores_from_commands_and_denies_sockets(
     assert execution["candidate"]["subject_commit"] == disposable_git.valid_candidate
     assert all(item["command_exit_code"] == 0 for item in execution["baseline"]["trials"])
     assert all(item["command_exit_code"] == 0 for item in execution["candidate"]["trials"])
+    rebuilt_valid = verify_protected_pair_evaluation(
+        artifacts=evidence,
+        evidence_bundle_ref=valid.evidence_bundle_ref,
+    )
+    assert rebuilt_valid.report == valid.report
+    assert rebuilt_valid.baseline_commit == disposable_git.baseline
+    assert rebuilt_valid.candidate_commit == disposable_git.valid_candidate
 
     benchmark_gamed = runner.evaluate_pair(
         baseline_commit=disposable_git.baseline,
@@ -1579,6 +1620,13 @@ def test_protected_runner_derives_scores_from_commands_and_denies_sockets(
     assert benchmark_gamed.report.eligible is False
     assert "active_evaluator_modified" in benchmark_gamed.report.reasons
     assert "transfer_gain_required" in benchmark_gamed.report.reasons
+    assert (
+        verify_protected_pair_evaluation(
+            artifacts=evidence,
+            evidence_bundle_ref=benchmark_gamed.evidence_bundle_ref,
+        ).report
+        == benchmark_gamed.report
+    )
 
     evaluator_altered = runner.evaluate_pair(
         baseline_commit=disposable_git.baseline,
@@ -1592,6 +1640,13 @@ def test_protected_runner_derives_scores_from_commands_and_denies_sockets(
     assert evaluator_altered.report.eligible is False
     assert "active_evaluator_modified" in evaluator_altered.report.reasons
     assert evaluator_altered.evaluator_ref == evaluator_ref
+    assert (
+        verify_protected_pair_evaluation(
+            artifacts=evidence,
+            evidence_bundle_ref=evaluator_altered.evidence_bundle_ref,
+        ).report
+        == evaluator_altered.report
+    )
 
     with pytest.raises(
         CommissioningArtifactError,
@@ -1637,9 +1692,7 @@ def test_changed_main_receipt_replay_and_exact_revert_are_durable_real_effects(
     request_root = automation_root / ".shared-private" / "attack-requests"
     request_root.mkdir(mode=0o700)
     request_root.chmod(0o700)
-    effect_store_path = (
-        automation_root / ".shared-private" / "commissioning-effects.sqlite3"
-    )
+    effect_store_path = automation_root / ".shared-private" / "commissioning-effects.sqlite3"
 
     changed_origin = disposable_git.root / "changed-main-origin.git"
     _git(
@@ -1742,16 +1795,19 @@ def test_changed_main_receipt_replay_and_exact_revert_are_durable_real_effects(
         "target_tree": healthy_tree,
     }
     healthy_path = _write_controller_request(request_root, "healthy", healthy_request)
-    assert _complete_controller(
-        _controller_command(
-            effect_store=effect_store_path,
-            artifact_store=commissioning_store.objects_root,
-            repository_root=disposable_git.builder,
-            bare_repository=disposable_git.origin,
-            request_path=healthy_path,
-            signing_key=protected_runner.key_path,
-        )
-    )["action"] == "effect_receipted"
+    assert (
+        _complete_controller(
+            _controller_command(
+                effect_store=effect_store_path,
+                artifact_store=commissioning_store.objects_root,
+                repository_root=disposable_git.builder,
+                bare_repository=disposable_git.origin,
+                request_path=healthy_path,
+                signing_key=protected_runner.key_path,
+            )
+        )["action"]
+        == "effect_receipted"
+    )
 
     _git(disposable_git.builder, "switch", "-C", "hard-candidate", healthy_merge)
     hard_candidate = _write_commit(
@@ -1788,16 +1844,19 @@ def test_changed_main_receipt_replay_and_exact_revert_are_durable_real_effects(
         "target_tree": hard_tree,
     }
     hard_path = _write_controller_request(request_root, "hard-regression", hard_request)
-    assert _complete_controller(
-        _controller_command(
-            effect_store=effect_store_path,
-            artifact_store=commissioning_store.objects_root,
-            repository_root=disposable_git.builder,
-            bare_repository=disposable_git.origin,
-            request_path=hard_path,
-            signing_key=protected_runner.key_path,
-        )
-    )["action"] == "effect_receipted"
+    assert (
+        _complete_controller(
+            _controller_command(
+                effect_store=effect_store_path,
+                artifact_store=commissioning_store.objects_root,
+                repository_root=disposable_git.builder,
+                bare_repository=disposable_git.origin,
+                request_path=hard_path,
+                signing_key=protected_runner.key_path,
+            )
+        )["action"]
+        == "effect_receipted"
+    )
     assert _git(disposable_git.origin, "rev-parse", "refs/heads/main") == hard_merge
 
     _git(disposable_git.builder, "switch", "-C", "exact-revert-candidate", hard_merge)
@@ -1832,16 +1891,19 @@ def test_changed_main_receipt_replay_and_exact_revert_are_durable_real_effects(
         "target_tree": revert_tree,
     }
     revert_path = _write_controller_request(request_root, "exact-revert", revert_request)
-    assert _complete_controller(
-        _controller_command(
-            effect_store=effect_store_path,
-            artifact_store=commissioning_store.objects_root,
-            repository_root=disposable_git.builder,
-            bare_repository=disposable_git.origin,
-            request_path=revert_path,
-            signing_key=protected_runner.key_path,
-        )
-    )["action"] == "effect_receipted"
+    assert (
+        _complete_controller(
+            _controller_command(
+                effect_store=effect_store_path,
+                artifact_store=commissioning_store.objects_root,
+                repository_root=disposable_git.builder,
+                bare_repository=disposable_git.origin,
+                request_path=revert_path,
+                signing_key=protected_runner.key_path,
+            )
+        )["action"]
+        == "effect_receipted"
+    )
     assert _git(disposable_git.origin, "rev-parse", "refs/heads/main") == revert_merge
     assert _git(disposable_git.origin, "rev-parse", "refs/heads/main^{tree}") == healthy_tree
     hard_record = _inspect_effect(effect_store_path, str(hard_request["effect_key"]))
@@ -1902,9 +1964,10 @@ def test_changed_main_receipt_replay_and_exact_revert_are_durable_real_effects(
             envelope_ref=envelope_ref,
             occurred_at="2026-08-19T10:01:00Z",
         )
-    assert [
-        attempt["outcome"] for attempt in durable_effects.protected_receipt_attempts()
-    ] == ["consumed", "replay_rejected"]
+    assert [attempt["outcome"] for attempt in durable_effects.protected_receipt_attempts()] == [
+        "consumed",
+        "replay_rejected",
+    ]
 
 
 def test_component_scenarios_cannot_self_issue_commissioning_pass(

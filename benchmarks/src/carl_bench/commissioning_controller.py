@@ -270,9 +270,7 @@ class CommissioningEffectStore:
         parent = self.path.parent
         if not _owner_private_directory(parent):
             raise CommissioningControllerError("unsafe_effect_store_parent")
-        if (self.path.exists() or self.path.is_symlink()) and not _owner_private_file(
-            self.path
-        ):
+        if (self.path.exists() or self.path.is_symlink()) and not _owner_private_file(self.path):
             raise CommissioningControllerError("unsafe_effect_store_file")
         try:
             with self._connect() as connection:
@@ -515,6 +513,156 @@ class CommissioningEffectStore:
             for row in rows
         )
 
+    def validated_snapshot(self) -> dict[str, Any]:
+        """Export a canonical journal after revalidating every stored identity."""
+        with self._connect() as connection:
+            effect_rows = connection.execute(
+                "SELECT effect_key, kind, request_digest, request_json, status, "
+                "result_json, receipt_ref_json FROM commissioning_effects ORDER BY rowid"
+            ).fetchall()
+            pr_rows = connection.execute(
+                "SELECT effect_key, role, promotion_id, number, base_branch, head_branch, "
+                "head_commit, head_tree, state, merge_commit, merge_tree "
+                "FROM protected_pull_requests ORDER BY number"
+            ).fetchall()
+            recovery_rows = connection.execute(
+                "SELECT recovery_id, effect_key, boundary, observed_commit, occurred_at "
+                "FROM effect_recoveries ORDER BY recovery_id"
+            ).fetchall()
+            invocation_rows = connection.execute(
+                "SELECT ordinal, effect_key, action, observed_commit, occurred_at, "
+                "receipt_digest FROM controller_invocations ORDER BY ordinal"
+            ).fetchall()
+            consumption_rows = connection.execute(
+                "SELECT receipt_digest, envelope_ref_json, consumed_at "
+                "FROM protected_receipt_consumptions ORDER BY receipt_digest"
+            ).fetchall()
+            attempt_rows = connection.execute(
+                "SELECT ordinal, receipt_digest, envelope_ref_json, occurred_at, outcome "
+                "FROM protected_receipt_attempts ORDER BY ordinal"
+            ).fetchall()
+
+        pull_requests = [dict(row) for row in pr_rows]
+        pull_requests_by_effect = {row["effect_key"]: row for row in pull_requests}
+        effects: list[dict[str, Any]] = []
+        for row in effect_rows:
+            try:
+                request_value = json.loads(row["request_json"])
+                request = EffectRequest.from_canonical_dict(request_value)
+            except (UnicodeError, json.JSONDecodeError, ValueError) as error:
+                raise CommissioningControllerError("invalid_effect_store_request") from error
+            if (
+                request.effect_key != row["effect_key"]
+                or request.kind != row["kind"]
+                or request.digest != row["request_digest"]
+                or canonical_json_bytes(request.to_canonical_dict()).decode("utf-8")
+                != row["request_json"]
+            ):
+                raise CommissioningControllerError("effect_store_request_mismatch")
+            status = row["status"]
+            if status not in {"pending", "applied", "receipted", "rejected"}:
+                raise CommissioningControllerError("invalid_effect_store_status")
+            result = None
+            if row["result_json"] is not None:
+                try:
+                    result = json.loads(row["result_json"])
+                except (UnicodeError, json.JSONDecodeError) as error:
+                    raise CommissioningControllerError("invalid_effect_store_result") from error
+                if canonical_json_bytes(result).decode("utf-8") != row["result_json"]:
+                    raise CommissioningControllerError("invalid_effect_store_result")
+            receipt_ref = None
+            if row["receipt_ref_json"] is not None:
+                try:
+                    receipt_ref = ArtifactRef.from_canonical_dict(
+                        json.loads(row["receipt_ref_json"])
+                    )
+                except (UnicodeError, json.JSONDecodeError, ValueError) as error:
+                    raise CommissioningControllerError("invalid_effect_store_receipt") from error
+                if (
+                    receipt_ref.evidence_kind != "commissioning_effect_receipt"
+                    or receipt_ref.media_type != "application/json"
+                    or canonical_json_bytes(receipt_ref.to_canonical_dict()).decode("utf-8")
+                    != row["receipt_ref_json"]
+                ):
+                    raise CommissioningControllerError("invalid_effect_store_receipt")
+            if status == "receipted" and receipt_ref is None:
+                raise CommissioningControllerError("effect_store_receipt_missing")
+            if status != "receipted" and receipt_ref is not None:
+                raise CommissioningControllerError("effect_store_receipt_unexpected")
+            stored_pr = pull_requests_by_effect.get(request.effect_key)
+            if (request.pr is None) != (stored_pr is None):
+                raise CommissioningControllerError("effect_store_pr_mismatch")
+            if request.pr is not None and stored_pr is not None:
+                expected_pr = {
+                    **request.pr.to_canonical_dict(),
+                    "effect_key": request.effect_key,
+                    "merge_commit": request.target_commit
+                    if status in {"applied", "receipted"}
+                    else None,
+                    "merge_tree": request.target_tree
+                    if status in {"applied", "receipted"}
+                    else None,
+                    "state": "MERGED" if status in {"applied", "receipted"} else "OPEN",
+                }
+                if stored_pr != expected_pr:
+                    raise CommissioningControllerError("effect_store_pr_mismatch")
+            effects.append(
+                {
+                    "effect_key": request.effect_key,
+                    "request": request.to_canonical_dict(),
+                    "request_digest": request.digest,
+                    "result": result,
+                    "receipt_ref": (
+                        receipt_ref.to_canonical_dict() if receipt_ref is not None else None
+                    ),
+                    "status": status,
+                }
+            )
+
+        recoveries = [dict(row) for row in recovery_rows]
+        invocations = [dict(row) for row in invocation_rows]
+        effect_keys = {item["effect_key"] for item in effects}
+        if any(item["effect_key"] not in effect_keys for item in (*recoveries, *invocations)):
+            raise CommissioningControllerError("effect_store_orphan_record")
+
+        consumptions: list[dict[str, Any]] = []
+        for row in consumption_rows:
+            try:
+                envelope_ref = ArtifactRef.from_canonical_dict(json.loads(row["envelope_ref_json"]))
+            except (UnicodeError, json.JSONDecodeError, ValueError) as error:
+                raise CommissioningControllerError("invalid_protected_receipt_record") from error
+            consumptions.append(
+                {
+                    "consumed_at": row["consumed_at"],
+                    "envelope_ref": envelope_ref.to_canonical_dict(),
+                    "receipt_digest": row["receipt_digest"],
+                }
+            )
+        attempts: list[dict[str, Any]] = []
+        for row in attempt_rows:
+            try:
+                envelope_ref = ArtifactRef.from_canonical_dict(json.loads(row["envelope_ref_json"]))
+            except (UnicodeError, json.JSONDecodeError, ValueError) as error:
+                raise CommissioningControllerError("invalid_protected_receipt_record") from error
+            attempts.append(
+                {
+                    "envelope_ref": envelope_ref.to_canonical_dict(),
+                    "occurred_at": row["occurred_at"],
+                    "ordinal": row["ordinal"],
+                    "outcome": row["outcome"],
+                    "receipt_digest": row["receipt_digest"],
+                }
+            )
+        return {
+            "effects": effects,
+            "invocations": invocations,
+            "protected_pull_requests": pull_requests,
+            "protected_receipt_attempts": attempts,
+            "protected_receipt_consumptions": consumptions,
+            "recoveries": recoveries,
+            "schema_version": 1,
+        }
+
     def record_recovery(self, request: EffectRequest, observed_commit: str) -> None:
         recovery_id = hashlib.sha256(
             canonical_json_bytes(
@@ -619,9 +767,7 @@ class CommissioningEffectStore:
             ),
             "recoveries": [dict(row) for row in recoveries],
             "result": (
-                json.loads(effect["result_json"])
-                if effect["result_json"] is not None
-                else None
+                json.loads(effect["result_json"]) if effect["result_json"] is not None else None
             ),
             "status": effect["status"],
         }
@@ -739,39 +885,26 @@ def _sign_receipt(
     )
 
 
-def verify_effect_receipt(
+def verify_effect_receipt_ref(
     *,
-    artifact_store_path: Path,
-    repository_root: Path,
-    receipt_ref_path: Path,
-    public_key_path: Path,
-    request_path: Path,
+    artifacts: PrivateArtifactStore,
+    receipt_ref: ArtifactRef,
+    public_key_pem: bytes,
+    request: EffectRequest,
 ) -> dict[str, Any]:
-    for path, code in (
-        (receipt_ref_path, "unsafe_effect_receipt_ref"),
-        (public_key_path, "unsafe_controller_public_key"),
-        (request_path, "unsafe_effect_request_file"),
-    ):
-        if not _owner_private_file(path):
-            raise CommissioningControllerError(code)
-    try:
-        ref = ArtifactRef.from_canonical_dict(
-            json.loads(receipt_ref_path.read_text(encoding="utf-8"))
-        )
-        request = EffectRequest.from_canonical_dict(
-            json.loads(request_path.read_text(encoding="utf-8"))
-        )
-    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
-        raise CommissioningControllerError("invalid_effect_receipt_input") from error
+    """Verify a durable effect receipt directly from typed trusted inputs."""
+    if not isinstance(artifacts, PrivateArtifactStore):
+        raise CommissioningControllerError("invalid_effect_artifact_store")
+    if not isinstance(request, EffectRequest):
+        raise CommissioningControllerError("invalid_effect_request")
     if (
-        ref.evidence_kind != "commissioning_effect_receipt"
-        or ref.media_type != "application/json"
+        not isinstance(receipt_ref, ArtifactRef)
+        or receipt_ref.evidence_kind != "commissioning_effect_receipt"
+        or receipt_ref.media_type != "application/json"
     ):
         raise CommissioningControllerError("invalid_effect_receipt_ref")
-    root = Path(_local_directory(os.fspath(repository_root), "invalid_repository_root"))
-    artifacts = PrivateArtifactStore(artifact_store_path, root)
     try:
-        envelope = json.loads(artifacts.read(ref))
+        envelope = json.loads(artifacts.read(receipt_ref))
     except (UnicodeError, json.JSONDecodeError, ValueError) as error:
         raise CommissioningControllerError("invalid_effect_receipt") from error
     if not isinstance(envelope, dict) or set(envelope) != {
@@ -810,9 +943,9 @@ def verify_effect_receipt(
     if not isinstance(payload["recovered"], bool):
         raise CommissioningControllerError("invalid_effect_receipt")
     try:
-        public_key = serialization.load_pem_public_key(public_key_path.read_bytes())
+        public_key = serialization.load_pem_public_key(public_key_pem)
         signature = base64.b64decode(envelope["signature_base64"], validate=True)
-    except (OSError, TypeError, ValueError) as error:
+    except (TypeError, ValueError) as error:
         raise CommissioningControllerError("invalid_effect_receipt_signature") from error
     if not isinstance(public_key, Ed25519PublicKey):
         raise CommissioningControllerError("invalid_controller_public_key")
@@ -823,9 +956,44 @@ def verify_effect_receipt(
     return {
         "action": "verified_effect_receipt",
         "effect_key": request.effect_key,
-        "receipt_digest": ref.digest,
+        "receipt_digest": receipt_ref.digest,
         "recovered": payload["recovered"],
     }
+
+
+def verify_effect_receipt(
+    *,
+    artifact_store_path: Path,
+    repository_root: Path,
+    receipt_ref_path: Path,
+    public_key_path: Path,
+    request_path: Path,
+) -> dict[str, Any]:
+    for path, code in (
+        (receipt_ref_path, "unsafe_effect_receipt_ref"),
+        (public_key_path, "unsafe_controller_public_key"),
+        (request_path, "unsafe_effect_request_file"),
+    ):
+        if not _owner_private_file(path):
+            raise CommissioningControllerError(code)
+    try:
+        ref = ArtifactRef.from_canonical_dict(
+            json.loads(receipt_ref_path.read_text(encoding="utf-8"))
+        )
+        request = EffectRequest.from_canonical_dict(
+            json.loads(request_path.read_text(encoding="utf-8"))
+        )
+        public_key_pem = public_key_path.read_bytes()
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
+        raise CommissioningControllerError("invalid_effect_receipt_input") from error
+    root = Path(_local_directory(os.fspath(repository_root), "invalid_repository_root"))
+    artifacts = PrivateArtifactStore(artifact_store_path, root)
+    return verify_effect_receipt_ref(
+        artifacts=artifacts,
+        receipt_ref=ref,
+        public_key_pem=public_key_pem,
+        request=request,
+    )
 
 
 def run_controller(
@@ -1002,8 +1170,7 @@ def main(arguments: list[str] | None = None) -> int:
             )
     except CommissioningControllerError as error:
         sys.stderr.write(
-            canonical_json_bytes({"error": error.code, "schema_version": 1}).decode("utf-8")
-            + "\n"
+            canonical_json_bytes({"error": error.code, "schema_version": 1}).decode("utf-8") + "\n"
         )
         return 2
     sys.stdout.write(canonical_json_bytes(result).decode("utf-8") + "\n")
