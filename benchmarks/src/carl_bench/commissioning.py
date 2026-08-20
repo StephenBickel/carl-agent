@@ -7,13 +7,17 @@ import json
 import os
 import re
 import stat
+import subprocess
 import tempfile
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from carl_bench.artifacts import ArtifactIntegrityError, ArtifactRef, PrivateArtifactStore
 from carl_bench.canonical import canonical_json_bytes
+from carl_bench.experiment import ExperimentState
+from carl_bench.ledger import ExperimentLedger, LedgerIntegrityError
 
 _DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 _OBJECT_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
@@ -346,6 +350,63 @@ class CommissioningArtifactBundle:
     report_ref: ArtifactRef
 
 
+@dataclass(frozen=True, slots=True)
+class VerifiedAcceptedLifecycle:
+    """Identities derived from a fresh ledger replay and local bare Git refs."""
+
+    experiment_id: str
+    terminal_state: str
+    experimental_ref: str
+    candidate_commit: str
+    candidate_tree: str
+    promotion_commit: str
+    promotion_tree: str
+    production_commit: str
+    soak_elapsed_seconds: int
+    lifecycle_artifact_ref: ArtifactRef
+
+
+def _canonical_lifecycle_export(ledger: ExperimentLedger, experiment_id: str) -> bytes:
+    projection = ledger.projection(experiment_id)
+    autonomy = ledger.autonomy_projection(experiment_id)
+    return canonical_json_bytes(
+        {
+            "autonomy": autonomy.to_canonical_dict(),
+            "events": [event.to_canonical_dict() for event in ledger.events(experiment_id)],
+            "experiment_id": experiment_id,
+            "projection_digest": projection.digest,
+            "schema_version": 1,
+            "terminal_state": projection.state.value,
+        }
+    )
+
+
+def _parse_utc(value: str, code: str) -> datetime:
+    if not isinstance(value, str) or not value.endswith("Z"):
+        raise CommissioningArtifactError(code)
+    try:
+        parsed = datetime.fromisoformat(value.removesuffix("Z") + "+00:00")
+    except ValueError as error:
+        raise CommissioningArtifactError(code) from error
+    if parsed.tzinfo != UTC:
+        raise CommissioningArtifactError(code)
+    return parsed
+
+
+def _bare_git(repository: Path, *arguments: str) -> str:
+    try:
+        completed = subprocess.run(
+            ("git", "--git-dir", os.fspath(repository), *arguments),
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise CommissioningArtifactError("commissioning_bare_git_invalid") from error
+    return completed.stdout.strip()
+
+
 class CommissioningArtifactStore:
     """Persist discoverable synthetic receipts beneath an owner-private automation root."""
 
@@ -371,6 +432,118 @@ class CommissioningArtifactStore:
             return self._objects.read(ref)
         except ArtifactIntegrityError as error:
             raise CommissioningArtifactError("commissioning_artifact_invalid") from error
+
+    def verify_accepted_lifecycle(
+        self,
+        *,
+        experiment_id: str,
+        ledger_path: Path,
+        bare_repository: Path,
+        lifecycle_artifact_ref: ArtifactRef,
+    ) -> VerifiedAcceptedLifecycle:
+        """Derive accepted identities without trusting caller-authored outcome fields."""
+        _identifier(experiment_id, "invalid_commissioning_experiment")
+        if not isinstance(lifecycle_artifact_ref, ArtifactRef):
+            raise CommissioningArtifactError("invalid_lifecycle_artifact_ref")
+        if (
+            lifecycle_artifact_ref.evidence_kind != "lifecycle_ledger"
+            or lifecycle_artifact_ref.media_type != "application/json"
+        ):
+            raise CommissioningArtifactError("invalid_lifecycle_artifact_ref")
+
+        ledger_file = _anchored(ledger_path)
+        if not _inside(ledger_file, self.automation_data_root):
+            raise CommissioningArtifactError("commissioning_ledger_outside_automation_root")
+        repository = _anchored(bare_repository)
+        is_bare = _bare_git(repository, "rev-parse", "--is-bare-repository")
+        if not repository.is_dir() or is_bare != "true":
+            raise CommissioningArtifactError("commissioning_bare_git_invalid")
+
+        try:
+            ledger = ExperimentLedger(ledger_file)
+            projection = ledger.projection(experiment_id)
+            autonomy = ledger.autonomy_projection(experiment_id)
+            lifecycle_bytes = _canonical_lifecycle_export(ledger, experiment_id)
+        except LedgerIntegrityError as error:
+            raise CommissioningArtifactError("commissioning_lifecycle_invalid") from error
+        if projection.state is not ExperimentState.ACCEPTED:
+            raise CommissioningArtifactError("commissioning_lifecycle_not_accepted")
+        if projection.lease is not None or projection.candidate is None:
+            raise CommissioningArtifactError("commissioning_lifecycle_incomplete")
+
+        publication = autonomy.experimental_publication
+        validation = autonomy.protected_validation
+        promotion = autonomy.promotion
+        observations = autonomy.soak_observations
+        if (
+            publication is None
+            or validation is None
+            or promotion is None
+            or autonomy.revert is not None
+            or not observations
+        ):
+            raise CommissioningArtifactError("commissioning_lifecycle_incomplete")
+        candidate = projection.candidate
+        if (
+            publication.candidate_packet_digest != candidate.digest
+            or publication.commit != candidate.candidate_commit
+            or validation.candidate_commit != publication.commit
+            or validation.candidate_tree != publication.tree
+            or promotion.merge_tree != publication.tree
+        ):
+            raise CommissioningArtifactError("commissioning_lifecycle_identity_mismatch")
+        if any(
+            not observation.healthy or observation.merge_commit != promotion.merge_commit
+            for observation in observations
+        ):
+            raise CommissioningArtifactError("commissioning_lifecycle_unhealthy")
+        merged_at = _parse_utc(promotion.merged_at, "commissioning_promotion_time_invalid")
+        latest_soak = max(
+            _parse_utc(item.observed_at, "commissioning_soak_time_invalid")
+            for item in observations
+        )
+        soak_elapsed = int((latest_soak - merged_at).total_seconds())
+        if soak_elapsed < 24 * 60 * 60:
+            raise CommissioningArtifactError("commissioning_soak_incomplete")
+
+        experimental_ref = f"refs/heads/experimental/{experiment_id}"
+        if publication.branch != experimental_ref.removeprefix("refs/heads/"):
+            raise CommissioningArtifactError("commissioning_experimental_ref_mismatch")
+        experimental_refs = tuple(
+            line
+            for line in _bare_git(
+                repository,
+                "for-each-ref",
+                "--format=%(refname)",
+                "refs/heads/experimental",
+            ).splitlines()
+            if line
+        )
+        if experimental_refs != (experimental_ref,):
+            raise CommissioningArtifactError("commissioning_experimental_ref_set_mismatch")
+        experimental_commit = _bare_git(repository, "rev-parse", experimental_ref)
+        experimental_tree = _bare_git(repository, "rev-parse", f"{experimental_ref}^{{tree}}")
+        production_commit = _bare_git(repository, "rev-parse", "refs/heads/main")
+        production_tree = _bare_git(repository, "rev-parse", "refs/heads/main^{tree}")
+        if experimental_commit != publication.commit or experimental_tree != publication.tree:
+            raise CommissioningArtifactError("commissioning_experimental_identity_mismatch")
+        if production_commit != promotion.merge_commit or production_tree != promotion.merge_tree:
+            raise CommissioningArtifactError("commissioning_production_identity_mismatch")
+
+        if self.read(lifecycle_artifact_ref) != lifecycle_bytes:
+            raise CommissioningArtifactError("commissioning_lifecycle_artifact_mismatch")
+        return VerifiedAcceptedLifecycle(
+            experiment_id=experiment_id,
+            terminal_state=projection.state.value,
+            experimental_ref=experimental_ref,
+            candidate_commit=publication.commit,
+            candidate_tree=publication.tree,
+            promotion_commit=promotion.merge_commit,
+            promotion_tree=promotion.merge_tree,
+            production_commit=production_commit,
+            soak_elapsed_seconds=soak_elapsed,
+            lifecycle_artifact_ref=lifecycle_artifact_ref,
+        )
 
     @staticmethod
     def _report(
@@ -407,8 +580,16 @@ class CommissioningArtifactStore:
     def persist_synthetic(
         self, receipt: SyntheticCommissioningReceipt
     ) -> CommissioningArtifactBundle:
-        if not isinstance(receipt, SyntheticCommissioningReceipt):
-            raise CommissioningArtifactError("invalid_commissioning_receipt")
+        if isinstance(receipt, SyntheticCommissioningReceipt):
+            raise CommissioningArtifactError(
+                "caller_authored_commissioning_receipt_forbidden"
+            )
+        raise CommissioningArtifactError("invalid_commissioning_evidence_sources")
+
+    def _persist_verified_receipt(
+        self, receipt: SyntheticCommissioningReceipt
+    ) -> CommissioningArtifactBundle:
+        """Persist only a receipt produced internally after source verification."""
         try:
             receipt_ref = self._objects.put(
                 evidence_kind="commissioning_receipt",
@@ -463,6 +644,8 @@ class CommissioningArtifactStore:
             value = json.loads(self.index_path.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError) as error:
             raise CommissioningArtifactError("commissioning_index_invalid") from error
+        if isinstance(value, dict) and value.get("schema_version") == 1:
+            raise CommissioningArtifactError("commissioning_verified_sources_required")
         if not isinstance(value, dict) or set(value) != {
             "report_ref",
             "receipt_ref",

@@ -29,7 +29,12 @@ from carl_bench.autonomy_controller import (
     SoakResult,
     next_controller_action,
 )
-from carl_bench.candidate import DeterministicCheckResult, SealedCandidate
+from carl_bench.candidate import (
+    DeterministicCheckResult,
+    PairedEvidence,
+    PreparedCandidate,
+    SealedCandidate,
+)
 from carl_bench.canonical import canonical_json_bytes
 from carl_bench.capability_validation import (
     CapabilityClaim,
@@ -49,7 +54,13 @@ from carl_bench.commissioning import (
     CommissioningArtifactStore,
     SyntheticCommissioningReceipt,
 )
-from carl_bench.experiment import EventType, ExperimentEvent
+from carl_bench.experiment import (
+    EventType,
+    ExperimentEvent,
+    ExperimentState,
+    ReviewRole,
+    ReviewVerdict,
+)
 from carl_bench.experimental_publication import (
     ExperimentalPublicationRequest,
     publish_experimental_branch,
@@ -562,7 +573,492 @@ def _append_publication(
     return ExperimentLedger(ledger_path).append(event).appended
 
 
-def test_autonomy_loop_commissions_healthy_and_adversarial_paths_without_network(
+def _lifecycle_transition(
+    *,
+    source: ExperimentState,
+    target: ExperimentState,
+    attempt: str,
+    occurred_at: str,
+    lease_owner: str = "commissioning-controller",
+    lease_attempt: str = "commissioning-lifecycle-lease",
+) -> ExperimentEvent:
+    payload: dict[str, object] = {
+        "from_state": source.value,
+        "to_state": target.value,
+    }
+    if target in {
+        ExperimentState.BUILDING,
+        ExperimentState.DETERMINISTIC_VALIDATION,
+        ExperimentState.PAIRED_EVALUATION,
+        ExperimentState.HOLDOUT_VALIDATION,
+        ExperimentState.REVIEW_COMPLETE,
+        ExperimentState.PR_OPEN,
+        ExperimentState.MERGED,
+        ExperimentState.SOAKING,
+        ExperimentState.ACCEPTED,
+    }:
+        payload["_lease"] = {
+            "owner_id": lease_owner,
+            "stage_attempt_id": lease_attempt,
+        }
+    return ExperimentEvent.create(
+        experiment_id=EXPERIMENT_ID,
+        stage_attempt_id=attempt,
+        event_type=EventType.STATE_TRANSITIONED,
+        occurred_at=occurred_at,
+        payload=payload,
+    )
+
+
+def _append_accepted_lifecycle(
+    *,
+    ledger_path: Path,
+    manifest_digest: str,
+    parent_commit: str,
+    packet: SealedCandidate,
+    candidate_tree: str,
+    protected_receipt_digest: str,
+    promotion_commit: str,
+    artifact_store: PrivateArtifactStore,
+) -> None:
+    ledger = ExperimentLedger(ledger_path)
+    for source, target, attempt, occurred_at in (
+        (
+            ExperimentState.QUEUED,
+            ExperimentState.BASELINING,
+            "commissioning-baseline",
+            "2026-08-19T09:01:00Z",
+        ),
+        (
+            ExperimentState.BASELINING,
+            ExperimentState.DIAGNOSING,
+            "commissioning-diagnosis",
+            "2026-08-19T09:02:00Z",
+        ),
+        (
+            ExperimentState.DIAGNOSING,
+            ExperimentState.PROPOSAL_REVIEW,
+            "commissioning-proposal",
+            "2026-08-19T09:03:00Z",
+        ),
+    ):
+        ledger.append(
+            _lifecycle_transition(
+                source=source,
+                target=target,
+                attempt=attempt,
+                occurred_at=occurred_at,
+            )
+        )
+    for index, role in enumerate((ReviewRole.CAUSAL, ReviewRole.PRODUCT), start=4):
+        review_ref = artifact_store.put(
+            evidence_kind="proposal_review",
+            media_type="application/json",
+            content=canonical_json_bytes({"role": role.value, "verdict": "approve"}),
+        )
+        ledger.append(
+            ExperimentEvent.create(
+                experiment_id=EXPERIMENT_ID,
+                stage_attempt_id=f"commissioning-proposal-review-{role.value}",
+                event_type=EventType.ROLE_RECORDED,
+                occurred_at=f"2026-08-19T09:0{index}:00Z",
+                payload={
+                    "artifact_digest": review_ref.digest,
+                    "role": role.value,
+                    "verdict": ReviewVerdict.APPROVE.value,
+                },
+            )
+        )
+    ledger.append(
+        ExperimentEvent.create(
+            experiment_id=EXPERIMENT_ID,
+            stage_attempt_id="commissioning-lifecycle-lease",
+            event_type=EventType.LEASE_ACQUIRED,
+            occurred_at="2026-08-19T09:06:00Z",
+            payload={
+                "expires_at": "2026-08-19T15:06:00Z",
+                "owner_id": "commissioning-controller",
+            },
+        )
+    )
+    ledger.append(
+        _lifecycle_transition(
+            source=ExperimentState.PROPOSAL_REVIEW,
+            target=ExperimentState.BUILDING,
+            attempt="commissioning-build",
+            occurred_at="2026-08-19T09:07:00Z",
+        )
+    )
+    request_ref = artifact_store.put(
+        evidence_kind="builder_request",
+        media_type="application/json",
+        content=canonical_json_bytes({"candidate": packet.candidate_commit}),
+    )
+    prepared = PreparedCandidate(
+        schema_version=1,
+        experiment_id=EXPERIMENT_ID,
+        manifest_digest=manifest_digest,
+        parent_commit=parent_commit,
+        branch=packet.branch,
+        request_artifact=request_ref,
+    )
+    lease = {
+        "owner_id": "commissioning-controller",
+        "stage_attempt_id": "commissioning-lifecycle-lease",
+    }
+    ledger.append(
+        ExperimentEvent.create(
+            experiment_id=EXPERIMENT_ID,
+            stage_attempt_id="commissioning-workspace-prepared",
+            event_type=EventType.WORKSPACE_PREPARED,
+            occurred_at="2026-08-19T09:08:00Z",
+            payload={**prepared.to_canonical_dict(), "_lease": lease},
+        )
+    )
+    ledger.append(
+        ExperimentEvent.create(
+            experiment_id=EXPERIMENT_ID,
+            stage_attempt_id="commissioning-candidate-sealed",
+            event_type=EventType.CANDIDATE_SEALED,
+            occurred_at="2026-08-19T09:09:00Z",
+            payload={**packet.to_canonical_dict(), "_lease": lease},
+        )
+    )
+    ledger.append(
+        _lifecycle_transition(
+            source=ExperimentState.BUILDING,
+            target=ExperimentState.DETERMINISTIC_VALIDATION,
+            attempt="commissioning-deterministic-validation",
+            occurred_at="2026-08-19T09:10:00Z",
+        )
+    )
+    ledger.append(
+        _lifecycle_transition(
+            source=ExperimentState.DETERMINISTIC_VALIDATION,
+            target=ExperimentState.PAIRED_EVALUATION,
+            attempt="commissioning-paired-evaluation",
+            occurred_at="2026-08-19T09:11:00Z",
+        )
+    )
+    baseline_ref = artifact_store.put(
+        evidence_kind="baseline_scorecard",
+        media_type="application/json",
+        content=canonical_json_bytes({"pass_rate_basis_points": 5_000}),
+    )
+    candidate_ref = artifact_store.put(
+        evidence_kind="candidate_scorecard",
+        media_type="application/json",
+        content=canonical_json_bytes({"pass_rate_basis_points": 7_500}),
+    )
+    comparison_ref = artifact_store.put(
+        evidence_kind="paired_comparison",
+        media_type="application/json",
+        content=canonical_json_bytes(
+            {
+                "baseline": baseline_ref.to_canonical_dict(),
+                "candidate": candidate_ref.to_canonical_dict(),
+            }
+        ),
+    )
+    paired = PairedEvidence(
+        schema_version=1,
+        experiment_id=EXPERIMENT_ID,
+        manifest_digest=manifest_digest,
+        parent_commit=parent_commit,
+        candidate_commit=packet.candidate_commit,
+        baseline_scorecard_digest=baseline_ref.digest,
+        candidate_scorecard_digest=candidate_ref.digest,
+        comparison_artifact=comparison_ref,
+        decision="improvement",
+        paired_trials=3,
+        pass_rate_delta_basis_points=2_500,
+        confidence_lower_basis_points=500,
+    )
+    ledger.append_trusted_authority(
+        ExperimentEvent.create(
+            experiment_id=EXPERIMENT_ID,
+            stage_attempt_id="commissioning-paired-evidence",
+            event_type=EventType.PAIRED_EVIDENCE_RECORDED,
+            occurred_at="2026-08-19T09:12:00Z",
+            payload={**paired.to_canonical_dict(), "_lease": lease},
+        )
+    )
+    ledger.append(
+        ExperimentEvent.create(
+            experiment_id=EXPERIMENT_ID,
+            stage_attempt_id="commissioning-experimental-publication",
+            event_type=EventType.EXPERIMENTAL_PUBLISHED,
+            occurred_at="2026-08-19T09:13:00Z",
+            payload={
+                "branch": f"experimental/{EXPERIMENT_ID}",
+                "candidate_packet_digest": packet.digest,
+                "commit": packet.candidate_commit,
+                "tree": candidate_tree,
+            },
+        )
+    )
+    ledger.append_trusted_authority(
+        ExperimentEvent.create(
+            experiment_id=EXPERIMENT_ID,
+            stage_attempt_id="commissioning-protected-validation",
+            event_type=EventType.PROTECTED_VALIDATION_RECORDED,
+            occurred_at="2026-08-19T09:14:00Z",
+            payload={
+                "candidate_commit": packet.candidate_commit,
+                "candidate_tree": candidate_tree,
+                "receipt_digest": protected_receipt_digest,
+            },
+        )
+    )
+    ledger.append(
+        _lifecycle_transition(
+            source=ExperimentState.PAIRED_EVALUATION,
+            target=ExperimentState.HOLDOUT_VALIDATION,
+            attempt="commissioning-holdout",
+            occurred_at="2026-08-19T09:15:00Z",
+        )
+    )
+    for minute, role in enumerate(
+        (ReviewRole.CORRECTNESS, ReviewRole.SECURITY, ReviewRole.MAINTAINABILITY),
+        start=16,
+    ):
+        review_ref = artifact_store.put(
+            evidence_kind="candidate_review",
+            media_type="application/json",
+            content=canonical_json_bytes({"role": role.value, "verdict": "approve"}),
+        )
+        ledger.append(
+            ExperimentEvent.create(
+                experiment_id=EXPERIMENT_ID,
+                stage_attempt_id=f"commissioning-candidate-review-{role.value}",
+                event_type=EventType.ROLE_RECORDED,
+                occurred_at=f"2026-08-19T09:{minute}:00Z",
+                payload={
+                    "_lease": lease,
+                    "artifact_digest": review_ref.digest,
+                    "role": role.value,
+                    "verdict": ReviewVerdict.APPROVE.value,
+                },
+            )
+        )
+    for source, target, attempt, occurred_at in (
+        (
+            ExperimentState.HOLDOUT_VALIDATION,
+            ExperimentState.REVIEW_COMPLETE,
+            "commissioning-review-complete",
+            "2026-08-19T09:19:00Z",
+        ),
+        (
+            ExperimentState.REVIEW_COMPLETE,
+            ExperimentState.PR_OPEN,
+            "commissioning-pr-open",
+            "2026-08-19T09:20:00Z",
+        ),
+    ):
+        ledger.append(
+            _lifecycle_transition(
+                source=source,
+                target=target,
+                attempt=attempt,
+                occurred_at=occurred_at,
+            )
+        )
+    ledger.append_trusted_authority(
+        ExperimentEvent.create(
+            experiment_id=EXPERIMENT_ID,
+            stage_attempt_id="commissioning-promotion",
+            event_type=EventType.PROMOTION_RECORDED,
+            occurred_at="2026-08-19T10:00:00Z",
+            payload={"merge_commit": promotion_commit, "merge_tree": candidate_tree},
+        )
+    )
+    ledger.append(
+        _lifecycle_transition(
+            source=ExperimentState.PR_OPEN,
+            target=ExperimentState.MERGED,
+            attempt="commissioning-merged",
+            occurred_at="2026-08-19T10:01:00Z",
+        )
+    )
+    ledger.append(
+        _lifecycle_transition(
+            source=ExperimentState.MERGED,
+            target=ExperimentState.SOAKING,
+            attempt="commissioning-soaking",
+            occurred_at="2026-08-19T10:02:00Z",
+        )
+    )
+    soak_ref = artifact_store.put(
+        evidence_kind="soak_observation",
+        media_type="application/json",
+        content=canonical_json_bytes({"healthy": True, "merge_commit": promotion_commit}),
+    )
+    ledger.append_trusted_authority(
+        ExperimentEvent.create(
+            experiment_id=EXPERIMENT_ID,
+            stage_attempt_id="commissioning-24h-soak",
+            event_type=EventType.SOAK_OBSERVED,
+            occurred_at="2026-08-20T10:02:00Z",
+            payload={
+                "evidence_digest": soak_ref.digest,
+                "healthy": True,
+                "merge_commit": promotion_commit,
+                "observed_at": "2026-08-20T10:02:00Z",
+            },
+        )
+    )
+    ledger.append(
+        ExperimentEvent.create(
+            experiment_id=EXPERIMENT_ID,
+            stage_attempt_id="commissioning-reconcile-expired-lease",
+            event_type=EventType.LEASE_RECONCILED,
+            occurred_at="2026-08-20T10:03:00Z",
+            payload={
+                "lease_stage_attempt_id": "commissioning-lifecycle-lease",
+                "worker_not_live": True,
+            },
+        )
+    )
+    ledger.append(
+        ExperimentEvent.create(
+            experiment_id=EXPERIMENT_ID,
+            stage_attempt_id="commissioning-acceptance-lease",
+            event_type=EventType.LEASE_ACQUIRED,
+            occurred_at="2026-08-20T10:04:00Z",
+            payload={
+                "expires_at": "2026-08-20T16:04:00Z",
+                "owner_id": "commissioning-acceptance-controller",
+            },
+        )
+    )
+    ledger.append(
+        _lifecycle_transition(
+            source=ExperimentState.SOAKING,
+            target=ExperimentState.ACCEPTED,
+            attempt="commissioning-accepted",
+            occurred_at="2026-08-20T10:05:00Z",
+            lease_owner="commissioning-acceptance-controller",
+            lease_attempt="commissioning-acceptance-lease",
+        )
+    )
+    ledger.append(
+        ExperimentEvent.create(
+            experiment_id=EXPERIMENT_ID,
+            stage_attempt_id="commissioning-release-acceptance-lease",
+            event_type=EventType.LEASE_RELEASED,
+            occurred_at="2026-08-20T10:06:00Z",
+            payload={"lease_stage_attempt_id": "commissioning-acceptance-lease"},
+        )
+    )
+
+
+def _canonical_lifecycle_export(ledger_path: Path) -> bytes:
+    ledger = ExperimentLedger(ledger_path)
+    projection = ledger.projection(EXPERIMENT_ID)
+    autonomy = ledger.autonomy_projection(EXPERIMENT_ID)
+    return canonical_json_bytes(
+        {
+            "autonomy": autonomy.to_canonical_dict(),
+            "events": [event.to_canonical_dict() for event in ledger.events(EXPERIMENT_ID)],
+            "experiment_id": EXPERIMENT_ID,
+            "projection_digest": projection.digest,
+            "schema_version": 1,
+            "terminal_state": projection.state.value,
+        }
+    )
+
+
+def test_accepted_lifecycle_is_derived_from_fresh_ledger_and_bare_refs(
+    tmp_path: Path,
+    disposable_git: DisposableGitFixture,
+) -> None:
+    automation_root = tmp_path / "automation-data"
+    store = CommissioningArtifactStore(
+        automation_data_root=automation_root,
+        repository_root=disposable_git.builder,
+    )
+    evidence = PrivateArtifactStore(store.objects_root, disposable_git.builder)
+    manifest = replace(
+        base_manifest(),
+        experiment_id=EXPERIMENT_ID,
+        parent_commit=disposable_git.baseline,
+        registered_at="2026-08-19T09:00:00Z",
+        deterministic_checks=("synthetic-contracts",),
+    )
+    ledger_path = automation_root / "lifecycle.sqlite3"
+    ledger = ExperimentLedger(ledger_path)
+    assert ledger.register_manifest(manifest) is True
+    packet = _candidate_packet(disposable_git, manifest.digest, evidence)
+
+    _git(disposable_git.builder, "switch", "-C", "commissioning-accepted", manifest.parent_commit)
+    _git(
+        disposable_git.builder,
+        "merge",
+        "--no-ff",
+        "--no-edit",
+        disposable_git.valid_candidate,
+    )
+    promotion_commit = _git(disposable_git.builder, "rev-parse", "HEAD")
+    assert _git(disposable_git.builder, "rev-parse", "HEAD^{tree}") == disposable_git.valid_tree
+    _git(disposable_git.builder, "push", "origin", "HEAD:refs/heads/main")
+    _git(
+        disposable_git.builder,
+        "push",
+        "origin",
+        f"{disposable_git.valid_candidate}:refs/heads/experimental/{EXPERIMENT_ID}",
+    )
+
+    protected_receipt_ref = evidence.put(
+        evidence_kind="protected_receipt",
+        media_type="application/json",
+        content=canonical_json_bytes({"candidate_commit": disposable_git.valid_candidate}),
+    )
+    _append_accepted_lifecycle(
+        ledger_path=ledger_path,
+        manifest_digest=manifest.digest,
+        parent_commit=manifest.parent_commit,
+        packet=packet,
+        candidate_tree=disposable_git.valid_tree,
+        protected_receipt_digest=protected_receipt_ref.digest,
+        promotion_commit=promotion_commit,
+        artifact_store=evidence,
+    )
+    assert ExperimentLedger(ledger_path).projection(EXPERIMENT_ID).state is ExperimentState.ACCEPTED
+    lifecycle_ref = evidence.put(
+        evidence_kind="lifecycle_ledger",
+        media_type="application/json",
+        content=_canonical_lifecycle_export(ledger_path),
+    )
+
+    verified = store.verify_accepted_lifecycle(
+        experiment_id=EXPERIMENT_ID,
+        ledger_path=ledger_path,
+        bare_repository=disposable_git.origin,
+        lifecycle_artifact_ref=lifecycle_ref,
+    )
+
+    assert verified.terminal_state == "accepted"
+    assert verified.candidate_commit == disposable_git.valid_candidate
+    assert verified.candidate_tree == disposable_git.valid_tree
+    assert verified.experimental_ref == f"refs/heads/experimental/{EXPERIMENT_ID}"
+    assert verified.promotion_commit == promotion_commit
+    assert verified.production_commit == promotion_commit
+    assert verified.soak_elapsed_seconds >= 24 * 60 * 60
+    assert verified.lifecycle_artifact_ref == lifecycle_ref
+
+    object_path = store.objects_root / lifecycle_ref.digest
+    object_path.write_bytes(b"x" * lifecycle_ref.byte_size)
+    object_path.chmod(0o600)
+    with pytest.raises(CommissioningArtifactError, match="commissioning_artifact_invalid"):
+        store.verify_accepted_lifecycle(
+            experiment_id=EXPERIMENT_ID,
+            ledger_path=ledger_path,
+            bare_repository=disposable_git.origin,
+            lifecycle_artifact_ref=lifecycle_ref,
+        )
+
+
+def test_component_scenarios_cannot_self_issue_commissioning_pass(
     tmp_path: Path,
     disposable_git: DisposableGitFixture,
 ) -> None:
@@ -1243,18 +1739,12 @@ def test_autonomy_loop_commissions_healthy_and_adversarial_paths_without_network
             "tampered_evidence_rejected",
         ),
     )
-    artifacts = commissioning_store.persist_synthetic(synthetic_receipt)
-    assert artifacts.report.status == "synthetic_passed"
-    assert artifacts.report.terminal_state == "accepted"
-    assert artifacts.report.remote_cloud_acceptance == "uncommissioned"
-    assert artifacts.report.restart_recoveries >= 2
-    assert (
-        CommissioningArtifactStore(
-            automation_data_root=automation_data_root,
-            repository_root=disposable_git.builder,
-        ).load_latest_synthetic()
-        == artifacts
-    )
+    with pytest.raises(
+        CommissioningArtifactError,
+        match="caller_authored_commissioning_receipt_forbidden",
+    ):
+        commissioning_store.persist_synthetic(synthetic_receipt)
+    assert not commissioning_store.index_path.exists()
 
 
 def _synthetic_receipt() -> SyntheticCommissioningReceipt:
@@ -1289,7 +1779,7 @@ def _synthetic_receipt() -> SyntheticCommissioningReceipt:
     )
 
 
-def test_synthetic_commissioning_artifacts_are_private_sanitized_and_restart_safe(
+def test_caller_authored_commissioning_receipt_cannot_create_passing_report(
     tmp_path: Path,
 ) -> None:
     automation_data_root = tmp_path / ".codex" / "automations"
@@ -1300,42 +1790,35 @@ def test_synthetic_commissioning_artifacts_are_private_sanitized_and_restart_saf
         repository_root=REPOSITORY_ROOT,
     )
 
-    first = store.persist_synthetic(_synthetic_receipt())
-    replay = CommissioningArtifactStore(
-        automation_data_root=automation_data_root,
-        repository_root=REPOSITORY_ROOT,
-    ).persist_synthetic(_synthetic_receipt())
-    reopened = CommissioningArtifactStore(
-        automation_data_root=automation_data_root,
-        repository_root=REPOSITORY_ROOT,
-    ).load_latest_synthetic()
-
-    assert replay == first
-    assert reopened == first
-    assert first.report.synthetic_test_only is True
-    assert first.report.remote_cloud_acceptance == "uncommissioned"
-    assert first.report.artifact_digests == (
-        ("capability_report", "6" * 64),
-        ("lifecycle_ledger", "4" * 64),
-        ("prompt_portfolio", "7" * 64),
-        ("protected_receipt", "5" * 64),
-        ("supervisor_result", "8" * 64),
-        ("synthetic_receipt", first.receipt_ref.digest),
-    )
-    assert first.report_ref.digest == first.report.digest
-
-    report_content = store.read(first.report_ref)
-    assert json.loads(report_content) == first.report.to_canonical_dict()
-    serialized = report_content.decode("utf-8")
-    assert "private_key" not in serialized
-    assert "signature_base64" not in serialized
-    assert os.fspath(REPOSITORY_ROOT) not in serialized
+    with pytest.raises(
+        CommissioningArtifactError,
+        match="caller_authored_commissioning_receipt_forbidden",
+    ):
+        store.persist_synthetic(_synthetic_receipt())
 
     assert stat.S_IMODE(automation_data_root.stat().st_mode) == 0o755
     for directory in (store.private_root, store.root, store.objects_root):
         assert stat.S_IMODE(directory.stat().st_mode) == 0o700
-    for file_path in (store.index_path, *store.objects_root.iterdir()):
-        assert stat.S_IMODE(file_path.stat().st_mode) == 0o600
+    assert tuple(store.objects_root.iterdir()) == ()
+    assert not store.index_path.exists()
+
+
+def test_legacy_unverified_commissioning_index_is_rejected(tmp_path: Path) -> None:
+    automation_data_root = tmp_path / ".codex" / "automations"
+    store = CommissioningArtifactStore(
+        automation_data_root=automation_data_root,
+        repository_root=REPOSITORY_ROOT,
+    )
+    store._persist_verified_receipt(_synthetic_receipt())
+
+    with pytest.raises(
+        CommissioningArtifactError,
+        match="commissioning_verified_sources_required",
+    ):
+        CommissioningArtifactStore(
+            automation_data_root=automation_data_root,
+            repository_root=REPOSITORY_ROOT,
+        ).load_latest_synthetic()
 
 
 def test_synthetic_commissioning_artifacts_cannot_claim_remote_acceptance_or_live_status(
