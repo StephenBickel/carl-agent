@@ -138,6 +138,7 @@ def _sandbox_command(
             bubblewrap,
             "--die-with-parent",
             "--new-session",
+            "--unshare-user",
             "--unshare-pid",
             "--unshare-uts",
             "--unshare-ipc",
