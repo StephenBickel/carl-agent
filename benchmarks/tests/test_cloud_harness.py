@@ -184,6 +184,28 @@ def test_trusted_harness_executes_exact_carl_binaries_and_owns_scoring(tmp_path:
     }
 
 
+def test_protected_harness_rejects_shared_or_harness_subject_uid(tmp_path: Path) -> None:
+    objects = _objects(tmp_path)
+    parent = _subject(tmp_path / "parent-carl", version_ok=False)
+    candidate = _subject(tmp_path / "candidate-carl", version_ok=True)
+    harness_identity = (os.geteuid(), os.getegid())
+
+    with pytest.raises(CloudHarnessError, match="subject_identity_not_isolated"):
+        evaluate_carl_pair(
+            parent_binary=parent,
+            candidate_binary=candidate,
+            parent_commit=PARENT,
+            candidate_commit=CANDIDATE,
+            experiment_path=objects["experiment"],
+            task_set_path=objects["task_set"],
+            metric_pack_path=objects["metric_pack"],
+            policy_path=objects["policy"],
+            mode="improvement",
+            parent_identity=harness_identity,
+            candidate_identity=harness_identity,
+        )
+
+
 def test_equal_or_worse_candidate_is_never_eligible(tmp_path: Path) -> None:
     equal = _evaluate(tmp_path / "equal", parent_ok=True, candidate_ok=True)
     worse = _evaluate(tmp_path / "worse", parent_ok=True, candidate_ok=False)

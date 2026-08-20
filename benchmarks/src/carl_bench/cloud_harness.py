@@ -12,6 +12,7 @@ import contextlib
 import hashlib
 import json
 import os
+import pwd
 import re
 import selectors
 import signal
@@ -384,8 +385,22 @@ def _terminate(process: subprocess.Popen[bytes]) -> None:
 
 
 def _bounded_process(
-    binary: Path, argv: Sequence[str], *, timeout_seconds: int, output_limit: int
+    binary: Path,
+    argv: Sequence[str],
+    *,
+    timeout_seconds: int,
+    output_limit: int,
+    subject_identity: tuple[int, int] | None,
 ) -> tuple[int | None, bytes, bytes, bool, bool]:
+    demote = None
+    if subject_identity is not None:
+        uid, gid = subject_identity
+
+        def demote() -> None:
+            os.setgroups([])
+            os.setgid(gid)
+            os.setuid(uid)
+
     try:
         process = subprocess.Popen(
             [os.fspath(binary), *argv],
@@ -394,8 +409,9 @@ def _bounded_process(
             stderr=subprocess.PIPE,
             close_fds=True,
             start_new_session=True,
+            preexec_fn=demote,
         )
-    except OSError as error:
+    except (OSError, subprocess.SubprocessError) as error:
         raise CloudHarnessError("subject_binary_execution_failed") from error
     assert process.stdout is not None and process.stderr is not None
     selector = selectors.DefaultSelector()
@@ -458,7 +474,14 @@ def _bounded_process(
     )
 
 
-def _observe(binary: Path, probe: _Probe, *, attempts: int, output_limit: int) -> ProbeObservation:
+def _observe(
+    binary: Path,
+    probe: _Probe,
+    *,
+    attempts: int,
+    output_limit: int,
+    subject_identity: tuple[int, int] | None,
+) -> ProbeObservation:
     all_passed = True
     any_timeout = False
     any_overflow = False
@@ -472,6 +495,7 @@ def _observe(binary: Path, probe: _Probe, *, attempts: int, output_limit: int) -
             probe.argv,
             timeout_seconds=probe.timeout_seconds,
             output_limit=output_limit,
+            subject_identity=subject_identity,
         )
         stdout = final_stdout.decode("utf-8", errors="replace")
         passed = (
@@ -524,9 +548,17 @@ def _subject(
     attempts: int,
     output_limit: int,
     weights: dict[str, int],
+    subject_identity: tuple[int, int] | None,
 ) -> SubjectResult:
     observations = tuple(
-        _observe(binary, probe, attempts=attempts, output_limit=output_limit) for probe in probes
+        _observe(
+            binary,
+            probe,
+            attempts=attempts,
+            output_limit=output_limit,
+            subject_identity=subject_identity,
+        )
+        for probe in probes
     )
     if _validate_binary(binary) != digest:
         raise CloudHarnessError("subject_binary_changed")
@@ -554,12 +586,21 @@ def evaluate_carl_pair(
     metric_pack_path: Path,
     policy_path: Path,
     mode: str,
+    parent_identity: tuple[int, int] | None = None,
+    candidate_identity: tuple[int, int] | None = None,
 ) -> CloudHarnessResult:
     """Run protected probes against exact binaries and emit bounded canonical evidence."""
     if not _COMMIT_RE.fullmatch(parent_commit) or not _COMMIT_RE.fullmatch(candidate_commit):
         raise CloudHarnessError("subject_commit_invalid")
     if mode not in {"improvement", "soak"}:
         raise CloudHarnessError("harness_mode_invalid")
+    if (parent_identity is None) != (candidate_identity is None):
+        raise CloudHarnessError("subject_identity_invalid")
+    if parent_identity is not None and (
+        parent_identity == candidate_identity
+        or os.geteuid() in {parent_identity[0], candidate_identity[0]}
+    ):
+        raise CloudHarnessError("subject_identity_not_isolated")
     parent_binary = Path(parent_binary)
     candidate_binary = Path(candidate_binary)
     digests = (_validate_binary(parent_binary), _validate_binary(candidate_binary))
@@ -578,6 +619,7 @@ def evaluate_carl_pair(
         attempts=attempts,
         output_limit=output_limit,
         weights=weights,
+        subject_identity=parent_identity,
     )
     candidate = _subject(
         candidate_binary,
@@ -587,6 +629,7 @@ def evaluate_carl_pair(
         attempts=attempts,
         output_limit=output_limit,
         weights=weights,
+        subject_identity=candidate_identity,
     )
     gain = candidate.score_basis_points - parent.score_basis_points
     reasons: list[str] = []
@@ -640,12 +683,21 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--metric-pack", type=Path, required=True)
     parser.add_argument("--policy", type=Path, required=True)
     parser.add_argument("--mode", choices=("improvement", "soak"), required=True)
+    parser.add_argument("--parent-uid", required=True)
+    parser.add_argument("--candidate-uid", required=True)
     parser.add_argument("--output", type=Path, required=True)
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    if os.geteuid() != 0:
+        raise CloudHarnessError("protected_harness_identity_required")
+    try:
+        parent_account = pwd.getpwnam(args.parent_uid)
+        candidate_account = pwd.getpwnam(args.candidate_uid)
+    except KeyError as error:
+        raise CloudHarnessError("subject_identity_invalid") from error
     result = evaluate_carl_pair(
         parent_binary=args.parent_binary,
         candidate_binary=args.candidate_binary,
@@ -656,6 +708,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         metric_pack_path=args.metric_pack,
         policy_path=args.policy,
         mode=args.mode,
+        parent_identity=(parent_account.pw_uid, parent_account.pw_gid),
+        candidate_identity=(candidate_account.pw_uid, candidate_account.pw_gid),
     )
     payload = canonical_json_bytes(result.to_canonical_dict()) + b"\n"
     try:

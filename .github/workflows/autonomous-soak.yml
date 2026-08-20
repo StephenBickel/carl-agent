@@ -31,6 +31,14 @@ name: Autonomous soak observation
         description: Canonical cloud request SHA-256
         required: true
         type: string
+      workflow_revision:
+        description: Exact protected workflow source commit
+        required: true
+        type: string
+      workflow_blob_digest:
+        description: Exact protected workflow file SHA-256
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -73,8 +81,13 @@ jobs:
           REPOSITORY: ${{ github.repository }}
           REQUEST_DIGEST: ${{ inputs.request_digest }}
           TASK_SET_DIGEST: ${{ inputs.task_set_digest }}
+          WORKFLOW_BLOB_DIGEST: ${{ inputs.workflow_blob_digest }}
+          WORKFLOW_REVISION: ${{ inputs.workflow_revision }}
         run: |
           set -euo pipefail
+          test "$(git -C trusted-source rev-parse HEAD)" = "$WORKFLOW_REVISION"
+          printf '%s  %s\n' "$WORKFLOW_BLOB_DIGEST" \
+            trusted-source/.github/workflows/autonomous-soak.yml | sha256sum --check --strict -
           test "$(git -C merge-source rev-parse HEAD)" = "$CANDIDATE_COMMIT"
           read -r -a MERGE_TOPOLOGY <<< "$(git -C merge-source rev-list --parents -n 1 "$CANDIDATE_COMMIT")"
           test "${#MERGE_TOPOLOGY[@]}" -eq 3
@@ -89,7 +102,7 @@ jobs:
           digest = re.compile(r"[0-9a-f]{64}\Z")
           commit = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
           for name in ("EXPERIMENT_DIGEST", "METRIC_PACK_DIGEST", "POLICY_DIGEST",
-                       "REQUEST_DIGEST", "TASK_SET_DIGEST"):
+                       "REQUEST_DIGEST", "TASK_SET_DIGEST", "WORKFLOW_BLOB_DIGEST"):
               if not digest.fullmatch(os.environ[name]): raise SystemExit(f"invalid {name.lower()}")
           for name in ("PARENT_COMMIT", "CANDIDATE_COMMIT"):
               if not commit.fullmatch(os.environ[name]): raise SystemExit(f"invalid {name.lower()}")
@@ -102,6 +115,8 @@ jobs:
               "repository": os.environ["REPOSITORY"], "schema_version": 1,
               "task_set_digest": os.environ["TASK_SET_DIGEST"],
               "workflow_file": "autonomous-soak.yml",
+              "workflow_revision": os.environ["WORKFLOW_REVISION"],
+              "workflow_blob_digest": os.environ["WORKFLOW_BLOB_DIGEST"],
           }
           encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
           if hashlib.sha256(encoded).hexdigest() != os.environ["REQUEST_DIGEST"]:
@@ -250,6 +265,8 @@ jobs:
           TASK_SET_DIGEST: ${{ inputs.task_set_digest }}
           TOPOLOGY_DIGEST: ${{ needs.commission.outputs.topology_digest }}
           TRUSTED_INPUTS_DIGEST: ${{ needs.commission.outputs.trusted_inputs_digest }}
+          WORKFLOW_BLOB_DIGEST: ${{ inputs.workflow_blob_digest }}
+          WORKFLOW_REVISION: ${{ inputs.workflow_revision }}
         run: |
           mkdir -p cloud-evidence
           python3 - <<'PY'
@@ -268,6 +285,8 @@ jobs:
               "topology_digest": os.environ["TOPOLOGY_DIGEST"],
               "trusted_inputs_digest": os.environ["TRUSTED_INPUTS_DIGEST"],
               "workflow_file": "autonomous-soak.yml",
+              "workflow_revision": os.environ["WORKFLOW_REVISION"],
+              "workflow_blob_digest": os.environ["WORKFLOW_BLOB_DIGEST"],
           }
           target = pathlib.Path("cloud-evidence/autonomous-soak.json")
           target.write_text(json.dumps(evidence, sort_keys=True, separators=(",", ":")) + "\n")

@@ -31,6 +31,14 @@ name: Autonomous improvement evidence
         description: Canonical cloud request SHA-256
         required: true
         type: string
+      workflow_revision:
+        description: Exact protected workflow source commit
+        required: true
+        type: string
+      workflow_blob_digest:
+        description: Exact protected workflow file SHA-256
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -64,7 +72,12 @@ jobs:
           REPOSITORY: ${{ github.repository }}
           REQUEST_DIGEST: ${{ inputs.request_digest }}
           TASK_SET_DIGEST: ${{ inputs.task_set_digest }}
+          WORKFLOW_BLOB_DIGEST: ${{ inputs.workflow_blob_digest }}
+          WORKFLOW_REVISION: ${{ inputs.workflow_revision }}
         run: |
+          test "$(git -C trusted-source rev-parse HEAD)" = "$WORKFLOW_REVISION"
+          printf '%s  %s\n' "$WORKFLOW_BLOB_DIGEST" \
+            trusted-source/.github/workflows/autonomous-improvement.yml | sha256sum --check --strict -
           python3 - <<'PY'
           import hashlib
           import json
@@ -75,7 +88,7 @@ jobs:
           commit = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
           for name in (
               "EXPERIMENT_DIGEST", "METRIC_PACK_DIGEST", "POLICY_DIGEST",
-              "REQUEST_DIGEST", "TASK_SET_DIGEST",
+              "REQUEST_DIGEST", "TASK_SET_DIGEST", "WORKFLOW_BLOB_DIGEST",
           ):
               if not digest.fullmatch(os.environ[name]):
                   raise SystemExit(f"invalid {name.lower()}")
@@ -92,6 +105,8 @@ jobs:
               "schema_version": 1,
               "task_set_digest": os.environ["TASK_SET_DIGEST"],
               "workflow_file": "autonomous-improvement.yml",
+              "workflow_revision": os.environ["WORKFLOW_REVISION"],
+              "workflow_blob_digest": os.environ["WORKFLOW_BLOB_DIGEST"],
           }
           encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
           if hashlib.sha256(encoded).hexdigest() != os.environ["REQUEST_DIGEST"]:
@@ -202,7 +217,6 @@ jobs:
           chmod 700 "$(dirname "$GITHUB_ENV")"
           sudo useradd --system --no-create-home --shell /usr/sbin/nologin carlparent
           sudo useradd --system --no-create-home --shell /usr/sbin/nologin carlcandidate
-          sudo useradd --system --no-create-home --shell /usr/sbin/nologin carlrunner
           parent_root="$RUNNER_TEMP/build-parent"
           candidate_root="$RUNNER_TEMP/build-candidate"
           bound="$RUNNER_TEMP/bound-subjects"
@@ -251,12 +265,21 @@ jobs:
           results="$RUNNER_TEMP/paired-results"
           sandbox="$RUNNER_TEMP/harness-sandbox"
           bound="$RUNNER_TEMP/bound-subjects"
-          sudo install -d -m 0700 -o carlrunner -g carlrunner \
+          sudo install -d -m 0700 -o root -g root \
             "$results" "$sandbox" "$sandbox/home" "$sandbox/tmp"
+          test "$(id -u)" != "$(id -u carlparent)"
+          test "$(id -u)" != "$(id -u carlcandidate)"
+          sudo -u carlparent test ! -r "$results"
+          sudo -u carlparent test ! -w "$results"
+          sudo -u carlparent test ! -x "$results"
+          sudo -u carlcandidate test ! -r "$results"
+          sudo -u carlcandidate test ! -w "$results"
+          sudo -u carlcandidate test ! -x "$results"
           (cd / && sha256sum --check "$bound/parent.sha256")
           (cd / && sha256sum --check "$bound/candidate.sha256")
           uv sync --project trusted-source/benchmarks --python 3.12 --locked
-          sudo -u carlrunner env -i HOME="$sandbox/home" PATH="$PATH" TMPDIR="$sandbox/tmp" \
+          umask 077
+          sudo env -i HOME="$sandbox/home" PATH="$PATH" TMPDIR="$sandbox/tmp" \
             PYTHONDONTWRITEBYTECODE=1 \
             trusted-source/benchmarks/.venv/bin/python -m carl_bench.cloud_harness \
               --parent-binary "$RUNNER_TEMP/build-parent/target/release/carl" \
@@ -266,10 +289,14 @@ jobs:
               --task-set "$RUNNER_TEMP/immutable-inputs/task-set" \
               --metric-pack "$RUNNER_TEMP/immutable-inputs/metric-pack" \
               --policy "$RUNNER_TEMP/immutable-inputs/policy" \
+              --parent-uid carlparent --candidate-uid carlcandidate \
               --mode improvement --output "$results/paired-result.json"
           (cd / && sha256sum --check "$bound/parent.sha256")
           (cd / && sha256sum --check "$bound/candidate.sha256")
           test -f "$results/paired-result.json"; test ! -L "$results/paired-result.json"
+          test "$(stat -c '%u:%a' "$results/paired-result.json")" = "0:600"
+          sudo -u carlparent test ! -r "$results/paired-result.json"
+          sudo -u carlcandidate test ! -r "$results/paired-result.json"
           test "$(wc -c < "$results/paired-result.json")" -le 262145
           printf 'paired_result_digest=%s\n' "$(sha256sum "$results/paired-result.json" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
           printf 'paired_result_payload_b64=%s\n' "$(base64 -w0 "$results/paired-result.json")" >> "$GITHUB_OUTPUT"
@@ -296,6 +323,8 @@ jobs:
           RUN_ID: ${{ github.run_id }}
           TASK_SET_DIGEST: ${{ inputs.task_set_digest }}
           TRUSTED_INPUTS_DIGEST: ${{ needs.commission.outputs.trusted_inputs_digest }}
+          WORKFLOW_BLOB_DIGEST: ${{ inputs.workflow_blob_digest }}
+          WORKFLOW_REVISION: ${{ inputs.workflow_revision }}
         run: |
           mkdir -p cloud-evidence
           python3 - <<'PY'
@@ -337,6 +366,8 @@ jobs:
               "task_set_digest": os.environ["TASK_SET_DIGEST"],
               "trusted_inputs_digest": os.environ["TRUSTED_INPUTS_DIGEST"],
               "workflow_file": "autonomous-improvement.yml",
+              "workflow_revision": os.environ["WORKFLOW_REVISION"],
+              "workflow_blob_digest": os.environ["WORKFLOW_BLOB_DIGEST"],
           }
           target = pathlib.Path("cloud-evidence/autonomous-improvement.json")
           target.write_text(json.dumps(evidence, sort_keys=True, separators=(",", ":")) + "\n")

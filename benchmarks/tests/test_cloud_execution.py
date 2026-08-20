@@ -15,6 +15,7 @@ from carl_bench.cloud_execution import (
     CloudRetryStateStore,
     CloudRunRequest,
     CloudRunSnapshot,
+    CommissioningReceipt,
     advance_retry_state,
     reconcile_cloud_run,
 )
@@ -26,6 +27,8 @@ LATER = "2026-08-26T12:00:00Z"
 PARENT = "1" * 40
 CANDIDATE = "2" * 40
 ARTIFACT_DIGEST = "a" * 64
+WORKFLOW_REVISION = "7" * 40
+WORKFLOW_BLOB_DIGEST = "8" * 64
 WORKFLOWS = (
     "autonomous-improvement.yml",
     "autonomous-soak.yml",
@@ -38,6 +41,8 @@ INPUTS = {
     "metric_pack_digest",
     "policy_digest",
     "request_digest",
+    "workflow_revision",
+    "workflow_blob_digest",
 }
 PINNED_ACTIONS = {
     "actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683",
@@ -56,6 +61,8 @@ def request(workflow_file: str = WORKFLOWS[0]) -> CloudRunRequest:
         task_set_digest="4" * 64,
         metric_pack_digest="5" * 64,
         policy_digest="6" * 64,
+        workflow_revision=WORKFLOW_REVISION,
+        workflow_blob_digest=WORKFLOW_BLOB_DIGEST,
     )
 
 
@@ -66,6 +73,26 @@ def artifact(cloud_request: CloudRunRequest, *, downloaded: bool = True) -> Clou
         run_id=42,
         digest=ARTIFACT_DIGEST,
         downloaded_digest=ARTIFACT_DIGEST if downloaded else None,
+    )
+
+
+def commissioning_receipt(cloud_request: CloudRunRequest) -> CommissioningReceipt:
+    return CommissioningReceipt(
+        schema_version=1,
+        repository=cloud_request.repository,
+        workflow_file=cloud_request.workflow_file,
+        workflow_revision=cloud_request.workflow_revision,
+        workflow_blob_digest=cloud_request.workflow_blob_digest,
+        request_digest=cloud_request.request_digest,
+        experiment_digest=cloud_request.experiment_digest,
+        task_set_digest=cloud_request.task_set_digest,
+        metric_pack_digest=cloud_request.metric_pack_digest,
+        policy_digest=cloud_request.policy_digest,
+        run_id=42,
+        conclusion="success",
+        artifact_id=99,
+        artifact_name=cloud_request.expected_artifact_name,
+        artifact_digest=ARTIFACT_DIGEST,
     )
 
 
@@ -90,8 +117,7 @@ def snapshot(
         prior_run_ids=(),
         artifacts=(artifact(current),),
         artifacts_expires_at=LATER,
-        commissioning_actionlint_passed=True,
-        commissioning_dry_run_id=7,
+        commissioning_receipt=commissioning_receipt(current),
     )
     return replace(base, **changes)
 
@@ -134,6 +160,8 @@ def test_request_digest_and_dispatch_key_are_exact_and_idempotent() -> None:
         task_set_digest=first.task_set_digest,
         metric_pack_digest=first.metric_pack_digest,
         policy_digest=first.policy_digest,
+        workflow_revision=first.workflow_revision,
+        workflow_blob_digest=first.workflow_blob_digest,
     )
 
     assert first.request_digest == duplicate.request_digest
@@ -413,8 +441,12 @@ def test_retry_transition_is_durable_atomic_and_idempotent(tmp_path: Path) -> No
         prior_run_id=42,
     )
 
-    persisted = store.compare_and_swap(expected=initial, replacement=replacement)
-    replayed = store.compare_and_swap(expected=initial, replacement=replacement)
+    persisted = store.compare_and_swap(
+        expected=initial, replacement=replacement, retry_decision=decision
+    )
+    replayed = store.compare_and_swap(
+        expected=initial, replacement=replacement, retry_decision=decision
+    )
 
     assert persisted == replayed == replacement
     assert store.load() == replacement
@@ -438,25 +470,185 @@ def test_retry_state_cas_rejects_a_different_stale_transition(tmp_path: Path) ->
     initial = CloudRetryState.initial(cloud_request)
     store = CloudRetryStateStore(tmp_path / "retry-state.json")
     store.initialize(initial)
+    decision = reconcile_cloud_run(
+        cloud_request,
+        snapshot(
+            cloud_request,
+            conclusion="timed_out",
+            artifacts=(),
+            artifacts_expires_at=None,
+        ),
+    )
     first = advance_retry_state(
         initial,
         request=cloud_request,
-        decision=reconcile_cloud_run(
-            cloud_request,
-            snapshot(
-                cloud_request,
-                conclusion="timed_out",
-                artifacts=(),
-                artifacts_expires_at=None,
-            ),
-        ),
+        decision=decision,
         prior_run_id=42,
     )
-    store.compare_and_swap(expected=initial, replacement=first)
+    store.compare_and_swap(expected=initial, replacement=first, retry_decision=decision)
     different = replace(first, prior_run_ids=(41,))
 
-    with pytest.raises(CloudExecutionError, match="cloud_retry_state_conflict"):
-        store.compare_and_swap(expected=initial, replacement=different)
+    with pytest.raises(CloudExecutionError, match="cloud_retry_transition_invalid"):
+        store.compare_and_swap(
+            expected=initial, replacement=different, retry_decision=decision
+        )
+
+
+def test_retry_cas_rejects_skip_reset_missing_deadline_and_history_attacks(
+    tmp_path: Path,
+) -> None:
+    cloud_request = request()
+    initial = CloudRetryState.initial(cloud_request)
+    store = CloudRetryStateStore(tmp_path / "retry-state.json")
+    store.initialize(initial)
+
+    skip = CloudRetryState(
+        schema_version=1,
+        request_digest=cloud_request.request_digest,
+        revision=1,
+        attempt=3,
+        attempt_key=cloud_request.attempt_key(3),
+        prior_run_ids=(40, 41),
+        retry_not_before="2026-08-19T12:05:00Z",
+    )
+    with pytest.raises(CloudExecutionError, match="cloud_retry_transition_invalid"):
+        store.compare_and_swap(
+            expected=initial,
+            replacement=skip,
+            retry_decision=reconcile_cloud_run(
+                cloud_request,
+                snapshot(
+                    cloud_request,
+                    conclusion="timed_out",
+                    artifacts=(),
+                    artifacts_expires_at=None,
+                ),
+            ),
+        )
+
+    with pytest.raises(CloudExecutionError, match="invalid_cloud_retry_state"):
+        CloudRetryState(
+            schema_version=1,
+            request_digest=cloud_request.request_digest,
+            revision=1,
+            attempt=2,
+            attempt_key=cloud_request.attempt_key(2),
+            prior_run_ids=(42,),
+            retry_not_before=None,
+        )
+
+    first_decision = reconcile_cloud_run(
+        cloud_request,
+        snapshot(
+            cloud_request,
+            conclusion="timed_out",
+            artifacts=(),
+            artifacts_expires_at=None,
+        ),
+    )
+    first = advance_retry_state(
+        initial,
+        request=cloud_request,
+        decision=first_decision,
+        prior_run_id=42,
+    )
+    store.compare_and_swap(expected=initial, replacement=first, retry_decision=first_decision)
+    second_decision = reconcile_cloud_run(
+        cloud_request,
+        snapshot(
+            cloud_request,
+            run_id=43,
+            conclusion="timed_out",
+            attempt=2,
+            attempt_key=cloud_request.attempt_key(2),
+            prior_run_ids=(42,),
+            artifacts=(),
+            artifacts_expires_at=None,
+        ),
+    )
+    reset = CloudRetryState(
+        schema_version=1,
+        request_digest=cloud_request.request_digest,
+        revision=2,
+        attempt=1,
+        attempt_key=cloud_request.attempt_key(1),
+        prior_run_ids=(),
+        retry_not_before=None,
+    )
+    with pytest.raises(CloudExecutionError, match="cloud_retry_transition_invalid"):
+        store.compare_and_swap(
+            expected=first, replacement=reset, retry_decision=second_decision
+        )
+
+    second = CloudRetryState(
+        schema_version=1,
+        request_digest=cloud_request.request_digest,
+        revision=2,
+        attempt=3,
+        attempt_key=cloud_request.attempt_key(3),
+        prior_run_ids=(42, 44),
+        retry_not_before="2026-08-19T12:15:00Z",
+    )
+    with pytest.raises(CloudExecutionError, match="cloud_retry_transition_invalid"):
+        store.compare_and_swap(
+            expected=first, replacement=second, retry_decision=second_decision
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("attempt_key", "cloud-run-" + "0" * 64 + "-attempt-2"),
+        ("retry_not_before", None),
+        ("prior_run_ids", ()),
+        ("prior_run_ids", (42, 43)),
+    ),
+)
+def test_retry_cas_revalidates_even_a_tampered_state_object(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    cloud_request = request()
+    initial = CloudRetryState.initial(cloud_request)
+    store = CloudRetryStateStore(tmp_path / "retry-state.json")
+    store.initialize(initial)
+    decision = reconcile_cloud_run(
+        cloud_request,
+        snapshot(
+            cloud_request,
+            conclusion="timed_out",
+            artifacts=(),
+            artifacts_expires_at=None,
+        ),
+    )
+    replacement = advance_retry_state(
+        initial,
+        request=cloud_request,
+        decision=decision,
+        prior_run_id=42,
+    )
+    object.__setattr__(replacement, field, value)
+
+    with pytest.raises(CloudExecutionError, match="cloud_retry_transition_invalid"):
+        store.compare_and_swap(
+            expected=initial, replacement=replacement, retry_decision=decision
+        )
+
+
+def test_advance_retry_requires_completed_prior_run_id() -> None:
+    cloud_request = request()
+    initial = CloudRetryState.initial(cloud_request)
+    decision = reconcile_cloud_run(
+        cloud_request,
+        snapshot(
+            cloud_request,
+            conclusion="timed_out",
+            artifacts=(),
+            artifacts_expires_at=None,
+        ),
+    )
+
+    with pytest.raises(TypeError):
+        advance_retry_state(initial, request=cloud_request, decision=decision)
 
 
 def test_retry_attempt_rejects_reused_run_and_wrong_attempt_key() -> None:
@@ -505,17 +697,44 @@ def test_completed_infrastructure_failure_schedules_retry_but_test_failure_block
     assert failed.reason == "cloud_run_failed"
 
 
+def test_success_requires_exact_remote_commissioning_receipt() -> None:
+    cloud_request = request()
+    absent = reconcile_cloud_run(
+        cloud_request, snapshot(cloud_request, commissioning_receipt=None)
+    )
+    wrong_run = replace(commissioning_receipt(cloud_request), run_id=41)
+    mismatched = reconcile_cloud_run(
+        cloud_request,
+        snapshot(cloud_request, commissioning_receipt=wrong_run),
+    )
+
+    assert absent.action == "blocked"
+    assert absent.reason == "cloud_commissioning_receipt_missing"
+    assert mismatched.action == "blocked"
+    assert mismatched.reason == "cloud_commissioning_run_mismatch"
+
+
 @pytest.mark.parametrize(
-    ("changes", "reason"),
-    [
-        ({"commissioning_actionlint_passed": False}, "cloud_actionlint_not_commissioned"),
-        ({"commissioning_dry_run_id": None}, "cloud_github_dry_run_not_commissioned"),
-    ],
+    ("field", "value", "reason"),
+    (
+        ("repository", "other/project", "cloud_commissioning_repository_mismatch"),
+        ("workflow_revision", "9" * 40, "cloud_commissioning_revision_mismatch"),
+        ("workflow_blob_digest", "9" * 64, "cloud_commissioning_blob_mismatch"),
+        ("request_digest", "9" * 64, "cloud_commissioning_request_mismatch"),
+        ("task_set_digest", "9" * 64, "cloud_commissioning_task_set_mismatch"),
+        ("artifact_id", 100, "cloud_commissioning_artifact_id_mismatch"),
+        ("artifact_digest", "9" * 64, "cloud_commissioning_artifact_digest_mismatch"),
+    ),
 )
-def test_success_requires_actionlint_and_prior_github_hosted_dry_run(
-    changes: dict[str, object], reason: str
+def test_commissioning_receipt_is_bound_to_protected_run_and_inputs(
+    field: str, value: object, reason: str
 ) -> None:
-    decision = reconcile_cloud_run(request(), snapshot(**changes))
+    cloud_request = request()
+    receipt = replace(commissioning_receipt(cloud_request), **{field: value})
+
+    decision = reconcile_cloud_run(
+        cloud_request, snapshot(cloud_request, commissioning_receipt=receipt)
+    )
 
     assert decision.action == "blocked"
     assert decision.reason == reason
@@ -573,7 +792,9 @@ def test_candidate_execution_isolated_from_trusted_evidence_and_inputs(name: str
     if name == "autonomous-improvement.yml":
         assert "sudo -u carlparent env -i" in evaluate_commands
         assert "sudo -u carlcandidate env -i" in evaluate_commands
-        assert "sudo -u carlrunner env -i" in evaluate_commands
+        assert "sudo env -i" in evaluate_commands
+        assert "--parent-uid carlparent" in evaluate_commands
+        assert "--candidate-uid carlcandidate" in evaluate_commands
         assert "python -m carl_bench.cloud_harness" in evaluate_commands
         assert "carl-bench" not in evaluate_commands
         assert "--adapter scripted" not in evaluate_commands
@@ -616,11 +837,16 @@ def test_improvement_workflow_runs_real_exact_parent_candidate_pair() -> None:
     assert "paired-result" in commands
     assert "useradd --system --no-create-home --shell /usr/sbin/nologin carlparent" in commands
     assert "useradd --system --no-create-home --shell /usr/sbin/nologin carlcandidate" in commands
-    assert "useradd --system --no-create-home --shell /usr/sbin/nologin carlrunner" in commands
     assert "sudo -u carlparent env -i" in commands
     assert "sudo -u carlcandidate env -i" in commands
-    assert "sudo -u carlrunner env -i" in commands
-    assert "sudo install -d -m 0700 -o carlrunner -g carlrunner" in commands
+    assert "sudo env -i" in commands
+    assert "--parent-uid carlparent" in commands
+    assert "--candidate-uid carlcandidate" in commands
+    assert "sudo install -d -m 0700 -o root -g root" in commands
+    assert 'test "$(id -u)" != "$(id -u carlparent)"' in commands
+    assert 'test "$(id -u)" != "$(id -u carlcandidate)"' in commands
+    assert 'sudo -u carlparent test ! -r "$results"' in commands
+    assert 'sudo -u carlcandidate test ! -r "$results"' in commands
     assert commands.index("sudo -u carlparent env -i") < commands.index(
         'sha256sum "$parent_binary"'
     )

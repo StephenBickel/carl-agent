@@ -87,6 +87,8 @@ def _request_payload(
     task_set_digest: str,
     metric_pack_digest: str,
     policy_digest: str,
+    workflow_revision: str,
+    workflow_blob_digest: str,
 ) -> dict[str, Any]:
     return {
         "candidate_commit": candidate_commit,
@@ -98,6 +100,8 @@ def _request_payload(
         "schema_version": 1,
         "task_set_digest": task_set_digest,
         "workflow_file": workflow_file,
+        "workflow_revision": workflow_revision,
+        "workflow_blob_digest": workflow_blob_digest,
     }
 
 
@@ -116,6 +120,8 @@ class CloudRunRequest:
     task_set_digest: str
     metric_pack_digest: str
     policy_digest: str
+    workflow_revision: str
+    workflow_blob_digest: str
     request_digest: str
     dispatch_key: str
 
@@ -131,11 +137,13 @@ class CloudRunRequest:
             "task_set_digest",
             "metric_pack_digest",
             "policy_digest",
+            "workflow_blob_digest",
             "request_digest",
         ):
             _digest(name, getattr(self, name))
         _object("parent_commit", self.parent_commit)
         _object("candidate_commit", self.candidate_commit)
+        _object("workflow_revision", self.workflow_revision)
         expected_digest = _request_digest(
             _request_payload(
                 repository=self.repository,
@@ -146,6 +154,8 @@ class CloudRunRequest:
                 task_set_digest=self.task_set_digest,
                 metric_pack_digest=self.metric_pack_digest,
                 policy_digest=self.policy_digest,
+                workflow_revision=self.workflow_revision,
+                workflow_blob_digest=self.workflow_blob_digest,
             )
         )
         if self.request_digest != expected_digest:
@@ -165,6 +175,8 @@ class CloudRunRequest:
         task_set_digest: str,
         metric_pack_digest: str,
         policy_digest: str,
+        workflow_revision: str,
+        workflow_blob_digest: str,
     ) -> CloudRunRequest:
         payload = _request_payload(
             repository=repository,
@@ -175,6 +187,8 @@ class CloudRunRequest:
             task_set_digest=task_set_digest,
             metric_pack_digest=metric_pack_digest,
             policy_digest=policy_digest,
+            workflow_revision=workflow_revision,
+            workflow_blob_digest=workflow_blob_digest,
         )
         request_digest = _request_digest(payload)
         return cls(
@@ -187,6 +201,8 @@ class CloudRunRequest:
             task_set_digest=task_set_digest,
             metric_pack_digest=metric_pack_digest,
             policy_digest=policy_digest,
+            workflow_revision=workflow_revision,
+            workflow_blob_digest=workflow_blob_digest,
             request_digest=request_digest,
             dispatch_key=f"cloud-run-{request_digest}",
         )
@@ -232,6 +248,59 @@ class CloudArtifact:
 
 
 @dataclass(frozen=True, slots=True)
+class CommissioningReceipt:
+    """Verified GitHub-hosted run identity required before cloud evidence is trusted."""
+
+    schema_version: int
+    repository: str
+    workflow_file: str
+    workflow_revision: str
+    workflow_blob_digest: str
+    request_digest: str
+    experiment_digest: str
+    task_set_digest: str
+    metric_pack_digest: str
+    policy_digest: str
+    run_id: int
+    conclusion: str
+    artifact_id: int
+    artifact_name: str
+    artifact_digest: str
+
+    def __post_init__(self) -> None:
+        if self.schema_version != 1:
+            raise CloudExecutionError("cloud_commissioning_schema_invalid")
+        if not isinstance(self.repository, str) or not _REPOSITORY_RE.fullmatch(self.repository):
+            raise CloudExecutionError("invalid_cloud_commissioning_repository")
+        if self.workflow_file not in _WORKFLOWS:
+            raise CloudExecutionError("invalid_cloud_commissioning_workflow")
+        _object("cloud_commissioning_workflow_revision", self.workflow_revision)
+        for name in (
+            "workflow_blob_digest",
+            "request_digest",
+            "experiment_digest",
+            "task_set_digest",
+            "metric_pack_digest",
+            "policy_digest",
+            "artifact_digest",
+        ):
+            _digest(f"cloud_commissioning_{name}", getattr(self, name))
+        for name in ("run_id", "artifact_id"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise CloudExecutionError(f"invalid_cloud_commissioning_{name}")
+        if self.conclusion != "success":
+            raise CloudExecutionError("cloud_commissioning_run_not_successful")
+        if (
+            not isinstance(self.artifact_name, str)
+            or not self.artifact_name
+            or len(self.artifact_name.encode("utf-8")) > 180
+            or not re.fullmatch(r"[A-Za-z0-9_.-]+", self.artifact_name)
+        ):
+            raise CloudExecutionError("invalid_cloud_commissioning_artifact_name")
+
+
+@dataclass(frozen=True, slots=True)
 class CloudRunSnapshot:
     remote_available: bool
     observed_at: str
@@ -249,8 +318,7 @@ class CloudRunSnapshot:
     prior_run_ids: tuple[int, ...] = ()
     artifacts: tuple[CloudArtifact, ...] = ()
     artifacts_expires_at: str | None = None
-    commissioning_actionlint_passed: bool = False
-    commissioning_dry_run_id: int | None = None
+    commissioning_receipt: CommissioningReceipt | None = None
     local_fallback_command: str | None = None
 
     def __post_init__(self) -> None:
@@ -310,14 +378,10 @@ class CloudRunSnapshot:
             raise CloudExecutionError("invalid_cloud_artifacts")
         if self.artifacts_expires_at is not None:
             _utc("cloud_artifacts_expires_at", self.artifacts_expires_at)
-        if not isinstance(self.commissioning_actionlint_passed, bool):
-            raise CloudExecutionError("invalid_cloud_actionlint_commissioning")
-        if self.commissioning_dry_run_id is not None and (
-            isinstance(self.commissioning_dry_run_id, bool)
-            or not isinstance(self.commissioning_dry_run_id, int)
-            or self.commissioning_dry_run_id <= 0
+        if self.commissioning_receipt is not None and not isinstance(
+            self.commissioning_receipt, CommissioningReceipt
         ):
-            raise CloudExecutionError("invalid_cloud_dry_run_id")
+            raise CloudExecutionError("invalid_cloud_commissioning_receipt")
         if self.local_fallback_command is not None and (
             not isinstance(self.local_fallback_command, str)
             or not self.local_fallback_command.strip()
@@ -378,17 +442,17 @@ class CloudRetryState:
             raise CloudExecutionError("invalid_cloud_attempt_key")
         if (
             not isinstance(self.prior_run_ids, tuple)
-            or tuple(sorted(set(self.prior_run_ids))) != self.prior_run_ids
+            or len(set(self.prior_run_ids)) != len(self.prior_run_ids)
             or any(
                 isinstance(value, bool) or not isinstance(value, int) or value <= 0
                 for value in self.prior_run_ids
             )
-            or len(self.prior_run_ids) > self.attempt - 1
+            or len(self.prior_run_ids) != self.attempt - 1
         ):
             raise CloudExecutionError("invalid_cloud_prior_runs")
         if self.retry_not_before is not None:
             _utc("cloud_retry_not_before", self.retry_not_before)
-        if self.attempt == 1 and self.retry_not_before is not None:
+        if (self.attempt == 1) != (self.retry_not_before is None):
             raise CloudExecutionError("invalid_cloud_retry_state")
 
     @classmethod
@@ -450,7 +514,7 @@ def advance_retry_state(
     *,
     request: CloudRunRequest,
     decision: CloudRunDecision,
-    prior_run_id: int | None = None,
+    prior_run_id: int,
 ) -> CloudRetryState:
     """Derive the sole valid successor for a schedule-retry decision."""
     if (
@@ -466,13 +530,13 @@ def advance_retry_state(
     ):
         raise CloudExecutionError("cloud_retry_transition_invalid")
     _utc("cloud_retry_not_before", decision.retry_not_before)
-    prior_runs = state.prior_run_ids
-    if prior_run_id is not None:
-        if isinstance(prior_run_id, bool) or not isinstance(prior_run_id, int) or prior_run_id <= 0:
-            raise CloudExecutionError("invalid_cloud_run_id")
-        if prior_run_id in prior_runs:
-            raise CloudExecutionError("cloud_run_id_reused")
-        prior_runs = tuple(sorted((*prior_runs, prior_run_id)))
+    if isinstance(prior_run_id, bool) or not isinstance(prior_run_id, int) or prior_run_id <= 0:
+        raise CloudExecutionError("invalid_cloud_run_id")
+    if decision.run_id != prior_run_id:
+        raise CloudExecutionError("cloud_retry_prior_run_mismatch")
+    if prior_run_id in state.prior_run_ids:
+        raise CloudExecutionError("cloud_run_id_reused")
+    prior_runs = (*state.prior_run_ids, prior_run_id)
     return CloudRetryState(
         schema_version=1,
         request_digest=state.request_digest,
@@ -564,13 +628,34 @@ class CloudRetryStateStore:
             raise CloudExecutionError("cloud_retry_state_conflict")
 
     def compare_and_swap(
-        self, *, expected: CloudRetryState, replacement: CloudRetryState
+        self,
+        *,
+        expected: CloudRetryState,
+        replacement: CloudRetryState,
+        retry_decision: CloudRunDecision,
     ) -> CloudRetryState:
         if (
             not isinstance(expected, CloudRetryState)
             or not isinstance(replacement, CloudRetryState)
+            or not isinstance(retry_decision, CloudRunDecision)
             or replacement.request_digest != expected.request_digest
             or replacement.revision != expected.revision + 1
+            or expected.attempt >= 3
+            or replacement.attempt != expected.attempt + 1
+            or replacement.attempt_key
+            != f"cloud-run-{expected.request_digest}-attempt-{expected.attempt + 1}"
+            or replacement.retry_not_before is None
+            or retry_decision.action != "schedule_retry"
+            or retry_decision.request_digest != expected.request_digest
+            or retry_decision.next_attempt != replacement.attempt
+            or retry_decision.next_attempt_key != replacement.attempt_key
+            or retry_decision.retry_not_before != replacement.retry_not_before
+            or retry_decision.run_id is None
+            or retry_decision.conclusion not in _INFRASTRUCTURE_CONCLUSIONS
+            or replacement.prior_run_ids[:-1] != expected.prior_run_ids
+            or len(replacement.prior_run_ids) != len(expected.prior_run_ids) + 1
+            or replacement.prior_run_ids[-1] != retry_decision.run_id
+            or retry_decision.run_id in expected.prior_run_ids
         ):
             raise CloudExecutionError("cloud_retry_transition_invalid")
         with self._locked():
@@ -654,6 +739,69 @@ def _binding_failure(
     return None, complete
 
 
+def _commissioning_failure(
+    request: CloudRunRequest,
+    snapshot: CloudRunSnapshot,
+    artifact: CloudArtifact,
+) -> str | None:
+    receipt = snapshot.commissioning_receipt
+    if receipt is None:
+        return "cloud_commissioning_receipt_missing"
+    bindings: tuple[tuple[object, object, str], ...] = (
+        (receipt.repository, request.repository, "cloud_commissioning_repository_mismatch"),
+        (receipt.workflow_file, request.workflow_file, "cloud_commissioning_workflow_mismatch"),
+        (
+            receipt.workflow_revision,
+            request.workflow_revision,
+            "cloud_commissioning_revision_mismatch",
+        ),
+        (
+            receipt.workflow_blob_digest,
+            request.workflow_blob_digest,
+            "cloud_commissioning_blob_mismatch",
+        ),
+        (receipt.request_digest, request.request_digest, "cloud_commissioning_request_mismatch"),
+        (
+            receipt.experiment_digest,
+            request.experiment_digest,
+            "cloud_commissioning_experiment_mismatch",
+        ),
+        (
+            receipt.task_set_digest,
+            request.task_set_digest,
+            "cloud_commissioning_task_set_mismatch",
+        ),
+        (
+            receipt.metric_pack_digest,
+            request.metric_pack_digest,
+            "cloud_commissioning_metric_pack_mismatch",
+        ),
+        (
+            receipt.policy_digest,
+            request.policy_digest,
+            "cloud_commissioning_policy_mismatch",
+        ),
+        (receipt.run_id, snapshot.run_id, "cloud_commissioning_run_mismatch"),
+        (receipt.conclusion, snapshot.conclusion, "cloud_commissioning_conclusion_mismatch"),
+        (
+            receipt.artifact_id,
+            artifact.artifact_id,
+            "cloud_commissioning_artifact_id_mismatch",
+        ),
+        (
+            receipt.artifact_name,
+            artifact.name,
+            "cloud_commissioning_artifact_name_mismatch",
+        ),
+        (
+            receipt.artifact_digest,
+            artifact.digest,
+            "cloud_commissioning_artifact_digest_mismatch",
+        ),
+    )
+    return next((reason for actual, expected, reason in bindings if actual != expected), None)
+
+
 def reconcile_cloud_run(
     request: CloudRunRequest, snapshot: CloudRunSnapshot
 ) -> CloudRunDecision:
@@ -712,10 +860,6 @@ def reconcile_cloud_run(
         return _retry_decision("cloud_run_infrastructure_failure", request, snapshot)
     if snapshot.conclusion != "success":
         return _decision("blocked", "cloud_run_failed", request, snapshot)
-    if not snapshot.commissioning_actionlint_passed:
-        return _decision("blocked", "cloud_actionlint_not_commissioned", request, snapshot)
-    if snapshot.commissioning_dry_run_id is None:
-        return _decision("blocked", "cloud_github_dry_run_not_commissioned", request, snapshot)
     if not snapshot.artifacts or snapshot.artifacts_expires_at is None:
         return _decision("blocked", "cloud_artifact_identity_missing", request, snapshot)
     if len(snapshot.artifacts) != 1:
@@ -739,6 +883,9 @@ def reconcile_cloud_run(
         )
     if artifact.downloaded_digest != artifact.digest:
         return _decision("blocked", "cloud_artifact_digest_mismatch", request, snapshot)
+    commissioning_failure = _commissioning_failure(request, snapshot, artifact)
+    if commissioning_failure is not None:
+        return _decision("blocked", commissioning_failure, request, snapshot)
     return _decision(
         "record_success", "cloud_run_evidence_verified", request, snapshot, artifact=artifact
     )
