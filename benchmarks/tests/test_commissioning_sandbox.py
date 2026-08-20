@@ -15,6 +15,7 @@ from carl_bench.commissioning_runner import (
     ProtectedSyntheticRunner,
     _sandbox_command,
     _sandbox_environment,
+    _sandbox_failure_reason,
 )
 
 
@@ -110,6 +111,19 @@ def test_linux_sandbox_fails_closed_when_bubblewrap_is_unavailable(tmp_path: Pat
             platform="linux",
             executable_lookup=lambda _name: None,
         )
+
+
+@pytest.mark.parametrize(
+    ("stderr", "expected"),
+    (
+        (b"bwrap: Operation not permitted", "operation_not_permitted"),
+        (b"bwrap: Permission denied", "permission_denied"),
+        (b"bwrap: No such file or directory", "missing_path"),
+        (b"unclassified diagnostic", "unknown"),
+    ),
+)
+def test_sandbox_failure_reason_is_bounded(stderr: bytes, expected: str) -> None:
+    assert _sandbox_failure_reason(stderr) == expected
 
 
 def test_protected_commands_normalize_launch_timeout_and_signal_failures(

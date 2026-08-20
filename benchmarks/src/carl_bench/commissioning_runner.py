@@ -186,6 +186,22 @@ def _launch_failure(code: bytes) -> tuple[int, bytes, bytes]:
     )
 
 
+def _sandbox_failure_reason(stderr: bytes) -> str:
+    lowered = stderr.lower()
+    reasons = (
+        (b"operation not permitted", "operation_not_permitted"),
+        (b"permission denied", "permission_denied"),
+        (b"no such file or directory", "missing_path"),
+        (b"not found", "missing_path"),
+        (b"read-only file system", "readonly_filesystem"),
+        (b"invalid argument", "invalid_argument"),
+    )
+    for marker, reason in reasons:
+        if marker in lowered:
+            return reason
+    return "unknown"
+
+
 def _toolchain_paths(command: tuple[str, ...]) -> tuple[Path, ...]:
     paths: list[Path] = []
     executable = command[0]
@@ -938,7 +954,7 @@ class ProtectedSyntheticRunner:
         self.source_repository = source
         probe_root = Path(tempfile.mkdtemp(prefix="sandbox-probe-", dir=self.protected_root))
         try:
-            exit_code, _, _ = _run_sandboxed_command(
+            exit_code, _, stderr = _run_sandboxed_command(
                 (sys.executable, "-c", "raise SystemExit(0)"),
                 checkout=self.protected_root,
                 writable_root=probe_root,
@@ -948,7 +964,10 @@ class ProtectedSyntheticRunner:
         finally:
             shutil.rmtree(probe_root, ignore_errors=True)
         if exit_code != 0:
-            raise CommissioningArtifactError("synthetic_execution_sandbox_unavailable")
+            reason = _sandbox_failure_reason(stderr)
+            raise CommissioningArtifactError(
+                f"synthetic_execution_sandbox_unavailable:{reason}:exit_{exit_code}"
+            )
 
     @staticmethod
     def _git(*arguments: str, cwd: Path | None = None) -> str:
