@@ -116,9 +116,15 @@ def test_linux_sandbox_fails_closed_when_bubblewrap_is_unavailable(tmp_path: Pat
 @pytest.mark.parametrize(
     ("stderr", "expected"),
     (
-        (b"bwrap: Operation not permitted", "operation_not_permitted"),
-        (b"bwrap: Permission denied", "permission_denied"),
-        (b"bwrap: No such file or directory", "missing_path"),
+        (
+            b"bwrap: Operation not permitted",
+            "operation_not_permitted:bwrap: Operation not permitted",
+        ),
+        (b"bwrap: Permission denied", "permission_denied:bwrap: Permission denied"),
+        (
+            b"bwrap: No such file or directory",
+            "missing_path:bwrap: No such file or directory",
+        ),
         (b"unclassified diagnostic", "unknown:unclassified diagnostic"),
     ),
 )

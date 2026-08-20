@@ -194,6 +194,8 @@ def _launch_failure(code: bytes) -> tuple[int, bytes, bytes]:
 
 def _sandbox_failure_reason(stderr: bytes) -> str:
     lowered = stderr.lower()
+    diagnostic = stderr.decode("ascii", errors="backslashreplace")[:240]
+    diagnostic = re.sub(r"[^A-Za-z0-9 ._:/=+-]", "?", diagnostic).strip()
     reasons = (
         (b"operation not permitted", "operation_not_permitted"),
         (b"permission denied", "permission_denied"),
@@ -204,9 +206,7 @@ def _sandbox_failure_reason(stderr: bytes) -> str:
     )
     for marker, reason in reasons:
         if marker in lowered:
-            return reason
-    diagnostic = stderr.decode("ascii", errors="backslashreplace")[:240]
-    diagnostic = re.sub(r"[^A-Za-z0-9 ._:/=+-]", "?", diagnostic).strip()
+            return f"{reason}:{diagnostic}"
     return f"unknown:{diagnostic or 'empty_stderr'}"
 
 
