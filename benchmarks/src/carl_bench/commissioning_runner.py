@@ -199,7 +199,9 @@ def _sandbox_failure_reason(stderr: bytes) -> str:
     for marker, reason in reasons:
         if marker in lowered:
             return reason
-    return "unknown"
+    diagnostic = stderr.decode("ascii", errors="backslashreplace")[:240]
+    diagnostic = re.sub(r"[^A-Za-z0-9 ._:/=+-]", "?", diagnostic).strip()
+    return f"unknown:{diagnostic or 'empty_stderr'}"
 
 
 def _toolchain_paths(command: tuple[str, ...]) -> tuple[Path, ...]:

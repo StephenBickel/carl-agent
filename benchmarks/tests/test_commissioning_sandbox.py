@@ -119,7 +119,7 @@ def test_linux_sandbox_fails_closed_when_bubblewrap_is_unavailable(tmp_path: Pat
         (b"bwrap: Operation not permitted", "operation_not_permitted"),
         (b"bwrap: Permission denied", "permission_denied"),
         (b"bwrap: No such file or directory", "missing_path"),
-        (b"unclassified diagnostic", "unknown"),
+        (b"unclassified diagnostic", "unknown:unclassified diagnostic"),
     ),
 )
 def test_sandbox_failure_reason_is_bounded(stderr: bytes, expected: str) -> None:
