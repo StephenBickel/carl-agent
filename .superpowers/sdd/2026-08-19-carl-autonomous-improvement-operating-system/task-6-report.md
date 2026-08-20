@@ -2,47 +2,54 @@
 
 ## Status
 
-Implementation complete; remote commissioning remains intentionally fail-closed until one real
-GitHub-hosted dry run is recorded. The controller cannot accept a successful run without both an
-actionlint commissioning fact and a prior GitHub-hosted dry-run ID.
+Round 3 implementation is complete locally. Remote acceptance remains explicitly uncommissioned:
+no GitHub-hosted commissioning run, artifact, live ACP credential path, or production-grade
+capability result is claimed by this report. The protected harness continues to emit
+`live_acp_credential_missing` and is wiring evidence only.
 
-The review's two Critical and four Important findings are fixed:
+## Round 3 controls
 
-- candidate/subject execution runs as unprivileged `nobody` with an empty environment, read-only
-  source, no checkout credentials, and inaccessible GitHub file-command endpoints;
-- final evidence is created and uploaded in a fresh job that never checks out or executes candidate
-  code;
-- experiment, task-set, metric-pack, and policy content is resolved from the protected parent by
-  digest and SHA-256 verified before use;
-- the exact parent and candidate each run the same trusted tests and immutable task archive for
-  three attempts, then the protected-parent comparator emits the paired result;
-- soak accepts only an exact two-parent merge whose supplied parent is the immediate first parent;
-- retry state is bounded to at most five attempts and binds attempt keys plus prior run IDs, with a
-  deterministic next-at time and fail-closed exhaustion;
-- reconciliation accepts exactly one request-named artifact and binds its artifact ID, name, run
-  ID, API digest, downloaded digest, and expiration to the exact workflow run.
-
-## Commit
-
-`fix(factory): secure cloud evidence execution`
-
-## Tests
-
-- TDD RED: the first pass failed at import because `CloudArtifact` did not exist; workflow trust
-  tests then failed against the original single-job workflows; retry-key, file-command endpoint,
-  and real paired-scorecard tests each failed before their implementation was added.
-- `benchmarks/.venv/bin/pytest -q benchmarks/tests/test_cloud_execution.py` — 40 passed.
-- `benchmarks/.venv/bin/pytest -q benchmarks/tests` — 427 passed before the instruction to stop at
-  focused verification; no additional full-suite run was performed afterward.
-- `cargo test --locked --test workflow_contract` — 41 passed.
-- `go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7` for both workflows — passed.
-- `benchmarks/.venv/bin/ruff check benchmarks` — passed.
-- `git diff --check` — passed.
+- The parent and candidate are built under distinct nonprivileged Unix identities with separate
+  homes, temporary directories, Cargo homes, and target roots.
+- The parent executable is checked as a regular executable, SHA-256 bound immediately after the
+  parent build, and recursively stripped of write permissions before the candidate build begins.
+  The workflow proves the candidate identity cannot write the parent root or executable.
+- Parent and candidate digests are rechecked before and after protected harness execution, exported
+  through protected workflow outputs, and independently matched to the harness result in the fresh
+  evidence job.
+- Every bounded probe attempt now retains its exit code, stdout, stderr, timeout, overflow, and pass
+  disposition, so a failing earlier attempt cannot disappear behind a later success.
+- Enabled affected, guard, and held-out policy gates reject empty groups with a stable fail-closed
+  error instead of reaching a zero-weight score.
+- Cloud retries have a hard budget of exactly three attempts. Remote-unavailable observations must
+  carry the current deterministic attempt key.
+- `CloudRetryStateStore` persists request digest, revision, attempt, attempt key, prior run IDs, and
+  retry-not-before using a locked atomic replace. Compare-and-swap rejects stale divergent writers
+  while replaying the same completed transition idempotently.
 
 ## Commissioning gate
 
-No GitHub-hosted dry run was claimed from the local worktree. The workflows must first exist on the
-remote protected branch with protected immutable inputs at
-`benchmarks/immutable-inputs/<kind>/<sha256>`. Until a real workflow run is recorded as the
-commissioning run, `reconcile_cloud_run` returns `cloud_github_dry_run_not_commissioned` rather than
-accepting evidence. This is a deliberate remote acceptance gate, not a silent local fallback.
+The local model still must not be treated as proof of remote commissioning. A later commissioning
+step must bind an observed GitHub run to the exact repository, protected workflow revision,
+immutable request, successful conclusion, and retained artifact before remote evidence can be used
+for promotion. No such binding is fabricated here.
+
+## Verification
+
+- TDD RED: retry-state imports were absent; the old model accepted attempt four and remote
+  unavailability without an attempt key; retry state had no durable store; flaky first-attempt
+  failures were absent from evidence; enabled empty guard/held-out groups raised
+  `ZeroDivisionError`; and the workflow used one shared identity. Each failed before its scoped
+  implementation.
+- Focused command: `benchmarks/.venv/bin/pytest -q benchmarks/tests/test_cloud_execution.py
+  benchmarks/tests/test_cloud_harness.py`.
+- Lint command: `benchmarks/.venv/bin/ruff check benchmarks/src/carl_bench/cloud_execution.py
+  benchmarks/src/carl_bench/cloud_harness.py benchmarks/tests/test_cloud_execution.py
+  benchmarks/tests/test_cloud_harness.py`.
+- Workflow command: `go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7
+  .github/workflows/autonomous-improvement.yml .github/workflows/autonomous-soak.yml`.
+- No full test suite was run, per task instruction.
+
+## Commit
+
+`fix(factory): harden cloud isolation and durable retries`

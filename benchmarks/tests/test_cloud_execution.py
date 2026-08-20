@@ -11,8 +11,11 @@ import pytest
 from carl_bench.cloud_execution import (
     CloudArtifact,
     CloudExecutionError,
+    CloudRetryState,
+    CloudRetryStateStore,
     CloudRunRequest,
     CloudRunSnapshot,
+    advance_retry_state,
     reconcile_cloud_run,
 )
 
@@ -323,14 +326,44 @@ def test_remote_unavailability_rejects_every_heavy_local_fallback(command: str) 
 
 
 def test_remote_unavailability_without_fallback_schedules_bounded_retry() -> None:
+    cloud_request = request()
     decision = reconcile_cloud_run(
-        request(), CloudRunSnapshot(remote_available=False, observed_at=NOW)
+        cloud_request,
+        CloudRunSnapshot(
+            remote_available=False,
+            observed_at=NOW,
+            attempt_key=cloud_request.attempt_key(1),
+        ),
     )
 
     assert decision.action == "schedule_retry"
     assert decision.reason == "cloud_execution_unavailable"
     assert decision.next_attempt == 2
     assert decision.next_attempt_key == request().attempt_key(2)
+
+
+def test_remote_unavailability_without_current_attempt_key_fails_closed() -> None:
+    decision = reconcile_cloud_run(
+        request(), CloudRunSnapshot(remote_available=False, observed_at=NOW)
+    )
+
+    assert decision.action == "blocked"
+    assert decision.reason == "cloud_attempt_key_missing"
+
+
+def test_retry_budget_is_exactly_three_attempts() -> None:
+    cloud_request = request()
+
+    with pytest.raises(CloudExecutionError, match="invalid_cloud_attempt"):
+        cloud_request.attempt_key(4)
+    with pytest.raises(CloudExecutionError, match="invalid_cloud_retry_state"):
+        CloudRunSnapshot(
+            remote_available=False,
+            observed_at=NOW,
+            attempt=1,
+            max_attempts=4,
+            attempt_key=cloud_request.attempt_key(1),
+        )
 
 
 def test_retry_budget_is_bounded_and_replay_is_idempotent() -> None:
@@ -359,6 +392,71 @@ def test_retry_budget_is_bounded_and_replay_is_idempotent() -> None:
     assert first.retry_not_before == "2026-08-19T12:05:00Z"
     assert exhausted.action == "blocked"
     assert exhausted.reason == "cloud_retry_budget_exhausted"
+
+
+def test_retry_transition_is_durable_atomic_and_idempotent(tmp_path: Path) -> None:
+    cloud_request = request()
+    initial = CloudRetryState.initial(cloud_request)
+    store = CloudRetryStateStore(tmp_path / "retry-state.json")
+    assert store.initialize(initial) == initial
+    failed_attempt = snapshot(
+        cloud_request,
+        conclusion="timed_out",
+        artifacts=(),
+        artifacts_expires_at=None,
+    )
+    decision = reconcile_cloud_run(cloud_request, failed_attempt)
+    replacement = advance_retry_state(
+        initial,
+        request=cloud_request,
+        decision=decision,
+        prior_run_id=42,
+    )
+
+    persisted = store.compare_and_swap(expected=initial, replacement=replacement)
+    replayed = store.compare_and_swap(expected=initial, replacement=replacement)
+
+    assert persisted == replayed == replacement
+    assert store.load() == replacement
+    assert replacement.attempt == 2
+    assert replacement.attempt_key == cloud_request.attempt_key(2)
+    assert replacement.prior_run_ids == (42,)
+    assert replacement.retry_not_before == "2026-08-19T12:05:00Z"
+    assert json.loads((tmp_path / "retry-state.json").read_text(encoding="utf-8")) == {
+        "attempt": 2,
+        "attempt_key": cloud_request.attempt_key(2),
+        "prior_run_ids": [42],
+        "request_digest": cloud_request.request_digest,
+        "retry_not_before": "2026-08-19T12:05:00Z",
+        "revision": 1,
+        "schema_version": 1,
+    }
+
+
+def test_retry_state_cas_rejects_a_different_stale_transition(tmp_path: Path) -> None:
+    cloud_request = request()
+    initial = CloudRetryState.initial(cloud_request)
+    store = CloudRetryStateStore(tmp_path / "retry-state.json")
+    store.initialize(initial)
+    first = advance_retry_state(
+        initial,
+        request=cloud_request,
+        decision=reconcile_cloud_run(
+            cloud_request,
+            snapshot(
+                cloud_request,
+                conclusion="timed_out",
+                artifacts=(),
+                artifacts_expires_at=None,
+            ),
+        ),
+        prior_run_id=42,
+    )
+    store.compare_and_swap(expected=initial, replacement=first)
+    different = replace(first, prior_run_ids=(41,))
+
+    with pytest.raises(CloudExecutionError, match="cloud_retry_state_conflict"):
+        store.compare_and_swap(expected=initial, replacement=different)
 
 
 def test_retry_attempt_rejects_reused_run_and_wrong_attempt_key() -> None:
@@ -470,14 +568,17 @@ def test_candidate_execution_isolated_from_trusted_evidence_and_inputs(name: str
     evaluate_commands = "\n".join(step["run"] for step in evaluate["steps"] if "run" in step)
     evidence_serialized = json.dumps(evidence, sort_keys=True)
 
-    assert "sudo -u nobody env -i" in evaluate_commands
     assert "GITHUB_ENV=" not in evaluate_commands
     assert "PYTHONDONTWRITEBYTECODE=1" in evaluate_commands
     if name == "autonomous-improvement.yml":
+        assert "sudo -u carlparent env -i" in evaluate_commands
+        assert "sudo -u carlcandidate env -i" in evaluate_commands
+        assert "sudo -u carlrunner env -i" in evaluate_commands
         assert "python -m carl_bench.cloud_harness" in evaluate_commands
         assert "carl-bench" not in evaluate_commands
         assert "--adapter scripted" not in evaluate_commands
     else:
+        assert "sudo -u nobody env -i" in evaluate_commands
         assert "PYTEST_DISABLE_PLUGIN_AUTOLOAD=1" in evaluate_commands
         assert "-p no:cacheprovider" in evaluate_commands
     assert "sha256sum --check" in evaluate_commands
@@ -513,11 +614,32 @@ def test_improvement_workflow_runs_real_exact_parent_candidate_pair() -> None:
     assert "carl-bench" not in commands
     assert "--adapter scripted" not in commands
     assert "paired-result" in commands
+    assert "useradd --system --no-create-home --shell /usr/sbin/nologin carlparent" in commands
+    assert "useradd --system --no-create-home --shell /usr/sbin/nologin carlcandidate" in commands
+    assert "useradd --system --no-create-home --shell /usr/sbin/nologin carlrunner" in commands
+    assert "sudo -u carlparent env -i" in commands
+    assert "sudo -u carlcandidate env -i" in commands
+    assert "sudo -u carlrunner env -i" in commands
+    assert "sudo install -d -m 0700 -o carlrunner -g carlrunner" in commands
+    assert commands.index("sudo -u carlparent env -i") < commands.index(
+        'sha256sum "$parent_binary"'
+    )
+    assert commands.index('sha256sum "$parent_binary"') < commands.index(
+        'chmod -R a-w "$parent_root"'
+    )
+    assert commands.index('chmod -R a-w "$parent_root"') < commands.index(
+        "sudo -u carlcandidate env -i"
+    )
+    assert commands.count('sha256sum --check "$bound/parent.sha256"') >= 2
+    assert "parent_binary_digest=" in commands
+    assert "candidate_binary_digest=" in commands
     evidence = json.dumps(jobs["evidence"], sort_keys=True)
     evidence_commands = "\n".join(
         step["run"] for step in jobs["evidence"]["steps"] if "run" in step
     )
     assert '"paired_result": result' in evidence_commands
+    assert 'result.get("parent", {}).get("binary_digest")' in evidence_commands
+    assert 'result.get("candidate", {}).get("binary_digest")' in evidence_commands
     assert "live_acp_credential_missing" in evidence
     assert jobs["evidence"]["needs"] == ["commission", "evaluate"]
 

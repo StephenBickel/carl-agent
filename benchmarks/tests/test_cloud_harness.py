@@ -41,6 +41,27 @@ def _subject(path: Path, *, version_ok: bool, flood: bool = False) -> Path:
     return path
 
 
+def _flaky_subject(path: Path) -> Path:
+    path.write_text(
+        "#!/bin/sh\n"
+        "set -eu\n"
+        'case "${1-}" in\n'
+        "  --version)\n"
+        '    count_file="$0.version-count"\n'
+        '    count=0; test ! -f "$count_file" || count="$(cat "$count_file")"\n'
+        '    count=$((count + 1)); printf "%s" "$count" > "$count_file"\n'
+        '    if test "$count" -eq 1; then printf "transient failure\\n" >&2; exit 2; fi\n'
+        "    printf 'carl 0.1.0\\n'; exit 0 ;;\n"
+        "  --help) printf 'Usage: carl [COMMAND]\\n'; exit 0 ;;\n"
+        "  memory) test \"${2-}\" = --help; printf 'Usage: carl memory\\n'; exit 0 ;;\n"
+        "  *) exit 64 ;;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
+    path.chmod(0o755)
+    return path
+
+
 def _objects(root: Path, *, minimum_gain: int = 1) -> dict[str, Path]:
     root.mkdir(parents=True, exist_ok=True)
     return {
@@ -224,6 +245,89 @@ def test_probe_output_and_final_payload_are_bounded(tmp_path: Path) -> None:
     assert "probe_output_overflow" in result.contract_reasons
     assert result.eligible is False
     assert len(encoded) <= 262144
+
+
+def test_each_bounded_attempt_observation_is_retained(tmp_path: Path) -> None:
+    objects = _objects(tmp_path)
+    result = evaluate_carl_pair(
+        parent_binary=_subject(tmp_path / "parent-carl", version_ok=False),
+        candidate_binary=_flaky_subject(tmp_path / "candidate-carl"),
+        parent_commit=PARENT,
+        candidate_commit=CANDIDATE,
+        experiment_path=objects["experiment"],
+        task_set_path=objects["task_set"],
+        metric_pack_path=objects["metric_pack"],
+        policy_path=objects["policy"],
+        mode="improvement",
+    )
+    version = next(
+        item
+        for item in result.to_canonical_dict()["candidate"]["observations"]
+        if item["probe_id"] == "version"
+    )
+
+    assert version["passed"] is False
+    assert version["attempt_observations"] == [
+        {
+            "attempt": 1,
+            "exit_code": 2,
+            "output_overflow": False,
+            "passed": False,
+            "stderr": "transient failure\n",
+            "stdout": "",
+            "timed_out": False,
+        },
+        {
+            "attempt": 2,
+            "exit_code": 0,
+            "output_overflow": False,
+            "passed": True,
+            "stderr": "",
+            "stdout": "carl 0.1.0\n",
+            "timed_out": False,
+        },
+        {
+            "attempt": 3,
+            "exit_code": 0,
+            "output_overflow": False,
+            "passed": True,
+            "stderr": "",
+            "stdout": "carl 0.1.0\n",
+            "timed_out": False,
+        },
+    ]
+
+
+@pytest.mark.parametrize(
+    ("group", "gate"),
+    (
+        ("guard_probe_ids", "require_guard_non_regression"),
+        ("held_out_probe_ids", "require_held_out_non_regression"),
+    ),
+)
+def test_enabled_policy_gate_rejects_an_empty_probe_group(
+    tmp_path: Path, group: str, gate: str
+) -> None:
+    objects = _objects(tmp_path)
+    experiment = json.loads(objects["experiment"].read_text(encoding="utf-8"))
+    policy = json.loads(objects["policy"].read_text(encoding="utf-8"))
+    experiment[group] = []
+    policy[gate] = True
+    _write_json(objects["experiment"], experiment)
+    _write_json(objects["policy"], policy)
+
+    with pytest.raises(CloudHarnessError, match="experiment_required_probe_group_empty"):
+        evaluate_carl_pair(
+            parent_binary=_subject(tmp_path / "parent-carl", version_ok=False),
+            candidate_binary=_subject(tmp_path / "candidate-carl", version_ok=True),
+            parent_commit=PARENT,
+            candidate_commit=CANDIDATE,
+            experiment_path=objects["experiment"],
+            task_set_path=objects["task_set"],
+            metric_pack_path=objects["metric_pack"],
+            policy_path=objects["policy"],
+            mode="improvement",
+        )
 
 
 def test_harness_rejects_non_regular_or_mutated_input_contracts(tmp_path: Path) -> None:

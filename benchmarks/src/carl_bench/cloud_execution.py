@@ -2,10 +2,17 @@
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
+import json
+import os
 import re
+import stat
+import tempfile
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any, Literal
 
 from carl_bench.canonical import canonical_json_bytes
@@ -194,7 +201,7 @@ class CloudRunRequest:
         return f"{prefix}-{self.request_digest}"
 
     def attempt_key(self, attempt: int) -> str:
-        if isinstance(attempt, bool) or not isinstance(attempt, int) or not 1 <= attempt <= 5:
+        if isinstance(attempt, bool) or not isinstance(attempt, int) or not 1 <= attempt <= 3:
             raise CloudExecutionError("invalid_cloud_attempt")
         return f"{self.dispatch_key}-attempt-{attempt}"
 
@@ -276,15 +283,15 @@ class CloudRunSnapshot:
         if (
             isinstance(self.attempt, bool)
             or not isinstance(self.attempt, int)
-            or not 1 <= self.attempt <= 5
+            or not 1 <= self.attempt <= 3
             or isinstance(self.max_attempts, bool)
             or not isinstance(self.max_attempts, int)
-            or not self.attempt <= self.max_attempts <= 5
+            or self.max_attempts != 3
         ):
             raise CloudExecutionError("invalid_cloud_retry_state")
         if self.attempt_key is not None and (
             not isinstance(self.attempt_key, str)
-            or not re.fullmatch(r"cloud-run-[0-9a-f]{64}-attempt-[1-5]", self.attempt_key)
+            or not re.fullmatch(r"cloud-run-[0-9a-f]{64}-attempt-[1-3]", self.attempt_key)
         ):
             raise CloudExecutionError("invalid_cloud_attempt_key")
         if (
@@ -336,6 +343,244 @@ class CloudRunDecision:
     next_attempt: int | None = None
     next_attempt_key: str | None = None
     retry_not_before: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CloudRetryState:
+    """Minimal restart-safe state for one bounded cloud retry sequence."""
+
+    schema_version: int
+    request_digest: str
+    revision: int
+    attempt: int
+    attempt_key: str
+    prior_run_ids: tuple[int, ...]
+    retry_not_before: str | None
+
+    def __post_init__(self) -> None:
+        if self.schema_version != 1:
+            raise CloudExecutionError("cloud_retry_state_schema_invalid")
+        _digest("cloud_retry_request_digest", self.request_digest)
+        if (
+            isinstance(self.revision, bool)
+            or not isinstance(self.revision, int)
+            or self.revision < 0
+        ):
+            raise CloudExecutionError("invalid_cloud_retry_revision")
+        if (
+            isinstance(self.attempt, bool)
+            or not isinstance(self.attempt, int)
+            or not 1 <= self.attempt <= 3
+        ):
+            raise CloudExecutionError("invalid_cloud_retry_state")
+        expected_key = f"cloud-run-{self.request_digest}-attempt-{self.attempt}"
+        if self.attempt_key != expected_key:
+            raise CloudExecutionError("invalid_cloud_attempt_key")
+        if (
+            not isinstance(self.prior_run_ids, tuple)
+            or tuple(sorted(set(self.prior_run_ids))) != self.prior_run_ids
+            or any(
+                isinstance(value, bool) or not isinstance(value, int) or value <= 0
+                for value in self.prior_run_ids
+            )
+            or len(self.prior_run_ids) > self.attempt - 1
+        ):
+            raise CloudExecutionError("invalid_cloud_prior_runs")
+        if self.retry_not_before is not None:
+            _utc("cloud_retry_not_before", self.retry_not_before)
+        if self.attempt == 1 and self.retry_not_before is not None:
+            raise CloudExecutionError("invalid_cloud_retry_state")
+
+    @classmethod
+    def initial(cls, request: CloudRunRequest) -> CloudRetryState:
+        if not isinstance(request, CloudRunRequest):
+            raise CloudExecutionError("invalid_cloud_retry_state")
+        return cls(
+            schema_version=1,
+            request_digest=request.request_digest,
+            revision=0,
+            attempt=1,
+            attempt_key=request.attempt_key(1),
+            prior_run_ids=(),
+            retry_not_before=None,
+        )
+
+    def to_canonical_dict(self) -> dict[str, Any]:
+        return {
+            "attempt": self.attempt,
+            "attempt_key": self.attempt_key,
+            "prior_run_ids": list(self.prior_run_ids),
+            "request_digest": self.request_digest,
+            "retry_not_before": self.retry_not_before,
+            "revision": self.revision,
+            "schema_version": self.schema_version,
+        }
+
+    @classmethod
+    def from_canonical_dict(cls, value: object) -> CloudRetryState:
+        if not isinstance(value, dict) or set(value) != {
+            "attempt",
+            "attempt_key",
+            "prior_run_ids",
+            "request_digest",
+            "retry_not_before",
+            "revision",
+            "schema_version",
+        }:
+            raise CloudExecutionError("cloud_retry_state_invalid")
+        prior_run_ids = value["prior_run_ids"]
+        if not isinstance(prior_run_ids, list):
+            raise CloudExecutionError("cloud_retry_state_invalid")
+        try:
+            return cls(
+                schema_version=value["schema_version"],
+                request_digest=value["request_digest"],
+                revision=value["revision"],
+                attempt=value["attempt"],
+                attempt_key=value["attempt_key"],
+                prior_run_ids=tuple(prior_run_ids),
+                retry_not_before=value["retry_not_before"],
+            )
+        except TypeError as error:
+            raise CloudExecutionError("cloud_retry_state_invalid") from error
+
+
+def advance_retry_state(
+    state: CloudRetryState,
+    *,
+    request: CloudRunRequest,
+    decision: CloudRunDecision,
+    prior_run_id: int | None = None,
+) -> CloudRetryState:
+    """Derive the sole valid successor for a schedule-retry decision."""
+    if (
+        not isinstance(state, CloudRetryState)
+        or not isinstance(request, CloudRunRequest)
+        or not isinstance(decision, CloudRunDecision)
+        or state.request_digest != request.request_digest
+        or decision.request_digest != request.request_digest
+        or decision.action != "schedule_retry"
+        or decision.next_attempt != state.attempt + 1
+        or decision.next_attempt_key != request.attempt_key(state.attempt + 1)
+        or decision.retry_not_before is None
+    ):
+        raise CloudExecutionError("cloud_retry_transition_invalid")
+    _utc("cloud_retry_not_before", decision.retry_not_before)
+    prior_runs = state.prior_run_ids
+    if prior_run_id is not None:
+        if isinstance(prior_run_id, bool) or not isinstance(prior_run_id, int) or prior_run_id <= 0:
+            raise CloudExecutionError("invalid_cloud_run_id")
+        if prior_run_id in prior_runs:
+            raise CloudExecutionError("cloud_run_id_reused")
+        prior_runs = tuple(sorted((*prior_runs, prior_run_id)))
+    return CloudRetryState(
+        schema_version=1,
+        request_digest=state.request_digest,
+        revision=state.revision + 1,
+        attempt=decision.next_attempt,
+        attempt_key=decision.next_attempt_key,
+        prior_run_ids=prior_runs,
+        retry_not_before=decision.retry_not_before,
+    )
+
+
+class CloudRetryStateStore:
+    """Atomic JSON store with compare-and-swap and idempotent replay."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = Path(path)
+        self.lock_path = self.path.with_name(f"{self.path.name}.lock")
+
+    @contextmanager
+    def _locked(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor = os.open(self.lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            yield
+        finally:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
+
+    def _load_unlocked(self) -> CloudRetryState | None:
+        try:
+            metadata = self.path.lstat()
+        except FileNotFoundError:
+            return None
+        except OSError as error:
+            raise CloudExecutionError("cloud_retry_state_unreadable") from error
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+            or metadata.st_size > 65_536
+        ):
+            raise CloudExecutionError("cloud_retry_state_invalid")
+        try:
+            value = json.loads(self.path.read_bytes())
+        except (OSError, json.JSONDecodeError, UnicodeError) as error:
+            raise CloudExecutionError("cloud_retry_state_invalid") from error
+        return CloudRetryState.from_canonical_dict(value)
+
+    def _write_unlocked(self, state: CloudRetryState) -> None:
+        payload = canonical_json_bytes(state.to_canonical_dict()) + b"\n"
+        temporary_path: str | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="wb", dir=self.path.parent, prefix=f".{self.path.name}.", delete=False
+            ) as target:
+                temporary_path = target.name
+                os.chmod(target.name, 0o600)
+                target.write(payload)
+                target.flush()
+                os.fsync(target.fileno())
+            os.replace(temporary_path, self.path)
+            temporary_path = None
+            directory = os.open(self.path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        except OSError as error:
+            raise CloudExecutionError("cloud_retry_state_write_failed") from error
+        finally:
+            if temporary_path is not None:
+                with suppress(FileNotFoundError):
+                    os.unlink(temporary_path)
+
+    def load(self) -> CloudRetryState | None:
+        with self._locked():
+            return self._load_unlocked()
+
+    def initialize(self, state: CloudRetryState) -> CloudRetryState:
+        if not isinstance(state, CloudRetryState) or state.revision != 0:
+            raise CloudExecutionError("cloud_retry_state_invalid")
+        with self._locked():
+            current = self._load_unlocked()
+            if current is None:
+                self._write_unlocked(state)
+                return state
+            if current == state:
+                return current
+            raise CloudExecutionError("cloud_retry_state_conflict")
+
+    def compare_and_swap(
+        self, *, expected: CloudRetryState, replacement: CloudRetryState
+    ) -> CloudRetryState:
+        if (
+            not isinstance(expected, CloudRetryState)
+            or not isinstance(replacement, CloudRetryState)
+            or replacement.request_digest != expected.request_digest
+            or replacement.revision != expected.revision + 1
+        ):
+            raise CloudExecutionError("cloud_retry_transition_invalid")
+        with self._locked():
+            current = self._load_unlocked()
+            if current == replacement:
+                return replacement
+            if current != expected:
+                raise CloudExecutionError("cloud_retry_state_conflict")
+            self._write_unlocked(replacement)
+            return replacement
 
 
 def _decision(
@@ -420,13 +665,14 @@ def reconcile_cloud_run(
         and _HEAVY_LOCAL_RE.search(snapshot.local_fallback_command)
     ):
         return _decision("blocked", "local_heavy_fallback_forbidden", request, snapshot)
-    if not snapshot.remote_available:
-        return _retry_decision("cloud_execution_unavailable", request, snapshot)
-
     if snapshot.attempt_key is not None and snapshot.attempt_key != request.attempt_key(
         snapshot.attempt
     ):
         return _decision("blocked", "cloud_attempt_key_mismatch", request, snapshot)
+    if snapshot.attempt_key is None and not snapshot.remote_available:
+        return _decision("blocked", "cloud_attempt_key_missing", request, snapshot)
+    if not snapshot.remote_available:
+        return _retry_decision("cloud_execution_unavailable", request, snapshot)
 
     failure, bindings_complete = _binding_failure(request, snapshot)
     if failure is not None:

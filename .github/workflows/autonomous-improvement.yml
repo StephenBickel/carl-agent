@@ -134,6 +134,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     outputs:
+      candidate_binary_digest: ${{ steps.build.outputs.candidate_binary_digest }}
+      parent_binary_digest: ${{ steps.build.outputs.parent_binary_digest }}
       paired_result_digest: ${{ steps.pair.outputs.paired_result_digest }}
       paired_result_payload_b64: ${{ steps.pair.outputs.paired_result_payload_b64 }}
     steps:
@@ -190,24 +192,54 @@ jobs:
           resolve task-set "$TASK_SET_DIGEST"
           resolve metric-pack "$METRIC_PACK_DIGEST"
           resolve policy "$POLICY_DIGEST"
-      - name: Build exact subjects without workflow commands or credentials
+      - name: Build and bind exact subjects under distinct identities
+        id: build
         env:
           CANDIDATE_COMMIT: ${{ inputs.candidate_commit }}
           PARENT_COMMIT: ${{ inputs.parent_commit }}
         run: |
           set -euo pipefail
           chmod 700 "$(dirname "$GITHUB_ENV")"
-          for role in parent candidate; do
-            subject="subject-$role"
-            sandbox="$RUNNER_TEMP/build-$role"
-            mkdir -p "$sandbox/home" "$sandbox/tmp" "$sandbox/cargo" "$sandbox/target"
-            chown -R nobody:nogroup "$sandbox"
-            sudo -u nobody env -i HOME="$sandbox/home" PATH="$PATH" TMPDIR="$sandbox/tmp" \
-              CARGO_HOME="$sandbox/cargo" CARGO_TARGET_DIR="$sandbox/target" \
-              RUSTUP_HOME="$RUSTUP_HOME" \
-              cargo +1.97.0 build --locked --release --manifest-path "$subject/Cargo.toml"
-            test -x "$sandbox/target/release/carl"
-          done
+          sudo useradd --system --no-create-home --shell /usr/sbin/nologin carlparent
+          sudo useradd --system --no-create-home --shell /usr/sbin/nologin carlcandidate
+          sudo useradd --system --no-create-home --shell /usr/sbin/nologin carlrunner
+          parent_root="$RUNNER_TEMP/build-parent"
+          candidate_root="$RUNNER_TEMP/build-candidate"
+          bound="$RUNNER_TEMP/bound-subjects"
+          sudo install -d -m 0700 -o carlparent -g carlparent \
+            "$parent_root" "$parent_root/home" "$parent_root/tmp" \
+            "$parent_root/cargo" "$parent_root/target"
+          sudo install -d -m 0700 -o carlcandidate -g carlcandidate \
+            "$candidate_root" "$candidate_root/home" "$candidate_root/tmp" \
+            "$candidate_root/cargo" "$candidate_root/target"
+          install -d -m 0700 "$bound"
+          sudo -u carlparent env -i HOME="$parent_root/home" PATH="$PATH" \
+            TMPDIR="$parent_root/tmp" CARGO_HOME="$parent_root/cargo" \
+            CARGO_TARGET_DIR="$parent_root/target" RUSTUP_HOME="$RUSTUP_HOME" \
+            cargo +1.97.0 build --locked --release --manifest-path subject-parent/Cargo.toml
+          parent_binary="$parent_root/target/release/carl"
+          test -x "$parent_binary"; test ! -L "$parent_binary"
+          sha256sum "$parent_binary" > "$bound/parent.sha256"
+          parent_digest="$(cut -d' ' -f1 "$bound/parent.sha256")"
+          chmod 0444 "$bound/parent.sha256"
+          chmod -R a-w "$parent_root"
+          chmod -R go+rX "$parent_root"
+          sudo -u carlcandidate test ! -w "$parent_root"
+          sudo -u carlcandidate test ! -w "$parent_binary"
+          sudo -u carlcandidate env -i HOME="$candidate_root/home" PATH="$PATH" \
+            TMPDIR="$candidate_root/tmp" CARGO_HOME="$candidate_root/cargo" \
+            CARGO_TARGET_DIR="$candidate_root/target" RUSTUP_HOME="$RUSTUP_HOME" \
+            cargo +1.97.0 build --locked --release --manifest-path subject-candidate/Cargo.toml
+          candidate_binary="$candidate_root/target/release/carl"
+          test -x "$candidate_binary"; test ! -L "$candidate_binary"
+          sha256sum "$candidate_binary" > "$bound/candidate.sha256"
+          candidate_digest="$(cut -d' ' -f1 "$bound/candidate.sha256")"
+          chmod 0444 "$bound/candidate.sha256"
+          chmod -R a-w "$candidate_root"
+          chmod -R go+rX "$candidate_root"
+          (cd / && sha256sum --check "$bound/parent.sha256")
+          printf 'parent_binary_digest=%s\n' "$parent_digest" >> "$GITHUB_OUTPUT"
+          printf 'candidate_binary_digest=%s\n' "$candidate_digest" >> "$GITHUB_OUTPUT"
       - name: Run the protected-parent harness against both exact binaries
         id: pair
         env:
@@ -218,10 +250,13 @@ jobs:
           chmod 700 "$(dirname "$GITHUB_ENV")"
           results="$RUNNER_TEMP/paired-results"
           sandbox="$RUNNER_TEMP/harness-sandbox"
-          mkdir -p "$results" "$sandbox/home" "$sandbox/tmp"
-          chown -R nobody:nogroup "$results" "$sandbox"
+          bound="$RUNNER_TEMP/bound-subjects"
+          sudo install -d -m 0700 -o carlrunner -g carlrunner \
+            "$results" "$sandbox" "$sandbox/home" "$sandbox/tmp"
+          (cd / && sha256sum --check "$bound/parent.sha256")
+          (cd / && sha256sum --check "$bound/candidate.sha256")
           uv sync --project trusted-source/benchmarks --python 3.12 --locked
-          sudo -u nobody env -i HOME="$sandbox/home" PATH="$PATH" TMPDIR="$sandbox/tmp" \
+          sudo -u carlrunner env -i HOME="$sandbox/home" PATH="$PATH" TMPDIR="$sandbox/tmp" \
             PYTHONDONTWRITEBYTECODE=1 \
             trusted-source/benchmarks/.venv/bin/python -m carl_bench.cloud_harness \
               --parent-binary "$RUNNER_TEMP/build-parent/target/release/carl" \
@@ -232,6 +267,8 @@ jobs:
               --metric-pack "$RUNNER_TEMP/immutable-inputs/metric-pack" \
               --policy "$RUNNER_TEMP/immutable-inputs/policy" \
               --mode improvement --output "$results/paired-result.json"
+          (cd / && sha256sum --check "$bound/parent.sha256")
+          (cd / && sha256sum --check "$bound/candidate.sha256")
           test -f "$results/paired-result.json"; test ! -L "$results/paired-result.json"
           test "$(wc -c < "$results/paired-result.json")" -le 262145
           printf 'paired_result_digest=%s\n' "$(sha256sum "$results/paired-result.json" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
@@ -248,8 +285,10 @@ jobs:
           CANDIDATE_COMMIT: ${{ inputs.candidate_commit }}
           EXPERIMENT_DIGEST: ${{ inputs.experiment_digest }}
           METRIC_PACK_DIGEST: ${{ inputs.metric_pack_digest }}
+          CANDIDATE_BINARY_DIGEST: ${{ needs.evaluate.outputs.candidate_binary_digest }}
           PAIRED_RESULT_DIGEST: ${{ needs.evaluate.outputs.paired_result_digest }}
           PAIRED_RESULT_PAYLOAD_B64: ${{ needs.evaluate.outputs.paired_result_payload_b64 }}
+          PARENT_BINARY_DIGEST: ${{ needs.evaluate.outputs.parent_binary_digest }}
           PARENT_COMMIT: ${{ inputs.parent_commit }}
           POLICY_DIGEST: ${{ inputs.policy_digest }}
           REPOSITORY: ${{ github.repository }}
@@ -277,6 +316,10 @@ jobs:
               raise SystemExit("paired result parent mismatch")
           if result.get("candidate", {}).get("commit") != os.environ["CANDIDATE_COMMIT"]:
               raise SystemExit("paired result candidate mismatch")
+          if result.get("parent", {}).get("binary_digest") != os.environ["PARENT_BINARY_DIGEST"]:
+              raise SystemExit("paired result parent binary mismatch")
+          if result.get("candidate", {}).get("binary_digest") != os.environ["CANDIDATE_BINARY_DIGEST"]:
+              raise SystemExit("paired result candidate binary mismatch")
           if result.get("eligible") is not False or result.get("reasons") != ["live_acp_credential_missing"]:
               raise SystemExit("live ACP fail-closed gate missing")
           evidence = {

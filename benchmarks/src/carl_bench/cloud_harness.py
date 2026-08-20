@@ -119,6 +119,28 @@ class _Probe:
 
 
 @dataclass(frozen=True, slots=True)
+class AttemptObservation:
+    attempt: int
+    exit_code: int | None
+    stdout: str
+    stderr: str
+    passed: bool
+    timed_out: bool
+    output_overflow: bool
+
+    def to_canonical_dict(self) -> dict[str, Any]:
+        return {
+            "attempt": self.attempt,
+            "exit_code": self.exit_code,
+            "output_overflow": self.output_overflow,
+            "passed": self.passed,
+            "stderr": self.stderr,
+            "stdout": self.stdout,
+            "timed_out": self.timed_out,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class ProbeObservation:
     probe_id: str
     argv: tuple[str, ...]
@@ -129,11 +151,15 @@ class ProbeObservation:
     passed: bool
     timed_out: bool
     output_overflow: bool
+    attempt_observations: tuple[AttemptObservation, ...]
 
     def to_canonical_dict(self) -> dict[str, Any]:
         return {
             "argv": list(self.argv),
             "attempts": self.attempts,
+            "attempt_observations": [
+                item.to_canonical_dict() for item in self.attempt_observations
+            ],
             "exit_code": self.exit_code,
             "output_overflow": self.output_overflow,
             "passed": self.passed,
@@ -319,6 +345,13 @@ def _parse_contracts(
         "require_held_out_non_regression",
     ):
         _require_bool(policy.get(field), code="policy_contract_invalid")
+    required_groups = (
+        (0, "require_affected_improvement"),
+        (1, "require_guard_non_regression"),
+        (2, "require_held_out_non_regression"),
+    )
+    if any(policy[gate] and not groups[index] for index, gate in required_groups):
+        raise CloudHarnessError("experiment_required_probe_group_empty")
 
     return (
         experiment,
@@ -432,7 +465,8 @@ def _observe(binary: Path, probe: _Probe, *, attempts: int, output_limit: int) -
     final_exit: int | None = None
     final_stdout = b""
     final_stderr = b""
-    for _ in range(attempts):
+    attempt_observations: list[AttemptObservation] = []
+    for attempt in range(1, attempts + 1):
         final_exit, final_stdout, final_stderr, timed_out, overflow = _bounded_process(
             binary,
             probe.argv,
@@ -450,6 +484,17 @@ def _observe(binary: Path, probe: _Probe, *, attempts: int, output_limit: int) -
         all_passed = all_passed and passed
         any_timeout = any_timeout or timed_out
         any_overflow = any_overflow or overflow
+        attempt_observations.append(
+            AttemptObservation(
+                attempt=attempt,
+                exit_code=final_exit,
+                stdout=stdout,
+                stderr=final_stderr.decode("utf-8", errors="replace"),
+                passed=passed,
+                timed_out=timed_out,
+                output_overflow=overflow,
+            )
+        )
     return ProbeObservation(
         probe_id=probe.probe_id,
         argv=probe.argv,
@@ -460,6 +505,7 @@ def _observe(binary: Path, probe: _Probe, *, attempts: int, output_limit: int) -
         passed=all_passed,
         timed_out=any_timeout,
         output_overflow=any_overflow,
+        attempt_observations=tuple(attempt_observations),
     )
 
 
