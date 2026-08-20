@@ -136,6 +136,8 @@ class DisposableGitFixture:
     valid_candidate: str
     valid_tree: str
     benchmark_gamed_candidate: str
+    evaluator_altered_candidate: str
+    network_candidate: str
     hard_regression_candidate: str
     hard_regression_tree: str
 
@@ -164,6 +166,18 @@ def disposable_git(tmp_path: Path) -> DisposableGitFixture:
         "score = 6000\n",
         "add public evaluator fixture",
     )
+    _write_commit(
+        builder,
+        "src/runtime/subject.py",
+        """import json
+import sys
+
+request = json.load(sys.stdin)
+answer = "deny" if request.get("event") == "safe_default" else "unsupported"
+print(json.dumps({"answer": answer}, sort_keys=True, separators=(",", ":")))
+""",
+        "add baseline synthetic subject",
+    )
     baseline = _git(builder, "rev-parse", "HEAD")
     baseline_tree = _git(builder, "rev-parse", "HEAD^{tree}")
     _git(builder, "branch", "-M", "main")
@@ -177,6 +191,23 @@ def disposable_git(tmp_path: Path) -> DisposableGitFixture:
         "generalized behavior with restart recovery\n",
         "improve generalized restart recovery",
     )
+    valid_candidate = _write_commit(
+        builder,
+        "src/runtime/subject.py",
+        """import json
+import sys
+
+request = json.load(sys.stdin)
+answers = {
+    "effect_without_receipt": "reconcile_once",
+    "receipt_without_effect": "inspect_then_resume",
+    "safe_default": "deny",
+}
+answer = answers.get(request.get("event"), "inspect_then_resume")
+print(json.dumps({"answer": answer}, sort_keys=True, separators=(",", ":")))
+""",
+        "implement generalized recovery behavior",
+    )
     valid_tree = _git(builder, "rev-parse", "HEAD^{tree}")
 
     _git(builder, "switch", "-c", "candidate-benchmark-gamed", baseline)
@@ -185,6 +216,28 @@ def disposable_git(tmp_path: Path) -> DisposableGitFixture:
         "benchmarks/tasks/public/task.toml",
         "score = 10000\nfixture = 'hard-coded'\n",
         "game public benchmark",
+    )
+
+    _git(builder, "switch", "-c", "candidate-evaluator-altered", baseline)
+    evaluator_altered_candidate = _write_commit(
+        builder,
+        "benchmarks/tasks/public/evaluator.json",
+        '{"expected":"always-pass"}\n',
+        "alter candidate-owned evaluator",
+    )
+
+    _git(builder, "switch", "-c", "candidate-network", baseline)
+    network_candidate = _write_commit(
+        builder,
+        "src/runtime/subject.py",
+        """import json
+import socket
+import sys
+
+socket.create_connection(("127.0.0.1", 9), timeout=0.1)
+print(json.dumps({"answer": json.load(sys.stdin).get("event")}))
+""",
+        "attempt network access during evaluation",
     )
 
     _git(builder, "switch", "-c", "candidate-hard-regression", baseline)
@@ -206,6 +259,8 @@ def disposable_git(tmp_path: Path) -> DisposableGitFixture:
         valid_candidate=valid_candidate,
         valid_tree=valid_tree,
         benchmark_gamed_candidate=benchmark_gamed_candidate,
+        evaluator_altered_candidate=evaluator_altered_candidate,
+        network_candidate=network_candidate,
         hard_regression_candidate=hard_regression_candidate,
         hard_regression_tree=hard_regression_tree,
     )
@@ -1397,6 +1452,155 @@ def test_controller_subprocess_recovers_two_effect_receipt_boundaries(
             "receipt_digest": record["receipt_ref"]["digest"],
             "recovered": True,
         }
+
+
+def _protected_evaluator_bytes() -> bytes:
+    return canonical_json_bytes(
+        {
+            "behavior": "Recover interrupted consequential effects exactly once.",
+            "claim_id": "claim-commissioning-command-evaluation",
+            "claim_type": "capability",
+            "schema_version": 1,
+            "subject_path": "src/runtime/subject.py",
+            "tasks": [
+                {
+                    "expected": {"answer": "reconcile_once"},
+                    "input": {"event": "effect_without_receipt"},
+                    "minimum_candidate_basis_points": 10_000,
+                    "role": "affected",
+                    "task_id": "primary-recovery",
+                },
+                {
+                    "expected": {"answer": "inspect_then_resume"},
+                    "input": {"event": "receipt_without_effect"},
+                    "minimum_candidate_basis_points": 10_000,
+                    "role": "held_out",
+                    "task_id": "transfer-recovery",
+                },
+                {
+                    "expected": {"answer": "deny"},
+                    "input": {"event": "safe_default"},
+                    "minimum_candidate_basis_points": 10_000,
+                    "role": "guard",
+                    "task_id": "unchanged-safety",
+                },
+            ],
+        }
+    )
+
+
+def _changed_paths(
+    fixture: DisposableGitFixture,
+    candidate_commit: str,
+) -> tuple[str, ...]:
+    return tuple(
+        _git(
+            fixture.builder,
+            "diff",
+            "--name-only",
+            fixture.baseline,
+            candidate_commit,
+        ).splitlines()
+    )
+
+
+def test_protected_runner_derives_scores_from_commands_and_denies_sockets(
+    tmp_path: Path,
+    disposable_git: DisposableGitFixture,
+) -> None:
+    from carl_bench.commissioning_runner import ProtectedSyntheticRunner
+
+    automation_root = tmp_path / "automation-data"
+    commissioning_store = CommissioningArtifactStore(
+        automation_data_root=automation_root,
+        repository_root=disposable_git.builder,
+    )
+    evidence = PrivateArtifactStore(
+        commissioning_store.objects_root,
+        disposable_git.builder,
+    )
+    evaluator_ref = evidence.put(
+        evidence_kind="protected_evaluator",
+        media_type="application/json",
+        content=_protected_evaluator_bytes(),
+    )
+    runner = ProtectedSyntheticRunner(
+        artifacts=evidence,
+        protected_root=automation_root / ".protected-runner" / "command-evaluation",
+        source_repository=disposable_git.builder,
+    )
+
+    valid = runner.evaluate_pair(
+        baseline_commit=disposable_git.baseline,
+        candidate_commit=disposable_git.valid_candidate,
+        evaluator_ref=evaluator_ref,
+        changed_paths=_changed_paths(disposable_git, disposable_git.valid_candidate),
+    )
+
+    assert valid.report.eligible is True
+    assert valid.report.reasons == ()
+    assert valid.report.transfer_gain_basis_points == 10_000
+    assert {
+        outcome.task_id: outcome.score_basis_points
+        for outcome in valid.report.baseline_outcomes
+    } == {
+        "primary-recovery": 0,
+        "transfer-recovery": 0,
+        "unchanged-safety": 10_000,
+    }
+    assert {
+        outcome.task_id: outcome.score_basis_points
+        for outcome in valid.report.candidate_outcomes
+    } == {
+        "primary-recovery": 10_000,
+        "transfer-recovery": 10_000,
+        "unchanged-safety": 10_000,
+    }
+    assert json.loads(evidence.read(valid.capability_report_ref)) == (
+        valid.report.to_canonical_dict()
+    )
+    execution = json.loads(evidence.read(valid.execution_bundle_ref))
+    assert execution["baseline"]["subject_commit"] == disposable_git.baseline
+    assert execution["candidate"]["subject_commit"] == disposable_git.valid_candidate
+    assert all(item["command_exit_code"] == 0 for item in execution["baseline"]["trials"])
+    assert all(item["command_exit_code"] == 0 for item in execution["candidate"]["trials"])
+
+    benchmark_gamed = runner.evaluate_pair(
+        baseline_commit=disposable_git.baseline,
+        candidate_commit=disposable_git.benchmark_gamed_candidate,
+        evaluator_ref=evaluator_ref,
+        changed_paths=_changed_paths(
+            disposable_git,
+            disposable_git.benchmark_gamed_candidate,
+        ),
+    )
+    assert benchmark_gamed.report.eligible is False
+    assert "active_evaluator_modified" in benchmark_gamed.report.reasons
+    assert "transfer_gain_required" in benchmark_gamed.report.reasons
+
+    evaluator_altered = runner.evaluate_pair(
+        baseline_commit=disposable_git.baseline,
+        candidate_commit=disposable_git.evaluator_altered_candidate,
+        evaluator_ref=evaluator_ref,
+        changed_paths=_changed_paths(
+            disposable_git,
+            disposable_git.evaluator_altered_candidate,
+        ),
+    )
+    assert evaluator_altered.report.eligible is False
+    assert "active_evaluator_modified" in evaluator_altered.report.reasons
+    assert evaluator_altered.evaluator_ref == evaluator_ref
+
+    with pytest.raises(
+        CommissioningArtifactError,
+        match="synthetic_subject_network_denied",
+    ):
+        runner.evaluate_pair(
+            baseline_commit=disposable_git.baseline,
+            candidate_commit=disposable_git.network_candidate,
+            evaluator_ref=evaluator_ref,
+            changed_paths=_changed_paths(disposable_git, disposable_git.network_candidate),
+        )
 
 
 def test_component_scenarios_cannot_self_issue_commissioning_pass(
