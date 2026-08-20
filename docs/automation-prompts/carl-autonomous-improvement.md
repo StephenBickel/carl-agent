@@ -345,10 +345,12 @@ Shared supervisor-trigger store:
 /Users/openclaw/.codex/automations/.shared-private/carl-autonomy-supervisor-triggers.sqlite3
 Consume the SupervisorTrigger v1 record with: trigger_id, exact evidence_digest,
 unsafe_boundary, attempt_history, next_safe_node_key, and created_at. Poll it on every scheduled
-run, atomically claim the trigger by revision, and record one materially changed recovery action in
-the same compare-and-swap operation before reporting progress. Idempotently replay an exact prior
-claim. The polling contract guarantees the next supervisor inspection occurs within six hours; hard
-production rollback remains bounded to two hours and never waits for this supervisor.
+run. Enumerate unresolved triggers oldest-first, atomically claim the trigger by revision, perform and
+record one materially changed recovery action in the same compare-and-swap operation, then atomically
+resolve it as `resolved` or `rejected` with the exact recovery action, evidence digest, result digest,
+and resolved_at. Idempotently replay an exact prior claim or terminal resolution; reject stale
+claimants. The polling contract guarantees the next supervisor inspection occurs within six hours;
+hard production rollback remains bounded to two hours and never waits for this supervisor.
 
 Identify the smallest causal prompt, orchestration, credential, environment, evaluation, or GitHub
 control failure. Make routine reversible repairs already authorized by policy: reconcile duplicate or

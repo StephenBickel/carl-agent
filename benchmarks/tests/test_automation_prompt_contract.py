@@ -207,8 +207,11 @@ def test_recovery_roles_share_one_durable_supervisor_trigger_contract() -> None:
     assert watchdog.contains("append the trigger idempotently")
     assert monitor.contains("append the trigger idempotently")
     assert supervisor.contains(
+        "enumerate unresolved triggers oldest-first",
         "atomically claim the trigger",
         "record one materially changed recovery action",
+        "atomically resolve it as `resolved` or `rejected`",
+        "exact recovery action, evidence digest, result digest, and resolved_at",
     )
 
 

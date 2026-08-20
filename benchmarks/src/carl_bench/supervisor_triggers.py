@@ -17,6 +17,7 @@ from carl_bench.canonical import canonical_json_bytes
 _DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 _KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,191}$")
 _OUTCOME_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+_TERMINAL_STATUSES = frozenset({"rejected", "resolved"})
 
 
 class SupervisorTriggerError(ValueError):
@@ -158,10 +159,67 @@ class SupervisorTrigger:
 
 
 @dataclass(frozen=True, slots=True)
+class TriggerResolution:
+    status: str
+    recovery_action: RecoveryAttempt
+    evidence_digest: str
+    result_digest: str
+    resolved_at: str
+
+    def __post_init__(self) -> None:
+        if self.status not in _TERMINAL_STATUSES:
+            raise SupervisorTriggerError("invalid_resolution_status")
+        if not isinstance(self.recovery_action, RecoveryAttempt):
+            raise SupervisorTriggerError("invalid_resolution_action")
+        if not isinstance(self.evidence_digest, str) or not _DIGEST_RE.fullmatch(
+            self.evidence_digest
+        ):
+            raise SupervisorTriggerError("invalid_resolution_evidence_digest")
+        if not isinstance(self.result_digest, str) or not _DIGEST_RE.fullmatch(
+            self.result_digest
+        ):
+            raise SupervisorTriggerError("invalid_resolution_result_digest")
+        _validate_timestamp(self.resolved_at)
+
+    def to_canonical_dict(self) -> dict[str, Any]:
+        return {
+            "evidence_digest": self.evidence_digest,
+            "recovery_action": self.recovery_action.to_canonical_dict(),
+            "resolved_at": self.resolved_at,
+            "result_digest": self.result_digest,
+            "status": self.status,
+        }
+
+    @classmethod
+    def from_canonical_dict(cls, value: Any) -> TriggerResolution:
+        if not isinstance(value, dict) or set(value) != {
+            "evidence_digest",
+            "recovery_action",
+            "resolved_at",
+            "result_digest",
+            "status",
+        }:
+            raise SupervisorTriggerError("invalid_resolution_record")
+        try:
+            return cls(
+                status=value["status"],
+                recovery_action=RecoveryAttempt.from_canonical_dict(
+                    value["recovery_action"]
+                ),
+                evidence_digest=value["evidence_digest"],
+                result_digest=value["result_digest"],
+                resolved_at=value["resolved_at"],
+            )
+        except KeyError as error:
+            raise SupervisorTriggerError("invalid_resolution_record") from error
+
+
+@dataclass(frozen=True, slots=True)
 class StoredSupervisorTrigger:
     trigger: SupervisorTrigger
     revision: int
     claim_id: str | None
+    resolution: TriggerResolution | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -200,7 +258,7 @@ def _owner_private_file(path: Path) -> bool:
 
 
 class SupervisorTriggerStore:
-    """Append and atomically claim versioned supervisor handoffs."""
+    """Discover, claim, and terminally resolve versioned supervisor handoffs."""
 
     def __init__(self, path: Path) -> None:
         self.path = path.expanduser().absolute()
@@ -267,19 +325,36 @@ class SupervisorTriggerStore:
                         trigger_id TEXT PRIMARY KEY,
                         trigger_json TEXT NOT NULL,
                         revision INTEGER NOT NULL CHECK (revision >= 0),
-                        claim_id TEXT
+                        claim_id TEXT,
+                        resolution_json TEXT
                     ) STRICT
                     """
                 )
                 row = connection.execute(
                     "SELECT value FROM store_metadata WHERE key = 'schema_version'"
                 ).fetchone()
+                columns = {
+                    column["name"]
+                    for column in connection.execute(
+                        "PRAGMA table_info(supervisor_triggers)"
+                    ).fetchall()
+                }
                 if row is None:
                     connection.execute(
-                        "INSERT INTO store_metadata(key, value) VALUES('schema_version', '1')"
+                        "INSERT INTO store_metadata(key, value) VALUES('schema_version', '2')"
                     )
-                elif row["value"] != "1":
+                elif row["value"] == "1":
+                    if "resolution_json" not in columns:
+                        connection.execute(
+                            "ALTER TABLE supervisor_triggers ADD COLUMN resolution_json TEXT"
+                        )
+                    connection.execute(
+                        "UPDATE store_metadata SET value = '2' WHERE key = 'schema_version'"
+                    )
+                elif row["value"] != "2":
                     raise SupervisorTriggerError("unsupported_trigger_store_schema")
+                if row is None and "resolution_json" not in columns:
+                    raise SupervisorTriggerError("invalid_trigger_store_schema")
                 connection.commit()
             except SupervisorTriggerError:
                 connection.rollback()
@@ -304,11 +379,60 @@ class SupervisorTriggerStore:
             raise SupervisorTriggerError("invalid_trigger_revision")
         if claim_id is not None and not _valid_key(claim_id):
             raise SupervisorTriggerError("invalid_claim_id")
+        resolution_json = row["resolution_json"]
+        resolution = None
+        if resolution_json is not None:
+            try:
+                decoded_resolution = json.loads(resolution_json)
+            except (json.JSONDecodeError, UnicodeError) as error:
+                raise SupervisorTriggerError("invalid_resolution_record") from error
+            resolution = TriggerResolution.from_canonical_dict(decoded_resolution)
         return StoredSupervisorTrigger(
             trigger=cls._decode_trigger(row["trigger_json"]),
             revision=revision,
             claim_id=claim_id,
+            resolution=resolution,
         )
+
+    def get(self, trigger_id: str) -> StoredSupervisorTrigger:
+        if not _valid_key(trigger_id):
+            raise SupervisorTriggerError("invalid_trigger_id")
+        with self._connect() as connection:
+            try:
+                row = connection.execute(
+                    "SELECT trigger_json, revision, claim_id, resolution_json "
+                    "FROM supervisor_triggers WHERE trigger_id = ?",
+                    (trigger_id,),
+                ).fetchone()
+                if row is None:
+                    raise SupervisorTriggerError("trigger_not_found")
+                return self._record(row)
+            except SupervisorTriggerError:
+                raise
+            except sqlite3.Error as error:
+                raise SupervisorTriggerError("trigger_store_database_error") from error
+
+    def list_pending(self) -> tuple[StoredSupervisorTrigger, ...]:
+        with self._connect() as connection:
+            try:
+                rows = connection.execute(
+                    "SELECT trigger_json, revision, claim_id, resolution_json "
+                    "FROM supervisor_triggers WHERE resolution_json IS NULL"
+                ).fetchall()
+                records = tuple(self._record(row) for row in rows)
+                return tuple(
+                    sorted(
+                        records,
+                        key=lambda record: (
+                            record.trigger.created_at,
+                            record.trigger.trigger_id,
+                        ),
+                    )
+                )
+            except SupervisorTriggerError:
+                raise
+            except sqlite3.Error as error:
+                raise SupervisorTriggerError("trigger_store_database_error") from error
 
     def append(self, trigger: SupervisorTrigger) -> TriggerMutation:
         if not isinstance(trigger, SupervisorTrigger):
@@ -318,7 +442,8 @@ class SupervisorTriggerStore:
             try:
                 connection.execute("BEGIN IMMEDIATE")
                 row = connection.execute(
-                    "SELECT trigger_json, revision, claim_id FROM supervisor_triggers "
+                    "SELECT trigger_json, revision, claim_id, resolution_json "
+                    "FROM supervisor_triggers "
                     "WHERE trigger_id = ?",
                     (trigger.trigger_id,),
                 ).fetchone()
@@ -330,11 +455,17 @@ class SupervisorTriggerStore:
                     return TriggerMutation(False, record.revision, record)
                 connection.execute(
                     "INSERT INTO supervisor_triggers"
-                    "(trigger_id, trigger_json, revision, claim_id) VALUES(?, ?, 0, NULL)",
+                    "(trigger_id, trigger_json, revision, claim_id, resolution_json) "
+                    "VALUES(?, ?, 0, NULL, NULL)",
                     (trigger.trigger_id, encoded),
                 )
                 connection.commit()
-                record = StoredSupervisorTrigger(trigger=trigger, revision=0, claim_id=None)
+                record = StoredSupervisorTrigger(
+                    trigger=trigger,
+                    revision=0,
+                    claim_id=None,
+                    resolution=None,
+                )
                 return TriggerMutation(True, 0, record)
             except SupervisorTriggerError:
                 connection.rollback()
@@ -368,7 +499,8 @@ class SupervisorTriggerStore:
             try:
                 connection.execute("BEGIN IMMEDIATE")
                 row = connection.execute(
-                    "SELECT trigger_json, revision, claim_id FROM supervisor_triggers "
+                    "SELECT trigger_json, revision, claim_id, resolution_json "
+                    "FROM supervisor_triggers "
                     "WHERE trigger_id = ?",
                     (trigger_id,),
                 ).fetchone()
@@ -382,6 +514,8 @@ class SupervisorTriggerStore:
                 if record.claim_id == claim_id and existing == attempt:
                     connection.commit()
                     return TriggerMutation(False, record.revision, record)
+                if record.resolution is not None:
+                    raise SupervisorTriggerError("trigger_already_resolved")
                 if existing is not None:
                     raise SupervisorTriggerError("attempt_id_conflict")
                 if record.claim_id is not None and record.claim_id != claim_id:
@@ -422,6 +556,90 @@ class SupervisorTriggerStore:
                     trigger=updated_trigger,
                     revision=updated_revision,
                     claim_id=claim_id,
+                    resolution=None,
+                )
+                return TriggerMutation(True, updated_revision, updated_record)
+            except SupervisorTriggerError:
+                connection.rollback()
+                raise
+            except sqlite3.Error as error:
+                connection.rollback()
+                raise SupervisorTriggerError("trigger_store_database_error") from error
+
+    def resolve(
+        self,
+        *,
+        trigger_id: str,
+        claim_id: str,
+        expected_revision: int,
+        resolution: TriggerResolution,
+    ) -> TriggerMutation:
+        if not _valid_key(trigger_id):
+            raise SupervisorTriggerError("invalid_trigger_id")
+        if not _valid_key(claim_id):
+            raise SupervisorTriggerError("invalid_claim_id")
+        if (
+            isinstance(expected_revision, bool)
+            or not isinstance(expected_revision, int)
+            or expected_revision < 0
+        ):
+            raise SupervisorTriggerError("invalid_expected_revision")
+        if not isinstance(resolution, TriggerResolution):
+            raise SupervisorTriggerError("invalid_resolution_record")
+
+        with self._connect() as connection:
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                row = connection.execute(
+                    "SELECT trigger_json, revision, claim_id, resolution_json "
+                    "FROM supervisor_triggers WHERE trigger_id = ?",
+                    (trigger_id,),
+                ).fetchone()
+                if row is None:
+                    raise SupervisorTriggerError("trigger_not_found")
+                record = self._record(row)
+                if record.claim_id != claim_id:
+                    raise SupervisorTriggerError("trigger_claim_conflict")
+                if record.resolution == resolution:
+                    connection.commit()
+                    return TriggerMutation(False, record.revision, record)
+                if record.revision != expected_revision:
+                    raise SupervisorTriggerError("trigger_cas_mismatch")
+                if record.resolution is not None:
+                    raise SupervisorTriggerError("trigger_resolution_conflict")
+                if (
+                    not record.trigger.attempt_history
+                    or record.trigger.attempt_history[-1] != resolution.recovery_action
+                ):
+                    raise SupervisorTriggerError("resolution_action_mismatch")
+                if record.trigger.evidence_digest != resolution.evidence_digest:
+                    raise SupervisorTriggerError("resolution_evidence_mismatch")
+
+                updated_revision = record.revision + 1
+                resolution_json = canonical_json_bytes(
+                    resolution.to_canonical_dict()
+                ).decode("utf-8")
+                cursor = connection.execute(
+                    "UPDATE supervisor_triggers "
+                    "SET revision = ?, resolution_json = ? "
+                    "WHERE trigger_id = ? AND revision = ? AND claim_id = ? "
+                    "AND resolution_json IS NULL",
+                    (
+                        updated_revision,
+                        resolution_json,
+                        trigger_id,
+                        expected_revision,
+                        claim_id,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise SupervisorTriggerError("trigger_cas_mismatch")
+                connection.commit()
+                updated_record = StoredSupervisorTrigger(
+                    trigger=record.trigger,
+                    revision=updated_revision,
+                    claim_id=claim_id,
+                    resolution=resolution,
                 )
                 return TriggerMutation(True, updated_revision, updated_record)
             except SupervisorTriggerError:

@@ -122,7 +122,7 @@
         "rrule": "RRULE:FREQ=HOURLY;INTERVAL=6;BYMINUTE=45"
       },
       "id": "carl-autonomy-loop-supervisor",
-      "prompt_sha256": "5640c19ac4e1c76d8ec11383a0b0b85b2054f79e242d47d0564375b3ff8f2a50",
+      "prompt_sha256": "5ce057a1e42cf521ebf9eb937d2c487241efb050e9f1660d6f6bbb180d85ba2b",
       "status": "ACTIVE"
     },
     {

@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from carl_bench import supervisor_triggers
 from carl_bench.supervisor_triggers import (
     RecoveryAttempt,
     SupervisorTrigger,
@@ -30,7 +31,11 @@ def _attempt(
     )
 
 
-def _trigger(*, trigger_id: str = "trigger-1") -> SupervisorTrigger:
+def _trigger(
+    *,
+    trigger_id: str = "trigger-1",
+    created_at: str = "2026-08-19T12:00:00Z",
+) -> SupervisorTrigger:
     return SupervisorTrigger(
         schema_version=1,
         trigger_id=trigger_id,
@@ -38,7 +43,22 @@ def _trigger(*, trigger_id: str = "trigger-1") -> SupervisorTrigger:
         unsafe_boundary="promotion:evidence_acceptance",
         attempt_history=(_attempt(),),
         next_safe_node_key="experiment-17:protected-validation",
-        created_at="2026-08-19T12:00:00Z",
+        created_at=created_at,
+    )
+
+
+def _resolution(
+    action: RecoveryAttempt,
+    *,
+    status: str = "resolved",
+    result_digest: str = "e" * 64,
+) -> supervisor_triggers.TriggerResolution:
+    return supervisor_triggers.TriggerResolution(
+        status=status,
+        recovery_action=action,
+        evidence_digest="a" * 64,
+        result_digest=result_digest,
+        resolved_at="2026-08-19T12:30:00Z",
     )
 
 
@@ -155,6 +175,144 @@ def test_concurrent_claimers_cannot_both_own_the_trigger(tmp_path: Path) -> None
         )
 
     assert outcomes == ["applied", "trigger_claim_conflict"]
+
+
+def test_fresh_store_enumerates_pending_oldest_first_with_stable_ties(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "private" / "supervisor-triggers.sqlite3"
+    writer = SupervisorTriggerStore(path)
+    writer.append(_trigger(trigger_id="later", created_at="2026-08-19T12:10:00Z"))
+    writer.append(_trigger(trigger_id="same-b", created_at="2026-08-19T12:05:00Z"))
+    writer.append(_trigger(trigger_id="oldest", created_at="2026-08-19T12:00:00Z"))
+    writer.append(_trigger(trigger_id="same-a", created_at="2026-08-19T12:05:00Z"))
+
+    pending = SupervisorTriggerStore(path).list_pending()
+
+    assert [record.trigger.trigger_id for record in pending] == [
+        "oldest",
+        "same-a",
+        "same-b",
+        "later",
+    ]
+    assert [record.revision for record in pending] == [0, 0, 0, 0]
+
+
+@pytest.mark.parametrize("status", ["resolved", "rejected"])
+def test_terminal_resolution_is_atomic_durable_and_removed_from_pending(
+    tmp_path: Path,
+    status: str,
+) -> None:
+    path = tmp_path / "private" / "supervisor-triggers.sqlite3"
+    store = SupervisorTriggerStore(path)
+    store.append(_trigger())
+    action = _attempt("supervisor-attempt-1", "c" * 64, outcome="state_reconciled")
+    claimed = store.claim_and_record_action(
+        trigger_id="trigger-1",
+        claim_id="supervisor-run-44",
+        expected_revision=0,
+        attempt=action,
+    )
+    resolution = _resolution(action, status=status)
+
+    completed = store.resolve(
+        trigger_id="trigger-1",
+        claim_id="supervisor-run-44",
+        expected_revision=claimed.revision,
+        resolution=resolution,
+    )
+    reopened = SupervisorTriggerStore(path)
+
+    assert completed.applied is True
+    assert completed.revision == 2
+    assert completed.record.resolution == resolution
+    assert reopened.list_pending() == ()
+    assert reopened.get("trigger-1") == completed.record
+
+
+def test_resolution_replay_is_idempotent_and_stale_claimants_are_rejected(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    store.append(_trigger())
+    action = _attempt("supervisor-attempt-1", "c" * 64, outcome="state_reconciled")
+    claimed = store.claim_and_record_action(
+        trigger_id="trigger-1",
+        claim_id="supervisor-run-44",
+        expected_revision=0,
+        attempt=action,
+    )
+    resolution = _resolution(action)
+    first = store.resolve(
+        trigger_id="trigger-1",
+        claim_id="supervisor-run-44",
+        expected_revision=claimed.revision,
+        resolution=resolution,
+    )
+
+    replay = store.resolve(
+        trigger_id="trigger-1",
+        claim_id="supervisor-run-44",
+        expected_revision=claimed.revision,
+        resolution=resolution,
+    )
+    assert replay.applied is False
+    assert replay.record == first.record
+
+    claim_replay = store.claim_and_record_action(
+        trigger_id="trigger-1",
+        claim_id="supervisor-run-44",
+        expected_revision=0,
+        attempt=action,
+    )
+    assert claim_replay.applied is False
+    assert claim_replay.record == first.record
+
+    with pytest.raises(SupervisorTriggerError, match="trigger_claim_conflict"):
+        store.resolve(
+            trigger_id="trigger-1",
+            claim_id="supervisor-run-45",
+            expected_revision=first.revision,
+            resolution=resolution,
+        )
+    with pytest.raises(SupervisorTriggerError, match="trigger_cas_mismatch"):
+        store.resolve(
+            trigger_id="trigger-1",
+            claim_id="supervisor-run-44",
+            expected_revision=0,
+            resolution=replace(resolution, result_digest="f" * 64),
+        )
+
+
+def test_resolution_must_bind_exact_claimed_action_and_trigger_evidence(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    store.append(_trigger())
+    action = _attempt("supervisor-attempt-1", "c" * 64, outcome="state_reconciled")
+    claimed = store.claim_and_record_action(
+        trigger_id="trigger-1",
+        claim_id="supervisor-run-44",
+        expected_revision=0,
+        attempt=action,
+    )
+
+    with pytest.raises(SupervisorTriggerError, match="resolution_action_mismatch"):
+        store.resolve(
+            trigger_id="trigger-1",
+            claim_id="supervisor-run-44",
+            expected_revision=claimed.revision,
+            resolution=_resolution(
+                _attempt("other-action", "d" * 64, outcome="state_reconciled")
+            ),
+        )
+    with pytest.raises(SupervisorTriggerError, match="resolution_evidence_mismatch"):
+        store.resolve(
+            trigger_id="trigger-1",
+            claim_id="supervisor-run-44",
+            expected_revision=claimed.revision,
+            resolution=replace(_resolution(action), evidence_digest="f" * 64),
+        )
 
 
 def test_store_rejects_unsafe_path_and_malformed_trigger(tmp_path: Path) -> None:
