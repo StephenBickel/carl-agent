@@ -7,6 +7,22 @@ Carl's personality and operating principles are public in the
 [public operating contract](CARL.md). The name is Stephen's middle name and his
 grandfather's name.
 
+## Autonomous improvement: commissioning
+
+Carl is commissioning a graph-engineered autonomous improvement factory. Within that
+commissioned flow, it implements and evaluates a bounded hypothesis, pushes an
+experimental candidate, independently promotes verified gains through protected main,
+observes a 24-hour soak, and performs an exact revert for a hard regression. Independent
+validation and the remaining flow require no routine human approval. The flow uses
+capability transfer only when durable evidence establishes that the receiving role has
+the narrowly scoped authority it needs.
+
+This commissioning status does not claim that all historical commits were autonomous. It
+also does not claim that current product promotion is autonomous. The public safety
+boundaries, evidence requirements, and responsibility graph are in the
+[autonomous improvement graph](docs/autonomous-improvement.md). The approved design is
+[the autonomous improvement operating-system design](docs/superpowers/specs/2026-08-19-carl-autonomous-improvement-operating-system-design.md).
+
 ## Status: pre-alpha, usable terminal and ACP coding paths
 
 Carl now has a usable ACP coding path: `carl acp` runs a real, version-pinned Codex

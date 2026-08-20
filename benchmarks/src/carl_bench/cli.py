@@ -32,6 +32,7 @@ from carl_bench.candidate import (
 )
 from carl_bench.candidate_evidence import (
     bind_paired_evidence,
+    capability_report_from_public,
     issue_review_packet,
     record_review_attestation,
     scorecard_from_public,
@@ -48,6 +49,11 @@ from carl_bench.experiment import (
     evaluate_dry_run,
     evaluate_phase3,
     reduce_events,
+)
+from carl_bench.experimental_publication import (
+    ExperimentalPublicationRequest,
+    candidate_tree,
+    publish_experimental_branch,
 )
 from carl_bench.github_draft import DraftPrGateway
 from carl_bench.ledger import ExperimentLedger
@@ -254,6 +260,21 @@ def _parser() -> argparse.ArgumentParser:
     draft.add_argument("--gateway-env-name", action="append", default=[])
     draft.add_argument("--enable-github-draft", action="store_true")
     draft.add_argument("--public-result", required=True, type=Path)
+
+    publish = candidate_commands.add_parser(
+        "publish-experimental", help="publish one verified immutable experimental branch"
+    )
+    publish.add_argument("--ledger", required=True, type=Path)
+    publish.add_argument("--experiment-id", required=True)
+    publish.add_argument("--repository", required=True, type=Path)
+    publish.add_argument("--remote", required=True)
+    publish.add_argument("--branch", required=True)
+    publish.add_argument("--candidate-packet", required=True, type=Path)
+    publish.add_argument("--capability-report", required=True, type=Path)
+    publish.add_argument("--git-executable", required=True, type=Path)
+    publish.add_argument("--stage-attempt-id", required=True)
+    publish.add_argument("--occurred-at", required=True)
+    publish.add_argument("--public-result", required=True, type=Path)
 
     dispose = candidate_commands.add_parser(
         "dispose", help="remove the exact clean candidate worktree after draft creation"
@@ -845,6 +866,60 @@ def _candidate_command(args: argparse.Namespace) -> int:
         "dispose",
     }:
         raise ValueError("isolated_signer_required")
+
+    if args.candidate_command == "publish-experimental":
+        packet = SealedCandidate.from_canonical_dict(_read_control_object(args.candidate_packet))
+        report = capability_report_from_public(_read_control_object(args.capability_report))
+        request = ExperimentalPublicationRequest(
+            experiment_id=args.experiment_id,
+            branch=args.branch,
+            candidate_packet=packet,
+            candidate_tree=candidate_tree(
+                _anchored(args.repository), packet.candidate_commit, _anchored(args.git_executable)
+            ),
+            capability_report=report,
+        )
+        decision = publish_experimental_branch(
+            request,
+            repository=_anchored(args.repository),
+            remote=args.remote,
+            git_executable=_anchored(args.git_executable),
+        )
+        if decision.outcome.startswith("blocked_"):
+            raise ValueError("experimental publication is not eligible")
+        assert decision.candidate_commit is not None
+        assert decision.candidate_tree is not None
+        assert decision.candidate_packet_digest is not None
+        payload = {
+            "branch": args.branch,
+            "candidate_packet_digest": decision.candidate_packet_digest,
+            "commit": decision.candidate_commit,
+            "tree": decision.candidate_tree,
+        }
+        existing = _existing_candidate_event(
+            ledger, args.experiment_id, args.stage_attempt_id, EventType.EXPERIMENTAL_PUBLISHED
+        )
+        if existing is None:
+            published = ledger.autonomy_projection(args.experiment_id).experimental_publication
+            if published is None:
+                ledger.append(
+                    ExperimentEvent.create(
+                        experiment_id=args.experiment_id,
+                        stage_attempt_id=args.stage_attempt_id,
+                        event_type=EventType.EXPERIMENTAL_PUBLISHED,
+                        occurred_at=args.occurred_at,
+                        payload=payload,
+                    )
+                )
+            elif published.to_canonical_dict() != payload:
+                raise ValueError("experimental publication conflicts with the recorded branch")
+        elif _candidate_event_payload(existing) != payload:
+            raise ValueError("experimental publication conflicts with the existing event")
+        write_public_json(
+            _experiment_output(args.public_result, args.ledger), payload, REPOSITORY_ROOT
+        )
+        print(f"candidate {args.experiment_id}: published {args.branch}")
+        return 0
 
     manager = _candidate_manager(args)
     projection = ledger.projection(args.experiment_id)

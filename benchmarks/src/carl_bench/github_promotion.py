@@ -14,6 +14,13 @@ _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
 _SUCCESS = frozenset({"SUCCESS"})
 _PENDING = frozenset({"", "PENDING", "QUEUED", "IN_PROGRESS"})
 _GITHUB_ACTIONS_APP_ID = 15368
+APPROVED_REQUIRED_CHECKS = (
+    "Quality",
+    "Benchmark contracts",
+    "Test (ubuntu-latest)",
+    "Test (macos-latest)",
+    "Test (windows-latest)",
+)
 
 
 def _id(name: str, value: str) -> None:
@@ -120,9 +127,7 @@ class PromotionSnapshot:
         _object("production_commit", self.production_commit)
         if self.active_promotion_id is not None:
             _id("active_promotion_id", self.active_promotion_id)
-        if self.pull_request is not None and not isinstance(
-            self.pull_request, PullRequestSnapshot
-        ):
+        if self.pull_request is not None and not isinstance(self.pull_request, PullRequestSnapshot):
             raise PromotionContractError("invalid_pull_request")
 
 
@@ -133,6 +138,10 @@ class PromotionDecision:
     pull_request_number: int | None = None
     merge_commit: str | None = None
     revert_commit: str | None = None
+    promotion_merge_commit: str | None = None
+    revert_pull_request_number: int | None = None
+    revert_candidate_commit: str | None = None
+    revert_merge_commit: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -165,6 +174,18 @@ class RevertSnapshot:
             _object("reverted_commit", self.reverted_commit)
 
 
+def promotion_lease_reason(snapshot: PromotionSnapshot, promotion_id: str) -> str | None:
+    """Return the stable fail-closed reason for unavailable serialized ownership."""
+    if not isinstance(snapshot, PromotionSnapshot):
+        raise PromotionContractError("invalid_promotion_snapshot")
+    _id("promotion_id", promotion_id)
+    if snapshot.active_promotion_id is None:
+        return "promotion_lease_required"
+    if snapshot.active_promotion_id != promotion_id:
+        return "promotion_lease_conflict"
+    return None
+
+
 def _check_decision(
     pull_request: PullRequestSnapshot, required_checks: tuple[str, ...]
 ) -> PromotionDecision | None:
@@ -176,9 +197,7 @@ def _check_decision(
     if missing or any(checks[name] in _PENDING for name in required_checks if name in checks):
         return PromotionDecision("await_checks", "required_checks_incomplete", pull_request.number)
     if any(check_apps[name] != _GITHUB_ACTIONS_APP_ID for name in required_checks):
-        return PromotionDecision(
-            "blocked", "required_check_app_mismatch", pull_request.number
-        )
+        return PromotionDecision("blocked", "required_check_app_mismatch", pull_request.number)
     if any(checks[name] not in _SUCCESS for name in required_checks):
         return PromotionDecision("blocked", "required_check_failed", pull_request.number)
     return None
@@ -190,10 +209,11 @@ def reconcile_promotion(
     required_checks: tuple[str, ...],
 ) -> PromotionDecision:
     """Choose one idempotent action without performing GitHub mutations."""
-    if snapshot.active_promotion_id is None:
-        return PromotionDecision("blocked", "promotion_lease_required")
-    if snapshot.active_promotion_id != request.promotion_id:
-        return PromotionDecision("blocked", "promotion_lease_conflict")
+    if required_checks != APPROVED_REQUIRED_CHECKS:
+        raise PromotionContractError("required_checks_policy_mismatch")
+    lease_reason = promotion_lease_reason(snapshot, request.promotion_id)
+    if lease_reason is not None:
+        return PromotionDecision("blocked", lease_reason)
     pull_request = snapshot.pull_request
     if pull_request is None:
         if snapshot.production_commit != request.parent_commit:
@@ -284,7 +304,10 @@ def reconcile_revert(snapshot: RevertSnapshot) -> PromotionDecision:
         return PromotionDecision(
             "record_reverted",
             "exact_revert_reconciled",
-            merge_commit=snapshot.reverted_commit,
+            promotion_merge_commit=snapshot.merge_commit,
+            revert_pull_request_number=pull_request.number,
+            revert_candidate_commit=snapshot.revert_candidate_commit,
+            revert_merge_commit=snapshot.reverted_commit,
         )
     if snapshot.production_commit != snapshot.merge_commit:
         raise PromotionContractError("revert_production_identity_mismatch")
@@ -293,11 +316,15 @@ def reconcile_revert(snapshot: RevertSnapshot) -> PromotionDecision:
         return PromotionDecision(
             "await_revert",
             "revert_pull_request_exists",
-            pull_request.number,
+            pull_request_number=pull_request.number,
             revert_commit=snapshot.merge_commit,
+            promotion_merge_commit=snapshot.merge_commit,
+            revert_pull_request_number=pull_request.number,
+            revert_candidate_commit=snapshot.revert_candidate_commit,
         )
     return PromotionDecision(
         "create_revert_pull_request",
         "hard_soak_failure",
         revert_commit=snapshot.merge_commit,
+        promotion_merge_commit=snapshot.merge_commit,
     )

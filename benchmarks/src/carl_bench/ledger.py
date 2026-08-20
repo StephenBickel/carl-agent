@@ -12,8 +12,10 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from carl_bench.autonomy import AutonomyProjection, reduce_autonomy_events
 from carl_bench.canonical import canonical_json_bytes
 from carl_bench.experiment import (
+    _ISOLATED_AUTHORITY_REQUIRED_EVENTS,
     EventType,
     ExperimentEvent,
     ExperimentManifest,
@@ -23,6 +25,29 @@ from carl_bench.experiment import (
 )
 
 _ZERO_DIGEST = "0" * 64
+_TRUSTED_AUTHORITY_EVENT_TYPES = frozenset(
+    {
+        EventType.PAIRED_EVIDENCE_RECORDED,
+        EventType.PROTECTED_VALIDATION_RECORDED,
+        EventType.PROMOTION_RECORDED,
+        EventType.SOAK_OBSERVED,
+        EventType.REVERT_RECORDED,
+    }
+)
+_TRUSTED_CANONICAL_EVENT_TYPES = frozenset(
+    {
+        EventType.PAIRED_EVIDENCE_RECORDED,
+        EventType.PROTECTED_VALIDATION_RECORDED,
+    }
+)
+
+
+def _trusted_canonical_digests(
+    events: tuple[ExperimentEvent, ...],
+) -> frozenset[str]:
+    return frozenset(
+        event.digest for event in events if event.event_type in _TRUSTED_CANONICAL_EVENT_TYPES
+    )
 
 
 class LedgerIntegrityError(ValueError):
@@ -369,6 +394,18 @@ class ExperimentLedger:
         return tuple(events), tuple(chains)
 
     def append(self, event: ExperimentEvent) -> AppendResult:
+        """Append candidate-authority facts without bypassing isolation gates."""
+        return self._append(event, trusted_authority=False)
+
+    def append_trusted_authority(self, event: ExperimentEvent) -> AppendResult:
+        """Append a protected lifecycle fact from the isolated trusted authority."""
+        if event.event_type not in _TRUSTED_AUTHORITY_EVENT_TYPES:
+            raise LedgerIntegrityError("trusted_authority_event_required")
+        return self._append(event, trusted_authority=True)
+
+    def _append(self, event: ExperimentEvent, *, trusted_authority: bool) -> AppendResult:
+        if event.event_type in _ISOLATED_AUTHORITY_REQUIRED_EVENTS and not trusted_authority:
+            raise LedgerIntegrityError("isolated_signer_required")
         with self._connect() as connection:
             try:
                 connection.execute("BEGIN IMMEDIATE")
@@ -399,13 +436,31 @@ class ExperimentLedger:
                     for other_manifest in self._all_manifests(connection):
                         other_events, _ = self._read_events(connection, other_manifest)
                         try:
-                            other_projection = reduce_events(other_manifest, other_events)
+                            other_projection = reduce_events(
+                                other_manifest,
+                                other_events,
+                                trusted_authority_event_digests=(
+                                    _trusted_canonical_digests(other_events)
+                                ),
+                            )
                         except GraphContractError as error:
                             raise LedgerIntegrityError(error.code) from error
-                        if other_projection.lease is not None:
+                        if (
+                            other_projection.lease is not None
+                            and not other_projection.lease.stale_reconciled
+                        ):
                             raise LedgerIntegrityError("mutable_lease_conflict")
                 try:
-                    reduce_events(manifest, (*events, event))
+                    proposed_events = (*events, event)
+                    trusted_digests = _trusted_canonical_digests(events)
+                    if trusted_authority and event.event_type in _TRUSTED_CANONICAL_EVENT_TYPES:
+                        trusted_digests = trusted_digests | {event.digest}
+                    reduce_events(
+                        manifest,
+                        proposed_events,
+                        trusted_authority_event_digests=trusted_digests,
+                    )
+                    reduce_autonomy_events(manifest, proposed_events)
                 except GraphContractError as error:
                     raise LedgerIntegrityError(error.code) from error
                 ordinal = len(events) + 1
@@ -460,7 +515,20 @@ class ExperimentLedger:
             manifest = self._load_manifest(connection, experiment_id)
             events, _ = self._read_events(connection, manifest)
         try:
-            return reduce_events(manifest, events)
+            return reduce_events(
+                manifest,
+                events,
+                trusted_authority_event_digests=_trusted_canonical_digests(events),
+            )
+        except GraphContractError as error:
+            raise LedgerIntegrityError(error.code) from error
+
+    def autonomy_projection(self, experiment_id: str) -> AutonomyProjection:
+        with self._connect() as connection:
+            manifest = self._load_manifest(connection, experiment_id)
+            events, _ = self._read_events(connection, manifest)
+        try:
+            return reduce_autonomy_events(manifest, events)
         except GraphContractError as error:
             raise LedgerIntegrityError(error.code) from error
 

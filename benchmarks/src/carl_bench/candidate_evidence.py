@@ -11,6 +11,12 @@ from carl_bench.candidate import (
     ReviewPacket,
     SealedCandidate,
 )
+from carl_bench.capability_validation import (
+    CapabilityValidationError,
+    CapabilityValidationReport,
+    TaskOutcome,
+    TransferCheck,
+)
 from carl_bench.experiment import (
     ExperimentManifest,
     ExperimentProjection,
@@ -37,6 +43,98 @@ class CandidateEvidenceError(ValueError):
 def _exact_keys(value: dict[str, Any], expected: set[str]) -> None:
     if set(value) != expected:
         raise CandidateEvidenceError("scorecard_keys_invalid")
+
+
+def capability_report_from_public(value: Any) -> CapabilityValidationReport:
+    """Parse the bounded public capability summary used by protected validation."""
+    if not isinstance(value, dict):
+        raise CandidateEvidenceError("capability_report_invalid")
+    expected = {
+        "affected_contract_cases_improved",
+        "baseline_outcomes",
+        "candidate_outcomes",
+        "claim_id",
+        "claim_type",
+        "eligible",
+        "guards_non_inferior",
+        "reasons",
+        "schema_version",
+        "transfer_checks",
+        "transfer_gain_basis_points",
+    }
+    if set(value) != expected:
+        raise CandidateEvidenceError("capability_report_keys_invalid")
+    if not all(
+        isinstance(value[name], list)
+        for name in ("baseline_outcomes", "candidate_outcomes", "reasons", "transfer_checks")
+    ):
+        raise CandidateEvidenceError("capability_report_reasons_invalid")
+    try:
+        return CapabilityValidationReport(
+            schema_version=value["schema_version"],
+            claim_id=value["claim_id"],
+            claim_type=value["claim_type"],
+            eligible=value["eligible"],
+            reasons=tuple(value["reasons"]),
+            transfer_gain_basis_points=value["transfer_gain_basis_points"],
+            affected_contract_cases_improved=value["affected_contract_cases_improved"],
+            guards_non_inferior=value["guards_non_inferior"],
+            baseline_outcomes=tuple(
+                _capability_task_outcome_from_public(item)
+                for item in value["baseline_outcomes"]
+            ),
+            candidate_outcomes=tuple(
+                _capability_task_outcome_from_public(item)
+                for item in value["candidate_outcomes"]
+            ),
+            transfer_checks=tuple(
+                _capability_transfer_check_from_public(item)
+                for item in value["transfer_checks"]
+            ),
+        )
+    except (CapabilityValidationError, TypeError) as error:
+        raise CandidateEvidenceError("capability_report_invalid") from error
+
+
+def _capability_task_outcome_from_public(value: Any) -> TaskOutcome:
+    expected = {
+        "evaluator_digest",
+        "failed_trials",
+        "invalid_trials",
+        "passed_trials",
+        "score_basis_points",
+        "task_digest",
+        "task_id",
+        "valid_trials",
+    }
+    if not isinstance(value, dict) or set(value) != expected:
+        raise CandidateEvidenceError("capability_task_outcome_invalid")
+    collection_names = ("failed_trials", "invalid_trials", "passed_trials", "valid_trials")
+    if any(not isinstance(value[name], list) for name in collection_names):
+        raise CandidateEvidenceError("capability_task_outcome_invalid")
+    return TaskOutcome(
+        task_id=value["task_id"],
+        task_digest=value["task_digest"],
+        evaluator_digest=value["evaluator_digest"],
+        score_basis_points=value["score_basis_points"],
+        valid_trials=tuple(value["valid_trials"]),
+        invalid_trials=tuple(value["invalid_trials"]),
+        passed_trials=tuple(value["passed_trials"]),
+        failed_trials=tuple(value["failed_trials"]),
+    )
+
+
+def _capability_transfer_check_from_public(value: Any) -> TransferCheck:
+    expected = {
+        "check_id",
+        "check_type",
+        "evaluator_digest",
+        "minimum_candidate_basis_points",
+        "task_id",
+    }
+    if not isinstance(value, dict) or set(value) != expected:
+        raise CandidateEvidenceError("capability_transfer_check_invalid")
+    return TransferCheck(**value)
 
 
 def _trial_from_public(value: Any) -> TrialResult:

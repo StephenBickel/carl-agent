@@ -1,0 +1,311 @@
+name: Autonomous soak observation
+
+"on":
+  workflow_dispatch:
+    inputs:
+      experiment_digest:
+        description: Immutable experiment manifest SHA-256
+        required: true
+        type: string
+      parent_commit:
+        description: Exact pre-merge first parent commit
+        required: true
+        type: string
+      candidate_commit:
+        description: Exact two-parent merge commit to observe
+        required: true
+        type: string
+      task_set_digest:
+        description: Immutable health task-set archive SHA-256
+        required: true
+        type: string
+      metric_pack_digest:
+        description: Immutable health metric-pack SHA-256
+        required: true
+        type: string
+      policy_digest:
+        description: Immutable soak policy SHA-256
+        required: true
+        type: string
+      request_digest:
+        description: Canonical cloud request SHA-256
+        required: true
+        type: string
+      workflow_revision:
+        description: Exact protected workflow source commit
+        required: true
+        type: string
+      workflow_blob_digest:
+        description: Exact protected workflow file SHA-256
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: autonomous-soak-${{ inputs.request_digest }}
+  cancel-in-progress: false
+
+jobs:
+  commission:
+    name: Validate workflow, inputs, and exact merge topology
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      trusted_inputs_digest: ${{ steps.inputs.outputs.trusted_inputs_digest }}
+      topology_digest: ${{ steps.topology.outputs.topology_digest }}
+    steps:
+      - name: Check out the protected parent
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.workflow_revision }}
+          path: trusted-source
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Check out the exact merge commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.candidate_commit }}
+          path: merge-source
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Validate request and exact immediate-parent topology
+        id: topology
+        env:
+          CANDIDATE_COMMIT: ${{ inputs.candidate_commit }}
+          EXPERIMENT_DIGEST: ${{ inputs.experiment_digest }}
+          METRIC_PACK_DIGEST: ${{ inputs.metric_pack_digest }}
+          PARENT_COMMIT: ${{ inputs.parent_commit }}
+          POLICY_DIGEST: ${{ inputs.policy_digest }}
+          REPOSITORY: ${{ github.repository }}
+          REQUEST_DIGEST: ${{ inputs.request_digest }}
+          RUN_HEAD_SHA: ${{ github.sha }}
+          TASK_SET_DIGEST: ${{ inputs.task_set_digest }}
+          WORKFLOW_BLOB_DIGEST: ${{ inputs.workflow_blob_digest }}
+          WORKFLOW_PATH: .github/workflows/autonomous-soak.yml
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          WORKFLOW_REVISION: ${{ inputs.workflow_revision }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: |
+          set -euo pipefail
+          test "$RUN_HEAD_SHA" = "$WORKFLOW_REVISION"
+          test "$WORKFLOW_SHA" = "$WORKFLOW_REVISION"
+          test "${WORKFLOW_REF%%@*}" = "$REPOSITORY/$WORKFLOW_PATH"
+          test "$(git -C trusted-source rev-parse HEAD)" = "$WORKFLOW_REVISION"
+          printf '%s  %s\n' "$WORKFLOW_BLOB_DIGEST" \
+            "trusted-source/$WORKFLOW_PATH" | sha256sum --check --strict -
+          test "$(git -C merge-source rev-parse HEAD)" = "$CANDIDATE_COMMIT"
+          read -r -a MERGE_TOPOLOGY <<< "$(git -C merge-source rev-list --parents -n 1 "$CANDIDATE_COMMIT")"
+          test "${#MERGE_TOPOLOGY[@]}" -eq 3
+          test "${MERGE_TOPOLOGY[0]}" = "$CANDIDATE_COMMIT"
+          test "${MERGE_TOPOLOGY[1]}" = "$PARENT_COMMIT"
+          printf '%s\n' "${MERGE_TOPOLOGY[*]}" | sha256sum | {
+            read -r digest rest
+            printf 'topology_digest=%s\n' "$digest" >> "$GITHUB_OUTPUT"
+          }
+          python3 - <<'PY'
+          import hashlib, json, os, re
+          digest = re.compile(r"[0-9a-f]{64}\Z")
+          commit = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
+          for name in ("EXPERIMENT_DIGEST", "METRIC_PACK_DIGEST", "POLICY_DIGEST",
+                       "REQUEST_DIGEST", "TASK_SET_DIGEST", "WORKFLOW_BLOB_DIGEST"):
+              if not digest.fullmatch(os.environ[name]): raise SystemExit(f"invalid {name.lower()}")
+          for name in ("PARENT_COMMIT", "CANDIDATE_COMMIT", "WORKFLOW_REVISION"):
+              if not commit.fullmatch(os.environ[name]): raise SystemExit(f"invalid {name.lower()}")
+          payload = {
+              "candidate_commit": os.environ["CANDIDATE_COMMIT"],
+              "experiment_digest": os.environ["EXPERIMENT_DIGEST"],
+              "metric_pack_digest": os.environ["METRIC_PACK_DIGEST"],
+              "parent_commit": os.environ["PARENT_COMMIT"],
+              "policy_digest": os.environ["POLICY_DIGEST"],
+              "repository": os.environ["REPOSITORY"], "schema_version": 1,
+              "task_set_digest": os.environ["TASK_SET_DIGEST"],
+              "workflow_file": "autonomous-soak.yml",
+              "workflow_revision": os.environ["WORKFLOW_REVISION"],
+              "workflow_blob_digest": os.environ["WORKFLOW_BLOB_DIGEST"],
+          }
+          encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+          if hashlib.sha256(encoded).hexdigest() != os.environ["REQUEST_DIGEST"]:
+              raise SystemExit("request_digest mismatch")
+          PY
+      - name: Run actionlint commissioning gate
+        working-directory: trusted-source
+        run: |
+          go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7 \
+            .github/workflows/autonomous-improvement.yml \
+            .github/workflows/autonomous-soak.yml
+      - name: Resolve and verify protected immutable inputs
+        id: inputs
+        env:
+          EXPERIMENT_DIGEST: ${{ inputs.experiment_digest }}
+          METRIC_PACK_DIGEST: ${{ inputs.metric_pack_digest }}
+          POLICY_DIGEST: ${{ inputs.policy_digest }}
+          TASK_SET_DIGEST: ${{ inputs.task_set_digest }}
+        run: |
+          set -euo pipefail
+          resolved="$RUNNER_TEMP/immutable-inputs"; mkdir -p "$resolved"
+          resolve() {
+            kind="$1"; digest="$2"
+            source="trusted-source/benchmarks/immutable-inputs/$kind/$digest"
+            test -f "$source"; test ! -L "$source"
+            printf '%s  %s\n' "$digest" "$source" | sha256sum --check --strict -
+            cp -- "$source" "$resolved/$kind"
+          }
+          resolve experiment "$EXPERIMENT_DIGEST"
+          resolve task-set "$TASK_SET_DIGEST"
+          resolve metric-pack "$METRIC_PACK_DIGEST"
+          resolve policy "$POLICY_DIGEST"
+          aggregate="$(find "$resolved" -maxdepth 1 -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1)"
+          printf 'trusted_inputs_digest=%s\n' "$aggregate" >> "$GITHUB_OUTPUT"
+
+  evaluate:
+    name: Run merge-bound health probes in isolated subject
+    needs: [commission]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      health_result_digest: ${{ steps.health.outputs.health_result_digest }}
+    steps:
+      - name: Check out trusted harness from protected parent
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.workflow_revision }}
+          path: trusted-source
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Check out exact merge subject
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.candidate_commit }}
+          path: subject-merge
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Install pinned uv and Python
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          version: "0.10.4"
+          python-version: "3.12"
+          enable-cache: false
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.97.0 --profile minimal --no-self-update
+      - name: Verify immutable inputs outside subject authority
+        env:
+          EXPERIMENT_DIGEST: ${{ inputs.experiment_digest }}
+          METRIC_PACK_DIGEST: ${{ inputs.metric_pack_digest }}
+          POLICY_DIGEST: ${{ inputs.policy_digest }}
+          TASK_SET_DIGEST: ${{ inputs.task_set_digest }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/immutable-inputs"
+          resolve() {
+            kind="$1"; digest="$2"
+            source="trusted-source/benchmarks/immutable-inputs/$kind/$digest"
+            test -f "$source"; test ! -L "$source"
+            printf '%s  %s\n' "$digest" "$source" | sha256sum --check --strict -
+            cp -- "$source" "$RUNNER_TEMP/immutable-inputs/$kind"
+          }
+          resolve experiment "$EXPERIMENT_DIGEST"
+          resolve task-set "$TASK_SET_DIGEST"
+          resolve metric-pack "$METRIC_PACK_DIGEST"
+          resolve policy "$POLICY_DIGEST"
+      - name: Run repository health probes without workflow commands or credentials
+        id: health
+        env:
+          MERGE_COMMIT: ${{ inputs.candidate_commit }}
+        run: |
+          set -euo pipefail
+          chmod 700 "$(dirname "$GITHUB_ENV")"
+          test "$(git -C subject-merge rev-parse HEAD)" = "$MERGE_COMMIT"
+          eval_root="$RUNNER_TEMP/eval-merge"; sandbox="$RUNNER_TEMP/sandbox-merge"
+          cp -R -- subject-merge "$eval_root"
+          rm -rf -- "$eval_root/benchmarks/tests" "$eval_root/benchmarks/tasks/dev"
+          cp -R -- trusted-source/benchmarks/tests "$eval_root/benchmarks/tests"
+          mkdir -p "$eval_root/benchmarks/tasks/dev"
+          tar --extract --file "$RUNNER_TEMP/immutable-inputs/task-set" \
+            --directory "$eval_root/benchmarks/tasks/dev" --no-same-owner --no-same-permissions
+          cp -- trusted-source/scripts/benchmark-smoke.sh "$eval_root/scripts/benchmark-smoke.sh"
+          chmod -R a-w "$eval_root"
+          mkdir -p "$sandbox/home" "$sandbox/tmp" "$sandbox/cargo" "$sandbox/target" "$sandbox/uv"
+          chown -R nobody:nogroup "$sandbox"
+          sudo -u nobody env -i HOME="$sandbox/home" PATH="$PATH" TMPDIR="$sandbox/tmp" \
+            CARGO_HOME="$sandbox/cargo" CARGO_TARGET_DIR="$sandbox/target" \
+            RUSTUP_HOME="$RUSTUP_HOME" UV_CACHE_DIR="$sandbox/uv" \
+            PYTHONDONTWRITEBYTECODE=1 \
+            PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
+            UV_PROJECT_ENVIRONMENT="$sandbox/venv" SUBJECT_ROOT="$eval_root" \
+            bash --noprofile --norc -c '
+              set -euo pipefail; cd "$SUBJECT_ROOT"
+              cargo +1.97.0 test --locked --test workflow_contract --test docs_contract
+              uv sync --project benchmarks --python 3.12 --locked
+              uv run --offline --project benchmarks --locked pytest -q \
+                -c /dev/null -p no:cacheprovider \
+                benchmarks/tests/test_integration_contract.py benchmarks/tests/test_cloud_execution.py
+              ./scripts/benchmark-smoke.sh
+            '
+          result="$RUNNER_TEMP/health-result.json"
+          python3 - "$result" "$MERGE_COMMIT" <<'PY'
+          import json, pathlib, sys
+          pathlib.Path(sys.argv[1]).write_text(
+              json.dumps({"merge_commit": sys.argv[2], "status": "passed"},
+                         sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+          PY
+          printf 'health_result_digest=%s\n' "$(sha256sum "$result" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+  evidence:
+    name: Create trusted bounded soak evidence
+    needs: [commission, evaluate]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Write fresh trusted merge observation
+        env:
+          EXPERIMENT_DIGEST: ${{ inputs.experiment_digest }}
+          HEALTH_RESULT_DIGEST: ${{ needs.evaluate.outputs.health_result_digest }}
+          MERGE_COMMIT: ${{ inputs.candidate_commit }}
+          METRIC_PACK_DIGEST: ${{ inputs.metric_pack_digest }}
+          PARENT_COMMIT: ${{ inputs.parent_commit }}
+          POLICY_DIGEST: ${{ inputs.policy_digest }}
+          REPOSITORY: ${{ github.repository }}
+          REQUEST_DIGEST: ${{ inputs.request_digest }}
+          RUN_ID: ${{ github.run_id }}
+          TASK_SET_DIGEST: ${{ inputs.task_set_digest }}
+          TOPOLOGY_DIGEST: ${{ needs.commission.outputs.topology_digest }}
+          TRUSTED_INPUTS_DIGEST: ${{ needs.commission.outputs.trusted_inputs_digest }}
+          WORKFLOW_BLOB_DIGEST: ${{ inputs.workflow_blob_digest }}
+          WORKFLOW_REVISION: ${{ inputs.workflow_revision }}
+        run: |
+          mkdir -p cloud-evidence
+          python3 - <<'PY'
+          import json, os, pathlib
+          evidence = {
+              "experiment_digest": os.environ["EXPERIMENT_DIGEST"],
+              "health_result_digest": os.environ["HEALTH_RESULT_DIGEST"],
+              "kind": "autonomous_soak_observation", "merge_commit": os.environ["MERGE_COMMIT"],
+              "metric_pack_digest": os.environ["METRIC_PACK_DIGEST"],
+              "parent_commit": os.environ["PARENT_COMMIT"],
+              "policy_digest": os.environ["POLICY_DIGEST"],
+              "repository": os.environ["REPOSITORY"],
+              "request_digest": os.environ["REQUEST_DIGEST"],
+              "run_id": int(os.environ["RUN_ID"]), "schema_version": 2,
+              "task_set_digest": os.environ["TASK_SET_DIGEST"],
+              "topology_digest": os.environ["TOPOLOGY_DIGEST"],
+              "trusted_inputs_digest": os.environ["TRUSTED_INPUTS_DIGEST"],
+              "workflow_file": "autonomous-soak.yml",
+              "workflow_revision": os.environ["WORKFLOW_REVISION"],
+              "workflow_blob_digest": os.environ["WORKFLOW_BLOB_DIGEST"],
+          }
+          target = pathlib.Path("cloud-evidence/autonomous-soak.json")
+          target.write_text(json.dumps(evidence, sort_keys=True, separators=(",", ":")) + "\n")
+          if target.stat().st_size > 1_048_576: raise SystemExit("observation exceeds bound")
+          PY
+      - name: Upload the one request-named soak artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: autonomous-soak-observation-${{ inputs.request_digest }}
+          path: cloud-evidence/autonomous-soak.json
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 9
+          overwrite: false
+          include-hidden-files: false

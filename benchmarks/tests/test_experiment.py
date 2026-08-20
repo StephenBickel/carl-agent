@@ -5,6 +5,7 @@ from dataclasses import replace
 import pytest
 
 from carl_bench.artifacts import ArtifactRef
+from carl_bench.autonomy import reduce_autonomy_events
 from carl_bench.candidate import (
     DeterministicCheckResult,
     PairedEvidence,
@@ -267,6 +268,22 @@ def candidate_event(
         stage_attempt_id=attempt,
         event_type=event_type,
         occurred_at=f"2026-08-10T12:01:{second:02d}Z",
+        payload=payload,
+    )
+
+
+def autonomy_event(
+    *,
+    attempt: str,
+    event_type: EventType,
+    occurred_at: str,
+    payload: dict[str, object],
+) -> ExperimentEvent:
+    return ExperimentEvent.create(
+        experiment_id=manifest().experiment_id,
+        stage_attempt_id=attempt,
+        event_type=event_type,
+        occurred_at=occurred_at,
         payload=payload,
     )
 
@@ -798,3 +815,309 @@ def test_phase3_candidate_evidence_gates_build_and_cannot_claim_holdout_validati
     )
     with pytest.raises(GraphContractError, match="phase4_protected_validation_required"):
         reduce_events(manifest(), (*events, holdout))
+
+
+def test_autonomy_projection_replays_durable_lifecycle_facts() -> None:
+    events = (
+        autonomy_event(
+            attempt="retry-parser-1",
+            event_type=EventType.RETRY_SCHEDULED,
+            occurred_at="2026-08-10T12:00:01Z",
+            payload={
+                "attempt": 1,
+                "changed_action": "add parser failure telemetry",
+                "failed_stage_attempt_id": "stage-parser-1",
+                "failure_class": "infrastructure",
+                "scheduled_at": "2026-08-10T12:00:01Z",
+            },
+        ),
+        autonomy_event(
+            attempt="retry-parser-2",
+            event_type=EventType.RETRY_SCHEDULED,
+            occurred_at="2026-08-10T12:01:01Z",
+            payload={
+                "attempt": 2,
+                "changed_action": "replace brittle parser with token scanner",
+                "failed_stage_attempt_id": "stage-parser-1",
+                "failure_class": "infrastructure",
+                "scheduled_at": "2026-08-10T12:01:01Z",
+            },
+        ),
+        autonomy_event(
+            attempt="publish-1",
+            event_type=EventType.EXPERIMENTAL_PUBLISHED,
+            occurred_at="2026-08-10T12:02:01Z",
+            payload={
+                "branch": "experimental/exp-product-001",
+                "candidate_packet_digest": "d" * 64,
+                "commit": "a" * 40,
+                "tree": "a" * 40,
+            },
+        ),
+        autonomy_event(
+            attempt="protected-validation-1",
+            event_type=EventType.PROTECTED_VALIDATION_RECORDED,
+            occurred_at="2026-08-10T12:03:01Z",
+            payload={
+                "candidate_commit": "a" * 40,
+                "candidate_tree": "a" * 40,
+                "receipt_digest": "e" * 64,
+            },
+        ),
+        autonomy_event(
+            attempt="promotion-1",
+            event_type=EventType.PROMOTION_RECORDED,
+            occurred_at="2026-08-10T12:04:01Z",
+            payload={"merge_commit": "b" * 40, "merge_tree": "b" * 40},
+        ),
+        autonomy_event(
+            attempt="soak-healthy-1",
+            event_type=EventType.SOAK_OBSERVED,
+            occurred_at="2026-08-11T12:04:01Z",
+            payload={
+                "evidence_digest": "f" * 64,
+                "healthy": True,
+                "merge_commit": "b" * 40,
+                "observed_at": "2026-08-11T12:04:01Z",
+            },
+        ),
+    )
+
+    projection = reduce_autonomy_events(manifest(), events)
+
+    assert projection.experimental_publication is not None
+    assert projection.experimental_publication.branch == "experimental/exp-product-001"
+    assert projection.retry is not None
+    assert projection.retry.changed_action == "replace brittle parser with token scanner"
+    assert projection.retry.attempt == 2
+    assert projection.promotion is not None
+    assert projection.promotion.merge_commit == "b" * 40
+    assert projection.soak_observations[-1].healthy is True
+
+
+def test_autonomy_projection_reverts_only_after_a_hard_failure() -> None:
+    publication = autonomy_event(
+        attempt="publish-1",
+        event_type=EventType.EXPERIMENTAL_PUBLISHED,
+        occurred_at="2026-08-10T12:02:01Z",
+        payload={
+            "branch": "experimental/exp-product-001",
+            "candidate_packet_digest": "d" * 64,
+            "commit": "a" * 40,
+            "tree": "a" * 40,
+        },
+    )
+    protected_validation = autonomy_event(
+        attempt="protected-validation-1",
+        event_type=EventType.PROTECTED_VALIDATION_RECORDED,
+        occurred_at="2026-08-10T12:03:01Z",
+        payload={
+            "candidate_commit": "a" * 40,
+            "candidate_tree": "a" * 40,
+            "receipt_digest": "e" * 64,
+        },
+    )
+    promotion = autonomy_event(
+        attempt="promotion-1",
+        event_type=EventType.PROMOTION_RECORDED,
+        occurred_at="2026-08-10T12:04:01Z",
+        payload={"merge_commit": "b" * 40, "merge_tree": "b" * 40},
+    )
+    hard_failure = autonomy_event(
+        attempt="soak-failure-1",
+        event_type=EventType.SOAK_OBSERVED,
+        occurred_at="2026-08-10T12:05:01Z",
+        payload={
+            "evidence_digest": "f" * 64,
+            "healthy": False,
+            "merge_commit": "b" * 40,
+            "observed_at": "2026-08-10T12:05:01Z",
+        },
+    )
+    revert = autonomy_event(
+        attempt="revert-1",
+        event_type=EventType.REVERT_RECORDED,
+        occurred_at="2026-08-10T12:06:01Z",
+        payload={
+            "hard_failure_digest": "f" * 64,
+            "merge_commit": "b" * 40,
+            "restored_tree": "c" * 40,
+            "revert_candidate_commit": "d" * 40,
+            "revert_merge_commit": "e" * 40,
+            "revert_pull_request_number": 82,
+        },
+    )
+
+    projection = reduce_autonomy_events(
+        manifest(), (publication, protected_validation, promotion, hard_failure, revert)
+    )
+
+    assert projection.revert is not None
+    assert projection.revert.restored_tree == "c" * 40
+
+
+def test_autonomy_projection_fails_closed_for_invalid_lifecycle_ordering() -> None:
+    publication = autonomy_event(
+        attempt="publish-1",
+        event_type=EventType.EXPERIMENTAL_PUBLISHED,
+        occurred_at="2026-08-10T12:00:01Z",
+        payload={
+            "branch": "experimental/exp-product-001",
+            "candidate_packet_digest": "d" * 64,
+            "commit": "a" * 40,
+            "tree": "a" * 40,
+        },
+    )
+    duplicate_publication = autonomy_event(
+        attempt="publish-2",
+        event_type=EventType.EXPERIMENTAL_PUBLISHED,
+        occurred_at="2026-08-10T12:01:01Z",
+        payload={
+            "branch": "experimental/exp-product-002",
+            "candidate_packet_digest": "e" * 64,
+            "commit": "b" * 40,
+            "tree": "b" * 40,
+        },
+    )
+    protected_validation = autonomy_event(
+        attempt="protected-validation-1",
+        event_type=EventType.PROTECTED_VALIDATION_RECORDED,
+        occurred_at="2026-08-10T12:02:01Z",
+        payload={
+            "candidate_commit": "a" * 40,
+            "candidate_tree": "a" * 40,
+            "receipt_digest": "e" * 64,
+        },
+    )
+    retry_one = autonomy_event(
+        attempt="retry-1",
+        event_type=EventType.RETRY_SCHEDULED,
+        occurred_at="2026-08-10T12:00:01Z",
+        payload={
+            "attempt": 1,
+            "changed_action": "rebuild the remote cache",
+            "failed_stage_attempt_id": "stage-cache-1",
+            "failure_class": "infrastructure",
+            "scheduled_at": "2026-08-10T12:00:01Z",
+        },
+    )
+    unchanged_retry = autonomy_event(
+        attempt="retry-2",
+        event_type=EventType.RETRY_SCHEDULED,
+        occurred_at="2026-08-10T12:01:01Z",
+        payload={
+            "attempt": 2,
+            "changed_action": "rebuild the remote cache",
+            "failed_stage_attempt_id": "stage-cache-1",
+            "failure_class": "infrastructure",
+            "scheduled_at": "2026-08-10T12:01:01Z",
+        },
+    )
+    fourth_retry = autonomy_event(
+        attempt="retry-4",
+        event_type=EventType.RETRY_SCHEDULED,
+        occurred_at="2026-08-10T12:00:01Z",
+        payload={
+            "attempt": 4,
+            "changed_action": "route to a different runner image",
+            "failed_stage_attempt_id": "stage-runner-1",
+            "failure_class": "infrastructure",
+            "scheduled_at": "2026-08-10T12:00:01Z",
+        },
+    )
+    soak_before_merge = autonomy_event(
+        attempt="soak-1",
+        event_type=EventType.SOAK_OBSERVED,
+        occurred_at="2026-08-10T12:00:01Z",
+        payload={
+            "evidence_digest": "f" * 64,
+            "healthy": True,
+            "merge_commit": "b" * 40,
+            "observed_at": "2026-08-10T12:00:01Z",
+        },
+    )
+    premature_healthy_soak = autonomy_event(
+        attempt="soak-healthy-early-1",
+        event_type=EventType.SOAK_OBSERVED,
+        occurred_at="2026-08-11T11:59:01Z",
+        payload={
+            "evidence_digest": "9" * 64,
+            "healthy": True,
+            "merge_commit": "b" * 40,
+            "observed_at": "2026-08-11T11:59:01Z",
+        },
+    )
+    accept_without_24_hour_soak = autonomy_event(
+        attempt="accept-1",
+        event_type=EventType.STATE_TRANSITIONED,
+        occurred_at="2026-08-11T12:00:01Z",
+        payload={
+            "from_state": ExperimentState.SOAKING.value,
+            "to_state": ExperimentState.ACCEPTED.value,
+        },
+    )
+    promotion = autonomy_event(
+        attempt="promotion-1",
+        event_type=EventType.PROMOTION_RECORDED,
+        occurred_at="2026-08-10T12:00:01Z",
+        payload={"merge_commit": "b" * 40, "merge_tree": "b" * 40},
+    )
+    revert_without_failure = autonomy_event(
+        attempt="revert-1",
+        event_type=EventType.REVERT_RECORDED,
+        occurred_at="2026-08-10T12:01:01Z",
+        payload={
+            "hard_failure_digest": "f" * 64,
+            "merge_commit": "b" * 40,
+            "restored_tree": "c" * 40,
+            "revert_candidate_commit": "d" * 40,
+            "revert_merge_commit": "e" * 40,
+            "revert_pull_request_number": 82,
+        },
+    )
+
+    with pytest.raises(GraphContractError, match="experimental_publication_already_recorded"):
+        reduce_autonomy_events(manifest(), (publication, duplicate_publication))
+    with pytest.raises(GraphContractError, match="retry_action_unchanged"):
+        reduce_autonomy_events(manifest(), (retry_one, unchanged_retry))
+    with pytest.raises(GraphContractError, match="retry_attempt_exhausted"):
+        reduce_autonomy_events(manifest(), (fourth_retry,))
+    with pytest.raises(GraphContractError, match="soak_promotion_required"):
+        reduce_autonomy_events(manifest(), (soak_before_merge,))
+    with pytest.raises(GraphContractError, match="soak_healthy_observation_required"):
+        reduce_autonomy_events(
+            manifest(),
+            (
+                publication,
+                protected_validation,
+                promotion,
+                premature_healthy_soak,
+                accept_without_24_hour_soak,
+            ),
+        )
+    with pytest.raises(GraphContractError, match="hard_failure_required"):
+        reduce_autonomy_events(
+            manifest(), (publication, protected_validation, promotion, revert_without_failure)
+        )
+
+
+def test_autonomy_events_leave_legacy_experiment_projection_byte_identical() -> None:
+    legacy_events = proposal_state_events()
+    lifecycle_event = autonomy_event(
+        attempt="retry-1",
+        event_type=EventType.RETRY_SCHEDULED,
+        occurred_at="2026-08-10T12:10:01Z",
+        payload={
+            "attempt": 1,
+            "changed_action": "rebuild the remote cache",
+            "failed_stage_attempt_id": "stage-cache-1",
+            "failure_class": "infrastructure",
+            "scheduled_at": "2026-08-10T12:10:01Z",
+        },
+    )
+
+    original = reduce_events(manifest(), legacy_events)
+    replayed = reduce_events(manifest(), (*legacy_events, lifecycle_event))
+
+    assert replayed == original
+    assert replayed.digest == original.digest

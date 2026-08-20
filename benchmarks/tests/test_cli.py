@@ -46,6 +46,13 @@ def test_help_and_task_validation_are_available(capsys: pytest.CaptureFixture[st
     assert "coding" in output and "workflow" in output and "safety" in output
 
 
+def test_candidate_publish_experimental_command_is_available() -> None:
+    with pytest.raises(SystemExit) as help_exit:
+        cli.main(["candidate", "publish-experimental", "--help"])
+
+    assert help_exit.value.code == 0
+
+
 def test_scripted_run_writes_only_sanitized_scorecard(tmp_path: Path) -> None:
     destination = tmp_path / "scorecard.json"
     assert run_scripted(destination) == 0

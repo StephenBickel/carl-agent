@@ -16,10 +16,10 @@ from carl_bench.github_promotion import (
 from carl_bench.promotion import PromotionContractError
 
 REQUIRED_CHECKS = (
-    "Benchmark contracts",
     "Quality",
-    "Test (macos-latest)",
+    "Benchmark contracts",
     "Test (ubuntu-latest)",
+    "Test (macos-latest)",
     "Test (windows-latest)",
 )
 
@@ -50,8 +50,7 @@ def pull_request() -> PullRequestSnapshot:
         head_tree="3" * 40,
         merge_state="CLEAN",
         checks=tuple(
-            CheckRun(name=name, conclusion="SUCCESS", app_id=15368)
-            for name in REQUIRED_CHECKS
+            CheckRun(name=name, conclusion="SUCCESS", app_id=15368) for name in REQUIRED_CHECKS
         ),
         merge_commit=None,
         merge_tree=None,
@@ -109,9 +108,7 @@ def test_stale_base_or_concurrent_promotion_fails_closed(
 
 
 def test_missing_promotion_lease_fails_closed() -> None:
-    decision = reconcile_promotion(
-        request(), snapshot(active_promotion_id=None), REQUIRED_CHECKS
-    )
+    decision = reconcile_promotion(request(), snapshot(active_promotion_id=None), REQUIRED_CHECKS)
 
     assert decision.action == "blocked"
     assert decision.reason == "promotion_lease_required"
@@ -153,12 +150,11 @@ def test_missing_or_failed_check_never_enables_auto_merge() -> None:
         ),
     )
 
-    assert reconcile_promotion(
-        request(), snapshot(pull_request=missing), REQUIRED_CHECKS
-    ).action == "await_checks"
-    failed_decision = reconcile_promotion(
-        request(), snapshot(pull_request=failed), REQUIRED_CHECKS
+    assert (
+        reconcile_promotion(request(), snapshot(pull_request=missing), REQUIRED_CHECKS).action
+        == "await_checks"
     )
+    failed_decision = reconcile_promotion(request(), snapshot(pull_request=failed), REQUIRED_CHECKS)
     assert failed_decision.action == "blocked"
     assert failed_decision.reason == "required_check_failed"
 
@@ -175,9 +171,7 @@ def test_nonexecuted_required_check_never_enables_auto_merge(conclusion: str) ->
         ),
     )
 
-    decision = reconcile_promotion(
-        request(), snapshot(pull_request=current), REQUIRED_CHECKS
-    )
+    decision = reconcile_promotion(request(), snapshot(pull_request=current), REQUIRED_CHECKS)
 
     assert decision.action == "blocked"
     assert decision.reason == "required_check_failed"
@@ -192,9 +186,7 @@ def test_required_check_from_untrusted_app_never_enables_auto_merge() -> None:
         ),
     )
 
-    decision = reconcile_promotion(
-        request(), snapshot(pull_request=current), REQUIRED_CHECKS
-    )
+    decision = reconcile_promotion(request(), snapshot(pull_request=current), REQUIRED_CHECKS)
 
     assert decision.action == "blocked"
     assert decision.reason == "required_check_app_mismatch"
@@ -252,7 +244,7 @@ def test_hard_soak_failure_opens_one_exact_revert() -> None:
     decision = reconcile_revert(state)
 
     assert decision.action == "create_revert_pull_request"
-    assert decision.revert_commit == "5" * 40
+    assert decision.promotion_merge_commit == "5" * 40
 
 
 def test_existing_revert_pr_is_reconciled_not_duplicated() -> None:
@@ -347,4 +339,7 @@ def test_exact_merged_revert_restores_the_preceding_tree() -> None:
     decision = reconcile_revert(state)
 
     assert decision.action == "record_reverted"
-    assert decision.merge_commit == "8" * 40
+    assert decision.promotion_merge_commit == "5" * 40
+    assert decision.revert_pull_request_number == 82
+    assert decision.revert_candidate_commit == "6" * 40
+    assert decision.revert_merge_commit == "8" * 40
