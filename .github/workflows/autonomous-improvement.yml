@@ -58,7 +58,7 @@ jobs:
       - name: Check out the protected parent
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          ref: ${{ inputs.parent_commit }}
+          ref: ${{ inputs.workflow_revision }}
           path: trusted-source
           fetch-depth: 1
           persist-credentials: false
@@ -71,13 +71,20 @@ jobs:
           POLICY_DIGEST: ${{ inputs.policy_digest }}
           REPOSITORY: ${{ github.repository }}
           REQUEST_DIGEST: ${{ inputs.request_digest }}
+          RUN_HEAD_SHA: ${{ github.sha }}
           TASK_SET_DIGEST: ${{ inputs.task_set_digest }}
           WORKFLOW_BLOB_DIGEST: ${{ inputs.workflow_blob_digest }}
+          WORKFLOW_PATH: .github/workflows/autonomous-improvement.yml
+          WORKFLOW_REF: ${{ github.workflow_ref }}
           WORKFLOW_REVISION: ${{ inputs.workflow_revision }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
         run: |
+          test "$RUN_HEAD_SHA" = "$WORKFLOW_REVISION"
+          test "$WORKFLOW_SHA" = "$WORKFLOW_REVISION"
+          test "${WORKFLOW_REF%%@*}" = "$REPOSITORY/$WORKFLOW_PATH"
           test "$(git -C trusted-source rev-parse HEAD)" = "$WORKFLOW_REVISION"
           printf '%s  %s\n' "$WORKFLOW_BLOB_DIGEST" \
-            trusted-source/.github/workflows/autonomous-improvement.yml | sha256sum --check --strict -
+            "trusted-source/$WORKFLOW_PATH" | sha256sum --check --strict -
           python3 - <<'PY'
           import hashlib
           import json
@@ -92,7 +99,7 @@ jobs:
           ):
               if not digest.fullmatch(os.environ[name]):
                   raise SystemExit(f"invalid {name.lower()}")
-          for name in ("PARENT_COMMIT", "CANDIDATE_COMMIT"):
+          for name in ("PARENT_COMMIT", "CANDIDATE_COMMIT", "WORKFLOW_REVISION"):
               if not commit.fullmatch(os.environ[name]):
                   raise SystemExit(f"invalid {name.lower()}")
           payload = {
@@ -157,7 +164,7 @@ jobs:
       - name: Check out trusted harness from protected parent
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          ref: ${{ inputs.parent_commit }}
+          ref: ${{ inputs.workflow_revision }}
           path: trusted-source
           fetch-depth: 1
           persist-credentials: false

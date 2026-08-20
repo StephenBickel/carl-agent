@@ -2,10 +2,30 @@
 
 ## Status
 
-Round 4 implementation is complete locally. Remote acceptance remains explicitly uncommissioned:
+Round 5 implementation is complete locally. Remote acceptance remains explicitly uncommissioned:
 no GitHub-hosted commissioning run, artifact, live ACP credential path, or production-grade
 capability result is claimed by this report. The protected harness continues to emit
 `live_acp_credential_missing` and is wiring evidence only.
+
+## Round 5 controls
+
+- GitHub run identity now binds `head_sha` to the protected `workflow_revision`, not the candidate
+  commit. The candidate remains an immutable subject input. Reconciliation also requires the exact
+  `.github/workflows/...` path and protected workflow blob digest before accepting any run.
+- Both workflow files check that `github.sha` and `github.workflow_sha` equal the requested protected
+  workflow revision, verify `github.workflow_ref` names the expected workflow path, hash-check that
+  workflow blob, and load the trusted harness from that revision.
+- `CommissioningReceipt` schema 2 is canonical and digest-bound. Only a
+  `SignedCommissioningReceipt` with a valid Ed25519 signature from the configured trusted key can
+  authorize success; missing, unsigned, wrong-key, malformed, forged, or mismatched receipts block.
+  Workflows and candidate processes receive no signing private key.
+- Every retry transition consumes a separately canonical, digest-bound, Ed25519-signed
+  `CompletedRunObservation` that binds run ID, repository, workflow revision/path/blob, request
+  digest, completed status, infrastructure conclusion, and observation time.
+- Retry decisions carry the observation digest, retry-state schema 2 durably appends that digest
+  beside the run ID, and `CloudRetryStateStore.compare_and_swap` re-verifies the signature and all
+  bindings while holding the file lock. Caller-constructed decisions without signed provenance,
+  forged observations, replay, reset, skip, and history substitution fail closed.
 
 ## Round 4 controls
 
@@ -78,7 +98,15 @@ Round 4 focused verification: 66 tests passed across `test_cloud_execution.py` a
 Attack regressions cover forged commissioning fields, absent receipts, retry reset/skip/key/deadline
 and history tampering, and shared harness/subject identities.
 
+Round 5 focused verification: 84 tests passed across `test_cloud_execution.py` and
+`test_cloud_harness.py`; focused Ruff, pinned Actionlint v1.7.7, and `git diff --check` passed.
+Adversarial regressions cover candidate-ref workflow execution, missing/mismatched workflow
+path/blob, unsigned and forged commissioning receipts, unsigned/forged/mismatched completed-run
+observations, manually constructed retry decisions, and signature revalidation inside atomic CAS.
+No full suite was run, per task instruction.
+
 ## Commit
 
 - Round 3: `30b098c` — `fix(factory): harden cloud isolation and durable retries`
 - Round 4: `200d741` — `fix(factory): close cloud trust boundary gaps`
+- Round 5: this commit — `fix(factory): authenticate cloud run provenance`
