@@ -78,9 +78,9 @@ def _macos_sandbox_profile(
             '(import "system.sb")',
             "(allow process*)",
             "(allow signal (target self))",
-            f"(allow file-read* {reads} (literal \"/dev/null\") (literal \"/dev/urandom\"))",
+            f'(allow file-read* {reads} (literal "/dev/null") (literal "/dev/urandom"))',
             f"(allow file-map-executable {reads})",
-            f"(allow file-write* {writes} (literal \"/dev/null\"))",
+            f'(allow file-write* {writes} (literal "/dev/null"))',
             "(deny network*)",
         )
     )
@@ -362,6 +362,25 @@ def _canonical_git_diff(
     if not paths or len(paths) != len(set(paths)):
         raise CommissioningArtifactError("invalid_synthetic_changed_paths")
     return diff, paths
+
+
+def _git_tree(source_repository: Path, commit: str) -> str:
+    """Resolve an exact commit tree from the protected source repository."""
+    _object(commit, "invalid_synthetic_subject_commit")
+    source = source_repository.expanduser().absolute()
+    if not source.is_dir() or "://" in os.fspath(source):
+        raise CommissioningArtifactError("invalid_synthetic_source_repository")
+    try:
+        tree = subprocess.run(
+            ("git", "-C", os.fspath(source), "rev-parse", f"{commit}^{{tree}}"),
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError) as error:
+        raise CommissioningArtifactError("synthetic_git_failed") from error
+    return _object(tree, "protected_git_tree_mismatch")
 
 
 @dataclass(frozen=True, slots=True)
@@ -727,6 +746,12 @@ def verify_protected_pair_evaluation(
         evaluator=evaluator,
         evaluator_ref=evaluator_ref,
     )
+    derived_baseline_tree = _git_tree(source_repository, baseline_commit)
+    derived_candidate_tree = _git_tree(source_repository, candidate_commit)
+    if baseline_tree != derived_baseline_tree or candidate_tree != derived_candidate_tree:
+        raise CommissioningArtifactError("protected_git_tree_mismatch")
+    baseline_tree = derived_baseline_tree
+    candidate_tree = derived_candidate_tree
     exact_diff, changed_paths = _canonical_git_diff(
         source_repository,
         baseline_commit,
@@ -1098,6 +1123,9 @@ class ProtectedSyntheticRunner:
     ):
         """Execute protected checks and derive one fully artifact-backed receipt."""
         from carl_bench.protected_run import (
+            ProtectedCommandResult,
+            ProtectedFlakeObservationSet,
+            ProtectedFlakeSample,
             ProtectedVerifierConfig,
             persist_protected_run,
         )
@@ -1133,9 +1161,7 @@ class ProtectedSyntheticRunner:
                 "--",
             )
             git_executable = shutil.which("git")
-            command_line_tools_git = Path(
-                "/Library/Developer/CommandLineTools/usr/bin/git"
-            )
+            command_line_tools_git = Path("/Library/Developer/CommandLineTools/usr/bin/git")
             if (
                 sys.platform == "darwin"
                 and command_line_tools_git.is_file()
@@ -1144,28 +1170,67 @@ class ProtectedSyntheticRunner:
                 git_executable = os.fspath(command_line_tools_git)
             if git_executable is None:
                 raise CommissioningArtifactError("synthetic_git_failed")
-            deterministic = self._protected_command_result(
-                checkout=checkout,
-                run_kind="deterministic_checks",
-                baseline_commit=verified.baseline_commit,
-                candidate_commit=verified.candidate_commit,
-                candidate_tree=verified.candidate_tree,
-                logical_command=logical_deterministic,
-                actual_command=(git_executable, *logical_deterministic[1:]),
-            )
-            repository_tests = self._protected_command_result(
-                checkout=checkout,
-                run_kind="full_repository_tests",
-                baseline_commit=verified.baseline_commit,
-                candidate_commit=verified.candidate_commit,
-                candidate_tree=verified.candidate_tree,
-                logical_command=verifier_config.repository_tests_command,
-                actual_command=verifier_config.repository_tests_command,
-            )
+            samples = []
+            for sample_number in range(1, 4):
+                deterministic = self._protected_command_result(
+                    checkout=checkout,
+                    run_kind="deterministic_checks",
+                    baseline_commit=verified.baseline_commit,
+                    candidate_commit=verified.candidate_commit,
+                    candidate_tree=verified.candidate_tree,
+                    logical_command=logical_deterministic,
+                    actual_command=(git_executable, *logical_deterministic[1:]),
+                )
+                repository_tests = self._protected_command_result(
+                    checkout=checkout,
+                    run_kind="full_repository_tests",
+                    baseline_commit=verified.baseline_commit,
+                    candidate_commit=verified.candidate_commit,
+                    candidate_tree=verified.candidate_tree,
+                    logical_command=verifier_config.repository_tests_command,
+                    actual_command=verifier_config.repository_tests_command,
+                )
+                deterministic_ref = self.artifacts.put(
+                    evidence_kind="protected_deterministic_checks",
+                    media_type="application/json",
+                    content=canonical_json_bytes(deterministic.to_canonical_dict()),
+                )
+                repository_ref = self.artifacts.put(
+                    evidence_kind="protected_repository_tests",
+                    media_type="application/json",
+                    content=canonical_json_bytes(repository_tests.to_canonical_dict()),
+                )
+                samples.append(
+                    ProtectedFlakeSample(
+                        schema_version=1,
+                        sample_id=f"sample-{sample_number:03d}",
+                        deterministic_checks_ref=deterministic_ref,
+                        repository_tests_ref=repository_ref,
+                    )
+                )
         finally:
             shutil.rmtree(run_root, ignore_errors=True)
+        observations = ProtectedFlakeObservationSet(
+            schema_version=1,
+            baseline_commit=verified.baseline_commit,
+            candidate_commit=verified.candidate_commit,
+            candidate_tree=verified.candidate_tree,
+            samples=tuple(samples),
+        )
+        flake_observations_ref = self.artifacts.put(
+            evidence_kind="protected_flake_observations",
+            media_type="application/json",
+            content=canonical_json_bytes(observations.to_canonical_dict()),
+        )
+        first_deterministic = ProtectedCommandResult.from_canonical_dict(
+            json.loads(self.artifacts.read(samples[0].deterministic_checks_ref))
+        )
+        first_repository = ProtectedCommandResult.from_canonical_dict(
+            json.loads(self.artifacts.read(samples[0].repository_tests_ref))
+        )
         return persist_protected_run(
             artifacts=self.artifacts,
+            source_repository=self.source_repository,
             verifier_config=verifier_config,
             experiment_id=experiment_id,
             manifest_digest=manifest_digest,
@@ -1180,8 +1245,9 @@ class ProtectedSyntheticRunner:
             changed_paths=verified.changed_paths,
             executable_bytes=executable_bytes,
             subject_path=evaluator.subject_path,
-            deterministic_result=deterministic,
-            repository_result=repository_tests,
+            deterministic_result=first_deterministic,
+            repository_result=first_repository,
+            flake_observations_ref=flake_observations_ref,
             created_at=created_at,
             expires_at=expires_at,
         )
@@ -1271,6 +1337,8 @@ class ProtectedSyntheticRunner:
             baseline_commit,
             candidate_commit,
         )
+        baseline_tree = _git_tree(self.source_repository, baseline_commit)
+        candidate_tree = _git_tree(self.source_repository, candidate_commit)
         diff_ref = self.artifacts.put(
             evidence_kind="git_binary_diff",
             media_type="application/octet-stream",
@@ -1312,6 +1380,11 @@ class ProtectedSyntheticRunner:
                 evaluator=evaluator,
                 evaluator_ref=evaluator_ref,
             )
+            if (
+                baseline_execution["subject_tree"] != baseline_tree
+                or candidate_execution["subject_tree"] != candidate_tree
+            ):
+                raise CommissioningArtifactError("protected_git_tree_mismatch")
         finally:
             shutil.rmtree(run_root, ignore_errors=True)
         execution_ref = self.artifacts.put(

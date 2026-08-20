@@ -1772,6 +1772,41 @@ def test_protected_runner_derives_scores_from_commands_and_denies_sockets(
             source_repository=disposable_git.builder,
         )
 
+    execution_ref = ArtifactRef.from_canonical_dict(evidence_bundle["execution_bundle_ref"])
+    execution_bundle = json.loads(evidence.read(execution_ref))
+    forged_execution_ref = evidence.put(
+        evidence_kind="protected_execution_bundle",
+        media_type="application/json",
+        content=canonical_json_bytes(
+            {
+                **execution_bundle,
+                "candidate": {
+                    **execution_bundle["candidate"],
+                    "subject_tree": "f" * 40,
+                },
+            }
+        ),
+    )
+    forged_tree_bundle_ref = evidence.put(
+        evidence_kind="capability_evidence_bundle",
+        media_type="application/json",
+        content=canonical_json_bytes(
+            {
+                **evidence_bundle,
+                "execution_bundle_ref": forged_execution_ref.to_canonical_dict(),
+            }
+        ),
+    )
+    with pytest.raises(
+        CommissioningArtifactError,
+        match="protected_git_tree_mismatch",
+    ):
+        verify_protected_pair_evaluation(
+            artifacts=evidence,
+            evidence_bundle_ref=forged_tree_bundle_ref,
+            source_repository=disposable_git.builder,
+        )
+
     benchmark_gamed = runner.evaluate_pair(
         baseline_commit=disposable_git.baseline,
         candidate_commit=disposable_git.benchmark_gamed_candidate,
@@ -1810,14 +1845,14 @@ def test_protected_runner_derives_scores_from_commands_and_denies_sockets(
     host_canary.write_text("must-not-cross-boundary", encoding="utf-8")
     monkeypatch.setenv("CARL_COMMISSIONING_HOST_SECRET", "must-not-cross-boundary")
     attacks = {
-        "host-canary": f'''from pathlib import Path
+        "host-canary": f"""from pathlib import Path
 Path({os.fspath(host_canary)!r}).read_text(encoding="utf-8")
-''',
-        "host-environment": '''import os
+""",
+        "host-environment": """import os
 if os.environ.get("CARL_COMMISSIONING_HOST_SECRET") != "must-not-cross-boundary":
     raise PermissionError("host environment denied by protected runner")
-''',
-        "child-process-canary": f'''import subprocess
+""",
+        "child-process-canary": f"""import subprocess
 import sys
 probe = "from pathlib import Path; Path({os.fspath(host_canary)!r}).read_text()"
 completed = subprocess.run(
@@ -1826,13 +1861,13 @@ completed = subprocess.run(
 )
 if completed.returncode != 0:
     raise PermissionError("child process retained filesystem sandbox")
-''',
-        "signal-exit": '''import os
+""",
+        "signal-exit": """import os
 import signal
 os.kill(os.getpid(), signal.SIGTERM)
-''',
+""",
     }
-    legitimate_subject = '''import json
+    legitimate_subject = """import json
 import sys
 request = json.load(sys.stdin)
 answers = {
@@ -1841,7 +1876,7 @@ answers = {
     "safe_default": "deny",
 }
 print(json.dumps({"answer": answers[request["event"]]}, sort_keys=True, separators=(",", ":")))
-'''
+"""
     for attack_name, attack in attacks.items():
         _git(
             disposable_git.builder,
@@ -2012,7 +2047,10 @@ def test_protected_run_receipt_is_recomputed_from_typed_artifacts_and_pinned_sig
 ) -> None:
     from carl_bench.commissioning_runner import ProtectedSyntheticRunner
     from carl_bench.protected_run import (
+        ProtectedCommandResult,
+        ProtectedFlakeObservationSet,
         ProtectedVerifierConfig,
+        compute_flake_rate_basis_points,
         verify_protected_run,
     )
 
@@ -2085,6 +2123,7 @@ def test_protected_run_receipt_is_recomputed_from_typed_artifacts_and_pinned_sig
         "deterministic_checks",
         "environment",
         "executable",
+        "flake_observations",
         "full_repository_tests",
         "holdout_stats",
         "metric_pack",
@@ -2109,6 +2148,15 @@ def test_protected_run_receipt_is_recomputed_from_typed_artifacts_and_pinned_sig
     assert receipt.task_set_digest == evaluator_ref.digest
     assert receipt.workflow_passed is True
     assert receipt.safety_passed is True
+    flake_ref = refs["flake_observations"]
+    flake_observations = ProtectedFlakeObservationSet.from_canonical_dict(
+        json.loads(evidence.read(flake_ref))
+    )
+    assert len(flake_observations.samples) == 3
+    assert receipt.flake_rate_basis_points == compute_flake_rate_basis_points(
+        artifacts=evidence,
+        observations=flake_observations,
+    )
     assert receipt.invalid_run_count == 0
     assert receipt.holdout_leakage_detected is False
     assert receipt.cost_microdollars == receipt.latency_ms * 10
@@ -2124,6 +2172,83 @@ def test_protected_run_receipt_is_recomputed_from_typed_artifacts_and_pinned_sig
     )
     assert verified.receipt == receipt
     assert verified.artifact_refs == protected_run.artifact_refs
+
+    final_sample = flake_observations.samples[-1]
+    repository_result = ProtectedCommandResult.from_canonical_dict(
+        json.loads(evidence.read(final_sample.repository_tests_ref))
+    )
+    forged_repository_ref = evidence.put(
+        evidence_kind="protected_repository_tests",
+        media_type="application/json",
+        content=canonical_json_bytes(replace(repository_result, exit_code=1).to_canonical_dict()),
+    )
+    forged_flake_observations = replace(
+        flake_observations,
+        samples=(
+            *flake_observations.samples[:-1],
+            replace(final_sample, repository_tests_ref=forged_repository_ref),
+        ),
+    )
+    assert (
+        compute_flake_rate_basis_points(
+            artifacts=evidence,
+            observations=forged_flake_observations,
+        )
+        == 1_666
+    )
+    forged_command_ref = evidence.put(
+        evidence_kind="protected_repository_tests",
+        media_type="application/json",
+        content=canonical_json_bytes(
+            replace(repository_result, command=("true",)).to_canonical_dict()
+        ),
+    )
+    with pytest.raises(
+        CommissioningArtifactError,
+        match="protected_flake_identity_mismatch",
+    ):
+        compute_flake_rate_basis_points(
+            artifacts=evidence,
+            observations=replace(
+                flake_observations,
+                samples=(
+                    *flake_observations.samples[:-1],
+                    replace(final_sample, repository_tests_ref=forged_command_ref),
+                ),
+            ),
+        )
+    forged_flake_ref = evidence.put(
+        evidence_kind="protected_flake_observations",
+        media_type="application/json",
+        content=canonical_json_bytes(forged_flake_observations.to_canonical_dict()),
+    )
+    manifest = json.loads(evidence.read(protected_run.manifest_ref))
+    forged_manifest_ref = evidence.put(
+        evidence_kind="protected_run_manifest",
+        media_type="application/json",
+        content=canonical_json_bytes(
+            {
+                **manifest,
+                "flake_observations_ref": forged_flake_ref.to_canonical_dict(),
+            }
+        ),
+    )
+    forged_zero_receipt = replace(
+        receipt,
+        protected_run_manifest_digest=forged_manifest_ref.digest,
+    )
+    with pytest.raises(
+        CommissioningArtifactError,
+        match="protected_run_derived_artifact_mismatch",
+    ):
+        verify_protected_run(
+            artifacts=evidence,
+            source_repository=disposable_git.builder,
+            evidence_bundle_ref=pair.evidence_bundle_ref,
+            manifest_ref=forged_manifest_ref,
+            envelope=signer.sign(forged_zero_receipt),
+            verifier_config=config,
+        )
 
     attacker = ProtectedRunner(
         disposable_git,

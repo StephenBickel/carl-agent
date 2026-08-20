@@ -7,6 +7,7 @@ import os
 import re
 import subprocess
 import sys
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -217,6 +218,180 @@ class ProtectedCommandResult:
 
 
 @dataclass(frozen=True, slots=True)
+class ProtectedFlakeSample:
+    """One repeated protected-run sample bound to both required checks."""
+
+    schema_version: int
+    sample_id: str
+    deterministic_checks_ref: ArtifactRef
+    repository_tests_ref: ArtifactRef
+
+    def __post_init__(self) -> None:
+        if self.schema_version != 1:
+            raise CommissioningArtifactError("invalid_protected_flake_sample")
+        _identifier(self.sample_id, "invalid_protected_flake_sample")
+        if (
+            not isinstance(self.deterministic_checks_ref, ArtifactRef)
+            or self.deterministic_checks_ref.evidence_kind != "protected_deterministic_checks"
+            or self.deterministic_checks_ref.media_type != "application/json"
+            or not isinstance(self.repository_tests_ref, ArtifactRef)
+            or self.repository_tests_ref.evidence_kind != "protected_repository_tests"
+            or self.repository_tests_ref.media_type != "application/json"
+        ):
+            raise CommissioningArtifactError("invalid_protected_flake_sample")
+
+    def to_canonical_dict(self) -> dict[str, Any]:
+        return {
+            "deterministic_checks_ref": self.deterministic_checks_ref.to_canonical_dict(),
+            "repository_tests_ref": self.repository_tests_ref.to_canonical_dict(),
+            "sample_id": self.sample_id,
+            "schema_version": self.schema_version,
+        }
+
+    @classmethod
+    def from_canonical_dict(cls, value: Any) -> ProtectedFlakeSample:
+        expected = {
+            "deterministic_checks_ref",
+            "repository_tests_ref",
+            "sample_id",
+            "schema_version",
+        }
+        if not isinstance(value, dict) or set(value) != expected:
+            raise CommissioningArtifactError("invalid_protected_flake_sample")
+        try:
+            return cls(
+                schema_version=value["schema_version"],
+                sample_id=value["sample_id"],
+                deterministic_checks_ref=ArtifactRef.from_canonical_dict(
+                    value["deterministic_checks_ref"]
+                ),
+                repository_tests_ref=ArtifactRef.from_canonical_dict(value["repository_tests_ref"]),
+            )
+        except (ArtifactIntegrityError, TypeError) as error:
+            raise CommissioningArtifactError("invalid_protected_flake_sample") from error
+
+
+@dataclass(frozen=True, slots=True)
+class ProtectedFlakeObservationSet:
+    """Content-addressed repeated observations used to derive flake rate."""
+
+    schema_version: int
+    baseline_commit: str
+    candidate_commit: str
+    candidate_tree: str
+    samples: tuple[ProtectedFlakeSample, ...]
+
+    def __post_init__(self) -> None:
+        if self.schema_version != 1:
+            raise CommissioningArtifactError("invalid_protected_flake_observations")
+        _object(self.baseline_commit, "invalid_protected_flake_observations")
+        _object(self.candidate_commit, "invalid_protected_flake_observations")
+        _object(self.candidate_tree, "invalid_protected_flake_observations")
+        if (
+            not isinstance(self.samples, tuple)
+            or not 3 <= len(self.samples) <= 20
+            or any(not isinstance(sample, ProtectedFlakeSample) for sample in self.samples)
+            or len({sample.sample_id for sample in self.samples}) != len(self.samples)
+        ):
+            raise CommissioningArtifactError("invalid_protected_flake_observations")
+
+    def to_canonical_dict(self) -> dict[str, Any]:
+        return {
+            "baseline_commit": self.baseline_commit,
+            "candidate_commit": self.candidate_commit,
+            "candidate_tree": self.candidate_tree,
+            "samples": [sample.to_canonical_dict() for sample in self.samples],
+            "schema_version": self.schema_version,
+        }
+
+    @classmethod
+    def from_canonical_dict(cls, value: Any) -> ProtectedFlakeObservationSet:
+        expected = {
+            "baseline_commit",
+            "candidate_commit",
+            "candidate_tree",
+            "samples",
+            "schema_version",
+        }
+        if (
+            not isinstance(value, dict)
+            or set(value) != expected
+            or not isinstance(value.get("samples"), list)
+        ):
+            raise CommissioningArtifactError("invalid_protected_flake_observations")
+        try:
+            return cls(
+                schema_version=value["schema_version"],
+                baseline_commit=value["baseline_commit"],
+                candidate_commit=value["candidate_commit"],
+                candidate_tree=value["candidate_tree"],
+                samples=tuple(
+                    ProtectedFlakeSample.from_canonical_dict(sample) for sample in value["samples"]
+                ),
+            )
+        except TypeError as error:
+            raise CommissioningArtifactError("invalid_protected_flake_observations") from error
+
+
+def _resolve_flake_results(
+    *,
+    artifacts: PrivateArtifactStore,
+    observations: ProtectedFlakeObservationSet,
+) -> tuple[tuple[ProtectedCommandResult, ProtectedCommandResult], ...]:
+    resolved: list[tuple[ProtectedCommandResult, ProtectedCommandResult]] = []
+    for sample in observations.samples:
+        try:
+            deterministic = ProtectedCommandResult.from_canonical_dict(
+                json.loads(artifacts.read(sample.deterministic_checks_ref))
+            )
+            repository = ProtectedCommandResult.from_canonical_dict(
+                json.loads(artifacts.read(sample.repository_tests_ref))
+            )
+        except (ArtifactIntegrityError, UnicodeError, json.JSONDecodeError) as error:
+            raise CommissioningArtifactError("invalid_protected_flake_observations") from error
+        for result, expected_kind in (
+            (deterministic, "deterministic_checks"),
+            (repository, "full_repository_tests"),
+        ):
+            if (
+                result.run_kind != expected_kind
+                or result.baseline_commit != observations.baseline_commit
+                or result.candidate_commit != observations.candidate_commit
+                or result.candidate_tree != observations.candidate_tree
+            ):
+                raise CommissioningArtifactError("protected_flake_identity_mismatch")
+            artifacts.read(result.stdout_ref)
+            artifacts.read(result.stderr_ref)
+        resolved.append((deterministic, repository))
+    expected_deterministic_command = resolved[0][0].command
+    expected_repository_command = resolved[0][1].command
+    if any(
+        deterministic.command != expected_deterministic_command
+        or repository.command != expected_repository_command
+        for deterministic, repository in resolved
+    ):
+        raise CommissioningArtifactError("protected_flake_identity_mismatch")
+    return tuple(resolved)
+
+
+def compute_flake_rate_basis_points(
+    *,
+    artifacts: PrivateArtifactStore,
+    observations: ProtectedFlakeObservationSet,
+) -> int:
+    """Derive instability from invalid runs and non-modal successful outcomes."""
+    resolved = _resolve_flake_results(artifacts=artifacts, observations=observations)
+    unstable = 0
+    for index in (0, 1):
+        results = [sample[index] for sample in resolved]
+        modal_exit_code = Counter(result.exit_code for result in results).most_common(1)[0][0]
+        unstable += sum(
+            not result.passed or result.exit_code != modal_exit_code for result in results
+        )
+    return unstable * 10_000 // (len(resolved) * 2)
+
+
+@dataclass(frozen=True, slots=True)
 class ProtectedRunEvidence:
     receipt: ProtectedValidationReceipt
     manifest_ref: ArtifactRef
@@ -305,6 +480,7 @@ def _score_values(
 def persist_protected_run(
     *,
     artifacts: PrivateArtifactStore,
+    source_repository: Path,
     verifier_config: ProtectedVerifierConfig,
     experiment_id: str,
     manifest_digest: str,
@@ -321,6 +497,7 @@ def persist_protected_run(
     subject_path: str,
     deterministic_result: ProtectedCommandResult,
     repository_result: ProtectedCommandResult,
+    flake_observations_ref: ArtifactRef,
     created_at: str,
     expires_at: str,
 ) -> ProtectedRunEvidence:
@@ -331,6 +508,9 @@ def persist_protected_run(
     _object(baseline_commit, "invalid_protected_run_identity")
     _object(candidate_commit, "invalid_protected_run_identity")
     _object(candidate_tree, "invalid_protected_run_identity")
+    _git_tree(source_repository, baseline_commit)
+    if _git_tree(source_repository, candidate_commit) != candidate_tree:
+        raise CommissioningArtifactError("protected_git_tree_mismatch")
     if not capability_report.eligible:
         raise CommissioningArtifactError("protected_run_capability_ineligible")
     if deterministic_result.run_kind != "deterministic_checks" or (
@@ -381,6 +561,34 @@ def persist_protected_run(
         artifacts,
         evidence_kind="protected_repository_tests",
         value=repository_result.to_canonical_dict(),
+    )
+    if (
+        not isinstance(flake_observations_ref, ArtifactRef)
+        or flake_observations_ref.evidence_kind != "protected_flake_observations"
+        or flake_observations_ref.media_type != "application/json"
+    ):
+        raise CommissioningArtifactError("invalid_protected_flake_observations")
+    try:
+        flake_observations = ProtectedFlakeObservationSet.from_canonical_dict(
+            json.loads(artifacts.read(flake_observations_ref))
+        )
+    except (ArtifactIntegrityError, UnicodeError, json.JSONDecodeError) as error:
+        raise CommissioningArtifactError("invalid_protected_flake_observations") from error
+    if (
+        flake_observations.baseline_commit != baseline_commit
+        or flake_observations.candidate_commit != candidate_commit
+        or flake_observations.candidate_tree != candidate_tree
+        or flake_observations.samples[0].deterministic_checks_ref != deterministic_ref
+        or flake_observations.samples[0].repository_tests_ref != repository_ref
+    ):
+        raise CommissioningArtifactError("protected_flake_identity_mismatch")
+    flake_results = _resolve_flake_results(
+        artifacts=artifacts,
+        observations=flake_observations,
+    )
+    flake_rate_basis_points = compute_flake_rate_basis_points(
+        artifacts=artifacts,
+        observations=flake_observations,
     )
 
     try:
@@ -433,14 +641,16 @@ def persist_protected_run(
         evidence_kind="protected_holdout_stats",
         value=holdout_value,
     )
-    latency_ms = deterministic_result.elapsed_ms + repository_result.elapsed_ms
+    all_results = tuple(result for sample in flake_results for result in sample)
+    latency_ms = sum(result.elapsed_ms for result in all_results)
     cost_value = {
         "cost_microdollars": latency_ms * verifier_config.cost_per_millisecond_microdollars,
         "latency_ms": latency_ms,
         "rate_microdollars_per_ms": verifier_config.cost_per_millisecond_microdollars,
         "run_refs": [
-            deterministic_ref.to_canonical_dict(),
-            repository_ref.to_canonical_dict(),
+            ref.to_canonical_dict()
+            for sample in flake_observations.samples
+            for ref in (sample.deterministic_checks_ref, sample.repository_tests_ref)
         ],
         "schema_version": 1,
     }
@@ -453,7 +663,7 @@ def persist_protected_run(
     reviewer_ids = dict(verifier_config.reviewer_ids)
     review_inputs = {
         "proposal": (evidence_bundle_ref, holdout_ref),
-        "build": (deterministic_ref, repository_ref),
+        "build": (deterministic_ref, repository_ref, flake_observations_ref),
         "security": (workflow_ref, safety_ref),
     }
     review_refs: dict[str, ArtifactRef] = {}
@@ -462,7 +672,11 @@ def persist_protected_run(
         if role == "proposal":
             approved = capability_report.eligible
         elif role == "build":
-            approved = deterministic_result.passed and repository_result.passed
+            approved = (
+                deterministic_result.passed
+                and repository_result.passed
+                and flake_rate_basis_points == 0
+            )
         else:
             approved = workflow_value["passed"] and safety_value["passed"]
         review_refs[role] = _put_json(
@@ -484,6 +698,7 @@ def persist_protected_run(
             (
                 deterministic_result.passed,
                 repository_result.passed,
+                flake_rate_basis_points == 0,
                 workflow_value["passed"],
                 safety_value["passed"],
                 not score_values["holdout_leakage_detected"],
@@ -505,6 +720,7 @@ def persist_protected_run(
         "experiment_id": experiment_id,
         "expires_at": expires_at,
         "full_repository_tests_ref": repository_ref.to_canonical_dict(),
+        "flake_observations_ref": flake_observations_ref.to_canonical_dict(),
         "holdout_stats_ref": holdout_ref.to_canonical_dict(),
         "manifest_digest": manifest_digest,
         "metric_pack_ref": metric_pack_ref.to_canonical_dict(),
@@ -514,7 +730,7 @@ def persist_protected_run(
         "proposal_review_ref": review_refs["proposal"].to_canonical_dict(),
         "build_review_ref": review_refs["build"].to_canonical_dict(),
         "safety_gate_ref": safety_ref.to_canonical_dict(),
-        "schema_version": 1,
+        "schema_version": 2,
         "security_review_ref": review_refs["security"].to_canonical_dict(),
         "task_set_ref": evaluator_ref.to_canonical_dict(),
         "validation_id": validation_id,
@@ -550,7 +766,7 @@ def persist_protected_run(
         guard_delta_basis_points=int(score_values["guard_delta_basis_points"]),
         workflow_passed=bool(workflow_value["passed"]),
         safety_passed=bool(safety_value["passed"]),
-        flake_rate_basis_points=0,
+        flake_rate_basis_points=flake_rate_basis_points,
         invalid_run_count=int(score_values["invalid_run_count"]),
         cost_microdollars=cost_value["cost_microdollars"],
         latency_ms=cost_value["latency_ms"],
@@ -573,6 +789,7 @@ def persist_protected_run(
         "deterministic_checks": deterministic_ref,
         "environment": environment_ref,
         "executable": executable_ref,
+        "flake_observations": flake_observations_ref,
         "full_repository_tests": repository_ref,
         "holdout_stats": holdout_ref,
         "metric_pack": metric_pack_ref,
@@ -595,6 +812,20 @@ def _git_blob(repository: Path, commit: str, path: str) -> bytes:
         ).stdout
     except (OSError, subprocess.SubprocessError) as error:
         raise CommissioningArtifactError("protected_run_git_identity_invalid") from error
+
+
+def _git_tree(repository: Path, commit: str) -> str:
+    try:
+        tree = subprocess.run(
+            ("git", "-C", os.fspath(repository), "rev-parse", f"{commit}^{{tree}}"),
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError) as error:
+        raise CommissioningArtifactError("protected_run_git_identity_invalid") from error
+    return _object(tree, "protected_git_tree_mismatch")
 
 
 def verify_protected_run(
@@ -636,6 +867,7 @@ def verify_protected_run(
         "executable_ref",
         "experiment_id",
         "expires_at",
+        "flake_observations_ref",
         "full_repository_tests_ref",
         "holdout_stats_ref",
         "manifest_digest",
@@ -658,7 +890,7 @@ def verify_protected_run(
         expected=manifest_keys,
         code="protected_run_manifest_invalid",
     )
-    if manifest["schema_version"] != 1:
+    if manifest["schema_version"] != 2:
         raise CommissioningArtifactError("protected_run_manifest_invalid")
     if (
         manifest["candidate_commit"] != verified_pair.candidate_commit
@@ -685,6 +917,11 @@ def verify_protected_run(
             "executable_ref",
             "protected_executable",
             "application/octet-stream",
+        ),
+        "flake_observations": (
+            "flake_observations_ref",
+            "protected_flake_observations",
+            "application/json",
         ),
         "full_repository_tests": (
             "full_repository_tests_ref",
@@ -766,6 +1003,25 @@ def verify_protected_run(
     repository_tests = ProtectedCommandResult.from_canonical_dict(
         json.loads(artifacts.read(refs["full_repository_tests"]))
     )
+    flake_observations = ProtectedFlakeObservationSet.from_canonical_dict(
+        json.loads(artifacts.read(refs["flake_observations"]))
+    )
+    if (
+        flake_observations.baseline_commit != verified_pair.baseline_commit
+        or flake_observations.candidate_commit != verified_pair.candidate_commit
+        or flake_observations.candidate_tree != verified_pair.candidate_tree
+        or flake_observations.samples[0].deterministic_checks_ref != refs["deterministic_checks"]
+        or flake_observations.samples[0].repository_tests_ref != refs["full_repository_tests"]
+    ):
+        raise CommissioningArtifactError("protected_flake_identity_mismatch")
+    flake_results = _resolve_flake_results(
+        artifacts=artifacts,
+        observations=flake_observations,
+    )
+    flake_rate_basis_points = compute_flake_rate_basis_points(
+        artifacts=artifacts,
+        observations=flake_observations,
+    )
     expected_deterministic_command = (
         "git",
         "diff",
@@ -845,14 +1101,16 @@ def verify_protected_run(
         "schema_version": 1,
         "transfer_gain_basis_points": verified_pair.report.transfer_gain_basis_points,
     }
-    latency_ms = deterministic.elapsed_ms + repository_tests.elapsed_ms
+    all_results = tuple(result for sample in flake_results for result in sample)
+    latency_ms = sum(result.elapsed_ms for result in all_results)
     cost = {
         "cost_microdollars": latency_ms * verifier_config.cost_per_millisecond_microdollars,
         "latency_ms": latency_ms,
         "rate_microdollars_per_ms": verifier_config.cost_per_millisecond_microdollars,
         "run_refs": [
-            refs["deterministic_checks"].to_canonical_dict(),
-            refs["full_repository_tests"].to_canonical_dict(),
+            ref.to_canonical_dict()
+            for sample in flake_observations.samples
+            for ref in (sample.deterministic_checks_ref, sample.repository_tests_ref)
         ],
         "schema_version": 1,
     }
@@ -869,13 +1127,19 @@ def verify_protected_run(
     reviewer_ids = dict(verifier_config.reviewer_ids)
     review_inputs = {
         "proposal": (evidence_bundle_ref, refs["holdout_stats"]),
-        "build": (refs["deterministic_checks"], refs["full_repository_tests"]),
+        "build": (
+            refs["deterministic_checks"],
+            refs["full_repository_tests"],
+            refs["flake_observations"],
+        ),
         "security": (refs["workflow_gate"], refs["safety_gate"]),
     }
     for role in ("proposal", "build", "security"):
         approved = {
             "proposal": verified_pair.report.eligible,
-            "build": deterministic.passed and repository_tests.passed,
+            "build": (
+                deterministic.passed and repository_tests.passed and flake_rate_basis_points == 0
+            ),
             "security": workflow["passed"] and safety["passed"],
         }[role]
         expected_review = {
@@ -914,7 +1178,7 @@ def verify_protected_run(
         guard_delta_basis_points=int(score_values["guard_delta_basis_points"]),
         workflow_passed=bool(workflow["passed"]),
         safety_passed=bool(safety["passed"]),
-        flake_rate_basis_points=0,
+        flake_rate_basis_points=flake_rate_basis_points,
         invalid_run_count=int(score_values["invalid_run_count"]),
         cost_microdollars=cost["cost_microdollars"],
         latency_ms=cost["latency_ms"],
@@ -931,6 +1195,7 @@ def verify_protected_run(
                 (
                     deterministic.passed,
                     repository_tests.passed,
+                    flake_rate_basis_points == 0,
                     workflow["passed"],
                     safety["passed"],
                     not score_values["holdout_leakage_detected"],
