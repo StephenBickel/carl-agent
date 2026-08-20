@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 from dataclasses import replace
+from datetime import UTC, datetime
 from inspect import signature
 
 import pytest
@@ -10,6 +11,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from carl_bench.cloud_state import (
     AuthorityCapability,
+    AuthorityVerifier,
     ClaimReconciliation,
     CloudCommand,
     CloudLease,
@@ -33,21 +35,43 @@ from carl_bench.cloud_state import (
     reconcile_lease,
     release_lease,
     replay_command,
-    verify_authority_capability,
-    verify_dead_holder_observation,
 )
 
 _DIGEST = "a" * 64
 _RESULT_DIGEST = "b" * 64
 _TIMESTAMP = "2026-08-20T12:00:00Z"
 _EXPIRES_AT = "2026-08-20T12:05:00Z"
-_PRIVATE_KEY = Ed25519PrivateKey.generate()
+_AUTHORITY_PRIVATE_KEY = Ed25519PrivateKey.generate()
+_OBSERVATION_PRIVATE_KEY = Ed25519PrivateKey.generate()
 _TRUSTED_KEY = TrustedAuthorityKey(
-    key_id="state-test-key",
-    public_key_pem=_PRIVATE_KEY.public_key().public_bytes(
+    key_id="state-test-authority-key",
+    purpose="authority_capability",
+    public_key_pem=_AUTHORITY_PRIVATE_KEY.public_key().public_bytes(
         serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo
     ),
 )
+_OBSERVATION_KEY = TrustedAuthorityKey(
+    key_id="state-test-observation-key",
+    purpose="dead_holder_observation",
+    public_key_pem=_OBSERVATION_PRIVATE_KEY.public_key().public_bytes(
+        serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo
+    ),
+)
+
+
+def _clock(value: str = _TIMESTAMP):
+    return lambda: datetime.fromisoformat(value.removesuffix("Z") + "+00:00").astimezone(UTC)
+
+
+def _verifier_at(value: str = _TIMESTAMP) -> AuthorityVerifier:
+    return AuthorityVerifier(
+        authority_key=_TRUSTED_KEY,
+        dead_holder_key=_OBSERVATION_KEY,
+        clock=_clock(value),
+    )
+
+
+_VERIFIER = _verifier_at()
 
 
 def _authority_capability(
@@ -57,27 +81,28 @@ def _authority_capability(
     scope_kind: str,
     scope_key: str,
     revision: int,
-    observed_at: str = _TIMESTAMP,
+    action: str,
 ):
     unsigned = AuthorityCapability(
         schema_version=1,
         authority=authority,
+        action=action,
         subject_id=subject_id,
         scope_kind=scope_kind,
         scope_key=scope_key,
         revision=revision,
         issued_at="2026-08-20T11:00:00Z",
         expires_at="2026-08-20T12:05:00Z",
-        key_id="state-test-key",
+        key_id="state-test-authority-key",
         signature_base64=base64.b64encode(b"\0" * 64).decode("ascii"),
     )
     signed = replace(
         unsigned,
-        signature_base64=base64.b64encode(_PRIVATE_KEY.sign(unsigned.signing_payload())).decode(
-            "ascii"
-        ),
+        signature_base64=base64.b64encode(
+            _AUTHORITY_PRIVATE_KEY.sign(unsigned.signing_payload())
+        ).decode("ascii"),
     )
-    return verify_authority_capability(signed, trusted_key=_TRUSTED_KEY, observed_at=observed_at)
+    return signed
 
 
 def _dead_holder_observation(
@@ -101,35 +126,39 @@ def _dead_holder_observation(
         observed_at=observed_at,
         expires_at="2026-08-20T12:05:00Z",
         live=live,
-        key_id="state-test-key",
+        key_id="state-test-observation-key",
         signature_base64=base64.b64encode(b"\0" * 64).decode("ascii"),
     )
     signed = replace(
         unsigned,
-        signature_base64=base64.b64encode(_PRIVATE_KEY.sign(unsigned.signing_payload())).decode(
-            "ascii"
-        ),
+        signature_base64=base64.b64encode(
+            _OBSERVATION_PRIVATE_KEY.sign(unsigned.signing_payload())
+        ).decode("ascii"),
     )
-    return verify_dead_holder_observation(signed, trusted_key=_TRUSTED_KEY, observed_at=observed_at)
+    return signed
 
 
-def _command_capability(revision: int, claim_id: str = "claim-improvement-01"):
+def _command_capability(
+    action: str, revision: int, claim_id: str = "claim-improvement-01"
+) -> AuthorityCapability:
     return _authority_capability(
         authority="coordinator",
         subject_id=claim_id,
         scope_kind="command",
         scope_key="dispatch-improvement-01",
         revision=revision,
+        action=action,
     )
 
 
-def _lease_capability(revision: int, holder_id: str) -> object:
+def _lease_capability(action: str, revision: int, holder_id: str) -> AuthorityCapability:
     return _authority_capability(
         authority="coordinator",
         subject_id=holder_id,
         scope_kind="lease",
         scope_key="coordinator",
         revision=revision,
+        action=action,
     )
 
 
@@ -230,23 +259,118 @@ def test_changed_command_identity_changes_the_effect_key() -> None:
     assert all(changed.effect_key != original.effect_key for changed in changed_commands)
 
 
-def test_forged_signed_capability_and_live_observation_are_rejected_before_reconciliation() -> None:
-    capability = _command_capability(7).capability
+def test_verified_handles_are_not_part_of_the_authority_boundary() -> None:
+    """Raw signed envelopes must be rechecked at the mutation, not wrapped once."""
+    import carl_bench.cloud_state as cloud_state
+
+    assert not hasattr(cloud_state, "VerifiedAuthority")
+    assert not hasattr(cloud_state, "VerifiedDeadHolderObservation")
+
+
+def test_authority_verifier_owns_a_trusted_clock() -> None:
+    verifier = _verifier_at()
+
+    assert verifier is not None
+
+
+def test_raw_envelope_mutation_is_reverified_at_the_claim_boundary() -> None:
+    capability = _command_capability("claim_command", 7)
+    object.__setattr__(capability, "action", "complete_command")
 
     with pytest.raises(CloudStateError, match="trusted_authority_signature_invalid"):
-        verify_authority_capability(
-            replace(capability, signature_base64=base64.b64encode(b"\0" * 64).decode("ascii")),
-            trusted_key=_TRUSTED_KEY,
-            observed_at=_TIMESTAMP,
+        claim_command(
+            create_command_state(_command()),
+            _claim(),
+            verifier=_VERIFIER,
+            capability=capability,
+        )
+
+
+def test_capability_action_is_exactly_bound_to_the_mutation() -> None:
+    with pytest.raises(CloudStateError, match="authority_capability_mismatch"):
+        claim_command(
+            create_command_state(_command()),
+            _claim(),
+            verifier=_VERIFIER,
+            capability=_command_capability("complete_command", 7),
+        )
+
+
+def test_verifier_clock_rejects_expired_capabilities() -> None:
+    with pytest.raises(CloudStateError, match="authority_capability_expired"):
+        claim_command(
+            create_command_state(_command()),
+            _claim(),
+            verifier=_verifier_at("2026-08-20T12:06:00Z"),
+            capability=_command_capability("claim_command", 7),
+        )
+
+
+def test_verifier_rejects_future_dead_holder_observations() -> None:
+    expired = CloudLease(
+        lease_key="coordinator",
+        holder_id="worker-a",
+        authority="coordinator",
+        revision=4,
+        acquired_at="2026-08-20T11:00:00Z",
+        expires_at="2026-08-20T11:05:00Z",
+    )
+    with pytest.raises(CloudStateError, match="dead_holder_observation_expired"):
+        reconcile_lease(
+            expired,
+            LeaseReconciliation(
+                lease_key="coordinator",
+                holder_id="worker-a",
+                authority="coordinator",
+                expected_revision=4,
+                next_revision=5,
+                observed_at="2026-08-20T12:01:00Z",
+            ),
+            verifier=_VERIFIER,
+            capability=_lease_capability("reconcile_lease", 4, "worker-a"),
+            dead_holder=_dead_liveness(revision=4, observed_at="2026-08-20T12:01:00Z"),
+        )
+
+
+def test_noncanonical_base64_signature_is_rejected_even_when_bytes_match() -> None:
+    capability = _command_capability("claim_command", 7)
+    alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+    last_value = alphabet.index(capability.signature_base64[-3])
+    alternate = alphabet[(last_value & 0b110000) | ((last_value + 1) & 0b001111)]
+    noncanonical = f"{capability.signature_base64[:-3]}{alternate}=="
+
+    assert base64.b64decode(noncanonical) == base64.b64decode(capability.signature_base64)
+    with pytest.raises(CloudStateError, match="invalid_authority_capability_signature"):
+        replace(capability, signature_base64=noncanonical)
+
+
+def test_forged_signed_capability_and_live_observation_are_rejected_before_reconciliation() -> None:
+    capability = _command_capability("claim_command", 7)
+
+    with pytest.raises(CloudStateError, match="trusted_authority_signature_invalid"):
+        claim_command(
+            create_command_state(_command()),
+            _claim(),
+            verifier=_VERIFIER,
+            capability=replace(
+                capability, signature_base64=base64.b64encode(b"\0" * 64).decode("ascii")
+            ),
         )
     with pytest.raises(CloudStateError, match="dead_holder_observation_live"):
-        _dead_holder_observation(
+        _VERIFIER.require_dead_holder(
+            _dead_holder_observation(
+                scope_kind="command",
+                scope_key="dispatch-improvement-01",
+                holder_id="claim-improvement-01",
+                authority="coordinator",
+                revision=7,
+                live=True,
+            ),
+            authority="coordinator",
+            subject_id="claim-improvement-01",
             scope_kind="command",
             scope_key="dispatch-improvement-01",
-            holder_id="claim-improvement-01",
-            authority="coordinator",
             revision=7,
-            live=True,
         )
 
 
@@ -270,7 +394,10 @@ def test_active_lease_conflict_fails_before_recovery() -> None:
 
     with pytest.raises(CloudStateError, match="lease_active"):
         acquire_lease(
-            active, desired, capability=_lease_capability(4, "worker-b"), observed_at=_TIMESTAMP
+            active,
+            desired,
+            verifier=_VERIFIER,
+            capability=_lease_capability("acquire_lease", 4, "worker-b"),
         )
 
 
@@ -347,15 +474,15 @@ def test_claim_requires_matching_role_and_current_revision() -> None:
         claim_command(
             state,
             replace(_claim(), authority="builder"),
-            capability=_command_capability(7),
-            observed_at=_TIMESTAMP,
+            verifier=_VERIFIER,
+            capability=_command_capability("claim_command", 7),
         )
     with pytest.raises(CloudStateError, match="command_cas_mismatch"):
         claim_command(
             state,
             _claim(expected_revision=6),
-            capability=_command_capability(7),
-            observed_at=_TIMESTAMP,
+            verifier=_VERIFIER,
+            capability=_command_capability("claim_command", 7),
         )
 
 
@@ -368,7 +495,10 @@ def test_claim_rejects_an_already_expired_holder_and_untrusted_context() -> None
     )
     with pytest.raises(CloudStateError, match="command_claim_expired"):
         claim_command(
-            state, expired_claim, capability=_command_capability(7), observed_at=_TIMESTAMP
+            state,
+            expired_claim,
+            verifier=_VERIFIER,
+            capability=_command_capability("claim_command", 7),
         )
     with pytest.raises(CloudStateError, match="authority_capability_mismatch"):
         claim_command(
@@ -380,21 +510,27 @@ def test_claim_rejects_an_already_expired_holder_and_untrusted_context() -> None
                 scope_kind="command",
                 scope_key="dispatch-improvement-01",
                 revision=7,
+                action="claim_command",
             ),
-            observed_at=_TIMESTAMP,
+            verifier=_VERIFIER,
         )
 
 
 def test_command_claim_successor_is_idempotent_and_preserves_claim_time() -> None:
     state = create_command_state(_command())
     claimed = claim_command(
-        state, _claim(), capability=_command_capability(7), observed_at=_TIMESTAMP
+        state, _claim(), verifier=_VERIFIER, capability=_command_capability("claim_command", 7)
     )
 
     assert claimed.revision == 8
     assert claimed.claim == _claim()
     assert (
-        claim_command(claimed, _claim(), capability=_command_capability(8), observed_at=_TIMESTAMP)
+        claim_command(
+            claimed,
+            _claim(),
+            verifier=_VERIFIER,
+            capability=_command_capability("claim_command", 8),
+        )
         == claimed
     )
     assert CommandState.from_canonical_dict(claimed.to_canonical_dict()) == claimed
@@ -404,13 +540,16 @@ def test_complete_requires_an_exact_result_identity() -> None:
     claimed = claim_command(
         create_command_state(_command()),
         _claim(),
-        capability=_command_capability(7),
-        observed_at=_TIMESTAMP,
+        verifier=_VERIFIER,
+        capability=_command_capability("claim_command", 7),
     )
     transition = _complete_transition()
 
     completed = complete_command(
-        claimed, transition, capability=_command_capability(8), observed_at="2026-08-20T12:02:00Z"
+        claimed,
+        transition,
+        verifier=_VERIFIER,
+        capability=_command_capability("complete_command", 8),
     )
 
     assert completed.result_digest == _RESULT_DIGEST
@@ -418,8 +557,8 @@ def test_complete_requires_an_exact_result_identity() -> None:
         complete_command(
             completed,
             transition,
-            capability=_command_capability(8),
-            observed_at="2026-08-20T12:02:00Z",
+            verifier=_VERIFIER,
+            capability=_command_capability("complete_command", 8),
         )
         == completed
     )
@@ -433,15 +572,16 @@ def test_complete_requires_an_exact_result_identity() -> None:
                 scope_kind="command",
                 scope_key="dispatch-improvement-01",
                 revision=8,
+                action="complete_command",
             ),
-            observed_at="2026-08-20T12:02:00Z",
+            verifier=_VERIFIER,
         )
     with pytest.raises(CloudStateError, match="command_result_conflict"):
         complete_command(
             completed,
             replace(transition, result_digest="d" * 64),
-            capability=_command_capability(8),
-            observed_at="2026-08-20T12:02:00Z",
+            verifier=_VERIFIER,
+            capability=_command_capability("complete_command", 8),
         )
 
 
@@ -449,16 +589,16 @@ def test_terminal_transition_must_chain_from_the_claim_revision() -> None:
     claimed = claim_command(
         create_command_state(_command()),
         _claim(),
-        capability=_command_capability(7),
-        observed_at=_TIMESTAMP,
+        verifier=_VERIFIER,
+        capability=_command_capability("claim_command", 7),
     )
 
     with pytest.raises(CloudStateError, match="transition_claim_revision_mismatch"):
         complete_command(
             claimed,
             _complete_transition(expected_revision=7),
-            capability=_command_capability(8),
-            observed_at="2026-08-20T12:02:00Z",
+            verifier=_VERIFIER,
+            capability=_command_capability("complete_command", 8),
         )
 
 
@@ -466,8 +606,8 @@ def test_fail_command_uses_the_same_fenced_claim_chain() -> None:
     claimed = claim_command(
         create_command_state(_command()),
         _claim(),
-        capability=_command_capability(7),
-        observed_at=_TIMESTAMP,
+        verifier=_VERIFIER,
+        capability=_command_capability("claim_command", 7),
     )
     transition = StateTransition(
         command_key="dispatch-improvement-01",
@@ -482,7 +622,10 @@ def test_fail_command_uses_the_same_fenced_claim_chain() -> None:
     )
 
     failed = fail_command(
-        claimed, transition, capability=_command_capability(8), observed_at="2026-08-20T12:02:00Z"
+        claimed,
+        transition,
+        verifier=_VERIFIER,
+        capability=_command_capability("fail_command", 8),
     )
 
     assert failed.status == "failed"
@@ -529,16 +672,26 @@ def test_expired_lease_requires_trusted_dead_worker_reconciliation_and_fenced_re
 
     with pytest.raises(CloudStateError, match="lease_reconciliation_required"):
         acquire_lease(
-            expired, successor, capability=_lease_capability(4, "worker-b"), observed_at=_TIMESTAMP
+            expired,
+            successor,
+            verifier=_VERIFIER,
+            capability=_lease_capability("acquire_lease", 4, "worker-b"),
         )
     with pytest.raises(CloudStateError, match="dead_holder_observation_live"):
-        _dead_holder_observation(
+        _VERIFIER.require_dead_holder(
+            _dead_holder_observation(
+                scope_kind="lease",
+                scope_key="coordinator",
+                holder_id="worker-a",
+                authority="coordinator",
+                revision=4,
+                live=True,
+            ),
+            authority="coordinator",
+            subject_id="worker-a",
             scope_kind="lease",
             scope_key="coordinator",
-            holder_id="worker-a",
-            authority="coordinator",
             revision=4,
-            live=True,
         )
     reconciliation = LeaseReconciliation(
         lease_key="coordinator",
@@ -552,7 +705,8 @@ def test_expired_lease_requires_trusted_dead_worker_reconciliation_and_fenced_re
     reconciled = reconcile_lease(
         expired,
         reconciliation,
-        capability=_lease_capability(4, "worker-a"),
+        verifier=_VERIFIER,
+        capability=_lease_capability("reconcile_lease", 4, "worker-a"),
         dead_holder=dead_holder,
     )
     successor = replace(successor, revision=5)
@@ -560,8 +714,8 @@ def test_expired_lease_requires_trusted_dead_worker_reconciliation_and_fenced_re
         acquire_lease(
             reconciled,
             successor,
-            capability=_lease_capability(5, "worker-b"),
-            observed_at=_TIMESTAMP,
+            verifier=_VERIFIER,
+            capability=_lease_capability("acquire_lease", 5, "worker-b"),
         )
     released = release_lease(
         reconciled,
@@ -574,13 +728,14 @@ def test_expired_lease_requires_trusted_dead_worker_reconciliation_and_fenced_re
             released_at="2026-08-20T12:01:00Z",
             observation_digest=dead_holder.digest,
         ),
-        capability=_lease_capability(5, "worker-a"),
+        verifier=_VERIFIER,
+        capability=_lease_capability("release_lease", 5, "worker-a"),
     )
     acquired = acquire_lease(
         released,
         replace(successor, revision=6),
-        capability=_lease_capability(6, "worker-b"),
-        observed_at=_TIMESTAMP,
+        verifier=_VERIFIER,
+        capability=_lease_capability("acquire_lease", 6, "worker-b"),
     )
 
     assert acquired.revision == 7
@@ -608,7 +763,8 @@ def test_lease_reconciliation_and_release_are_both_revision_fenced() -> None:
                 next_revision=4,
                 observed_at=_TIMESTAMP,
             ),
-            capability=_lease_capability(4, "worker-a"),
+            verifier=_VERIFIER,
+            capability=_lease_capability("reconcile_lease", 4, "worker-a"),
             dead_holder=_dead_liveness(revision=3),
         )
     dead_holder = _dead_liveness(revision=4)
@@ -622,7 +778,8 @@ def test_lease_reconciliation_and_release_are_both_revision_fenced() -> None:
             next_revision=5,
             observed_at=_TIMESTAMP,
         ),
-        capability=_lease_capability(4, "worker-a"),
+        verifier=_VERIFIER,
+        capability=_lease_capability("reconcile_lease", 4, "worker-a"),
         dead_holder=dead_holder,
     )
     with pytest.raises(CloudStateError, match="lease_cas_mismatch"):
@@ -637,7 +794,8 @@ def test_lease_reconciliation_and_release_are_both_revision_fenced() -> None:
                 released_at="2026-08-20T12:01:00Z",
                 observation_digest=dead_holder.digest,
             ),
-            capability=_lease_capability(5, "worker-a"),
+            verifier=_VERIFIER,
+            capability=_lease_capability("release_lease", 5, "worker-a"),
         )
 
 
@@ -650,15 +808,15 @@ def test_expired_claim_requires_trusted_reconciliation_before_reclaim() -> None:
     claimed = claim_command(
         create_command_state(_command()),
         expired_claim,
-        capability=_command_capability(7),
-        observed_at="2026-08-20T11:01:00Z",
+        verifier=_verifier_at("2026-08-20T11:01:00Z"),
+        capability=_command_capability("claim_command", 7),
     )
     with pytest.raises(CloudStateError, match="command_claim_expired"):
         complete_command(
             claimed,
             _complete_transition(),
-            capability=_command_capability(8),
-            observed_at=_TIMESTAMP,
+            verifier=_VERIFIER,
+            capability=_command_capability("complete_command", 8),
         )
     reconciled = reconcile_expired_claim(
         claimed,
@@ -670,7 +828,8 @@ def test_expired_claim_requires_trusted_reconciliation_before_reclaim() -> None:
             next_revision=9,
             observed_at=_TIMESTAMP,
         ),
-        capability=_command_capability(8),
+        verifier=_VERIFIER,
+        capability=_command_capability("reconcile_expired_claim", 8),
         dead_holder=_dead_holder_observation(
             scope_kind="command",
             scope_key="dispatch-improvement-01",
@@ -686,8 +845,8 @@ def test_expired_claim_requires_trusted_reconciliation_before_reclaim() -> None:
         claim_command(
             reconciled,
             replace(_claim(), expected_revision=9, claim_id="claim-improvement-02"),
-            capability=_command_capability(9, "claim-improvement-02"),
-            observed_at=_TIMESTAMP,
+            verifier=_VERIFIER,
+            capability=_command_capability("claim_command", 9, "claim-improvement-02"),
         ).revision
         == 10
     )
@@ -714,8 +873,9 @@ def test_evidence_object_requires_its_content_addressed_key_and_authorized_produ
                 scope_kind="evidence",
                 scope_key=f"evidence/{_DIGEST}",
                 revision=0,
+                action="register_evidence",
             ),
-            observed_at=_TIMESTAMP,
+            verifier=_VERIFIER,
         )
     assert (
         authorize_evidence(
@@ -726,8 +886,9 @@ def test_evidence_object_requires_its_content_addressed_key_and_authorized_produ
                 scope_kind="evidence",
                 scope_key=f"evidence/{_DIGEST}",
                 revision=0,
+                action="register_evidence",
             ),
-            observed_at=_TIMESTAMP,
+            verifier=_VERIFIER,
         )
         == evidence
     )
@@ -761,8 +922,8 @@ def test_canonical_codecs_reject_extra_and_missing_fields() -> None:
             CloudLease,
         ),
         (_complete_transition(), StateTransition),
-        (_command_capability(7).capability, AuthorityCapability),
-        (_dead_liveness(revision=4).observation, DeadHolderObservation),
+        (_command_capability("claim_command", 7), AuthorityCapability),
+        (_dead_liveness(revision=4), DeadHolderObservation),
         (
             ClaimReconciliation(
                 command_key="dispatch-improvement-01",
@@ -829,6 +990,8 @@ def test_state_backend_exposes_every_fenced_mutation_boundary() -> None:
 
     assert required_methods <= set(StateBackend.__dict__)
     for method_name in required_methods - {"load_projection", "health_snapshot"}:
-        assert "capability" in signature(getattr(StateBackend, method_name)).parameters
+        parameters = signature(getattr(StateBackend, method_name)).parameters
+        assert {"verifier", "capability"} <= set(parameters)
+        assert "observed_at" not in parameters
     for method_name in {"reconcile_expired_claim", "reconcile_lease"}:
         assert "dead_holder" in signature(getattr(StateBackend, method_name)).parameters

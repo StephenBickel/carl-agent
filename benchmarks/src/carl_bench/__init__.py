@@ -2,6 +2,7 @@
 
 from carl_bench.cloud_state import (
     AuthorityCapability,
+    AuthorityVerifier,
     ClaimReconciliation,
     CloudCommand,
     CloudLease,
@@ -15,12 +16,11 @@ from carl_bench.cloud_state import (
     StateBackend,
     StateTransition,
     TrustedAuthorityKey,
-    VerifiedAuthority,
-    VerifiedDeadHolderObservation,
 )
 
 __all__ = [
     "AuthorityCapability",
+    "AuthorityVerifier",
     "ClaimReconciliation",
     "CloudCommand",
     "CloudLease",
@@ -34,6 +34,4 @@ __all__ = [
     "StateBackend",
     "StateTransition",
     "TrustedAuthorityKey",
-    "VerifiedAuthority",
-    "VerifiedDeadHolderObservation",
 ]
