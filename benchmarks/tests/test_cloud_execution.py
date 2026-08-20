@@ -467,16 +467,19 @@ def test_candidate_execution_isolated_from_trusted_evidence_and_inputs(name: str
     jobs = _jobs(_parse_workflow(name))
     evaluate = jobs["evaluate"]
     evidence = jobs["evidence"]
-    evaluate_commands = "\n".join(
-        step["run"] for step in evaluate["steps"] if "run" in step
-    )
+    evaluate_commands = "\n".join(step["run"] for step in evaluate["steps"] if "run" in step)
     evidence_serialized = json.dumps(evidence, sort_keys=True)
 
     assert "sudo -u nobody env -i" in evaluate_commands
     assert "GITHUB_ENV=" not in evaluate_commands
     assert "PYTHONDONTWRITEBYTECODE=1" in evaluate_commands
-    assert "PYTEST_DISABLE_PLUGIN_AUTOLOAD=1" in evaluate_commands
-    assert "-p no:cacheprovider" in evaluate_commands
+    if name == "autonomous-improvement.yml":
+        assert "python -m carl_bench.cloud_harness" in evaluate_commands
+        assert "carl-bench" not in evaluate_commands
+        assert "--adapter scripted" not in evaluate_commands
+    else:
+        assert "PYTEST_DISABLE_PLUGIN_AUTOLOAD=1" in evaluate_commands
+        assert "-p no:cacheprovider" in evaluate_commands
     assert "sha256sum --check" in evaluate_commands
     assert "immutable-inputs" in evaluate_commands
     assert "actions/upload-artifact" not in json.dumps(evaluate)
@@ -503,12 +506,19 @@ def test_improvement_workflow_runs_real_exact_parent_candidate_pair() -> None:
     assert "inputs.parent_commit" in serialized
     assert "inputs.candidate_commit" in serialized
     assert "rev-parse HEAD" in commands
-    assert "benchmark-smoke.sh" in commands
-    assert "carl-bench run" in commands
-    assert "--attempts 3" in commands
-    assert '--subject-commit "$EXPECTED_COMMIT"' in commands
-    assert "carl-bench compare" in commands
+    assert "cargo +1.97.0 build --locked --release" in commands
+    assert "python -m carl_bench.cloud_harness" in commands
+    assert '--parent-binary "$RUNNER_TEMP/build-parent/target/release/carl"' in commands
+    assert '--candidate-binary "$RUNNER_TEMP/build-candidate/target/release/carl"' in commands
+    assert "carl-bench" not in commands
+    assert "--adapter scripted" not in commands
     assert "paired-result" in commands
+    evidence = json.dumps(jobs["evidence"], sort_keys=True)
+    evidence_commands = "\n".join(
+        step["run"] for step in jobs["evidence"]["steps"] if "run" in step
+    )
+    assert '"paired_result": result' in evidence_commands
+    assert "live_acp_credential_missing" in evidence
     assert jobs["evidence"]["needs"] == ["commission", "evaluate"]
 
 
@@ -520,14 +530,12 @@ def test_improvement_workflow_runs_locked_suites_and_uploads_bounded_evidence() 
     commands = "\n".join(step["run"] for step in steps if isinstance(step, dict) and "run" in step)
 
     assert "rev-parse HEAD" in commands
-    assert "test --locked" in commands
-    assert "uv sync --project benchmarks --python 3.12 --locked" in commands
-    assert "pytest -q" in commands
+    assert "build --locked --release" in commands
+    assert "uv sync --project trusted-source/benchmarks --python 3.12 --locked" in commands
+    assert "python -m carl_bench.cloud_harness" in commands
     assert "paired" in commands.casefold()
     assert "request_digest" in json.dumps(jobs["evidence"])
-    _assert_bounded_credential_free_artifact(
-        jobs["evidence"], "autonomous-improvement-evidence"
-    )
+    _assert_bounded_credential_free_artifact(jobs["evidence"], "autonomous-improvement-evidence")
 
 
 def test_soak_workflow_runs_merge_bound_health_probes() -> None:

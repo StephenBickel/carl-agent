@@ -135,8 +135,7 @@ jobs:
     timeout-minutes: 60
     outputs:
       paired_result_digest: ${{ steps.pair.outputs.paired_result_digest }}
-      parent_result_digest: ${{ steps.pair.outputs.parent_result_digest }}
-      candidate_result_digest: ${{ steps.pair.outputs.candidate_result_digest }}
+      paired_result_payload_b64: ${{ steps.pair.outputs.paired_result_payload_b64 }}
     steps:
       - name: Check out trusted harness from protected parent
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -191,7 +190,25 @@ jobs:
           resolve task-set "$TASK_SET_DIGEST"
           resolve metric-pack "$METRIC_PACK_DIGEST"
           resolve policy "$POLICY_DIGEST"
-      - name: Run both subjects without workflow commands or credentials
+      - name: Build exact subjects without workflow commands or credentials
+        env:
+          CANDIDATE_COMMIT: ${{ inputs.candidate_commit }}
+          PARENT_COMMIT: ${{ inputs.parent_commit }}
+        run: |
+          set -euo pipefail
+          chmod 700 "$(dirname "$GITHUB_ENV")"
+          for role in parent candidate; do
+            subject="subject-$role"
+            sandbox="$RUNNER_TEMP/build-$role"
+            mkdir -p "$sandbox/home" "$sandbox/tmp" "$sandbox/cargo" "$sandbox/target"
+            chown -R nobody:nogroup "$sandbox"
+            sudo -u nobody env -i HOME="$sandbox/home" PATH="$PATH" TMPDIR="$sandbox/tmp" \
+              CARGO_HOME="$sandbox/cargo" CARGO_TARGET_DIR="$sandbox/target" \
+              RUSTUP_HOME="$RUSTUP_HOME" \
+              cargo +1.97.0 build --locked --release --manifest-path "$subject/Cargo.toml"
+            test -x "$sandbox/target/release/carl"
+          done
+      - name: Run the protected-parent harness against both exact binaries
         id: pair
         env:
           CANDIDATE_COMMIT: ${{ inputs.candidate_commit }}
@@ -200,49 +217,25 @@ jobs:
           set -euo pipefail
           chmod 700 "$(dirname "$GITHUB_ENV")"
           results="$RUNNER_TEMP/paired-results"
-          mkdir -p "$results"
+          sandbox="$RUNNER_TEMP/harness-sandbox"
+          mkdir -p "$results" "$sandbox/home" "$sandbox/tmp"
+          chown -R nobody:nogroup "$results" "$sandbox"
           uv sync --project trusted-source/benchmarks --python 3.12 --locked
-          for role in parent candidate; do
-            subject="subject-$role"; expected="$PARENT_COMMIT"
-            if [ "$role" = candidate ]; then expected="$CANDIDATE_COMMIT"; fi
-            eval_root="$RUNNER_TEMP/eval-$role"; sandbox="$RUNNER_TEMP/sandbox-$role"
-            cp -R -- "$subject" "$eval_root"
-            rm -rf -- "$eval_root/benchmarks/tests" "$eval_root/benchmarks/tasks/dev"
-            cp -R -- trusted-source/benchmarks/tests "$eval_root/benchmarks/tests"
-            mkdir -p "$eval_root/benchmarks/tasks/dev"
-            tar --extract --file "$RUNNER_TEMP/immutable-inputs/task-set" \
-              --directory "$eval_root/benchmarks/tasks/dev" --no-same-owner --no-same-permissions
-            cp -- trusted-source/scripts/benchmark-smoke.sh "$eval_root/scripts/benchmark-smoke.sh"
-            chmod -R a-w "$eval_root"
-            mkdir -p "$sandbox/home" "$sandbox/tmp" "$sandbox/cargo" "$sandbox/target" "$sandbox/uv"
-            chown -R nobody:nogroup "$sandbox"
-            sudo -u nobody env -i HOME="$sandbox/home" PATH="$PATH" TMPDIR="$sandbox/tmp" \
-              CARGO_HOME="$sandbox/cargo" CARGO_TARGET_DIR="$sandbox/target" \
-              RUSTUP_HOME="$RUSTUP_HOME" UV_CACHE_DIR="$sandbox/uv" \
-              PYTHONDONTWRITEBYTECODE=1 \
-              UV_PROJECT_ENVIRONMENT="$sandbox/venv" SUBJECT_ROOT="$eval_root" \
-              EXPECTED_COMMIT="$expected" RESULT_PATH="$sandbox/scorecard.json" \
-              bash --noprofile --norc -c '
-                set -euo pipefail; cd "$SUBJECT_ROOT"
-                cargo +1.97.0 test --locked --test workflow_contract --test docs_contract
-                uv sync --project benchmarks --python 3.12 --locked
-                PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 uv run --offline --project benchmarks --locked \
-                  pytest -q -c /dev/null -p no:cacheprovider benchmarks/tests
-                uv run --offline --project benchmarks --locked carl-bench run \
-                  --tasks "$SUBJECT_ROOT/benchmarks/tasks/dev" --adapter scripted \
-                  --attempts 3 --seed 20260819 --subject-commit "$EXPECTED_COMMIT" \
-                  --public-result "$RESULT_PATH"
-                ./scripts/benchmark-smoke.sh
-              '
-            test -f "$sandbox/scorecard.json"; test ! -L "$sandbox/scorecard.json"
-            cp -- "$sandbox/scorecard.json" "$results/$role.json"
-          done
-          uv run --offline --project trusted-source/benchmarks --locked carl-bench compare \
-            --baseline "$results/parent.json" --candidate "$results/candidate.json" \
-            --comparison-seed 20260819 --public-result "$results/paired-result.json"
-          printf 'parent_result_digest=%s\n' "$(sha256sum "$results/parent.json" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
-          printf 'candidate_result_digest=%s\n' "$(sha256sum "$results/candidate.json" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          sudo -u nobody env -i HOME="$sandbox/home" PATH="$PATH" TMPDIR="$sandbox/tmp" \
+            PYTHONDONTWRITEBYTECODE=1 \
+            trusted-source/benchmarks/.venv/bin/python -m carl_bench.cloud_harness \
+              --parent-binary "$RUNNER_TEMP/build-parent/target/release/carl" \
+              --candidate-binary "$RUNNER_TEMP/build-candidate/target/release/carl" \
+              --parent-commit "$PARENT_COMMIT" --candidate-commit "$CANDIDATE_COMMIT" \
+              --experiment "$RUNNER_TEMP/immutable-inputs/experiment" \
+              --task-set "$RUNNER_TEMP/immutable-inputs/task-set" \
+              --metric-pack "$RUNNER_TEMP/immutable-inputs/metric-pack" \
+              --policy "$RUNNER_TEMP/immutable-inputs/policy" \
+              --mode improvement --output "$results/paired-result.json"
+          test -f "$results/paired-result.json"; test ! -L "$results/paired-result.json"
+          test "$(wc -c < "$results/paired-result.json")" -le 262145
           printf 'paired_result_digest=%s\n' "$(sha256sum "$results/paired-result.json" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          printf 'paired_result_payload_b64=%s\n' "$(base64 -w0 "$results/paired-result.json")" >> "$GITHUB_OUTPUT"
 
   evidence:
     name: Create trusted bounded evidence
@@ -253,12 +246,11 @@ jobs:
       - name: Write fresh trusted evidence
         env:
           CANDIDATE_COMMIT: ${{ inputs.candidate_commit }}
-          CANDIDATE_RESULT_DIGEST: ${{ needs.evaluate.outputs.candidate_result_digest }}
           EXPERIMENT_DIGEST: ${{ inputs.experiment_digest }}
           METRIC_PACK_DIGEST: ${{ inputs.metric_pack_digest }}
           PAIRED_RESULT_DIGEST: ${{ needs.evaluate.outputs.paired_result_digest }}
+          PAIRED_RESULT_PAYLOAD_B64: ${{ needs.evaluate.outputs.paired_result_payload_b64 }}
           PARENT_COMMIT: ${{ inputs.parent_commit }}
-          PARENT_RESULT_DIGEST: ${{ needs.evaluate.outputs.parent_result_digest }}
           POLICY_DIGEST: ${{ inputs.policy_digest }}
           REPOSITORY: ${{ github.repository }}
           REQUEST_DIGEST: ${{ inputs.request_digest }}
@@ -268,20 +260,37 @@ jobs:
         run: |
           mkdir -p cloud-evidence
           python3 - <<'PY'
-          import json, os, pathlib
+          import base64, hashlib, json, os, pathlib
+          payload = base64.b64decode(os.environ["PAIRED_RESULT_PAYLOAD_B64"], validate=True)
+          if hashlib.sha256(payload).hexdigest() != os.environ["PAIRED_RESULT_DIGEST"]:
+              raise SystemExit("paired result digest mismatch")
+          result = json.loads(payload)
+          expected_inputs = {
+              "experiment": os.environ["EXPERIMENT_DIGEST"],
+              "metric_pack": os.environ["METRIC_PACK_DIGEST"],
+              "policy": os.environ["POLICY_DIGEST"],
+              "task_set": os.environ["TASK_SET_DIGEST"],
+          }
+          if result.get("immutable_inputs") != expected_inputs:
+              raise SystemExit("paired result immutable input mismatch")
+          if result.get("parent", {}).get("commit") != os.environ["PARENT_COMMIT"]:
+              raise SystemExit("paired result parent mismatch")
+          if result.get("candidate", {}).get("commit") != os.environ["CANDIDATE_COMMIT"]:
+              raise SystemExit("paired result candidate mismatch")
+          if result.get("eligible") is not False or result.get("reasons") != ["live_acp_credential_missing"]:
+              raise SystemExit("live ACP fail-closed gate missing")
           evidence = {
               "candidate_commit": os.environ["CANDIDATE_COMMIT"],
-              "candidate_result_digest": os.environ["CANDIDATE_RESULT_DIGEST"],
               "experiment_digest": os.environ["EXPERIMENT_DIGEST"],
               "kind": "autonomous_improvement_evidence",
               "metric_pack_digest": os.environ["METRIC_PACK_DIGEST"],
               "paired_result_digest": os.environ["PAIRED_RESULT_DIGEST"],
+              "paired_result": result,
               "parent_commit": os.environ["PARENT_COMMIT"],
-              "parent_result_digest": os.environ["PARENT_RESULT_DIGEST"],
               "policy_digest": os.environ["POLICY_DIGEST"],
               "repository": os.environ["REPOSITORY"],
               "request_digest": os.environ["REQUEST_DIGEST"],
-              "run_id": int(os.environ["RUN_ID"]), "schema_version": 2,
+              "run_id": int(os.environ["RUN_ID"]), "schema_version": 3,
               "task_set_digest": os.environ["TASK_SET_DIGEST"],
               "trusted_inputs_digest": os.environ["TRUSTED_INPUTS_DIGEST"],
               "workflow_file": "autonomous-improvement.yml",
