@@ -56,19 +56,30 @@ def test_linux_sandbox_command_has_explicit_mounts_and_no_host_root_bind(
     toolchain.mkdir()
     bwrap = tmp_path / "bwrap"
     bwrap.write_text("fixture", encoding="utf-8")
+    sudo = tmp_path / "sudo"
+    sudo.write_text("fixture", encoding="utf-8")
 
     command = _sandbox_command(
         ("/toolchain/python", "subject.py"),
         readonly_paths=(checkout, toolchain),
         writable_paths=(writable,),
         platform="linux",
-        executable_lookup=lambda name: os.fspath(bwrap) if name == "bwrap" else None,
+        executable_lookup=lambda name: {
+            "bwrap": os.fspath(bwrap),
+            "sudo": os.fspath(sudo),
+        }.get(name),
     )
 
-    assert command[0] == os.fspath(bwrap)
+    assert command[:3] == (os.fspath(sudo), "--non-interactive", os.fspath(bwrap))
     assert command[-2:] == ("/toolchain/python", "subject.py")
     assert "--unshare-net" in command
     assert "--die-with-parent" in command
+    assert ("--cap-drop", "ALL") in tuple(
+        tuple(command[index : index + 2]) for index in range(len(command) - 1)
+    )
+    assert ("--uid", "65534") in tuple(
+        tuple(command[index : index + 2]) for index in range(len(command) - 1)
+    )
     assert ("--ro-bind", "/", "/") not in tuple(
         tuple(command[index : index + 3]) for index in range(len(command) - 2)
     )

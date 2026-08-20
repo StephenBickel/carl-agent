@@ -129,14 +129,23 @@ def _sandbox_command(
         )
     if platform.startswith("linux"):
         bubblewrap = executable_lookup("bwrap")
-        if bubblewrap is None:
+        sudo = executable_lookup("sudo")
+        if bubblewrap is None or sudo is None:
             raise CommissioningArtifactError("synthetic_execution_sandbox_unavailable")
         prefix: list[str] = [
+            sudo,
+            "--non-interactive",
             bubblewrap,
             "--die-with-parent",
             "--new-session",
             "--unshare-all",
             "--unshare-net",
+            "--cap-drop",
+            "ALL",
+            "--uid",
+            "65534",
+            "--gid",
+            "65534",
             "--tmpfs",
             "/",
         ]
