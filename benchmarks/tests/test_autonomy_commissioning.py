@@ -1277,6 +1277,7 @@ def test_controller_subprocess_recovers_two_effect_receipt_boundaries(
         "occurred_at": "2026-08-19T09:13:00Z",
         "pr": None,
         "ref": f"refs/heads/experimental/{EXPERIMENT_ID}",
+        "repository_id": "fixture/carl-agent",
         "schema_version": 1,
         "source_repository": os.fspath(disposable_git.builder),
         "target_commit": disposable_git.valid_candidate,
@@ -1355,6 +1356,7 @@ def test_controller_subprocess_recovers_two_effect_receipt_boundaries(
             "role": "promotion",
         },
         "ref": "refs/heads/main",
+        "repository_id": "fixture/carl-agent",
         "schema_version": 1,
         "source_repository": os.fspath(disposable_git.builder),
         "target_commit": promotion_commit,
@@ -1601,6 +1603,308 @@ def test_protected_runner_derives_scores_from_commands_and_denies_sockets(
             evaluator_ref=evaluator_ref,
             changed_paths=_changed_paths(disposable_git, disposable_git.network_candidate),
         )
+
+
+def _write_controller_request(root: Path, name: str, value: dict[str, object]) -> Path:
+    path = root / f"{name}.json"
+    path.write_bytes(canonical_json_bytes(value))
+    path.chmod(0o600)
+    return path
+
+
+def test_changed_main_receipt_replay_and_exact_revert_are_durable_real_effects(
+    tmp_path: Path,
+    disposable_git: DisposableGitFixture,
+) -> None:
+    from carl_bench.commissioning_controller import (
+        CommissioningControllerError,
+        CommissioningEffectStore,
+    )
+
+    automation_root = tmp_path / "automation-data"
+    commissioning_store = CommissioningArtifactStore(
+        automation_data_root=automation_root,
+        repository_root=disposable_git.builder,
+    )
+    evidence = PrivateArtifactStore(
+        commissioning_store.objects_root,
+        disposable_git.builder,
+    )
+    protected_runner = ProtectedRunner(
+        disposable_git,
+        automation_root / ".protected-runner",
+    )
+    request_root = automation_root / ".shared-private" / "attack-requests"
+    request_root.mkdir(mode=0o700)
+    request_root.chmod(0o700)
+    effect_store_path = (
+        automation_root / ".shared-private" / "commissioning-effects.sqlite3"
+    )
+
+    changed_origin = disposable_git.root / "changed-main-origin.git"
+    _git(
+        disposable_git.root,
+        "clone",
+        "--bare",
+        os.fspath(disposable_git.origin),
+        os.fspath(changed_origin),
+    )
+    changed_builder = disposable_git.root / "changed-main-builder"
+    _git(
+        disposable_git.root,
+        "clone",
+        os.fspath(changed_origin),
+        os.fspath(changed_builder),
+    )
+    _git(changed_builder, "config", "user.email", "drift@example.invalid")
+    _git(changed_builder, "config", "user.name", "Changed Main Attack")
+    _git(changed_builder, "switch", "main")
+    drift_commit = _write_commit(
+        changed_builder,
+        "unexpected-main.txt",
+        "unexpected production advance\n",
+        "advance main before promotion reconciliation",
+    )
+    _git(changed_builder, "push", "origin", "HEAD:refs/heads/main")
+    drift_tree = _git(changed_builder, "rev-parse", "HEAD^{tree}")
+    changed_main_request = {
+        "effect_key": f"changed-main:{EXPERIMENT_ID}",
+        "expected_old_commit": disposable_git.baseline,
+        "kind": "main_precondition",
+        "occurred_at": "2026-08-19T09:30:00Z",
+        "pr": None,
+        "ref": "refs/heads/main",
+        "repository_id": "fixture/carl-agent-changed-main",
+        "schema_version": 1,
+        "source_repository": os.fspath(disposable_git.builder),
+        "target_commit": disposable_git.valid_candidate,
+        "target_tree": disposable_git.valid_tree,
+    }
+    changed_main_path = _write_controller_request(
+        request_root,
+        "changed-main",
+        changed_main_request,
+    )
+    changed_main = _complete_controller(
+        _controller_command(
+            effect_store=effect_store_path,
+            artifact_store=commissioning_store.objects_root,
+            repository_root=disposable_git.builder,
+            bare_repository=changed_origin,
+            request_path=changed_main_path,
+            signing_key=protected_runner.key_path,
+        )
+    )
+    assert changed_main == {
+        "action": "blocked",
+        "effect_key": changed_main_request["effect_key"],
+        "observed_commit": drift_commit,
+        "reason": "production_parent_changed",
+    }
+    assert _git(changed_origin, "rev-parse", "refs/heads/main") == drift_commit
+    assert _git(changed_origin, "rev-parse", "refs/heads/main^{tree}") == drift_tree
+    changed_record = _inspect_effect(
+        effect_store_path,
+        str(changed_main_request["effect_key"]),
+    )
+    assert changed_record["status"] == "rejected"
+    assert changed_record["pull_request"] is None
+
+    _git(disposable_git.builder, "switch", "-C", "healthy-production", disposable_git.baseline)
+    _git(
+        disposable_git.builder,
+        "merge",
+        "--no-ff",
+        "--no-edit",
+        disposable_git.valid_candidate,
+    )
+    healthy_merge = _git(disposable_git.builder, "rev-parse", "HEAD")
+    healthy_tree = _git(disposable_git.builder, "rev-parse", "HEAD^{tree}")
+    healthy_request = {
+        "effect_key": f"healthy-promotion:{EXPERIMENT_ID}",
+        "expected_old_commit": disposable_git.baseline,
+        "kind": "promotion_merge",
+        "occurred_at": "2026-08-19T10:00:00Z",
+        "pr": {
+            "base_branch": "main",
+            "head_branch": f"experimental/{EXPERIMENT_ID}",
+            "head_commit": disposable_git.valid_candidate,
+            "head_tree": disposable_git.valid_tree,
+            "number": 41,
+            "promotion_id": f"promotion-{EXPERIMENT_ID}-1",
+            "role": "promotion",
+        },
+        "ref": "refs/heads/main",
+        "repository_id": "fixture/carl-agent",
+        "schema_version": 1,
+        "source_repository": os.fspath(disposable_git.builder),
+        "target_commit": healthy_merge,
+        "target_tree": healthy_tree,
+    }
+    healthy_path = _write_controller_request(request_root, "healthy", healthy_request)
+    assert _complete_controller(
+        _controller_command(
+            effect_store=effect_store_path,
+            artifact_store=commissioning_store.objects_root,
+            repository_root=disposable_git.builder,
+            bare_repository=disposable_git.origin,
+            request_path=healthy_path,
+            signing_key=protected_runner.key_path,
+        )
+    )["action"] == "effect_receipted"
+
+    _git(disposable_git.builder, "switch", "-C", "hard-candidate", healthy_merge)
+    hard_candidate = _write_commit(
+        disposable_git.builder,
+        "src/runtime/subject.py",
+        "raise RuntimeError('hard production regression')\n",
+        "inject hard production regression after accepted candidate",
+    )
+    hard_candidate_tree = _git(disposable_git.builder, "rev-parse", "HEAD^{tree}")
+    _git(disposable_git.builder, "switch", "-C", "hard-merge", healthy_merge)
+    _git(disposable_git.builder, "merge", "--no-ff", "--no-edit", hard_candidate)
+    hard_merge = _git(disposable_git.builder, "rev-parse", "HEAD")
+    hard_tree = _git(disposable_git.builder, "rev-parse", "HEAD^{tree}")
+    assert hard_tree == hard_candidate_tree
+    hard_request = {
+        "effect_key": f"hard-regression:{EXPERIMENT_ID}",
+        "expected_old_commit": healthy_merge,
+        "kind": "hard_regression_merge",
+        "occurred_at": "2026-08-19T12:00:00Z",
+        "pr": {
+            "base_branch": "main",
+            "head_branch": f"hard-regression/{EXPERIMENT_ID}",
+            "head_commit": hard_candidate,
+            "head_tree": hard_tree,
+            "number": 42,
+            "promotion_id": f"hard-regression-{EXPERIMENT_ID}-1",
+            "role": "hard_regression",
+        },
+        "ref": "refs/heads/main",
+        "repository_id": "fixture/carl-agent",
+        "schema_version": 1,
+        "source_repository": os.fspath(disposable_git.builder),
+        "target_commit": hard_merge,
+        "target_tree": hard_tree,
+    }
+    hard_path = _write_controller_request(request_root, "hard-regression", hard_request)
+    assert _complete_controller(
+        _controller_command(
+            effect_store=effect_store_path,
+            artifact_store=commissioning_store.objects_root,
+            repository_root=disposable_git.builder,
+            bare_repository=disposable_git.origin,
+            request_path=hard_path,
+            signing_key=protected_runner.key_path,
+        )
+    )["action"] == "effect_receipted"
+    assert _git(disposable_git.origin, "rev-parse", "refs/heads/main") == hard_merge
+
+    _git(disposable_git.builder, "switch", "-C", "exact-revert-candidate", hard_merge)
+    _git(disposable_git.builder, "revert", "-m", "1", "--no-edit", hard_merge)
+    revert_candidate = _git(disposable_git.builder, "rev-parse", "HEAD")
+    revert_candidate_tree = _git(disposable_git.builder, "rev-parse", "HEAD^{tree}")
+    assert revert_candidate_tree == healthy_tree
+    _git(disposable_git.builder, "switch", "-C", "exact-revert-merge", hard_merge)
+    _git(disposable_git.builder, "merge", "--no-ff", "--no-edit", revert_candidate)
+    revert_merge = _git(disposable_git.builder, "rev-parse", "HEAD")
+    revert_tree = _git(disposable_git.builder, "rev-parse", "HEAD^{tree}")
+    assert revert_tree == healthy_tree
+    revert_request = {
+        "effect_key": f"exact-revert:{EXPERIMENT_ID}",
+        "expected_old_commit": hard_merge,
+        "kind": "revert_merge",
+        "occurred_at": "2026-08-19T13:00:00Z",
+        "pr": {
+            "base_branch": "main",
+            "head_branch": f"revert/hard-regression-{EXPERIMENT_ID}-1",
+            "head_commit": revert_candidate,
+            "head_tree": revert_tree,
+            "number": 43,
+            "promotion_id": f"revert-{EXPERIMENT_ID}-1",
+            "role": "revert",
+        },
+        "ref": "refs/heads/main",
+        "repository_id": "fixture/carl-agent",
+        "schema_version": 1,
+        "source_repository": os.fspath(disposable_git.builder),
+        "target_commit": revert_merge,
+        "target_tree": revert_tree,
+    }
+    revert_path = _write_controller_request(request_root, "exact-revert", revert_request)
+    assert _complete_controller(
+        _controller_command(
+            effect_store=effect_store_path,
+            artifact_store=commissioning_store.objects_root,
+            repository_root=disposable_git.builder,
+            bare_repository=disposable_git.origin,
+            request_path=revert_path,
+            signing_key=protected_runner.key_path,
+        )
+    )["action"] == "effect_receipted"
+    assert _git(disposable_git.origin, "rev-parse", "refs/heads/main") == revert_merge
+    assert _git(disposable_git.origin, "rev-parse", "refs/heads/main^{tree}") == healthy_tree
+    hard_record = _inspect_effect(effect_store_path, str(hard_request["effect_key"]))
+    revert_record = _inspect_effect(effect_store_path, str(revert_request["effect_key"]))
+    assert hard_record["pull_request"]["state"] == "MERGED"
+    assert revert_record["pull_request"]["state"] == "MERGED"
+    assert hard_record["pull_request"]["number"] == 42
+    assert revert_record["pull_request"]["number"] == 43
+
+    capability_report = evaluate_capability_validation(
+        _capability_claim(),
+        _baseline_outcomes(),
+        _improved_outcomes(),
+        ("src/runtime/capability.txt",),
+    )
+    protected_receipt = _protected_receipt(
+        manifest_digest="a" * 64,
+        fixture=disposable_git,
+        capability_report=capability_report,
+    )
+    envelope = protected_runner.sign(protected_receipt)
+    expectation = replace(
+        _promotion_expectation(protected_receipt),
+        capability_report_digest=capability_report.digest,
+        transfer_gain_basis_points=capability_report.transfer_gain_basis_points,
+        capability_claim_type=capability_report.claim_type,
+        affected_contract_cases_improved=capability_report.affected_contract_cases_improved,
+        capability_guards_non_inferior=capability_report.guards_non_inferior,
+    )
+    verify_protected_validation(
+        envelope,
+        public_key_pem=protected_runner.public_key_pem,
+        expected=expectation,
+        now=NOW,
+        changed_paths=("src/runtime/capability.txt",),
+    )
+    envelope_ref = evidence.put(
+        evidence_kind="signed_protected_receipt",
+        media_type="application/json",
+        content=canonical_json_bytes(
+            {
+                "key_id": envelope.key_id,
+                "receipt": envelope.receipt.to_canonical_dict(),
+                "signature_base64": envelope.signature_base64,
+            }
+        ),
+    )
+    durable_effects = CommissioningEffectStore(effect_store_path)
+    first_use = durable_effects.consume_protected_receipt(
+        receipt_digest=protected_receipt.digest,
+        envelope_ref=envelope_ref,
+        occurred_at="2026-08-19T10:00:00Z",
+    )
+    assert first_use == "consumed"
+    with pytest.raises(CommissioningControllerError, match="protected_receipt_replay"):
+        durable_effects.consume_protected_receipt(
+            receipt_digest=protected_receipt.digest,
+            envelope_ref=envelope_ref,
+            occurred_at="2026-08-19T10:01:00Z",
+        )
+    assert [
+        attempt["outcome"] for attempt in durable_effects.protected_receipt_attempts()
+    ] == ["consumed", "replay_rejected"]
 
 
 def test_component_scenarios_cannot_self_issue_commissioning_pass(

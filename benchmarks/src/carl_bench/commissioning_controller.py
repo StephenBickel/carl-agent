@@ -29,6 +29,7 @@ from carl_bench.artifacts import ArtifactRef, PrivateArtifactStore
 from carl_bench.canonical import canonical_json_bytes
 
 _OBJECT_RE = re.compile(r"^[0-9a-f]{40}$")
+_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 _KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,191}$")
 _REF_RE = re.compile(r"^refs/heads/[A-Za-z0-9][A-Za-z0-9._/-]{0,191}$")
 _KINDS = frozenset(
@@ -36,6 +37,7 @@ _KINDS = frozenset(
         "experimental_publish",
         "promotion_merge",
         "hard_regression_merge",
+        "main_precondition",
         "revert_merge",
     }
 )
@@ -181,6 +183,7 @@ class EffectRequest:
     target_commit: str
     target_tree: str
     source_repository: str
+    repository_id: str
     occurred_at: str
     pr: ProtectedPullRequestRecord | None
 
@@ -193,6 +196,7 @@ class EffectRequest:
             "occurred_at",
             "pr",
             "ref",
+            "repository_id",
             "schema_version",
             "source_repository",
             "target_commit",
@@ -218,12 +222,24 @@ class EffectRequest:
         _object(request.target_commit, "invalid_effect_target")
         _object(request.target_tree, "invalid_effect_tree")
         _local_directory(request.source_repository, "invalid_effect_source")
+        _key(request.repository_id, "invalid_effect_repository")
         _timestamp(request.occurred_at, "invalid_effect_timestamp")
         if request.kind == "experimental_publish":
             if request.pr is not None or not request.ref.startswith("refs/heads/experimental/"):
                 raise CommissioningControllerError("invalid_experimental_effect")
+        elif request.kind == "main_precondition":
+            if request.pr is not None or request.ref != "refs/heads/main":
+                raise CommissioningControllerError("invalid_main_precondition")
         elif request.pr is None or request.ref != "refs/heads/main":
             raise CommissioningControllerError("invalid_protected_effect")
+        if request.pr is not None:
+            expected_role = {
+                "promotion_merge": "promotion",
+                "hard_regression_merge": "hard_regression",
+                "revert_merge": "revert",
+            }.get(request.kind)
+            if request.pr.role != expected_role:
+                raise CommissioningControllerError("protected_pr_role_mismatch")
         return request
 
     def to_canonical_dict(self) -> dict[str, Any]:
@@ -234,6 +250,7 @@ class EffectRequest:
             "occurred_at": self.occurred_at,
             "pr": self.pr.to_canonical_dict() if self.pr is not None else None,
             "ref": self.ref,
+            "repository_id": self.repository_id,
             "schema_version": self.schema_version,
             "source_repository": self.source_repository,
             "target_commit": self.target_commit,
@@ -301,6 +318,18 @@ class CommissioningEffectStore:
                         observed_commit TEXT NOT NULL,
                         occurred_at TEXT NOT NULL,
                         receipt_digest TEXT
+                    );
+                    CREATE TABLE IF NOT EXISTS protected_receipt_consumptions(
+                        receipt_digest TEXT PRIMARY KEY,
+                        envelope_ref_json TEXT NOT NULL,
+                        consumed_at TEXT NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS protected_receipt_attempts(
+                        ordinal INTEGER PRIMARY KEY AUTOINCREMENT,
+                        receipt_digest TEXT NOT NULL,
+                        envelope_ref_json TEXT NOT NULL,
+                        occurred_at TEXT NOT NULL,
+                        outcome TEXT NOT NULL
                     );
                     """
                 )
@@ -398,6 +427,93 @@ class CommissioningEffectStore:
                     (request.target_commit, request.target_tree, request.effect_key),
                 )
             connection.commit()
+
+    def mark_rejected(self, request: EffectRequest, result: dict[str, Any]) -> None:
+        encoded = canonical_json_bytes(result).decode("utf-8")
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT status, result_json FROM commissioning_effects WHERE effect_key = ?",
+                (request.effect_key,),
+            ).fetchone()
+            if row is None:
+                raise CommissioningControllerError("effect_not_found")
+            if row["status"] == "rejected":
+                if row["result_json"] != encoded:
+                    raise CommissioningControllerError("effect_result_conflict")
+                connection.commit()
+                return
+            if row["status"] != "pending":
+                raise CommissioningControllerError("effect_state_invalid")
+            connection.execute(
+                "UPDATE commissioning_effects SET status = 'rejected', result_json = ? "
+                "WHERE effect_key = ? AND status = 'pending'",
+                (encoded, request.effect_key),
+            )
+            connection.commit()
+
+    def consume_protected_receipt(
+        self,
+        *,
+        receipt_digest: str,
+        envelope_ref: ArtifactRef,
+        occurred_at: str,
+    ) -> str:
+        if not isinstance(receipt_digest, str) or _DIGEST_RE.fullmatch(receipt_digest) is None:
+            raise CommissioningControllerError("invalid_protected_receipt_digest")
+        if (
+            not isinstance(envelope_ref, ArtifactRef)
+            or envelope_ref.evidence_kind != "signed_protected_receipt"
+            or envelope_ref.media_type != "application/json"
+        ):
+            raise CommissioningControllerError("invalid_protected_receipt_ref")
+        _timestamp(occurred_at, "invalid_protected_receipt_time")
+        encoded_ref = canonical_json_bytes(envelope_ref.to_canonical_dict()).decode("utf-8")
+        replay = False
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT envelope_ref_json FROM protected_receipt_consumptions "
+                "WHERE receipt_digest = ?",
+                (receipt_digest,),
+            ).fetchone()
+            if existing is None:
+                outcome = "consumed"
+                connection.execute(
+                    "INSERT INTO protected_receipt_consumptions("
+                    "receipt_digest, envelope_ref_json, consumed_at) VALUES(?, ?, ?)",
+                    (receipt_digest, encoded_ref, occurred_at),
+                )
+            else:
+                if existing["envelope_ref_json"] != encoded_ref:
+                    raise CommissioningControllerError("protected_receipt_identity_conflict")
+                outcome = "replay_rejected"
+                replay = True
+            connection.execute(
+                "INSERT INTO protected_receipt_attempts("
+                "receipt_digest, envelope_ref_json, occurred_at, outcome) VALUES(?, ?, ?, ?)",
+                (receipt_digest, encoded_ref, occurred_at, outcome),
+            )
+            connection.commit()
+        if replay:
+            raise CommissioningControllerError("protected_receipt_replay")
+        return outcome
+
+    def protected_receipt_attempts(self) -> tuple[dict[str, Any], ...]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT receipt_digest, envelope_ref_json, occurred_at, outcome "
+                "FROM protected_receipt_attempts ORDER BY ordinal"
+            ).fetchall()
+        return tuple(
+            {
+                "envelope_ref": json.loads(row["envelope_ref_json"]),
+                "occurred_at": row["occurred_at"],
+                "outcome": row["outcome"],
+                "receipt_digest": row["receipt_digest"],
+            }
+            for row in rows
+        )
 
     def record_recovery(self, request: EffectRequest, observed_commit: str) -> None:
         recovery_id = hashlib.sha256(
@@ -737,6 +853,28 @@ def run_controller(
     initial_status = store.begin(request)
 
     observed = _read_ref(bare, request.ref)
+    if request.kind == "main_precondition":
+        if observed == request.expected_old_commit:
+            raise CommissioningControllerError("main_precondition_not_changed")
+        result = {
+            "expected_commit": request.expected_old_commit,
+            "observed_commit": observed,
+            "reason": "production_parent_changed",
+            "ref": request.ref,
+        }
+        store.mark_rejected(request, result)
+        store.record_invocation(
+            request=request,
+            action="production_parent_changed",
+            observed_commit=observed,
+            receipt_digest=None,
+        )
+        return {
+            "action": "blocked",
+            "effect_key": request.effect_key,
+            "observed_commit": observed,
+            "reason": "production_parent_changed",
+        }
     if initial_status == "receipted":
         if observed != request.target_commit:
             raise CommissioningControllerError("receipted_effect_identity_mismatch")
