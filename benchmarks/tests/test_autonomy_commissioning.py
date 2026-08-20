@@ -55,6 +55,7 @@ from carl_bench.commissioning import (
     CommissioningArtifactError,
     CommissioningArtifactStore,
     SyntheticCommissioningReceipt,
+    SyntheticCommissioningSources,
 )
 from carl_bench.experiment import (
     EventType,
@@ -1103,6 +1104,24 @@ def test_accepted_lifecycle_is_derived_from_fresh_ledger_and_bare_refs(
     assert verified.soak_elapsed_seconds >= 24 * 60 * 60
     assert verified.lifecycle_artifact_ref == lifecycle_ref
 
+    export_ref, chain_ref = store.capture_lifecycle_sources(
+        experiment_id=EXPERIMENT_ID,
+        ledger_path=ledger_path,
+    )
+    export = json.loads(store.read(export_ref))
+    chain = json.loads(store.read(chain_ref))
+    assert export["schema_version"] == 2
+    assert export["projection"]["state"] == "accepted"
+    assert chain == {
+        "event_count": len(export["events"]),
+        "experiment_id": EXPERIMENT_ID,
+        "lifecycle_export_digest": export_ref.digest,
+        "manifest_digest": manifest.digest,
+        "schema_version": 1,
+        "terminal_chain_digest": chain["terminal_chain_digest"],
+    }
+    assert len(chain["terminal_chain_digest"]) == 64
+
     object_path = store.objects_root / lifecycle_ref.digest
     object_path.write_bytes(b"x" * lifecycle_ref.byte_size)
     object_path.chmod(0o600)
@@ -1795,6 +1814,30 @@ def test_changed_main_receipt_replay_and_exact_revert_are_durable_real_effects(
         "target_tree": healthy_tree,
     }
     healthy_path = _write_controller_request(request_root, "healthy", healthy_request)
+    healthy_marker = request_root / "healthy.effect-applied"
+    _kill_after_effect(
+        _controller_command(
+            effect_store=effect_store_path,
+            artifact_store=commissioning_store.objects_root,
+            repository_root=disposable_git.builder,
+            bare_repository=disposable_git.origin,
+            request_path=healthy_path,
+            signing_key=protected_runner.key_path,
+            pause_marker=healthy_marker,
+        ),
+        healthy_marker,
+    )
+    healthy_recovery = _complete_controller(
+        _controller_command(
+            effect_store=effect_store_path,
+            artifact_store=commissioning_store.objects_root,
+            repository_root=disposable_git.builder,
+            bare_repository=disposable_git.origin,
+            request_path=healthy_path,
+            signing_key=protected_runner.key_path,
+        )
+    )
+    assert healthy_recovery["action"] == "recovered_effect_receipt"
     assert (
         _complete_controller(
             _controller_command(
@@ -1806,7 +1849,7 @@ def test_changed_main_receipt_replay_and_exact_revert_are_durable_real_effects(
                 signing_key=protected_runner.key_path,
             )
         )["action"]
-        == "effect_receipted"
+        == "already_receipted"
     )
 
     _git(disposable_git.builder, "switch", "-C", "hard-candidate", healthy_merge)
@@ -1844,6 +1887,30 @@ def test_changed_main_receipt_replay_and_exact_revert_are_durable_real_effects(
         "target_tree": hard_tree,
     }
     hard_path = _write_controller_request(request_root, "hard-regression", hard_request)
+    hard_marker = request_root / "hard-regression.effect-applied"
+    _kill_after_effect(
+        _controller_command(
+            effect_store=effect_store_path,
+            artifact_store=commissioning_store.objects_root,
+            repository_root=disposable_git.builder,
+            bare_repository=disposable_git.origin,
+            request_path=hard_path,
+            signing_key=protected_runner.key_path,
+            pause_marker=hard_marker,
+        ),
+        hard_marker,
+    )
+    hard_recovery = _complete_controller(
+        _controller_command(
+            effect_store=effect_store_path,
+            artifact_store=commissioning_store.objects_root,
+            repository_root=disposable_git.builder,
+            bare_repository=disposable_git.origin,
+            request_path=hard_path,
+            signing_key=protected_runner.key_path,
+        )
+    )
+    assert hard_recovery["action"] == "recovered_effect_receipt"
     assert (
         _complete_controller(
             _controller_command(
@@ -1855,7 +1922,7 @@ def test_changed_main_receipt_replay_and_exact_revert_are_durable_real_effects(
                 signing_key=protected_runner.key_path,
             )
         )["action"]
-        == "effect_receipted"
+        == "already_receipted"
     )
     assert _git(disposable_git.origin, "rev-parse", "refs/heads/main") == hard_merge
 
@@ -1913,14 +1980,47 @@ def test_changed_main_receipt_replay_and_exact_revert_are_durable_real_effects(
     assert hard_record["pull_request"]["number"] == 42
     assert revert_record["pull_request"]["number"] == 43
 
-    capability_report = evaluate_capability_validation(
-        _capability_claim(),
-        _baseline_outcomes(),
-        _improved_outcomes(),
-        ("src/runtime/capability.txt",),
+    from carl_bench.commissioning_runner import ProtectedSyntheticRunner
+
+    evaluator_ref = evidence.put(
+        evidence_kind="protected_evaluator",
+        media_type="application/json",
+        content=_protected_evaluator_bytes(),
+    )
+    command_runner = ProtectedSyntheticRunner(
+        artifacts=evidence,
+        protected_root=automation_root / ".protected-runner" / "report-evaluation",
+        source_repository=disposable_git.builder,
+    )
+    valid_pair = command_runner.evaluate_pair(
+        baseline_commit=disposable_git.baseline,
+        candidate_commit=disposable_git.valid_candidate,
+        evaluator_ref=evaluator_ref,
+        changed_paths=_changed_paths(disposable_git, disposable_git.valid_candidate),
+    )
+    gaming_pair = command_runner.evaluate_pair(
+        baseline_commit=disposable_git.baseline,
+        candidate_commit=disposable_git.benchmark_gamed_candidate,
+        evaluator_ref=evaluator_ref,
+        changed_paths=_changed_paths(disposable_git, disposable_git.benchmark_gamed_candidate),
+    )
+    altered_pair = command_runner.evaluate_pair(
+        baseline_commit=disposable_git.baseline,
+        candidate_commit=disposable_git.evaluator_altered_candidate,
+        evaluator_ref=evaluator_ref,
+        changed_paths=_changed_paths(disposable_git, disposable_git.evaluator_altered_candidate),
+    )
+    capability_report = valid_pair.report
+    assert capability_report.eligible is True
+    manifest = replace(
+        base_manifest(),
+        experiment_id=EXPERIMENT_ID,
+        parent_commit=disposable_git.baseline,
+        registered_at="2026-08-19T09:00:00Z",
+        deterministic_checks=("synthetic-contracts",),
     )
     protected_receipt = _protected_receipt(
-        manifest_digest="a" * 64,
+        manifest_digest=manifest.digest,
         fixture=disposable_git,
         capability_report=capability_report,
     )
@@ -1968,6 +2068,182 @@ def test_changed_main_receipt_replay_and_exact_revert_are_durable_real_effects(
         "consumed",
         "replay_rejected",
     ]
+
+    ledger_path = automation_root / "accepted-lifecycle.sqlite3"
+    ledger = ExperimentLedger(ledger_path)
+    assert ledger.register_manifest(manifest) is True
+    packet = _candidate_packet(disposable_git, manifest.digest, evidence)
+    _git(
+        disposable_git.builder,
+        "push",
+        "origin",
+        f"{disposable_git.valid_candidate}:refs/heads/experimental/{EXPERIMENT_ID}",
+    )
+    _append_accepted_lifecycle(
+        ledger_path=ledger_path,
+        manifest_digest=manifest.digest,
+        parent_commit=manifest.parent_commit,
+        packet=packet,
+        candidate_tree=disposable_git.valid_tree,
+        protected_receipt_digest=protected_receipt.digest,
+        promotion_commit=healthy_merge,
+        artifact_store=evidence,
+    )
+    lifecycle_export_ref, lifecycle_chain_ref = commissioning_store.capture_lifecycle_sources(
+        experiment_id=EXPERIMENT_ID,
+        ledger_path=ledger_path,
+    )
+
+    supervisor_result = canonical_json_bytes(
+        {
+            "action": "reconcile_existing_effect",
+            "duplicate_effects": 0,
+            "status": "resolved",
+        }
+    )
+    supervisor_result_ref = evidence.put(
+        evidence_kind="supervisor_result",
+        media_type="application/json",
+        content=supervisor_result,
+    )
+    supervisor_path = automation_root / ".shared-private" / "commissioning-supervisor.sqlite3"
+    supervisor_store = SupervisorTriggerStore(supervisor_path)
+    initial_attempt = RecoveryAttempt(
+        attempt_id="watchdog-observed-interruption",
+        action_digest=_sha256(b"observe effect without durable receipt"),
+        occurred_at="2026-08-19T11:01:00Z",
+        outcome="still_blocked",
+    )
+    trigger = SupervisorTrigger(
+        schema_version=1,
+        trigger_id="commissioning-controller-interruption",
+        evidence_digest=protected_receipt.digest,
+        unsafe_boundary="promotion:effect_receipt_gap",
+        attempt_history=(initial_attempt,),
+        next_safe_node_key="commissioning:reconcile-existing-effect",
+        created_at="2026-08-19T11:02:00Z",
+    )
+    assert supervisor_store.append(trigger).applied is True
+    recovery_attempt = RecoveryAttempt(
+        attempt_id="supervisor-reconcile-exact-effect",
+        action_digest=_sha256(b"reconcile exact remote identity then append receipt"),
+        occurred_at="2026-08-19T11:03:00Z",
+        outcome="state_reconciled",
+    )
+    claimed = supervisor_store.claim_and_record_action(
+        trigger_id=trigger.trigger_id,
+        claim_id="supervisor-commissioning-run",
+        expected_revision=0,
+        attempt=recovery_attempt,
+    )
+    supervisor_store.resolve(
+        trigger_id=trigger.trigger_id,
+        claim_id="supervisor-commissioning-run",
+        expected_revision=claimed.revision,
+        resolution=TriggerResolution(
+            status="resolved",
+            recovery_action=recovery_attempt,
+            evidence_digest=protected_receipt.digest,
+            result_digest=supervisor_result_ref.digest,
+            resolved_at="2026-08-19T11:04:00Z",
+        ),
+    )
+
+    bare_refs_ref = commissioning_store.capture_bare_refs(disposable_git.origin)
+    effects_ref = commissioning_store.capture_effects_snapshot(effect_store_path)
+    sources = SyntheticCommissioningSources(
+        experiment_id=EXPERIMENT_ID,
+        ledger_path=ledger_path,
+        lifecycle_export_ref=lifecycle_export_ref,
+        lifecycle_chain_receipt_ref=lifecycle_chain_ref,
+        bare_repository=disposable_git.origin,
+        bare_refs_snapshot_ref=bare_refs_ref,
+        effect_store_path=effect_store_path,
+        effects_snapshot_ref=effects_ref,
+        capability_evidence_refs=(
+            valid_pair.evidence_bundle_ref,
+            gaming_pair.evidence_bundle_ref,
+            altered_pair.evidence_bundle_ref,
+        ),
+        signed_protected_receipt_ref=envelope_ref,
+        protected_public_key_path=request_root / "protected-public.pem",
+        supervisor_store_path=supervisor_path,
+        supervisor_trigger_id=trigger.trigger_id,
+        supervisor_result_ref=supervisor_result_ref,
+    )
+    sources.protected_public_key_path.write_bytes(protected_runner.public_key_pem)
+    sources.protected_public_key_path.chmod(0o600)
+
+    bundle = commissioning_store.build_synthetic(sources)
+    assert bundle.receipt is None
+    assert bundle.receipt_ref is None
+    assert bundle.report.schema_version == 2
+    assert bundle.report.status == "synthetic_passed"
+    assert bundle.report.terminal_state == "accepted"
+    assert bundle.report.candidate_commit == disposable_git.valid_candidate
+    assert bundle.report.candidate_tree == disposable_git.valid_tree
+    assert bundle.report.promotion_id == healthy_request["pr"]["promotion_id"]
+    assert bundle.report.pull_request_number == 41
+    assert bundle.report.merge_commit == healthy_merge
+    assert bundle.report.production_ref == "refs/heads/main"
+    assert bundle.report.hard_failure_promotion_id == hard_request["pr"]["promotion_id"]
+    assert bundle.report.hard_failure_pull_request_number == 42
+    assert bundle.report.hard_failure_candidate_commit == hard_candidate
+    assert bundle.report.hard_failure_merge_commit == hard_merge
+    assert bundle.report.revert_promotion_id == revert_request["pr"]["promotion_id"]
+    assert bundle.report.revert_pull_request_number == 43
+    assert bundle.report.revert_candidate_commit == revert_candidate
+    assert bundle.report.revert_merge_commit == revert_merge
+    assert bundle.report.restored_tree == healthy_tree
+    assert bundle.report.restart_recoveries == 2
+    assert bundle.report.adversarial_outcomes == (
+        "benchmark_gaming_rejected",
+        "changed_main_rejected",
+        "controller_effect_recovered",
+        "duplicate_tick_idempotent",
+        "evaluator_alteration_rejected",
+        "exact_revert_restored_tree",
+        "receipt_replay_rejected",
+        "tampered_evidence_rejected",
+    )
+    assert (
+        CommissioningArtifactStore(
+            automation_data_root=automation_root,
+            repository_root=disposable_git.builder,
+        ).load_latest_synthetic()
+        == bundle
+    )
+
+    report_bytes = commissioning_store.read(bundle.report_ref)
+    report_path = commissioning_store.objects_root / bundle.report_ref.digest
+    report_path.write_bytes(b"x" * len(report_bytes))
+    report_path.chmod(0o600)
+    with pytest.raises(
+        CommissioningArtifactError,
+        match="commissioning_artifact_invalid",
+    ):
+        commissioning_store.load_latest_synthetic()
+    report_path.write_bytes(report_bytes)
+    report_path.chmod(0o600)
+
+    effects_bytes = commissioning_store.read(effects_ref)
+    effects_path = commissioning_store.objects_root / effects_ref.digest
+    effects_path.write_bytes(b"x" * len(effects_bytes))
+    effects_path.chmod(0o600)
+    with pytest.raises(
+        CommissioningArtifactError,
+        match="commissioning_artifact_invalid",
+    ):
+        commissioning_store.load_latest_synthetic()
+    effects_path.write_bytes(effects_bytes)
+    effects_path.chmod(0o600)
+
+    effects_path.unlink()
+    with pytest.raises(
+        CommissioningArtifactError,
+        match="commissioning_artifact_invalid",
+    ):
+        commissioning_store.load_latest_synthetic()
 
 
 def test_component_scenarios_cannot_self_issue_commissioning_pass(
@@ -2712,6 +2988,22 @@ def test_caller_authored_commissioning_receipt_cannot_create_passing_report(
     for directory in (store.private_root, store.root, store.objects_root):
         assert stat.S_IMODE(directory.stat().st_mode) == 0o700
     assert tuple(store.objects_root.iterdir()) == ()
+    assert not store.index_path.exists()
+
+
+def test_schema_v2_commissioning_requires_typed_source_bundle(tmp_path: Path) -> None:
+    store = CommissioningArtifactStore(
+        automation_data_root=tmp_path / "automations",
+        repository_root=REPOSITORY_ROOT,
+    )
+
+    with pytest.raises(
+        CommissioningArtifactError,
+        match="invalid_commissioning_evidence_sources",
+    ):
+        store.build_synthetic("caller-authored-claims")  # type: ignore[arg-type]
+
+    assert SyntheticCommissioningSources.__dataclass_fields__
     assert not store.index_path.exists()
 
 
