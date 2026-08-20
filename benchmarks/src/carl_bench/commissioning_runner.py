@@ -30,7 +30,238 @@ from carl_bench.commissioning import CommissioningArtifactError
 
 _OBJECT_RE = re.compile(r"^[0-9a-f]{40}$")
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,255}$")
-_MACOS_NETWORK_PROFILE = "(version 1) (allow default) (deny network*)"
+_MAX_COMMAND_OUTPUT_BYTES = 65_536
+_SANDBOX_DIAGNOSTIC_PREFIX = b"carl-protected-run:"
+
+
+def _sandbox_environment(writable_root: Path) -> dict[str, str]:
+    root = writable_root.expanduser().absolute()
+    return {
+        "HOME": os.fspath(root),
+        "LANG": "C",
+        "LC_ALL": "C",
+        "PATH": os.pathsep.join(("/usr/bin", "/bin")),
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONSAFEPATH": "1",
+        "TMPDIR": os.fspath(root),
+        "XDG_CACHE_HOME": os.fspath(root),
+    }
+
+
+def _sandbox_path(path: Path) -> Path:
+    return Path(os.path.realpath(path.expanduser().absolute()))
+
+
+def _sandbox_path_variants(path: Path) -> tuple[Path, ...]:
+    lexical = path.expanduser().absolute()
+    resolved = _sandbox_path(path)
+    return tuple(dict.fromkeys((lexical, resolved)))
+
+
+def _sbpl_literal(path: Path) -> str:
+    value = os.fspath(path.expanduser().absolute())
+    if "\0" in value or "\n" in value or "\r" in value:
+        raise CommissioningArtifactError("invalid_synthetic_sandbox_path")
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _macos_sandbox_profile(
+    readonly_paths: tuple[Path, ...],
+    writable_paths: tuple[Path, ...],
+) -> str:
+    reads = " ".join(f'(subpath "{_sbpl_literal(path)}")' for path in readonly_paths)
+    writes = " ".join(f'(subpath "{_sbpl_literal(path)}")' for path in writable_paths)
+    return " ".join(
+        (
+            "(version 1)",
+            "(deny default)",
+            '(import "system.sb")',
+            "(allow process*)",
+            "(allow signal (target self))",
+            f"(allow file-read* {reads} (literal \"/dev/null\") (literal \"/dev/urandom\"))",
+            f"(allow file-map-executable {reads})",
+            f"(allow file-write* {writes} (literal \"/dev/null\"))",
+            "(deny network*)",
+        )
+    )
+
+
+def _linux_parent_directories(paths: tuple[Path, ...]) -> tuple[str, ...]:
+    parents: set[str] = {"/dev", "/proc", "/tmp"}
+    for path in paths:
+        resolved = _sandbox_path(path)
+        current = resolved if resolved.is_dir() else resolved.parent
+        while current != current.parent:
+            parents.add(os.fspath(current))
+            current = current.parent
+    return tuple(sorted(parents, key=lambda item: (item.count("/"), item)))
+
+
+def _sandbox_command(
+    command: tuple[str, ...],
+    *,
+    readonly_paths: tuple[Path, ...],
+    writable_paths: tuple[Path, ...],
+    platform: str = sys.platform,
+    executable_lookup=shutil.which,
+) -> tuple[str, ...]:
+    if not command:
+        raise CommissioningArtifactError("invalid_synthetic_sandbox_command")
+    reads = tuple(
+        dict.fromkeys(
+            variant for path in readonly_paths for variant in _sandbox_path_variants(path)
+        )
+    )
+    writes = tuple(
+        dict.fromkeys(
+            variant for path in writable_paths for variant in _sandbox_path_variants(path)
+        )
+    )
+    if platform == "darwin":
+        executable = Path("/usr/bin/sandbox-exec")
+        if not executable.is_file() or not os.access(executable, os.X_OK):
+            raise CommissioningArtifactError("synthetic_execution_sandbox_unavailable")
+        return (
+            os.fspath(executable),
+            "-p",
+            _macos_sandbox_profile(reads, writes),
+            *command,
+        )
+    if platform.startswith("linux"):
+        bubblewrap = executable_lookup("bwrap")
+        if bubblewrap is None:
+            raise CommissioningArtifactError("synthetic_execution_sandbox_unavailable")
+        prefix: list[str] = [
+            bubblewrap,
+            "--die-with-parent",
+            "--new-session",
+            "--unshare-all",
+            "--unshare-net",
+            "--tmpfs",
+            "/",
+        ]
+        for directory in _linux_parent_directories((*reads, *writes)):
+            prefix.extend(("--dir", directory))
+        prefix.extend(("--dev", "/dev", "--proc", "/proc"))
+        for path in reads:
+            value = os.fspath(path)
+            prefix.extend(("--ro-bind", value, value))
+        for path in writes:
+            value = os.fspath(path)
+            prefix.extend(("--bind", value, value))
+        prefix.append("--")
+        return (*prefix, *command)
+    raise CommissioningArtifactError("synthetic_execution_sandbox_unavailable")
+
+
+def _bounded_output(content: bytes, marker: bytes = b"truncated") -> bytes:
+    if len(content) <= _MAX_COMMAND_OUTPUT_BYTES:
+        return content
+    suffix = b"\n" + _SANDBOX_DIAGNOSTIC_PREFIX + b" " + marker + b"\n"
+    return content[: _MAX_COMMAND_OUTPUT_BYTES - len(suffix)] + suffix
+
+
+def _launch_failure(code: bytes) -> tuple[int, bytes, bytes]:
+    exit_codes = {
+        b"executable_not_found": 127,
+        b"permission_denied": 126,
+        b"os_launch_error": 125,
+    }
+    return (
+        exit_codes[code],
+        b"",
+        _SANDBOX_DIAGNOSTIC_PREFIX + b" " + code + b"\n",
+    )
+
+
+def _toolchain_paths(command: tuple[str, ...]) -> tuple[Path, ...]:
+    paths: list[Path] = []
+    executable = command[0]
+    resolved = executable if os.path.isabs(executable) else shutil.which(executable)
+    if resolved is not None:
+        paths.append(Path(resolved).parent)
+    for prefix in {sys.prefix, sys.base_prefix, sys.exec_prefix, sys.base_exec_prefix}:
+        paths.append(Path(prefix))
+    xcode_selectors = {
+        Path("/private/var/db/xcode_select_link"),
+        Path("/var/db/xcode_select_link"),
+    }
+    for path in (
+        Path("/bin"),
+        Path("/usr/bin"),
+        Path("/usr/lib"),
+        Path("/usr/libexec"),
+        Path("/System/Library"),
+        Path("/Library/Apple"),
+        Path("/Library/Developer/CommandLineTools"),
+        Path("/Applications/Xcode.app/Contents/Developer"),
+        Path("/private/var/db/xcode_select_link"),
+        Path("/var/db/xcode_select_link"),
+        Path("/private/var/select"),
+        Path("/var/select"),
+        Path("/lib"),
+        Path("/lib64"),
+        Path("/etc/ld.so.cache"),
+    ):
+        if path.exists() or path in xcode_selectors:
+            paths.append(path)
+    return tuple(dict.fromkeys(path.expanduser().absolute() for path in paths))
+
+
+def _run_sandboxed_command(
+    command: tuple[str, ...],
+    *,
+    checkout: Path,
+    writable_root: Path,
+    input_bytes: bytes | None,
+    timeout_seconds: int,
+) -> tuple[int, bytes, bytes]:
+    executable = command[0]
+    resolved = executable if os.path.isabs(executable) else shutil.which(executable)
+    if resolved is None or not Path(resolved).exists():
+        return _launch_failure(b"executable_not_found")
+    if not os.access(resolved, os.X_OK):
+        return _launch_failure(b"permission_denied")
+    executable_path = os.path.realpath(resolved)
+    executable_command = (executable_path, *command[1:])
+    sandboxed = _sandbox_command(
+        executable_command,
+        readonly_paths=(checkout, *_toolchain_paths(command)),
+        writable_paths=(writable_root,),
+    )
+    try:
+        completed = subprocess.run(
+            sandboxed,
+            cwd=checkout,
+            input=input_bytes,
+            check=False,
+            capture_output=True,
+            timeout=timeout_seconds,
+            env=_sandbox_environment(writable_root),
+        )
+        exit_code = completed.returncode
+        stdout = completed.stdout
+        stderr = completed.stderr
+    except subprocess.TimeoutExpired as error:
+        exit_code = 124
+        stdout = error.stdout or b""
+        stderr = (error.stderr or b"") + _SANDBOX_DIAGNOSTIC_PREFIX + b" timeout\n"
+    except FileNotFoundError:
+        return _launch_failure(b"executable_not_found")
+    except PermissionError:
+        return _launch_failure(b"permission_denied")
+    except (OSError, subprocess.SubprocessError):
+        return _launch_failure(b"os_launch_error")
+    if exit_code < 0:
+        signal_number = min(abs(exit_code), 127)
+        exit_code = 128 + signal_number
+        stderr += (
+            _SANDBOX_DIAGNOSTIC_PREFIX
+            + b" terminated_by_signal:"
+            + str(signal_number).encode("ascii")
+            + b"\n"
+        )
+    return exit_code, _bounded_output(stdout), _bounded_output(stderr)
 
 
 def _identifier(value: object, code: str) -> str:
@@ -131,54 +362,6 @@ def _canonical_git_diff(
     if not paths or len(paths) != len(set(paths)):
         raise CommissioningArtifactError("invalid_synthetic_changed_paths")
     return diff, paths
-
-
-def _network_sandbox_prefix() -> tuple[str, ...]:
-    """Resolve one real OS network sandbox and prove that it can launch a process."""
-    prefixes: list[tuple[str, ...]] = []
-    if sys.platform == "darwin":
-        executable = Path("/usr/bin/sandbox-exec")
-        if executable.is_file() and os.access(executable, os.X_OK):
-            prefixes.append((os.fspath(executable), "-p", _MACOS_NETWORK_PROFILE))
-    elif sys.platform.startswith("linux"):
-        bubblewrap = shutil.which("bwrap")
-        if bubblewrap is not None:
-            prefixes.append(
-                (
-                    bubblewrap,
-                    "--die-with-parent",
-                    "--unshare-net",
-                    "--ro-bind",
-                    "/",
-                    "/",
-                    "--dev-bind",
-                    "/dev",
-                    "/dev",
-                    "--proc",
-                    "/proc",
-                    "--",
-                )
-            )
-        unshare = shutil.which("unshare")
-        if unshare is not None:
-            prefixes.append((unshare, "--user", "--map-root-user", "--net", "--"))
-    else:
-        raise CommissioningArtifactError("synthetic_network_sandbox_unavailable")
-
-    for prefix in prefixes:
-        try:
-            probe = subprocess.run(
-                (*prefix, sys.executable, "-c", "raise SystemExit(0)"),
-                check=False,
-                capture_output=True,
-                timeout=10,
-                env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1", "PYTHONSAFEPATH": "1"},
-            )
-        except (OSError, subprocess.SubprocessError):
-            continue
-        if probe.returncode == 0:
-            return prefix
-    raise CommissioningArtifactError("synthetic_network_sandbox_unavailable")
 
 
 @dataclass(frozen=True, slots=True)
@@ -716,7 +899,19 @@ class ProtectedSyntheticRunner:
         if not source.is_dir() or "://" in os.fspath(source):
             raise CommissioningArtifactError("invalid_synthetic_source_repository")
         self.source_repository = source
-        self.network_sandbox_prefix = _network_sandbox_prefix()
+        probe_root = Path(tempfile.mkdtemp(prefix="sandbox-probe-", dir=self.protected_root))
+        try:
+            exit_code, _, _ = _run_sandboxed_command(
+                (sys.executable, "-c", "raise SystemExit(0)"),
+                checkout=self.protected_root,
+                writable_root=probe_root,
+                input_bytes=None,
+                timeout_seconds=10,
+            )
+        finally:
+            shutil.rmtree(probe_root, ignore_errors=True)
+        if exit_code != 0:
+            raise CommissioningArtifactError("synthetic_execution_sandbox_unavailable")
 
     @staticmethod
     def _git(*arguments: str, cwd: Path | None = None) -> str:
@@ -758,29 +953,17 @@ class ProtectedSyntheticRunner:
         subject = checkout / evaluator.subject_path
         if not subject.is_file() or subject.is_symlink():
             raise CommissioningArtifactError("synthetic_subject_missing")
-        environment = {
-            **os.environ,
-            "PYTHONDONTWRITEBYTECODE": "1",
-            "PYTHONSAFEPATH": "1",
-        }
-        environment.pop("PYTHONPATH", None)
+        writable_root = Path(tempfile.mkdtemp(prefix="trial-output-", dir=self.protected_root))
         try:
-            completed = subprocess.run(
-                (*self.network_sandbox_prefix, sys.executable, os.fspath(subject)),
-                cwd=checkout,
-                input=canonical_json_bytes(task.input).decode("utf-8") + "\n",
-                capture_output=True,
-                text=True,
-                timeout=10,
-                env=environment,
+            exit_code, stdout, stderr = _run_sandboxed_command(
+                (sys.executable, os.fspath(subject)),
+                checkout=checkout,
+                writable_root=writable_root,
+                input_bytes=canonical_json_bytes(task.input) + b"\n",
+                timeout_seconds=10,
             )
-            exit_code = completed.returncode
-            stdout = completed.stdout.encode("utf-8")
-            stderr = completed.stderr.encode("utf-8")
-        except subprocess.TimeoutExpired as error:
-            exit_code = 124
-            stdout = (error.stdout or b"") if isinstance(error.stdout, bytes) else b""
-            stderr = (error.stderr or b"") if isinstance(error.stderr, bytes) else b""
+        finally:
+            shutil.rmtree(writable_root, ignore_errors=True)
         stdout_ref = self.artifacts.put(
             evidence_kind="command_stdout",
             media_type="application/json",
@@ -860,32 +1043,24 @@ class ProtectedSyntheticRunner:
         candidate_tree: str,
         logical_command: tuple[str, ...],
         actual_command: tuple[str, ...],
+        timeout_seconds: int = 120,
     ):
         from carl_bench.protected_run import ProtectedCommandResult
 
-        environment = {
-            **os.environ,
-            "PYTHONDONTWRITEBYTECODE": "1",
-            "PYTHONSAFEPATH": "1",
-        }
-        environment.pop("PYTHONPATH", None)
         started = time.monotonic_ns()
+        writable_root = Path(
+            tempfile.mkdtemp(prefix="protected-command-output-", dir=self.protected_root)
+        )
         try:
-            completed = subprocess.run(
-                (*self.network_sandbox_prefix, *actual_command),
-                cwd=checkout,
-                check=False,
-                capture_output=True,
-                timeout=120,
-                env=environment,
+            exit_code, stdout, stderr = _run_sandboxed_command(
+                actual_command,
+                checkout=checkout,
+                writable_root=writable_root,
+                input_bytes=None,
+                timeout_seconds=timeout_seconds,
             )
-            exit_code = completed.returncode
-            stdout = completed.stdout
-            stderr = completed.stderr
-        except subprocess.TimeoutExpired as error:
-            exit_code = 124
-            stdout = error.stdout or b""
-            stderr = error.stderr or b""
+        finally:
+            shutil.rmtree(writable_root, ignore_errors=True)
         elapsed_ms = max(1, (time.monotonic_ns() - started) // 1_000_000)
         stdout_ref = self.artifacts.put(
             evidence_kind="protected_command_stdout",
@@ -958,6 +1133,15 @@ class ProtectedSyntheticRunner:
                 "--",
             )
             git_executable = shutil.which("git")
+            command_line_tools_git = Path(
+                "/Library/Developer/CommandLineTools/usr/bin/git"
+            )
+            if (
+                sys.platform == "darwin"
+                and command_line_tools_git.is_file()
+                and os.access(command_line_tools_git, os.X_OK)
+            ):
+                git_executable = os.fspath(command_line_tools_git)
             if git_executable is None:
                 raise CommissioningArtifactError("synthetic_git_failed")
             deterministic = self._protected_command_result(

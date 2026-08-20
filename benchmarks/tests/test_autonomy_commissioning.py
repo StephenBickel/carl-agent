@@ -1664,6 +1664,7 @@ def _protected_evaluator_bytes() -> bytes:
 def test_protected_runner_derives_scores_from_commands_and_denies_sockets(
     tmp_path: Path,
     disposable_git: DisposableGitFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from carl_bench.commissioning_runner import (
         ProtectedSyntheticRunner,
@@ -1804,6 +1805,63 @@ def test_protected_runner_derives_scores_from_commands_and_denies_sockets(
         ).report
         == evaluator_altered.report
     )
+
+    host_canary = tmp_path / "host-canary.txt"
+    host_canary.write_text("must-not-cross-boundary", encoding="utf-8")
+    monkeypatch.setenv("CARL_COMMISSIONING_HOST_SECRET", "must-not-cross-boundary")
+    attacks = {
+        "host-canary": f'''from pathlib import Path
+Path({os.fspath(host_canary)!r}).read_text(encoding="utf-8")
+''',
+        "host-environment": '''import os
+if os.environ.get("CARL_COMMISSIONING_HOST_SECRET") != "must-not-cross-boundary":
+    raise PermissionError("host environment denied by protected runner")
+''',
+        "child-process-canary": f'''import subprocess
+import sys
+probe = "from pathlib import Path; Path({os.fspath(host_canary)!r}).read_text()"
+completed = subprocess.run(
+    [sys.executable, "-c", probe],
+    check=False,
+)
+if completed.returncode != 0:
+    raise PermissionError("child process retained filesystem sandbox")
+''',
+        "signal-exit": '''import os
+import signal
+os.kill(os.getpid(), signal.SIGTERM)
+''',
+    }
+    legitimate_subject = '''import json
+import sys
+request = json.load(sys.stdin)
+answers = {
+    "effect_without_receipt": "reconcile_once",
+    "receipt_without_effect": "inspect_then_resume",
+    "safe_default": "deny",
+}
+print(json.dumps({"answer": answers[request["event"]]}, sort_keys=True, separators=(",", ":")))
+'''
+    for attack_name, attack in attacks.items():
+        _git(
+            disposable_git.builder,
+            "switch",
+            "-C",
+            f"candidate-{attack_name}",
+            disposable_git.baseline,
+        )
+        attack_commit = _write_commit(
+            disposable_git.builder,
+            "src/runtime/subject.py",
+            attack + legitimate_subject,
+            f"attempt {attack_name} escape",
+        )
+        attacked = runner.evaluate_pair(
+            baseline_commit=disposable_git.baseline,
+            candidate_commit=attack_commit,
+            evaluator_ref=evaluator_ref,
+        )
+        assert attacked.report.eligible is False, attack_name
 
     high_level_network = runner.evaluate_pair(
         baseline_commit=disposable_git.baseline,
