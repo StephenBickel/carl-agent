@@ -28,22 +28,7 @@ from carl_bench.commissioning import CommissioningArtifactError
 
 _OBJECT_RE = re.compile(r"^[0-9a-f]{40}$")
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,255}$")
-_SOCKET_GUARD = b"""import socket as _socket
-
-def _deny(*_args, **_kwargs):
-    raise PermissionError("commissioning_socket_denied")
-
-class _DeniedSocket(_socket.socket):
-    def connect(self, *_args, **_kwargs):
-        return _deny()
-
-    def connect_ex(self, *_args, **_kwargs):
-        return _deny()
-
-_socket.socket = _DeniedSocket
-_socket.create_connection = _deny
-_socket.getaddrinfo = _deny
-"""
+_MACOS_NETWORK_PROFILE = "(version 1) (allow default) (deny network*)"
 
 
 def _identifier(value: object, code: str) -> str:
@@ -93,6 +78,105 @@ def _safe_relative_path(value: object) -> str:
     if path.is_absolute() or any(part in {"", ".", ".."} for part in value.split("/")):
         raise CommissioningArtifactError("invalid_synthetic_subject_path")
     return value
+
+
+def _canonical_git_diff(
+    source_repository: Path,
+    baseline_commit: str,
+    candidate_commit: str,
+) -> tuple[bytes, tuple[str, ...]]:
+    """Return protected diff bytes and canonical paths for two exact commits."""
+    _object(baseline_commit, "invalid_synthetic_baseline_commit")
+    _object(candidate_commit, "invalid_synthetic_candidate_commit")
+    source = source_repository.expanduser().absolute()
+    if not source.is_dir() or "://" in os.fspath(source):
+        raise CommissioningArtifactError("invalid_synthetic_source_repository")
+
+    base = (
+        "git",
+        "-c",
+        "core.quotepath=false",
+        "-c",
+        "diff.external=",
+        "-C",
+        os.fspath(source),
+        "diff",
+        "--no-ext-diff",
+        "--no-renames",
+    )
+    try:
+        diff = subprocess.run(
+            (*base, "--binary", "--full-index", baseline_commit, candidate_commit, "--"),
+            check=True,
+            capture_output=True,
+            timeout=30,
+        ).stdout
+        raw_paths = subprocess.run(
+            (*base, "--name-only", "-z", baseline_commit, candidate_commit, "--"),
+            check=True,
+            capture_output=True,
+            timeout=30,
+        ).stdout
+    except (OSError, subprocess.SubprocessError) as error:
+        raise CommissioningArtifactError("synthetic_git_failed") from error
+    try:
+        decoded = tuple(
+            item.decode("utf-8", errors="strict") for item in raw_paths.split(b"\0") if item
+        )
+    except UnicodeError as error:
+        raise CommissioningArtifactError("invalid_synthetic_changed_paths") from error
+    paths = tuple(sorted((_safe_relative_path(path) for path in decoded), key=str.encode))
+    if not paths or len(paths) != len(set(paths)):
+        raise CommissioningArtifactError("invalid_synthetic_changed_paths")
+    return diff, paths
+
+
+def _network_sandbox_prefix() -> tuple[str, ...]:
+    """Resolve one real OS network sandbox and prove that it can launch a process."""
+    prefixes: list[tuple[str, ...]] = []
+    if sys.platform == "darwin":
+        executable = Path("/usr/bin/sandbox-exec")
+        if executable.is_file() and os.access(executable, os.X_OK):
+            prefixes.append((os.fspath(executable), "-p", _MACOS_NETWORK_PROFILE))
+    elif sys.platform.startswith("linux"):
+        bubblewrap = shutil.which("bwrap")
+        if bubblewrap is not None:
+            prefixes.append(
+                (
+                    bubblewrap,
+                    "--die-with-parent",
+                    "--unshare-net",
+                    "--ro-bind",
+                    "/",
+                    "/",
+                    "--dev-bind",
+                    "/dev",
+                    "/dev",
+                    "--proc",
+                    "/proc",
+                    "--",
+                )
+            )
+        unshare = shutil.which("unshare")
+        if unshare is not None:
+            prefixes.append((unshare, "--user", "--map-root-user", "--net", "--"))
+    else:
+        raise CommissioningArtifactError("synthetic_network_sandbox_unavailable")
+
+    for prefix in prefixes:
+        try:
+            probe = subprocess.run(
+                (*prefix, sys.executable, "-c", "raise SystemExit(0)"),
+                check=False,
+                capture_output=True,
+                timeout=10,
+                env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1", "PYTHONSAFEPATH": "1"},
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if probe.returncode == 0:
+            return prefix
+    raise CommissioningArtifactError("synthetic_network_sandbox_unavailable")
 
 
 @dataclass(frozen=True, slots=True)
@@ -335,9 +419,7 @@ def _rebuild_execution_side(
             code="invalid_protected_stderr_ref",
         )
         stdout = artifacts.read(stdout_ref)
-        stderr = artifacts.read(stderr_ref)
-        if b"commissioning_socket_denied" in stderr:
-            raise CommissioningArtifactError("synthetic_subject_network_denied")
+        artifacts.read(stderr_ref)
         parsed: Any = None
         valid = exit_code == 0
         if valid:
@@ -377,6 +459,7 @@ def verify_protected_pair_evaluation(
     *,
     artifacts: PrivateArtifactStore,
     evidence_bundle_ref: ArtifactRef,
+    source_repository: Path,
 ) -> VerifiedProtectedPairEvaluation:
     """Recompute a paired report without trusting persisted scores or validity flags."""
     if not isinstance(artifacts, PrivateArtifactStore):
@@ -391,15 +474,16 @@ def verify_protected_pair_evaluation(
         artifacts.read(evidence_bundle_ref),
         {
             "capability_report_ref",
-            "changed_paths",
+            "changed_paths_ref",
             "claim",
+            "diff_ref",
             "evaluator_ref",
             "execution_bundle_ref",
             "schema_version",
         },
         "invalid_capability_evidence_bundle",
     )
-    if bundle["schema_version"] != 1:
+    if bundle["schema_version"] != 2:
         raise CommissioningArtifactError("invalid_capability_evidence_bundle")
     evaluator_ref = _typed_artifact_ref(
         bundle["evaluator_ref"],
@@ -419,16 +503,22 @@ def verify_protected_pair_evaluation(
         media_type="application/json",
         code="invalid_capability_report_ref",
     )
+    changed_paths_ref = _typed_artifact_ref(
+        bundle["changed_paths_ref"],
+        evidence_kind="git_changed_paths",
+        media_type="application/json",
+        code="invalid_synthetic_changed_paths_ref",
+    )
+    diff_ref = _typed_artifact_ref(
+        bundle["diff_ref"],
+        evidence_kind="git_binary_diff",
+        media_type="application/octet-stream",
+        code="invalid_synthetic_diff_ref",
+    )
     evaluator = ProtectedEvaluator.from_bytes(artifacts.read(evaluator_ref))
     claim = evaluator.capability_claim(evaluator_ref.digest)
     if bundle["claim"] != claim.to_canonical_dict():
         raise CommissioningArtifactError("protected_capability_claim_mismatch")
-    changed_paths_value = bundle["changed_paths"]
-    if not isinstance(changed_paths_value, list) or any(
-        not isinstance(path, str) for path in changed_paths_value
-    ):
-        raise CommissioningArtifactError("invalid_synthetic_changed_paths")
-    changed_paths = tuple(changed_paths_value)
     execution = _json_object(
         artifacts.read(execution_ref),
         {"baseline", "candidate", "evaluator_ref", "schema_version"},
@@ -452,6 +542,27 @@ def verify_protected_pair_evaluation(
         evaluator=evaluator,
         evaluator_ref=evaluator_ref,
     )
+    exact_diff, changed_paths = _canonical_git_diff(
+        source_repository,
+        baseline_commit,
+        candidate_commit,
+    )
+    expected_paths = {
+        "baseline_commit": baseline_commit,
+        "candidate_commit": candidate_commit,
+        "paths": list(changed_paths),
+        "schema_version": 1,
+    }
+    if (
+        artifacts.read(diff_ref) != exact_diff
+        or _json_object(
+            artifacts.read(changed_paths_ref),
+            {"baseline_commit", "candidate_commit", "paths", "schema_version"},
+            "invalid_synthetic_changed_paths",
+        )
+        != expected_paths
+    ):
+        raise CommissioningArtifactError("protected_git_diff_mismatch")
     report = evaluate_capability_validation(
         claim,
         baseline,
@@ -465,6 +576,8 @@ def verify_protected_pair_evaluation(
             (
                 ("capability_evidence_bundle", evidence_bundle_ref),
                 ("capability_report", report_ref),
+                ("git_binary_diff", diff_ref),
+                ("git_changed_paths", changed_paths_ref),
                 ("protected_evaluator", evaluator_ref),
                 ("protected_execution_bundle", execution_ref),
                 *baseline_refs,
@@ -484,7 +597,7 @@ def verify_protected_pair_evaluation(
 
 
 class ProtectedSyntheticRunner:
-    """Run exact commits against protected tasks with Python socket access denied."""
+    """Run exact commits against protected tasks inside an OS network sandbox."""
 
     def __init__(
         self,
@@ -502,16 +615,7 @@ class ProtectedSyntheticRunner:
         if not source.is_dir() or "://" in os.fspath(source):
             raise CommissioningArtifactError("invalid_synthetic_source_repository")
         self.source_repository = source
-        self.guard_root = self.protected_root / "socket-guard"
-        _prepare_private_directory(self.guard_root)
-        guard = self.guard_root / "sitecustomize.py"
-        if guard.exists():
-            if guard.read_bytes() != _SOCKET_GUARD:
-                raise CommissioningArtifactError("synthetic_socket_guard_mismatch")
-        else:
-            guard.write_bytes(_SOCKET_GUARD)
-            if os.name != "nt":
-                guard.chmod(0o600)
+        self.network_sandbox_prefix = _network_sandbox_prefix()
 
     @staticmethod
     def _git(*arguments: str, cwd: Path | None = None) -> str:
@@ -556,12 +660,12 @@ class ProtectedSyntheticRunner:
         environment = {
             **os.environ,
             "PYTHONDONTWRITEBYTECODE": "1",
-            "PYTHONPATH": os.fspath(self.guard_root),
             "PYTHONSAFEPATH": "1",
         }
+        environment.pop("PYTHONPATH", None)
         try:
             completed = subprocess.run(
-                (sys.executable, os.fspath(subject)),
+                (*self.network_sandbox_prefix, sys.executable, os.fspath(subject)),
                 cwd=checkout,
                 input=canonical_json_bytes(task.input).decode("utf-8") + "\n",
                 capture_output=True,
@@ -576,8 +680,6 @@ class ProtectedSyntheticRunner:
             exit_code = 124
             stdout = (error.stdout or b"") if isinstance(error.stdout, bytes) else b""
             stderr = (error.stderr or b"") if isinstance(error.stderr, bytes) else b""
-        if b"commissioning_socket_denied" in stderr:
-            raise CommissioningArtifactError("synthetic_subject_network_denied")
         stdout_ref = self.artifacts.put(
             evidence_kind="command_stdout",
             media_type="application/json",
@@ -653,7 +755,6 @@ class ProtectedSyntheticRunner:
         baseline_commit: str,
         candidate_commit: str,
         evaluator_ref: ArtifactRef,
-        changed_paths: tuple[str, ...],
     ) -> ProtectedPairEvaluation:
         _object(baseline_commit, "invalid_synthetic_baseline_commit")
         _object(candidate_commit, "invalid_synthetic_candidate_commit")
@@ -665,10 +766,28 @@ class ProtectedSyntheticRunner:
             or evaluator_ref.media_type != "application/json"
         ):
             raise CommissioningArtifactError("invalid_protected_evaluator_ref")
-        if not isinstance(changed_paths, tuple) or any(
-            not isinstance(path, str) for path in changed_paths
-        ):
-            raise CommissioningArtifactError("invalid_synthetic_changed_paths")
+        exact_diff, changed_paths = _canonical_git_diff(
+            self.source_repository,
+            baseline_commit,
+            candidate_commit,
+        )
+        diff_ref = self.artifacts.put(
+            evidence_kind="git_binary_diff",
+            media_type="application/octet-stream",
+            content=exact_diff,
+        )
+        changed_paths_ref = self.artifacts.put(
+            evidence_kind="git_changed_paths",
+            media_type="application/json",
+            content=canonical_json_bytes(
+                {
+                    "baseline_commit": baseline_commit,
+                    "candidate_commit": candidate_commit,
+                    "paths": list(changed_paths),
+                    "schema_version": 1,
+                }
+            ),
+        )
         evaluator_bytes = self.artifacts.read(evaluator_ref)
         if hashlib.sha256(evaluator_bytes).hexdigest() != evaluator_ref.digest:
             raise CommissioningArtifactError("protected_evaluator_digest_mismatch")
@@ -725,11 +844,12 @@ class ProtectedSyntheticRunner:
             content=canonical_json_bytes(
                 {
                     "capability_report_ref": report_ref.to_canonical_dict(),
-                    "changed_paths": list(changed_paths),
+                    "changed_paths_ref": changed_paths_ref.to_canonical_dict(),
                     "claim": claim.to_canonical_dict(),
+                    "diff_ref": diff_ref.to_canonical_dict(),
                     "evaluator_ref": evaluator_ref.to_canonical_dict(),
                     "execution_bundle_ref": execution_ref.to_canonical_dict(),
-                    "schema_version": 1,
+                    "schema_version": 2,
                 }
             ),
         )

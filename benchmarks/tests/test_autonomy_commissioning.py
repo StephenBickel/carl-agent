@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import http.server
 import json
 import os
 import shutil
 import stat
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
@@ -1591,7 +1593,6 @@ def test_protected_runner_derives_scores_from_commands_and_denies_sockets(
         baseline_commit=disposable_git.baseline,
         candidate_commit=disposable_git.valid_candidate,
         evaluator_ref=evaluator_ref,
-        changed_paths=_changed_paths(disposable_git, disposable_git.valid_candidate),
     )
 
     assert valid.report.eligible is True
@@ -1622,19 +1623,57 @@ def test_protected_runner_derives_scores_from_commands_and_denies_sockets(
     rebuilt_valid = verify_protected_pair_evaluation(
         artifacts=evidence,
         evidence_bundle_ref=valid.evidence_bundle_ref,
+        source_repository=disposable_git.builder,
     )
     assert rebuilt_valid.report == valid.report
     assert rebuilt_valid.baseline_commit == disposable_git.baseline
     assert rebuilt_valid.candidate_commit == disposable_git.valid_candidate
+    assert rebuilt_valid.changed_paths == (
+        "src/runtime/capability.txt",
+        "src/runtime/subject.py",
+    )
+    evidence_bundle = json.loads(evidence.read(valid.evidence_bundle_ref))
+    assert evidence_bundle["schema_version"] == 2
+    changed_paths_ref = ArtifactRef.from_canonical_dict(evidence_bundle["changed_paths_ref"])
+    assert json.loads(evidence.read(changed_paths_ref)) == {
+        "baseline_commit": disposable_git.baseline,
+        "candidate_commit": disposable_git.valid_candidate,
+        "paths": ["src/runtime/capability.txt", "src/runtime/subject.py"],
+        "schema_version": 1,
+    }
+    false_paths_ref = evidence.put(
+        evidence_kind="git_changed_paths",
+        media_type="application/json",
+        content=canonical_json_bytes(
+            {
+                "baseline_commit": disposable_git.baseline,
+                "candidate_commit": disposable_git.valid_candidate,
+                "paths": ["src/runtime/capability.txt"],
+                "schema_version": 1,
+            }
+        ),
+    )
+    forged_bundle_ref = evidence.put(
+        evidence_kind="capability_evidence_bundle",
+        media_type="application/json",
+        content=canonical_json_bytes(
+            {**evidence_bundle, "changed_paths_ref": false_paths_ref.to_canonical_dict()}
+        ),
+    )
+    with pytest.raises(
+        CommissioningArtifactError,
+        match="protected_git_diff_mismatch",
+    ):
+        verify_protected_pair_evaluation(
+            artifacts=evidence,
+            evidence_bundle_ref=forged_bundle_ref,
+            source_repository=disposable_git.builder,
+        )
 
     benchmark_gamed = runner.evaluate_pair(
         baseline_commit=disposable_git.baseline,
         candidate_commit=disposable_git.benchmark_gamed_candidate,
         evaluator_ref=evaluator_ref,
-        changed_paths=_changed_paths(
-            disposable_git,
-            disposable_git.benchmark_gamed_candidate,
-        ),
     )
     assert benchmark_gamed.report.eligible is False
     assert "active_evaluator_modified" in benchmark_gamed.report.reasons
@@ -1643,6 +1682,7 @@ def test_protected_runner_derives_scores_from_commands_and_denies_sockets(
         verify_protected_pair_evaluation(
             artifacts=evidence,
             evidence_bundle_ref=benchmark_gamed.evidence_bundle_ref,
+            source_repository=disposable_git.builder,
         ).report
         == benchmark_gamed.report
     )
@@ -1651,10 +1691,6 @@ def test_protected_runner_derives_scores_from_commands_and_denies_sockets(
         baseline_commit=disposable_git.baseline,
         candidate_commit=disposable_git.evaluator_altered_candidate,
         evaluator_ref=evaluator_ref,
-        changed_paths=_changed_paths(
-            disposable_git,
-            disposable_git.evaluator_altered_candidate,
-        ),
     )
     assert evaluator_altered.report.eligible is False
     assert "active_evaluator_modified" in evaluator_altered.report.reasons
@@ -1663,20 +1699,145 @@ def test_protected_runner_derives_scores_from_commands_and_denies_sockets(
         verify_protected_pair_evaluation(
             artifacts=evidence,
             evidence_bundle_ref=evaluator_altered.evidence_bundle_ref,
+            source_repository=disposable_git.builder,
         ).report
         == evaluator_altered.report
     )
 
-    with pytest.raises(
-        CommissioningArtifactError,
-        match="synthetic_subject_network_denied",
-    ):
-        runner.evaluate_pair(
-            baseline_commit=disposable_git.baseline,
-            candidate_commit=disposable_git.network_candidate,
-            evaluator_ref=evaluator_ref,
-            changed_paths=_changed_paths(disposable_git, disposable_git.network_candidate),
+    high_level_network = runner.evaluate_pair(
+        baseline_commit=disposable_git.baseline,
+        candidate_commit=disposable_git.network_candidate,
+        evaluator_ref=evaluator_ref,
+    )
+    assert high_level_network.report.eligible is False
+
+    _git(
+        disposable_git.builder,
+        "switch",
+        "-C",
+        "candidate-native-socket",
+        disposable_git.baseline,
+    )
+    native_socket_candidate = _write_commit(
+        disposable_git.builder,
+        "src/runtime/subject.py",
+        """import _socket
+import errno
+import json
+import sys
+
+result = _socket.socket().connect_ex(("127.0.0.1", 9))
+if result in {errno.EPERM, errno.EACCES}:
+    raise PermissionError("native socket denied by OS sandbox")
+request = json.load(sys.stdin)
+answers = {
+    "effect_without_receipt": "reconcile_once",
+    "receipt_without_effect": "inspect_then_resume",
+    "safe_default": "deny",
+}
+print(json.dumps({"answer": answers[request["event"]]}, sort_keys=True, separators=(",", ":")))
+""",
+        "attempt native socket bypass",
+    )
+    native_socket = runner.evaluate_pair(
+        baseline_commit=disposable_git.baseline,
+        candidate_commit=native_socket_candidate,
+        evaluator_ref=evaluator_ref,
+    )
+    assert native_socket.report.eligible is False
+
+    _git(
+        disposable_git.builder,
+        "switch",
+        "-C",
+        "candidate-scrubbed-child",
+        disposable_git.baseline,
+    )
+    scrubbed_child_candidate = _write_commit(
+        disposable_git.builder,
+        "src/runtime/subject.py",
+        """import json
+import os
+import subprocess
+import sys
+
+probe = "import _socket; raise SystemExit(_socket.socket().connect_ex(('127.0.0.1', 9)) in (1, 13))"
+completed = subprocess.run(
+    [sys.executable, "-c", probe],
+    env={"PATH": os.environ.get("PATH", "")},
+    check=False,
+)
+if completed.returncode != 0:
+    raise PermissionError("scrubbed child denied by OS sandbox")
+request = json.load(sys.stdin)
+answers = {
+    "effect_without_receipt": "reconcile_once",
+    "receipt_without_effect": "inspect_then_resume",
+    "safe_default": "deny",
+}
+print(json.dumps({"answer": answers[request["event"]]}, sort_keys=True, separators=(",", ":")))
+""",
+        "attempt scrubbed child socket bypass",
+    )
+    scrubbed_child = runner.evaluate_pair(
+        baseline_commit=disposable_git.baseline,
+        candidate_commit=scrubbed_child_candidate,
+        evaluator_ref=evaluator_ref,
+    )
+    assert scrubbed_child.report.eligible is False
+
+    server = http.server.ThreadingHTTPServer(
+        ("127.0.0.1", 0),
+        http.server.SimpleHTTPRequestHandler,
+    )
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    try:
+        _git(
+            disposable_git.builder,
+            "switch",
+            "-C",
+            "candidate-external-network-tool",
+            disposable_git.baseline,
         )
+        external_tool_candidate = _write_commit(
+            disposable_git.builder,
+            "src/runtime/subject.py",
+            f"""import json
+import shutil
+import subprocess
+import sys
+
+curl = shutil.which("curl")
+nc = shutil.which("nc")
+if curl:
+    command = [curl, "--fail", "--silent", "--max-time", "2", "http://127.0.0.1:{server.server_port}/"]
+elif nc:
+    command = [nc, "-z", "-w", "2", "127.0.0.1", "{server.server_port}"]
+else:
+    raise RuntimeError("curl_or_nc_required_for_sandbox_test")
+if subprocess.run(command, check=False, stdout=subprocess.DEVNULL).returncode != 0:
+    raise PermissionError("external network tool denied by OS sandbox")
+request = json.load(sys.stdin)
+answers = {{
+    "effect_without_receipt": "reconcile_once",
+    "receipt_without_effect": "inspect_then_resume",
+    "safe_default": "deny",
+}}
+print(json.dumps({{"answer": answers[request["event"]]}}, sort_keys=True, separators=(",", ":")))
+""",
+            "attempt external network tool bypass",
+        )
+        external_tool = runner.evaluate_pair(
+            baseline_commit=disposable_git.baseline,
+            candidate_commit=external_tool_candidate,
+            evaluator_ref=evaluator_ref,
+        )
+        assert external_tool.report.eligible is False
+    finally:
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=5)
 
 
 def _write_controller_request(root: Path, name: str, value: dict[str, object]) -> Path:
@@ -1996,19 +2157,16 @@ def test_changed_main_receipt_replay_and_exact_revert_are_durable_real_effects(
         baseline_commit=disposable_git.baseline,
         candidate_commit=disposable_git.valid_candidate,
         evaluator_ref=evaluator_ref,
-        changed_paths=_changed_paths(disposable_git, disposable_git.valid_candidate),
     )
     gaming_pair = command_runner.evaluate_pair(
         baseline_commit=disposable_git.baseline,
         candidate_commit=disposable_git.benchmark_gamed_candidate,
         evaluator_ref=evaluator_ref,
-        changed_paths=_changed_paths(disposable_git, disposable_git.benchmark_gamed_candidate),
     )
     altered_pair = command_runner.evaluate_pair(
         baseline_commit=disposable_git.baseline,
         candidate_commit=disposable_git.evaluator_altered_candidate,
         evaluator_ref=evaluator_ref,
-        changed_paths=_changed_paths(disposable_git, disposable_git.evaluator_altered_candidate),
     )
     capability_report = valid_pair.report
     assert capability_report.eligible is True

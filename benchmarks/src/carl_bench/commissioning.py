@@ -675,6 +675,7 @@ class CommissioningArtifactStore:
     def __init__(self, *, automation_data_root: Path, repository_root: Path) -> None:
         self.automation_data_root = _anchored(automation_data_root)
         repository = _anchored(repository_root)
+        self.repository_root = repository
         if _inside(self.automation_data_root, repository):
             raise CommissioningArtifactError("commissioning_store_inside_repository")
         _prepare_automation_data_root(self.automation_data_root)
@@ -1140,6 +1141,7 @@ class CommissioningArtifactStore:
             verify_protected_pair_evaluation(
                 artifacts=self._objects,
                 evidence_bundle_ref=ref,
+                source_repository=self.repository_root,
             )
             for ref in capability_refs
         )
@@ -1507,6 +1509,7 @@ class CommissioningArtifactStore:
             verify_protected_pair_evaluation(
                 artifacts=self._objects,
                 evidence_bundle_ref=ref,
+                source_repository=self.repository_root,
             )
             for ref in sources.capability_evidence_refs
         )
