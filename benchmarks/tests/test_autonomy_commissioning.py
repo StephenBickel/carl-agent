@@ -181,6 +181,42 @@ print(json.dumps({"answer": answer}, sort_keys=True, separators=(",", ":")))
 """,
         "add baseline synthetic subject",
     )
+    _write_commit(
+        builder,
+        "tests/test_subject.py",
+        """import json
+import subprocess
+import sys
+import unittest
+from pathlib import Path
+
+
+SUBJECT = Path(__file__).parents[1] / "src" / "runtime" / "subject.py"
+
+
+def run_subject(event: str) -> str:
+    completed = subprocess.run(
+        [sys.executable, str(SUBJECT)],
+        input=json.dumps({"event": event}) + "\\n",
+        capture_output=True,
+        check=True,
+        text=True,
+    )
+    return json.loads(completed.stdout)["answer"]
+
+
+class SubjectBehaviorTests(unittest.TestCase):
+    def test_effect_without_receipt(self):
+        self.assertEqual(run_subject("effect_without_receipt"), "reconcile_once")
+
+    def test_receipt_without_effect(self):
+        self.assertEqual(run_subject("receipt_without_effect"), "inspect_then_resume")
+
+    def test_safe_default(self):
+        self.assertEqual(run_subject("safe_default"), "deny")
+""",
+        "add repository behavior tests",
+    )
     baseline = _git(builder, "rev-parse", "HEAD")
     baseline_tree = _git(builder, "rev-parse", "HEAD^{tree}")
     _git(builder, "branch", "-M", "main")
@@ -457,13 +493,50 @@ def _candidate_packet(
     manifest_digest: str,
     artifact_store: PrivateArtifactStore,
 ) -> SealedCandidate:
-    diff = _git(
-        fixture.builder,
+    diff_command = (
+        "git",
+        "-c",
+        "core.quotepath=false",
+        "-c",
+        "diff.external=",
+        "-C",
+        os.fspath(fixture.builder),
         "diff",
+        "--no-ext-diff",
+        "--no-renames",
         "--binary",
+        "--full-index",
         fixture.baseline,
         fixture.valid_candidate,
-    ).encode()
+        "--",
+    )
+    diff = subprocess.run(diff_command, check=True, capture_output=True).stdout
+    changed_paths = tuple(
+        sorted(
+            _git(
+                fixture.builder,
+                "diff",
+                "--no-renames",
+                "--name-only",
+                fixture.baseline,
+                fixture.valid_candidate,
+                "--",
+            ).splitlines()
+        )
+    )
+    check_command = (
+        "git",
+        "-C",
+        os.fspath(fixture.builder),
+        "diff",
+        "--check",
+        fixture.baseline,
+        fixture.valid_candidate,
+        "--",
+    )
+    started = time.monotonic_ns()
+    check = subprocess.run(check_command, check=False, capture_output=True)
+    elapsed_ms = max(1, (time.monotonic_ns() - started) // 1_000_000)
     return SealedCandidate(
         schema_version=1,
         experiment_id=EXPERIMENT_ID,
@@ -489,19 +562,26 @@ def _candidate_packet(
         changed_paths_artifact=artifact_store.put(
             evidence_kind="changed_paths",
             media_type="application/json",
-            content=canonical_json_bytes({"paths": ["src/runtime/capability.txt"]}),
+            content=canonical_json_bytes({"paths": list(changed_paths)}),
         ),
-        changed_path_count=1,
+        changed_path_count=len(changed_paths),
         checks=(
             DeterministicCheckResult(
-                check_id="synthetic-contracts",
-                status="passed",
-                exit_code=0,
-                elapsed_ms=125,
+                check_id="synthetic-git-diff-check",
+                status="passed" if check.returncode == 0 else "failed",
+                exit_code=check.returncode,
+                elapsed_ms=elapsed_ms,
                 output_artifact=artifact_store.put(
                     evidence_kind="check_output",
                     media_type="application/json",
-                    content=canonical_json_bytes({"passed": True}),
+                    content=canonical_json_bytes(
+                        {
+                            "command": list(check_command),
+                            "exit_code": check.returncode,
+                            "stderr_sha256": _sha256(check.stderr),
+                            "stdout_sha256": _sha256(check.stdout),
+                        }
+                    ),
                 ),
             ),
         ),
@@ -680,6 +760,7 @@ def _append_accepted_lifecycle(
     protected_receipt_digest: str,
     promotion_commit: str,
     artifact_store: PrivateArtifactStore,
+    paired: PairedEvidence,
 ) -> None:
     ledger = ExperimentLedger(ledger_path)
     for source, target, attempt, occurred_at in (
@@ -800,40 +881,10 @@ def _append_accepted_lifecycle(
             occurred_at="2026-08-19T09:11:00Z",
         )
     )
-    baseline_ref = artifact_store.put(
-        evidence_kind="baseline_scorecard",
-        media_type="application/json",
-        content=canonical_json_bytes({"pass_rate_basis_points": 5_000}),
-    )
-    candidate_ref = artifact_store.put(
-        evidence_kind="candidate_scorecard",
-        media_type="application/json",
-        content=canonical_json_bytes({"pass_rate_basis_points": 7_500}),
-    )
-    comparison_ref = artifact_store.put(
-        evidence_kind="paired_comparison",
-        media_type="application/json",
-        content=canonical_json_bytes(
-            {
-                "baseline": baseline_ref.to_canonical_dict(),
-                "candidate": candidate_ref.to_canonical_dict(),
-            }
-        ),
-    )
-    paired = PairedEvidence(
-        schema_version=1,
-        experiment_id=EXPERIMENT_ID,
-        manifest_digest=manifest_digest,
-        parent_commit=parent_commit,
-        candidate_commit=packet.candidate_commit,
-        baseline_scorecard_digest=baseline_ref.digest,
-        candidate_scorecard_digest=candidate_ref.digest,
-        comparison_artifact=comparison_ref,
-        decision="improvement",
-        paired_trials=3,
-        pass_rate_delta_basis_points=2_500,
-        confidence_lower_basis_points=500,
-    )
+    assert paired.experiment_id == EXPERIMENT_ID
+    assert paired.manifest_digest == manifest_digest
+    assert paired.parent_commit == parent_commit
+    assert paired.candidate_commit == packet.candidate_commit
     ledger.append_trusted_authority(
         ExperimentEvent.create(
             experiment_id=EXPERIMENT_ID,
@@ -1032,6 +1083,12 @@ def test_accepted_lifecycle_is_derived_from_fresh_ledger_and_bare_refs(
     tmp_path: Path,
     disposable_git: DisposableGitFixture,
 ) -> None:
+    from carl_bench.commissioning_runner import (
+        ProtectedSyntheticRunner,
+        derive_protected_paired_evidence,
+    )
+    from carl_bench.protected_run import ProtectedVerifierConfig
+
     automation_root = tmp_path / "automation-data"
     store = CommissioningArtifactStore(
         automation_data_root=automation_root,
@@ -1043,12 +1100,75 @@ def test_accepted_lifecycle_is_derived_from_fresh_ledger_and_bare_refs(
         experiment_id=EXPERIMENT_ID,
         parent_commit=disposable_git.baseline,
         registered_at="2026-08-19T09:00:00Z",
-        deterministic_checks=("synthetic-contracts",),
+        deterministic_checks=("synthetic-git-diff-check",),
     )
     ledger_path = automation_root / "lifecycle.sqlite3"
     ledger = ExperimentLedger(ledger_path)
     assert ledger.register_manifest(manifest) is True
-    packet = _candidate_packet(disposable_git, manifest.digest, evidence)
+    signer = ProtectedRunner(
+        disposable_git,
+        automation_root / ".protected-runner" / "lifecycle-signer",
+    )
+    verifier_config = ProtectedVerifierConfig(
+        schema_version=1,
+        key_id="synthetic-protected-validator",
+        public_key_pem=signer.public_key_pem,
+        policy_digest=POLICY_DIGEST,
+        model="synthetic-command-agent",
+        effort="deterministic",
+        repository_tests_command=(
+            sys.executable,
+            "-m",
+            "unittest",
+            "discover",
+            "-s",
+            "tests",
+            "-v",
+        ),
+        cost_per_millisecond_microdollars=10,
+        reviewer_ids=(
+            ("build", "protected-build-reviewer"),
+            ("proposal", "protected-proposal-reviewer"),
+            ("security", "protected-security-reviewer"),
+        ),
+    )
+    evaluator_ref = evidence.put(
+        evidence_kind="protected_evaluator",
+        media_type="application/json",
+        content=_protected_evaluator_bytes(),
+    )
+    runner = ProtectedSyntheticRunner(
+        artifacts=evidence,
+        protected_root=automation_root / ".protected-runner" / "lifecycle-evaluation",
+        source_repository=disposable_git.builder,
+    )
+    pair = runner.evaluate_pair(
+        baseline_commit=disposable_git.baseline,
+        candidate_commit=disposable_git.valid_candidate,
+        evaluator_ref=evaluator_ref,
+    )
+    protected_run = runner.build_protected_run(
+        evaluation=pair,
+        experiment_id=EXPERIMENT_ID,
+        manifest_digest=manifest.digest,
+        validation_id="validation-lifecycle-001",
+        created_at="2026-08-19T10:00:00Z",
+        expires_at="2026-08-19T18:00:00Z",
+        verifier_config=verifier_config,
+    )
+    packet = runner.seal_candidate_from_protected_run(
+        evaluation=pair,
+        protected_run=protected_run,
+        experiment_id=EXPERIMENT_ID,
+        manifest_digest=manifest.digest,
+    )
+    paired = derive_protected_paired_evidence(
+        artifacts=evidence,
+        source_repository=disposable_git.builder,
+        evidence_bundle_ref=pair.evidence_bundle_ref,
+        experiment_id=EXPERIMENT_ID,
+        manifest_digest=manifest.digest,
+    )
 
     _git(disposable_git.builder, "switch", "-C", "commissioning-accepted", manifest.parent_commit)
     _git(
@@ -1068,20 +1188,16 @@ def test_accepted_lifecycle_is_derived_from_fresh_ledger_and_bare_refs(
         f"{disposable_git.valid_candidate}:refs/heads/experimental/{EXPERIMENT_ID}",
     )
 
-    protected_receipt_ref = evidence.put(
-        evidence_kind="protected_receipt",
-        media_type="application/json",
-        content=canonical_json_bytes({"candidate_commit": disposable_git.valid_candidate}),
-    )
     _append_accepted_lifecycle(
         ledger_path=ledger_path,
         manifest_digest=manifest.digest,
         parent_commit=manifest.parent_commit,
         packet=packet,
         candidate_tree=disposable_git.valid_tree,
-        protected_receipt_digest=protected_receipt_ref.digest,
+        protected_receipt_digest=protected_run.receipt.digest,
         promotion_commit=promotion_commit,
         artifact_store=evidence,
+        paired=paired,
     )
     assert ExperimentLedger(ledger_path).projection(EXPERIMENT_ID).state is ExperimentState.ACCEPTED
     lifecycle_ref = evidence.put(
@@ -1545,21 +1661,6 @@ def _protected_evaluator_bytes() -> bytes:
     )
 
 
-def _changed_paths(
-    fixture: DisposableGitFixture,
-    candidate_commit: str,
-) -> tuple[str, ...]:
-    return tuple(
-        _git(
-            fixture.builder,
-            "diff",
-            "--name-only",
-            fixture.baseline,
-            candidate_commit,
-        ).splitlines()
-    )
-
-
 def test_protected_runner_derives_scores_from_commands_and_denies_sockets(
     tmp_path: Path,
     disposable_git: DisposableGitFixture,
@@ -1711,6 +1812,12 @@ def test_protected_runner_derives_scores_from_commands_and_denies_sockets(
     )
     assert high_level_network.report.eligible is False
 
+    server = http.server.ThreadingHTTPServer(
+        ("127.0.0.1", 0),
+        http.server.SimpleHTTPRequestHandler,
+    )
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
     _git(
         disposable_git.builder,
         "switch",
@@ -1721,13 +1828,14 @@ def test_protected_runner_derives_scores_from_commands_and_denies_sockets(
     native_socket_candidate = _write_commit(
         disposable_git.builder,
         "src/runtime/subject.py",
-        """import _socket
+        (
+            """import _socket
 import errno
 import json
 import sys
 
-result = _socket.socket().connect_ex(("127.0.0.1", 9))
-if result in {errno.EPERM, errno.EACCES}:
+result = _socket.socket().connect_ex(("127.0.0.1", __PORT__))
+if result != 0:
     raise PermissionError("native socket denied by OS sandbox")
 request = json.load(sys.stdin)
 answers = {
@@ -1736,7 +1844,8 @@ answers = {
     "safe_default": "deny",
 }
 print(json.dumps({"answer": answers[request["event"]]}, sort_keys=True, separators=(",", ":")))
-""",
+""".replace("__PORT__", str(server.server_port))
+        ),
         "attempt native socket bypass",
     )
     native_socket = runner.evaluate_pair(
@@ -1756,12 +1865,16 @@ print(json.dumps({"answer": answers[request["event"]]}, sort_keys=True, separato
     scrubbed_child_candidate = _write_commit(
         disposable_git.builder,
         "src/runtime/subject.py",
-        """import json
+        (
+            """import json
 import os
 import subprocess
 import sys
 
-probe = "import _socket; raise SystemExit(_socket.socket().connect_ex(('127.0.0.1', 9)) in (1, 13))"
+probe = (
+    "import _socket; "
+    "raise SystemExit(_socket.socket().connect_ex(('127.0.0.1', __PORT__)) != 0)"
+)
 completed = subprocess.run(
     [sys.executable, "-c", probe],
     env={"PATH": os.environ.get("PATH", "")},
@@ -1776,7 +1889,8 @@ answers = {
     "safe_default": "deny",
 }
 print(json.dumps({"answer": answers[request["event"]]}, sort_keys=True, separators=(",", ":")))
-""",
+""".replace("__PORT__", str(server.server_port))
+        ),
         "attempt scrubbed child socket bypass",
     )
     scrubbed_child = runner.evaluate_pair(
@@ -1786,12 +1900,6 @@ print(json.dumps({"answer": answers[request["event"]]}, sort_keys=True, separato
     )
     assert scrubbed_child.report.eligible is False
 
-    server = http.server.ThreadingHTTPServer(
-        ("127.0.0.1", 0),
-        http.server.SimpleHTTPRequestHandler,
-    )
-    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
-    server_thread.start()
     try:
         _git(
             disposable_git.builder,
@@ -1840,6 +1948,277 @@ print(json.dumps({{"answer": answers[request["event"]]}}, sort_keys=True, separa
         server_thread.join(timeout=5)
 
 
+def test_protected_run_receipt_is_recomputed_from_typed_artifacts_and_pinned_signer(
+    tmp_path: Path,
+    disposable_git: DisposableGitFixture,
+) -> None:
+    from carl_bench.commissioning_runner import ProtectedSyntheticRunner
+    from carl_bench.protected_run import (
+        ProtectedVerifierConfig,
+        verify_protected_run,
+    )
+
+    automation_root = tmp_path / "automation-data"
+    commissioning_store = CommissioningArtifactStore(
+        automation_data_root=automation_root,
+        repository_root=disposable_git.builder,
+    )
+    evidence = PrivateArtifactStore(
+        commissioning_store.objects_root,
+        disposable_git.builder,
+    )
+    evaluator_ref = evidence.put(
+        evidence_kind="protected_evaluator",
+        media_type="application/json",
+        content=_protected_evaluator_bytes(),
+    )
+    runner = ProtectedSyntheticRunner(
+        artifacts=evidence,
+        protected_root=automation_root / ".protected-runner" / "typed-run",
+        source_repository=disposable_git.builder,
+    )
+    pair = runner.evaluate_pair(
+        baseline_commit=disposable_git.baseline,
+        candidate_commit=disposable_git.valid_candidate,
+        evaluator_ref=evaluator_ref,
+    )
+    signer = ProtectedRunner(
+        disposable_git,
+        automation_root / ".protected-runner" / "trusted-signer",
+    )
+    config = ProtectedVerifierConfig(
+        schema_version=1,
+        key_id="synthetic-protected-validator",
+        public_key_pem=signer.public_key_pem,
+        policy_digest=POLICY_DIGEST,
+        model="synthetic-command-agent",
+        effort="deterministic",
+        repository_tests_command=(
+            sys.executable,
+            "-m",
+            "unittest",
+            "discover",
+            "-s",
+            "tests",
+            "-v",
+        ),
+        cost_per_millisecond_microdollars=10,
+        reviewer_ids=(
+            ("build", "protected-build-reviewer"),
+            ("proposal", "protected-proposal-reviewer"),
+            ("security", "protected-security-reviewer"),
+        ),
+    )
+
+    protected_run = runner.build_protected_run(
+        evaluation=pair,
+        experiment_id=EXPERIMENT_ID,
+        manifest_digest="a" * 64,
+        validation_id="validation-typed-run-001",
+        created_at="2026-08-19T10:00:00Z",
+        expires_at="2026-08-19T18:00:00Z",
+        verifier_config=config,
+    )
+    refs = dict(protected_run.artifact_refs)
+    assert set(refs) == {
+        "adapter",
+        "build_review",
+        "cost_latency",
+        "deterministic_checks",
+        "environment",
+        "executable",
+        "full_repository_tests",
+        "holdout_stats",
+        "metric_pack",
+        "proposal_review",
+        "protected_run_manifest",
+        "safety_gate",
+        "security_review",
+        "workflow_gate",
+    }
+    receipt = protected_run.receipt
+    assert receipt.schema_version == 3
+    assert receipt.protected_run_manifest_digest == refs["protected_run_manifest"].digest
+    assert receipt.deterministic_checks_digest == refs["deterministic_checks"].digest
+    assert receipt.repository_tests_digest == refs["full_repository_tests"].digest
+    assert receipt.proposal_review_digest == refs["proposal_review"].digest
+    assert receipt.build_review_digest == refs["build_review"].digest
+    assert receipt.security_review_digest == refs["security_review"].digest
+    assert receipt.executable_digest == refs["executable"].digest
+    assert receipt.adapter_digest == refs["adapter"].digest
+    assert receipt.metric_pack_digest == refs["metric_pack"].digest
+    assert receipt.environment_digest == refs["environment"].digest
+    assert receipt.task_set_digest == evaluator_ref.digest
+    assert receipt.workflow_passed is True
+    assert receipt.safety_passed is True
+    assert receipt.invalid_run_count == 0
+    assert receipt.holdout_leakage_detected is False
+    assert receipt.cost_microdollars == receipt.latency_ms * 10
+
+    envelope = signer.sign(receipt)
+    verified = verify_protected_run(
+        artifacts=evidence,
+        source_repository=disposable_git.builder,
+        evidence_bundle_ref=pair.evidence_bundle_ref,
+        manifest_ref=protected_run.manifest_ref,
+        envelope=envelope,
+        verifier_config=config,
+    )
+    assert verified.receipt == receipt
+    assert verified.artifact_refs == protected_run.artifact_refs
+
+    attacker = ProtectedRunner(
+        disposable_git,
+        automation_root / ".protected-runner" / "attacker-signer",
+    )
+    with pytest.raises(
+        CommissioningArtifactError,
+        match="protected_run_signature_invalid",
+    ):
+        verify_protected_run(
+            artifacts=evidence,
+            source_repository=disposable_git.builder,
+            evidence_bundle_ref=pair.evidence_bundle_ref,
+            manifest_ref=protected_run.manifest_ref,
+            envelope=attacker.sign(receipt),
+            verifier_config=config,
+        )
+
+
+def test_sealed_candidate_and_paired_evidence_share_protected_command_graph(
+    tmp_path: Path,
+    disposable_git: DisposableGitFixture,
+) -> None:
+    from carl_bench.commissioning_runner import (
+        ProtectedSyntheticRunner,
+        derive_protected_paired_evidence,
+    )
+    from carl_bench.protected_run import ProtectedVerifierConfig
+
+    automation_root = tmp_path / "automation-data"
+    store = CommissioningArtifactStore(
+        automation_data_root=automation_root,
+        repository_root=disposable_git.builder,
+    )
+    evidence = PrivateArtifactStore(store.objects_root, disposable_git.builder)
+    evaluator_ref = evidence.put(
+        evidence_kind="protected_evaluator",
+        media_type="application/json",
+        content=_protected_evaluator_bytes(),
+    )
+    runner = ProtectedSyntheticRunner(
+        artifacts=evidence,
+        protected_root=automation_root / ".protected-runner" / "candidate-graph",
+        source_repository=disposable_git.builder,
+    )
+    pair = runner.evaluate_pair(
+        baseline_commit=disposable_git.baseline,
+        candidate_commit=disposable_git.valid_candidate,
+        evaluator_ref=evaluator_ref,
+    )
+    signer = ProtectedRunner(
+        disposable_git,
+        automation_root / ".protected-runner" / "candidate-graph-signer",
+    )
+    config = ProtectedVerifierConfig(
+        schema_version=1,
+        key_id="synthetic-protected-validator",
+        public_key_pem=signer.public_key_pem,
+        policy_digest=POLICY_DIGEST,
+        model="synthetic-command-agent",
+        effort="deterministic",
+        repository_tests_command=(
+            sys.executable,
+            "-m",
+            "unittest",
+            "discover",
+            "-s",
+            "tests",
+            "-v",
+        ),
+        cost_per_millisecond_microdollars=10,
+        reviewer_ids=(
+            ("build", "protected-build-reviewer"),
+            ("proposal", "protected-proposal-reviewer"),
+            ("security", "protected-security-reviewer"),
+        ),
+    )
+    manifest_digest = "a" * 64
+    protected_run = runner.build_protected_run(
+        evaluation=pair,
+        experiment_id=EXPERIMENT_ID,
+        manifest_digest=manifest_digest,
+        validation_id="validation-candidate-graph-001",
+        created_at="2026-08-19T10:00:00Z",
+        expires_at="2026-08-19T18:00:00Z",
+        verifier_config=config,
+    )
+
+    packet = runner.seal_candidate_from_protected_run(
+        evaluation=pair,
+        protected_run=protected_run,
+        experiment_id=EXPERIMENT_ID,
+        manifest_digest=manifest_digest,
+    )
+    paired = derive_protected_paired_evidence(
+        artifacts=evidence,
+        source_repository=disposable_git.builder,
+        evidence_bundle_ref=pair.evidence_bundle_ref,
+        experiment_id=EXPERIMENT_ID,
+        manifest_digest=manifest_digest,
+    )
+
+    assert packet.parent_commit == disposable_git.baseline
+    assert packet.candidate_commit == disposable_git.valid_candidate
+    assert packet.changed_path_count == 2
+    assert json.loads(evidence.read(packet.changed_paths_artifact))["paths"] == [
+        "src/runtime/capability.txt",
+        "src/runtime/subject.py",
+    ]
+    assert (
+        evidence.read(packet.diff_artifact)
+        == subprocess.run(
+            (
+                "git",
+                "-c",
+                "core.quotepath=false",
+                "-c",
+                "diff.external=",
+                "-C",
+                os.fspath(disposable_git.builder),
+                "diff",
+                "--no-ext-diff",
+                "--no-renames",
+                "--binary",
+                "--full-index",
+                disposable_git.baseline,
+                disposable_git.valid_candidate,
+                "--",
+            ),
+            check=True,
+            capture_output=True,
+        ).stdout
+    )
+    assert (
+        packet.checks[0].output_artifact
+        == dict(protected_run.artifact_refs)["deterministic_checks"]
+    )
+    assert paired.parent_commit == packet.parent_commit
+    assert paired.candidate_commit == packet.candidate_commit
+    assert paired.decision == "improvement"
+    comparison = json.loads(evidence.read(paired.comparison_artifact))
+    baseline_scorecard_ref = ArtifactRef.from_canonical_dict(comparison["baseline_scorecard_ref"])
+    candidate_scorecard_ref = ArtifactRef.from_canonical_dict(comparison["candidate_scorecard_ref"])
+    assert paired.baseline_scorecard_digest == baseline_scorecard_ref.digest
+    assert paired.candidate_scorecard_digest == candidate_scorecard_ref.digest
+    assert json.loads(evidence.read(baseline_scorecard_ref))["outcomes"] == [
+        item.to_canonical_dict() for item in pair.report.baseline_outcomes
+    ]
+    assert json.loads(evidence.read(candidate_scorecard_ref))["outcomes"] == [
+        item.to_canonical_dict() for item in pair.report.candidate_outcomes
+    ]
+
+
 def _write_controller_request(root: Path, name: str, value: dict[str, object]) -> Path:
     path = root / f"{name}.json"
     path.write_bytes(canonical_json_bytes(value))
@@ -1855,19 +2234,49 @@ def test_changed_main_receipt_replay_and_exact_revert_are_durable_real_effects(
         CommissioningControllerError,
         CommissioningEffectStore,
     )
+    from carl_bench.protected_run import (
+        ProtectedVerifierConfig,
+        verify_protected_run,
+    )
 
     automation_root = tmp_path / "automation-data"
+    automation_root.mkdir(mode=0o700)
+    automation_root.chmod(0o700)
+    protected_runner = ProtectedRunner(
+        disposable_git,
+        automation_root / ".protected-runner",
+    )
+    verifier_config = ProtectedVerifierConfig(
+        schema_version=1,
+        key_id="synthetic-protected-validator",
+        public_key_pem=protected_runner.public_key_pem,
+        policy_digest=POLICY_DIGEST,
+        model="synthetic-command-agent",
+        effort="deterministic",
+        repository_tests_command=(
+            sys.executable,
+            "-m",
+            "unittest",
+            "discover",
+            "-s",
+            "tests",
+            "-v",
+        ),
+        cost_per_millisecond_microdollars=10,
+        reviewer_ids=(
+            ("build", "protected-build-reviewer"),
+            ("proposal", "protected-proposal-reviewer"),
+            ("security", "protected-security-reviewer"),
+        ),
+    )
     commissioning_store = CommissioningArtifactStore(
         automation_data_root=automation_root,
         repository_root=disposable_git.builder,
+        protected_verifier_config=verifier_config,
     )
     evidence = PrivateArtifactStore(
         commissioning_store.objects_root,
         disposable_git.builder,
-    )
-    protected_runner = ProtectedRunner(
-        disposable_git,
-        automation_root / ".protected-runner",
     )
     request_root = automation_root / ".shared-private" / "attack-requests"
     request_root.mkdir(mode=0o700)
@@ -2141,7 +2550,10 @@ def test_changed_main_receipt_replay_and_exact_revert_are_durable_real_effects(
     assert hard_record["pull_request"]["number"] == 42
     assert revert_record["pull_request"]["number"] == 43
 
-    from carl_bench.commissioning_runner import ProtectedSyntheticRunner
+    from carl_bench.commissioning_runner import (
+        ProtectedSyntheticRunner,
+        derive_protected_paired_evidence,
+    )
 
     evaluator_ref = evidence.put(
         evidence_kind="protected_evaluator",
@@ -2175,28 +2587,26 @@ def test_changed_main_receipt_replay_and_exact_revert_are_durable_real_effects(
         experiment_id=EXPERIMENT_ID,
         parent_commit=disposable_git.baseline,
         registered_at="2026-08-19T09:00:00Z",
-        deterministic_checks=("synthetic-contracts",),
+        deterministic_checks=("synthetic-git-diff-check",),
     )
-    protected_receipt = _protected_receipt(
+    protected_run = command_runner.build_protected_run(
+        evaluation=valid_pair,
+        experiment_id=EXPERIMENT_ID,
         manifest_digest=manifest.digest,
-        fixture=disposable_git,
-        capability_report=capability_report,
+        validation_id="validation-commissioning-001",
+        created_at="2026-08-19T10:00:00Z",
+        expires_at="2026-08-19T18:00:00Z",
+        verifier_config=verifier_config,
     )
+    protected_receipt = protected_run.receipt
     envelope = protected_runner.sign(protected_receipt)
-    expectation = replace(
-        _promotion_expectation(protected_receipt),
-        capability_report_digest=capability_report.digest,
-        transfer_gain_basis_points=capability_report.transfer_gain_basis_points,
-        capability_claim_type=capability_report.claim_type,
-        affected_contract_cases_improved=capability_report.affected_contract_cases_improved,
-        capability_guards_non_inferior=capability_report.guards_non_inferior,
-    )
-    verify_protected_validation(
-        envelope,
-        public_key_pem=protected_runner.public_key_pem,
-        expected=expectation,
-        now=NOW,
-        changed_paths=("src/runtime/capability.txt",),
+    verify_protected_run(
+        artifacts=evidence,
+        source_repository=disposable_git.builder,
+        evidence_bundle_ref=valid_pair.evidence_bundle_ref,
+        manifest_ref=protected_run.manifest_ref,
+        envelope=envelope,
+        verifier_config=verifier_config,
     )
     envelope_ref = evidence.put(
         evidence_kind="signed_protected_receipt",
@@ -2230,7 +2640,19 @@ def test_changed_main_receipt_replay_and_exact_revert_are_durable_real_effects(
     ledger_path = automation_root / "accepted-lifecycle.sqlite3"
     ledger = ExperimentLedger(ledger_path)
     assert ledger.register_manifest(manifest) is True
-    packet = _candidate_packet(disposable_git, manifest.digest, evidence)
+    packet = command_runner.seal_candidate_from_protected_run(
+        evaluation=valid_pair,
+        protected_run=protected_run,
+        experiment_id=EXPERIMENT_ID,
+        manifest_digest=manifest.digest,
+    )
+    paired = derive_protected_paired_evidence(
+        artifacts=evidence,
+        source_repository=disposable_git.builder,
+        evidence_bundle_ref=valid_pair.evidence_bundle_ref,
+        experiment_id=EXPERIMENT_ID,
+        manifest_digest=manifest.digest,
+    )
     _git(
         disposable_git.builder,
         "push",
@@ -2246,6 +2668,7 @@ def test_changed_main_receipt_replay_and_exact_revert_are_durable_real_effects(
         protected_receipt_digest=protected_receipt.digest,
         promotion_commit=healthy_merge,
         artifact_store=evidence,
+        paired=paired,
     )
     lifecycle_export_ref, lifecycle_chain_ref = commissioning_store.capture_lifecycle_sources(
         experiment_id=EXPERIMENT_ID,
@@ -2324,14 +2747,11 @@ def test_changed_main_receipt_replay_and_exact_revert_are_durable_real_effects(
             altered_pair.evidence_bundle_ref,
         ),
         signed_protected_receipt_ref=envelope_ref,
-        protected_public_key_path=request_root / "protected-public.pem",
+        protected_run_manifest_ref=protected_run.manifest_ref,
         supervisor_store_path=supervisor_path,
         supervisor_trigger_id=trigger.trigger_id,
         supervisor_result_ref=supervisor_result_ref,
     )
-    sources.protected_public_key_path.write_bytes(protected_runner.public_key_pem)
-    sources.protected_public_key_path.chmod(0o600)
-
     bundle = commissioning_store.build_synthetic(sources)
     assert bundle.receipt is None
     assert bundle.receipt_ref is None
@@ -2368,6 +2788,7 @@ def test_changed_main_receipt_replay_and_exact_revert_are_durable_real_effects(
         CommissioningArtifactStore(
             automation_data_root=automation_root,
             repository_root=disposable_git.builder,
+            protected_verifier_config=verifier_config,
         ).load_latest_synthetic()
         == bundle
     )

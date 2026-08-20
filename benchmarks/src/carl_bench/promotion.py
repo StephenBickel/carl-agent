@@ -116,9 +116,10 @@ class ProtectedValidationReceipt:
     decision: str
     capability_report_digest: str | None = None
     transfer_gain_basis_points: int | None = None
+    protected_run_manifest_digest: str | None = None
 
     def __post_init__(self) -> None:
-        if self.schema_version not in {1, 2}:
+        if self.schema_version not in {1, 2, 3}:
             raise PromotionContractError("invalid_protected_receipt_schema")
         _identifier("validation_id", self.validation_id)
         _identifier("experiment_id", self.experiment_id)
@@ -174,6 +175,7 @@ class ProtectedValidationReceipt:
             if (
                 self.capability_report_digest is not None
                 or self.transfer_gain_basis_points is not None
+                or self.protected_run_manifest_digest is not None
             ):
                 raise PromotionContractError("invalid_protected_receipt_schema")
         else:
@@ -185,6 +187,11 @@ class ProtectedValidationReceipt:
                 or not -10_000 <= transfer_gain <= 10_000
             ):
                 raise PromotionContractError("invalid_transfer_gain_basis_points")
+            if self.schema_version == 2:
+                if self.protected_run_manifest_digest is not None:
+                    raise PromotionContractError("invalid_protected_receipt_schema")
+            else:
+                _digest("protected_run_manifest_digest", self.protected_run_manifest_digest)
         created = _parse_utc("created_at", self.created_at)
         expires = _parse_utc("expires_at", self.expires_at)
         if expires <= created:
@@ -197,6 +204,12 @@ class ProtectedValidationReceipt:
                 name: field
                 for name, field in fields.items()
                 if name not in {"capability_report_digest", "transfer_gain_basis_points"}
+            }
+        if self.schema_version in {1, 2}:
+            fields = {
+                name: field
+                for name, field in fields.items()
+                if name != "protected_run_manifest_digest"
             }
         return {name: getattr(self, name) for name in fields}
 
@@ -247,6 +260,7 @@ class PromotionExpectation:
     capability_claim_type: str | None = None
     affected_contract_cases_improved: bool | None = None
     capability_guards_non_inferior: bool | None = None
+    protected_run_manifest_digest: str | None = None
 
     def __post_init__(self) -> None:
         _identifier("experiment_id", self.experiment_id)
@@ -294,6 +308,8 @@ class PromotionExpectation:
             ):
                 if not isinstance(getattr(self, name), bool):
                     raise PromotionContractError(f"invalid_{name}")
+        if self.protected_run_manifest_digest is not None:
+            _digest("protected_run_manifest_digest", self.protected_run_manifest_digest)
 
 
 @dataclass(frozen=True, slots=True)
@@ -375,6 +391,13 @@ def verify_protected_validation(
         )
         if receipt.transfer_gain_basis_points <= 0 and not contract_exception:
             raise PromotionContractError("protected_transfer_gain_required")
+        if receipt.schema_version == 3:
+            if expected.protected_run_manifest_digest is None:
+                raise PromotionContractError("protected_run_manifest_missing")
+            if receipt.protected_run_manifest_digest != expected.protected_run_manifest_digest:
+                raise PromotionContractError("protected_run_manifest_mismatch")
+        elif expected.protected_run_manifest_digest is not None:
+            raise PromotionContractError("protected_run_manifest_missing")
     if now < _parse_utc("created_at", receipt.created_at):
         raise PromotionContractError("protected_receipt_not_yet_valid")
     if now > _parse_utc("expires_at", receipt.expires_at):

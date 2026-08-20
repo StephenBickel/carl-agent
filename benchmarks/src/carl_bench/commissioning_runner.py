@@ -11,11 +11,13 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
 
 from carl_bench.artifacts import ArtifactRef, PrivateArtifactStore
+from carl_bench.candidate import DeterministicCheckResult, PairedEvidence, SealedCandidate
 from carl_bench.canonical import canonical_json_bytes
 from carl_bench.capability_validation import (
     CapabilityClaim,
@@ -596,6 +598,105 @@ def verify_protected_pair_evaluation(
     )
 
 
+def derive_protected_paired_evidence(
+    *,
+    artifacts: PrivateArtifactStore,
+    source_repository: Path,
+    evidence_bundle_ref: ArtifactRef,
+    experiment_id: str,
+    manifest_digest: str,
+) -> PairedEvidence:
+    """Derive canonical lifecycle evidence from protected command scorecards."""
+    verified = verify_protected_pair_evaluation(
+        artifacts=artifacts,
+        evidence_bundle_ref=evidence_bundle_ref,
+        source_repository=source_repository,
+    )
+    _identifier(experiment_id, "invalid_paired_experiment")
+    if (
+        not isinstance(manifest_digest, str)
+        or re.fullmatch(r"[0-9a-f]{64}", manifest_digest) is None
+    ):
+        raise CommissioningArtifactError("invalid_paired_manifest")
+    refs = dict(verified.artifact_refs)
+    evaluator = ProtectedEvaluator.from_bytes(artifacts.read(refs["protected_evaluator"]))
+    baseline_ref = artifacts.put(
+        evidence_kind="baseline_scorecard",
+        media_type="application/json",
+        content=canonical_json_bytes(
+            {
+                "commit": verified.baseline_commit,
+                "outcomes": [
+                    item.to_canonical_dict() for item in verified.report.baseline_outcomes
+                ],
+                "schema_version": 1,
+            }
+        ),
+    )
+    candidate_ref = artifacts.put(
+        evidence_kind="candidate_scorecard",
+        media_type="application/json",
+        content=canonical_json_bytes(
+            {
+                "commit": verified.candidate_commit,
+                "outcomes": [
+                    item.to_canonical_dict() for item in verified.report.candidate_outcomes
+                ],
+                "schema_version": 1,
+            }
+        ),
+    )
+    before = {item.task_id: item.score_basis_points for item in verified.report.baseline_outcomes}
+    after = {item.task_id: item.score_basis_points for item in verified.report.candidate_outcomes}
+    if set(before) != set(after) or not before:
+        raise CommissioningArtifactError("protected_paired_identity_mismatch")
+    deltas = tuple(after[task] - before[task] for task in sorted(before))
+    non_guard_deltas = tuple(
+        after[task.task_id] - before[task.task_id]
+        for task in evaluator.tasks
+        if task.role != "guard"
+    )
+    if not non_guard_deltas:
+        raise CommissioningArtifactError("protected_paired_identity_mismatch")
+    paired_trials = sum(
+        len(item.valid_trials) + len(item.invalid_trials)
+        for item in verified.report.candidate_outcomes
+    )
+    pass_rate_delta = sum(deltas) // len(deltas)
+    confidence_lower = min(non_guard_deltas)
+    comparison_ref = artifacts.put(
+        evidence_kind="paired_comparison",
+        media_type="application/json",
+        content=canonical_json_bytes(
+            {
+                "baseline_scorecard_ref": baseline_ref.to_canonical_dict(),
+                "candidate_scorecard_ref": candidate_ref.to_canonical_dict(),
+                "capability_report_ref": refs["capability_report"].to_canonical_dict(),
+                "confidence_lower_basis_points": confidence_lower,
+                "paired_trials": paired_trials,
+                "parent_commit": verified.baseline_commit,
+                "candidate_commit": verified.candidate_commit,
+                "pass_rate_delta_basis_points": pass_rate_delta,
+                "schema_version": 1,
+            }
+        ),
+    )
+    return PairedEvidence(
+        schema_version=1,
+        experiment_id=experiment_id,
+        manifest_digest=manifest_digest,
+        parent_commit=verified.baseline_commit,
+        candidate_commit=verified.candidate_commit,
+        baseline_scorecard_digest=baseline_ref.digest,
+        candidate_scorecard_digest=candidate_ref.digest,
+        comparison_artifact=comparison_ref,
+        decision="improvement" if verified.report.eligible else "rejected",
+        paired_trials=paired_trials,
+        pass_rate_delta_basis_points=pass_rate_delta,
+        confidence_lower_basis_points=confidence_lower,
+    )
+
+
 class ProtectedSyntheticRunner:
     """Run exact commits against protected tasks inside an OS network sandbox."""
 
@@ -748,6 +849,221 @@ class ProtectedSyntheticRunner:
             "subject_tree": self._git("rev-parse", "HEAD^{tree}", cwd=checkout),
             "trials": trials,
         }
+
+    def _protected_command_result(
+        self,
+        *,
+        checkout: Path,
+        run_kind: str,
+        baseline_commit: str,
+        candidate_commit: str,
+        candidate_tree: str,
+        logical_command: tuple[str, ...],
+        actual_command: tuple[str, ...],
+    ):
+        from carl_bench.protected_run import ProtectedCommandResult
+
+        environment = {
+            **os.environ,
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTHONSAFEPATH": "1",
+        }
+        environment.pop("PYTHONPATH", None)
+        started = time.monotonic_ns()
+        try:
+            completed = subprocess.run(
+                (*self.network_sandbox_prefix, *actual_command),
+                cwd=checkout,
+                check=False,
+                capture_output=True,
+                timeout=120,
+                env=environment,
+            )
+            exit_code = completed.returncode
+            stdout = completed.stdout
+            stderr = completed.stderr
+        except subprocess.TimeoutExpired as error:
+            exit_code = 124
+            stdout = error.stdout or b""
+            stderr = error.stderr or b""
+        elapsed_ms = max(1, (time.monotonic_ns() - started) // 1_000_000)
+        stdout_ref = self.artifacts.put(
+            evidence_kind="protected_command_stdout",
+            media_type="application/octet-stream",
+            content=stdout,
+        )
+        stderr_ref = self.artifacts.put(
+            evidence_kind="protected_command_stderr",
+            media_type="application/octet-stream",
+            content=stderr,
+        )
+        return ProtectedCommandResult(
+            schema_version=1,
+            run_kind=run_kind,
+            baseline_commit=baseline_commit,
+            candidate_commit=candidate_commit,
+            candidate_tree=candidate_tree,
+            command=logical_command,
+            exit_code=exit_code,
+            elapsed_ms=elapsed_ms,
+            stdout_ref=stdout_ref,
+            stderr_ref=stderr_ref,
+        )
+
+    def build_protected_run(
+        self,
+        *,
+        evaluation: ProtectedPairEvaluation,
+        experiment_id: str,
+        manifest_digest: str,
+        validation_id: str,
+        created_at: str,
+        expires_at: str,
+        verifier_config,
+    ):
+        """Execute protected checks and derive one fully artifact-backed receipt."""
+        from carl_bench.protected_run import (
+            ProtectedVerifierConfig,
+            persist_protected_run,
+        )
+
+        if not isinstance(evaluation, ProtectedPairEvaluation) or not isinstance(
+            verifier_config, ProtectedVerifierConfig
+        ):
+            raise CommissioningArtifactError("invalid_protected_run_input")
+        verified = verify_protected_pair_evaluation(
+            artifacts=self.artifacts,
+            evidence_bundle_ref=evaluation.evidence_bundle_ref,
+            source_repository=self.source_repository,
+        )
+        if verified.report != evaluation.report:
+            raise CommissioningArtifactError("protected_run_evaluation_mismatch")
+        evaluator = ProtectedEvaluator.from_bytes(self.artifacts.read(evaluation.evaluator_ref))
+        run_root = Path(tempfile.mkdtemp(prefix="protected-run-", dir=self.protected_root))
+        if os.name != "nt":
+            run_root.chmod(0o700)
+        try:
+            checkout = run_root / "candidate"
+            self._checkout(verified.candidate_commit, checkout)
+            subject = checkout / evaluator.subject_path
+            if not subject.is_file() or subject.is_symlink():
+                raise CommissioningArtifactError("synthetic_subject_missing")
+            executable_bytes = subject.read_bytes()
+            logical_deterministic = (
+                "git",
+                "diff",
+                "--check",
+                verified.baseline_commit,
+                verified.candidate_commit,
+                "--",
+            )
+            git_executable = shutil.which("git")
+            if git_executable is None:
+                raise CommissioningArtifactError("synthetic_git_failed")
+            deterministic = self._protected_command_result(
+                checkout=checkout,
+                run_kind="deterministic_checks",
+                baseline_commit=verified.baseline_commit,
+                candidate_commit=verified.candidate_commit,
+                candidate_tree=verified.candidate_tree,
+                logical_command=logical_deterministic,
+                actual_command=(git_executable, *logical_deterministic[1:]),
+            )
+            repository_tests = self._protected_command_result(
+                checkout=checkout,
+                run_kind="full_repository_tests",
+                baseline_commit=verified.baseline_commit,
+                candidate_commit=verified.candidate_commit,
+                candidate_tree=verified.candidate_tree,
+                logical_command=verifier_config.repository_tests_command,
+                actual_command=verifier_config.repository_tests_command,
+            )
+        finally:
+            shutil.rmtree(run_root, ignore_errors=True)
+        return persist_protected_run(
+            artifacts=self.artifacts,
+            verifier_config=verifier_config,
+            experiment_id=experiment_id,
+            manifest_digest=manifest_digest,
+            validation_id=validation_id,
+            baseline_commit=verified.baseline_commit,
+            candidate_commit=verified.candidate_commit,
+            candidate_tree=verified.candidate_tree,
+            evidence_bundle_ref=evaluation.evidence_bundle_ref,
+            evaluator_ref=evaluation.evaluator_ref,
+            capability_report=verified.report,
+            task_roles=tuple((task.task_id, task.role) for task in evaluator.tasks),
+            changed_paths=verified.changed_paths,
+            executable_bytes=executable_bytes,
+            subject_path=evaluator.subject_path,
+            deterministic_result=deterministic,
+            repository_result=repository_tests,
+            created_at=created_at,
+            expires_at=expires_at,
+        )
+
+    def seal_candidate_from_protected_run(
+        self,
+        *,
+        evaluation: ProtectedPairEvaluation,
+        protected_run,
+        experiment_id: str,
+        manifest_digest: str,
+    ) -> SealedCandidate:
+        """Seal the exact pair diff and protected deterministic command output."""
+        from carl_bench.protected_run import (
+            ProtectedCommandResult,
+            ProtectedRunEvidence,
+        )
+
+        if not isinstance(evaluation, ProtectedPairEvaluation) or not isinstance(
+            protected_run, ProtectedRunEvidence
+        ):
+            raise CommissioningArtifactError("invalid_protected_candidate_input")
+        verified = verify_protected_pair_evaluation(
+            artifacts=self.artifacts,
+            evidence_bundle_ref=evaluation.evidence_bundle_ref,
+            source_repository=self.source_repository,
+        )
+        pair_refs = dict(verified.artifact_refs)
+        run_refs = dict(protected_run.artifact_refs)
+        deterministic_ref = run_refs["deterministic_checks"]
+        deterministic = ProtectedCommandResult.from_canonical_dict(
+            json.loads(self.artifacts.read(deterministic_ref))
+        )
+        report_ref = self.artifacts.put(
+            evidence_kind="implementation_report",
+            media_type="application/json",
+            content=canonical_json_bytes(
+                {
+                    "candidate_commit": verified.candidate_commit,
+                    "capability_report_ref": pair_refs["capability_report"].to_canonical_dict(),
+                    "protected_run_manifest_ref": protected_run.manifest_ref.to_canonical_dict(),
+                    "schema_version": 1,
+                }
+            ),
+        )
+        return SealedCandidate(
+            schema_version=1,
+            experiment_id=experiment_id,
+            manifest_digest=manifest_digest,
+            parent_commit=verified.baseline_commit,
+            candidate_commit=verified.candidate_commit,
+            branch=f"codex/experiment-{experiment_id}-{verified.baseline_commit[:10]}",
+            diff_artifact=pair_refs["git_binary_diff"],
+            report_artifact=report_ref,
+            changed_paths_artifact=pair_refs["git_changed_paths"],
+            changed_path_count=len(verified.changed_paths),
+            checks=(
+                DeterministicCheckResult(
+                    check_id="synthetic-git-diff-check",
+                    status="passed" if deterministic.passed else "failed",
+                    exit_code=deterministic.exit_code,
+                    elapsed_ms=deterministic.elapsed_ms,
+                    output_artifact=deterministic_ref,
+                ),
+            ),
+        )
 
     def evaluate_pair(
         self,

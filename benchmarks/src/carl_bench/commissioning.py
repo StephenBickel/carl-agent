@@ -517,7 +517,7 @@ class SyntheticCommissioningSources:
     effects_snapshot_ref: ArtifactRef
     capability_evidence_refs: tuple[ArtifactRef, ...]
     signed_protected_receipt_ref: ArtifactRef
-    protected_public_key_path: Path
+    protected_run_manifest_ref: ArtifactRef
     supervisor_store_path: Path
     supervisor_trigger_id: str
     supervisor_result_ref: ArtifactRef
@@ -528,7 +528,6 @@ class SyntheticCommissioningSources:
             "ledger_path",
             "bare_repository",
             "effect_store_path",
-            "protected_public_key_path",
             "supervisor_store_path",
         ):
             if not isinstance(getattr(self, name), Path):
@@ -539,6 +538,7 @@ class SyntheticCommissioningSources:
             "bare_refs_snapshot_ref",
             "effects_snapshot_ref",
             "signed_protected_receipt_ref",
+            "protected_run_manifest_ref",
             "supervisor_result_ref",
         ):
             if not isinstance(getattr(self, name), ArtifactRef):
@@ -549,6 +549,7 @@ class SyntheticCommissioningSources:
             "bare_refs_snapshot_ref": "bare_refs_snapshot",
             "effects_snapshot_ref": "commissioning_effects_snapshot",
             "signed_protected_receipt_ref": "signed_protected_receipt",
+            "protected_run_manifest_ref": "protected_run_manifest",
             "supervisor_result_ref": "supervisor_result",
         }
         if any(
@@ -672,10 +673,22 @@ def _bare_git(repository: Path, *arguments: str) -> str:
 class CommissioningArtifactStore:
     """Persist discoverable synthetic receipts beneath an owner-private automation root."""
 
-    def __init__(self, *, automation_data_root: Path, repository_root: Path) -> None:
+    def __init__(
+        self,
+        *,
+        automation_data_root: Path,
+        repository_root: Path,
+        protected_verifier_config: Any | None = None,
+    ) -> None:
         self.automation_data_root = _anchored(automation_data_root)
         repository = _anchored(repository_root)
         self.repository_root = repository
+        if protected_verifier_config is not None:
+            from carl_bench.protected_run import ProtectedVerifierConfig
+
+            if not isinstance(protected_verifier_config, ProtectedVerifierConfig):
+                raise CommissioningArtifactError("invalid_protected_verifier_config")
+        self.protected_verifier_config = protected_verifier_config
         if _inside(self.automation_data_root, repository):
             raise CommissioningArtifactError("commissioning_store_inside_repository")
         _prepare_automation_data_root(self.automation_data_root)
@@ -1070,13 +1083,15 @@ class CommissioningArtifactStore:
             EffectRequest,
             verify_effect_receipt_ref,
         )
-        from carl_bench.commissioning_runner import verify_protected_pair_evaluation
+        from carl_bench.commissioning_runner import (
+            derive_protected_paired_evidence,
+            verify_protected_pair_evaluation,
+        )
         from carl_bench.promotion import (
-            PromotionExpectation,
             ProtectedValidationReceipt,
             SignedProtectedValidation,
-            verify_protected_validation,
         )
+        from carl_bench.protected_run import ProtectedCommandResult, verify_protected_run
 
         refs = self._artifact_map(artifact_refs)
         required = {
@@ -1084,7 +1099,7 @@ class CommissioningArtifactStore:
             "commissioning_effects_snapshot",
             "lifecycle_chain_receipt",
             "lifecycle_export",
-            "protected_public_key",
+            "protected_run_manifest",
             "signed_protected_receipt",
             "supervisor_record",
             "supervisor_result",
@@ -1137,25 +1152,28 @@ class CommissioningArtifactStore:
         )
         if len(capability_refs) != 3:
             raise CommissioningArtifactError("commissioning_capability_evidence_incomplete")
-        evaluations = tuple(
-            verify_protected_pair_evaluation(
-                artifacts=self._objects,
-                evidence_bundle_ref=ref,
-                source_repository=self.repository_root,
+        evaluated_refs = tuple(
+            (
+                ref,
+                verify_protected_pair_evaluation(
+                    artifacts=self._objects,
+                    evidence_bundle_ref=ref,
+                    source_repository=self.repository_root,
+                ),
             )
             for ref in capability_refs
         )
-        eligible = tuple(item for item in evaluations if item.report.eligible)
+        eligible = tuple(item for item in evaluated_refs if item[1].report.eligible)
         if len(eligible) != 1:
             raise CommissioningArtifactError("commissioning_capability_evidence_invalid")
-        accepted_evaluation = eligible[0]
+        accepted_evidence_ref, accepted_evaluation = eligible[0]
         if (
             accepted_evaluation.baseline_commit != manifest.parent_commit
             or accepted_evaluation.candidate_commit != publication.commit
             or accepted_evaluation.candidate_tree != publication.tree
         ):
             raise CommissioningArtifactError("commissioning_capability_identity_mismatch")
-        rejected = tuple(item for item in evaluations if not item.report.eligible)
+        rejected = tuple(item for _, item in evaluated_refs if not item.report.eligible)
         gaming = any(
             any(path.endswith("/task.toml") for path in item.changed_paths)
             and "active_evaluator_modified" in item.report.reasons
@@ -1176,6 +1194,8 @@ class CommissioningArtifactStore:
         )
         if set(envelope_value) != {"key_id", "receipt", "signature_base64"}:
             raise CommissioningArtifactError("commissioning_protected_receipt_invalid")
+        if self.protected_verifier_config is None:
+            raise CommissioningArtifactError("commissioning_protected_verifier_required")
         try:
             receipt = ProtectedValidationReceipt(**envelope_value["receipt"])
             envelope = SignedProtectedValidation(
@@ -1183,39 +1203,104 @@ class CommissioningArtifactStore:
                 key_id=envelope_value["key_id"],
                 signature_base64=envelope_value["signature_base64"],
             )
-            expected = PromotionExpectation(
-                experiment_id=manifest.experiment_id,
-                manifest_digest=manifest.digest,
-                policy_digest=receipt.policy_digest,
-                parent_commit=manifest.parent_commit,
-                candidate_commit=publication.commit,
-                candidate_tree=publication.tree,
-                executable_digest=receipt.executable_digest,
-                adapter_digest=receipt.adapter_digest,
-                task_set_digest=receipt.task_set_digest,
-                metric_pack_digest=receipt.metric_pack_digest,
-                model=receipt.model,
-                effort=receipt.effort,
-                environment_digest=receipt.environment_digest,
-                capability_report_digest=accepted_evaluation.report.digest,
-                transfer_gain_basis_points=(accepted_evaluation.report.transfer_gain_basis_points),
-                capability_claim_type=accepted_evaluation.report.claim_type,
-                affected_contract_cases_improved=(
-                    accepted_evaluation.report.affected_contract_cases_improved
-                ),
-                capability_guards_non_inferior=(accepted_evaluation.report.guards_non_inferior),
-            )
-            verify_protected_validation(
-                envelope,
-                public_key_pem=self.read(refs["protected_public_key"]),
-                expected=expected,
-                now=_parse_utc(receipt.created_at, "commissioning_receipt_time_invalid"),
-                changed_paths=accepted_evaluation.changed_paths,
+            verified_run = verify_protected_run(
+                artifacts=self._objects,
+                source_repository=self.repository_root,
+                evidence_bundle_ref=accepted_evidence_ref,
+                manifest_ref=refs["protected_run_manifest"],
+                envelope=envelope,
+                verifier_config=self.protected_verifier_config,
             )
         except (TypeError, ValueError) as error:
             raise CommissioningArtifactError("commissioning_protected_receipt_invalid") from error
-        if validation.receipt_digest != receipt.digest:
+        if (
+            verified_run.receipt != receipt
+            or receipt.experiment_id != manifest.experiment_id
+            or receipt.manifest_digest != manifest.digest
+            or receipt.parent_commit != manifest.parent_commit
+            or receipt.candidate_commit != publication.commit
+            or receipt.candidate_tree != publication.tree
+            or receipt.capability_report_digest != accepted_evaluation.report.digest
+            or validation.receipt_digest != receipt.digest
+        ):
             raise CommissioningArtifactError("commissioning_protected_receipt_mismatch")
+
+        pair_refs = dict(accepted_evaluation.artifact_refs)
+        run_refs = dict(verified_run.artifact_refs)
+        deterministic = ProtectedCommandResult.from_canonical_dict(
+            json.loads(self.read(run_refs["deterministic_checks"]))
+        )
+        expected_candidate_report = canonical_json_bytes(
+            {
+                "candidate_commit": accepted_evaluation.candidate_commit,
+                "capability_report_ref": pair_refs["capability_report"].to_canonical_dict(),
+                "protected_run_manifest_ref": refs["protected_run_manifest"].to_canonical_dict(),
+                "schema_version": 1,
+            }
+        )
+        if (
+            candidate.parent_commit != accepted_evaluation.baseline_commit
+            or candidate.diff_artifact != pair_refs["git_binary_diff"]
+            or candidate.changed_paths_artifact != pair_refs["git_changed_paths"]
+            or candidate.changed_path_count != len(accepted_evaluation.changed_paths)
+            or self.read(candidate.report_artifact) != expected_candidate_report
+            or len(candidate.checks) != 1
+            or candidate.checks[0].check_id != "synthetic-git-diff-check"
+            or candidate.checks[0].output_artifact != run_refs["deterministic_checks"]
+            or candidate.checks[0].exit_code != deterministic.exit_code
+            or candidate.checks[0].elapsed_ms != deterministic.elapsed_ms
+            or candidate.checks[0].passed != deterministic.passed
+        ):
+            raise CommissioningArtifactError("commissioning_candidate_evidence_mismatch")
+        paired = derive_protected_paired_evidence(
+            artifacts=self._objects,
+            source_repository=self.repository_root,
+            evidence_bundle_ref=accepted_evidence_ref,
+            experiment_id=manifest.experiment_id,
+            manifest_digest=manifest.digest,
+        )
+        if (
+            projection.paired_evidence != paired
+            or receipt.paired_score_delta_basis_points != paired.pass_rate_delta_basis_points
+            or receipt.paired_confidence_lower_basis_points != paired.confidence_lower_basis_points
+        ):
+            raise CommissioningArtifactError("commissioning_paired_evidence_mismatch")
+        comparison = self._json_object(
+            self.read(paired.comparison_artifact),
+            "commissioning_paired_evidence_mismatch",
+        )
+        try:
+            baseline_scorecard_ref = ArtifactRef.from_canonical_dict(
+                comparison["baseline_scorecard_ref"]
+            )
+            candidate_scorecard_ref = ArtifactRef.from_canonical_dict(
+                comparison["candidate_scorecard_ref"]
+            )
+        except (ArtifactIntegrityError, KeyError, TypeError) as error:
+            raise CommissioningArtifactError("commissioning_paired_evidence_mismatch") from error
+        if (
+            baseline_scorecard_ref.digest != paired.baseline_scorecard_digest
+            or candidate_scorecard_ref.digest != paired.candidate_scorecard_digest
+        ):
+            raise CommissioningArtifactError("commissioning_paired_evidence_mismatch")
+        self.read(baseline_scorecard_ref)
+        self.read(candidate_scorecard_ref)
+
+        nested_refs = {
+            "candidate_check_0": candidate.checks[0].output_artifact,
+            "candidate_changed_paths": candidate.changed_paths_artifact,
+            "candidate_diff": candidate.diff_artifact,
+            "candidate_report": candidate.report_artifact,
+            "paired_baseline_scorecard": baseline_scorecard_ref,
+            "paired_candidate_scorecard": candidate_scorecard_ref,
+            "paired_comparison": paired.comparison_artifact,
+            **{f"protected_run_{name}": ref for name, ref in verified_run.artifact_refs},
+        }
+        for name, ref in nested_refs.items():
+            existing = refs.get(name)
+            if existing is not None and existing != ref:
+                raise CommissioningArtifactError("commissioning_source_artifact_mismatch")
+            refs[name] = ref
 
         effects = self._json_object(
             self.read(refs["commissioning_effects_snapshot"]),
@@ -1249,7 +1334,7 @@ class CommissioningArtifactStore:
                     verify_effect_receipt_ref(
                         artifacts=self._objects,
                         receipt_ref=effect_receipt_ref,
-                        public_key_pem=self.read(refs["protected_public_key"]),
+                        public_key_pem=self.protected_verifier_config.public_key_pem,
                         request=request,
                     )
                 except ValueError as error:
@@ -1467,7 +1552,7 @@ class CommissioningArtifactStore:
             restart_recoveries=len(recovered_keys),
             remote_cloud_acceptance="uncommissioned",
             adversarial_outcomes=outcomes,
-            artifact_refs=artifact_refs,
+            artifact_refs=tuple(sorted(refs.items())),
         )
 
     def build_synthetic(
@@ -1485,7 +1570,6 @@ class CommissioningArtifactStore:
         for path in (
             sources.ledger_path,
             sources.effect_store_path,
-            sources.protected_public_key_path,
             sources.supervisor_store_path,
         ):
             if not _inside(_anchored(path), self.automation_data_root):
@@ -1513,13 +1597,8 @@ class CommissioningArtifactStore:
             )
             for ref in sources.capability_evidence_refs
         )
-        if not _owner_private_file(_anchored(sources.protected_public_key_path)):
-            raise CommissioningArtifactError("commissioning_protected_public_key_invalid")
-        public_key_ref = self._objects.put(
-            evidence_kind="protected_public_key",
-            media_type="application/x-pem-file",
-            content=_anchored(sources.protected_public_key_path).read_bytes(),
-        )
+        if self.protected_verifier_config is None:
+            raise CommissioningArtifactError("commissioning_protected_verifier_required")
         try:
             supervisor = SupervisorTriggerStore(sources.supervisor_store_path).get(
                 sources.supervisor_trigger_id
@@ -1555,7 +1634,7 @@ class CommissioningArtifactStore:
             ("commissioning_effects_snapshot", sources.effects_snapshot_ref),
             ("lifecycle_chain_receipt", sources.lifecycle_chain_receipt_ref),
             ("lifecycle_export", sources.lifecycle_export_ref),
-            ("protected_public_key", public_key_ref),
+            ("protected_run_manifest", sources.protected_run_manifest_ref),
             ("signed_protected_receipt", sources.signed_protected_receipt_ref),
             ("supervisor_record", supervisor_record_ref),
             ("supervisor_result", sources.supervisor_result_ref),
