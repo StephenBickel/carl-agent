@@ -30,6 +30,11 @@ jobs:
           cache-python: false
       - name: Install locked benchmark dependencies
         run: uv sync --project benchmarks --python 3.12 --locked
+      - name: Install Linux commissioning sandbox
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends bubblewrap
+          bwrap --version
       - name: Test benchmark contracts
         run: uv run --offline --project benchmarks --locked pytest -q benchmarks/tests
       - name: Lint benchmark code
