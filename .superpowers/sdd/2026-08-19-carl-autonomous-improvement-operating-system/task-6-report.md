@@ -80,4 +80,5 @@ and history tampering, and shared harness/subject identities.
 
 ## Commit
 
-`fix(factory): harden cloud isolation and durable retries`
+- Round 3: `30b098c` — `fix(factory): harden cloud isolation and durable retries`
+- Round 4: `200d741` — `fix(factory): close cloud trust boundary gaps`
