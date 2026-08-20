@@ -73,6 +73,10 @@ def test_linux_sandbox_command_has_explicit_mounts_and_no_host_root_bind(
     assert command[:3] == (os.fspath(sudo), "--non-interactive", os.fspath(bwrap))
     assert command[-2:] == ("/toolchain/python", "subject.py")
     assert "--unshare-net" in command
+    assert "--unshare-pid" in command
+    assert "--unshare-uts" in command
+    assert "--unshare-ipc" in command
+    assert "--unshare-all" not in command
     assert "--die-with-parent" in command
     assert ("--cap-drop", "ALL") in tuple(
         tuple(command[index : index + 2]) for index in range(len(command) - 1)
