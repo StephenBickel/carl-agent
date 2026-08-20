@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 import tomllib
 from dataclasses import dataclass
@@ -11,6 +13,13 @@ PORTFOLIO_PATH = (
     / "docs"
     / "automation-prompts"
     / "carl-autonomous-improvement.md"
+)
+LIVE_MANIFEST_PATH = PORTFOLIO_PATH.with_name(
+    "carl-autonomous-improvement-live-manifest.json"
+)
+SUPERVISOR_TRIGGER_PATH = (
+    "/Users/openclaw/.codex/automations/.shared-private/"
+    "carl-autonomy-supervisor-triggers.sqlite3"
 )
 
 
@@ -151,6 +160,12 @@ def test_watchdog_is_compact_when_idle_and_recovers_active_work() -> None:
         "reconcile active experiments, reviews, promotions, soaks, reverts, leases, and retries",
         "three materially different recovery attempts",
     )
+    assert watchdog.contains(
+        "commissioning and live acp gates apply only to forward evidence acceptance, "
+        "disposition, and promotion",
+        "never block rollback or exact revert reconciliation",
+        "hard production rollback remains bounded to two hours",
+    )
 
 
 def test_supervisor_changes_recovery_action_and_noops_only_when_healthy() -> None:
@@ -161,6 +176,39 @@ def test_supervisor_changes_recovery_action_and_noops_only_when_healthy() -> Non
         "no-op only when commissioning is complete, no critical condition exists, "
         "and the loop is advancing",
         "redispatch the exact next safe node",
+    )
+
+
+def test_recovery_roles_share_one_durable_supervisor_trigger_contract() -> None:
+    portfolio = _load_portfolio()
+
+    for automation_id in {
+        "carl-promotion-and-rollback-watchdog",
+        "daily-carl-autonomy-outcome-monitor",
+        "carl-autonomy-loop-supervisor",
+    }:
+        snapshot = portfolio[automation_id]
+        assert SUPERVISOR_TRIGGER_PATH in snapshot.prompt, automation_id
+        assert snapshot.contains(
+            "supervisortrigger v1",
+            "trigger_id",
+            "exact evidence_digest",
+            "unsafe_boundary",
+            "attempt_history",
+            "next_safe_node_key",
+            "created_at",
+            "next supervisor inspection occurs within six hours",
+            "hard production rollback remains bounded to two hours",
+        ), automation_id
+
+    watchdog = portfolio["carl-promotion-and-rollback-watchdog"]
+    monitor = portfolio["daily-carl-autonomy-outcome-monitor"]
+    supervisor = portfolio["carl-autonomy-loop-supervisor"]
+    assert watchdog.contains("append the trigger idempotently")
+    assert monitor.contains("append the trigger idempotently")
+    assert supervisor.contains(
+        "atomically claim the trigger",
+        "record one materially changed recovery action",
     )
 
 
@@ -229,10 +277,43 @@ def test_every_automation_is_a_thin_fail_closed_local_controller() -> None:
         assert snapshot.metadata["heavy_execution"] == "github_hosted", automation_id
         assert snapshot.metadata["local_heavy_fallback"] is False, automation_id
         assert snapshot.contains(
-            "dispatch heavy builds, tests, evaluations, and soak probes to github-hosted workflows",
             "never silently fall back to heavy local execution",
             "fail closed if either a trusted signed commissioning receipt or live acp "
             "capability evidence is missing",
+        ), automation_id
+
+
+def test_only_operational_roles_may_dispatch_heavy_workflows() -> None:
+    portfolio = _load_portfolio()
+    dispatch_phrase = (
+        "dispatch heavy builds, tests, evaluations, and soak probes to github-hosted workflows"
+    )
+
+    for automation_id in {
+        "daily-carl-self-improvement-graph",
+        "daily-carl-production-review",
+        "carl-promotion-and-rollback-watchdog",
+        "carl-autonomy-loop-supervisor",
+    }:
+        assert portfolio[automation_id].contains(dispatch_phrase), automation_id
+
+    for automation_id in {
+        "daily-carl-autonomy-outcome-monitor",
+        "weekly-carl-feature-and-autonomy-report",
+    }:
+        observer = portfolio[automation_id]
+        assert not observer.contains(dispatch_phrase), automation_id
+        assert observer.contains(
+            "do not dispatch heavy workflows",
+            "reconcile already-produced signed evidence",
+            "append",
+            "supervisortrigger v1",
+            "trigger_id",
+            "exact evidence_digest",
+            "unsafe_boundary",
+            "attempt_history",
+            "next_safe_node_key",
+            "created_at",
         ), automation_id
 
 
@@ -247,3 +328,22 @@ def test_no_automation_has_forbidden_production_authority() -> None:
         assert snapshot.contains(
             "never directly push `main`, force-push, deploy, or release",
         ), automation_id
+
+
+def test_sanitized_live_manifest_matches_the_complete_canonical_portfolio() -> None:
+    portfolio = _load_portfolio()
+    manifest = json.loads(LIVE_MANIFEST_PATH.read_text(encoding="utf-8"))
+
+    assert manifest["schema_version"] == 1
+    assert manifest["source"] == "sanitized_live_definition_export"
+    entries = {entry["id"]: entry for entry in manifest["automations"]}
+    assert len(manifest["automations"]) == 6
+    assert set(entries) == set(portfolio)
+
+    for automation_id, snapshot in portfolio.items():
+        entry = entries[automation_id]
+        assert entry["status"] == "ACTIVE"
+        assert entry["configuration"] == snapshot.metadata
+        assert entry["prompt_sha256"] == hashlib.sha256(
+            snapshot.prompt.encode("utf-8")
+        ).hexdigest()

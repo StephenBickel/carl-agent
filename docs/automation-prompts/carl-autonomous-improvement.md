@@ -208,10 +208,23 @@ free. Repeating the same command against unchanged state is forbidden. A hard pr
 must start or reconcile one exact git-revert PR within two hours and enable protected auto-merge only
 after required checks pass.
 
+Shared supervisor-trigger store:
+/Users/openclaw/.codex/automations/.shared-private/carl-autonomy-supervisor-triggers.sqlite3
+Use the SupervisorTrigger v1 record with: trigger_id, exact evidence_digest, unsafe_boundary,
+attempt_history, next_safe_node_key, and created_at. After bounded recovery is exhausted, append
+the trigger idempotently with the exact failed evidence and attempts. The polling contract guarantees
+the next supervisor inspection occurs within six hours; hard production rollback remains bounded to
+two hours and never waits for supervisor polling.
+
 Dispatch heavy builds, tests, evaluations, and soak probes to GitHub-hosted workflows. Never silently
 fall back to heavy local execution. Fail closed if either a trusted signed commissioning receipt or
-live ACP capability evidence is missing. Invalid signatures, changed production parents, protection drift,
-unexpected PR heads, stale soak evidence, or rollback failure freeze the consequential stage.
+live ACP capability evidence is missing. Commissioning and live ACP gates apply only to forward
+evidence acceptance, disposition, and promotion; they never block rollback or exact revert
+reconciliation. Even during commissioning or ACP outages, reconcile the exact rollback target and
+git-revert PR within the two-hour bound, while still requiring protected PR identity and required
+checks before auto-merge. Invalid forward provenance freezes only the forward consequential stage;
+rollback identity or check failures keep exact rollback reconciliation active and emit a durable
+supervisor trigger.
 
 Never directly push `main`, force-push, deploy, or release. Never mutate candidate code, assign a
 disposition, weaken policy or branch protection, invent evidence, expose credentials, or reset main.
@@ -254,9 +267,10 @@ Authoritative workspace: /Users/openclaw/Documents/Carl-agent-harness/.worktrees
 
 Reconcile durable run times, experiment/review/promotion ledgers, remote experimental branches, PRs,
 main commits, signed receipts, required checks, protection, leases, soak observations, rollback timing,
-and retained learning. Dispatch heavy builds, tests, evaluations, and soak probes to GitHub-hosted
-workflows. Never silently fall back to heavy local execution. Run only lightweight deterministic
-health evaluation locally.
+and retained learning. Do not dispatch heavy workflows. Reconcile already-produced signed evidence
+and create a durable supervisor trigger when required evidence or an owner action is missing. Never
+silently fall back to heavy local execution. Run only lightweight deterministic health evaluation
+locally.
 
 Count new user-visible hypotheses, implemented candidates, experimental pushes, independent
 dispositions, production promotions, accepted soaks, reverts, and retained learning since the prior
@@ -270,6 +284,14 @@ Also report critical for a daily builder or review outcome older than 36 hours, 
 hours, hard failure without revert started within 2 hours, protection drift, or worse production
 without active rollback. A critical or repeatedly stuck finding must trigger the supervisor with the
 exact evidence and next unsafe boundary; do not merely restate it on later audits.
+
+Shared supervisor-trigger store:
+/Users/openclaw/.codex/automations/.shared-private/carl-autonomy-supervisor-triggers.sqlite3
+Use the SupervisorTrigger v1 record with: trigger_id, exact evidence_digest, unsafe_boundary,
+attempt_history, next_safe_node_key, and created_at. Append the trigger idempotently; do not
+dispatch replacement verification from this observer role. The polling contract guarantees the next
+supervisor inspection occurs within six hours; hard production rollback remains bounded to two hours
+and remains owned by the recovery controller.
 
 Fail closed if either a trusted signed commissioning receipt or live ACP capability evidence is missing:
 label the relevant stage uncommissioned or blocked and never count it as verified throughput.
@@ -319,6 +341,15 @@ incomplete, an outcome is critical, recovery failed repeatedly, or the loop is s
 commissioning is complete, no critical condition exists, and the loop is advancing. A healthy no-op
 must emit only `supervisor: healthy`.
 
+Shared supervisor-trigger store:
+/Users/openclaw/.codex/automations/.shared-private/carl-autonomy-supervisor-triggers.sqlite3
+Consume the SupervisorTrigger v1 record with: trigger_id, exact evidence_digest,
+unsafe_boundary, attempt_history, next_safe_node_key, and created_at. Poll it on every scheduled
+run, atomically claim the trigger by revision, and record one materially changed recovery action in
+the same compare-and-swap operation before reporting progress. Idempotently replay an exact prior
+claim. The polling contract guarantees the next supervisor inspection occurs within six hours; hard
+production rollback remains bounded to two hours and never waits for this supervisor.
+
 Identify the smallest causal prompt, orchestration, credential, environment, evaluation, or GitHub
 control failure. Make routine reversible repairs already authorized by policy: reconcile duplicate or
 stale durable state, repair contradictory operational prompts, fix control-plane code, rerun
@@ -367,17 +398,20 @@ release = false
 
 ```text prompt
 Produce Carl's concise Monday-through-Sunday user-visible product and autonomy report. This task is
-read-only outcome synthesis; do not mutate code or state, assign disposition, promote, recover, or
-manufacture work.
+read-only outcome synthesis except for one idempotent supervisor-trigger append; do not mutate code or
+other state, assign disposition, promote, recover, or manufacture work.
 
 Repository: StephenBickel/carl-agent
 Authoritative workspace: /Users/openclaw/Documents/Carl-agent-harness/.worktrees/carl-improvement-factory
 
 Reconcile exact Git commits, immutable experimental branches, PRs, durable ledgers, signed workflow
 receipts, task-level capability evidence, security review, soaks, reverts, and automation timestamps.
-Do not trust summaries without source identities. Dispatch heavy builds, tests, evaluations, and soak
-probes to GitHub-hosted workflows if verification is required. Never silently fall back to heavy local
-execution.
+Do not trust summaries without source identities. Do not dispatch heavy workflows. Reconcile
+already-produced signed evidence; when required evidence is missing, append an idempotent
+SupervisorTrigger v1 to
+/Users/openclaw/.codex/automations/.shared-private/carl-autonomy-supervisor-triggers.sqlite3. Use the
+complete record: trigger_id, exact evidence_digest, unsafe_boundary, attempt_history,
+next_safe_node_key, and created_at. Never silently fall back to heavy local execution.
 
 Summarize user-visible production changes with commit, PR, evidence delta, and accepted soak;
 experimental changes with branch, commit, disposition, and next gate; rejected or inconclusive work
@@ -388,8 +422,9 @@ watchdog and supervisor ticks. State plainly when no feature advanced or evidenc
 Fail closed if either a trusted signed commissioning receipt or live ACP capability evidence is missing:
 label the corresponding outcome unverified and do not claim autonomous production capability.
 
-Never directly push `main`, force-push, deploy, or release. Never modify repositories, branches, PRs,
-policies, automations, ledgers, receipts, or evidence.
+Never directly push `main`, force-push, deploy, or release. Except for the bounded supervisor-trigger
+append above, never modify repositories, branches, PRs, policies, automations, ledgers, receipts, or
+evidence.
 
 Emit one progress report organized as: production pushed; experimental pushed; rejected and learned;
 reverts; exact health and throughput; commissioning status; blockers; next expected outcome. Report-only
