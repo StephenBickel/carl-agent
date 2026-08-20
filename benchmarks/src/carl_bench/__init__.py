@@ -1,31 +1,39 @@
 """Carl's reproducible benchmark lab."""
 
 from carl_bench.cloud_state import (
-    AuthorityContext,
+    AuthorityCapability,
     ClaimReconciliation,
     CloudCommand,
     CloudLease,
     CloudStateError,
     CommandClaim,
     CommandState,
+    DeadHolderObservation,
     EvidenceObject,
     LeaseReconciliation,
     LeaseRelease,
     StateBackend,
     StateTransition,
+    TrustedAuthorityKey,
+    VerifiedAuthority,
+    VerifiedDeadHolderObservation,
 )
 
 __all__ = [
-    "AuthorityContext",
+    "AuthorityCapability",
     "ClaimReconciliation",
     "CloudCommand",
     "CloudLease",
     "CloudStateError",
     "CommandClaim",
     "CommandState",
+    "DeadHolderObservation",
     "EvidenceObject",
     "LeaseReconciliation",
     "LeaseRelease",
     "StateBackend",
     "StateTransition",
+    "TrustedAuthorityKey",
+    "VerifiedAuthority",
+    "VerifiedDeadHolderObservation",
 ]
