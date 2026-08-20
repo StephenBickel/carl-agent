@@ -67,6 +67,21 @@ class CloudStateError(ValueError):
         super().__init__(code)
 
 
+@dataclass(frozen=True, slots=True)
+class AuthorityContext:
+    """Adapter-authenticated authority, deliberately separate from persisted payload labels."""
+
+    authority: str
+    principal_id: str
+    credential_digest: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.authority, str) or self.authority not in _OPERATIONS_BY_AUTHORITY:
+            raise CloudStateError("invalid_context_authority")
+        _key("context_principal_id", self.principal_id)
+        _digest("context_credential_digest", self.credential_digest)
+
+
 def _key(name: str, value: object) -> str:
     if not isinstance(value, str) or _KEY_RE.fullmatch(value) is None:
         raise CloudStateError(f"invalid_{name}")
@@ -127,6 +142,11 @@ def _authorized_operation(authority: object, operation: object) -> tuple[str, st
     if not isinstance(operation, str) or operation not in _OPERATIONS_BY_AUTHORITY[authority]:
         raise CloudStateError("command_authority_denied")
     return authority, operation
+
+
+def _require_context(context: AuthorityContext, authority: str) -> None:
+    if not isinstance(context, AuthorityContext) or context.authority != authority:
+        raise CloudStateError("authority_context_mismatch")
 
 
 @dataclass(frozen=True, slots=True)
@@ -248,6 +268,33 @@ class CommandClaim:
 
 
 @dataclass(frozen=True, slots=True)
+class ClaimReconciliation:
+    command_key: str
+    claim_id: str
+    authority: str
+    expected_revision: int
+    next_revision: int
+    observed_at: str
+    worker_live: bool
+    evidence_digest: str
+    observer_id: str
+
+    def __post_init__(self) -> None:
+        _key("reconciliation_command_key", self.command_key)
+        _key("reconciliation_claim_id", self.claim_id)
+        if not isinstance(self.authority, str) or self.authority not in _OPERATIONS_BY_AUTHORITY:
+            raise CloudStateError("invalid_reconciliation_authority")
+        expected_revision = _revision("reconciliation_expected_revision", self.expected_revision)
+        if _revision("reconciliation_next_revision", self.next_revision) != expected_revision + 1:
+            raise CloudStateError("reconciliation_revision_invalid")
+        _timestamp("reconciliation_observed_at", self.observed_at)
+        if not isinstance(self.worker_live, bool):
+            raise CloudStateError("invalid_reconciliation_liveness")
+        _digest("reconciliation_evidence_digest", self.evidence_digest)
+        _key("reconciliation_observer_id", self.observer_id)
+
+
+@dataclass(frozen=True, slots=True)
 class StateTransition:
     command_key: str
     authority: str
@@ -317,7 +364,7 @@ class CommandState:
             raise CloudStateError("invalid_state_status")
         if self.status == "pending":
             if (
-                revision != self.command.expected_revision
+                revision < self.command.expected_revision
                 or self.claim is not None
                 or self.transition is not None
                 or self.result_digest is not None
@@ -348,6 +395,7 @@ class CommandState:
             or self.transition.authority != self.command.authority
             or self.transition.next_revision != revision
             or self.transition.status != self.status
+            or self.transition.expected_revision != self.claim.expected_revision + 1
         ):
             raise CloudStateError("state_transition_mismatch")
         if (
@@ -402,6 +450,9 @@ class CloudLease:
     revision: int
     acquired_at: str
     expires_at: str
+    reconciled_at: str | None = None
+    reconciliation_evidence_digest: str | None = None
+    released_at: str | None = None
 
     def __post_init__(self) -> None:
         _key("lease_key", self.lease_key)
@@ -413,6 +464,27 @@ class CloudLease:
             "lease_acquired_at", self.acquired_at
         ):
             raise CloudStateError("invalid_lease_expiry")
+        reconciliation = (self.reconciled_at, self.reconciliation_evidence_digest)
+        if any(item is None for item in reconciliation) and any(
+            item is not None for item in reconciliation
+        ):
+            raise CloudStateError("invalid_lease_reconciliation")
+        if self.reconciled_at is not None:
+            if _timestamp("lease_reconciled_at", self.reconciled_at) < _timestamp(
+                "lease_expires_at", self.expires_at
+            ):
+                raise CloudStateError("lease_reconciliation_precedes_expiry")
+            _digest("lease_reconciliation_evidence_digest", self.reconciliation_evidence_digest)
+        if self.released_at is not None:
+            _timestamp("lease_released_at", self.released_at)
+
+    @property
+    def status(self) -> Literal["active", "reconciled", "released"]:
+        if self.released_at is not None:
+            return "released"
+        if self.reconciled_at is not None:
+            return "reconciled"
+        return "active"
 
     def to_canonical_dict(self) -> dict[str, Any]:
         return _canonical_output({name: getattr(self, name) for name in self.__dataclass_fields__})
@@ -426,6 +498,61 @@ class CloudLease:
             return cls(**decoded)
         except TypeError as error:
             raise CloudStateError("invalid_cloud_lease") from error
+
+
+@dataclass(frozen=True, slots=True)
+class LeaseReconciliation:
+    lease_key: str
+    holder_id: str
+    authority: str
+    expected_revision: int
+    next_revision: int
+    observed_at: str
+    worker_live: bool
+    evidence_digest: str
+    observer_id: str
+
+    def __post_init__(self) -> None:
+        _key("lease_reconciliation_key", self.lease_key)
+        _key("lease_reconciliation_holder_id", self.holder_id)
+        if not isinstance(self.authority, str) or self.authority not in _LEASE_AUTHORITIES:
+            raise CloudStateError("lease_authority_denied")
+        expected_revision = _revision(
+            "lease_reconciliation_expected_revision", self.expected_revision
+        )
+        if (
+            _revision("lease_reconciliation_next_revision", self.next_revision)
+            != expected_revision + 1
+        ):
+            raise CloudStateError("lease_reconciliation_revision_invalid")
+        _timestamp("lease_reconciliation_observed_at", self.observed_at)
+        if not isinstance(self.worker_live, bool):
+            raise CloudStateError("invalid_lease_liveness")
+        _digest("lease_reconciliation_evidence_digest", self.evidence_digest)
+        _key("lease_reconciliation_observer_id", self.observer_id)
+
+
+@dataclass(frozen=True, slots=True)
+class LeaseRelease:
+    lease_key: str
+    holder_id: str
+    authority: str
+    expected_revision: int
+    next_revision: int
+    released_at: str
+    evidence_digest: str | None
+
+    def __post_init__(self) -> None:
+        _key("lease_release_key", self.lease_key)
+        _key("lease_release_holder_id", self.holder_id)
+        if not isinstance(self.authority, str) or self.authority not in _LEASE_AUTHORITIES:
+            raise CloudStateError("lease_authority_denied")
+        expected_revision = _revision("lease_release_expected_revision", self.expected_revision)
+        if _revision("lease_release_next_revision", self.next_revision) != expected_revision + 1:
+            raise CloudStateError("lease_release_revision_invalid")
+        _timestamp("lease_released_at", self.released_at)
+        if self.evidence_digest is not None:
+            _digest("lease_release_evidence_digest", self.evidence_digest)
 
 
 @dataclass(frozen=True, slots=True)
@@ -469,6 +596,14 @@ class EvidenceObject:
             return cls(**decoded)
         except TypeError as error:
             raise CloudStateError("invalid_evidence_object") from error
+
+
+def authorize_evidence(evidence: EvidenceObject, *, context: AuthorityContext) -> EvidenceObject:
+    """Require adapter-authenticated authority before an evidence record is persisted."""
+    if not isinstance(evidence, EvidenceObject):
+        raise CloudStateError("invalid_evidence_object")
+    _require_context(context, evidence.producer)
+    return evidence
 
 
 @dataclass(frozen=True, slots=True)
@@ -543,13 +678,24 @@ def replay_command(persisted: CloudCommand, replay: CloudCommand) -> CloudComman
     return persisted
 
 
-def claim_command(state: CommandState, claim: CommandClaim) -> CommandState:
+def claim_command(
+    state: CommandState,
+    claim: CommandClaim,
+    *,
+    context: AuthorityContext,
+    observed_at: str,
+) -> CommandState:
     if not isinstance(state, CommandState) or not isinstance(claim, CommandClaim):
         raise CloudStateError("invalid_command_claim")
     if state.command.command_key != claim.command_key:
         raise CloudStateError("claim_command_mismatch")
     if state.command.authority != claim.authority:
         raise CloudStateError("command_authority_denied")
+    _require_context(context, state.command.authority)
+    if _timestamp("claim_observed_at", observed_at) >= _timestamp(
+        "claim_expires_at", claim.expires_at
+    ):
+        raise CloudStateError("command_claim_expired")
     if state.status == "claimed" and state.claim == claim:
         return state
     if state.status != "pending":
@@ -568,10 +714,20 @@ def claim_command(state: CommandState, claim: CommandClaim) -> CommandState:
 
 
 def _terminal_successor(
-    state: CommandState, transition: StateTransition, expected_status: TransitionStatus
+    state: CommandState,
+    transition: StateTransition,
+    expected_status: TransitionStatus,
+    *,
+    context: AuthorityContext,
+    observed_at: str,
 ) -> CommandState:
     if not isinstance(state, CommandState) or not isinstance(transition, StateTransition):
         raise CloudStateError("invalid_state_transition")
+    _require_context(context, state.command.authority)
+    if state.claim is not None and _timestamp("terminal_observed_at", observed_at) >= _timestamp(
+        "claim_expires_at", state.claim.expires_at
+    ):
+        raise CloudStateError("command_claim_expired")
     if transition.status != expected_status:
         raise CloudStateError("transition_status_mismatch")
     if state.status == expected_status:
@@ -588,6 +744,8 @@ def _terminal_successor(
         or transition.authority != state.command.authority
     ):
         raise CloudStateError("transition_claim_mismatch")
+    if transition.expected_revision != state.claim.expected_revision + 1:
+        raise CloudStateError("transition_claim_revision_mismatch")
     if transition.expected_revision != state.revision:
         raise CloudStateError("command_cas_mismatch")
     return CommandState(
@@ -601,12 +759,69 @@ def _terminal_successor(
     )
 
 
-def complete_command(state: CommandState, transition: StateTransition) -> CommandState:
-    return _terminal_successor(state, transition, "completed")
+def complete_command(
+    state: CommandState,
+    transition: StateTransition,
+    *,
+    context: AuthorityContext,
+    observed_at: str,
+) -> CommandState:
+    return _terminal_successor(
+        state, transition, "completed", context=context, observed_at=observed_at
+    )
 
 
-def fail_command(state: CommandState, transition: StateTransition) -> CommandState:
-    return _terminal_successor(state, transition, "failed")
+def fail_command(
+    state: CommandState,
+    transition: StateTransition,
+    *,
+    context: AuthorityContext,
+    observed_at: str,
+) -> CommandState:
+    return _terminal_successor(
+        state, transition, "failed", context=context, observed_at=observed_at
+    )
+
+
+def reconcile_expired_claim(
+    state: CommandState,
+    reconciliation: ClaimReconciliation,
+    *,
+    context: AuthorityContext,
+    observer_context: AuthorityContext,
+) -> CommandState:
+    """Fence an expired claim with independently authenticated dead-worker evidence."""
+    if not isinstance(state, CommandState) or not isinstance(reconciliation, ClaimReconciliation):
+        raise CloudStateError("invalid_claim_reconciliation")
+    if state.status != "claimed" or state.claim is None:
+        raise CloudStateError("command_not_reconcilable")
+    _require_context(context, state.command.authority)
+    _require_context(observer_context, "observer")
+    if reconciliation.observer_id != observer_context.principal_id:
+        raise CloudStateError("liveness_observer_mismatch")
+    if reconciliation.worker_live:
+        raise CloudStateError("claim_holder_live")
+    if (
+        reconciliation.command_key != state.command.command_key
+        or reconciliation.claim_id != state.claim.claim_id
+        or reconciliation.authority != state.command.authority
+    ):
+        raise CloudStateError("claim_reconciliation_mismatch")
+    if reconciliation.expected_revision != state.revision:
+        raise CloudStateError("command_cas_mismatch")
+    if _timestamp("reconciliation_observed_at", reconciliation.observed_at) < _timestamp(
+        "claim_expires_at", state.claim.expires_at
+    ):
+        raise CloudStateError("command_claim_active")
+    return CommandState(
+        command=state.command,
+        revision=reconciliation.next_revision,
+        status="pending",
+        claim=None,
+        transition=None,
+        result_digest=None,
+        failure_code=None,
+    )
 
 
 def lease_expired(lease: CloudLease, *, observed_at: str) -> bool:
@@ -618,22 +833,31 @@ def lease_expired(lease: CloudLease, *, observed_at: str) -> bool:
 
 
 def acquire_lease(
-    current: CloudLease | None, desired: CloudLease, *, observed_at: str
+    current: CloudLease | None,
+    desired: CloudLease,
+    *,
+    context: AuthorityContext,
+    observed_at: str,
 ) -> CloudLease:
     if (current is not None and not isinstance(current, CloudLease)) or not isinstance(
         desired, CloudLease
     ):
         raise CloudStateError("invalid_cloud_lease")
     observed = _timestamp("lease_observed_at", observed_at)
+    _require_context(context, desired.authority)
     if _timestamp("lease_desired_acquired_at", desired.acquired_at) < observed:
         raise CloudStateError("lease_acquisition_precedes_observation")
     if current is not None:
         if current.lease_key != desired.lease_key or current.authority != desired.authority:
             raise CloudStateError("lease_identity_mismatch")
-        if not lease_expired(current, observed_at=observed_at):
-            raise CloudStateError("lease_active")
         if desired.revision != current.revision:
             raise CloudStateError("lease_cas_mismatch")
+        if current.status == "active" and not lease_expired(current, observed_at=observed_at):
+            raise CloudStateError("lease_active")
+        if current.status == "active":
+            raise CloudStateError("lease_reconciliation_required")
+        if current.status == "reconciled":
+            raise CloudStateError("lease_release_required")
     elif desired.revision != 0:
         raise CloudStateError("lease_cas_mismatch")
     return CloudLease(
@@ -646,47 +870,138 @@ def acquire_lease(
     )
 
 
-def reconcile_lease(lease: CloudLease, *, observed_at: str) -> CloudLease | None:
-    """A caller may clear only an expired lease after checking external truth."""
-    return None if lease_expired(lease, observed_at=observed_at) else lease
-
-
-def release_lease(lease: CloudLease, *, holder_id: str, expected_revision: int) -> LeaseMutation:
-    if not isinstance(lease, CloudLease):
-        raise CloudStateError("invalid_cloud_lease")
-    _key("lease_holder_id", holder_id)
-    if holder_id != lease.holder_id:
-        raise CloudStateError("lease_holder_mismatch")
-    if _revision("lease_expected_revision", expected_revision) != lease.revision:
+def reconcile_lease(
+    lease: CloudLease,
+    reconciliation: LeaseReconciliation,
+    *,
+    context: AuthorityContext,
+    observer_context: AuthorityContext,
+) -> CloudLease:
+    """Mark an expired lease reconciled only after trusted dead-worker observation."""
+    if not isinstance(lease, CloudLease) or not isinstance(reconciliation, LeaseReconciliation):
+        raise CloudStateError("invalid_lease_reconciliation")
+    _require_context(context, lease.authority)
+    _require_context(observer_context, "observer")
+    if reconciliation.observer_id != observer_context.principal_id:
+        raise CloudStateError("liveness_observer_mismatch")
+    if reconciliation.worker_live:
+        raise CloudStateError("lease_holder_live")
+    if (
+        lease.status != "active"
+        or reconciliation.lease_key != lease.lease_key
+        or reconciliation.holder_id != lease.holder_id
+        or reconciliation.authority != lease.authority
+    ):
+        raise CloudStateError("lease_reconciliation_mismatch")
+    if reconciliation.expected_revision != lease.revision:
         raise CloudStateError("lease_cas_mismatch")
-    return LeaseMutation(applied=True, lease=None, revision=lease.revision + 1)
+    if _timestamp("lease_reconciliation_observed_at", reconciliation.observed_at) < _timestamp(
+        "lease_expires_at", lease.expires_at
+    ):
+        raise CloudStateError("lease_active")
+    return CloudLease(
+        lease_key=lease.lease_key,
+        holder_id=lease.holder_id,
+        authority=lease.authority,
+        revision=reconciliation.next_revision,
+        acquired_at=lease.acquired_at,
+        expires_at=lease.expires_at,
+        reconciled_at=reconciliation.observed_at,
+        reconciliation_evidence_digest=reconciliation.evidence_digest,
+    )
+
+
+def release_lease(
+    lease: CloudLease, release: LeaseRelease, *, context: AuthorityContext
+) -> CloudLease:
+    if not isinstance(lease, CloudLease) or not isinstance(release, LeaseRelease):
+        raise CloudStateError("invalid_cloud_lease")
+    _require_context(context, lease.authority)
+    if (
+        lease.status == "released"
+        or release.lease_key != lease.lease_key
+        or release.holder_id != lease.holder_id
+        or release.authority != lease.authority
+    ):
+        raise CloudStateError("lease_release_mismatch")
+    if release.expected_revision != lease.revision:
+        raise CloudStateError("lease_cas_mismatch")
+    if lease.status == "reconciled":
+        if release.evidence_digest != lease.reconciliation_evidence_digest:
+            raise CloudStateError("lease_release_evidence_mismatch")
+    elif release.evidence_digest is not None:
+        raise CloudStateError("lease_release_evidence_unexpected")
+    return CloudLease(
+        lease_key=lease.lease_key,
+        holder_id=lease.holder_id,
+        authority=lease.authority,
+        revision=release.next_revision,
+        acquired_at=lease.acquired_at,
+        expires_at=lease.expires_at,
+        reconciled_at=lease.reconciled_at,
+        reconciliation_evidence_digest=lease.reconciliation_evidence_digest,
+        released_at=release.released_at,
+    )
 
 
 class StateBackend(Protocol):
     """Transactional persistence boundary implemented by the cloud state adapter."""
 
-    def register_manifest(self, manifest: ExperimentManifest, *, authority: str) -> bool: ...
+    def register_manifest(
+        self, manifest: ExperimentManifest, *, context: AuthorityContext
+    ) -> bool: ...
 
-    def append_event(self, event: ExperimentEvent, *, authority: str) -> AppendResult: ...
+    def append_event(
+        self, event: ExperimentEvent, *, context: AuthorityContext
+    ) -> AppendResult: ...
 
-    def create_command(self, command: CloudCommand) -> CommandMutation: ...
+    def create_command(
+        self, command: CloudCommand, *, context: AuthorityContext
+    ) -> CommandMutation: ...
 
-    def claim_command(self, claim: CommandClaim) -> CommandMutation: ...
+    def claim_command(
+        self, claim: CommandClaim, *, context: AuthorityContext, observed_at: str
+    ) -> CommandMutation: ...
 
-    def complete_command(self, transition: StateTransition) -> CommandMutation: ...
+    def complete_command(
+        self, transition: StateTransition, *, context: AuthorityContext, observed_at: str
+    ) -> CommandMutation: ...
 
-    def fail_command(self, transition: StateTransition) -> CommandMutation: ...
+    def fail_command(
+        self, transition: StateTransition, *, context: AuthorityContext, observed_at: str
+    ) -> CommandMutation: ...
 
-    def acquire_lease(self, desired: CloudLease, *, observed_at: str) -> LeaseMutation: ...
+    def reconcile_expired_claim(
+        self,
+        reconciliation: ClaimReconciliation,
+        *,
+        context: AuthorityContext,
+        observer_context: AuthorityContext,
+    ) -> CommandMutation: ...
 
-    def reconcile_lease(self, lease_key: str, *, observed_at: str) -> LeaseMutation: ...
+    def acquire_lease(
+        self, desired: CloudLease, *, context: AuthorityContext, observed_at: str
+    ) -> LeaseMutation: ...
+
+    def reconcile_lease(
+        self,
+        reconciliation: LeaseReconciliation,
+        *,
+        context: AuthorityContext,
+        observer_context: AuthorityContext,
+    ) -> LeaseMutation: ...
 
     def release_lease(
-        self, lease_key: str, *, holder_id: str, expected_revision: int
+        self, release: LeaseRelease, *, context: AuthorityContext
     ) -> LeaseMutation: ...
 
     def claim_supervisor_trigger(
-        self, *, trigger_id: str, claim_id: str, expected_revision: int
+        self,
+        *,
+        trigger_id: str,
+        claim_id: str,
+        expected_revision: int,
+        context: AuthorityContext,
     ) -> TriggerMutation: ...
 
     def resolve_supervisor_trigger(
@@ -696,12 +1011,13 @@ class StateBackend(Protocol):
         claim_id: str,
         expected_revision: int,
         resolution: TriggerResolution,
+        context: AuthorityContext,
     ) -> TriggerMutation: ...
 
     def load_projection(
         self, experiment_id: str
     ) -> tuple[ExperimentProjection, AutonomyProjection]: ...
 
-    def register_evidence(self, evidence: EvidenceObject) -> bool: ...
+    def register_evidence(self, evidence: EvidenceObject, *, context: AuthorityContext) -> bool: ...
 
     def health_snapshot(self) -> HealthSnapshot: ...
