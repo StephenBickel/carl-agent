@@ -881,9 +881,12 @@ def _projection(
 
 
 def reduce_events(
-    manifest: ExperimentManifest, events: tuple[ExperimentEvent, ...]
+    manifest: ExperimentManifest,
+    events: tuple[ExperimentEvent, ...],
+    *,
+    trusted_authority_event_digests: frozenset[str] = frozenset(),
 ) -> ExperimentProjection:
-    """Replay a verified event sequence into one deterministic projection."""
+    """Replay events, recognizing only explicitly ledger-verified authority facts."""
     state = ExperimentState.QUEUED
     attempts: list[str] = []
     digests: list[str] = []
@@ -900,12 +903,23 @@ def reduce_events(
     draft_pull_request: DraftPullRequest | None = None
     draft_pull_request_request: dict[str, str] | None = None
     workspace_disposed = False
+    experimental_publication: dict[str, Any] | None = None
+    protected_validation_candidate_commit: str | None = None
     for event in events:
         if event.experiment_id != manifest.experiment_id:
             raise GraphContractError("event_experiment_mismatch")
-        if event.event_type in _AUTONOMY_EVENT_TYPES:
+        trusted_authority = event.digest in trusted_authority_event_digests
+        if event.event_type is EventType.EXPERIMENTAL_PUBLISHED:
+            experimental_publication = event.payload
             continue
-        if event.event_type in _ISOLATED_AUTHORITY_REQUIRED_EVENTS:
+        if event.event_type in _AUTONOMY_EVENT_TYPES and not (
+            event.event_type is EventType.PROTECTED_VALIDATION_RECORDED
+            and trusted_authority
+            and candidate is not None
+            and paired_evidence is not None
+        ):
+            continue
+        if event.event_type in _ISOLATED_AUTHORITY_REQUIRED_EVENTS and not trusted_authority:
             raise GraphContractError("isolated_signer_required")
         if _parse_utc(event.occurred_at) < _parse_utc(manifest.registered_at):
             raise GraphContractError("event_precedes_registration")
@@ -937,7 +951,14 @@ def reduce_events(
                 check_ids = tuple(check.check_id for check in candidate.checks)
                 if check_ids != tuple(sorted(manifest.deterministic_checks, key=str.encode)):
                     raise GraphContractError("deterministic_checks_mismatch")
-            if target is ExperimentState.HOLDOUT_VALIDATION and candidate is not None:
+            if (
+                target is ExperimentState.HOLDOUT_VALIDATION
+                and candidate is not None
+                and (
+                    paired_evidence is None
+                    or protected_validation_candidate_commit != candidate.candidate_commit
+                )
+            ):
                 raise GraphContractError("phase4_protected_validation_required")
             state = target
         elif event.event_type is EventType.ROLE_RECORDED:
@@ -959,9 +980,12 @@ def reduce_events(
             payload = event.payload
             if set(payload) != {"expires_at", "owner_id"}:
                 raise GraphContractError("invalid_lease_payload")
-            if state is not ExperimentState.PROPOSAL_REVIEW:
+            replacing_reconciled = lease is not None and lease.stale_reconciled
+            if state is not ExperimentState.PROPOSAL_REVIEW and not (
+                replacing_reconciled and state in _MUTABLE_STATES
+            ):
                 raise GraphContractError("lease_wrong_state")
-            if lease is not None:
+            if lease is not None and not replacing_reconciled:
                 raise GraphContractError("mutable_lease_conflict")
             try:
                 _identifier("lease_owner", payload["owner_id"])
@@ -1079,6 +1103,34 @@ def reduce_events(
             ):
                 raise GraphContractError("paired_evidence_candidate_mismatch")
             paired_evidence = evidence
+        elif event.event_type is EventType.PROTECTED_VALIDATION_RECORDED:
+            if state is not ExperimentState.PAIRED_EVALUATION:
+                raise GraphContractError("protected_validation_wrong_state")
+            if candidate is None or paired_evidence is None:
+                raise GraphContractError("paired_evidence_required")
+            if protected_validation_candidate_commit is not None:
+                raise GraphContractError("protected_validation_already_recorded")
+            payload = event.payload
+            if set(payload) != {
+                "candidate_commit",
+                "candidate_tree",
+                "receipt_digest",
+            }:
+                raise GraphContractError("invalid_protected_validation_payload")
+            if (
+                experimental_publication is None
+                or set(experimental_publication)
+                != {"branch", "candidate_packet_digest", "commit", "tree"}
+                or experimental_publication["candidate_packet_digest"] != candidate.digest
+                or experimental_publication["commit"] != candidate.candidate_commit
+                or payload["candidate_commit"] != candidate.candidate_commit
+                or payload["candidate_commit"] != experimental_publication["commit"]
+                or payload["candidate_tree"] != experimental_publication["tree"]
+                or not isinstance(payload["receipt_digest"], str)
+                or not _DIGEST_RE.fullmatch(payload["receipt_digest"])
+            ):
+                raise GraphContractError("protected_validation_candidate_mismatch")
+            protected_validation_candidate_commit = payload["candidate_commit"]
         elif event.event_type is EventType.REVIEW_PACKET_RECORDED:
             if state is not ExperimentState.PAIRED_EVALUATION:
                 raise GraphContractError("review_packet_wrong_state")
@@ -1221,9 +1273,10 @@ def reduce_events(
             workspace_disposed = True
         else:
             raise GraphContractError("unsupported_event_type")
-        seen_attempts.add(event.stage_attempt_id)
-        attempts.append(event.stage_attempt_id)
-        digests.append(event.digest)
+        if event.event_type not in _AUTONOMY_EVENT_TYPES:
+            seen_attempts.add(event.stage_attempt_id)
+            attempts.append(event.stage_attempt_id)
+            digests.append(event.digest)
     return _projection(
         manifest=manifest,
         state=state,

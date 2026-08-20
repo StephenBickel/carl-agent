@@ -6,9 +6,23 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
-from test_experiment import manifest, transition
+from test_experiment import (
+    candidate_event,
+    manifest,
+    paired_evidence,
+    phase3_build_events,
+    prepared_candidate,
+    sealed_candidate,
+    transition,
+)
 
-from carl_bench.experiment import EventType, ExperimentEvent, ExperimentState
+from carl_bench.experiment import (
+    EventType,
+    ExperimentEvent,
+    ExperimentState,
+    ReviewRole,
+    ReviewVerdict,
+)
 from carl_bench.ledger import ExperimentLedger, LedgerIntegrityError
 
 
@@ -66,6 +80,350 @@ def test_exact_stage_redelivery_is_a_noop_but_conflict_fails_closed(tmp_path: Pa
     with pytest.raises(LedgerIntegrityError, match="stage_attempt_conflict"):
         ledger.append(conflict)
     assert ledger.event_count("exp-context-recovery-001") == 1
+
+
+def test_protected_candidate_reaches_accepted_after_reconciled_lease_rollover(
+    tmp_path: Path,
+) -> None:
+    """Reach durable acceptance through protected evidence and a 24-hour soak."""
+    ledger_path = tmp_path / "ledger.sqlite3"
+    ledger = ExperimentLedger(ledger_path)
+    ledger.register_manifest(manifest())
+    for item in phase3_build_events():
+        ledger.append(item)
+    ledger.append(
+        candidate_event(
+            attempt="prepare-protected-candidate",
+            event_type=EventType.WORKSPACE_PREPARED,
+            second=1,
+            payload=prepared_candidate().to_canonical_dict(),
+        )
+    )
+    ledger.append(
+        candidate_event(
+            attempt="seal-protected-candidate",
+            event_type=EventType.CANDIDATE_SEALED,
+            second=2,
+            payload=sealed_candidate().to_canonical_dict(),
+        )
+    )
+    ledger.append(
+        ExperimentEvent.create(
+            experiment_id=manifest().experiment_id,
+            stage_attempt_id="publish-protected-candidate",
+            event_type=EventType.EXPERIMENTAL_PUBLISHED,
+            occurred_at="2026-08-10T12:01:03Z",
+            payload={
+                "branch": f"experimental/{manifest().experiment_id}",
+                "candidate_packet_digest": sealed_candidate().digest,
+                "commit": sealed_candidate().candidate_commit,
+                "tree": "7" * 40,
+            },
+        )
+    )
+    ledger.append(
+        transition(
+            attempt="enter-deterministic-validation",
+            source=ExperimentState.BUILDING,
+            target=ExperimentState.DETERMINISTIC_VALIDATION,
+            second=10,
+        )
+    )
+    ledger.append(
+        transition(
+            attempt="enter-paired-evaluation",
+            source=ExperimentState.DETERMINISTIC_VALIDATION,
+            target=ExperimentState.PAIRED_EVALUATION,
+            second=11,
+        )
+    )
+    ledger.append_trusted_authority(
+        candidate_event(
+            attempt="record-protected-paired-evidence",
+            event_type=EventType.PAIRED_EVIDENCE_RECORDED,
+            second=3,
+            payload=paired_evidence().to_canonical_dict(),
+        )
+    )
+    ledger.append_trusted_authority(
+        ExperimentEvent.create(
+            experiment_id=manifest().experiment_id,
+            stage_attempt_id="record-protected-validation",
+            event_type=EventType.PROTECTED_VALIDATION_RECORDED,
+            occurred_at="2026-08-10T12:02:00Z",
+            payload={
+                "candidate_commit": sealed_candidate().candidate_commit,
+                "candidate_tree": "7" * 40,
+                "receipt_digest": "8" * 64,
+            },
+        )
+    )
+    ledger.append(
+        transition(
+            attempt="enter-protected-holdout",
+            source=ExperimentState.PAIRED_EVALUATION,
+            target=ExperimentState.HOLDOUT_VALIDATION,
+            second=12,
+        )
+    )
+    for index, role in enumerate(
+        (ReviewRole.CORRECTNESS, ReviewRole.SECURITY, ReviewRole.MAINTAINABILITY),
+        start=1,
+    ):
+        ledger.append(
+            ExperimentEvent.create(
+                experiment_id=manifest().experiment_id,
+                stage_attempt_id=f"protected-review-{index}",
+                event_type=EventType.ROLE_RECORDED,
+                occurred_at=f"2026-08-10T12:03:0{index}Z",
+                payload={
+                    "_lease": {
+                        "owner_id": "director-phase3",
+                        "stage_attempt_id": "lease-phase3",
+                    },
+                    "artifact_digest": str(index) * 64,
+                    "role": role.value,
+                    "verdict": ReviewVerdict.APPROVE.value,
+                },
+            )
+        )
+    for attempt, source, target, second in (
+        (
+            "finish-protected-review",
+            ExperimentState.HOLDOUT_VALIDATION,
+            ExperimentState.REVIEW_COMPLETE,
+            13,
+        ),
+        (
+            "open-protected-pr",
+            ExperimentState.REVIEW_COMPLETE,
+            ExperimentState.PR_OPEN,
+            14,
+        ),
+    ):
+        ledger.append(transition(attempt=attempt, source=source, target=target, second=second))
+    ledger.append_trusted_authority(
+        ExperimentEvent.create(
+            experiment_id=manifest().experiment_id,
+            stage_attempt_id="record-protected-promotion",
+            event_type=EventType.PROMOTION_RECORDED,
+            occurred_at="2026-08-10T12:00:15Z",
+            payload={"merge_commit": "9" * 40, "merge_tree": "a" * 40},
+        )
+    )
+    ledger.append(
+        transition(
+            attempt="record-protected-merge",
+            source=ExperimentState.PR_OPEN,
+            target=ExperimentState.MERGED,
+            second=15,
+        )
+    )
+    ledger.append(
+        transition(
+            attempt="start-protected-soak",
+            source=ExperimentState.MERGED,
+            target=ExperimentState.SOAKING,
+            second=16,
+        )
+    )
+    ledger.append_trusted_authority(
+        ExperimentEvent.create(
+            experiment_id=manifest().experiment_id,
+            stage_attempt_id="observe-healthy-protected-soak",
+            event_type=EventType.SOAK_OBSERVED,
+            occurred_at="2026-08-11T12:00:16Z",
+            payload={
+                "evidence_digest": "b" * 64,
+                "healthy": True,
+                "merge_commit": "9" * 40,
+                "observed_at": "2026-08-11T12:00:16Z",
+            },
+        )
+    )
+
+    ledger.append(
+        ExperimentEvent.create(
+            experiment_id=manifest().experiment_id,
+            stage_attempt_id="reconcile-expired-soak-lease",
+            event_type=EventType.LEASE_RECONCILED,
+            occurred_at="2026-08-11T12:00:16Z",
+            payload={"lease_stage_attempt_id": "lease-phase3", "worker_not_live": True},
+        )
+    )
+    ledger.append(
+        ExperimentEvent.create(
+            experiment_id=manifest().experiment_id,
+            stage_attempt_id="lease-acceptance",
+            event_type=EventType.LEASE_ACQUIRED,
+            occurred_at="2026-08-11T12:00:17Z",
+            payload={
+                "expires_at": "2026-08-11T18:00:17Z",
+                "owner_id": "acceptance-controller",
+            },
+        )
+    )
+    ledger.append(
+        ExperimentEvent.create(
+            experiment_id=manifest().experiment_id,
+            stage_attempt_id="accept-after-24h-soak",
+            event_type=EventType.STATE_TRANSITIONED,
+            occurred_at="2026-08-11T12:00:18Z",
+            payload={
+                "_lease": {
+                    "owner_id": "acceptance-controller",
+                    "stage_attempt_id": "lease-acceptance",
+                },
+                "from_state": ExperimentState.SOAKING.value,
+                "to_state": ExperimentState.ACCEPTED.value,
+            },
+        )
+    )
+    ledger.append(
+        ExperimentEvent.create(
+            experiment_id=manifest().experiment_id,
+            stage_attempt_id="release-acceptance-lease",
+            event_type=EventType.LEASE_RELEASED,
+            occurred_at="2026-08-11T12:00:19Z",
+            payload={"lease_stage_attempt_id": "lease-acceptance"},
+        )
+    )
+
+    reopened = ExperimentLedger(ledger_path)
+    projection = reopened.projection(manifest().experiment_id)
+    assert projection.state is ExperimentState.ACCEPTED
+    assert projection.lease is None
+    assert projection.candidate == sealed_candidate()
+
+
+def test_trusted_paired_evidence_is_bound_to_the_exact_sealed_candidate(
+    tmp_path: Path,
+) -> None:
+    ledger = ExperimentLedger(tmp_path / "ledger.sqlite3")
+    ledger.register_manifest(manifest())
+    for item in phase3_build_events():
+        ledger.append(item)
+    ledger.append(
+        candidate_event(
+            attempt="prepare-candidate-binding",
+            event_type=EventType.WORKSPACE_PREPARED,
+            second=1,
+            payload=prepared_candidate().to_canonical_dict(),
+        )
+    )
+    ledger.append(
+        candidate_event(
+            attempt="seal-candidate-binding",
+            event_type=EventType.CANDIDATE_SEALED,
+            second=2,
+            payload=sealed_candidate().to_canonical_dict(),
+        )
+    )
+    ledger.append(
+        transition(
+            attempt="enter-deterministic-binding",
+            source=ExperimentState.BUILDING,
+            target=ExperimentState.DETERMINISTIC_VALIDATION,
+            second=10,
+        )
+    )
+    ledger.append(
+        transition(
+            attempt="enter-paired-binding",
+            source=ExperimentState.DETERMINISTIC_VALIDATION,
+            target=ExperimentState.PAIRED_EVALUATION,
+            second=11,
+        )
+    )
+
+    forged = replace(paired_evidence(), candidate_commit="e" * 40)
+    with pytest.raises(LedgerIntegrityError, match="paired_evidence_candidate_mismatch"):
+        ledger.append_trusted_authority(
+            candidate_event(
+                attempt="forged-protected-paired-evidence",
+                event_type=EventType.PAIRED_EVIDENCE_RECORDED,
+                second=3,
+                payload=forged.to_canonical_dict(),
+            )
+        )
+
+
+def test_protected_validation_is_bound_to_the_sealed_candidate_packet(
+    tmp_path: Path,
+) -> None:
+    ledger = ExperimentLedger(tmp_path / "ledger.sqlite3")
+    ledger.register_manifest(manifest())
+    for item in phase3_build_events():
+        ledger.append(item)
+    ledger.append(
+        candidate_event(
+            attempt="prepare-validation-binding",
+            event_type=EventType.WORKSPACE_PREPARED,
+            second=1,
+            payload=prepared_candidate().to_canonical_dict(),
+        )
+    )
+    ledger.append(
+        candidate_event(
+            attempt="seal-validation-binding",
+            event_type=EventType.CANDIDATE_SEALED,
+            second=2,
+            payload=sealed_candidate().to_canonical_dict(),
+        )
+    )
+    ledger.append(
+        ExperimentEvent.create(
+            experiment_id=manifest().experiment_id,
+            stage_attempt_id="publish-wrong-candidate-packet",
+            event_type=EventType.EXPERIMENTAL_PUBLISHED,
+            occurred_at="2026-08-10T12:01:03Z",
+            payload={
+                "branch": f"experimental/{manifest().experiment_id}",
+                "candidate_packet_digest": "0" * 64,
+                "commit": sealed_candidate().candidate_commit,
+                "tree": "7" * 40,
+            },
+        )
+    )
+    ledger.append(
+        transition(
+            attempt="enter-deterministic-validation-binding",
+            source=ExperimentState.BUILDING,
+            target=ExperimentState.DETERMINISTIC_VALIDATION,
+            second=10,
+        )
+    )
+    ledger.append(
+        transition(
+            attempt="enter-paired-validation-binding",
+            source=ExperimentState.DETERMINISTIC_VALIDATION,
+            target=ExperimentState.PAIRED_EVALUATION,
+            second=11,
+        )
+    )
+    ledger.append_trusted_authority(
+        candidate_event(
+            attempt="record-paired-validation-binding",
+            event_type=EventType.PAIRED_EVIDENCE_RECORDED,
+            second=3,
+            payload=paired_evidence().to_canonical_dict(),
+        )
+    )
+
+    with pytest.raises(LedgerIntegrityError, match="protected_validation_candidate_mismatch"):
+        ledger.append_trusted_authority(
+            ExperimentEvent.create(
+                experiment_id=manifest().experiment_id,
+                stage_attempt_id="record-mismatched-protected-validation",
+                event_type=EventType.PROTECTED_VALIDATION_RECORDED,
+                occurred_at="2026-08-10T12:02:00Z",
+                payload={
+                    "candidate_commit": sealed_candidate().candidate_commit,
+                    "candidate_tree": "7" * 40,
+                    "receipt_digest": "8" * 64,
+                },
+            )
+        )
 
 
 @pytest.mark.parametrize(
