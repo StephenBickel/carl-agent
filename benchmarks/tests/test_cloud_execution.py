@@ -252,6 +252,116 @@ def snapshot(
     return replace(base, **changes)
 
 
+def codec_values() -> tuple[object, ...]:
+    cloud_request = request()
+    completed_observation = completed_run_observation(cloud_request)
+    commissioning = commissioning_receipt(cloud_request)
+    return (
+        cloud_request,
+        artifact(cloud_request),
+        snapshot(cloud_request),
+        reconcile_cloud_run(cloud_request, snapshot(cloud_request)),
+        completed_observation,
+        sign_completed_run_observation(completed_observation, TEST_SIGNER),
+        commissioning,
+        sign_commissioning_receipt(commissioning, TEST_SIGNER),
+    )
+
+
+@pytest.mark.parametrize("value", codec_values())
+def test_cloud_wire_codecs_round_trip_canonical_values(value: object) -> None:
+    codec_type = type(value)
+    encoded = value.to_canonical_dict()  # type: ignore[attr-defined]
+
+    decoded = codec_type.from_canonical_dict(encoded)
+
+    assert decoded == value
+    assert canonical_json_bytes(decoded.to_canonical_dict()) == canonical_json_bytes(encoded)
+
+
+@pytest.mark.parametrize("value", codec_values())
+def test_cloud_wire_codecs_reject_missing_and_unknown_fields(value: object) -> None:
+    codec_type = type(value)
+    encoded = value.to_canonical_dict()  # type: ignore[attr-defined]
+    missing = dict(encoded)
+    missing.pop(next(iter(missing)))
+    extra = dict(encoded)
+    extra["unexpected"] = None
+
+    with pytest.raises(CloudExecutionError):
+        codec_type.from_canonical_dict(missing)
+    with pytest.raises(CloudExecutionError):
+        codec_type.from_canonical_dict(extra)
+
+
+class _DuplicateJsonObject(dict[str, object]):
+    """A duplicate-key parser stand-in; strict codecs accept only plain JSON objects."""
+
+
+def test_cloud_wire_codecs_reject_duplicate_key_object_representations() -> None:
+    encoded = _DuplicateJsonObject(request().to_canonical_dict())
+
+    with pytest.raises(CloudExecutionError):
+        CloudRunRequest.from_canonical_dict(encoded)
+
+
+def test_cloud_wire_codecs_reject_invalid_enums_and_boolean_integers() -> None:
+    invalid_snapshot = snapshot().to_canonical_dict()
+    invalid_snapshot["status"] = "invented"
+    invalid_artifact = artifact(request()).to_canonical_dict()
+    invalid_artifact["artifact_id"] = True
+    invalid_request = request().to_canonical_dict()
+    invalid_request["schema_version"] = True
+    invalid_observation = completed_run_observation(request()).to_canonical_dict()
+    invalid_observation["schema_version"] = True
+    invalid_decision = reconcile_cloud_run(request(), snapshot(request())).to_canonical_dict()
+    invalid_decision["action"] = "invented"
+
+    with pytest.raises(CloudExecutionError, match="invalid_cloud_run_status"):
+        CloudRunSnapshot.from_canonical_dict(invalid_snapshot)
+    with pytest.raises(CloudExecutionError, match="invalid_cloud_artifact_id"):
+        CloudArtifact.from_canonical_dict(invalid_artifact)
+    with pytest.raises(CloudExecutionError, match="cloud_request_schema_invalid"):
+        CloudRunRequest.from_canonical_dict(invalid_request)
+    with pytest.raises(CloudExecutionError, match="cloud_completed_run_schema_invalid"):
+        CompletedRunObservation.from_canonical_dict(invalid_observation)
+    with pytest.raises(CloudExecutionError, match="cloud_decision_invalid"):
+        CloudRunDecision.from_canonical_dict(invalid_decision)
+
+
+def test_cloud_wire_codecs_reject_mismatched_signed_identities() -> None:
+    cloud_request = request()
+    signed = sign_completed_run_observation(
+        completed_run_observation(cloud_request), TEST_SIGNER
+    )
+    encoded = signed.to_canonical_dict()
+    encoded["observation_digest"] = "0" * 64
+
+    with pytest.raises(
+        CloudExecutionError, match="cloud_completed_run_observation_digest_mismatch"
+    ):
+        SignedCompletedRunObservation.from_canonical_dict(encoded)
+
+
+def test_cloud_wire_codecs_reject_oversized_canonical_payloads() -> None:
+    oversized = CloudRunSnapshot(
+        remote_available=True,
+        observed_at=NOW,
+        artifacts=tuple(
+            CloudArtifact(
+                artifact_id=index + 1,
+                name=f"artifact-{index}",
+                run_id=42,
+                digest=ARTIFACT_DIGEST,
+            )
+            for index in range(9_000)
+        ),
+    )
+
+    with pytest.raises(CloudExecutionError, match="cloud_codec_payload_too_large"):
+        oversized.to_canonical_dict()
+
+
 def _parse_workflow(name: str) -> dict[str, object]:
     script = (
         'require "yaml"; require "json"; '
