@@ -81,7 +81,10 @@ def test_linux_sandbox_command_has_explicit_mounts_and_no_host_root_bind(
     assert ("--cap-drop", "ALL") in tuple(
         tuple(command[index : index + 2]) for index in range(len(command) - 1)
     )
-    assert ("--uid", "65534") in tuple(
+    assert ("--uid", str(os.getuid())) in tuple(
+        tuple(command[index : index + 2]) for index in range(len(command) - 1)
+    )
+    assert ("--gid", str(os.getgid())) in tuple(
         tuple(command[index : index + 2]) for index in range(len(command) - 1)
     )
     assert ("--ro-bind", "/", "/") not in tuple(

@@ -146,9 +146,9 @@ def _sandbox_command(
             "--cap-drop",
             "ALL",
             "--uid",
-            "65534",
+            str(os.getuid()),
             "--gid",
-            "65534",
+            str(os.getgid()),
             "--tmpfs",
             "/",
         ]
