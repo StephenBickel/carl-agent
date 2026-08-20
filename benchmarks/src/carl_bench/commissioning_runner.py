@@ -130,7 +130,8 @@ def _sandbox_command(
     if platform.startswith("linux"):
         bubblewrap = executable_lookup("bwrap")
         sudo = executable_lookup("sudo")
-        if bubblewrap is None or sudo is None:
+        setpriv = executable_lookup("setpriv")
+        if bubblewrap is None or sudo is None or setpriv is None:
             raise CommissioningArtifactError("synthetic_execution_sandbox_unavailable")
         prefix: list[str] = [
             sudo,
@@ -138,18 +139,11 @@ def _sandbox_command(
             bubblewrap,
             "--die-with-parent",
             "--new-session",
-            "--unshare-user",
             "--unshare-pid",
             "--unshare-uts",
             "--unshare-ipc",
             "--unshare-cgroup-try",
             "--unshare-net",
-            "--cap-drop",
-            "ALL",
-            "--uid",
-            str(os.getuid()),
-            "--gid",
-            str(os.getgid()),
             "--tmpfs",
             "/",
         ]
@@ -162,7 +156,18 @@ def _sandbox_command(
         for path in writes:
             value = os.fspath(path)
             prefix.extend(("--bind", value, value))
-        prefix.append("--")
+        prefix.extend(
+            (
+                "--",
+                setpriv,
+                f"--reuid={os.getuid()}",
+                f"--regid={os.getgid()}",
+                "--clear-groups",
+                "--bounding-set=-all",
+                "--no-new-privs",
+                "--",
+            )
+        )
         return (*prefix, *command)
     raise CommissioningArtifactError("synthetic_execution_sandbox_unavailable")
 
