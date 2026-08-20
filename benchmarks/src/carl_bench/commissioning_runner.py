@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -291,6 +292,14 @@ def _run_sandboxed_command(
     if exit_code < 0:
         signal_number = min(abs(exit_code), 127)
         exit_code = 128 + signal_number
+        stderr += (
+            _SANDBOX_DIAGNOSTIC_PREFIX
+            + b" terminated_by_signal:"
+            + str(signal_number).encode("ascii")
+            + b"\n"
+        )
+    elif 128 < exit_code <= 255 and (exit_code - 128) in signal.valid_signals():
+        signal_number = exit_code - 128
         stderr += (
             _SANDBOX_DIAGNOSTIC_PREFIX
             + b" terminated_by_signal:"

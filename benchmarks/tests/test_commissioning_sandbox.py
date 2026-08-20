@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import signal
 import stat
+import subprocess
 import sys
 from pathlib import Path
 
@@ -141,6 +142,35 @@ def test_linux_toolchain_paths_do_not_include_missing_macos_selectors(
 
     assert Path("/private/var/db/xcode_select_link") not in paths
     assert Path("/var/db/xcode_select_link") not in paths
+
+
+def test_wrapped_signal_exit_is_normalized_into_durable_stderr(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        commissioning_runner,
+        "_sandbox_command",
+        lambda command, **_kwargs: command,
+    )
+    monkeypatch.setattr(
+        commissioning_runner.subprocess,
+        "run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            args=(sys.executable,), returncode=143, stdout=b"", stderr=b""
+        ),
+    )
+
+    exit_code, _, stderr = commissioning_runner._run_sandboxed_command(
+        (sys.executable, "-c", "raise SystemExit(0)"),
+        checkout=tmp_path,
+        writable_root=tmp_path,
+        input_bytes=None,
+        timeout_seconds=1,
+    )
+
+    assert exit_code == 143
+    assert b"terminated_by_signal:15" in stderr
 
 
 def test_protected_commands_normalize_launch_timeout_and_signal_failures(
