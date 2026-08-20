@@ -103,6 +103,35 @@ def _codec_fields(value: object, fields: frozenset[str], code: str) -> dict[str,
     return _codec_output(value)
 
 
+def _codec_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise CloudExecutionError("cloud_codec_duplicate_json_key")
+        value[key] = item
+    return value
+
+
+def decode_cloud_wire_json(payload: bytes) -> dict[str, Any]:
+    """Decode one bounded canonical wire object without collapsing duplicate keys."""
+    if not isinstance(payload, bytes):
+        raise CloudExecutionError("cloud_codec_invalid")
+    if len(payload) > _MAX_CLOUD_CODEC_BYTES:
+        raise CloudExecutionError("cloud_codec_payload_too_large")
+    try:
+        value = json.loads(payload, object_pairs_hook=_codec_json_object)
+    except CloudExecutionError:
+        raise
+    except (json.JSONDecodeError, UnicodeError, TypeError) as error:
+        raise CloudExecutionError("cloud_codec_invalid") from error
+    if type(value) is not dict:
+        raise CloudExecutionError("cloud_codec_invalid")
+    value = _codec_output(value)
+    if canonical_json_bytes(value) != payload:
+        raise CloudExecutionError("cloud_codec_invalid")
+    return value
+
+
 def _request_payload(
     *,
     repository: str,
@@ -875,9 +904,10 @@ class CloudRunDecision:
             if self.artifact_digest is not None:
                 _digest("cloud_artifact_digest", self.artifact_digest)
             artifact_identity = (self.artifact_id, self.artifact_name, self.artifact_digest)
-            if any(value is not None for value in artifact_identity) and any(
-                value is None for value in artifact_identity
-            ):
+            if self.action in {"download_artifacts", "record_success"}:
+                if any(value is None for value in artifact_identity):
+                    raise ValueError
+            elif any(value is not None for value in artifact_identity):
                 raise ValueError
             if self.next_attempt is not None and (
                 isinstance(self.next_attempt, bool)
@@ -905,6 +935,48 @@ class CloudRunDecision:
                     "cloud_completed_run_observation_digest",
                     self.completed_run_observation_digest,
                 )
+            if self.action == "dispatch":
+                if any(
+                    value is not None
+                    for value in (
+                        self.run_id,
+                        self.head_sha,
+                        self.conclusion,
+                        self.completed_run_observation_digest,
+                    )
+                ):
+                    raise ValueError
+            elif self.action == "await_run":
+                if (
+                    self.conclusion is not None
+                    or self.completed_run_observation_digest is not None
+                    or (self.run_id is None) != (self.head_sha is None)
+                ):
+                    raise ValueError
+            elif self.action in {"download_artifacts", "record_success"}:
+                if (
+                    self.run_id is None
+                    or self.head_sha is None
+                    or self.conclusion != "success"
+                    or self.completed_run_observation_digest is not None
+                ):
+                    raise ValueError
+            elif self.action == "schedule_retry":
+                if self.run_id is None:
+                    if any(
+                        value is not None
+                        for value in (
+                            self.head_sha,
+                            self.conclusion,
+                            self.completed_run_observation_digest,
+                        )
+                    ):
+                        raise ValueError
+                elif (
+                    self.head_sha is None
+                    or self.conclusion not in _INFRASTRUCTURE_CONCLUSIONS
+                ):
+                    raise ValueError
         except CloudExecutionError as error:
             raise CloudExecutionError("cloud_decision_invalid") from error
         except (TypeError, ValueError, UnicodeError) as error:
@@ -1253,6 +1325,28 @@ def _decision(
     next_attempt: int | None = None,
     retry_not_before: str | None = None,
 ) -> CloudRunDecision:
+    completed_run_observation_digest = (
+        snapshot.completed_run_observation.observation_digest
+        if isinstance(snapshot.completed_run_observation, SignedCompletedRunObservation)
+        else None
+    )
+    if action == "dispatch":
+        run_id = head_sha = conclusion = completed_run_observation_digest = None
+    elif action == "await_run":
+        run_id = snapshot.run_id
+        head_sha = snapshot.head_sha
+        conclusion = completed_run_observation_digest = None
+    elif action in {"download_artifacts", "record_success"}:
+        run_id = snapshot.run_id
+        head_sha = snapshot.head_sha
+        conclusion = snapshot.conclusion
+        completed_run_observation_digest = None
+    elif action == "schedule_retry" and not snapshot.remote_available:
+        run_id = head_sha = conclusion = completed_run_observation_digest = None
+    else:
+        run_id = snapshot.run_id
+        head_sha = snapshot.head_sha
+        conclusion = snapshot.conclusion
     return CloudRunDecision(
         action=action,
         reason=reason,
@@ -1264,9 +1358,9 @@ def _decision(
         workflow_path=request.expected_workflow_path,
         workflow_blob_digest=request.workflow_blob_digest,
         candidate_commit=request.candidate_commit,
-        run_id=snapshot.run_id,
-        head_sha=snapshot.head_sha,
-        conclusion=snapshot.conclusion,
+        run_id=run_id,
+        head_sha=head_sha,
+        conclusion=conclusion,
         artifact_id=artifact.artifact_id if artifact is not None else None,
         artifact_name=artifact.name if artifact is not None else None,
         artifact_digest=artifact.digest if artifact is not None else None,
@@ -1274,11 +1368,7 @@ def _decision(
         next_attempt_key=(request.attempt_key(next_attempt) if next_attempt is not None else None),
         retry_not_before=retry_not_before,
         observed_at=snapshot.observed_at,
-        completed_run_observation_digest=(
-            snapshot.completed_run_observation.observation_digest
-            if isinstance(snapshot.completed_run_observation, SignedCompletedRunObservation)
-            else None
-        ),
+        completed_run_observation_digest=completed_run_observation_digest,
     )
 
 

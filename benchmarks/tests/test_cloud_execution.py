@@ -294,15 +294,28 @@ def test_cloud_wire_codecs_reject_missing_and_unknown_fields(value: object) -> N
         codec_type.from_canonical_dict(extra)
 
 
-class _DuplicateJsonObject(dict[str, object]):
-    """A duplicate-key parser stand-in; strict codecs accept only plain JSON objects."""
+@pytest.mark.parametrize(
+    "payload",
+    (
+        b'{"schema_version":1,"schema_version":1}',
+        b'{"receipt":{"schema_version":2,"schema_version":2}}',
+    ),
+)
+def test_cloud_wire_json_ingress_rejects_actual_duplicate_json_keys(payload: bytes) -> None:
+    with pytest.raises(CloudExecutionError, match="cloud_codec_duplicate_json_key"):
+        cloud_execution.decode_cloud_wire_json(payload)
 
 
-def test_cloud_wire_codecs_reject_duplicate_key_object_representations() -> None:
-    encoded = _DuplicateJsonObject(request().to_canonical_dict())
+def test_cloud_wire_json_ingress_is_bounded_and_feeds_strict_dict_codecs() -> None:
+    cloud_request = request()
 
-    with pytest.raises(CloudExecutionError):
-        CloudRunRequest.from_canonical_dict(encoded)
+    decoded = cloud_execution.decode_cloud_wire_json(
+        canonical_json_bytes(cloud_request.to_canonical_dict())
+    )
+
+    assert CloudRunRequest.from_canonical_dict(decoded) == cloud_request
+    with pytest.raises(CloudExecutionError, match="cloud_codec_payload_too_large"):
+        cloud_execution.decode_cloud_wire_json(b" " * 1_048_577)
 
 
 def test_cloud_wire_codecs_reject_invalid_enums_and_boolean_integers() -> None:
@@ -341,6 +354,50 @@ def test_cloud_wire_codecs_reject_mismatched_signed_identities() -> None:
         CloudExecutionError, match="cloud_completed_run_observation_digest_mismatch"
     ):
         SignedCompletedRunObservation.from_canonical_dict(encoded)
+
+
+def test_cloud_run_decision_actions_require_exact_optional_identity_shapes() -> None:
+    cloud_request = request()
+    dispatch = reconcile_cloud_run(cloud_request, CloudRunSnapshot(True, NOW))
+    awaiting = reconcile_cloud_run(
+        cloud_request,
+        snapshot(
+            cloud_request,
+            status="in_progress",
+            conclusion=None,
+            artifacts=(),
+            artifacts_expires_at=None,
+        ),
+    )
+    download = reconcile_cloud_run(
+        cloud_request,
+        snapshot(
+            cloud_request,
+            artifacts=(artifact(cloud_request, downloaded=False),),
+        ),
+    )
+    success = reconcile_cloud_run(cloud_request, snapshot(cloud_request))
+
+    with pytest.raises(CloudExecutionError, match="cloud_decision_invalid"):
+        replace(
+            dispatch,
+            run_id=42,
+            head_sha=cloud_request.workflow_revision,
+            conclusion="success",
+        )
+    with pytest.raises(CloudExecutionError, match="cloud_decision_invalid"):
+        replace(awaiting, conclusion="success")
+    with pytest.raises(CloudExecutionError, match="cloud_decision_invalid"):
+        replace(download, artifact_id=None, artifact_name=None, artifact_digest=None)
+    with pytest.raises(CloudExecutionError, match="cloud_decision_invalid"):
+        replace(success, artifact_id=None, artifact_name=None, artifact_digest=None)
+    with pytest.raises(CloudExecutionError, match="cloud_decision_invalid"):
+        replace(
+            dispatch,
+            artifact_id=99,
+            artifact_name=cloud_request.expected_artifact_name,
+            artifact_digest=ARTIFACT_DIGEST,
+        )
 
 
 def test_cloud_wire_codecs_reject_oversized_canonical_payloads() -> None:
