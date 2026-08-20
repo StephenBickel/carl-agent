@@ -7,6 +7,8 @@ import os
 import shutil
 import stat
 import subprocess
+import sys
+import time
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -1056,6 +1058,345 @@ def test_accepted_lifecycle_is_derived_from_fresh_ledger_and_bare_refs(
             bare_repository=disposable_git.origin,
             lifecycle_artifact_ref=lifecycle_ref,
         )
+
+
+def _controller_command(
+    *,
+    effect_store: Path,
+    artifact_store: Path,
+    repository_root: Path,
+    bare_repository: Path,
+    request_path: Path,
+    signing_key: Path,
+    pause_marker: Path | None = None,
+) -> tuple[str, ...]:
+    command = (
+        sys.executable,
+        "-m",
+        "carl_bench.commissioning_controller",
+        "run",
+        "--effect-store",
+        os.fspath(effect_store),
+        "--artifact-store",
+        os.fspath(artifact_store),
+        "--repository-root",
+        os.fspath(repository_root),
+        "--bare-repository",
+        os.fspath(bare_repository),
+        "--request",
+        os.fspath(request_path),
+        "--signing-key",
+        os.fspath(signing_key),
+        "--key-id",
+        "synthetic-protected-controller",
+    )
+    if pause_marker is not None:
+        command = (*command, "--pause-after-effect", os.fspath(pause_marker))
+    return command
+
+
+def _controller_environment() -> dict[str, str]:
+    return {
+        **os.environ,
+        "PYTHONPATH": os.fspath(REPOSITORY_ROOT / "benchmarks" / "src"),
+    }
+
+
+def _kill_after_effect(command: tuple[str, ...], marker: Path) -> None:
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=_controller_environment(),
+    )
+    deadline = time.monotonic() + 10
+    while not marker.exists() and process.poll() is None and time.monotonic() < deadline:
+        time.sleep(0.01)
+    if not marker.exists():
+        stdout, stderr = process.communicate(timeout=5)
+        pytest.fail(
+            f"controller did not reach effect boundary: return={process.returncode}; "
+            f"stdout={stdout!r}; stderr={stderr!r}"
+        )
+    process.kill()
+    process.wait(timeout=5)
+    assert process.returncode is not None and process.returncode != 0
+
+
+def _complete_controller(command: tuple[str, ...]) -> dict[str, object]:
+    completed = subprocess.run(
+        command,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env=_controller_environment(),
+    )
+    value = json.loads(completed.stdout)
+    assert isinstance(value, dict)
+    return value
+
+
+def _inspect_effect(effect_store: Path, effect_key: str) -> dict[str, object]:
+    completed = subprocess.run(
+        (
+            sys.executable,
+            "-m",
+            "carl_bench.commissioning_controller",
+            "inspect",
+            "--effect-store",
+            os.fspath(effect_store),
+            "--effect-key",
+            effect_key,
+        ),
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env=_controller_environment(),
+    )
+    value = json.loads(completed.stdout)
+    assert isinstance(value, dict)
+    return value
+
+
+def _verify_effect_receipt(
+    *,
+    artifact_store: Path,
+    repository_root: Path,
+    receipt_ref_path: Path,
+    public_key_path: Path,
+    request_path: Path,
+) -> dict[str, object]:
+    completed = subprocess.run(
+        (
+            sys.executable,
+            "-m",
+            "carl_bench.commissioning_controller",
+            "verify-receipt",
+            "--artifact-store",
+            os.fspath(artifact_store),
+            "--repository-root",
+            os.fspath(repository_root),
+            "--receipt-ref",
+            os.fspath(receipt_ref_path),
+            "--public-key",
+            os.fspath(public_key_path),
+            "--request",
+            os.fspath(request_path),
+        ),
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env=_controller_environment(),
+    )
+    value = json.loads(completed.stdout)
+    assert isinstance(value, dict)
+    return value
+
+
+def test_controller_subprocess_recovers_two_effect_receipt_boundaries(
+    tmp_path: Path,
+    disposable_git: DisposableGitFixture,
+) -> None:
+    automation_root = tmp_path / "automation-data"
+    commissioning_store = CommissioningArtifactStore(
+        automation_data_root=automation_root,
+        repository_root=disposable_git.builder,
+    )
+    protected_runner = ProtectedRunner(
+        disposable_git,
+        automation_root / ".protected-runner",
+    )
+    effect_store = automation_root / ".shared-private" / "commissioning-effects.sqlite3"
+    request_root = automation_root / ".shared-private" / "controller-requests"
+    request_root.mkdir(mode=0o700)
+    request_root.chmod(0o700)
+
+    publication_request = {
+        "effect_key": f"publish:{EXPERIMENT_ID}",
+        "expected_old_commit": "0" * 40,
+        "kind": "experimental_publish",
+        "occurred_at": "2026-08-19T09:13:00Z",
+        "pr": None,
+        "ref": f"refs/heads/experimental/{EXPERIMENT_ID}",
+        "schema_version": 1,
+        "source_repository": os.fspath(disposable_git.builder),
+        "target_commit": disposable_git.valid_candidate,
+        "target_tree": disposable_git.valid_tree,
+    }
+    publication_path = request_root / "publication.json"
+    publication_path.write_bytes(canonical_json_bytes(publication_request))
+    publication_path.chmod(0o600)
+    publication_marker = request_root / "publication.effect-applied"
+    publication_command = _controller_command(
+        effect_store=effect_store,
+        artifact_store=commissioning_store.objects_root,
+        repository_root=disposable_git.builder,
+        bare_repository=disposable_git.origin,
+        request_path=publication_path,
+        signing_key=protected_runner.key_path,
+        pause_marker=publication_marker,
+    )
+    _kill_after_effect(publication_command, publication_marker)
+    assert (
+        _git(
+            disposable_git.origin,
+            "rev-parse",
+            f"refs/heads/experimental/{EXPERIMENT_ID}",
+        )
+        == disposable_git.valid_candidate
+    )
+
+    recovered_publication = _complete_controller(
+        _controller_command(
+            effect_store=effect_store,
+            artifact_store=commissioning_store.objects_root,
+            repository_root=disposable_git.builder,
+            bare_repository=disposable_git.origin,
+            request_path=publication_path,
+            signing_key=protected_runner.key_path,
+        )
+    )
+    assert recovered_publication["action"] == "recovered_effect_receipt"
+    publication_replay = _complete_controller(
+        _controller_command(
+            effect_store=effect_store,
+            artifact_store=commissioning_store.objects_root,
+            repository_root=disposable_git.builder,
+            bare_repository=disposable_git.origin,
+            request_path=publication_path,
+            signing_key=protected_runner.key_path,
+        )
+    )
+    assert publication_replay["action"] == "already_receipted"
+    assert publication_replay["receipt_ref"] == recovered_publication["receipt_ref"]
+
+    _git(disposable_git.builder, "switch", "-C", "controller-promotion", disposable_git.baseline)
+    _git(
+        disposable_git.builder,
+        "merge",
+        "--no-ff",
+        "--no-edit",
+        disposable_git.valid_candidate,
+    )
+    promotion_commit = _git(disposable_git.builder, "rev-parse", "HEAD")
+    promotion_tree = _git(disposable_git.builder, "rev-parse", "HEAD^{tree}")
+    assert promotion_tree == disposable_git.valid_tree
+    promotion_request = {
+        "effect_key": f"promotion:{EXPERIMENT_ID}",
+        "expected_old_commit": disposable_git.baseline,
+        "kind": "promotion_merge",
+        "occurred_at": "2026-08-19T10:00:00Z",
+        "pr": {
+            "base_branch": "main",
+            "head_branch": f"experimental/{EXPERIMENT_ID}",
+            "head_commit": disposable_git.valid_candidate,
+            "head_tree": disposable_git.valid_tree,
+            "number": 41,
+            "promotion_id": f"promotion-{EXPERIMENT_ID}-1",
+            "role": "promotion",
+        },
+        "ref": "refs/heads/main",
+        "schema_version": 1,
+        "source_repository": os.fspath(disposable_git.builder),
+        "target_commit": promotion_commit,
+        "target_tree": promotion_tree,
+    }
+    promotion_path = request_root / "promotion.json"
+    promotion_path.write_bytes(canonical_json_bytes(promotion_request))
+    promotion_path.chmod(0o600)
+    promotion_marker = request_root / "promotion.effect-applied"
+    promotion_command = _controller_command(
+        effect_store=effect_store,
+        artifact_store=commissioning_store.objects_root,
+        repository_root=disposable_git.builder,
+        bare_repository=disposable_git.origin,
+        request_path=promotion_path,
+        signing_key=protected_runner.key_path,
+        pause_marker=promotion_marker,
+    )
+    _kill_after_effect(promotion_command, promotion_marker)
+    assert _git(disposable_git.origin, "rev-parse", "refs/heads/main") == promotion_commit
+
+    recovered_promotion = _complete_controller(
+        _controller_command(
+            effect_store=effect_store,
+            artifact_store=commissioning_store.objects_root,
+            repository_root=disposable_git.builder,
+            bare_repository=disposable_git.origin,
+            request_path=promotion_path,
+            signing_key=protected_runner.key_path,
+        )
+    )
+    assert recovered_promotion["action"] == "recovered_effect_receipt"
+    promotion_replay = _complete_controller(
+        _controller_command(
+            effect_store=effect_store,
+            artifact_store=commissioning_store.objects_root,
+            repository_root=disposable_git.builder,
+            bare_repository=disposable_git.origin,
+            request_path=promotion_path,
+            signing_key=protected_runner.key_path,
+        )
+    )
+    assert promotion_replay["action"] == "already_receipted"
+    assert promotion_replay["receipt_ref"] == recovered_promotion["receipt_ref"]
+
+    publication_record = _inspect_effect(effect_store, publication_request["effect_key"])
+    promotion_record = _inspect_effect(effect_store, promotion_request["effect_key"])
+    assert publication_record["status"] == "receipted"
+    assert promotion_record["status"] == "receipted"
+    assert len(publication_record["recoveries"]) == 1
+    assert len(promotion_record["recoveries"]) == 1
+    assert [item["action"] for item in publication_record["invocations"]] == [
+        "effect_applied",
+        "recovered_effect_receipt",
+        "already_receipted",
+    ]
+    assert [item["action"] for item in promotion_record["invocations"]] == [
+        "effect_applied",
+        "recovered_effect_receipt",
+        "already_receipted",
+    ]
+    assert promotion_record["pull_request"] == {
+        **promotion_request["pr"],
+        "effect_key": promotion_request["effect_key"],
+        "merge_commit": promotion_commit,
+        "merge_tree": promotion_tree,
+        "state": "MERGED",
+    }
+    receipt_refs = {
+        publication_record["receipt_ref"]["digest"],
+        promotion_record["receipt_ref"]["digest"],
+    }
+    assert len(receipt_refs) == 2
+    assert all((commissioning_store.objects_root / digest).is_file() for digest in receipt_refs)
+    public_key_path = request_root / "protected-controller-public.pem"
+    public_key_path.write_bytes(protected_runner.public_key_pem)
+    public_key_path.chmod(0o600)
+    for request_path, record in (
+        (publication_path, publication_record),
+        (promotion_path, promotion_record),
+    ):
+        receipt_ref_path = request_root / f"{record['effect_key'].replace(':', '-')}.ref.json"
+        receipt_ref_path.write_bytes(canonical_json_bytes(record["receipt_ref"]))
+        receipt_ref_path.chmod(0o600)
+        verified_receipt = _verify_effect_receipt(
+            artifact_store=commissioning_store.objects_root,
+            repository_root=disposable_git.builder,
+            receipt_ref_path=receipt_ref_path,
+            public_key_path=public_key_path,
+            request_path=request_path,
+        )
+        assert verified_receipt == {
+            "action": "verified_effect_receipt",
+            "effect_key": record["effect_key"],
+            "receipt_digest": record["receipt_ref"]["digest"],
+            "recovered": True,
+        }
 
 
 def test_component_scenarios_cannot_self_issue_commissioning_pass(
