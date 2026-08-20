@@ -132,6 +132,17 @@ def test_sandbox_failure_reason_is_bounded(stderr: bytes, expected: str) -> None
     assert _sandbox_failure_reason(stderr) == expected
 
 
+def test_linux_toolchain_paths_do_not_include_missing_macos_selectors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(commissioning_runner.sys, "platform", "linux")
+
+    paths = commissioning_runner._toolchain_paths((sys.executable,))
+
+    assert Path("/private/var/db/xcode_select_link") not in paths
+    assert Path("/var/db/xcode_select_link") not in paths
+
+
 def test_protected_commands_normalize_launch_timeout_and_signal_failures(
     tmp_path: Path,
 ) -> None:

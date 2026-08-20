@@ -239,7 +239,7 @@ def _toolchain_paths(command: tuple[str, ...]) -> tuple[Path, ...]:
         Path("/lib64"),
         Path("/etc/ld.so.cache"),
     ):
-        if path.exists() or path in xcode_selectors:
+        if path.exists() or (sys.platform == "darwin" and path in xcode_selectors):
             paths.append(path)
     return tuple(dict.fromkeys(path.expanduser().absolute() for path in paths))
 
