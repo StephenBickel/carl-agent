@@ -9,6 +9,7 @@ description = "Reproducible benchmark lab for the Carl agent harness"
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "cryptography==46.0.5",
+    "psycopg[binary]==3.2.9",
 ]
 
 [project.scripts]
