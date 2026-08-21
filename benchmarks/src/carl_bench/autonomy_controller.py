@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Literal
 from carl_bench.autonomy import AutonomyProjection
 from carl_bench.canonical import canonical_json_bytes
 from carl_bench.capability_validation import CapabilityValidationReport
-from carl_bench.experiment import EventType, ExperimentEvent
+from carl_bench.experiment import EventType, ExperimentEvent, MutableStageLease
 from carl_bench.github_promotion import (
     PromotionRequest,
     PromotionSnapshot,
@@ -142,6 +142,7 @@ class ControllerSnapshot:
     infrastructure_failure: InfrastructureFailure | None = None
     promotion_health: PromotionHealthSnapshot | None = None
     changed_paths: tuple[str, ...] = ()
+    lifecycle_lease: MutableStageLease | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.autonomy, AutonomyProjection):
@@ -192,6 +193,10 @@ class ControllerSnapshot:
             not isinstance(item, str) for item in self.changed_paths
         ):
             raise PromotionContractError("invalid_changed_paths")
+        if self.lifecycle_lease is not None and not isinstance(
+            self.lifecycle_lease, MutableStageLease
+        ):
+            raise PromotionContractError("invalid_lifecycle_lease")
 
 
 @dataclass(frozen=True, slots=True)
@@ -199,6 +204,7 @@ class ControllerAction:
     action: ControllerActionName
     reason: str
     event: ExperimentEvent | None = None
+    event_authority: Literal["candidate", "trusted_controller"] = "candidate"
     promotion_id: str | None = None
     parent_commit: str | None = None
     candidate_commit: str | None = None
@@ -218,10 +224,26 @@ class ControllerAction:
     restored_tree: str | None = None
     health_findings: tuple[str, ...] = ()
 
+    def __post_init__(self) -> None:
+        if self.event_authority == "candidate":
+            return
+        if (
+            self.event_authority != "trusted_controller"
+            or self.action != "accept"
+            or self.event is None
+            or self.event.event_type is not EventType.STATE_TRANSITIONED
+            or set(self.event.payload) != {"_lease", "from_state", "to_state"}
+            or self.event.payload["from_state"] != "soaking"
+            or self.event.payload["to_state"] != "accepted"
+        ):
+            raise PromotionContractError("invalid_controller_event_authority")
+
     def append_event(self, ledger: ExperimentLedger) -> AppendResult | None:
         """Persist only this action's graph fact through the appropriate ledger boundary."""
         if self.event is None:
             return None
+        if self.event_authority == "trusted_controller":
+            return ledger.append_trusted_authority(self.event)
         if self.event.event_type in _TRUSTED_EVENTS:
             return ledger.append_trusted_authority(self.event)
         return ledger.append(self.event)
@@ -569,7 +591,19 @@ def _soak_action(
             raise PromotionContractError("controller_command_in_future")
         if not _accepted_evidence_is_bound(snapshot.autonomy, occurred_at):
             raise PromotionContractError("accepted_soak_evidence_required")
+        lifecycle_lease = snapshot.lifecycle_lease
+        if (
+            lifecycle_lease is None
+            or lifecycle_lease.stale_reconciled
+            or occurred_at < _utc("lifecycle_lease_acquired_at", lifecycle_lease.acquired_at)
+            or occurred_at > _utc("lifecycle_lease_expires_at", lifecycle_lease.expires_at)
+        ):
+            raise PromotionContractError("active_acceptance_lease_required")
         event_payload = {
+            "_lease": {
+                "owner_id": lifecycle_lease.owner_id,
+                "stage_attempt_id": lifecycle_lease.stage_attempt_id,
+            },
             "from_state": "soaking",
             "to_state": "accepted",
         }
@@ -590,6 +624,7 @@ def _soak_action(
             "accept",
             "healthy_24_hour_soak_complete",
             event=event,
+            event_authority="trusted_controller",
             promotion_id=request.promotion_id,
             merge_commit=promotion.merge_commit,
         )

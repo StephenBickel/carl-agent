@@ -28,7 +28,12 @@ from carl_bench.autonomy_controller import (
 )
 from carl_bench.canonical import canonical_json_bytes
 from carl_bench.capability_validation import CapabilityValidationReport
-from carl_bench.experiment import EventType, ExperimentEvent, GraphContractError
+from carl_bench.experiment import (
+    EventType,
+    ExperimentEvent,
+    GraphContractError,
+    MutableStageLease,
+)
 from carl_bench.github_promotion import (
     CheckRun,
     PromotionRequest,
@@ -241,6 +246,12 @@ def controller_snapshot() -> ControllerSnapshot:
             pull_request=None,
         ),
         required_checks=REQUIRED_CHECKS,
+        lifecycle_lease=MutableStageLease(
+            stage_attempt_id="controller-acceptance-lease",
+            owner_id="controller-acceptance-owner",
+            acquired_at="2026-08-20T12:59:00Z",
+            expires_at="2026-08-20T14:00:00Z",
+        ),
     )
 
 
@@ -345,6 +356,11 @@ def test_restart_safe_healthy_and_exact_revert_lifecycles() -> None:
     assert accepted.action == "accept"
     assert accepted.merge_commit == MERGE
     assert accepted.event is not None
+    assert accepted.event_authority == "trusted_controller"
+    assert accepted.event.payload["_lease"] == {
+        "owner_id": "controller-acceptance-owner",
+        "stage_attempt_id": "controller-acceptance-lease",
+    }
     assert (
         next_controller_action(
             replace(
@@ -959,7 +975,14 @@ def test_accept_replay_reuses_persisted_command_time_and_event_identity() -> Non
     assert first.event is not None
     assert first.event.event_type is EventType.STATE_TRANSITIONED
     assert first.event.occurred_at == command_occurred_at
-    assert first.event.payload == {"from_state": "soaking", "to_state": "accepted"}
+    assert first.event.payload == {
+        "_lease": {
+            "owner_id": "controller-acceptance-owner",
+            "stage_attempt_id": "controller-acceptance-lease",
+        },
+        "from_state": "soaking",
+        "to_state": "accepted",
+    }
     assert replay.event is not None
     assert replay.event.stage_attempt_id == first.event.stage_attempt_id
     assert replay.event.digest == first.event.digest

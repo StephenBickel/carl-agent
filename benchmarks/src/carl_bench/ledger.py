@@ -42,6 +42,19 @@ _TRUSTED_CANONICAL_EVENT_TYPES = frozenset(
 )
 
 
+def _is_trusted_acceptance_transition(event: ExperimentEvent) -> bool:
+    if event.event_type is not EventType.STATE_TRANSITIONED:
+        return False
+    payload = event.payload
+    return (
+        set(payload) == {"_lease", "from_state", "to_state"}
+        and payload["from_state"] == "soaking"
+        and payload["to_state"] == "accepted"
+        and isinstance(payload["_lease"], dict)
+        and set(payload["_lease"]) == {"owner_id", "stage_attempt_id"}
+    )
+
+
 def _trusted_canonical_digests(
     events: tuple[ExperimentEvent, ...],
 ) -> frozenset[str]:
@@ -399,7 +412,10 @@ class ExperimentLedger:
 
     def append_trusted_authority(self, event: ExperimentEvent) -> AppendResult:
         """Append a protected lifecycle fact from the isolated trusted authority."""
-        if event.event_type not in _TRUSTED_AUTHORITY_EVENT_TYPES:
+        if (
+            event.event_type not in _TRUSTED_AUTHORITY_EVENT_TYPES
+            and not _is_trusted_acceptance_transition(event)
+        ):
             raise LedgerIntegrityError("trusted_authority_event_required")
         return self._append(event, trusted_authority=True)
 

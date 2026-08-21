@@ -63,6 +63,7 @@ from carl_bench.experiment import (
     EventType,
     ExperimentEvent,
     ExperimentState,
+    MutableStageLease,
     ReviewRole,
     ReviewVerdict,
 )
@@ -78,7 +79,7 @@ from carl_bench.github_promotion import (
     PullRequestSnapshot,
     RevertSnapshot,
 )
-from carl_bench.ledger import ExperimentLedger
+from carl_bench.ledger import ExperimentLedger, LedgerIntegrityError
 from carl_bench.promotion import (
     PromotionContractError,
     PromotionExpectation,
@@ -759,6 +760,7 @@ def _append_accepted_lifecycle(
     promotion_commit: str,
     artifact_store: PrivateArtifactStore,
     paired: PairedEvidence,
+    append_acceptance: bool = True,
 ) -> None:
     ledger = ExperimentLedger(ledger_path)
     for source, target, attempt, occurred_at in (
@@ -1040,7 +1042,9 @@ def _append_accepted_lifecycle(
             },
         )
     )
-    ledger.append(
+    if not append_acceptance:
+        return
+    ledger.append_trusted_authority(
         _lifecycle_transition(
             source=ExperimentState.SOAKING,
             target=ExperimentState.ACCEPTED,
@@ -1196,8 +1200,106 @@ def test_accepted_lifecycle_is_derived_from_fresh_ledger_and_bare_refs(
         promotion_commit=promotion_commit,
         artifact_store=evidence,
         paired=paired,
+        append_acceptance=False,
     )
-    assert ExperimentLedger(ledger_path).projection(EXPERIMENT_ID).state is ExperimentState.ACCEPTED
+    before_acceptance = ExperimentLedger(ledger_path)
+    lifecycle = before_acceptance.projection(EXPERIMENT_ID)
+    assert lifecycle.state is ExperimentState.SOAKING
+    assert lifecycle.lease is not None
+    promotion_id = "promotion-exp-commissioning-001-acceptance"
+    request = PromotionRequest(
+        promotion_id=promotion_id,
+        experiment_id=EXPERIMENT_ID,
+        repository="fixture/carl-agent",
+        base_branch="main",
+        head_branch=f"experimental/{EXPERIMENT_ID}",
+        parent_commit=manifest.parent_commit,
+        candidate_commit=packet.candidate_commit,
+        candidate_tree=disposable_git.valid_tree,
+        protected_receipt_digest=protected_run.receipt.digest,
+    )
+    acceptance_snapshot = ControllerSnapshot(
+        autonomy=before_acceptance.autonomy_projection(EXPERIMENT_ID),
+        capability_report=None,
+        protected_validation=None,
+        protected_public_key_pem=None,
+        promotion_expectation=None,
+        promotion_request=request,
+        promotion_snapshot=PromotionSnapshot(
+            production_commit=promotion_commit,
+            active_promotion_id=promotion_id,
+            pull_request=None,
+        ),
+        required_checks=APPROVED_REQUIRED_CHECKS,
+        lifecycle_lease=lifecycle.lease,
+    )
+    command_time = "2026-08-20T10:05:00Z"
+    accepted_at = datetime(2026, 8, 20, 10, 5, tzinfo=UTC)
+    first_action = next_controller_action(
+        acceptance_snapshot,
+        accepted_at,
+        command_key="accept-lifecycle-001",
+        command_occurred_at=command_time,
+    )
+    replay_action = next_controller_action(
+        acceptance_snapshot,
+        accepted_at,
+        command_key="accept-lifecycle-001",
+        command_occurred_at=command_time,
+    )
+    conflicting_action = next_controller_action(
+        acceptance_snapshot,
+        accepted_at + timedelta(minutes=1),
+        command_key="accept-lifecycle-001",
+        command_occurred_at="2026-08-20T10:06:00Z",
+    )
+
+    assert first_action.action == "accept"
+    assert first_action.event_authority == "trusted_controller"
+    assert first_action.event is not None
+    assert first_action.event.payload == {
+        "_lease": {
+            "owner_id": "commissioning-acceptance-controller",
+            "stage_attempt_id": "commissioning-acceptance-lease",
+        },
+        "from_state": "soaking",
+        "to_state": "accepted",
+    }
+    assert replay_action.event == first_action.event
+    assert replay_action.event.digest == first_action.event.digest
+
+    first_append = first_action.append_event(ExperimentLedger(ledger_path))
+    replay_append = replay_action.append_event(ExperimentLedger(ledger_path))
+    assert first_append is not None and first_append.appended
+    assert replay_append is not None and not replay_append.appended
+    assert replay_append.event_digest == first_append.event_digest
+    assert replay_append.chain_digest == first_append.chain_digest
+    with pytest.raises(LedgerIntegrityError, match="stage_attempt_conflict"):
+        conflicting_action.append_event(ExperimentLedger(ledger_path))
+    ExperimentLedger(ledger_path).append(
+        ExperimentEvent.create(
+            experiment_id=EXPERIMENT_ID,
+            stage_attempt_id="commissioning-release-acceptance-lease",
+            event_type=EventType.LEASE_RELEASED,
+            occurred_at="2026-08-20T10:07:00Z",
+            payload={"lease_stage_attempt_id": "commissioning-acceptance-lease"},
+        )
+    )
+
+    reloaded = ExperimentLedger(ledger_path)
+    assert reloaded.projection(EXPERIMENT_ID).state is ExperimentState.ACCEPTED
+    assert reloaded.projection(EXPERIMENT_ID).lease is None
+    assert reloaded.autonomy_projection(EXPERIMENT_ID).accepted_at == command_time
+    terminal = next_controller_action(
+        replace(
+            acceptance_snapshot,
+            autonomy=reloaded.autonomy_projection(EXPERIMENT_ID),
+            lifecycle_lease=reloaded.projection(EXPERIMENT_ID).lease,
+        ),
+        accepted_at,
+    )
+    assert terminal.action == "idle"
+    assert terminal.reason == "experiment_accepted"
     lifecycle_ref = evidence.put(
         evidence_kind="lifecycle_ledger",
         media_type="application/json",
@@ -3352,14 +3454,22 @@ def test_component_scenarios_cannot_self_issue_commissioning_pass(
         assert replayed is not None and not replayed.appended
 
     accepted_at = NOW + timedelta(hours=24)
-    accepted_snapshot = _controller_snapshot(
-        ledger_path=ledger_path,
-        report=capability_report,
-        envelope=envelope,
-        public_key=runner.public_key_pem,
-        expectation=expectation,
-        request=request,
-        promotion_snapshot=runner.snapshot(request),
+    accepted_snapshot = replace(
+        _controller_snapshot(
+            ledger_path=ledger_path,
+            report=capability_report,
+            envelope=envelope,
+            public_key=runner.public_key_pem,
+            expectation=expectation,
+            request=request,
+            promotion_snapshot=runner.snapshot(request),
+        ),
+        lifecycle_lease=MutableStageLease(
+            stage_attempt_id="commissioning-controller-acceptance-lease",
+            owner_id="commissioning-controller",
+            acquired_at=(accepted_at - timedelta(minutes=1)).isoformat().replace("+00:00", "Z"),
+            expires_at=(accepted_at + timedelta(hours=1)).isoformat().replace("+00:00", "Z"),
+        ),
     )
     accepted_command_occurred_at = accepted_at.isoformat().replace("+00:00", "Z")
     accepted = next_controller_action(
@@ -3372,18 +3482,6 @@ def test_component_scenarios_cannot_self_issue_commissioning_pass(
     assert accepted.merge_commit == merged_pr.merge_commit
     assert accepted.event is not None
     assert accepted.event.occurred_at == accepted_command_occurred_at
-    terminal = next_controller_action(
-        replace(
-            accepted_snapshot,
-            autonomy=replace(
-                accepted_snapshot.autonomy,
-                accepted_at=accepted_command_occurred_at,
-            ),
-        ),
-        accepted_at,
-    )
-    assert terminal.action == "idle"
-    assert terminal.reason == "experiment_accepted"
 
     final_projection = ExperimentLedger(ledger_path).autonomy_projection(EXPERIMENT_ID)
     assert final_projection.experimental_publication is not None
