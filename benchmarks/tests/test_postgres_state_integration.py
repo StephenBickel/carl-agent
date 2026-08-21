@@ -771,6 +771,103 @@ def test_reducer_invalid_payload_types_do_not_mutate_live_chain(
 
 
 @pytest.mark.parametrize(
+    ("event_type", "field", "invalid_value"),
+    (
+        (EventType.WORKSPACE_PREPARED, "manifest_digest", "0" * 64),
+        (EventType.LEASE_ACQUIRED, "expires_at", "2026-08-10 18:00:00+00"),
+        (EventType.DRAFT_PR_REQUESTED, "base_branch", "a" * 129),
+    ),
+)
+def test_reducer_identity_and_text_contract_mismatch_does_not_mutate_chain(
+    postgres: object,
+    event_type: EventType,
+    field: str,
+    invalid_value: str,
+) -> None:
+    manifest = sample_manifest()
+    history = _full_event_history()
+    target_index = next(
+        index for index, event in enumerate(history) if event.event_type is event_type
+    )
+    with _as_role(postgres, "carl_builder") as builder:
+        _register_manifest(builder, manifest)
+    for event in history[:target_index]:
+        with _as_role(postgres, f"carl_{_event_authority(event)}") as connection:
+            _append_event(connection, event)
+
+    target = history[target_index]
+    invalid = ExperimentEvent.create(
+        experiment_id=target.experiment_id,
+        stage_attempt_id=f"invalid-contract-{event_type.value}-{field}",
+        event_type=event_type,
+        occurred_at=target.occurred_at,
+        payload={**target.payload, field: invalid_value},
+    )
+    with _as_role(postgres, "carl_coordinator") as reader:
+        before = reader.execute(
+            "SELECT * FROM carl_autonomy.load_experiment_events(%s)",
+            (manifest.experiment_id,),
+        ).fetchall()
+    with (
+        _as_role(postgres, f"carl_{_event_authority(target)}") as connection,
+        pytest.raises(psycopg.Error),
+    ):
+        _append_event(connection, invalid)
+    with _as_role(postgres, "carl_coordinator") as reader:
+        after = reader.execute(
+            "SELECT * FROM carl_autonomy.load_experiment_events(%s)",
+            (manifest.experiment_id,),
+        ).fetchall()
+
+    assert after == before
+    _backend(postgres).load_projection(manifest.experiment_id)
+
+
+def test_all_hard_finding_attestations_cannot_authorize_draft_pr(postgres: object) -> None:
+    manifest = sample_manifest()
+    history = _full_event_history()
+    draft_index = next(
+        index
+        for index, event in enumerate(history)
+        if event.event_type is EventType.DRAFT_PR_REQUESTED
+    )
+    hard_history = tuple(
+        ExperimentEvent.create(
+            experiment_id=event.experiment_id,
+            stage_attempt_id=event.stage_attempt_id,
+            event_type=event.event_type,
+            occurred_at=event.occurred_at,
+            payload={**event.payload, "verdict": "hard_finding"},
+        )
+        if event.event_type is EventType.REVIEW_ATTESTED
+        else event
+        for event in history[:draft_index]
+    )
+    with _as_role(postgres, "carl_builder") as builder:
+        _register_manifest(builder, manifest)
+    for event in hard_history:
+        with _as_role(postgres, f"carl_{_event_authority(event)}") as connection:
+            _append_event(connection, event)
+
+    draft = history[draft_index]
+    with _as_role(postgres, "carl_coordinator") as reader:
+        before = reader.execute(
+            "SELECT * FROM carl_autonomy.load_experiment_events(%s)",
+            (manifest.experiment_id,),
+        ).fetchall()
+    with _as_role(postgres, "carl_promoter") as promoter, pytest.raises(psycopg.Error):
+        _append_event(promoter, draft)
+    with _as_role(postgres, "carl_coordinator") as reader:
+        after = reader.execute(
+            "SELECT * FROM carl_autonomy.load_experiment_events(%s)",
+            (manifest.experiment_id,),
+        ).fetchall()
+
+    assert after == before
+    _backend(postgres).load_projection(manifest.experiment_id)
+
+
+@pytest.mark.parametrize(
     ("event_type", "field", "value"),
     (
         (EventType.EXPERIMENTAL_PUBLISHED, "branch", "experimental/wrong-experiment"),

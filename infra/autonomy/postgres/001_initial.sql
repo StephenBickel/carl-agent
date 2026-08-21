@@ -56,6 +56,12 @@ CREATE INDEX experiment_events_experiment_order
 CREATE TABLE carl_autonomy.experiment_projection_guards (
     experiment_id varchar(128) PRIMARY KEY
         REFERENCES carl_autonomy.experiment_manifests(experiment_id),
+    manifest_digest character(64) NOT NULL CHECK (manifest_digest ~ '^[0-9a-f]{64}$'),
+    manifest_parent_commit varchar(64) NOT NULL CHECK (
+        manifest_parent_commit ~ '^([0-9a-f]{40}|[0-9a-f]{64})$'
+    ),
+    manifest_registered_at timestamptz NOT NULL,
+    manifest_deterministic_checks text[] NOT NULL,
     lifecycle_state varchar(32) NOT NULL DEFAULT 'queued' CHECK (
         lifecycle_state IN (
             'queued', 'baselining', 'diagnosing', 'proposal_review', 'building',
@@ -67,7 +73,11 @@ CREATE TABLE carl_autonomy.experiment_projection_guards (
     lifecycle_revision integer NOT NULL DEFAULT 0
         CHECK (lifecycle_revision BETWEEN 0 AND 2147483647),
     proposal_approvals smallint NOT NULL DEFAULT 0 CHECK (proposal_approvals BETWEEN 0 AND 3),
+    proposal_hard_objections smallint NOT NULL DEFAULT 0
+        CHECK (proposal_hard_objections BETWEEN 0 AND 3),
     candidate_approvals smallint NOT NULL DEFAULT 0 CHECK (candidate_approvals BETWEEN 0 AND 4),
+    candidate_hard_findings smallint NOT NULL DEFAULT 0
+        CHECK (candidate_hard_findings BETWEEN 0 AND 4),
     proposal_roles text[] NOT NULL DEFAULT '{}',
     candidate_roles text[] NOT NULL DEFAULT '{}',
     review_packet_roles text[] NOT NULL DEFAULT '{}',
@@ -78,30 +88,97 @@ CREATE TABLE carl_autonomy.experiment_projection_guards (
     lease_owner_id varchar(192),
     lease_expires_at timestamptz,
     workspace_prepared boolean NOT NULL DEFAULT false,
+    workspace_manifest_digest character(64),
+    workspace_parent_commit varchar(64),
+    workspace_branch text,
     candidate_sealed boolean NOT NULL DEFAULT false,
     candidate_packet_digest character(64),
     candidate_commit varchar(64),
+    candidate_branch text,
+    candidate_diff_digest character(64),
     paired_evidence_recorded boolean NOT NULL DEFAULT false,
+    paired_evidence_digest character(64),
+    paired_evidence_candidate_commit varchar(64),
+    paired_baseline_scorecard_digest character(64),
+    paired_candidate_scorecard_digest character(64),
+    paired_decision varchar(32),
     protected_validation_recorded boolean NOT NULL DEFAULT false,
+    protected_validation_candidate_commit varchar(64),
+    protected_validation_candidate_tree varchar(64),
+    protected_validation_receipt_digest character(64),
     review_packet_count smallint NOT NULL DEFAULT 0 CHECK (review_packet_count BETWEEN 0 AND 4),
     review_attestation_count smallint NOT NULL DEFAULT 0
         CHECK (review_attestation_count BETWEEN 0 AND 4),
+    review_packet_identities jsonb NOT NULL DEFAULT '{}'::jsonb,
+    review_attestation_identities jsonb NOT NULL DEFAULT '{}'::jsonb,
+    review_attestation_reviewers text[] NOT NULL DEFAULT '{}',
+    review_attestation_contexts text[] NOT NULL DEFAULT '{}',
+    review_attestation_approvals smallint NOT NULL DEFAULT 0
+        CHECK (review_attestation_approvals BETWEEN 0 AND 4),
+    review_attestation_hard_findings smallint NOT NULL DEFAULT 0
+        CHECK (review_attestation_hard_findings BETWEEN 0 AND 4),
     draft_pr_requested boolean NOT NULL DEFAULT false,
+    draft_request_repository text,
+    draft_request_base_branch text,
+    draft_request_head_branch text,
+    draft_request_candidate_commit varchar(64),
     draft_pr_recorded boolean NOT NULL DEFAULT false,
+    draft_pr_repository text,
+    draft_pr_base_branch text,
+    draft_pr_head_branch text,
+    draft_pr_candidate_commit varchar(64),
     workspace_disposed boolean NOT NULL DEFAULT false,
+    workspace_disposed_branch text,
+    workspace_disposed_candidate_commit varchar(64),
     retry_state jsonb NOT NULL DEFAULT '{}'::jsonb,
     experimental_published boolean NOT NULL DEFAULT false,
+    experimental_branch text,
+    experimental_candidate_packet_digest character(64),
     experimental_commit varchar(64),
     experimental_tree varchar(64),
     promotion_recorded boolean NOT NULL DEFAULT false,
     promotion_merge_commit varchar(64),
     promotion_merge_tree varchar(64),
+    promotion_merged_at timestamptz,
     soak_failure_recorded boolean NOT NULL DEFAULT false,
     soak_failure_digest character(64),
+    soak_failures jsonb NOT NULL DEFAULT '{}'::jsonb,
+    qualifying_healthy_soak_at timestamptz,
     revert_recorded boolean NOT NULL DEFAULT false,
+    revert_merge_commit varchar(64),
+    revert_hard_failure_digest character(64),
+    revert_restored_tree varchar(64),
+    revert_candidate_commit varchar(64),
+    revert_result_merge_commit varchar(64),
+    revert_pull_request_number numeric,
     updated_at timestamptz NOT NULL,
     CHECK (candidate_packet_digest IS NULL OR candidate_packet_digest ~ '^[0-9a-f]{64}$'),
+    CHECK (
+        workspace_manifest_digest IS NULL OR workspace_manifest_digest ~ '^[0-9a-f]{64}$'
+    ),
+    CHECK (
+        workspace_parent_commit IS NULL
+        OR workspace_parent_commit ~ '^([0-9a-f]{40}|[0-9a-f]{64})$'
+    ),
     CHECK (candidate_commit IS NULL OR candidate_commit ~ '^([0-9a-f]{40}|[0-9a-f]{64})$'),
+    CHECK (candidate_diff_digest IS NULL OR candidate_diff_digest ~ '^[0-9a-f]{64}$'),
+    CHECK (paired_evidence_digest IS NULL OR paired_evidence_digest ~ '^[0-9a-f]{64}$'),
+    CHECK (
+        paired_evidence_candidate_commit IS NULL
+        OR paired_evidence_candidate_commit ~ '^([0-9a-f]{40}|[0-9a-f]{64})$'
+    ),
+    CHECK (
+        paired_baseline_scorecard_digest IS NULL
+        OR paired_baseline_scorecard_digest ~ '^[0-9a-f]{64}$'
+    ),
+    CHECK (
+        paired_candidate_scorecard_digest IS NULL
+        OR paired_candidate_scorecard_digest ~ '^[0-9a-f]{64}$'
+    ),
+    CHECK (
+        paired_decision IS NULL
+        OR paired_decision IN ('improvement', 'rejected', 'insufficient_evidence')
+    ),
     CHECK (
         experimental_commit IS NULL
         OR experimental_commit ~ '^([0-9a-f]{40}|[0-9a-f]{64})$'

@@ -17,6 +17,7 @@ from postgres_event_policy import (
     EVENT_BOOLEAN_FIELDS,
     EVENT_INTEGER_FIELDS,
     EVENT_PAYLOAD_KEY_SETS,
+    EVENT_REDUCER_BINDINGS,
     EVENT_STRING_FIELDS,
     INVALID_EVENT_PAYLOAD_TYPES,
 )
@@ -93,9 +94,100 @@ EVENT_POLICY_CASES = (
 def test_shared_event_policy_keys_equal_production_event_type() -> None:
     production = set(EventType)
 
+    assert {event_type for event_type, _authorities, _handler in EVENT_POLICY_CASES} == production
     assert set(EVENT_PAYLOAD_KEY_SETS) == production
     assert set(EVENT_STRING_FIELDS) == production
+    assert set(EVENT_INTEGER_FIELDS) == production
+    assert set(EVENT_BOOLEAN_FIELDS) == production
+    assert set(EVENT_REDUCER_BINDINGS) == production
     assert {event_type for event_type, _path, _value in INVALID_EVENT_PAYLOAD_TYPES} == production
+
+
+def test_sql_guard_binds_workspace_to_registered_manifest_identity() -> None:
+    assert re.search(r"manifest_digest\s+character\(64\)\s+NOT\s+NULL", INITIAL_SQL, re.I)
+    assert re.search(r"manifest_parent_commit\s+varchar\(64\)\s+NOT\s+NULL", INITIAL_SQL, re.I)
+    assert re.search(r"workspace_manifest_digest\s+character\(64\)", INITIAL_SQL, re.I)
+    assert re.search(r"workspace_parent_commit\s+varchar\(64\)", INITIAL_SQL, re.I)
+    validator = re.search(
+        r"FUNCTION\s+carl_autonomy\.validate_and_advance_event.*?"
+        r"AS\s+\$\$(?P<body>.*?)\$\$;",
+        ROLE_PROCEDURES_SQL,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    assert validator is not None
+    workspace = re.search(
+        r"WHEN\s+'workspace_prepared'\s+THEN(?P<body>.*?)"
+        r"WHEN\s+'candidate_sealed'",
+        validator.group("body"),
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    assert workspace is not None
+    assert "guard.manifest_digest" in workspace.group("body")
+    assert "guard.manifest_parent_commit" in workspace.group("body")
+
+
+def test_sql_attestation_quorum_rejects_all_hard_findings() -> None:
+    assert re.search(r"review_attestation_approvals\s+smallint\s+NOT\s+NULL", INITIAL_SQL, re.I)
+    assert re.search(r"review_attestation_hard_findings\s+smallint\s+NOT\s+NULL", INITIAL_SQL, re.I)
+    validator = re.search(
+        r"FUNCTION\s+carl_autonomy\.validate_and_advance_event.*?"
+        r"AS\s+\$\$(?P<body>.*?)\$\$;",
+        ROLE_PROCEDURES_SQL,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    assert validator is not None
+    draft = re.search(
+        r"WHEN\s+'draft_pr_requested'\s+THEN(?P<body>.*?)"
+        r"WHEN\s+'draft_pr_recorded'",
+        validator.group("body"),
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    assert draft is not None
+    assert re.search(r"review_attestation_approvals\s*<\s*3", draft.group("body"), re.I)
+    assert re.search(r"review_attestation_hard_findings\s*<>\s*0", draft.group("body"), re.I)
+
+
+def test_sql_requires_canonical_utc_z_event_timestamps() -> None:
+    validator = re.search(
+        r"FUNCTION\s+carl_autonomy\.canonical_utc_text_valid\(.*?"
+        r"AS\s+\$\$(?P<body>.*?)\$\$;",
+        ROLE_PROCEDURES_SQL,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    assert validator is not None
+    body = validator.group("body")
+    assert "octet_length" in body
+    assert re.search(r"T.*Z", body, re.DOTALL)
+    assert re.search(
+        r"canonical_utc_text_valid\(p_payload->>'expires_at'\)",
+        ROLE_PROCEDURES_SQL,
+        re.I,
+    )
+    assert re.search(
+        r"canonical_utc_text_valid\(p_payload->>'scheduled_at'\)",
+        ROLE_PROCEDURES_SQL,
+        re.I,
+    )
+    assert re.search(
+        r"canonical_utc_text_valid\(p_payload->>'observed_at'\)",
+        ROLE_PROCEDURES_SQL,
+        re.I,
+    )
+
+
+def test_sql_draft_base_branch_matches_python_128_byte_bound() -> None:
+    draft_shape = re.search(
+        r"WHEN\s+'draft_pr_requested'\s+THEN(?P<body>.*?)"
+        r"WHEN\s+'draft_pr_recorded'",
+        ROLE_PROCEDURES_SQL,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    assert draft_shape is not None
+    assert re.search(
+        r"octet_length\(p_payload->>'base_branch'\)\s+BETWEEN\s+1\s+AND\s+128",
+        draft_shape.group("body"),
+        re.I,
+    )
 
 
 AUTHORITY_PRIVATE = Ed25519PrivateKey.generate()
@@ -733,7 +825,12 @@ def test_sql_rejects_duplicate_revert_and_records_terminal_identity() -> None:
     assert revert is not None
     body = revert.group("body")
     assert re.search(r"guard\.revert_recorded", body, re.I)
-    assert re.search(r"hard_failure_digest.*?guard\.soak_failure_digest", body, re.I | re.S)
+    assert re.search(
+        r"guard\.soak_failures\s*->>\s*\(p_payload->>'hard_failure_digest'\)"
+        r".*?guard\.promotion_merge_commit",
+        body,
+        re.I | re.S,
+    )
     assert re.search(r"merge_commit.*?guard\.promotion_merge_commit", body, re.I | re.S)
     assert re.search(r"SET\s+revert_recorded\s*=\s*true", body, re.I | re.S)
 
