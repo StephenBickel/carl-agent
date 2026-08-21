@@ -79,6 +79,8 @@ CREATE TABLE carl_autonomy.experiment_projection_guards (
     lease_expires_at timestamptz,
     workspace_prepared boolean NOT NULL DEFAULT false,
     candidate_sealed boolean NOT NULL DEFAULT false,
+    candidate_packet_digest character(64),
+    candidate_commit varchar(64),
     paired_evidence_recorded boolean NOT NULL DEFAULT false,
     protected_validation_recorded boolean NOT NULL DEFAULT false,
     review_packet_count smallint NOT NULL DEFAULT 0 CHECK (review_packet_count BETWEEN 0 AND 4),
@@ -87,14 +89,35 @@ CREATE TABLE carl_autonomy.experiment_projection_guards (
     draft_pr_requested boolean NOT NULL DEFAULT false,
     draft_pr_recorded boolean NOT NULL DEFAULT false,
     workspace_disposed boolean NOT NULL DEFAULT false,
+    retry_state jsonb NOT NULL DEFAULT '{}'::jsonb,
     experimental_published boolean NOT NULL DEFAULT false,
-    experimental_commit character(40),
-    experimental_tree character(40),
+    experimental_commit varchar(64),
+    experimental_tree varchar(64),
     promotion_recorded boolean NOT NULL DEFAULT false,
-    promotion_merge_commit character(40),
+    promotion_merge_commit varchar(64),
+    promotion_merge_tree varchar(64),
     soak_failure_recorded boolean NOT NULL DEFAULT false,
     soak_failure_digest character(64),
+    revert_recorded boolean NOT NULL DEFAULT false,
     updated_at timestamptz NOT NULL,
+    CHECK (candidate_packet_digest IS NULL OR candidate_packet_digest ~ '^[0-9a-f]{64}$'),
+    CHECK (candidate_commit IS NULL OR candidate_commit ~ '^([0-9a-f]{40}|[0-9a-f]{64})$'),
+    CHECK (
+        experimental_commit IS NULL
+        OR experimental_commit ~ '^([0-9a-f]{40}|[0-9a-f]{64})$'
+    ),
+    CHECK (
+        experimental_tree IS NULL
+        OR experimental_tree ~ '^([0-9a-f]{40}|[0-9a-f]{64})$'
+    ),
+    CHECK (
+        promotion_merge_commit IS NULL
+        OR promotion_merge_commit ~ '^([0-9a-f]{40}|[0-9a-f]{64})$'
+    ),
+    CHECK (
+        promotion_merge_tree IS NULL
+        OR promotion_merge_tree ~ '^([0-9a-f]{40}|[0-9a-f]{64})$'
+    ),
     CHECK (
         (lease_active AND lease_attempt_id IS NOT NULL AND lease_owner_id IS NOT NULL
             AND lease_expires_at IS NOT NULL)

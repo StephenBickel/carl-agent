@@ -138,6 +138,94 @@ AS $$
     SELECT encode(carl_autonomy.digest(convert_to(value, 'UTF8'), 'sha256'), 'hex')
 $$;
 
+CREATE OR REPLACE FUNCTION carl_autonomy.event_payload_key_policy()
+RETURNS TABLE(event_type text, required_keys text[])
+LANGUAGE sql
+IMMUTABLE
+SECURITY INVOKER
+SET search_path = pg_catalog, carl_autonomy
+AS $$
+    VALUES
+        ('state_transitioned', ARRAY['from_state', 'to_state']::text[]),
+        ('state_transitioned', ARRAY['_lease', 'from_state', 'to_state']::text[]),
+        ('role_recorded', ARRAY['artifact_digest', 'role', 'verdict']::text[]),
+        ('role_recorded', ARRAY['_lease', 'artifact_digest', 'role', 'verdict']::text[]),
+        ('lease_acquired', ARRAY['expires_at', 'owner_id']::text[]),
+        ('lease_reconciled', ARRAY['lease_stage_attempt_id', 'worker_not_live']::text[]),
+        ('lease_released', ARRAY['lease_stage_attempt_id']::text[]),
+        ('live_spend_recorded', ARRAY['live_microdollars', 'run_id']::text[]),
+        ('workspace_prepared', ARRAY[
+            '_lease', 'branch', 'experiment_id', 'manifest_digest', 'parent_commit',
+            'request_artifact', 'schema_version'
+        ]::text[]),
+        ('candidate_sealed', ARRAY[
+            '_lease', 'branch', 'candidate_commit', 'changed_path_count',
+            'changed_paths_artifact', 'checks', 'diff_artifact', 'experiment_id',
+            'manifest_digest', 'parent_commit', 'report_artifact', 'schema_version'
+        ]::text[]),
+        ('paired_evidence_recorded', ARRAY[
+            '_lease', 'baseline_scorecard_digest', 'candidate_commit',
+            'candidate_scorecard_digest', 'comparison_artifact',
+            'confidence_lower_basis_points', 'decision', 'experiment_id',
+            'manifest_digest', 'paired_trials', 'parent_commit',
+            'pass_rate_delta_basis_points', 'schema_version'
+        ]::text[]),
+        ('review_packet_recorded', ARRAY[
+            '_lease', 'candidate_commit', 'deterministic_evidence_digest', 'diff_digest',
+            'experiment_id', 'manifest_digest', 'paired_evidence_digest',
+            'review_contract_version', 'role', 'schema_version'
+        ]::text[]),
+        ('review_attested', ARRAY[
+            '_lease', 'candidate_commit', 'context_id', 'experiment_id', 'manifest_digest',
+            'packet_digest', 'report_artifact', 'reviewer_id', 'role', 'schema_version', 'verdict'
+        ]::text[]),
+        ('draft_pr_requested', ARRAY[
+            '_lease', 'base_branch', 'candidate_commit', 'expected_remote_url',
+            'head_branch', 'repository'
+        ]::text[]),
+        ('draft_pr_recorded', ARRAY[
+            '_lease', 'base_branch', 'candidate_commit', 'head_branch', 'is_draft',
+            'number', 'repository', 'schema_version', 'state', 'url'
+        ]::text[]),
+        ('workspace_disposed', ARRAY['_lease', 'branch', 'candidate_commit']::text[]),
+        ('retry_scheduled', ARRAY[
+            'attempt', 'changed_action', 'failed_stage_attempt_id', 'failure_class', 'scheduled_at'
+        ]::text[]),
+        ('experimental_published', ARRAY[
+            'branch', 'candidate_packet_digest', 'commit', 'tree'
+        ]::text[]),
+        ('protected_validation_recorded', ARRAY[
+            'candidate_commit', 'candidate_tree', 'receipt_digest'
+        ]::text[]),
+        ('promotion_recorded', ARRAY['merge_commit', 'merge_tree']::text[]),
+        ('soak_observed', ARRAY[
+            'evidence_digest', 'healthy', 'merge_commit', 'observed_at'
+        ]::text[]),
+        ('revert_recorded', ARRAY[
+            'hard_failure_digest', 'merge_commit', 'restored_tree',
+            'revert_candidate_commit', 'revert_merge_commit', 'revert_pull_request_number'
+        ]::text[])
+$$;
+
+CREATE OR REPLACE FUNCTION carl_autonomy.event_payload_keys_exact(
+    p_event_type text,
+    p_payload jsonb
+)
+RETURNS boolean
+LANGUAGE sql
+IMMUTABLE
+SECURITY INVOKER
+SET search_path = pg_catalog, carl_autonomy
+AS $$
+    SELECT EXISTS (
+        SELECT 1
+        FROM carl_autonomy.event_payload_key_policy() AS policy
+        WHERE policy.event_type = p_event_type
+          AND cardinality(policy.required_keys) = jsonb_object_length(p_payload)
+          AND p_payload ?& policy.required_keys
+    )
+$$;
+
 CREATE OR REPLACE FUNCTION carl_autonomy.event_role_allowed(
     role_name text,
     event_type text,
@@ -252,7 +340,9 @@ CREATE OR REPLACE FUNCTION carl_autonomy.validate_and_advance_event(
     p_experiment_id text,
     p_event_type text,
     p_payload jsonb,
+    p_payload_digest text,
     p_stage_attempt_id text,
+    p_occurred_at_text text,
     p_occurred_at timestamptz,
     p_observed_at timestamptz
 )
@@ -269,6 +359,9 @@ DECLARE
     verdict_name text;
     expected_target text;
     lease_required boolean := false;
+    prior_retry jsonb;
+    retry_attempt integer;
+    retry_key text;
 BEGIN
     SELECT g.* INTO guard
     FROM carl_autonomy.experiment_projection_guards AS g
@@ -276,6 +369,9 @@ BEGIN
     FOR UPDATE;
     IF NOT FOUND THEN
         RAISE EXCEPTION USING ERRCODE = '23503', MESSAGE = 'experiment_projection_missing';
+    END IF;
+    IF NOT carl_autonomy.event_payload_keys_exact(p_event_type, p_payload) THEN
+        RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'invalid_event_payload_keys';
     END IF;
 
     IF p_event_type = 'state_transitioned' THEN
@@ -436,10 +532,14 @@ BEGIN
         WHEN 'candidate_sealed' THEN
             IF guard.lifecycle_state <> 'building' OR NOT guard.workspace_prepared
                 OR guard.candidate_sealed
+                OR p_payload->>'candidate_commit' !~ '^([0-9a-f]{40}|[0-9a-f]{64})$'
             THEN
                 RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'prepared_candidate_required';
             END IF;
-            UPDATE carl_autonomy.experiment_projection_guards SET candidate_sealed = true,
+            UPDATE carl_autonomy.experiment_projection_guards
+            SET candidate_sealed = true,
+                candidate_packet_digest = p_payload_digest,
+                candidate_commit = p_payload->>'candidate_commit',
                 updated_at = p_observed_at WHERE experiment_id = p_experiment_id;
         WHEN 'paired_evidence_recorded' THEN
             IF guard.lifecycle_state <> 'paired_evaluation' OR NOT guard.candidate_sealed
@@ -508,13 +608,15 @@ BEGIN
             UPDATE carl_autonomy.experiment_projection_guards SET workspace_disposed = true,
                 updated_at = p_observed_at WHERE experiment_id = p_experiment_id;
         WHEN 'experimental_published' THEN
-            IF guard.experimental_published OR jsonb_object_length(p_payload) <> 4
-                OR NOT p_payload ?& ARRAY['branch', 'candidate_packet_digest', 'commit', 'tree']
+            IF guard.experimental_published OR NOT guard.candidate_sealed
                 OR jsonb_typeof(p_payload->'branch') <> 'string'
-                OR p_payload->>'branch' !~ '^experimental/'
+                OR p_payload->>'branch' IS DISTINCT FROM 'experimental/' || p_experiment_id
                 OR octet_length(p_payload->>'branch') > 256
                 OR p_payload->>'candidate_packet_digest' !~ '^[0-9a-f]{64}$'
+                OR p_payload->>'candidate_packet_digest'
+                    IS DISTINCT FROM guard.candidate_packet_digest
                 OR p_payload->>'commit' !~ '^([0-9a-f]{40}|[0-9a-f]{64})$'
+                OR p_payload->>'commit' IS DISTINCT FROM guard.candidate_commit
                 OR p_payload->>'tree' !~ '^([0-9a-f]{40}|[0-9a-f]{64})$'
             THEN
                 RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'experimental_already_published';
@@ -524,15 +626,15 @@ BEGIN
                 updated_at = p_observed_at WHERE experiment_id = p_experiment_id;
         WHEN 'promotion_recorded' THEN
             IF NOT guard.protected_validation_recorded OR guard.promotion_recorded
-                OR jsonb_object_length(p_payload) <> 2
-                OR NOT p_payload ?& ARRAY['merge_commit', 'merge_tree']
-                OR p_payload->>'merge_commit' !~ '^[0-9a-f]{40}$'
-                OR p_payload->>'merge_tree' !~ '^[0-9a-f]{40}$'
+                OR p_payload->>'merge_commit' !~ '^([0-9a-f]{40}|[0-9a-f]{64})$'
+                OR p_payload->>'merge_tree' !~ '^([0-9a-f]{40}|[0-9a-f]{64})$'
             THEN
                 RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'promotion_prerequisite_missing';
             END IF;
-            UPDATE carl_autonomy.experiment_projection_guards SET promotion_recorded = true,
+            UPDATE carl_autonomy.experiment_projection_guards
+            SET promotion_recorded = true,
                 promotion_merge_commit = p_payload->>'merge_commit',
+                promotion_merge_tree = p_payload->>'merge_tree',
                 updated_at = p_observed_at WHERE experiment_id = p_experiment_id;
         WHEN 'soak_observed' THEN
             IF NOT guard.promotion_recorded OR jsonb_object_length(p_payload) <> 4
@@ -552,16 +654,20 @@ BEGIN
                     THEN p_payload->>'evidence_digest' ELSE soak_failure_digest END,
                 updated_at = p_observed_at WHERE experiment_id = p_experiment_id;
         WHEN 'revert_recorded' THEN
-            IF NOT guard.soak_failure_recorded OR jsonb_object_length(p_payload) <> 6
-                OR NOT p_payload ?& ARRAY[
-                    'hard_failure_digest', 'merge_commit', 'restored_tree',
-                    'revert_candidate_commit', 'revert_merge_commit', 'revert_pull_request_number'
-                ]
+            IF NOT guard.soak_failure_recorded OR guard.revert_recorded
                 OR p_payload->>'hard_failure_digest' IS DISTINCT FROM guard.soak_failure_digest
                 OR p_payload->>'merge_commit' IS DISTINCT FROM guard.promotion_merge_commit
+                OR p_payload->>'restored_tree' !~ '^([0-9a-f]{40}|[0-9a-f]{64})$'
+                OR p_payload->>'revert_candidate_commit' !~ '^([0-9a-f]{40}|[0-9a-f]{64})$'
+                OR p_payload->>'revert_merge_commit' !~ '^([0-9a-f]{40}|[0-9a-f]{64})$'
+                OR jsonb_typeof(p_payload->'revert_pull_request_number') <> 'number'
+                OR p_payload->>'revert_pull_request_number' !~ '^[1-9][0-9]*$'
             THEN
                 RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'hard_failure_required';
             END IF;
+            UPDATE carl_autonomy.experiment_projection_guards
+            SET revert_recorded = true, updated_at = p_observed_at
+            WHERE experiment_id = p_experiment_id;
         WHEN 'lease_reconciled' THEN
             IF NOT guard.lease_active OR guard.lease_reconciled
                 OR p_payload->>'lease_stage_attempt_id' IS DISTINCT FROM guard.lease_attempt_id
@@ -595,16 +701,36 @@ BEGIN
                 RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'invalid_spend_payload';
             END IF;
         WHEN 'retry_scheduled' THEN
-            IF jsonb_object_length(p_payload) <> 5
-                OR NOT p_payload ?& ARRAY[
-                    'attempt', 'changed_action', 'failed_stage_attempt_id',
-                    'failure_class', 'scheduled_at'
-                ]
-                OR (p_payload->>'attempt')::integer NOT BETWEEN 1 AND 3
-                OR (p_payload->>'scheduled_at')::timestamptz <> p_occurred_at
+            retry_key := p_payload->>'failed_stage_attempt_id';
+            IF jsonb_typeof(p_payload->'attempt') <> 'number'
+                OR p_payload->>'attempt' !~ '^[1-3]$'
+                OR retry_key !~ '^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$'
+                OR p_payload->>'failure_class' !~ '^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$'
+                OR octet_length(p_payload->>'changed_action') NOT BETWEEN 1 AND 1024
+                OR p_payload->>'scheduled_at' IS DISTINCT FROM p_occurred_at_text
             THEN
                 RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'invalid_retry_payload';
             END IF;
+            retry_attempt := (p_payload->>'attempt')::integer;
+            prior_retry := guard.retry_state -> retry_key;
+            IF (prior_retry IS NULL AND retry_attempt <> 1)
+                OR (
+                    prior_retry IS NOT NULL
+                    AND retry_attempt <> (prior_retry->>'attempt')::integer + 1
+                )
+            THEN
+                RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'retry_attempt_not_monotonic';
+            END IF;
+            IF prior_retry IS NOT NULL
+                AND p_payload->>'changed_action'
+                    IS NOT DISTINCT FROM prior_retry->>'changed_action'
+            THEN
+                RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'retry_action_unchanged';
+            END IF;
+            UPDATE carl_autonomy.experiment_projection_guards
+            SET retry_state = jsonb_set(retry_state, ARRAY[retry_key], p_payload, true),
+                updated_at = p_observed_at
+            WHERE experiment_id = p_experiment_id;
         ELSE
             RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'unsupported_event_type';
     END CASE;
@@ -687,7 +813,8 @@ BEGIN
         RAISE EXCEPTION USING ERRCODE = '23503', MESSAGE = 'experiment_not_found';
     END IF;
     PERFORM carl_autonomy.validate_and_advance_event(
-        experiment_key, type_name, payload, attempt_key, occurred_time, p_observed_at
+        experiment_key, type_name, payload, carl_autonomy.sha256_text(p_payload_json),
+        attempt_key, occurred_text, occurred_time, p_observed_at
     );
     SELECT e.ordinal, e.chain_digest::text
     INTO next_ordinal, previous_hash

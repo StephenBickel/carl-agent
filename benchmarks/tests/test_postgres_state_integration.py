@@ -14,6 +14,7 @@ import psycopg
 import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from postgres_event_policy import EVENT_PAYLOAD_KEY_SETS
 from test_experiment import (
     candidate_artifact,
     paired_evidence,
@@ -303,7 +304,7 @@ def _full_event_history() -> tuple[ExperimentEvent, ...]:
                 event_type=EventType.EXPERIMENTAL_PUBLISHED,
                 occurred_at="2026-08-10T12:01:06Z",
                 payload={
-                    "branch": "experimental/parity",
+                    "branch": f"experimental/{manifest.experiment_id}",
                     "candidate_packet_digest": candidate.digest,
                     "commit": candidate.candidate_commit,
                     "tree": "b" * 40,
@@ -688,6 +689,7 @@ def test_invalid_payload_for_each_authorized_event_does_not_mutate_chain(
             _append_event(connection, event)
 
     target = history[target_index]
+    assert frozenset(target.payload) in EVENT_PAYLOAD_KEY_SETS[event_type]
     invalid = ExperimentEvent.create(
         experiment_id=target.experiment_id,
         stage_attempt_id=f"invalid-{event_type.value}",
@@ -712,6 +714,225 @@ def test_invalid_payload_for_each_authorized_event_does_not_mutate_chain(
         ).fetchall()
 
     assert after == before
+    _backend(postgres).load_projection(manifest.experiment_id)
+
+
+@pytest.mark.parametrize(
+    ("event_type", "field", "value"),
+    (
+        (EventType.EXPERIMENTAL_PUBLISHED, "branch", "experimental/wrong-experiment"),
+        (EventType.EXPERIMENTAL_PUBLISHED, "candidate_packet_digest", "0" * 64),
+        (EventType.EXPERIMENTAL_PUBLISHED, "commit", "9" * 40),
+        (EventType.PROTECTED_VALIDATION_RECORDED, "candidate_tree", "9" * 40),
+    ),
+)
+def test_candidate_publication_identity_mismatch_does_not_mutate_chain(
+    postgres: object, event_type: EventType, field: str, value: str
+) -> None:
+    manifest = sample_manifest()
+    history = _full_event_history()
+    target_index = next(
+        index for index, event in enumerate(history) if event.event_type is event_type
+    )
+    with _as_role(postgres, "carl_builder") as builder:
+        _register_manifest(builder, manifest)
+    for event in history[:target_index]:
+        with _as_role(postgres, f"carl_{_event_authority(event)}") as connection:
+            _append_event(connection, event)
+
+    target = history[target_index]
+    invalid = ExperimentEvent.create(
+        experiment_id=target.experiment_id,
+        stage_attempt_id=f"invalid-identity-{field}",
+        event_type=event_type,
+        occurred_at=target.occurred_at,
+        payload={**target.payload, field: value},
+    )
+    with _as_role(postgres, "carl_coordinator") as reader:
+        before = reader.execute(
+            "SELECT * FROM carl_autonomy.load_experiment_events(%s)",
+            (manifest.experiment_id,),
+        ).fetchall()
+    with (
+        _as_role(postgres, f"carl_{_event_authority(target)}") as connection,
+        pytest.raises(psycopg.Error),
+    ):
+        _append_event(connection, invalid)
+    with _as_role(postgres, "carl_coordinator") as reader:
+        after = reader.execute(
+            "SELECT * FROM carl_autonomy.load_experiment_events(%s)",
+            (manifest.experiment_id,),
+        ).fetchall()
+
+    assert after == before
+    _backend(postgres).load_projection(manifest.experiment_id)
+
+
+def test_retry_sequence_rejects_nonfirst_skipped_and_repeated_attempts(postgres: object) -> None:
+    manifest = sample_manifest()
+    with _as_role(postgres, "carl_builder") as builder:
+        _register_manifest(builder, manifest)
+
+    def retry(stage_attempt_id: str, attempt: int, changed_action: str) -> ExperimentEvent:
+        occurred_at = f"2026-08-20T12:00:0{attempt}Z"
+        return ExperimentEvent.create(
+            experiment_id=manifest.experiment_id,
+            stage_attempt_id=stage_attempt_id,
+            event_type=EventType.RETRY_SCHEDULED,
+            occurred_at=occurred_at,
+            payload=_retry_payload(
+                attempt=attempt,
+                scheduled_at=occurred_at,
+                changed_action=changed_action,
+            ),
+        )
+
+    with _as_role(postgres, "carl_coordinator") as coordinator:
+        with pytest.raises(psycopg.Error, match="retry_attempt_not_monotonic"):
+            _append_event(coordinator, retry("retry-first-two", 2, "first action"))
+        assert _append_event(coordinator, retry("retry-one", 1, "first action"))["appended"]
+        with pytest.raises(psycopg.Error, match="retry_attempt_not_monotonic"):
+            _append_event(coordinator, retry("retry-skipped-three", 3, "third action"))
+        with pytest.raises(psycopg.Error, match="retry_attempt_not_monotonic"):
+            _append_event(coordinator, retry("retry-repeated-one", 1, "repeated action"))
+        assert _append_event(coordinator, retry("retry-two", 2, "second action"))["appended"]
+        with pytest.raises(psycopg.Error, match="retry_attempt_not_monotonic"):
+            _append_event(coordinator, retry("retry-repeated-two", 2, "another action"))
+
+    _backend(postgres).load_projection(manifest.experiment_id)
+
+
+def test_duplicate_revert_is_rejected_without_chain_mutation(postgres: object) -> None:
+    manifest = sample_manifest()
+    history = _full_event_history()
+    target_index = next(
+        index
+        for index, event in enumerate(history)
+        if event.event_type is EventType.REVERT_RECORDED
+    )
+    with _as_role(postgres, "carl_builder") as builder:
+        _register_manifest(builder, manifest)
+    for event in history[: target_index + 1]:
+        with _as_role(postgres, f"carl_{_event_authority(event)}") as connection:
+            _append_event(connection, event)
+
+    first = history[target_index]
+    duplicate = ExperimentEvent.create(
+        experiment_id=first.experiment_id,
+        stage_attempt_id="duplicate-revert",
+        event_type=EventType.REVERT_RECORDED,
+        occurred_at="2026-08-11T12:01:31Z",
+        payload=first.payload,
+    )
+    with _as_role(postgres, "carl_coordinator") as reader:
+        before = reader.execute(
+            "SELECT * FROM carl_autonomy.load_experiment_events(%s)",
+            (manifest.experiment_id,),
+        ).fetchall()
+    with _as_role(postgres, "carl_soak") as soak, pytest.raises(psycopg.Error):
+        _append_event(soak, duplicate)
+    with _as_role(postgres, "carl_coordinator") as reader:
+        after = reader.execute(
+            "SELECT * FROM carl_autonomy.load_experiment_events(%s)",
+            (manifest.experiment_id,),
+        ).fetchall()
+
+    assert after == before
+    _backend(postgres).load_projection(manifest.experiment_id)
+
+
+@pytest.mark.parametrize("width", (40, 64))
+def test_projection_guard_preserves_sha1_and_sha256_git_ids(postgres: object, width: int) -> None:
+    manifest = sample_manifest()
+    candidate_commit = "9" * width
+    candidate = replace(sealed_candidate(), candidate_commit=candidate_commit)
+    evidence = replace(paired_evidence(), candidate_commit=candidate_commit)
+    candidate_tree = "8" * width
+    merge_commit = "7" * width
+    merge_tree = "6" * width
+    events = (
+        *phase3_build_events(),
+        _leased_event(
+            attempt=f"width-{width}-workspace",
+            event_type=EventType.WORKSPACE_PREPARED,
+            occurred_at="2026-08-10T12:01:01Z",
+            payload=prepared_candidate().to_canonical_dict(),
+        ),
+        _leased_event(
+            attempt=f"width-{width}-sealed",
+            event_type=EventType.CANDIDATE_SEALED,
+            occurred_at="2026-08-10T12:01:02Z",
+            payload=candidate.to_canonical_dict(),
+        ),
+        _state_event(
+            attempt=f"width-{width}-deterministic",
+            source=ExperimentState.BUILDING,
+            target=ExperimentState.DETERMINISTIC_VALIDATION,
+            occurred_at="2026-08-10T12:01:03Z",
+        ),
+        _state_event(
+            attempt=f"width-{width}-paired",
+            source=ExperimentState.DETERMINISTIC_VALIDATION,
+            target=ExperimentState.PAIRED_EVALUATION,
+            occurred_at="2026-08-10T12:01:04Z",
+        ),
+        _leased_event(
+            attempt=f"width-{width}-evidence",
+            event_type=EventType.PAIRED_EVIDENCE_RECORDED,
+            occurred_at="2026-08-10T12:01:05Z",
+            payload=evidence.to_canonical_dict(),
+        ),
+        ExperimentEvent.create(
+            experiment_id=manifest.experiment_id,
+            stage_attempt_id=f"width-{width}-publication",
+            event_type=EventType.EXPERIMENTAL_PUBLISHED,
+            occurred_at="2026-08-10T12:01:06Z",
+            payload={
+                "branch": f"experimental/{manifest.experiment_id}",
+                "candidate_packet_digest": candidate.digest,
+                "commit": candidate_commit,
+                "tree": candidate_tree,
+            },
+        ),
+        ExperimentEvent.create(
+            experiment_id=manifest.experiment_id,
+            stage_attempt_id=f"width-{width}-protected",
+            event_type=EventType.PROTECTED_VALIDATION_RECORDED,
+            occurred_at="2026-08-10T12:01:07Z",
+            payload={
+                "candidate_commit": candidate_commit,
+                "candidate_tree": candidate_tree,
+                "receipt_digest": "5" * 64,
+            },
+        ),
+        ExperimentEvent.create(
+            experiment_id=manifest.experiment_id,
+            stage_attempt_id=f"width-{width}-promotion",
+            event_type=EventType.PROMOTION_RECORDED,
+            occurred_at="2026-08-10T12:01:08Z",
+            payload={"merge_commit": merge_commit, "merge_tree": merge_tree},
+        ),
+    )
+    with _as_role(postgres, "carl_builder") as builder:
+        _register_manifest(builder, manifest)
+    for event in events:
+        with _as_role(postgres, f"carl_{_event_authority(event)}") as connection:
+            _append_event(connection, event)
+
+    with _as_role(postgres, "carl_coordinator") as reader:
+        guard = reader.execute(
+            "SELECT candidate_commit, experimental_commit, experimental_tree, "
+            "promotion_merge_commit, promotion_merge_tree "
+            "FROM carl_autonomy.experiment_projection_guards WHERE experiment_id = %s",
+            (manifest.experiment_id,),
+        ).fetchone()
+    assert guard == {
+        "candidate_commit": candidate_commit,
+        "experimental_commit": candidate_commit,
+        "experimental_tree": candidate_tree,
+        "promotion_merge_commit": merge_commit,
+        "promotion_merge_tree": merge_tree,
+    }
     _backend(postgres).load_projection(manifest.experiment_id)
 
 

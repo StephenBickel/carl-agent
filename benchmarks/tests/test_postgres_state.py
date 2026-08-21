@@ -11,6 +11,7 @@ from typing import Any
 import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from postgres_event_policy import EVENT_PAYLOAD_KEY_SETS
 from test_experiment import manifest as sample_manifest
 
 from carl_bench.canonical import canonical_json_bytes
@@ -250,7 +251,7 @@ def test_sql_grants_no_state_procedure_execution_to_workflow_roles() -> None:
     assert granted_roles.isdisjoint(WORKFLOW_DATABASE_ROLES)
 
 
-def test_sql_rejects_experimental_publication_outside_experimental_namespace() -> None:
+def test_sql_binds_experimental_publication_branch_to_experiment() -> None:
     branch = re.search(
         r"WHEN\s+'experimental_published'\s+THEN(?P<body>.*?)WHEN\s+'promotion_recorded'",
         ROLE_PROCEDURES_SQL,
@@ -259,7 +260,8 @@ def test_sql_rejects_experimental_publication_outside_experimental_namespace() -
 
     assert branch is not None
     assert re.search(
-        r"p_payload->>'branch'\s*!~\s*'\^experimental/'",
+        r"p_payload->>'branch'\s+IS\s+DISTINCT\s+FROM\s+"
+        r"'experimental/'\s*\|\|\s*p_experiment_id",
         branch.group("body"),
         flags=re.IGNORECASE,
     )
@@ -309,6 +311,162 @@ def test_sql_event_vocabulary_authority_and_handler_parity(
         else rf"WHEN\s+'{event_type.value}'\s+THEN"
     )
     assert re.search(handler_pattern, validator_match.group("body"), flags=re.IGNORECASE)
+
+
+def test_sql_exact_payload_key_policy_matches_canonical_event_schemas() -> None:
+    policy = re.search(
+        r"FUNCTION\s+carl_autonomy\.event_payload_key_policy\(\).*?"
+        r"AS\s+\$\$(?P<body>.*?)\$\$;",
+        ROLE_PROCEDURES_SQL,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    assert policy is not None
+
+    actual: dict[EventType, set[frozenset[str]]] = {}
+    for event_name, raw_keys in re.findall(
+        r"\('([a-z_]+)'\s*,\s*ARRAY\[(.*?)\]::text\[\]\)",
+        policy.group("body"),
+        flags=re.IGNORECASE | re.DOTALL,
+    ):
+        actual.setdefault(EventType(event_name), set()).add(
+            frozenset(re.findall(r"'([a-z_]+)'", raw_keys))
+        )
+
+    assert actual == {
+        event_type: set(key_sets) for event_type, key_sets in EVENT_PAYLOAD_KEY_SETS.items()
+    }
+
+    validator = re.search(
+        r"FUNCTION\s+carl_autonomy\.validate_and_advance_event.*?"
+        r"AS\s+\$\$(?P<body>.*?)\$\$;",
+        ROLE_PROCEDURES_SQL,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    assert validator is not None
+    assert re.search(
+        r"IF\s+NOT\s+carl_autonomy\.event_payload_keys_exact"
+        r"\(p_event_type,\s*p_payload\)\s+THEN",
+        validator.group("body"),
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+
+def test_sql_binds_experimental_publication_to_sealed_candidate_guard() -> None:
+    assert re.search(r"candidate_packet_digest\s+character\(64\)", INITIAL_SQL, flags=re.IGNORECASE)
+    assert re.search(r"candidate_commit\s+varchar\(64\)", INITIAL_SQL, flags=re.IGNORECASE)
+
+    sealed = re.search(
+        r"WHEN\s+'candidate_sealed'\s+THEN(?P<body>.*?)"
+        r"WHEN\s+'paired_evidence_recorded'",
+        ROLE_PROCEDURES_SQL,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    publication = re.search(
+        r"WHEN\s+'experimental_published'\s+THEN(?P<body>.*?)"
+        r"WHEN\s+'promotion_recorded'",
+        ROLE_PROCEDURES_SQL,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    protected = re.search(
+        r"WHEN\s+'protected_validation_recorded'\s+THEN(?P<body>.*?)"
+        r"WHEN\s+'review_packet_recorded'",
+        ROLE_PROCEDURES_SQL,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    assert sealed is not None and publication is not None and protected is not None
+    assert re.search(r"candidate_packet_digest\s*=\s*p_payload_digest", sealed.group("body"), re.I)
+    assert re.search(
+        r"candidate_commit\s*=\s*p_payload->>'candidate_commit'", sealed.group("body"), re.I
+    )
+    assert re.search(
+        r"p_payload->>'candidate_packet_digest'\s+IS\s+DISTINCT\s+FROM\s+"
+        r"guard\.candidate_packet_digest",
+        publication.group("body"),
+        re.I,
+    )
+    assert re.search(
+        r"p_payload->>'commit'\s+IS\s+DISTINCT\s+FROM\s+guard\.candidate_commit",
+        publication.group("body"),
+        re.I,
+    )
+    assert re.search(
+        r"p_payload->>'branch'\s+IS\s+DISTINCT\s+FROM\s+"
+        r"'experimental/'\s*\|\|\s*p_experiment_id",
+        publication.group("body"),
+        re.I,
+    )
+    assert re.search(
+        r"p_payload->>'candidate_tree'\s+IS\s+DISTINCT\s+FROM\s+"
+        r"guard\.experimental_tree",
+        protected.group("body"),
+        re.I,
+    )
+
+
+def test_sql_enforces_retry_first_attempt_and_monotonic_sequence() -> None:
+    assert re.search(
+        r"retry_state\s+jsonb\s+NOT\s+NULL\s+DEFAULT\s+'\{\}'::jsonb",
+        INITIAL_SQL,
+        flags=re.IGNORECASE,
+    )
+    retry = re.search(
+        r"WHEN\s+'retry_scheduled'\s+THEN(?P<body>.*?)ELSE\s+RAISE",
+        ROLE_PROCEDURES_SQL,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    assert retry is not None
+    body = retry.group("body")
+    assert re.search(r"prior_retry\s*:=\s*guard\.retry_state\s*->", body, re.I)
+    assert re.search(r"prior_retry\s+IS\s+NULL.*?attempt.*?<>\s*1", body, re.I | re.S)
+    assert re.search(
+        r"prior_retry\s+IS\s+NOT\s+NULL.*?attempt.*?<>.*?prior_retry.*?attempt.*?\+\s*1",
+        body,
+        re.I | re.S,
+    )
+    assert re.search(
+        r"changed_action.*?IS\s+NOT\s+DISTINCT\s+FROM.*?prior_retry", body, re.I | re.S
+    )
+    assert re.search(r"scheduled_at.*?IS\s+DISTINCT\s+FROM\s+p_occurred_at_text", body, re.I | re.S)
+
+
+def test_sql_rejects_duplicate_revert_and_records_terminal_identity() -> None:
+    assert re.search(
+        r"revert_recorded\s+boolean\s+NOT\s+NULL\s+DEFAULT\s+false",
+        INITIAL_SQL,
+        flags=re.IGNORECASE,
+    )
+    revert = re.search(
+        r"WHEN\s+'revert_recorded'\s+THEN(?P<body>.*?)"
+        r"WHEN\s+'lease_reconciled'",
+        ROLE_PROCEDURES_SQL,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    assert revert is not None
+    body = revert.group("body")
+    assert re.search(r"guard\.revert_recorded", body, re.I)
+    assert re.search(r"hard_failure_digest.*?guard\.soak_failure_digest", body, re.I | re.S)
+    assert re.search(r"merge_commit.*?guard\.promotion_merge_commit", body, re.I | re.S)
+    assert re.search(r"SET\s+revert_recorded\s*=\s*true", body, re.I | re.S)
+
+
+@pytest.mark.parametrize(
+    "column",
+    (
+        "candidate_commit",
+        "experimental_commit",
+        "experimental_tree",
+        "promotion_merge_commit",
+        "promotion_merge_tree",
+    ),
+)
+def test_projection_guard_git_object_columns_accept_sha1_and_sha256(column: str) -> None:
+    assert re.search(rf"{column}\s+varchar\(64\)", INITIAL_SQL, flags=re.IGNORECASE)
+    assert re.search(
+        rf"{column}\s+IS\s+NULL\s+OR\s+{column}\s+~\s+"
+        r"'\^\(\[0-9a-f\]\{40\}\|\[0-9a-f\]\{64\}\)\$'",
+        INITIAL_SQL,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
 
 
 def _command(*, revision: int = 7) -> CloudCommand:
