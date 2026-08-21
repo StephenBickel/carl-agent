@@ -142,7 +142,6 @@ class ControllerSnapshot:
     infrastructure_failure: InfrastructureFailure | None = None
     promotion_health: PromotionHealthSnapshot | None = None
     changed_paths: tuple[str, ...] = ()
-    accepted: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.autonomy, AutonomyProjection):
@@ -193,8 +192,6 @@ class ControllerSnapshot:
             not isinstance(item, str) for item in self.changed_paths
         ):
             raise PromotionContractError("invalid_changed_paths")
-        if not isinstance(self.accepted, bool):
-            raise PromotionContractError("invalid_controller_accepted")
 
 
 @dataclass(frozen=True, slots=True)
@@ -499,6 +496,9 @@ def _soak_action(
     snapshot: ControllerSnapshot,
     request: PromotionRequest,
     now: datetime,
+    *,
+    command_key: str | None,
+    command_occurred_at: str | None,
 ) -> ControllerAction:
     promotion = snapshot.autonomy.promotion
     assert promotion is not None
@@ -555,9 +555,41 @@ def _soak_action(
         >= timedelta(hours=24)
         for item in observations
     ):
+        if (
+            not isinstance(command_key, str)
+            or not command_key
+            or len(command_key.encode("utf-8")) > 128
+            or not _IDENTIFIER_RE.fullmatch(command_key)
+        ):
+            raise PromotionContractError("persisted_controller_command_required")
+        if command_occurred_at is None:
+            raise PromotionContractError("persisted_controller_command_required")
+        occurred_at = _utc("controller_command_occurred_at", command_occurred_at)
+        if occurred_at > now:
+            raise PromotionContractError("controller_command_in_future")
+        if not _accepted_evidence_is_bound(snapshot.autonomy, occurred_at):
+            raise PromotionContractError("accepted_soak_evidence_required")
+        event_payload = {
+            "from_state": "soaking",
+            "to_state": "accepted",
+        }
+        event = ExperimentEvent.create(
+            experiment_id=request.experiment_id,
+            stage_attempt_id=_attempt_id(
+                "accept",
+                {
+                    "command_key": command_key,
+                    "merge_commit": promotion.merge_commit,
+                },
+            ),
+            event_type=EventType.STATE_TRANSITIONED,
+            occurred_at=command_occurred_at,
+            payload=event_payload,
+        )
         return ControllerAction(
             "accept",
             "healthy_24_hour_soak_complete",
+            event=event,
             promotion_id=request.promotion_id,
             merge_commit=promotion.merge_commit,
         )
@@ -569,13 +601,20 @@ def _soak_action(
     )
 
 
-def next_controller_action(snapshot: ControllerSnapshot, now: datetime) -> ControllerAction:
+def next_controller_action(
+    snapshot: ControllerSnapshot,
+    now: datetime,
+    *,
+    command_key: str | None = None,
+    command_occurred_at: str | None = None,
+) -> ControllerAction:
     """Return one deterministic action while preserving every protected identity."""
     if not isinstance(snapshot, ControllerSnapshot):
         raise PromotionContractError("invalid_controller_snapshot")
     _now(now)
-    if snapshot.accepted:
-        if not _accepted_evidence_is_bound(snapshot.autonomy, now):
+    if snapshot.autonomy.accepted_at is not None:
+        accepted_at = _utc("accepted_at", snapshot.autonomy.accepted_at)
+        if accepted_at > now or not _accepted_evidence_is_bound(snapshot.autonomy, accepted_at):
             raise PromotionContractError("accepted_soak_evidence_required")
         return _idle("experiment_accepted")
     if snapshot.autonomy.revert is not None:
@@ -590,7 +629,16 @@ def next_controller_action(snapshot: ControllerSnapshot, now: datetime) -> Contr
     ):
         request, _ = _request(snapshot)
         _require_recorded_validation(snapshot, request)
-        return replace(_soak_action(snapshot, request, now), health_findings=health_findings)
+        return replace(
+            _soak_action(
+                snapshot,
+                request,
+                now,
+                command_key=command_key,
+                command_occurred_at=command_occurred_at,
+            ),
+            health_findings=health_findings,
+        )
     if snapshot.infrastructure_failure is not None:
         return _retry_action(snapshot, snapshot.infrastructure_failure, now)
     if health_report is not None:
@@ -607,5 +655,11 @@ def next_controller_action(snapshot: ControllerSnapshot, now: datetime) -> Contr
         if snapshot.autonomy.promotion is None:
             action = _promotion_action(snapshot, request, github, now)
         else:
-            action = _soak_action(snapshot, request, now)
+            action = _soak_action(
+                snapshot,
+                request,
+                now,
+                command_key=command_key,
+                command_occurred_at=command_occurred_at,
+            )
     return replace(action, health_findings=health_findings)

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import base64
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -18,6 +18,7 @@ from carl_bench.autonomy import (
     RetryRecord,
     RevertRecord,
     SoakObservation,
+    reduce_autonomy_events,
 )
 from carl_bench.autonomy_controller import (
     ControllerSnapshot,
@@ -27,7 +28,7 @@ from carl_bench.autonomy_controller import (
 )
 from carl_bench.canonical import canonical_json_bytes
 from carl_bench.capability_validation import CapabilityValidationReport
-from carl_bench.experiment import EventType, ExperimentEvent
+from carl_bench.experiment import EventType, ExperimentEvent, GraphContractError
 from carl_bench.github_promotion import (
     CheckRun,
     PromotionRequest,
@@ -335,12 +336,21 @@ def test_restart_safe_healthy_and_exact_revert_lifecycles() -> None:
         autonomy=replace(snapshot.autonomy, soak_observations=(healthy,)),
         soak_result=None,
     )
-    accepted = next_controller_action(snapshot, datetime(2026, 8, 20, 13, tzinfo=UTC))
+    accepted = next_controller_action(
+        snapshot,
+        datetime(2026, 8, 20, 13, tzinfo=UTC),
+        command_key="accept-exp-001",
+        command_occurred_at="2026-08-20T13:00:00Z",
+    )
     assert accepted.action == "accept"
     assert accepted.merge_commit == MERGE
+    assert accepted.event is not None
     assert (
         next_controller_action(
-            replace(snapshot, accepted=True),
+            replace(
+                snapshot,
+                autonomy=replace(snapshot.autonomy, accepted_at=accepted.event.occurred_at),
+            ),
             datetime(2026, 8, 20, 13, tzinfo=UTC),
         ).action
         == "idle"
@@ -838,7 +848,157 @@ def test_protected_verification_receives_exact_changed_paths() -> None:
 
 def test_accepted_marker_without_bound_24_hour_soak_evidence_is_rejected() -> None:
     with pytest.raises(PromotionContractError, match="accepted_soak_evidence_required"):
-        next_controller_action(replace(controller_snapshot(), accepted=True), NOW)
+        snapshot = controller_snapshot()
+        next_controller_action(
+            replace(
+                snapshot, autonomy=replace(snapshot.autonomy, accepted_at="2026-08-20T13:00:00Z")
+            ),
+            NOW,
+        )
+
+
+def _acceptance_ready_snapshot() -> ControllerSnapshot:
+    snapshot = controller_snapshot()
+    return replace(
+        snapshot,
+        autonomy=replace(
+            snapshot.autonomy,
+            protected_validation=ProtectedValidation(
+                candidate_commit=CANDIDATE,
+                candidate_tree=CANDIDATE_TREE,
+                receipt_digest=snapshot.promotion_request.protected_receipt_digest,
+            ),
+            promotion=PromotionRecord(
+                merge_commit=MERGE,
+                merge_tree=CANDIDATE_TREE,
+                merged_at="2026-08-19T12:00:00Z",
+            ),
+            soak_observations=(
+                SoakObservation(
+                    merge_commit=MERGE,
+                    observed_at="2026-08-20T12:00:00Z",
+                    healthy=True,
+                    evidence_digest=HEALTHY_DIGEST,
+                ),
+            ),
+        ),
+        promotion_snapshot=replace(snapshot.promotion_snapshot, production_commit=MERGE),
+    )
+
+
+def _acceptance_history(
+    snapshot: ControllerSnapshot,
+    accepted_event: ExperimentEvent,
+) -> tuple[ExperimentEvent, ...]:
+    return (
+        ExperimentEvent.create(
+            experiment_id=MANIFEST.experiment_id,
+            stage_attempt_id="publication-before-accept",
+            event_type=EventType.EXPERIMENTAL_PUBLISHED,
+            occurred_at="2026-08-19T09:00:00Z",
+            payload={
+                "branch": "experimental/exp-001",
+                "candidate_packet_digest": PACKET_DIGEST,
+                "commit": CANDIDATE,
+                "tree": CANDIDATE_TREE,
+            },
+        ),
+        ExperimentEvent.create(
+            experiment_id=MANIFEST.experiment_id,
+            stage_attempt_id="validation-before-accept",
+            event_type=EventType.PROTECTED_VALIDATION_RECORDED,
+            occurred_at="2026-08-19T10:00:00Z",
+            payload={
+                "candidate_commit": CANDIDATE,
+                "candidate_tree": CANDIDATE_TREE,
+                "receipt_digest": snapshot.promotion_request.protected_receipt_digest,
+            },
+        ),
+        ExperimentEvent.create(
+            experiment_id=MANIFEST.experiment_id,
+            stage_attempt_id="promotion-before-accept",
+            event_type=EventType.PROMOTION_RECORDED,
+            occurred_at="2026-08-19T12:00:00Z",
+            payload={"merge_commit": MERGE, "merge_tree": CANDIDATE_TREE},
+        ),
+        ExperimentEvent.create(
+            experiment_id=MANIFEST.experiment_id,
+            stage_attempt_id="soak-before-accept",
+            event_type=EventType.SOAK_OBSERVED,
+            occurred_at="2026-08-20T12:00:00Z",
+            payload={
+                "evidence_digest": HEALTHY_DIGEST,
+                "healthy": True,
+                "merge_commit": MERGE,
+                "observed_at": "2026-08-20T12:00:00Z",
+            },
+        ),
+        accepted_event,
+    )
+
+
+def test_accept_replay_reuses_persisted_command_time_and_event_identity() -> None:
+    evaluated_at = datetime(2026, 8, 20, 14, tzinfo=UTC)
+    command_occurred_at = "2026-08-20T13:00:00Z"
+    snapshot = _acceptance_ready_snapshot()
+
+    first = next_controller_action(
+        snapshot,
+        evaluated_at,
+        command_key="accept-exp-001",
+        command_occurred_at=command_occurred_at,
+    )
+    replay = next_controller_action(
+        snapshot,
+        evaluated_at + timedelta(hours=1),
+        command_key="accept-exp-001",
+        command_occurred_at=command_occurred_at,
+    )
+
+    assert first.action == "accept"
+    assert first.event is not None
+    assert first.event.event_type is EventType.STATE_TRANSITIONED
+    assert first.event.occurred_at == command_occurred_at
+    assert first.event.payload == {"from_state": "soaking", "to_state": "accepted"}
+    assert replay.event is not None
+    assert replay.event.stage_attempt_id == first.event.stage_attempt_id
+    assert replay.event.digest == first.event.digest
+    durable = reduce_autonomy_events(MANIFEST, _acceptance_history(snapshot, first.event))
+    assert durable.accepted_at == command_occurred_at
+    with pytest.raises(PromotionContractError, match="accepted_soak_evidence_required"):
+        next_controller_action(
+            snapshot,
+            evaluated_at,
+            command_key="accept-exp-001-early",
+            command_occurred_at="2026-08-20T11:59:59Z",
+        )
+
+
+def test_accept_conflicting_command_timestamp_keeps_attempt_identity_but_changes_digest() -> None:
+    evaluated_at = datetime(2026, 8, 20, 14, tzinfo=UTC)
+    snapshot = _acceptance_ready_snapshot()
+
+    first = next_controller_action(
+        snapshot,
+        evaluated_at,
+        command_key="accept-exp-001",
+        command_occurred_at="2026-08-20T13:00:00Z",
+    )
+    conflicting = next_controller_action(
+        snapshot,
+        evaluated_at,
+        command_key="accept-exp-001",
+        command_occurred_at="2026-08-20T13:01:00Z",
+    )
+
+    assert first.event is not None and conflicting.event is not None
+    assert conflicting.event.stage_attempt_id == first.event.stage_attempt_id
+    assert conflicting.event.digest != first.event.digest
+    with pytest.raises(GraphContractError, match="duplicate_stage_attempt"):
+        reduce_autonomy_events(
+            MANIFEST,
+            (*_acceptance_history(snapshot, first.event), conflicting.event),
+        )
 
 
 def test_different_eligible_report_cannot_reuse_an_exact_protected_receipt() -> None:
@@ -1065,4 +1225,9 @@ def test_future_dated_durable_soak_cannot_accept_or_replay_acceptance() -> None:
     with pytest.raises(PromotionContractError, match="soak_observation_in_future"):
         next_controller_action(snapshot, evaluated_at)
     with pytest.raises(PromotionContractError, match="accepted_soak_evidence_required"):
-        next_controller_action(replace(snapshot, accepted=True), evaluated_at)
+        next_controller_action(
+            replace(
+                snapshot, autonomy=replace(snapshot.autonomy, accepted_at="2026-08-20T09:00:00Z")
+            ),
+            evaluated_at,
+        )

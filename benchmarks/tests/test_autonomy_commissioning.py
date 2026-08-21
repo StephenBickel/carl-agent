@@ -676,7 +676,6 @@ def _controller_snapshot(
     request: PromotionRequest,
     promotion_snapshot: PromotionSnapshot,
     soak_result: SoakResult | None = None,
-    accepted: bool = False,
 ) -> ControllerSnapshot:
     return ControllerSnapshot(
         autonomy=ExperimentLedger(ledger_path).autonomy_projection(EXPERIMENT_ID),
@@ -689,7 +688,6 @@ def _controller_snapshot(
         required_checks=APPROVED_REQUIRED_CHECKS,
         soak_result=soak_result,
         changed_paths=("src/runtime/capability.txt",),
-        accepted=accepted,
     )
 
 
@@ -3363,11 +3361,25 @@ def test_component_scenarios_cannot_self_issue_commissioning_pass(
         request=request,
         promotion_snapshot=runner.snapshot(request),
     )
-    accepted = next_controller_action(accepted_snapshot, accepted_at)
+    accepted_command_occurred_at = accepted_at.isoformat().replace("+00:00", "Z")
+    accepted = next_controller_action(
+        accepted_snapshot,
+        accepted_at,
+        command_key="accept-commissioning-001",
+        command_occurred_at=accepted_command_occurred_at,
+    )
     assert accepted.action == "accept"
     assert accepted.merge_commit == merged_pr.merge_commit
+    assert accepted.event is not None
+    assert accepted.event.occurred_at == accepted_command_occurred_at
     terminal = next_controller_action(
-        replace(accepted_snapshot, accepted=True),
+        replace(
+            accepted_snapshot,
+            autonomy=replace(
+                accepted_snapshot.autonomy,
+                accepted_at=accepted_command_occurred_at,
+            ),
+        ),
         accepted_at,
     )
     assert terminal.action == "idle"
