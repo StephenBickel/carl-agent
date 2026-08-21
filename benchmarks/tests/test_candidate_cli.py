@@ -86,16 +86,12 @@ def test_publish_experimental_cli_accepts_only_a_receipt_path_not_boolean_shortc
         "exp-cli-001",
         "--repository",
         "/checkout",
-        "--remote",
-        "origin",
         "--branch",
         "experimental/exp-cli-001",
         "--candidate-packet",
         "/private/candidate.json",
         "--eligibility-receipt",
         "/private/eligibility.json",
-        "--git-executable",
-        "/usr/bin/git",
         "--stage-attempt-id",
         "publish-exp-cli-001",
         "--occurred-at",
@@ -107,9 +103,15 @@ def test_publish_experimental_cli_accepts_only_a_receipt_path_not_boolean_shortc
     parsed = cli._parser().parse_args(arguments)
 
     assert parsed.eligibility_receipt == Path("/private/eligibility.json")
-    for shortcut in ("--locally-eligible", "--security-passed", "--capability-report"):
+    for shortcut in (
+        "--locally-eligible",
+        "--security-passed",
+        "--capability-report",
+        "--git-executable",
+        "--remote",
+    ):
         with pytest.raises(SystemExit):
-            cli._parser().parse_args([*arguments, shortcut])
+            cli._parser().parse_args([*arguments, shortcut, "caller-controlled"])
 
 
 def test_candidate_cli_runs_prepare_seal_evidence_review_and_draft_without_claiming_holdout(

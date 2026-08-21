@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
+import os
 import re
+import stat
 import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass, replace
@@ -27,9 +30,9 @@ from carl_bench.capability_validation import (
 )
 
 _OBJECT_ID_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
-_REMOTE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 _KEY_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _SIGNATURE_DOMAIN = "carl.experimental-publication-eligibility.v1"
+_PROTECTED_GIT_EXECUTABLE = Path("/usr/bin/git")
 
 PublicationOutcome = Literal[
     "push_branch",
@@ -412,15 +415,140 @@ def _eligible_for_request(
     )
 
 
-def candidate_tree(repository: Path, candidate_commit: str, git_executable: Path) -> str:
+class _ProtectedGitTransport:
+    """Fixed, identity-pinned Git transport with a caller-independent environment."""
+
+    __slots__ = ("_digest", "_identity")
+
+    def __init__(self) -> None:
+        identity, digest = self._read_identity()
+        object.__setattr__(self, "_identity", identity)
+        object.__setattr__(self, "_digest", digest)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise AttributeError("protected Git transport is immutable")
+
+    @staticmethod
+    def _read_identity() -> tuple[tuple[int, int, int, int, int], bytes]:
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(_PROTECTED_GIT_EXECUTABLE, flags)
+        except OSError as error:
+            raise ExperimentalPublicationError("experimental_git_unavailable") from error
+        try:
+            metadata = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != 0
+                or stat.S_IMODE(metadata.st_mode) & 0o022
+            ):
+                raise ExperimentalPublicationError("experimental_git_identity_invalid")
+            digest = hashlib.sha256()
+            while chunk := os.read(descriptor, 1024 * 1024):
+                digest.update(chunk)
+            identity = (
+                metadata.st_dev,
+                metadata.st_ino,
+                metadata.st_size,
+                metadata.st_mtime_ns,
+                metadata.st_uid,
+            )
+            return identity, digest.digest()
+        finally:
+            os.close(descriptor)
+
+    def _command(self, *args: str) -> str:
+        identity, digest = self._read_identity()
+        if identity != self._identity or digest != self._digest:
+            raise ExperimentalPublicationError("experimental_git_identity_changed")
+        environment = {
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_TERMINAL_PROMPT": "0",
+            "HOME": "/var/empty",
+            "LANG": "C",
+            "LC_ALL": "C",
+            "PATH": "/usr/bin:/bin",
+        }
+        try:
+            result = subprocess.run(
+                (os.fspath(_PROTECTED_GIT_EXECUTABLE), *args),
+                check=False,
+                capture_output=True,
+                env=environment,
+                text=True,
+                timeout=30,
+            )
+        except (OSError, subprocess.SubprocessError) as error:
+            raise ExperimentalPublicationError("experimental_git_unavailable") from error
+        if result.returncode != 0:
+            raise ExperimentalPublicationError("experimental_git_failed")
+        return result.stdout.strip()
+
+    def local(self, repository: Path, *args: str) -> str:
+        return self._command("-C", os.fspath(repository), *args)
+
+    def network(self, repository: Path, operation: str, remote_url: str, *args: str) -> str:
+        if operation not in {"fetch", "ls-remote", "push"}:
+            raise ExperimentalPublicationError("experimental_git_operation_invalid")
+        # The exact URL is repeated as a same-to-same longest-prefix rewrite. This prevents a
+        # repository-local url.*.insteadOf rule from replacing the signed destination.
+        protected_config = (
+            "-c",
+            "credential.helper=",
+            "-c",
+            "core.askPass=",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "http.proxy=",
+            "-c",
+            f"http.{remote_url}.proxy=",
+            "-c",
+            "http.curloptResolve=",
+            "-c",
+            f"http.{remote_url}.curloptResolve=",
+            "-c",
+            "http.followRedirects=initial",
+            "-c",
+            f"http.{remote_url}.followRedirects=initial",
+            "-c",
+            "http.sslVerify=true",
+            "-c",
+            f"http.{remote_url}.sslVerify=true",
+            "-c",
+            f"url.{remote_url}.insteadOf={remote_url}",
+        )
+        if operation == "ls-remote":
+            return self._command(
+                *protected_config,
+                "-C",
+                os.fspath(repository),
+                operation,
+                "--refs",
+                remote_url,
+                *args,
+            )
+        if len(args) != 2:
+            raise ExperimentalPublicationError("experimental_git_operation_invalid")
+        return self._command(
+            *protected_config,
+            "-C",
+            os.fspath(repository),
+            operation,
+            args[0],
+            remote_url,
+            args[1],
+        )
+
+
+def _protected_git_transport() -> _ProtectedGitTransport:
+    return _ProtectedGitTransport()
+
+
+def candidate_tree(repository: Path, candidate_commit: str) -> str:
     """Resolve the tree object for the exact candidate commit with an argument vector."""
-    tree = _git(
-        git_executable,
-        "-C",
-        str(repository),
-        "rev-parse",
-        f"{candidate_commit}^{{tree}}",
-    )
+    tree = _protected_git_transport().local(repository, "rev-parse", f"{candidate_commit}^{{tree}}")
     if not _OBJECT_ID_RE.fullmatch(tree):
         raise ExperimentalPublicationError("experimental_candidate_tree_invalid")
     return tree
@@ -432,14 +560,11 @@ def publish_experimental_branch(
     verifier: ExperimentalEligibilityVerifier,
     eligibility: SignedExperimentalPublicationEligibility,
     repository: Path,
-    remote: str,
-    git_executable: Path,
 ) -> ExperimentalPublicationDecision:
     """Push one exact non-force ref, refetch it, and confirm the resulting object identity."""
-    if not isinstance(remote, str) or not _REMOTE_RE.fullmatch(remote):
-        raise ExperimentalPublicationError("experimental_remote_invalid")
+    transport = _protected_git_transport()
     ref = _ref(request.experiment_id, request.branch)
-    snapshot = _remote_snapshot(git_executable, repository, remote, ref)
+    snapshot = _remote_snapshot(transport, repository, request.remote_url, ref)
     decision = reconcile_experimental_publication(
         request,
         snapshot,
@@ -449,36 +574,34 @@ def publish_experimental_branch(
     if decision.outcome != "push_branch":
         return decision
     assert decision.candidate_commit is not None
-    _git(
-        git_executable,
-        "-C",
-        str(repository),
+    transport.network(
+        repository,
         "push",
+        request.remote_url,
         f"--force-with-lease={decision.ref}:",
-        remote,
         f"{decision.candidate_commit}:{decision.ref}",
     )
-    tracking_ref = f"refs/remotes/{remote}/{request.branch}"
-    _git(
-        git_executable,
-        "-C",
-        str(repository),
+    tracking_ref = f"refs/carl/experimental-verification/{request.experiment_id}"
+    transport.network(
+        repository,
         "fetch",
+        request.remote_url,
         "--no-tags",
-        remote,
         f"{decision.ref}:{tracking_ref}",
     )
-    fetched = _git(git_executable, "-C", str(repository), "rev-parse", tracking_ref)
+    fetched = transport.local(repository, "rev-parse", tracking_ref)
     if fetched != decision.candidate_commit:
         raise ExperimentalPublicationError("experimental_remote_verification_failed")
-    verified = _remote_snapshot(git_executable, repository, remote, decision.ref)
+    verified = _remote_snapshot(transport, repository, request.remote_url, decision.ref)
     if verified != decision.candidate_commit:
         raise ExperimentalPublicationError("experimental_remote_verification_failed")
     return replace(decision, outcome="record_existing_exact_branch")
 
 
-def _remote_snapshot(git_executable: Path, repository: Path, remote: str, ref: str) -> str | None:
-    result = _git(git_executable, "-C", str(repository), "ls-remote", "--refs", remote, ref)
+def _remote_snapshot(
+    transport: _ProtectedGitTransport, repository: Path, remote_url: str, ref: str
+) -> str | None:
+    result = transport.network(repository, "ls-remote", remote_url, ref)
     if not result:
         return None
     lines = result.splitlines()
@@ -488,19 +611,3 @@ def _remote_snapshot(git_executable: Path, repository: Path, remote: str, ref: s
     if len(fields) != 2 or fields[1] != ref or not _OBJECT_ID_RE.fullmatch(fields[0]):
         raise ExperimentalPublicationError("experimental_remote_snapshot_invalid")
     return fields[0]
-
-
-def _git(git_executable: Path, *args: str) -> str:
-    try:
-        result = subprocess.run(
-            (str(git_executable), *args),
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-    except (OSError, subprocess.SubprocessError) as error:
-        raise ExperimentalPublicationError("experimental_git_unavailable") from error
-    if result.returncode != 0:
-        raise ExperimentalPublicationError("experimental_git_failed")
-    return result.stdout.strip()

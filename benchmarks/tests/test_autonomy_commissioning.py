@@ -24,6 +24,7 @@ from test_experimental_publication import (
 )
 from test_experimental_publication import _verifier as experimental_eligibility_verifier
 
+import carl_bench.experimental_publication as experimental_publication
 from carl_bench.artifacts import ArtifactRef, PrivateArtifactStore
 from carl_bench.autonomy import (
     AutonomyProjection,
@@ -3115,6 +3116,7 @@ def test_changed_main_receipt_replay_and_exact_revert_are_durable_real_effects(
 def test_component_scenarios_cannot_self_issue_commissioning_pass(
     tmp_path: Path,
     disposable_git: DisposableGitFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     automation_data_root = tmp_path / "owner-private-automation-data"
     commissioning_store = CommissioningArtifactStore(
@@ -3201,7 +3203,19 @@ def test_component_scenarios_cannot_self_issue_commissioning_pass(
         expires_at="2026-08-19T13:00:00Z",
     )
     publication_verifier = experimental_eligibility_verifier(NOW)
-    git_executable = Path(shutil.which("git") or "/missing-git")
+
+    class CommissioningTransport:
+        def local(self, repository: Path, *args: str) -> str:
+            return _git(repository, *args)
+
+        def network(self, repository: Path, operation: str, remote_url: str, *args: str) -> str:
+            assert remote_url == "https://github.com/StephenBickel/carl-agent.git"
+            if operation == "ls-remote":
+                return _git(repository, operation, "--refs", disposable_git.origin, *args)
+            return _git(repository, operation, args[0], disposable_git.origin, args[1])
+
+    transport = CommissioningTransport()
+    monkeypatch.setattr(experimental_publication, "_protected_git_transport", lambda: transport)
 
     # The branch effect succeeds and the controller is killed before its ledger receipt.
     first_publication = publish_experimental_branch(
@@ -3209,8 +3223,6 @@ def test_component_scenarios_cannot_self_issue_commissioning_pass(
         verifier=publication_verifier,
         eligibility=publication_eligibility,
         repository=disposable_git.builder,
-        remote="origin",
-        git_executable=git_executable,
     )
     assert first_publication.outcome == "record_existing_exact_branch"
     assert (
@@ -3224,8 +3236,6 @@ def test_component_scenarios_cannot_self_issue_commissioning_pass(
         verifier=publication_verifier,
         eligibility=publication_eligibility,
         repository=disposable_git.builder,
-        remote="origin",
-        git_executable=git_executable,
     )
     assert recovered_publication == first_publication
     assert _append_publication(ledger_path, packet, disposable_git.valid_tree) is True

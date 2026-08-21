@@ -271,11 +271,9 @@ def _parser() -> argparse.ArgumentParser:
     publish.add_argument("--ledger", required=True, type=Path)
     publish.add_argument("--experiment-id", required=True)
     publish.add_argument("--repository", required=True, type=Path)
-    publish.add_argument("--remote", required=True)
     publish.add_argument("--branch", required=True)
     publish.add_argument("--candidate-packet", required=True, type=Path)
     publish.add_argument("--eligibility-receipt", required=True, type=Path)
-    publish.add_argument("--git-executable", required=True, type=Path)
     publish.add_argument("--stage-attempt-id", required=True)
     publish.add_argument("--occurred-at", required=True)
     publish.add_argument("--public-result", required=True, type=Path)
@@ -567,38 +565,6 @@ def _experimental_eligibility_policy() -> ExperimentalPublicationPolicy:
 
 def _experimental_eligibility_verifier() -> ExperimentalEligibilityVerifier:
     return ExperimentalEligibilityVerifier(policy=_experimental_eligibility_policy())
-
-
-def _experimental_remote_destination(
-    repository: Path,
-    remote: str,
-    git_executable: Path,
-) -> str:
-    if not isinstance(remote, str) or not remote:
-        raise ValueError("experimental publication remote alias is invalid")
-    try:
-        result = subprocess.run(
-            (
-                os.fspath(git_executable),
-                "-C",
-                os.fspath(repository),
-                "remote",
-                "get-url",
-                "--push",
-                "--all",
-                remote,
-            ),
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-    except (OSError, subprocess.SubprocessError) as error:
-        raise ValueError("experimental publication remote destination is unavailable") from error
-    lines = result.stdout.splitlines()
-    if result.returncode != 0 or len(lines) != 1:
-        raise ValueError("experimental publication remote destination is unavailable")
-    return lines[0]
 
 
 def _private_ledger(path: Path) -> ExperimentLedger:
@@ -1011,31 +977,21 @@ def _candidate_command(args: argparse.Namespace) -> int:
         )
         verifier = _experimental_eligibility_verifier()
         repository = _anchored(args.repository)
-        git_executable = _anchored(args.git_executable)
-        actual_remote_url = _experimental_remote_destination(
-            repository,
-            args.remote,
-            git_executable,
-        )
-        if actual_remote_url != verifier.remote_url:
-            raise ValueError("experimental publication remote destination mismatch")
         request = ExperimentalPublicationRequest(
             experiment_id=args.experiment_id,
             branch=args.branch,
             candidate_packet=packet,
-            candidate_tree=candidate_tree(repository, packet.candidate_commit, git_executable),
+            candidate_tree=candidate_tree(repository, packet.candidate_commit),
             request_id=args.stage_attempt_id,
             requested_at=args.occurred_at,
             repository_id=verifier.repository_id,
-            remote_url=actual_remote_url,
+            remote_url=verifier.remote_url,
         )
         decision = publish_experimental_branch(
             request,
             verifier=verifier,
             eligibility=eligibility,
             repository=repository,
-            remote=args.remote,
-            git_executable=git_executable,
         )
         if decision.outcome.startswith("blocked_"):
             raise ValueError("experimental publication is not eligible")

@@ -16,6 +16,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from test_candidate_git import _repository
 from test_experiment import manifest, sealed_candidate
 
+import carl_bench.experimental_publication as experimental_publication
 from carl_bench import cli
 from carl_bench.canonical import canonical_json_bytes
 from carl_bench.capability_validation import (
@@ -49,6 +50,36 @@ ELIGIBILITY_PUBLIC_KEY = ELIGIBILITY_PRIVATE_KEY.public_key().public_bytes(
 )
 REPOSITORY_ID = "StephenBickel/carl-agent"
 CANONICAL_REMOTE_URL = "https://github.com/StephenBickel/carl-agent.git"
+
+
+class _RecordingGitTransport:
+    def __init__(self, actual_remote: Path) -> None:
+        self.actual_remote = actual_remote
+        self.network_commands: list[tuple[str, str, tuple[str, ...]]] = []
+
+    def local(self, repository: Path, *args: str) -> str:
+        return subprocess.run(
+            ("/usr/bin/git", "-C", os.fspath(repository), *args),
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+    def network(self, repository: Path, operation: str, remote_url: str, *args: str) -> str:
+        self.network_commands.append((operation, remote_url, args))
+        if operation == "ls-remote":
+            command = (operation, "--refs", os.fspath(self.actual_remote), *args)
+        else:
+            command = (operation, args[0], os.fspath(self.actual_remote), args[1])
+        result = subprocess.run(
+            ("/usr/bin/git", "-C", os.fspath(repository), *command),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            raise ExperimentalPublicationError("experimental_git_failed")
+        return result.stdout.strip()
 
 
 def _policy() -> ExperimentalPublicationPolicy:
@@ -737,23 +768,8 @@ def test_publish_cli_records_one_immutable_branch_without_protected_validation(
     )
     monkeypatch.setenv("CARL_EXPERIMENTAL_ELIGIBILITY_KEY_ID", "attacker-selected-key")
     monkeypatch.setattr(cli, "_experimental_eligibility_policy", _policy)
-    git_log = private / "git-log.jsonl"
-    fake_git = private / "fake-git.py"
-    fake_git.write_text(
-        "#!/usr/bin/env python3\n"
-        "import json, os, subprocess, sys\n"
-        "with open(os.environ['CARL_TEST_GIT_LOG'], 'a', encoding='utf-8') as handle:\n"
-        "    handle.write(json.dumps(sys.argv[1:]) + '\\n')\n"
-        "if 'remote' in sys.argv[1:] and 'get-url' in sys.argv[1:]:\n"
-        "    if sys.argv[-1] != 'origin':\n"
-        "        raise SystemExit(2)\n"
-        "    print(os.environ['CARL_TEST_EXPECTED_REMOTE_URL'])\n"
-        "    raise SystemExit(0)\n"
-        "result = subprocess.run([os.environ['CARL_TEST_REAL_GIT'], *sys.argv[1:]])\n"
-        "raise SystemExit(result.returncode)\n",
-        encoding="utf-8",
-    )
-    fake_git.chmod(0o700)
+    transport = _RecordingGitTransport(origin)
+    monkeypatch.setattr(experimental_publication, "_protected_git_transport", lambda: transport)
     result = tmp_path / "publication.json"
     command = [
         "candidate",
@@ -764,16 +780,12 @@ def test_publish_cli_records_one_immutable_branch_without_protected_validation(
         selected.experiment_id,
         "--repository",
         os.fspath(repository),
-        "--remote",
-        "origin",
         "--branch",
         f"experimental/{selected.experiment_id}",
         "--candidate-packet",
         os.fspath(packet_path),
         "--eligibility-receipt",
         os.fspath(eligibility_path),
-        "--git-executable",
-        os.fspath(fake_git),
         "--stage-attempt-id",
         "publish-experimental-001",
         "--occurred-at",
@@ -781,9 +793,6 @@ def test_publish_cli_records_one_immutable_branch_without_protected_validation(
         "--public-result",
         os.fspath(result),
     ]
-    monkeypatch.setenv("CARL_TEST_GIT_LOG", os.fspath(git_log))
-    monkeypatch.setenv("CARL_TEST_REAL_GIT", "/usr/bin/git")
-    monkeypatch.setenv("CARL_TEST_EXPECTED_REMOTE_URL", CANONICAL_REMOTE_URL)
     assert cli.main(command) == 0
 
     remote_experimental = subprocess.run(
@@ -800,25 +809,20 @@ def test_publish_cli_records_one_immutable_branch_without_protected_validation(
         capture_output=True,
         text=True,
     ).stdout.split()[0]
-    commands = [json.loads(line) for line in git_log.read_text(encoding="utf-8").splitlines()]
-
     assert remote_experimental == candidate_commit
     assert remote_main == parent
     assert json.loads(result.read_text(encoding="utf-8"))["tree"] == candidate_tree
-    assert any(
-        command[-4:]
-        == [
-            "push",
-            f"--force-with-lease=refs/heads/experimental/{selected.experiment_id}:",
-            "origin",
-            f"{candidate_commit}:refs/heads/experimental/{selected.experiment_id}",
-        ]
-        for command in commands
-    )
-    assert all("--force" not in command for command in commands)
-    assert all("main" not in command for command in commands)
-    assert any(
-        command[-5:] == ["remote", "get-url", "--push", "--all", "origin"] for command in commands
+    assert [item[0] for item in transport.network_commands] == [
+        "ls-remote",
+        "push",
+        "fetch",
+        "ls-remote",
+    ]
+    assert all(item[1] == CANONICAL_REMOTE_URL for item in transport.network_commands)
+    assert all("origin" not in item[2] for item in transport.network_commands)
+    assert transport.network_commands[1][2] == (
+        f"--force-with-lease=refs/heads/experimental/{selected.experiment_id}:",
+        f"{candidate_commit}:refs/heads/experimental/{selected.experiment_id}",
     )
     assert (
         ExperimentLedger(ledger_path)
@@ -837,10 +841,6 @@ def test_publish_cli_records_one_immutable_branch_without_protected_validation(
     forged_command = list(command)
     forged_command[forged_command.index("--eligibility-receipt") + 1] = os.fspath(forged_path)
     assert cli.main(forged_command) == 2
-
-    alias_command = list(command)
-    alias_command[alias_command.index("--remote") + 1] = "attacker-origin"
-    assert cli.main(alias_command) == 2
 
     canonical = eligibility_path.read_text(encoding="utf-8")
     trust_override = signed_eligibility.to_canonical_dict()
@@ -862,7 +862,7 @@ def test_publish_cli_records_one_immutable_branch_without_protected_validation(
         assert cli.main(invalid_command) == 2
 
 
-def test_remote_destination_rejects_multiple_push_urls(tmp_path: Path) -> None:
+def test_local_remote_aliases_cannot_select_the_publication_destination(tmp_path: Path) -> None:
     repository, _, _ = _repository(tmp_path)
     subprocess.run(
         ("git", "remote", "set-url", "--add", "--push", "origin", CANONICAL_REMOTE_URL),
@@ -883,8 +883,115 @@ def test_remote_destination_rejects_multiple_push_urls(tmp_path: Path) -> None:
         check=True,
     )
 
-    with pytest.raises(ValueError, match="remote destination is unavailable"):
-        cli._experimental_remote_destination(repository, "origin", Path("/usr/bin/git"))
+    parser = cli._parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            [
+                "candidate",
+                "publish-experimental",
+                "--remote",
+                "origin",
+            ]
+        )
+
+
+def test_protected_transport_pins_binary_sanitizes_environment_and_passes_exact_url(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GIT_EXEC_PATH", os.fspath(tmp_path / "caller-helpers"))
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("HTTPS_PROXY", "http://attacker.invalid:8080")
+    invocations: list[tuple[tuple[str, ...], dict[str, str]]] = []
+
+    class Result:
+        returncode = 0
+        stdout = ""
+
+    def record(command: tuple[str, ...], **kwargs: object) -> Result:
+        invocations.append((command, kwargs["env"]))  # type: ignore[arg-type]
+        return Result()
+
+    transport = experimental_publication._ProtectedGitTransport()
+    monkeypatch.setattr(experimental_publication.subprocess, "run", record)
+    repository = tmp_path / "repository"
+    transport.network(repository, "ls-remote", CANONICAL_REMOTE_URL, "refs/heads/test")
+    transport.network(
+        repository,
+        "push",
+        CANONICAL_REMOTE_URL,
+        "--force-with-lease=refs/heads/test:",
+        "a" * 40 + ":refs/heads/test",
+    )
+    transport.network(
+        repository,
+        "fetch",
+        CANONICAL_REMOTE_URL,
+        "--no-tags",
+        "refs/heads/test:refs/carl/test",
+    )
+
+    assert len(invocations) == 3
+    for command, environment in invocations:
+        assert command[0] == "/usr/bin/git"
+        assert command.count(CANONICAL_REMOTE_URL) == 1
+        assert "origin" not in command
+        assert "core.hooksPath=/dev/null" in command
+        assert f"url.{CANONICAL_REMOTE_URL}.insteadOf={CANONICAL_REMOTE_URL}" in command
+        assert f"http.{CANONICAL_REMOTE_URL}.proxy=" in command
+        assert f"http.{CANONICAL_REMOTE_URL}.curloptResolve=" in command
+        assert f"http.{CANONICAL_REMOTE_URL}.sslVerify=true" in command
+        assert environment == {
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_TERMINAL_PROMPT": "0",
+            "HOME": "/var/empty",
+            "LANG": "C",
+            "LC_ALL": "C",
+            "PATH": "/usr/bin:/bin",
+        }
+    assert invocations[1][0][-3:] == (
+        "--force-with-lease=refs/heads/test:",
+        CANONICAL_REMOTE_URL,
+        "a" * 40 + ":refs/heads/test",
+    )
+    assert invocations[2][0][-3:] == (
+        "--no-tags",
+        CANONICAL_REMOTE_URL,
+        "refs/heads/test:refs/carl/test",
+    )
+
+
+def test_protected_transport_rejects_symlinked_or_unowned_binary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    symlink = tmp_path / "git"
+    symlink.symlink_to("/usr/bin/git")
+    monkeypatch.setattr(experimental_publication, "_PROTECTED_GIT_EXECUTABLE", symlink)
+    with pytest.raises(ExperimentalPublicationError, match="experimental_git_unavailable"):
+        experimental_publication._ProtectedGitTransport()
+
+    executable = tmp_path / "caller-git"
+    executable.write_bytes(b"#!/bin/sh\nexit 0\n")
+    executable.chmod(0o755)
+    monkeypatch.setattr(experimental_publication, "_PROTECTED_GIT_EXECUTABLE", executable)
+    with pytest.raises(ExperimentalPublicationError, match="experimental_git_identity_invalid"):
+        experimental_publication._ProtectedGitTransport()
+
+
+def test_protected_transport_rechecks_pinned_binary_identity_before_every_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(experimental_publication, "_PROTECTED_GIT_EXECUTABLE", Path("/usr/bin/git"))
+    transport = experimental_publication._ProtectedGitTransport()
+    identity = object.__getattribute__(transport, "_identity")
+    monkeypatch.setattr(
+        experimental_publication._ProtectedGitTransport,
+        "_read_identity",
+        staticmethod(lambda: (identity, b"changed-binary-digest")),
+    )
+
+    with pytest.raises(ExperimentalPublicationError, match="experimental_git_identity_changed"):
+        transport.local(tmp_path, "status")
 
 
 def test_create_only_push_never_fast_forwards_a_ref_created_after_the_snapshot(
@@ -931,27 +1038,20 @@ def test_create_only_push_never_fast_forwards_a_ref_created_after_the_snapshot(
     eligibility = _signed_eligibility(request)
     ref = f"refs/heads/experimental/{selected.experiment_id}"
     marker = tmp_path / "racer-ran"
-    fake_git = tmp_path / "racing-git.py"
-    fake_git.write_text(
-        "#!/usr/bin/env python3\n"
-        "import os, subprocess, sys\n"
-        "if 'push' in sys.argv[1:] and not os.path.exists(os.environ['CARL_RACE_MARKER']):\n"
-        "    open(os.environ['CARL_RACE_MARKER'], 'x').close()\n"
-        "    subprocess.run([\n"
-        "        os.environ['CARL_TEST_REAL_GIT'], '-C', os.environ['CARL_RACE_REPOSITORY'],\n"
-        "        'push', 'origin',\n"
-        "        os.environ['CARL_RACE_COMMIT'] + ':' + os.environ['CARL_RACE_REF'],\n"
-        "    ], check=True)\n"
-        "result = subprocess.run([os.environ['CARL_TEST_REAL_GIT'], *sys.argv[1:]])\n"
-        "raise SystemExit(result.returncode)\n",
-        encoding="utf-8",
-    )
-    fake_git.chmod(0o700)
-    monkeypatch.setenv("CARL_TEST_REAL_GIT", "/usr/bin/git")
-    monkeypatch.setenv("CARL_RACE_MARKER", os.fspath(marker))
-    monkeypatch.setenv("CARL_RACE_REPOSITORY", os.fspath(repository))
-    monkeypatch.setenv("CARL_RACE_COMMIT", parent)
-    monkeypatch.setenv("CARL_RACE_REF", ref)
+    transport = _RecordingGitTransport(origin)
+    original_network = transport.network
+
+    def racing_network(repository_path: Path, operation: str, remote_url: str, *args: str) -> str:
+        if operation == "push" and not marker.exists():
+            marker.touch(exist_ok=False)
+            subprocess.run(
+                ("/usr/bin/git", "-C", os.fspath(repository), "push", "origin", f"{parent}:{ref}"),
+                check=True,
+            )
+        return original_network(repository_path, operation, remote_url, *args)
+
+    transport.network = racing_network  # type: ignore[method-assign]
+    monkeypatch.setattr(experimental_publication, "_protected_git_transport", lambda: transport)
 
     with pytest.raises(ExperimentalPublicationError, match="experimental_git_failed"):
         publish_experimental_branch(
@@ -959,8 +1059,6 @@ def test_create_only_push_never_fast_forwards_a_ref_created_after_the_snapshot(
             verifier=_verifier(),
             eligibility=eligibility,
             repository=repository,
-            remote="origin",
-            git_executable=fake_git,
         )
 
     remote_commit = subprocess.run(
