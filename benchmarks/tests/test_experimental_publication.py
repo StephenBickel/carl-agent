@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import base64
+import copy
 import json
 import os
+import pickle
 import subprocess
 from dataclasses import replace
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from test_candidate_git import _repository
 from test_experiment import manifest, sealed_candidate
 
@@ -20,8 +26,11 @@ from carl_bench.capability_validation import (
     experimental_publication_request_digest,
 )
 from carl_bench.experimental_publication import (
+    ExperimentalEligibilityTrustedKey,
+    ExperimentalEligibilityVerifier,
     ExperimentalPublicationError,
     ExperimentalPublicationRequest,
+    SignedExperimentalPublicationEligibility,
     publish_experimental_branch,
     reconcile_experimental_publication,
 )
@@ -30,6 +39,59 @@ from carl_bench.promotion import PromotionContractError, SignedProtectedValidati
 
 REQUESTED_AT = "2026-08-10T12:02:00Z"
 EXPIRES_AT = "2026-08-10T13:02:00Z"
+ELIGIBILITY_KEY_ID = "experimental-eligibility-v1"
+ELIGIBILITY_ISSUER = "protected-experimental-validator"
+ELIGIBILITY_PRIVATE_KEY = Ed25519PrivateKey.generate()
+ELIGIBILITY_PUBLIC_KEY = ELIGIBILITY_PRIVATE_KEY.public_key().public_bytes(
+    serialization.Encoding.PEM,
+    serialization.PublicFormat.SubjectPublicKeyInfo,
+)
+
+
+def test_experimental_eligibility_verifier_is_immutable_and_production_distinct() -> None:
+    verifier = ExperimentalEligibilityVerifier(
+        trusted_key=ExperimentalEligibilityTrustedKey(
+            key_id=ELIGIBILITY_KEY_ID,
+            public_key_pem=ELIGIBILITY_PUBLIC_KEY,
+        ),
+        clock=lambda: datetime(2026, 8, 10, 12, 2, tzinfo=UTC),
+    )
+
+    for operation in (
+        lambda: setattr(verifier, "_clock", lambda: datetime.now(UTC)),
+        lambda: copy.copy(verifier),
+        lambda: copy.deepcopy(verifier),
+        lambda: pickle.dumps(verifier),
+    ):
+        with pytest.raises((AttributeError, TypeError)):
+            operation()
+    with pytest.raises(TypeError, match="cannot be subclassed"):
+
+        class BypassVerifier(ExperimentalEligibilityVerifier):
+            def require(self, envelope: object, request: object) -> None:
+                return None
+
+    with pytest.raises(TypeError, match="cannot be subclassed"):
+
+        class BypassTrustedKey(ExperimentalEligibilityTrustedKey):
+            pass
+
+    with pytest.raises(TypeError, match="cannot be subclassed"):
+
+        class BypassEnvelope(SignedExperimentalPublicationEligibility):
+            pass
+
+    with pytest.raises(TypeError, match="cannot be subclassed"):
+
+        class BypassReceipt(ExperimentalPublicationEligibility):
+            pass
+
+    with pytest.raises(PromotionContractError, match="invalid_protected_receipt"):
+        SignedProtectedValidation(
+            receipt=_signed_eligibility(_request()),  # type: ignore[arg-type]
+            key_id="production-key",
+            signature_base64=base64.b64encode(b"0" * 64).decode("ascii"),
+        )
 
 
 def _eligibility(
@@ -40,11 +102,16 @@ def _eligibility(
     values: dict[str, object] = {
         "schema_version": 1,
         "receipt_type": "experimental_publication_eligibility",
+        "receipt_id": f"eligibility-{request.request_id}",
+        "issuer": ELIGIBILITY_ISSUER,
+        "key_id": ELIGIBILITY_KEY_ID,
         "request_id": request.request_id,
         "requested_at": request.requested_at,
         "request_digest": "",
+        "effect_digest": "",
         "experiment_id": request.experiment_id,
         "branch": request.branch,
+        "ref": f"refs/heads/{request.branch}",
         "candidate_packet_digest": packet.digest,
         "candidate_commit": packet.candidate_commit,
         "candidate_tree": request.candidate_tree,
@@ -100,6 +167,8 @@ def _eligibility(
         "expires_at": EXPIRES_AT,
     }
     values.update(changes)
+    if "ref" not in changes:
+        values["ref"] = f"refs/heads/{values['branch']}"
     values["request_digest"] = experimental_publication_request_digest(
         request_id=values["request_id"],
         requested_at=values["requested_at"],
@@ -109,6 +178,7 @@ def _eligibility(
         candidate_commit=values["candidate_commit"],
         candidate_tree=values["candidate_tree"],
     )
+    values["effect_digest"] = values["request_digest"]
     values["evidence_digest"] = experimental_evidence_digest(
         required_checks=values["required_checks"],
         builder_id=values["builder_id"],
@@ -117,6 +187,40 @@ def _eligibility(
         local_gates=values["local_gates"],
     )
     return ExperimentalPublicationEligibility(**values)  # type: ignore[arg-type]
+
+
+def _signed_eligibility(
+    request: ExperimentalPublicationRequest,
+    *,
+    private_key: Ed25519PrivateKey = ELIGIBILITY_PRIVATE_KEY,
+    **changes: object,
+) -> SignedExperimentalPublicationEligibility:
+    receipt = _eligibility(request, **changes)
+    unsigned = SignedExperimentalPublicationEligibility(
+        receipt=receipt,
+        signature_base64=base64.b64encode(b"0" * 64).decode("ascii"),
+    )
+    return replace(
+        unsigned,
+        signature_base64=base64.b64encode(private_key.sign(unsigned.signing_payload())).decode(
+            "ascii"
+        ),
+    )
+
+
+def _verifier(
+    now: datetime = datetime(2026, 8, 10, 12, 2, tzinfo=UTC),
+    *,
+    clock: object | None = None,
+) -> ExperimentalEligibilityVerifier:
+    selected_clock = clock if clock is not None else (lambda: now)
+    return ExperimentalEligibilityVerifier(
+        trusted_key=ExperimentalEligibilityTrustedKey(
+            key_id=ELIGIBILITY_KEY_ID,
+            public_key_pem=ELIGIBILITY_PUBLIC_KEY,
+        ),
+        clock=selected_clock,  # type: ignore[arg-type]
+    )
 
 
 def _request(
@@ -141,15 +245,29 @@ def _request(
         candidate_tree=candidate_tree,
         request_id=request_id,
         requested_at=requested_at,
-        eligibility=None,
     )
-    return replace(request, eligibility=_eligibility(request))
+    return request
+
+
+def _reconcile(
+    request: ExperimentalPublicationRequest,
+    remote_snapshot: str | None,
+    *,
+    eligibility: SignedExperimentalPublicationEligibility | None = None,
+    verifier: ExperimentalEligibilityVerifier | None = None,
+):
+    return reconcile_experimental_publication(
+        request,
+        remote_snapshot,
+        verifier=verifier or _verifier(),
+        eligibility=eligibility or _signed_eligibility(request),
+    )
 
 
 def test_reconciliation_pushes_only_the_exact_experimental_ref() -> None:
     request = _request()
 
-    decision = reconcile_experimental_publication(request, remote_snapshot=None)
+    decision = _reconcile(request, remote_snapshot=None)
 
     assert decision.outcome == "push_branch"
     assert decision.ref == "refs/heads/experimental/exp-publication-001"
@@ -161,13 +279,13 @@ def test_reconciliation_pushes_only_the_exact_experimental_ref() -> None:
 def test_reconciliation_records_an_existing_exact_experimental_branch() -> None:
     request = _request()
 
-    decision = reconcile_experimental_publication(request, remote_snapshot="a" * 40)
+    decision = _reconcile(request, remote_snapshot="a" * 40)
 
     assert decision.outcome == "record_existing_exact_branch"
 
 
 def test_reconciliation_blocks_an_existing_branch_with_a_different_commit() -> None:
-    decision = reconcile_experimental_publication(_request(), remote_snapshot="c" * 40)
+    decision = _reconcile(_request(), remote_snapshot="c" * 40)
 
     assert decision.outcome == "blocked_branch_identity_mismatch"
 
@@ -176,23 +294,23 @@ def test_reconciliation_blocks_an_incomplete_candidate_packet() -> None:
     request = _request()
     incomplete = replace(request.candidate_packet, experiment_id="other-experiment")
 
-    decision = reconcile_experimental_publication(
-        replace(request, candidate_packet=incomplete), remote_snapshot=None
-    )
+    changed = replace(request, candidate_packet=incomplete)
+    decision = _reconcile(changed, remote_snapshot=None, eligibility=_signed_eligibility(request))
 
     assert decision.outcome == "blocked_candidate_packet_incomplete"
 
 
 def test_reconciliation_blocks_a_candidate_without_exact_local_eligibility() -> None:
     request = _request()
-    assert request.eligibility is not None
+    receipt = _eligibility(request)
     failed_gates = tuple(
         replace(gate, result="fail") if gate.gate_id == "repository_tests" else gate
-        for gate in request.eligibility.local_gates
+        for gate in receipt.local_gates
     )
-    decision = reconcile_experimental_publication(
-        replace(request, eligibility=_eligibility(request, local_gates=failed_gates)),
+    decision = _reconcile(
+        request,
         remote_snapshot=None,
+        eligibility=_signed_eligibility(request, local_gates=failed_gates),
     )
 
     assert decision.outcome == "blocked_candidate_not_locally_eligible"
@@ -200,8 +318,7 @@ def test_reconciliation_blocks_a_candidate_without_exact_local_eligibility() -> 
 
 def test_eligibility_is_frozen_canonical_request_bound_and_not_a_production_receipt() -> None:
     request = _request()
-    eligibility = request.eligibility
-    assert eligibility is not None
+    eligibility = _eligibility(request)
 
     assert (
         ExperimentalPublicationEligibility.from_canonical_dict(eligibility.to_canonical_dict())
@@ -244,9 +361,10 @@ def test_eligibility_is_frozen_canonical_request_bound_and_not_a_production_rece
 def test_reconciliation_rejects_reused_or_mismatched_receipt(change: dict[str, object]) -> None:
     request = _request()
 
-    decision = reconcile_experimental_publication(
-        replace(request, eligibility=_eligibility(request, **change)),
+    decision = _reconcile(
+        request,
         remote_snapshot=None,
+        eligibility=_signed_eligibility(request, **change),
     )
 
     assert decision.outcome == "blocked_candidate_not_locally_eligible"
@@ -254,8 +372,7 @@ def test_reconciliation_rejects_reused_or_mismatched_receipt(change: dict[str, o
 
 def test_reconciliation_rejects_stale_checks_reviews_security_and_local_gates() -> None:
     request = _request()
-    receipt = request.eligibility
-    assert receipt is not None
+    receipt = _eligibility(request)
     mismatched_checks = (replace(receipt.required_checks[0], output_digest="9" * 64),)
     benchmark_only = (receipt.review_dispositions[0],)
     self_authored = tuple(
@@ -270,39 +387,30 @@ def test_reconciliation_rejects_stale_checks_reviews_security_and_local_gates() 
         replace(receipt.local_gates[0], candidate_tree="9" * 40),
         *receipt.local_gates[1:],
     )
-    stale = _request(requested_at="2026-08-10T14:02:00Z")
-
     receipts = (
-        _eligibility(request, required_checks=mismatched_checks),
-        _eligibility(request, review_dispositions=benchmark_only),
-        _eligibility(request, review_dispositions=self_authored),
-        _eligibility(request, review_dispositions=mismatched_review),
-        _eligibility(request, security_result="fail"),
-        _eligibility(request, local_gates=mismatched_gate),
-        _eligibility(
+        _signed_eligibility(request, required_checks=mismatched_checks),
+        _signed_eligibility(request, review_dispositions=benchmark_only),
+        _signed_eligibility(request, review_dispositions=self_authored),
+        _signed_eligibility(request, review_dispositions=mismatched_review),
+        _signed_eligibility(request, security_result="fail"),
+        _signed_eligibility(request, local_gates=mismatched_gate),
+        _signed_eligibility(
             request,
             local_gates=tuple(
                 replace(gate, result="fail") if gate.gate_id == "security_review" else gate
                 for gate in receipt.local_gates
             ),
         ),
-        _eligibility(stale, expires_at=EXPIRES_AT),
     )
 
-    for selected_request, eligibility in (
-        *((request, item) for item in receipts[:-1]),
-        (stale, receipts[-1]),
-    ):
-        decision = reconcile_experimental_publication(
-            replace(selected_request, eligibility=eligibility), remote_snapshot=None
-        )
+    for eligibility in receipts:
+        decision = _reconcile(request, remote_snapshot=None, eligibility=eligibility)
         assert decision.outcome == "blocked_candidate_not_locally_eligible"
 
 
 @pytest.mark.parametrize("mutation", ["missing", "extra", "nested_extra"])
 def test_eligibility_parser_rejects_nonexact_fields(mutation: str) -> None:
-    eligibility = _request().eligibility
-    assert eligibility is not None
+    eligibility = _eligibility(_request())
     value = eligibility.to_canonical_dict()
     if mutation == "missing":
         value.pop("candidate_tree")
@@ -315,8 +423,94 @@ def test_eligibility_parser_rejects_nonexact_fields(mutation: str) -> None:
         ExperimentalPublicationEligibility.from_canonical_dict(value)
 
 
+def test_trusted_clock_rejects_expired_receipt_even_when_request_is_backdated() -> None:
+    request = _request(requested_at="2026-08-10T12:02:00Z")
+
+    decision = _reconcile(
+        request,
+        None,
+        verifier=_verifier(datetime(2026, 8, 10, 13, 2, tzinfo=UTC)),
+    )
+
+    assert decision.outcome == "blocked_candidate_not_locally_eligible"
+
+
+def test_trusted_clock_rejects_receipt_issued_in_the_future() -> None:
+    request = _request()
+    future = _signed_eligibility(
+        request,
+        issued_at="2026-08-10T12:03:00Z",
+        expires_at="2026-08-10T13:03:00Z",
+    )
+
+    decision = _reconcile(request, None, eligibility=future)
+
+    assert decision.outcome == "blocked_candidate_not_locally_eligible"
+
+
+def test_forged_self_key_unsigned_and_tampered_receipts_fail_closed() -> None:
+    request = _request()
+    valid = _signed_eligibility(request)
+    forged_key = Ed25519PrivateKey.generate()
+    forged = _signed_eligibility(request, private_key=forged_key)
+    unsigned = replace(valid, signature_base64=base64.b64encode(b"0" * 64).decode("ascii"))
+    tampered = replace(valid, receipt=replace(valid.receipt, issuer="attacker"))
+
+    for envelope in (forged, unsigned, tampered):
+        assert (
+            _reconcile(request, None, eligibility=envelope).outcome
+            == "blocked_candidate_not_locally_eligible"
+        )
+    assert (
+        reconcile_experimental_publication(
+            request,
+            None,
+            verifier=_verifier(),
+            eligibility=valid.receipt,  # type: ignore[arg-type]
+        ).outcome
+        == "blocked_candidate_not_locally_eligible"
+    )
+
+
+def test_signed_receipt_replays_only_the_same_immutable_effect() -> None:
+    request = _request()
+    envelope = _signed_eligibility(request)
+
+    assert _reconcile(request, None, eligibility=envelope).outcome == "push_branch"
+    assert (
+        _reconcile(request, request.candidate_packet.candidate_commit, eligibility=envelope).outcome
+        == "record_existing_exact_branch"
+    )
+    for changed in (
+        replace(request, request_id="publish-experimental-other"),
+        replace(request, requested_at="2026-08-10T12:02:01Z"),
+    ):
+        assert (
+            _reconcile(changed, None, eligibility=envelope).outcome
+            == "blocked_candidate_not_locally_eligible"
+        )
+    with pytest.raises(ExperimentalPublicationError, match="experimental_branch_invalid"):
+        _reconcile(replace(request, branch="experimental/other"), None, eligibility=envelope)
+
+
+def test_verifier_reads_trusted_clock_once_per_publication_decision() -> None:
+    calls = 0
+
+    def clock() -> datetime:
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            raise AssertionError("clock read more than once")
+        return datetime(2026, 8, 10, 12, 2, tzinfo=UTC)
+
+    decision = _reconcile(_request(), None, verifier=_verifier(clock=clock))
+
+    assert decision.outcome == "push_branch"
+    assert calls == 1
+
+
 def test_publish_cli_records_one_immutable_branch_without_protected_validation(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     repository, origin, parent = _repository(tmp_path)
     selected = replace(manifest(), experiment_id="exp-publication-001", parent_commit=parent)
@@ -362,12 +556,20 @@ def test_publish_cli_records_one_immutable_branch_without_protected_validation(
         candidate_tree=candidate_tree,
         request_id="publish-experimental-001",
         requested_at=REQUESTED_AT,
-        eligibility=None,
     )
     eligibility_path = private / "experimental-eligibility.json"
-    eligibility_path.write_text(
-        json.dumps(_eligibility(eligibility_request).to_canonical_dict()), encoding="utf-8"
+    signed_eligibility = _signed_eligibility(
+        eligibility_request,
+        issued_at="2020-01-01T00:00:00Z",
+        expires_at="2100-01-01T00:00:00Z",
     )
+    eligibility_path.write_text(
+        json.dumps(signed_eligibility.to_canonical_dict()), encoding="utf-8"
+    )
+    public_key_path = private / "experimental-eligibility-public.pem"
+    public_key_path.write_bytes(ELIGIBILITY_PUBLIC_KEY)
+    monkeypatch.setenv("CARL_EXPERIMENTAL_ELIGIBILITY_PUBLIC_KEY_PATH", os.fspath(public_key_path))
+    monkeypatch.setenv("CARL_EXPERIMENTAL_ELIGIBILITY_KEY_ID", ELIGIBILITY_KEY_ID)
     git_log = private / "git-log.jsonl"
     fake_git = private / "fake-git.py"
     fake_git.write_text(
@@ -461,13 +663,22 @@ def test_publish_cli_records_one_immutable_branch_without_protected_validation(
         is None
     )
 
+    monkeypatch.delenv("CARL_EXPERIMENTAL_ELIGIBILITY_PUBLIC_KEY_PATH")
+    assert cli.main(command) == 2
+    monkeypatch.setenv("CARL_EXPERIMENTAL_ELIGIBILITY_PUBLIC_KEY_PATH", os.fspath(public_key_path))
+    monkeypatch.setenv("CARL_EXPERIMENTAL_ELIGIBILITY_KEY_ID", "untrusted-key")
+    assert cli.main(command) == 2
+    monkeypatch.setenv("CARL_EXPERIMENTAL_ELIGIBILITY_KEY_ID", ELIGIBILITY_KEY_ID)
+
     canonical = eligibility_path.read_text(encoding="utf-8")
+    trust_override = signed_eligibility.to_canonical_dict()
+    trust_override["receipt"]["public_key_pem"] = "caller-selected"
     malformed_receipts = {
         "duplicate": canonical[:-1] + ', "schema_version": 1}',
         "extra": json.dumps(
-            _eligibility(eligibility_request).to_canonical_dict()
-            | {"live_capability_validated": True}
+            signed_eligibility.to_canonical_dict() | {"live_capability_validated": True}
         ),
+        "trust-override": json.dumps(trust_override),
         "oversized": "{" + '"padding":"' + ("x" * 1_048_576) + '"}',
     }
     receipt_index = command.index("--eligibility-receipt") + 1
@@ -517,9 +728,8 @@ def test_create_only_push_never_fast_forwards_a_ref_created_after_the_snapshot(
         candidate_tree=candidate_tree,
         request_id="publish-experimental-race-001",
         requested_at=REQUESTED_AT,
-        eligibility=None,
     )
-    request = replace(request, eligibility=_eligibility(request))
+    eligibility = _signed_eligibility(request)
     ref = f"refs/heads/experimental/{selected.experiment_id}"
     marker = tmp_path / "racer-ran"
     fake_git = tmp_path / "racing-git.py"
@@ -547,6 +757,8 @@ def test_create_only_push_never_fast_forwards_a_ref_created_after_the_snapshot(
     with pytest.raises(ExperimentalPublicationError, match="experimental_git_failed"):
         publish_experimental_branch(
             request,
+            verifier=_verifier(),
+            eligibility=eligibility,
             repository=repository,
             remote="origin",
             git_executable=fake_git,

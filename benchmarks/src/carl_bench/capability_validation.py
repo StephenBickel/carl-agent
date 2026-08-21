@@ -283,13 +283,16 @@ def experimental_publication_request_digest(
     candidate_commit: Any,
     candidate_tree: Any,
 ) -> str:
-    """Bind one eligibility receipt to one exact publication request."""
+    """Bind one eligibility receipt to one exact immutable publication effect."""
     payload = {
+        "action": "publish_experimental_ref",
         "branch": _experimental_identifier(branch),
         "candidate_commit": _experimental_object(candidate_commit),
         "candidate_packet_digest": _experimental_digest(candidate_packet_digest),
         "candidate_tree": _experimental_object(candidate_tree),
+        "domain": "carl.experimental-publication-effect.v1",
         "experiment_id": _experimental_identifier(experiment_id),
+        "ref": f"refs/heads/{branch}",
         "request_id": _experimental_identifier(request_id),
         "requested_at": requested_at,
         "schema_version": 1,
@@ -339,11 +342,16 @@ def experimental_evidence_digest(
 class ExperimentalPublicationEligibility:
     schema_version: int
     receipt_type: str
+    receipt_id: str
+    issuer: str
+    key_id: str
     request_id: str
     requested_at: str
     request_digest: str
+    effect_digest: str
     experiment_id: str
     branch: str
+    ref: str
     candidate_packet_digest: str
     candidate_commit: str
     candidate_tree: str
@@ -356,9 +364,15 @@ class ExperimentalPublicationEligibility:
     issued_at: str
     expires_at: str
 
+    def __init_subclass__(cls, **kwargs: object) -> None:
+        raise TypeError("ExperimentalPublicationEligibility cannot be subclassed")
+
     def __post_init__(self) -> None:
         if self.schema_version != 1 or self.receipt_type != _EXPERIMENTAL_RECEIPT_TYPE:
             raise ExperimentalEligibilityError("experimental_eligibility_schema_invalid")
+        _experimental_identifier(self.receipt_id)
+        _experimental_identifier(self.issuer)
+        _experimental_identifier(self.key_id)
         expected_request = experimental_publication_request_digest(
             request_id=self.request_id,
             requested_at=self.requested_at,
@@ -370,6 +384,10 @@ class ExperimentalPublicationEligibility:
         )
         if self.request_digest != expected_request:
             raise ExperimentalEligibilityError("experimental_eligibility_request_digest_invalid")
+        if self.effect_digest != expected_request:
+            raise ExperimentalEligibilityError("experimental_eligibility_effect_digest_invalid")
+        if self.ref != f"refs/heads/{self.branch}":
+            raise ExperimentalEligibilityError("experimental_eligibility_ref_invalid")
         check_ids = tuple(item.check_id for item in self.required_checks)
         if check_ids != tuple(sorted(set(check_ids), key=str.encode)):
             raise ExperimentalEligibilityError("experimental_eligibility_checks_invalid")
@@ -446,11 +464,16 @@ class ExperimentalPublicationEligibility:
             "candidate_packet_digest": self.candidate_packet_digest,
             "candidate_tree": self.candidate_tree,
             "evidence_digest": self.evidence_digest,
+            "effect_digest": self.effect_digest,
             "experiment_id": self.experiment_id,
             "expires_at": self.expires_at,
+            "issuer": self.issuer,
             "issued_at": self.issued_at,
+            "key_id": self.key_id,
             "local_gates": [item.to_canonical_dict() for item in self.local_gates],
             "receipt_type": self.receipt_type,
+            "receipt_id": self.receipt_id,
+            "ref": self.ref,
             "request_digest": self.request_digest,
             "request_id": self.request_id,
             "requested_at": self.requested_at,
@@ -473,11 +496,16 @@ class ExperimentalPublicationEligibility:
             "candidate_packet_digest",
             "candidate_tree",
             "evidence_digest",
+            "effect_digest",
             "experiment_id",
             "expires_at",
+            "issuer",
             "issued_at",
+            "key_id",
             "local_gates",
             "receipt_type",
+            "receipt_id",
+            "ref",
             "request_digest",
             "request_id",
             "requested_at",

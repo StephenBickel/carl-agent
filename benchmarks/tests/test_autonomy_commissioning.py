@@ -19,7 +19,10 @@ import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from test_experiment import manifest as base_manifest
-from test_experimental_publication import _eligibility as experimental_eligibility
+from test_experimental_publication import (
+    _signed_eligibility as signed_experimental_eligibility,
+)
+from test_experimental_publication import _verifier as experimental_eligibility_verifier
 
 from carl_bench.artifacts import ArtifactRef, PrivateArtifactStore
 from carl_bench.autonomy import (
@@ -3189,21 +3192,20 @@ def test_component_scenarios_cannot_self_issue_commissioning_pass(
         candidate_tree=disposable_git.valid_tree,
         request_id="publish-commissioning-001",
         requested_at="2026-08-19T12:00:00Z",
-        eligibility=None,
     )
-    publication_request = replace(
+    publication_eligibility = signed_experimental_eligibility(
         publication_request,
-        eligibility=experimental_eligibility(
-            publication_request,
-            issued_at="2026-08-19T11:59:00Z",
-            expires_at="2026-08-19T13:00:00Z",
-        ),
+        issued_at="2026-08-19T11:59:00Z",
+        expires_at="2026-08-19T13:00:00Z",
     )
+    publication_verifier = experimental_eligibility_verifier(NOW)
     git_executable = Path(shutil.which("git") or "/missing-git")
 
     # The branch effect succeeds and the controller is killed before its ledger receipt.
     first_publication = publish_experimental_branch(
         publication_request,
+        verifier=publication_verifier,
+        eligibility=publication_eligibility,
         repository=disposable_git.builder,
         remote="origin",
         git_executable=git_executable,
@@ -3217,6 +3219,8 @@ def test_component_scenarios_cannot_self_issue_commissioning_pass(
     # A fresh process reconciles the exact ref instead of pushing or duplicating it.
     recovered_publication = publish_experimental_branch(
         publication_request,
+        verifier=publication_verifier,
+        eligibility=publication_eligibility,
         repository=disposable_git.builder,
         remote="origin",
         git_executable=git_executable,

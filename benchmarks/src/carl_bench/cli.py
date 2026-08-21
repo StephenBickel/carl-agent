@@ -38,7 +38,6 @@ from carl_bench.candidate_evidence import (
 )
 from carl_bench.candidate_git import CandidateGitManager, TrustedCheckRegistry
 from carl_bench.canonical import canonical_json_bytes
-from carl_bench.capability_validation import ExperimentalPublicationEligibility
 from carl_bench.experiment import (
     EventType,
     ExperimentEvent,
@@ -51,7 +50,10 @@ from carl_bench.experiment import (
     reduce_events,
 )
 from carl_bench.experimental_publication import (
+    ExperimentalEligibilityTrustedKey,
+    ExperimentalEligibilityVerifier,
     ExperimentalPublicationRequest,
+    SignedExperimentalPublicationEligibility,
     candidate_tree,
     publish_experimental_branch,
 )
@@ -67,6 +69,8 @@ from carl_bench.tasks import BenchmarkTask, TaskContractError, discover_tasks
 REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
 MAX_SCORECARD_BYTES = 4 * 1_048_576
 MAX_CONTROL_INPUT_BYTES = 1_048_576
+_EXPERIMENTAL_ELIGIBILITY_PUBLIC_KEY_ENV = "CARL_EXPERIMENTAL_ELIGIBILITY_PUBLIC_KEY_PATH"
+_EXPERIMENTAL_ELIGIBILITY_KEY_ID_ENV = "CARL_EXPERIMENTAL_ELIGIBILITY_KEY_ID"
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -462,6 +466,34 @@ def _read_control_object(path: Path) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError("control input must be a JSON object")
     return value
+
+
+def _experimental_eligibility_verifier() -> ExperimentalEligibilityVerifier:
+    key_path_value = os.environ.get(_EXPERIMENTAL_ELIGIBILITY_PUBLIC_KEY_ENV)
+    key_id = os.environ.get(_EXPERIMENTAL_ELIGIBILITY_KEY_ID_ENV)
+    if not key_path_value or not key_id:
+        raise ValueError("experimental eligibility protected verifier is not configured")
+    source = _anchored(Path(key_path_value))
+    try:
+        metadata = source.lstat()
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or metadata.st_size > 16_384
+            or (os.name != "nt" and stat.S_IMODE(metadata.st_mode) & 0o022)
+            or (hasattr(os, "getuid") and metadata.st_uid != os.getuid())
+        ):
+            raise ValueError("experimental eligibility protected verifier is unsafe")
+        public_key_pem = source.read_bytes()
+    except OSError as error:
+        raise ValueError("experimental eligibility protected verifier is unavailable") from error
+    return ExperimentalEligibilityVerifier(
+        trusted_key=ExperimentalEligibilityTrustedKey(
+            key_id=key_id,
+            public_key_pem=public_key_pem,
+        )
+    )
 
 
 def _private_ledger(path: Path) -> ExperimentLedger:
@@ -869,9 +901,10 @@ def _candidate_command(args: argparse.Namespace) -> int:
 
     if args.candidate_command == "publish-experimental":
         packet = SealedCandidate.from_canonical_dict(_read_control_object(args.candidate_packet))
-        eligibility = ExperimentalPublicationEligibility.from_canonical_dict(
+        eligibility = SignedExperimentalPublicationEligibility.from_canonical_dict(
             _read_control_object(args.eligibility_receipt)
         )
+        verifier = _experimental_eligibility_verifier()
         request = ExperimentalPublicationRequest(
             experiment_id=args.experiment_id,
             branch=args.branch,
@@ -881,10 +914,11 @@ def _candidate_command(args: argparse.Namespace) -> int:
             ),
             request_id=args.stage_attempt_id,
             requested_at=args.occurred_at,
-            eligibility=eligibility,
         )
         decision = publish_experimental_branch(
             request,
+            verifier=verifier,
+            eligibility=eligibility,
             repository=_anchored(args.repository),
             remote=args.remote,
             git_executable=_anchored(args.git_executable),

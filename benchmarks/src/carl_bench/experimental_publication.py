@@ -2,13 +2,22 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import re
 import subprocess
+from collections.abc import Callable
 from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
+
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 from carl_bench.candidate import SealedCandidate
+from carl_bench.canonical import CanonicalizationError, canonical_json_bytes
 from carl_bench.capability_validation import (
     ExperimentalCheckResult,
     ExperimentalPublicationEligibility,
@@ -17,6 +26,8 @@ from carl_bench.capability_validation import (
 
 _OBJECT_ID_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 _REMOTE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+_KEY_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_SIGNATURE_DOMAIN = "carl.experimental-publication-eligibility.v1"
 
 PublicationOutcome = Literal[
     "push_branch",
@@ -31,6 +42,183 @@ class ExperimentalPublicationError(ValueError):
     """A stable publication-gateway failure that does not echo Git output."""
 
 
+def _canonical_signature(value: object) -> bytes:
+    if not isinstance(value, str):
+        raise ExperimentalPublicationError("experimental_eligibility_signature_invalid")
+    try:
+        decoded = base64.b64decode(value, validate=True)
+    except (ValueError, binascii.Error) as error:
+        raise ExperimentalPublicationError("experimental_eligibility_signature_invalid") from error
+    if len(decoded) != 64 or base64.b64encode(decoded).decode("ascii") != value:
+        raise ExperimentalPublicationError("experimental_eligibility_signature_invalid")
+    return decoded
+
+
+@dataclass(frozen=True, slots=True)
+class ExperimentalEligibilityTrustedKey:
+    """Pinned public key for the protected experimental eligibility issuer."""
+
+    key_id: str
+    public_key_pem: bytes
+
+    def __init_subclass__(cls, **kwargs: object) -> None:
+        raise TypeError("ExperimentalEligibilityTrustedKey cannot be subclassed")
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.key_id, str) or _KEY_ID_RE.fullmatch(self.key_id) is None:
+            raise ExperimentalPublicationError("experimental_eligibility_key_id_invalid")
+        if not isinstance(self.public_key_pem, bytes) or len(self.public_key_pem) > 16_384:
+            raise ExperimentalPublicationError("experimental_eligibility_public_key_invalid")
+        try:
+            key = serialization.load_pem_public_key(self.public_key_pem)
+        except (TypeError, ValueError) as error:
+            raise ExperimentalPublicationError(
+                "experimental_eligibility_public_key_invalid"
+            ) from error
+        if not isinstance(key, Ed25519PublicKey):
+            raise ExperimentalPublicationError("experimental_eligibility_public_key_invalid")
+
+    @property
+    def public_key(self) -> Ed25519PublicKey:
+        key = serialization.load_pem_public_key(self.public_key_pem)
+        if not isinstance(key, Ed25519PublicKey):  # pragma: no cover - constructor guards
+            raise ExperimentalPublicationError("experimental_eligibility_public_key_invalid")
+        return key
+
+
+@dataclass(frozen=True, slots=True)
+class SignedExperimentalPublicationEligibility:
+    """Raw signed experimental receipt wire, nominally distinct from production validation."""
+
+    receipt: ExperimentalPublicationEligibility
+    signature_base64: str
+
+    def __init_subclass__(cls, **kwargs: object) -> None:
+        raise TypeError("SignedExperimentalPublicationEligibility cannot be subclassed")
+
+    def __post_init__(self) -> None:
+        if type(self.receipt) is not ExperimentalPublicationEligibility:
+            raise ExperimentalPublicationError("experimental_eligibility_receipt_invalid")
+        _canonical_signature(self.signature_base64)
+
+    def signing_payload(self) -> bytes:
+        try:
+            return canonical_json_bytes(
+                {
+                    "domain": _SIGNATURE_DOMAIN,
+                    "receipt": self.receipt.to_canonical_dict(),
+                    "schema_version": 1,
+                }
+            )
+        except CanonicalizationError as error:
+            raise ExperimentalPublicationError(
+                "experimental_eligibility_receipt_invalid"
+            ) from error
+
+    def to_canonical_dict(self) -> dict[str, Any]:
+        return {
+            "receipt": self.receipt.to_canonical_dict(),
+            "signature_base64": self.signature_base64,
+        }
+
+    @classmethod
+    def from_canonical_dict(cls, value: object) -> SignedExperimentalPublicationEligibility:
+        if type(value) is not dict or set(value) != {"receipt", "signature_base64"}:
+            raise ExperimentalPublicationError("experimental_eligibility_envelope_invalid")
+        try:
+            return cls(
+                receipt=ExperimentalPublicationEligibility.from_canonical_dict(value["receipt"]),
+                signature_base64=value["signature_base64"],
+            )
+        except (TypeError, ValueError) as error:
+            if isinstance(error, ExperimentalPublicationError):
+                raise
+            raise ExperimentalPublicationError(
+                "experimental_eligibility_envelope_invalid"
+            ) from error
+
+
+def _utc_now() -> datetime:
+    return datetime.now(UTC)
+
+
+class ExperimentalEligibilityVerifier:
+    """Immutable verifier for one signed publication effect using controller-owned time.
+
+    A valid envelope is safe to replay only for the same immutable effect. Persistence and atomic
+    consumption of that effect key belong to the durable command boundary introduced by Task 7.
+    Hostile code already executing inside this trusted process is outside this object boundary.
+    """
+
+    __slots__ = ("_clock", "_trusted_key")
+
+    def __init_subclass__(cls, **kwargs: object) -> None:
+        raise TypeError("ExperimentalEligibilityVerifier cannot be subclassed")
+
+    def __init__(
+        self,
+        *,
+        trusted_key: ExperimentalEligibilityTrustedKey,
+        clock: Callable[[], datetime] = _utc_now,
+    ) -> None:
+        if type(trusted_key) is not ExperimentalEligibilityTrustedKey:
+            raise ExperimentalPublicationError("experimental_eligibility_trusted_key_missing")
+        if not callable(clock):
+            raise ExperimentalPublicationError("experimental_eligibility_trusted_clock_missing")
+        object.__setattr__(self, "_trusted_key", trusted_key)
+        object.__setattr__(self, "_clock", clock)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise AttributeError("ExperimentalEligibilityVerifier is immutable")
+
+    def __delattr__(self, name: str) -> None:
+        raise AttributeError("ExperimentalEligibilityVerifier is immutable")
+
+    def __copy__(self) -> ExperimentalEligibilityVerifier:
+        raise TypeError("ExperimentalEligibilityVerifier cannot be copied or serialized")
+
+    def __deepcopy__(self, memo: object) -> ExperimentalEligibilityVerifier:
+        raise TypeError("ExperimentalEligibilityVerifier cannot be copied or serialized")
+
+    def __reduce__(self) -> object:
+        raise TypeError("ExperimentalEligibilityVerifier cannot be copied or serialized")
+
+    def __reduce_ex__(self, protocol: int) -> object:
+        raise TypeError("ExperimentalEligibilityVerifier cannot be copied or serialized")
+
+    def require(
+        self,
+        envelope: SignedExperimentalPublicationEligibility,
+        request: ExperimentalPublicationRequest,
+    ) -> None:
+        now = object.__getattribute__(self, "_clock")()
+        if not isinstance(now, datetime) or now.tzinfo != UTC:
+            raise ExperimentalPublicationError("experimental_eligibility_trusted_clock_invalid")
+        if type(envelope) is not SignedExperimentalPublicationEligibility:
+            raise ExperimentalPublicationError("experimental_eligibility_envelope_invalid")
+        receipt = envelope.receipt
+        trusted_key = object.__getattribute__(self, "_trusted_key")
+        if receipt.key_id != trusted_key.key_id:
+            raise ExperimentalPublicationError("experimental_eligibility_key_mismatch")
+        try:
+            trusted_key.public_key.verify(
+                _canonical_signature(envelope.signature_base64),
+                SignedExperimentalPublicationEligibility.signing_payload(envelope),
+            )
+        except InvalidSignature as error:
+            raise ExperimentalPublicationError(
+                "experimental_eligibility_signature_invalid"
+            ) from error
+        issued = datetime.fromisoformat(receipt.issued_at.removesuffix("Z") + "+00:00")
+        expires = datetime.fromisoformat(receipt.expires_at.removesuffix("Z") + "+00:00")
+        if now < issued:
+            raise ExperimentalPublicationError("experimental_eligibility_not_yet_valid")
+        if now >= expires:
+            raise ExperimentalPublicationError("experimental_eligibility_expired")
+        if not receipt.eligible or not _eligible_for_request(receipt, request):
+            raise ExperimentalPublicationError("experimental_eligibility_effect_mismatch")
+
+
 @dataclass(frozen=True, slots=True)
 class ExperimentalPublicationRequest:
     experiment_id: str
@@ -39,7 +227,6 @@ class ExperimentalPublicationRequest:
     candidate_tree: str
     request_id: str
     requested_at: str
-    eligibility: ExperimentalPublicationEligibility | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,9 +264,13 @@ def _decision(
 
 
 def reconcile_experimental_publication(
-    request: ExperimentalPublicationRequest, remote_snapshot: str | None
+    request: ExperimentalPublicationRequest,
+    remote_snapshot: str | None,
+    *,
+    verifier: ExperimentalEligibilityVerifier,
+    eligibility: SignedExperimentalPublicationEligibility,
 ) -> ExperimentalPublicationDecision:
-    """Choose the only permitted immutable experimental-ref action for a remote snapshot."""
+    """Choose the only permitted immutable effect after point-of-use receipt verification."""
     ref = _ref(request.experiment_id, request.branch)
     packet = request.candidate_packet
     if (
@@ -90,10 +281,11 @@ def reconcile_experimental_publication(
         or not _OBJECT_ID_RE.fullmatch(request.candidate_tree)
     ):
         return _decision("blocked_candidate_packet_incomplete", request, ref)
-    receipt = request.eligibility
-    if not isinstance(receipt, ExperimentalPublicationEligibility) or not _eligible_for_request(
-        receipt, request
-    ):
+    if type(verifier) is not ExperimentalEligibilityVerifier:
+        raise ExperimentalPublicationError("experimental_eligibility_verifier_missing")
+    try:
+        ExperimentalEligibilityVerifier.require(verifier, eligibility, request)
+    except ExperimentalPublicationError:
         return _decision("blocked_candidate_not_locally_eligible", request, ref)
     if remote_snapshot is None:
         return _decision("push_branch", request, ref)
@@ -131,13 +323,13 @@ def _eligible_for_request(
     except ValueError:
         return False
     return (
-        receipt.eligible
-        and receipt.valid_at(request.requested_at)
-        and receipt.request_id == request.request_id
+        receipt.request_id == request.request_id
         and receipt.requested_at == request.requested_at
         and receipt.request_digest == request_digest
+        and receipt.effect_digest == request_digest
         and receipt.experiment_id == request.experiment_id
         and receipt.branch == request.branch
+        and receipt.ref == f"refs/heads/{request.branch}"
         and receipt.candidate_packet_digest == packet.digest
         and receipt.candidate_commit == packet.candidate_commit
         and receipt.candidate_tree == request.candidate_tree
@@ -162,6 +354,8 @@ def candidate_tree(repository: Path, candidate_commit: str, git_executable: Path
 def publish_experimental_branch(
     request: ExperimentalPublicationRequest,
     *,
+    verifier: ExperimentalEligibilityVerifier,
+    eligibility: SignedExperimentalPublicationEligibility,
     repository: Path,
     remote: str,
     git_executable: Path,
@@ -171,7 +365,12 @@ def publish_experimental_branch(
         raise ExperimentalPublicationError("experimental_remote_invalid")
     ref = _ref(request.experiment_id, request.branch)
     snapshot = _remote_snapshot(git_executable, repository, remote, ref)
-    decision = reconcile_experimental_publication(request, snapshot)
+    decision = reconcile_experimental_publication(
+        request,
+        snapshot,
+        verifier=verifier,
+        eligibility=eligibility,
+    )
     if decision.outcome != "push_branch":
         return decision
     assert decision.candidate_commit is not None
