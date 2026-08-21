@@ -19,6 +19,7 @@ import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from test_experiment import manifest as base_manifest
+from test_experimental_publication import _eligibility as experimental_eligibility
 
 from carl_bench.artifacts import ArtifactRef, PrivateArtifactStore
 from carl_bench.autonomy import (
@@ -3186,7 +3187,17 @@ def test_component_scenarios_cannot_self_issue_commissioning_pass(
         branch=f"experimental/{EXPERIMENT_ID}",
         candidate_packet=packet,
         candidate_tree=disposable_git.valid_tree,
-        capability_report=capability_report,
+        request_id="publish-commissioning-001",
+        requested_at="2026-08-19T12:00:00Z",
+        eligibility=None,
+    )
+    publication_request = replace(
+        publication_request,
+        eligibility=experimental_eligibility(
+            publication_request,
+            issued_at="2026-08-19T11:59:00Z",
+            expires_at="2026-08-19T13:00:00Z",
+        ),
     )
     git_executable = Path(shutil.which("git") or "/missing-git")
 

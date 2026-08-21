@@ -9,7 +9,11 @@ from pathlib import Path
 from typing import Literal
 
 from carl_bench.candidate import SealedCandidate
-from carl_bench.capability_validation import CapabilityValidationReport
+from carl_bench.capability_validation import (
+    ExperimentalCheckResult,
+    ExperimentalPublicationEligibility,
+    experimental_publication_request_digest,
+)
 
 _OBJECT_ID_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 _REMOTE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
@@ -33,7 +37,9 @@ class ExperimentalPublicationRequest:
     branch: str
     candidate_packet: SealedCandidate
     candidate_tree: str
-    capability_report: CapabilityValidationReport
+    request_id: str
+    requested_at: str
+    eligibility: ExperimentalPublicationEligibility | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,8 +90,10 @@ def reconcile_experimental_publication(
         or not _OBJECT_ID_RE.fullmatch(request.candidate_tree)
     ):
         return _decision("blocked_candidate_packet_incomplete", request, ref)
-    report = request.capability_report
-    if not isinstance(report, CapabilityValidationReport) or not report.eligible:
+    receipt = request.eligibility
+    if not isinstance(receipt, ExperimentalPublicationEligibility) or not _eligible_for_request(
+        receipt, request
+    ):
         return _decision("blocked_candidate_not_locally_eligible", request, ref)
     if remote_snapshot is None:
         return _decision("push_branch", request, ref)
@@ -96,9 +104,48 @@ def reconcile_experimental_publication(
     return _decision("record_existing_exact_branch", request, ref)
 
 
-def candidate_tree(
-    repository: Path, candidate_commit: str, git_executable: Path
-) -> str:
+def _eligible_for_request(
+    receipt: ExperimentalPublicationEligibility,
+    request: ExperimentalPublicationRequest,
+) -> bool:
+    packet = request.candidate_packet
+    checks = tuple(
+        ExperimentalCheckResult(
+            check_id=check.check_id,
+            status=check.status,
+            exit_code=check.exit_code,
+            output_digest=check.output_artifact.digest,
+        )
+        for check in packet.checks
+    )
+    try:
+        request_digest = experimental_publication_request_digest(
+            request_id=request.request_id,
+            requested_at=request.requested_at,
+            experiment_id=request.experiment_id,
+            branch=request.branch,
+            candidate_packet_digest=packet.digest,
+            candidate_commit=packet.candidate_commit,
+            candidate_tree=request.candidate_tree,
+        )
+    except ValueError:
+        return False
+    return (
+        receipt.eligible
+        and receipt.valid_at(request.requested_at)
+        and receipt.request_id == request.request_id
+        and receipt.requested_at == request.requested_at
+        and receipt.request_digest == request_digest
+        and receipt.experiment_id == request.experiment_id
+        and receipt.branch == request.branch
+        and receipt.candidate_packet_digest == packet.digest
+        and receipt.candidate_commit == packet.candidate_commit
+        and receipt.candidate_tree == request.candidate_tree
+        and receipt.required_checks == checks
+    )
+
+
+def candidate_tree(repository: Path, candidate_commit: str, git_executable: Path) -> str:
     """Resolve the tree object for the exact candidate commit with an argument vector."""
     tree = _git(
         git_executable,

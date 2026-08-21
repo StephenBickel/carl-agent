@@ -32,13 +32,13 @@ from carl_bench.candidate import (
 )
 from carl_bench.candidate_evidence import (
     bind_paired_evidence,
-    capability_report_from_public,
     issue_review_packet,
     record_review_attestation,
     scorecard_from_public,
 )
 from carl_bench.candidate_git import CandidateGitManager, TrustedCheckRegistry
 from carl_bench.canonical import canonical_json_bytes
+from carl_bench.capability_validation import ExperimentalPublicationEligibility
 from carl_bench.experiment import (
     EventType,
     ExperimentEvent,
@@ -270,7 +270,7 @@ def _parser() -> argparse.ArgumentParser:
     publish.add_argument("--remote", required=True)
     publish.add_argument("--branch", required=True)
     publish.add_argument("--candidate-packet", required=True, type=Path)
-    publish.add_argument("--capability-report", required=True, type=Path)
+    publish.add_argument("--eligibility-receipt", required=True, type=Path)
     publish.add_argument("--git-executable", required=True, type=Path)
     publish.add_argument("--stage-attempt-id", required=True)
     publish.add_argument("--occurred-at", required=True)
@@ -869,7 +869,9 @@ def _candidate_command(args: argparse.Namespace) -> int:
 
     if args.candidate_command == "publish-experimental":
         packet = SealedCandidate.from_canonical_dict(_read_control_object(args.candidate_packet))
-        report = capability_report_from_public(_read_control_object(args.capability_report))
+        eligibility = ExperimentalPublicationEligibility.from_canonical_dict(
+            _read_control_object(args.eligibility_receipt)
+        )
         request = ExperimentalPublicationRequest(
             experiment_id=args.experiment_id,
             branch=args.branch,
@@ -877,7 +879,9 @@ def _candidate_command(args: argparse.Namespace) -> int:
             candidate_tree=candidate_tree(
                 _anchored(args.repository), packet.candidate_commit, _anchored(args.git_executable)
             ),
-            capability_report=report,
+            request_id=args.stage_attempt_id,
+            requested_at=args.occurred_at,
+            eligibility=eligibility,
         )
         decision = publish_experimental_branch(
             request,

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import re
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import PurePosixPath
 from typing import Any
 
@@ -15,6 +16,25 @@ _IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
 _CLAIM_TYPES = frozenset({"capability", "compatibility", "correctness"})
 _TRANSFER_TYPES = frozenset({"adversarial", "fixture_probe", "held_out", "unit_contract"})
 _BEHAVIORAL_TRANSFER_TYPES = frozenset({"adversarial", "held_out"})
+_EXPERIMENTAL_RECEIPT_TYPE = "experimental_publication_eligibility"
+_EXPERIMENTAL_REVIEW_ROLES = (
+    "benchmark_integrity",
+    "correctness",
+    "maintainability",
+    "security",
+)
+_EXPERIMENTAL_LOCAL_GATES = (
+    "deterministic_checks",
+    "independent_reviews",
+    "repository_tests",
+    "security_review",
+)
+_EXPERIMENTAL_RESULTS = frozenset({"pass", "fail"})
+_EXPERIMENTAL_VERDICTS = frozenset({"approve", "reject", "hard_finding"})
+_UTC_RE = re.compile(
+    r"^[0-9]{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12][0-9]|3[01])"
+    r"T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](?:\.[0-9]{1,6})?Z$"
+)
 _PROTECTED_EXACT_PATHS = frozenset(
     {
         ".github/CODEOWNERS",
@@ -40,6 +60,456 @@ class CapabilityValidationError(ValueError):
     def __init__(self, code: str) -> None:
         self.code = code
         super().__init__(code)
+
+
+class ExperimentalEligibilityError(ValueError):
+    """A stable experimental-receipt failure that does not echo evidence."""
+
+    def __init__(self, code: str) -> None:
+        self.code = code
+        super().__init__(code)
+
+
+def _experimental_identifier(value: Any) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value.encode("utf-8")) > 256
+        or not _IDENTIFIER_RE.fullmatch(value)
+    ):
+        raise ExperimentalEligibilityError("experimental_eligibility_identifier_invalid")
+    return value
+
+
+def _experimental_digest(value: Any) -> str:
+    if not isinstance(value, str) or not _DIGEST_RE.fullmatch(value):
+        raise ExperimentalEligibilityError("experimental_eligibility_digest_invalid")
+    return value
+
+
+def _experimental_object(value: Any) -> str:
+    if not isinstance(value, str) or not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", value):
+        raise ExperimentalEligibilityError("experimental_eligibility_object_invalid")
+    return value
+
+
+def _experimental_timestamp(value: Any) -> datetime:
+    if not isinstance(value, str) or not _UTC_RE.fullmatch(value):
+        raise ExperimentalEligibilityError("experimental_eligibility_timestamp_invalid")
+    try:
+        parsed = datetime.fromisoformat(value.removesuffix("Z") + "+00:00")
+    except ValueError as error:
+        raise ExperimentalEligibilityError("experimental_eligibility_timestamp_invalid") from error
+    if parsed.tzinfo != UTC:
+        raise ExperimentalEligibilityError("experimental_eligibility_timestamp_invalid")
+    return parsed
+
+
+def _experimental_exact(value: Any, expected: set[str], code: str) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != expected:
+        raise ExperimentalEligibilityError(code)
+    return value
+
+
+@dataclass(frozen=True, slots=True)
+class ExperimentalCheckResult:
+    check_id: str
+    status: str
+    exit_code: int | None
+    output_digest: str
+
+    def __post_init__(self) -> None:
+        _experimental_identifier(self.check_id)
+        if self.status not in {"passed", "failed", "timed_out"}:
+            raise ExperimentalEligibilityError("experimental_eligibility_check_invalid")
+        if self.status == "timed_out":
+            if self.exit_code is not None:
+                raise ExperimentalEligibilityError("experimental_eligibility_check_invalid")
+        elif (
+            isinstance(self.exit_code, bool)
+            or not isinstance(self.exit_code, int)
+            or not 0 <= self.exit_code <= 255
+            or (self.status == "passed" and self.exit_code != 0)
+            or (self.status == "failed" and self.exit_code == 0)
+        ):
+            raise ExperimentalEligibilityError("experimental_eligibility_check_invalid")
+        _experimental_digest(self.output_digest)
+
+    @property
+    def passed(self) -> bool:
+        return self.status == "passed" and self.exit_code == 0
+
+    def to_canonical_dict(self) -> dict[str, Any]:
+        return {
+            "check_id": self.check_id,
+            "exit_code": self.exit_code,
+            "output_digest": self.output_digest,
+            "status": self.status,
+        }
+
+    @classmethod
+    def from_canonical_dict(cls, value: Any) -> ExperimentalCheckResult:
+        parsed = _experimental_exact(
+            value,
+            {"check_id", "exit_code", "output_digest", "status"},
+            "experimental_eligibility_check_keys_invalid",
+        )
+        try:
+            return cls(**parsed)
+        except TypeError as error:
+            raise ExperimentalEligibilityError("experimental_eligibility_check_invalid") from error
+
+
+@dataclass(frozen=True, slots=True)
+class ExperimentalReviewDisposition:
+    role: str
+    reviewer_id: str
+    context_id: str
+    experiment_id: str
+    candidate_packet_digest: str
+    candidate_commit: str
+    candidate_tree: str
+    packet_digest: str
+    report_digest: str
+    verdict: str
+
+    def __post_init__(self) -> None:
+        if self.role not in _EXPERIMENTAL_REVIEW_ROLES:
+            raise ExperimentalEligibilityError("experimental_eligibility_review_invalid")
+        _experimental_identifier(self.reviewer_id)
+        _experimental_identifier(self.context_id)
+        _experimental_identifier(self.experiment_id)
+        _experimental_digest(self.candidate_packet_digest)
+        _experimental_object(self.candidate_commit)
+        _experimental_object(self.candidate_tree)
+        _experimental_digest(self.packet_digest)
+        _experimental_digest(self.report_digest)
+        if self.verdict not in _EXPERIMENTAL_VERDICTS:
+            raise ExperimentalEligibilityError("experimental_eligibility_review_invalid")
+
+    def to_canonical_dict(self) -> dict[str, Any]:
+        return {
+            "candidate_commit": self.candidate_commit,
+            "candidate_packet_digest": self.candidate_packet_digest,
+            "candidate_tree": self.candidate_tree,
+            "context_id": self.context_id,
+            "experiment_id": self.experiment_id,
+            "packet_digest": self.packet_digest,
+            "report_digest": self.report_digest,
+            "reviewer_id": self.reviewer_id,
+            "role": self.role,
+            "verdict": self.verdict,
+        }
+
+    @classmethod
+    def from_canonical_dict(cls, value: Any) -> ExperimentalReviewDisposition:
+        parsed = _experimental_exact(
+            value,
+            {
+                "candidate_commit",
+                "candidate_packet_digest",
+                "candidate_tree",
+                "context_id",
+                "experiment_id",
+                "packet_digest",
+                "report_digest",
+                "reviewer_id",
+                "role",
+                "verdict",
+            },
+            "experimental_eligibility_review_keys_invalid",
+        )
+        try:
+            return cls(**parsed)
+        except TypeError as error:
+            raise ExperimentalEligibilityError("experimental_eligibility_review_invalid") from error
+
+
+@dataclass(frozen=True, slots=True)
+class ExperimentalLocalGateResult:
+    gate_id: str
+    result: str
+    candidate_packet_digest: str
+    candidate_commit: str
+    candidate_tree: str
+    evidence_digest: str
+
+    def __post_init__(self) -> None:
+        _experimental_identifier(self.gate_id)
+        if self.result not in _EXPERIMENTAL_RESULTS:
+            raise ExperimentalEligibilityError("experimental_eligibility_gate_invalid")
+        _experimental_digest(self.candidate_packet_digest)
+        _experimental_object(self.candidate_commit)
+        _experimental_object(self.candidate_tree)
+        _experimental_digest(self.evidence_digest)
+
+    def to_canonical_dict(self) -> dict[str, Any]:
+        return {
+            "candidate_commit": self.candidate_commit,
+            "candidate_packet_digest": self.candidate_packet_digest,
+            "candidate_tree": self.candidate_tree,
+            "evidence_digest": self.evidence_digest,
+            "gate_id": self.gate_id,
+            "result": self.result,
+        }
+
+    @classmethod
+    def from_canonical_dict(cls, value: Any) -> ExperimentalLocalGateResult:
+        parsed = _experimental_exact(
+            value,
+            {
+                "candidate_commit",
+                "candidate_packet_digest",
+                "candidate_tree",
+                "evidence_digest",
+                "gate_id",
+                "result",
+            },
+            "experimental_eligibility_gate_keys_invalid",
+        )
+        try:
+            return cls(**parsed)
+        except TypeError as error:
+            raise ExperimentalEligibilityError("experimental_eligibility_gate_invalid") from error
+
+
+def experimental_publication_request_digest(
+    *,
+    request_id: Any,
+    requested_at: Any,
+    experiment_id: Any,
+    branch: Any,
+    candidate_packet_digest: Any,
+    candidate_commit: Any,
+    candidate_tree: Any,
+) -> str:
+    """Bind one eligibility receipt to one exact publication request."""
+    payload = {
+        "branch": _experimental_identifier(branch),
+        "candidate_commit": _experimental_object(candidate_commit),
+        "candidate_packet_digest": _experimental_digest(candidate_packet_digest),
+        "candidate_tree": _experimental_object(candidate_tree),
+        "experiment_id": _experimental_identifier(experiment_id),
+        "request_id": _experimental_identifier(request_id),
+        "requested_at": requested_at,
+        "schema_version": 1,
+    }
+    _experimental_timestamp(requested_at)
+    if payload["branch"] != f"experimental/{payload['experiment_id']}":
+        raise ExperimentalEligibilityError("experimental_eligibility_branch_invalid")
+    return hashlib.sha256(canonical_json_bytes(payload)).hexdigest()
+
+
+def experimental_evidence_digest(
+    *,
+    required_checks: Any,
+    builder_id: Any,
+    review_dispositions: Any,
+    security_result: Any,
+    local_gates: Any,
+) -> str:
+    """Commit to the exact deterministic, review, security, and local gate evidence."""
+    if not isinstance(required_checks, tuple) or any(
+        not isinstance(item, ExperimentalCheckResult) for item in required_checks
+    ):
+        raise ExperimentalEligibilityError("experimental_eligibility_checks_invalid")
+    if not isinstance(review_dispositions, tuple) or any(
+        not isinstance(item, ExperimentalReviewDisposition) for item in review_dispositions
+    ):
+        raise ExperimentalEligibilityError("experimental_eligibility_reviews_invalid")
+    if not isinstance(local_gates, tuple) or any(
+        not isinstance(item, ExperimentalLocalGateResult) for item in local_gates
+    ):
+        raise ExperimentalEligibilityError("experimental_eligibility_gates_invalid")
+    _experimental_identifier(builder_id)
+    if security_result not in _EXPERIMENTAL_RESULTS:
+        raise ExperimentalEligibilityError("experimental_eligibility_security_invalid")
+    payload = {
+        "builder_id": builder_id,
+        "local_gates": [item.to_canonical_dict() for item in local_gates],
+        "required_checks": [item.to_canonical_dict() for item in required_checks],
+        "review_dispositions": [item.to_canonical_dict() for item in review_dispositions],
+        "security_result": security_result,
+        "schema_version": 1,
+    }
+    return hashlib.sha256(canonical_json_bytes(payload)).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class ExperimentalPublicationEligibility:
+    schema_version: int
+    receipt_type: str
+    request_id: str
+    requested_at: str
+    request_digest: str
+    experiment_id: str
+    branch: str
+    candidate_packet_digest: str
+    candidate_commit: str
+    candidate_tree: str
+    required_checks: tuple[ExperimentalCheckResult, ...]
+    builder_id: str
+    review_dispositions: tuple[ExperimentalReviewDisposition, ...]
+    security_result: str
+    local_gates: tuple[ExperimentalLocalGateResult, ...]
+    evidence_digest: str
+    issued_at: str
+    expires_at: str
+
+    def __post_init__(self) -> None:
+        if self.schema_version != 1 or self.receipt_type != _EXPERIMENTAL_RECEIPT_TYPE:
+            raise ExperimentalEligibilityError("experimental_eligibility_schema_invalid")
+        expected_request = experimental_publication_request_digest(
+            request_id=self.request_id,
+            requested_at=self.requested_at,
+            experiment_id=self.experiment_id,
+            branch=self.branch,
+            candidate_packet_digest=self.candidate_packet_digest,
+            candidate_commit=self.candidate_commit,
+            candidate_tree=self.candidate_tree,
+        )
+        if self.request_digest != expected_request:
+            raise ExperimentalEligibilityError("experimental_eligibility_request_digest_invalid")
+        check_ids = tuple(item.check_id for item in self.required_checks)
+        if check_ids != tuple(sorted(set(check_ids), key=str.encode)):
+            raise ExperimentalEligibilityError("experimental_eligibility_checks_invalid")
+        review_roles = tuple(item.role for item in self.review_dispositions)
+        if review_roles != tuple(sorted(set(review_roles), key=str.encode)):
+            raise ExperimentalEligibilityError("experimental_eligibility_reviews_invalid")
+        gate_ids = tuple(item.gate_id for item in self.local_gates)
+        if gate_ids != tuple(sorted(set(gate_ids), key=str.encode)):
+            raise ExperimentalEligibilityError("experimental_eligibility_gates_invalid")
+        expected_evidence = experimental_evidence_digest(
+            required_checks=self.required_checks,
+            builder_id=self.builder_id,
+            review_dispositions=self.review_dispositions,
+            security_result=self.security_result,
+            local_gates=self.local_gates,
+        )
+        if self.evidence_digest != expected_evidence:
+            raise ExperimentalEligibilityError("experimental_eligibility_evidence_digest_invalid")
+        issued = _experimental_timestamp(self.issued_at)
+        expires = _experimental_timestamp(self.expires_at)
+        if expires <= issued:
+            raise ExperimentalEligibilityError("experimental_eligibility_window_invalid")
+
+    @property
+    def eligible(self) -> bool:
+        reviews = self.review_dispositions
+        reviewers = tuple(item.reviewer_id for item in reviews)
+        contexts = tuple(item.context_id for item in reviews)
+        security_reviews = tuple(item for item in reviews if item.role == "security")
+        exact_review_identities = all(
+            item.experiment_id == self.experiment_id
+            and item.candidate_packet_digest == self.candidate_packet_digest
+            and item.candidate_commit == self.candidate_commit
+            and item.candidate_tree == self.candidate_tree
+            for item in reviews
+        )
+        exact_gate_identities = all(
+            item.candidate_packet_digest == self.candidate_packet_digest
+            and item.candidate_commit == self.candidate_commit
+            and item.candidate_tree == self.candidate_tree
+            for item in self.local_gates
+        )
+        return (
+            bool(self.required_checks)
+            and all(item.passed for item in self.required_checks)
+            and tuple(item.role for item in reviews) == _EXPERIMENTAL_REVIEW_ROLES
+            and exact_review_identities
+            and len(set(reviewers)) == len(reviewers)
+            and len(set(contexts)) == len(contexts)
+            and self.builder_id not in reviewers
+            and sum(item.verdict == "approve" for item in reviews) >= 3
+            and not any(item.verdict == "hard_finding" for item in reviews)
+            and len(security_reviews) == 1
+            and security_reviews[0].verdict == "approve"
+            and self.security_result == "pass"
+            and tuple(item.gate_id for item in self.local_gates) == _EXPERIMENTAL_LOCAL_GATES
+            and exact_gate_identities
+            and all(item.result == "pass" for item in self.local_gates)
+        )
+
+    def valid_at(self, value: str) -> bool:
+        observed = _experimental_timestamp(value)
+        return (
+            _experimental_timestamp(self.issued_at)
+            <= observed
+            < _experimental_timestamp(self.expires_at)
+        )
+
+    def to_canonical_dict(self) -> dict[str, Any]:
+        return {
+            "branch": self.branch,
+            "builder_id": self.builder_id,
+            "candidate_commit": self.candidate_commit,
+            "candidate_packet_digest": self.candidate_packet_digest,
+            "candidate_tree": self.candidate_tree,
+            "evidence_digest": self.evidence_digest,
+            "experiment_id": self.experiment_id,
+            "expires_at": self.expires_at,
+            "issued_at": self.issued_at,
+            "local_gates": [item.to_canonical_dict() for item in self.local_gates],
+            "receipt_type": self.receipt_type,
+            "request_digest": self.request_digest,
+            "request_id": self.request_id,
+            "requested_at": self.requested_at,
+            "required_checks": [item.to_canonical_dict() for item in self.required_checks],
+            "review_dispositions": [item.to_canonical_dict() for item in self.review_dispositions],
+            "schema_version": self.schema_version,
+            "security_result": self.security_result,
+        }
+
+    @property
+    def digest(self) -> str:
+        return hashlib.sha256(canonical_json_bytes(self.to_canonical_dict())).hexdigest()
+
+    @classmethod
+    def from_canonical_dict(cls, value: Any) -> ExperimentalPublicationEligibility:
+        expected = {
+            "branch",
+            "builder_id",
+            "candidate_commit",
+            "candidate_packet_digest",
+            "candidate_tree",
+            "evidence_digest",
+            "experiment_id",
+            "expires_at",
+            "issued_at",
+            "local_gates",
+            "receipt_type",
+            "request_digest",
+            "request_id",
+            "requested_at",
+            "required_checks",
+            "review_dispositions",
+            "schema_version",
+            "security_result",
+        }
+        parsed = _experimental_exact(value, expected, "experimental_eligibility_keys_invalid")
+        if any(
+            not isinstance(parsed[name], list)
+            for name in ("local_gates", "required_checks", "review_dispositions")
+        ):
+            raise ExperimentalEligibilityError("experimental_eligibility_collections_invalid")
+        normalized = dict(parsed)
+        normalized["required_checks"] = tuple(
+            ExperimentalCheckResult.from_canonical_dict(item) for item in parsed["required_checks"]
+        )
+        normalized["review_dispositions"] = tuple(
+            ExperimentalReviewDisposition.from_canonical_dict(item)
+            for item in parsed["review_dispositions"]
+        )
+        normalized["local_gates"] = tuple(
+            ExperimentalLocalGateResult.from_canonical_dict(item) for item in parsed["local_gates"]
+        )
+        try:
+            receipt = cls(**normalized)
+        except TypeError as error:
+            raise ExperimentalEligibilityError("experimental_eligibility_invalid") from error
+        if canonical_json_bytes(receipt.to_canonical_dict()) != canonical_json_bytes(value):
+            raise ExperimentalEligibilityError("experimental_eligibility_noncanonical")
+        return receipt
 
 
 def _identifier(value: Any) -> str:
@@ -288,9 +758,11 @@ def evaluate_capability_validation(
     if not any(item.check_type == "held_out" for item in claim.transfer_checks):
         reasons.add("held_out_transfer_required")
 
-    required_ids = set(claim.affected_task_ids) | set(claim.guard_task_ids) | {
-        item.task_id for item in claim.transfer_checks
-    }
+    required_ids = (
+        set(claim.affected_task_ids)
+        | set(claim.guard_task_ids)
+        | {item.task_id for item in claim.transfer_checks}
+    )
     if set(baseline_by_id) != set(candidate_by_id) or not required_ids <= set(baseline_by_id):
         reasons.add("evaluation_identity_changed")
 
@@ -321,8 +793,7 @@ def evaluate_capability_validation(
         affected_improved = False
     else:
         affected_improved = all(
-            after.score_basis_points > before.score_basis_points
-            for before, after in affected_pairs
+            after.score_basis_points > before.score_basis_points for before, after in affected_pairs
         )
 
     guard_pairs = tuple(
