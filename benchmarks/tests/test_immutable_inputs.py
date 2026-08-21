@@ -53,17 +53,33 @@ def _hold_publication_lock(entered: object, release: object) -> None:
     immutable_inputs._publication_lock = synchronized_lock
 
 
+def _observe_publication_after_load(entered: object, release: object | None = None) -> None:
+    import carl_bench.immutable_inputs as immutable_inputs
+
+    def after_load() -> None:
+        entered.set()  # type: ignore[attr-defined]
+        if release is not None and not release.wait(timeout=10):  # type: ignore[attr-defined]
+            raise RuntimeError("publication after-load test release timed out")
+
+    immutable_inputs._publication_after_registry_load_for_test = after_load
+
+
 def _publish_public_worker(
     root_text: str,
     payload: bytes,
-    barrier: object,
     results: object,
     entered: object | None = None,
     release: object | None = None,
+    after_load_entered: object | None = None,
+    after_load_release: object | None = None,
+    started: object | None = None,
 ) -> None:
     if entered is not None and release is not None:
         _hold_publication_lock(entered, release)
-    barrier.wait(timeout=10)  # type: ignore[attr-defined]
+    if after_load_entered is not None:
+        _observe_publication_after_load(after_load_entered, after_load_release)
+    if started is not None:
+        started.set()  # type: ignore[attr-defined]
     try:
         entry = publish_public(
             Path(root_text) / "registry.json",
@@ -81,10 +97,14 @@ def _publish_conflicting_private_worker(
     registry_text: str,
     digest: str,
     media_type: str,
-    barrier: object,
     results: object,
+    after_load_entered: object,
+    after_load_release: object | None = None,
+    started: object | None = None,
 ) -> None:
-    barrier.wait(timeout=10)  # type: ignore[attr-defined]
+    _observe_publication_after_load(after_load_entered, after_load_release)
+    if started is not None:
+        started.set()  # type: ignore[attr-defined]
     try:
         entry = publish_private_commitment(
             Path(registry_text),
@@ -382,23 +402,46 @@ def test_public_publish_is_atomic_create_or_reconcile_and_conflicts_fail(tmp_pat
 def test_concurrent_distinct_publishers_retain_both_registry_entries(tmp_path: Path) -> None:
     registry_path = _write_empty_registry(tmp_path)
     context = multiprocessing.get_context("fork")
-    barrier = context.Barrier(2)
     results = context.Queue()
+    first_loaded = context.Event()
+    release_first = context.Event()
+    second_started = context.Event()
+    second_loaded = context.Event()
     payloads = (
         canonical_json_bytes({"policy": "first", "schema_version": 1}),
         canonical_json_bytes({"policy": "second", "schema_version": 1}),
     )
-    processes = tuple(
-        context.Process(
-            target=_publish_public_worker,
-            args=(str(tmp_path), payload, barrier, results),
-        )
-        for payload in payloads
+    first = context.Process(
+        target=_publish_public_worker,
+        args=(str(tmp_path), payloads[0], results),
+        kwargs={
+            "after_load_entered": first_loaded,
+            "after_load_release": release_first,
+        },
     )
+    second = context.Process(
+        target=_publish_public_worker,
+        args=(str(tmp_path), payloads[1], results),
+        kwargs={"after_load_entered": second_loaded, "started": second_started},
+    )
+    processes = (first, second)
 
-    for process in processes:
-        process.start()
-    _join_publishers(processes)
+    try:
+        first.start()
+        assert first_loaded.wait(timeout=10)
+        second.start()
+        assert second_started.wait(timeout=10)
+        assert not second_loaded.wait(timeout=1)
+        release_first.set()
+        _join_publishers(processes)
+    finally:
+        release_first.set()
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+
+    assert second_loaded.is_set()
 
     outcomes = {results.get(timeout=2) for _ in processes}
     expected_digests = {hashlib.sha256(payload).hexdigest() for payload in payloads}
@@ -412,28 +455,45 @@ def test_concurrent_conflicting_publishers_have_one_winner_and_one_conflict(
 ) -> None:
     registry_path = _write_empty_registry(tmp_path)
     context = multiprocessing.get_context("fork")
-    barrier = context.Barrier(2)
     results = context.Queue()
+    first_loaded = context.Event()
+    release_first = context.Event()
+    second_started = context.Event()
+    second_loaded = context.Event()
     digest = hashlib.sha256(b"same committed private object").hexdigest()
     media_types = (EXPERIMENT_MEDIA_TYPE, POLICY_MEDIA_TYPE)
-    processes = tuple(
-        context.Process(
-            target=_publish_conflicting_private_worker,
-            args=(str(registry_path), digest, media_type, barrier, results),
-        )
-        for media_type in media_types
+    first = context.Process(
+        target=_publish_conflicting_private_worker,
+        args=(str(registry_path), digest, media_types[0], results, first_loaded, release_first),
     )
+    second = context.Process(
+        target=_publish_conflicting_private_worker,
+        args=(str(registry_path), digest, media_types[1], results, second_loaded),
+        kwargs={"started": second_started},
+    )
+    processes = (first, second)
 
-    for process in processes:
-        process.start()
-    _join_publishers(processes)
+    try:
+        first.start()
+        assert first_loaded.wait(timeout=10)
+        second.start()
+        assert second_started.wait(timeout=10)
+        assert not second_loaded.wait(timeout=1)
+        release_first.set()
+        _join_publishers(processes)
+    finally:
+        release_first.set()
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+
+    assert second_loaded.is_set()
 
     outcomes = [results.get(timeout=2) for _ in processes]
-    successes = [value for status, value in outcomes if status == "ok"]
-    failures = [value for status, value in outcomes if status == "error"]
-    assert len(successes) == 1
-    assert failures == ["registry_entry_conflict"]
-    assert load_registry(registry_path).entries[0].media_type == successes[0]
+    assert ("ok", EXPERIMENT_MEDIA_TYPE) in outcomes
+    assert ("error", "registry_entry_conflict") in outcomes
+    assert load_registry(registry_path).entries[0].media_type == EXPERIMENT_MEDIA_TYPE
 
 
 @pytest.mark.skipif(os.name == "nt", reason="requires POSIX no-follow open")
@@ -516,13 +576,12 @@ def test_publication_fails_closed_when_registry_root_is_replaced_while_locked(
     _write_empty_registry(outside)
     payload = canonical_json_bytes({"policy": "pinned-root", "schema_version": 1})
     context = multiprocessing.get_context("fork")
-    barrier = context.Barrier(1)
     entered = context.Event()
     release = context.Event()
     results = context.Queue()
     process = context.Process(
         target=_publish_public_worker,
-        args=(str(root), payload, barrier, results, entered, release),
+        args=(str(root), payload, results, entered, release),
     )
 
     process.start()
@@ -549,13 +608,12 @@ def test_publication_rejects_replaced_lock_before_any_commit(tmp_path: Path) -> 
     first = canonical_json_bytes({"policy": "old-lock", "schema_version": 1})
     second = canonical_json_bytes({"policy": "new-lock", "schema_version": 1})
     context = multiprocessing.get_context("fork")
-    barrier = context.Barrier(1)
     entered = context.Event()
     release = context.Event()
     first_results = context.Queue()
     first_process = context.Process(
         target=_publish_public_worker,
-        args=(str(root), first, barrier, first_results, entered, release),
+        args=(str(root), first, first_results, entered, release),
     )
 
     first_process.start()
@@ -568,7 +626,7 @@ def test_publication_rejects_replaced_lock_before_any_commit(tmp_path: Path) -> 
     second_results = context.Queue()
     second_process = context.Process(
         target=_publish_public_worker,
-        args=(str(root), second, context.Barrier(1), second_results),
+        args=(str(root), second, second_results),
     )
     second_process.start()
     second_process.join(timeout=10)

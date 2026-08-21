@@ -15,7 +15,7 @@ import sys
 import tarfile
 import tempfile
 import unicodedata
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -53,6 +53,8 @@ _KNOWN_MEDIA = {
     METRIC_PACK_MEDIA_TYPE: frozenset({1}),
     POLICY_MEDIA_TYPE: frozenset({1}),
 }
+
+_publication_after_registry_load_for_test: Callable[[], None] | None = None
 
 
 class ImmutableInputError(ValueError):
@@ -932,6 +934,8 @@ def _publish_entry(
             _reconcile_crash_temps_at(transaction.public_fd)
         transaction.verify()
         registry = _load_registry_at(transaction)
+        if _publication_after_registry_load_for_test is not None:
+            _publication_after_registry_load_for_test()
         by_digest = {item.digest: item for item in registry.entries}
         existing = by_digest.get(entry.digest)
         if existing is not None and existing != entry:

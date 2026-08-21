@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import shlex
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
@@ -166,6 +167,17 @@ def _assert_immutable_consumer_contract(document: str, *, mode: str) -> None:
     ]
     assert len(matches) == 1, (mode, consumer_id)
     consumer = matches[0]
+    consumer_tokens = [token for token in shlex.split(consumer.run, posix=True) if token != "\n"]
+    command_tokens = {
+        "improvement": ("-m", "carl_bench.cloud_harness"),
+        "soak": ("-m", "carl_bench.immutable_inputs", "soak-health"),
+    }[mode]
+    command_starts = [
+        index
+        for index in range(len(consumer_tokens) - len(command_tokens) + 1)
+        if tuple(consumer_tokens[index : index + len(command_tokens)]) == command_tokens
+    ]
+    assert len(command_starts) == 1, (mode, "consumer command")
     consumer_index = steps.index(consumer)
     resolvers = [
         step
@@ -193,6 +205,13 @@ def _assert_immutable_consumer_contract(document: str, *, mode: str) -> None:
         "METRIC_PACK_INPUT": ("metric-pack", "metric-pack-digest"),
         "POLICY_INPUT": ("policy", "policy-digest"),
     }
+    expected_environment = {
+        variable: f"${{{{ steps.{resolver.identifier}.outputs.{kind.replace('-', '_')} }}}}"
+        for variable, (kind, _) in required.items()
+    }
+    assert {
+        name: value for name, value in consumer.environment.items() if name.endswith("_INPUT")
+    } == expected_environment
     for variable, (kind, digest_argument) in required.items():
         digest_variable = kind.replace("-", "_").upper() + "_DIGEST"
         output_name = kind.replace("-", "_")
@@ -201,7 +220,16 @@ def _assert_immutable_consumer_contract(document: str, *, mode: str) -> None:
         assert consumer.environment.get(variable) == (
             f"${{{{ steps.{resolver.identifier}.outputs.{output_name} }}}}"
         )
-        assert f'"${variable}"' in consumer.run
+        option = f"--{kind}"
+        option_indices = [index for index, token in enumerate(consumer_tokens) if token == option]
+        assert len(option_indices) == 1, (mode, option)
+        assert consumer_tokens[option_indices[0] + 1] == f"${variable}", (mode, option)
+
+    expected_variable_uses = {variable: 1 for variable in required}
+    if mode == "soak":
+        expected_variable_uses["TASK_SET_INPUT"] = 2
+    for variable, expected_uses in expected_variable_uses.items():
+        assert consumer_tokens.count(f"${variable}") == expected_uses, (mode, variable)
 
     assert not any(name.endswith("_DIGEST") for name in consumer.environment)
     assert " resolve-set " not in consumer.run
@@ -531,3 +559,35 @@ def test_workflow_contract_rejects_consumer_path_or_resolver_bypass_mutations() 
     without_resolver = _remove_named_step(soak, "Verify immutable inputs outside subject authority")
     with pytest.raises(AssertionError):
         _assert_immutable_consumer_contract(without_resolver, mode="soak")
+
+
+def test_workflow_contract_binds_each_consumer_option_to_its_resolved_output() -> None:
+    improvement = IMPROVEMENT_WORKFLOW_PATH.read_text(encoding="utf-8")
+    soak = SOAK_WORKFLOW_PATH.read_text(encoding="utf-8")
+
+    alternate_with_noop = improvement.replace(
+        '--policy "$POLICY_INPUT" \\\n',
+        '--policy /tmp/alternate \\\n              "$POLICY_INPUT" \\\n',
+        1,
+    )
+    assert alternate_with_noop != improvement
+    with pytest.raises(AssertionError):
+        _assert_immutable_consumer_contract(alternate_with_noop, mode="improvement")
+
+    aliased_output = soak.replace(
+        "POLICY_INPUT: ${{ steps.immutable_inputs.outputs.policy }}",
+        "POLICY_INPUT: ${{ steps.immutable_inputs.outputs.metric_pack }}",
+        1,
+    )
+    assert aliased_output != soak
+    with pytest.raises(AssertionError):
+        _assert_immutable_consumer_contract(aliased_output, mode="soak")
+
+    duplicate_option = soak.replace(
+        '--policy "$POLICY_INPUT" \\\n',
+        '--policy "$POLICY_INPUT" --policy "$POLICY_INPUT" \\\n',
+        1,
+    )
+    assert duplicate_option != soak
+    with pytest.raises(AssertionError):
+        _assert_immutable_consumer_contract(duplicate_option, mode="soak")
