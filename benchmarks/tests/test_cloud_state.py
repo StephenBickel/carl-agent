@@ -6,6 +6,7 @@ import pickle
 from dataclasses import replace
 from datetime import UTC, datetime
 from inspect import signature
+from types import SimpleNamespace
 
 import pytest
 from cryptography.hazmat.primitives import serialization
@@ -22,6 +23,7 @@ from carl_bench.cloud_state import (
     CommandState,
     DeadHolderObservation,
     EvidenceObject,
+    HealthSnapshot,
     LeaseReconciliation,
     LeaseRelease,
     StateBackend,
@@ -287,8 +289,13 @@ def test_authority_verifier_is_immutable_and_nontransferable() -> None:
     )
 
     assert not hasattr(verifier, "__dict__")
-    with pytest.raises(AttributeError):
-        verifier.clock = _clock("2026-08-20T12:01:00Z")
+    for attribute, replacement in (
+        ("_clock", _clock("2026-08-20T12:01:00Z")),
+        ("_authority_key", _OBSERVATION_KEY),
+        ("_dead_holder_key", _TRUSTED_KEY),
+    ):
+        with pytest.raises(AttributeError, match="AuthorityVerifier is immutable"):
+            setattr(verifier, attribute, replacement)
     for transfer in (copy.copy, copy.deepcopy, pickle.dumps):
         with pytest.raises(TypeError, match="AuthorityVerifier cannot be copied or serialized"):
             transfer(verifier)
@@ -587,6 +594,18 @@ def test_verifier_rejects_future_dead_holder_observations() -> None:
             verifier=_VERIFIER,
             capability=_lease_capability("reconcile_lease", 4, "worker-a"),
             dead_holder=_dead_liveness(revision=4, observed_at="2026-08-20T12:01:00Z"),
+        )
+
+
+def test_dead_holder_observation_expires_at_the_exact_boundary() -> None:
+    with pytest.raises(CloudStateError, match="dead_holder_observation_expired"):
+        _verifier_at("2026-08-20T12:05:00Z").require_dead_holder(
+            _dead_liveness(revision=4),
+            authority="coordinator",
+            subject_id="worker-a",
+            scope_kind="lease",
+            scope_key="coordinator",
+            revision=4,
         )
 
 
@@ -1322,3 +1341,312 @@ def test_every_backend_mutation_has_an_exact_action_and_scope_binding(
             scope_key=f"{scope_kind}-01",
             revision=3,
         )
+
+
+class _FakeStateBackend(StateBackend):
+    def __init__(self, *, verifier: AuthorityVerifier) -> None:
+        self.hook_calls: list[str] = []
+        super().__init__(verifier=verifier)
+
+    def _record(self, name: str) -> str:
+        self.hook_calls.append(name)
+        return name
+
+    def _register_manifest(self, manifest, *, observed_at):
+        return self._record("register_manifest")
+
+    def _append_event(self, event, *, observed_at):
+        return self._record("append_event")
+
+    def _create_command(self, command, *, observed_at):
+        return self._record("create_command")
+
+    def _claim_command(self, claim, *, observed_at):
+        return self._record("claim_command")
+
+    def _complete_command(self, transition, *, observed_at):
+        return self._record("complete_command")
+
+    def _fail_command(self, transition, *, observed_at):
+        return self._record("fail_command")
+
+    def _reconcile_expired_claim(self, reconciliation, *, dead_holder, observed_at):
+        return self._record("reconcile_expired_claim")
+
+    def _acquire_lease(self, desired, *, observed_at):
+        return self._record("acquire_lease")
+
+    def _reconcile_lease(self, reconciliation, *, dead_holder, observed_at):
+        return self._record("reconcile_lease")
+
+    def _release_lease(self, release, *, observed_at):
+        return self._record("release_lease")
+
+    def _claim_supervisor_trigger(self, *, trigger_id, claim_id, expected_revision, observed_at):
+        return self._record("claim_supervisor_trigger")
+
+    def _resolve_supervisor_trigger(
+        self, *, trigger_id, claim_id, expected_revision, resolution, observed_at
+    ):
+        return self._record("resolve_supervisor_trigger")
+
+    def _register_evidence(self, evidence, *, observed_at):
+        return self._record("register_evidence")
+
+    def _record_health(self, snapshot, *, observed_at):
+        return self._record("record_health")
+
+    def load_projection(self, experiment_id):
+        raise NotImplementedError
+
+    def health_snapshot(self):
+        raise NotImplementedError
+
+
+def test_state_backend_wrappers_enforce_exact_actions_before_storage_hooks() -> None:
+    backend = _FakeStateBackend(verifier=_VERIFIER)
+    command = _command()
+    claim = _claim()
+    transition = _complete_transition()
+    reconciliation = ClaimReconciliation(
+        command_key=command.command_key,
+        claim_id=claim.claim_id,
+        authority=claim.authority,
+        expected_revision=8,
+        next_revision=9,
+        observed_at=_TIMESTAMP,
+    )
+    lease = CloudLease(
+        lease_key="coordinator",
+        holder_id="worker-a",
+        authority="coordinator",
+        revision=4,
+        acquired_at="2026-08-20T11:00:00Z",
+        expires_at="2026-08-20T11:05:00Z",
+    )
+    lease_reconciliation = LeaseReconciliation(
+        lease_key=lease.lease_key,
+        holder_id=lease.holder_id,
+        authority=lease.authority,
+        expected_revision=lease.revision,
+        next_revision=lease.revision + 1,
+        observed_at=_TIMESTAMP,
+    )
+    release = LeaseRelease(
+        lease_key=lease.lease_key,
+        holder_id=lease.holder_id,
+        authority=lease.authority,
+        expected_revision=lease.revision,
+        next_revision=lease.revision + 1,
+        released_at=_TIMESTAMP,
+        observation_digest=None,
+    )
+    evidence = EvidenceObject(
+        digest=_DIGEST,
+        object_key=f"evidence/{_DIGEST}",
+        object_version="version-01",
+        producer="validator",
+        request_digest=_DIGEST,
+        media_type="application/json",
+        retained_until="2026-09-20T12:00:00Z",
+    )
+    health = HealthSnapshot(observed_at=_TIMESTAMP, healthy=True, detail_digest=_DIGEST)
+    manifest = SimpleNamespace(experiment_id="experiment-01")
+    event = SimpleNamespace(experiment_id="experiment-01", stage_attempt_id="attempt-01")
+    resolution = SimpleNamespace(status="resolved")
+    dead_claim = _dead_holder_observation(
+        scope_kind="command",
+        scope_key=command.command_key,
+        holder_id=claim.claim_id,
+        authority=claim.authority,
+        revision=reconciliation.expected_revision,
+    )
+    dead_lease = _dead_liveness(revision=lease.revision)
+
+    operations = (
+        (
+            "register_manifest",
+            dict(
+                authority="builder",
+                subject_id=manifest.experiment_id,
+                scope_kind="manifest",
+                scope_key=manifest.experiment_id,
+                revision=0,
+            ),
+            lambda capability: backend.register_manifest(manifest, capability=capability),
+        ),
+        (
+            "append_event",
+            dict(
+                authority="builder",
+                subject_id=event.stage_attempt_id,
+                scope_kind="event",
+                scope_key=event.experiment_id,
+                revision=0,
+            ),
+            lambda capability: backend.append_event(event, capability=capability),
+        ),
+        (
+            "create_command",
+            dict(
+                authority=command.authority,
+                subject_id=command.effect_key,
+                scope_kind="command",
+                scope_key=command.command_key,
+                revision=command.expected_revision,
+            ),
+            lambda capability: backend.create_command(command, capability=capability),
+        ),
+        (
+            "claim_command",
+            dict(
+                authority=claim.authority,
+                subject_id=claim.claim_id,
+                scope_kind="command",
+                scope_key=claim.command_key,
+                revision=claim.expected_revision,
+            ),
+            lambda capability: backend.claim_command(claim, capability=capability),
+        ),
+        (
+            "complete_command",
+            dict(
+                authority=transition.authority,
+                subject_id=transition.claim_id,
+                scope_kind="command",
+                scope_key=transition.command_key,
+                revision=transition.expected_revision,
+            ),
+            lambda capability: backend.complete_command(transition, capability=capability),
+        ),
+        (
+            "fail_command",
+            dict(
+                authority=transition.authority,
+                subject_id=transition.claim_id,
+                scope_kind="command",
+                scope_key=transition.command_key,
+                revision=transition.expected_revision,
+            ),
+            lambda capability: backend.fail_command(transition, capability=capability),
+        ),
+        (
+            "reconcile_expired_claim",
+            dict(
+                authority=reconciliation.authority,
+                subject_id=reconciliation.claim_id,
+                scope_kind="command",
+                scope_key=reconciliation.command_key,
+                revision=reconciliation.expected_revision,
+            ),
+            lambda capability: backend.reconcile_expired_claim(
+                reconciliation, capability=capability, dead_holder=dead_claim
+            ),
+        ),
+        (
+            "acquire_lease",
+            dict(
+                authority=lease.authority,
+                subject_id=lease.holder_id,
+                scope_kind="lease",
+                scope_key=lease.lease_key,
+                revision=lease.revision,
+            ),
+            lambda capability: backend.acquire_lease(lease, capability=capability),
+        ),
+        (
+            "reconcile_lease",
+            dict(
+                authority=lease_reconciliation.authority,
+                subject_id=lease_reconciliation.holder_id,
+                scope_kind="lease",
+                scope_key=lease_reconciliation.lease_key,
+                revision=lease_reconciliation.expected_revision,
+            ),
+            lambda capability: backend.reconcile_lease(
+                lease_reconciliation, capability=capability, dead_holder=dead_lease
+            ),
+        ),
+        (
+            "release_lease",
+            dict(
+                authority=release.authority,
+                subject_id=release.holder_id,
+                scope_kind="lease",
+                scope_key=release.lease_key,
+                revision=release.expected_revision,
+            ),
+            lambda capability: backend.release_lease(release, capability=capability),
+        ),
+        (
+            "claim_supervisor_trigger",
+            dict(
+                authority="supervisor",
+                subject_id="trigger-claim-01",
+                scope_kind="supervisor_trigger",
+                scope_key="trigger-01",
+                revision=3,
+            ),
+            lambda capability: backend.claim_supervisor_trigger(
+                trigger_id="trigger-01",
+                claim_id="trigger-claim-01",
+                expected_revision=3,
+                capability=capability,
+            ),
+        ),
+        (
+            "resolve_supervisor_trigger",
+            dict(
+                authority="supervisor",
+                subject_id="trigger-claim-01",
+                scope_kind="supervisor_trigger",
+                scope_key="trigger-01",
+                revision=3,
+            ),
+            lambda capability: backend.resolve_supervisor_trigger(
+                trigger_id="trigger-01",
+                claim_id="trigger-claim-01",
+                expected_revision=3,
+                resolution=resolution,
+                capability=capability,
+            ),
+        ),
+        (
+            "register_evidence",
+            dict(
+                authority=evidence.producer,
+                subject_id=evidence.object_version,
+                scope_kind="evidence",
+                scope_key=evidence.object_key,
+                revision=0,
+            ),
+            lambda capability: backend.register_evidence(evidence, capability=capability),
+        ),
+        (
+            "record_health",
+            dict(
+                authority="observer",
+                subject_id=health.detail_digest,
+                scope_kind="health",
+                scope_key=health.detail_digest,
+                revision=0,
+            ),
+            lambda capability: backend.record_health(health, capability=capability),
+        ),
+    )
+
+    for action, binding, invoke in operations:
+        assert invoke(_authority_capability(action=action, **binding)) == action
+        before = list(backend.hook_calls)
+        wrong_action = "append_event" if action != "append_event" else "register_manifest"
+        with pytest.raises(CloudStateError, match="authority_capability_mismatch"):
+            invoke(_authority_capability(action=wrong_action, **binding))
+        assert backend.hook_calls == before
+
+
+def test_state_backend_rejects_public_mutation_overrides() -> None:
+    with pytest.raises(TypeError, match="cannot override authorized mutation"):
+
+        class UnsafeBackend(_FakeStateBackend):
+            def claim_command(self, claim, *, capability):
+                return self._claim_command(claim, observed_at=_fixed_clock())

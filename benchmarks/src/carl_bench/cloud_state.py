@@ -10,10 +10,11 @@ import base64
 import binascii
 import hashlib
 import re
+from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Literal, final
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import serialization
@@ -1592,81 +1593,289 @@ def release_lease(
     )
 
 
-class StateBackend(Protocol):
-    """Transactional adapter boundary that owns one immutable authority verifier.
+_BACKEND_MUTATIONS = frozenset(
+    {
+        "register_manifest",
+        "append_event",
+        "create_command",
+        "claim_command",
+        "complete_command",
+        "fail_command",
+        "reconcile_expired_claim",
+        "acquire_lease",
+        "reconcile_lease",
+        "release_lease",
+        "claim_supervisor_trigger",
+        "resolve_supervisor_trigger",
+        "register_evidence",
+        "record_health",
+    }
+)
 
-    Every mutation accepts its raw signed capability and verifies the action matching the method
-    name, except ``record_health`` which uses that same explicit action. Reconciliations also
-    verify the raw dead-holder observation with the backend-owned verifier.
+
+class StateBackend(ABC):
+    """Authorized template-method boundary for transactional state adapters.
+
+    Public mutation wrappers are final and cannot be replaced by adapters. They capture trusted
+    time once, verify the exact signed action and object scope, then delegate storage only to the
+    corresponding protected hook. Hostile code already executing inside the controller process is
+    outside this ordinary Python object boundary.
     """
 
+    __slots__ = ("_verifier",)
+
+    def __init_subclass__(cls, **kwargs: object) -> None:
+        super().__init_subclass__(**kwargs)
+        overridden = _BACKEND_MUTATIONS.intersection(cls.__dict__)
+        if overridden:
+            names = ", ".join(sorted(overridden))
+            raise TypeError(f"cannot override authorized mutation: {names}")
+
     def __init__(self, *, verifier: AuthorityVerifier) -> None:
-        """Retain the controller-owned verifier for the backend instance's lifetime."""
-        ...
+        if type(verifier) is not AuthorityVerifier:
+            raise CloudStateError("authority_verifier_required")
+        object.__setattr__(self, "_verifier", verifier)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if name == "_verifier" and hasattr(self, "_verifier"):
+            raise AttributeError("StateBackend verifier is immutable")
+        object.__setattr__(self, name, value)
 
     @property
-    def verifier(self) -> AuthorityVerifier: ...
+    def verifier(self) -> AuthorityVerifier:
+        return self._verifier
 
+    def _authorize(
+        self,
+        capability: AuthorityCapability,
+        *,
+        action: str,
+        authority: str,
+        subject_id: str,
+        scope_kind: str,
+        scope_key: str,
+        revision: int,
+        now: datetime,
+    ) -> None:
+        _require_capability(
+            self._verifier,
+            capability,
+            action=action,
+            authority=authority,
+            subject_id=subject_id,
+            scope_kind=scope_kind,
+            scope_key=scope_key,
+            revision=revision,
+            now=now,
+        )
+
+    @final
     def register_manifest(
-        self,
-        manifest: ExperimentManifest,
-        *,
-        capability: AuthorityCapability,
-    ) -> bool: ...
+        self, manifest: ExperimentManifest, *, capability: AuthorityCapability
+    ) -> bool:
+        now = _mutation_time(self._verifier)
+        self._authorize(
+            capability,
+            action="register_manifest",
+            authority="builder",
+            subject_id=manifest.experiment_id,
+            scope_kind="manifest",
+            scope_key=manifest.experiment_id,
+            revision=0,
+            now=now,
+        )
+        return self._register_manifest(manifest, observed_at=now)
 
+    @final
     def append_event(
-        self,
-        event: ExperimentEvent,
-        *,
-        capability: AuthorityCapability,
-    ) -> AppendResult: ...
+        self, event: ExperimentEvent, *, capability: AuthorityCapability
+    ) -> AppendResult:
+        if not isinstance(capability, AuthorityCapability):
+            raise CloudStateError("invalid_authority_capability")
+        now = _mutation_time(self._verifier)
+        self._authorize(
+            capability,
+            action="append_event",
+            authority=capability.authority,
+            subject_id=event.stage_attempt_id,
+            scope_kind="event",
+            scope_key=event.experiment_id,
+            revision=0,
+            now=now,
+        )
+        return self._append_event(event, observed_at=now)
 
+    @final
     def create_command(
         self, command: CloudCommand, *, capability: AuthorityCapability
-    ) -> CommandMutation: ...
+    ) -> CommandMutation:
+        now = _mutation_time(self._verifier)
+        self._authorize(
+            capability,
+            action="create_command",
+            authority=command.authority,
+            subject_id=command.effect_key,
+            scope_kind="command",
+            scope_key=command.command_key,
+            revision=command.expected_revision,
+            now=now,
+        )
+        return self._create_command(command, observed_at=now)
 
+    @final
     def claim_command(
         self, claim: CommandClaim, *, capability: AuthorityCapability
-    ) -> CommandMutation: ...
+    ) -> CommandMutation:
+        now = _mutation_time(self._verifier)
+        self._authorize(
+            capability,
+            action="claim_command",
+            authority=claim.authority,
+            subject_id=claim.claim_id,
+            scope_kind="command",
+            scope_key=claim.command_key,
+            revision=claim.expected_revision,
+            now=now,
+        )
+        return self._claim_command(claim, observed_at=now)
 
+    @final
     def complete_command(
-        self,
-        transition: StateTransition,
-        *,
-        capability: AuthorityCapability,
-    ) -> CommandMutation: ...
+        self, transition: StateTransition, *, capability: AuthorityCapability
+    ) -> CommandMutation:
+        now = _mutation_time(self._verifier)
+        self._authorize(
+            capability,
+            action="complete_command",
+            authority=transition.authority,
+            subject_id=transition.claim_id,
+            scope_kind="command",
+            scope_key=transition.command_key,
+            revision=transition.expected_revision,
+            now=now,
+        )
+        return self._complete_command(transition, observed_at=now)
 
+    @final
     def fail_command(
-        self,
-        transition: StateTransition,
-        *,
-        capability: AuthorityCapability,
-    ) -> CommandMutation: ...
+        self, transition: StateTransition, *, capability: AuthorityCapability
+    ) -> CommandMutation:
+        now = _mutation_time(self._verifier)
+        self._authorize(
+            capability,
+            action="fail_command",
+            authority=transition.authority,
+            subject_id=transition.claim_id,
+            scope_kind="command",
+            scope_key=transition.command_key,
+            revision=transition.expected_revision,
+            now=now,
+        )
+        return self._fail_command(transition, observed_at=now)
 
+    @final
     def reconcile_expired_claim(
         self,
         reconciliation: ClaimReconciliation,
         *,
         capability: AuthorityCapability,
         dead_holder: DeadHolderObservation,
-    ) -> CommandMutation: ...
+    ) -> CommandMutation:
+        now = _mutation_time(self._verifier)
+        self._authorize(
+            capability,
+            action="reconcile_expired_claim",
+            authority=reconciliation.authority,
+            subject_id=reconciliation.claim_id,
+            scope_kind="command",
+            scope_key=reconciliation.command_key,
+            revision=reconciliation.expected_revision,
+            now=now,
+        )
+        observation = _require_dead_holder(
+            self._verifier,
+            dead_holder,
+            authority=reconciliation.authority,
+            subject_id=reconciliation.claim_id,
+            scope_kind="command",
+            scope_key=reconciliation.command_key,
+            revision=reconciliation.expected_revision,
+            now=now,
+        )
+        if reconciliation.observed_at != observation.observed_at:
+            raise CloudStateError("dead_holder_observation_mismatch")
+        return self._reconcile_expired_claim(
+            reconciliation, dead_holder=observation, observed_at=now
+        )
 
+    @final
     def acquire_lease(
         self, desired: CloudLease, *, capability: AuthorityCapability
-    ) -> LeaseMutation: ...
+    ) -> LeaseMutation:
+        now = _mutation_time(self._verifier)
+        self._authorize(
+            capability,
+            action="acquire_lease",
+            authority=desired.authority,
+            subject_id=desired.holder_id,
+            scope_kind="lease",
+            scope_key=desired.lease_key,
+            revision=desired.revision,
+            now=now,
+        )
+        return self._acquire_lease(desired, observed_at=now)
 
+    @final
     def reconcile_lease(
         self,
         reconciliation: LeaseReconciliation,
         *,
         capability: AuthorityCapability,
         dead_holder: DeadHolderObservation,
-    ) -> LeaseMutation: ...
+    ) -> LeaseMutation:
+        now = _mutation_time(self._verifier)
+        self._authorize(
+            capability,
+            action="reconcile_lease",
+            authority=reconciliation.authority,
+            subject_id=reconciliation.holder_id,
+            scope_kind="lease",
+            scope_key=reconciliation.lease_key,
+            revision=reconciliation.expected_revision,
+            now=now,
+        )
+        observation = _require_dead_holder(
+            self._verifier,
+            dead_holder,
+            authority=reconciliation.authority,
+            subject_id=reconciliation.holder_id,
+            scope_kind="lease",
+            scope_key=reconciliation.lease_key,
+            revision=reconciliation.expected_revision,
+            now=now,
+        )
+        if reconciliation.observed_at != observation.observed_at:
+            raise CloudStateError("dead_holder_observation_mismatch")
+        return self._reconcile_lease(reconciliation, dead_holder=observation, observed_at=now)
 
+    @final
     def release_lease(
         self, release: LeaseRelease, *, capability: AuthorityCapability
-    ) -> LeaseMutation: ...
+    ) -> LeaseMutation:
+        now = _mutation_time(self._verifier)
+        self._authorize(
+            capability,
+            action="release_lease",
+            authority=release.authority,
+            subject_id=release.holder_id,
+            scope_kind="lease",
+            scope_key=release.lease_key,
+            revision=release.expected_revision,
+            now=now,
+        )
+        return self._release_lease(release, observed_at=now)
 
+    @final
     def claim_supervisor_trigger(
         self,
         *,
@@ -1674,8 +1883,26 @@ class StateBackend(Protocol):
         claim_id: str,
         expected_revision: int,
         capability: AuthorityCapability,
-    ) -> TriggerMutation: ...
+    ) -> TriggerMutation:
+        now = _mutation_time(self._verifier)
+        self._authorize(
+            capability,
+            action="claim_supervisor_trigger",
+            authority="supervisor",
+            subject_id=claim_id,
+            scope_kind="supervisor_trigger",
+            scope_key=trigger_id,
+            revision=expected_revision,
+            now=now,
+        )
+        return self._claim_supervisor_trigger(
+            trigger_id=trigger_id,
+            claim_id=claim_id,
+            expected_revision=expected_revision,
+            observed_at=now,
+        )
 
+    @final
     def resolve_supervisor_trigger(
         self,
         *,
@@ -1684,24 +1911,139 @@ class StateBackend(Protocol):
         expected_revision: int,
         resolution: TriggerResolution,
         capability: AuthorityCapability,
+    ) -> TriggerMutation:
+        now = _mutation_time(self._verifier)
+        self._authorize(
+            capability,
+            action="resolve_supervisor_trigger",
+            authority="supervisor",
+            subject_id=claim_id,
+            scope_kind="supervisor_trigger",
+            scope_key=trigger_id,
+            revision=expected_revision,
+            now=now,
+        )
+        return self._resolve_supervisor_trigger(
+            trigger_id=trigger_id,
+            claim_id=claim_id,
+            expected_revision=expected_revision,
+            resolution=resolution,
+            observed_at=now,
+        )
+
+    @final
+    def register_evidence(
+        self, evidence: EvidenceObject, *, capability: AuthorityCapability
+    ) -> bool:
+        now = _mutation_time(self._verifier)
+        self._authorize(
+            capability,
+            action="register_evidence",
+            authority=evidence.producer,
+            subject_id=evidence.object_version,
+            scope_kind="evidence",
+            scope_key=evidence.object_key,
+            revision=0,
+            now=now,
+        )
+        return self._register_evidence(evidence, observed_at=now)
+
+    @final
+    def record_health(self, snapshot: HealthSnapshot, *, capability: AuthorityCapability) -> bool:
+        now = _mutation_time(self._verifier)
+        self._authorize(
+            capability,
+            action="record_health",
+            authority="observer",
+            subject_id=snapshot.detail_digest,
+            scope_kind="health",
+            scope_key=snapshot.detail_digest,
+            revision=0,
+            now=now,
+        )
+        return self._record_health(snapshot, observed_at=now)
+
+    @abstractmethod
+    def _register_manifest(
+        self, manifest: ExperimentManifest, *, observed_at: datetime
+    ) -> bool: ...
+
+    @abstractmethod
+    def _append_event(self, event: ExperimentEvent, *, observed_at: datetime) -> AppendResult: ...
+
+    @abstractmethod
+    def _create_command(
+        self, command: CloudCommand, *, observed_at: datetime
+    ) -> CommandMutation: ...
+
+    @abstractmethod
+    def _claim_command(self, claim: CommandClaim, *, observed_at: datetime) -> CommandMutation: ...
+
+    @abstractmethod
+    def _complete_command(
+        self, transition: StateTransition, *, observed_at: datetime
+    ) -> CommandMutation: ...
+
+    @abstractmethod
+    def _fail_command(
+        self, transition: StateTransition, *, observed_at: datetime
+    ) -> CommandMutation: ...
+
+    @abstractmethod
+    def _reconcile_expired_claim(
+        self,
+        reconciliation: ClaimReconciliation,
+        *,
+        dead_holder: DeadHolderObservation,
+        observed_at: datetime,
+    ) -> CommandMutation: ...
+
+    @abstractmethod
+    def _acquire_lease(self, desired: CloudLease, *, observed_at: datetime) -> LeaseMutation: ...
+
+    @abstractmethod
+    def _reconcile_lease(
+        self,
+        reconciliation: LeaseReconciliation,
+        *,
+        dead_holder: DeadHolderObservation,
+        observed_at: datetime,
+    ) -> LeaseMutation: ...
+
+    @abstractmethod
+    def _release_lease(self, release: LeaseRelease, *, observed_at: datetime) -> LeaseMutation: ...
+
+    @abstractmethod
+    def _claim_supervisor_trigger(
+        self,
+        *,
+        trigger_id: str,
+        claim_id: str,
+        expected_revision: int,
+        observed_at: datetime,
     ) -> TriggerMutation: ...
 
+    @abstractmethod
+    def _resolve_supervisor_trigger(
+        self,
+        *,
+        trigger_id: str,
+        claim_id: str,
+        expected_revision: int,
+        resolution: TriggerResolution,
+        observed_at: datetime,
+    ) -> TriggerMutation: ...
+
+    @abstractmethod
+    def _register_evidence(self, evidence: EvidenceObject, *, observed_at: datetime) -> bool: ...
+
+    @abstractmethod
+    def _record_health(self, snapshot: HealthSnapshot, *, observed_at: datetime) -> bool: ...
+
+    @abstractmethod
     def load_projection(
         self, experiment_id: str
     ) -> tuple[ExperimentProjection, AutonomyProjection]: ...
 
-    def register_evidence(
-        self,
-        evidence: EvidenceObject,
-        *,
-        capability: AuthorityCapability,
-    ) -> bool: ...
-
-    def record_health(
-        self,
-        snapshot: HealthSnapshot,
-        *,
-        capability: AuthorityCapability,
-    ) -> bool: ...
-
+    @abstractmethod
     def health_snapshot(self) -> HealthSnapshot: ...
