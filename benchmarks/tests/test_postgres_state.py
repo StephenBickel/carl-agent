@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import base64
+import re
 from contextlib import AbstractContextManager
 from dataclasses import replace
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -39,6 +41,43 @@ NOW = datetime(2026, 8, 20, 12, tzinfo=UTC)
 NOW_TEXT = "2026-08-20T12:00:00Z"
 DIGEST_A = "a" * 64
 DIGEST_B = "b" * 64
+WORKFLOW_DATABASE_ROLES = (
+    "carl_builder",
+    "carl_coordinator",
+    "carl_observer",
+    "carl_promoter",
+    "carl_soak",
+    "carl_supervisor",
+    "carl_validator",
+)
+ROLE_PROCEDURES_SQL = (
+    Path(__file__).parents[2] / "infra/autonomy/postgres/002_role_procedures.sql"
+).read_text(encoding="utf-8")
+INITIAL_SQL = (Path(__file__).parents[2] / "infra/autonomy/postgres/001_initial.sql").read_text(
+    encoding="utf-8"
+)
+EVENT_POLICY_CASES = (
+    (EventType.STATE_TRANSITIONED, frozenset({"coordinator", "soak"}), "if"),
+    (EventType.ROLE_RECORDED, frozenset({"builder"}), "if"),
+    (EventType.LEASE_ACQUIRED, frozenset({"coordinator"}), "if"),
+    (EventType.LEASE_RECONCILED, frozenset({"coordinator"}), "case"),
+    (EventType.LEASE_RELEASED, frozenset({"coordinator"}), "case"),
+    (EventType.LIVE_SPEND_RECORDED, frozenset({"coordinator"}), "case"),
+    (EventType.WORKSPACE_PREPARED, frozenset({"builder"}), "case"),
+    (EventType.CANDIDATE_SEALED, frozenset({"builder"}), "case"),
+    (EventType.PAIRED_EVIDENCE_RECORDED, frozenset({"validator"}), "case"),
+    (EventType.REVIEW_PACKET_RECORDED, frozenset({"validator"}), "case"),
+    (EventType.REVIEW_ATTESTED, frozenset({"validator"}), "case"),
+    (EventType.DRAFT_PR_REQUESTED, frozenset({"promoter"}), "case"),
+    (EventType.DRAFT_PR_RECORDED, frozenset({"promoter"}), "case"),
+    (EventType.WORKSPACE_DISPOSED, frozenset({"promoter"}), "case"),
+    (EventType.RETRY_SCHEDULED, frozenset({"coordinator"}), "case"),
+    (EventType.EXPERIMENTAL_PUBLISHED, frozenset({"builder"}), "case"),
+    (EventType.PROTECTED_VALIDATION_RECORDED, frozenset({"validator"}), "case"),
+    (EventType.PROMOTION_RECORDED, frozenset({"promoter"}), "case"),
+    (EventType.SOAK_OBSERVED, frozenset({"soak"}), "case"),
+    (EventType.REVERT_RECORDED, frozenset({"soak"}), "case"),
+)
 
 AUTHORITY_PRIVATE = Ed25519PrivateKey.generate()
 LIVENESS_PRIVATE = Ed25519PrivateKey.generate()
@@ -125,7 +164,7 @@ class FakeConnection:
 
 
 class FakeDatabase:
-    def __init__(self, *, database_role: str = "carl_coordinator") -> None:
+    def __init__(self, *, database_role: str = "carl_state_backend") -> None:
         self.database_role = database_role
         self.calls: list[tuple[str, tuple[object, ...]]] = []
         self.call_depths: list[int] = []
@@ -169,7 +208,7 @@ class FakeDatabase:
         return FakeConnection(self)
 
 
-def _config(database: FakeDatabase, *, role: str = "carl_coordinator") -> PostgresStateConfig:
+def _config(database: FakeDatabase, *, role: str = "carl_state_backend") -> PostgresStateConfig:
     return PostgresStateConfig(
         dsn="postgresql://protected.invalid/carl",
         database_role=role,
@@ -180,12 +219,96 @@ def _config(database: FakeDatabase, *, role: str = "carl_coordinator") -> Postgr
     )
 
 
-def _backend(database: FakeDatabase, *, role: str = "carl_coordinator") -> PostgresStateBackend:
+def _backend(database: FakeDatabase, *, role: str = "carl_state_backend") -> PostgresStateBackend:
     return PostgresStateBackend.from_config(_config(database, role=role))
 
 
 def _canonical(value: dict[str, Any]) -> str:
     return canonical_json_bytes(value).decode("utf-8")
+
+
+@pytest.mark.parametrize("workflow_role", WORKFLOW_DATABASE_ROLES)
+def test_config_rejects_workflow_database_credentials(workflow_role: str) -> None:
+    database = FakeDatabase(database_role=workflow_role)
+
+    with pytest.raises(PostgresStateError, match="database_role_invalid"):
+        _config(database, role=workflow_role)
+
+
+def test_sql_grants_no_state_procedure_execution_to_workflow_roles() -> None:
+    execute_grants = re.findall(
+        r"GRANT\s+EXECUTE\s+ON\s+FUNCTION\s+.*?\s+TO\s+([^;]+);",
+        ROLE_PROCEDURES_SQL,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    granted_roles = {
+        role.strip()
+        for recipients in execute_grants
+        for role in recipients.replace("\n", " ").split(",")
+    }
+
+    assert granted_roles.isdisjoint(WORKFLOW_DATABASE_ROLES)
+
+
+def test_sql_rejects_experimental_publication_outside_experimental_namespace() -> None:
+    branch = re.search(
+        r"WHEN\s+'experimental_published'\s+THEN(?P<body>.*?)WHEN\s+'promotion_recorded'",
+        ROLE_PROCEDURES_SQL,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+    assert branch is not None
+    assert re.search(
+        r"p_payload->>'branch'\s*!~\s*'\^experimental/'",
+        branch.group("body"),
+        flags=re.IGNORECASE,
+    )
+
+
+@pytest.mark.parametrize(("event_type", "authorities", "handler"), EVENT_POLICY_CASES)
+def test_sql_event_vocabulary_authority_and_handler_parity(
+    event_type: EventType, authorities: frozenset[str], handler: str
+) -> None:
+    schema_match = re.search(
+        r"event_type\s+IN\s*\((?P<body>.*?)\)\s*\)",
+        INITIAL_SQL,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    policy_match = re.search(
+        r"FUNCTION\s+carl_autonomy\.event_role_allowed.*?AS\s+\$\$(?P<body>.*?)\$\$;",
+        ROLE_PROCEDURES_SQL,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    validator_match = re.search(
+        r"FUNCTION\s+carl_autonomy\.validate_and_advance_event.*?AS\s+\$\$(?P<body>.*?)\$\$;",
+        ROLE_PROCEDURES_SQL,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    assert schema_match is not None
+    assert policy_match is not None
+    assert validator_match is not None
+
+    schema_events = frozenset(re.findall(r"'([a-z_]+)'", schema_match.group("body")))
+    assert schema_events == frozenset(item.value for item in EventType)
+
+    actual_authorities = {
+        authority
+        for authority in ("builder", "validator", "promoter", "soak", "coordinator")
+        if re.search(
+            rf"WHEN\s+'carl_{authority}'\s+THEN(?:(?!WHEN\s+'carl_|ELSE).)*"
+            rf"'{event_type.value}'",
+            policy_match.group("body"),
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+    }
+    assert actual_authorities == authorities
+
+    handler_pattern = (
+        rf"IF\s+p_event_type\s*=\s*'{event_type.value}'"
+        if handler == "if"
+        else rf"WHEN\s+'{event_type.value}'\s+THEN"
+    )
+    assert re.search(handler_pattern, validator_match.group("body"), flags=re.IGNORECASE)
 
 
 def _command(*, revision: int = 7) -> CloudCommand:
@@ -329,8 +452,8 @@ def _dead_holder(
 
 
 def test_adapter_rejects_forged_observation_before_registration_sql() -> None:
-    database = FakeDatabase(database_role="carl_observer")
-    backend = _backend(database, role="carl_observer")
+    database = FakeDatabase()
+    backend = _backend(database)
     observation = _dead_holder()
     forged = replace(observation, signature_base64=base64.b64encode(bytes(64)).decode("ascii"))
     capability = _capability(
@@ -361,9 +484,9 @@ def test_adapter_rejects_forged_observation_before_registration_sql() -> None:
 
 
 def test_observation_registration_and_reconciliation_bind_digest_only() -> None:
-    database = FakeDatabase(database_role="carl_observer")
+    database = FakeDatabase()
     database.responses["register_dead_holder_observation"] = [{"applied": True}]
-    backend = _backend(database, role="carl_observer")
+    backend = _backend(database)
     observation = _dead_holder()
 
     assert backend._register_dead_holder_observation(observation, observed_at=NOW) is True
@@ -429,7 +552,7 @@ def test_atomic_completion_uses_one_combined_procedure_transaction() -> None:
 
     assert command_result.state.status == "completed"
     assert append_result.event_digest == event.digest
-    mutation_calls = [call for call in database.calls if "carl_autonomy." in call[0]]
+    mutation_calls = [call for call in database.calls if "FROM carl_autonomy." in call[0]]
     assert len(mutation_calls) == 1
     assert "complete_command_and_append_event" in mutation_calls[0][0]
     assert database.transactions_started == database.transactions_committed == 1
@@ -447,8 +570,8 @@ def test_backend_constructs_and_owns_verifier_from_protected_config() -> None:
 
 
 def test_public_authorization_fails_before_opening_database_connection() -> None:
-    database = FakeDatabase(database_role="carl_builder")
-    backend = _backend(database, role="carl_builder")
+    database = FakeDatabase()
+    backend = _backend(database)
     item = sample_manifest()
     wrong = _capability(
         action="register_manifest",
@@ -465,10 +588,41 @@ def test_public_authorization_fails_before_opening_database_connection() -> None
     assert database.calls == []
 
 
+def test_public_append_rejects_capability_from_wrong_event_authority_before_sql() -> None:
+    database = FakeDatabase()
+    backend = _backend(database)
+    event = ExperimentEvent.create(
+        experiment_id=sample_manifest().experiment_id,
+        stage_attempt_id="wrong-authority-retry",
+        event_type=EventType.RETRY_SCHEDULED,
+        occurred_at=NOW_TEXT,
+        payload={
+            "attempt": 1,
+            "changed_action": "retry with state isolation",
+            "failed_stage_attempt_id": "failed-stage-001",
+            "failure_class": "infrastructure",
+            "scheduled_at": NOW_TEXT,
+        },
+    )
+    capability = _capability(
+        action="append_event",
+        authority="builder",
+        subject_id=event.stage_attempt_id,
+        scope_kind="event",
+        scope_key=event.experiment_id,
+        revision=0,
+    )
+
+    with pytest.raises(ValueError, match="event_authority_denied"):
+        backend.append_event(event, capability=capability)
+
+    assert database.calls == []
+
+
 def test_register_manifest_binds_values_and_commits_one_transaction() -> None:
-    database = FakeDatabase(database_role="carl_builder")
+    database = FakeDatabase()
     database.responses["register_manifest"] = [{"applied": True}]
-    backend = _backend(database, role="carl_builder")
+    backend = _backend(database)
     item = sample_manifest()
 
     assert backend._register_manifest(item, observed_at=NOW) is True
@@ -483,10 +637,10 @@ def test_register_manifest_binds_values_and_commits_one_transaction() -> None:
 
 
 def test_database_role_probe_is_inside_the_committing_transaction() -> None:
-    database = FakeDatabase(database_role="carl_builder")
+    database = FakeDatabase()
     database.responses["register_manifest"] = [{"applied": True}]
 
-    _backend(database, role="carl_builder")._register_manifest(sample_manifest(), observed_at=NOW)
+    _backend(database)._register_manifest(sample_manifest(), observed_at=NOW)
 
     role_call = next(
         index
@@ -707,7 +861,7 @@ def test_every_state_backend_hook_maps_to_its_transactional_procedure() -> None:
 def test_adapter_rejects_wrong_database_role_before_mutation() -> None:
     database = FakeDatabase(database_role="carl_builder")
     database.responses["record_health"] = [{"applied": True}]
-    backend = _backend(database, role="carl_observer")
+    backend = _backend(database)
 
     with pytest.raises(PostgresStateError, match="database_role_mismatch"):
         backend._record_health(

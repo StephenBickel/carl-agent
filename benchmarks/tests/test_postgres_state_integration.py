@@ -6,14 +6,26 @@ import os
 import time
 from contextlib import contextmanager
 from dataclasses import replace
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import psycopg
 import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-from test_experiment import manifest as sample_manifest
+from test_experiment import (
+    candidate_artifact,
+    paired_evidence,
+    phase3_build_events,
+    prepared_candidate,
+    sealed_candidate,
+)
+from test_experiment import (
+    manifest as sample_manifest,
+)
 
+from carl_bench.candidate import DraftPullRequest, ReviewAttestation, ReviewPacket
 from carl_bench.canonical import canonical_json_bytes
 from carl_bench.cloud_state import (
     AuthorityCapability,
@@ -29,7 +41,7 @@ from carl_bench.cloud_state import (
     StateTransition,
     TrustedAuthorityKey,
 )
-from carl_bench.experiment import EventType, ExperimentEvent
+from carl_bench.experiment import EventType, ExperimentEvent, ExperimentState
 from carl_bench.postgres_state import PostgresStateBackend, PostgresStateConfig, PostgresStateError
 from carl_bench.supervisor_triggers import (
     RecoveryAttempt,
@@ -110,7 +122,11 @@ def _as_role(postgres: object, role: str):
     with postgres.connect(  # type: ignore[attr-defined]
         POSTGRES_DSN, autocommit=True, row_factory=dict_row
     ) as connection:
-        connection.execute(sql.SQL("SET ROLE {}").format(sql.Identifier(role)))
+        connection.execute(sql.SQL("SET ROLE {}").format(sql.Identifier("carl_state_backend")))
+        connection.execute(
+            "SELECT set_config('carl_autonomy.authority', %s, false)",
+            (role.removeprefix("carl_"),),
+        )
         yield connection
 
 
@@ -137,6 +153,373 @@ def _retry_payload(*, attempt: int, scheduled_at: str, changed_action: str) -> d
         "failure_class": "infrastructure",
         "scheduled_at": scheduled_at,
     }
+
+
+def _state_event(
+    *,
+    attempt: str,
+    source: ExperimentState,
+    target: ExperimentState,
+    occurred_at: str,
+    lease_attempt: str = "lease-phase3",
+    lease_owner: str = "director-phase3",
+) -> ExperimentEvent:
+    payload: dict[str, Any] = {"from_state": source.value, "to_state": target.value}
+    if target in {
+        ExperimentState.BUILDING,
+        ExperimentState.DETERMINISTIC_VALIDATION,
+        ExperimentState.PAIRED_EVALUATION,
+        ExperimentState.HOLDOUT_VALIDATION,
+        ExperimentState.REVIEW_COMPLETE,
+        ExperimentState.PR_OPEN,
+        ExperimentState.MERGED,
+        ExperimentState.SOAKING,
+        ExperimentState.ACCEPTED,
+    }:
+        payload["_lease"] = {"owner_id": lease_owner, "stage_attempt_id": lease_attempt}
+    return ExperimentEvent.create(
+        experiment_id=sample_manifest().experiment_id,
+        stage_attempt_id=attempt,
+        event_type=EventType.STATE_TRANSITIONED,
+        occurred_at=occurred_at,
+        payload=payload,
+    )
+
+
+def _leased_event(
+    *, attempt: str, event_type: EventType, occurred_at: str, payload: dict[str, Any]
+) -> ExperimentEvent:
+    return ExperimentEvent.create(
+        experiment_id=sample_manifest().experiment_id,
+        stage_attempt_id=attempt,
+        event_type=event_type,
+        occurred_at=occurred_at,
+        payload={
+            **payload,
+            "_lease": {"owner_id": "director-phase3", "stage_attempt_id": "lease-phase3"},
+        },
+    )
+
+
+def _full_event_history() -> tuple[ExperimentEvent, ...]:
+    manifest = sample_manifest()
+    candidate = sealed_candidate()
+    evidence = paired_evidence()
+    roles = ("correctness", "security", "maintainability", "benchmark_integrity")
+    packets = {
+        role: ReviewPacket(
+            schema_version=1,
+            experiment_id=manifest.experiment_id,
+            manifest_digest=manifest.digest,
+            candidate_commit=candidate.candidate_commit,
+            role=role,
+            diff_digest=candidate.diff_artifact.digest,
+            deterministic_evidence_digest=candidate.digest,
+            paired_evidence_digest=evidence.digest,
+            review_contract_version="candidate-review-v1",
+        )
+        for role in roles
+    }
+    attestations = {
+        role: ReviewAttestation(
+            schema_version=1,
+            experiment_id=manifest.experiment_id,
+            manifest_digest=manifest.digest,
+            candidate_commit=candidate.candidate_commit,
+            role=role,
+            reviewer_id=f"reviewer-{role}",
+            context_id=f"context-{role}",
+            packet_digest=packets[role].digest,
+            verdict="approve" if index < 3 else "reject",
+            report_artifact=candidate_artifact("review_report", marker),
+        )
+        for index, (role, marker) in enumerate(zip(roles, "789a", strict=True))
+    }
+    draft = DraftPullRequest(
+        schema_version=1,
+        repository="StephenBickel/carl-agent",
+        number=17,
+        url="https://github.com/StephenBickel/carl-agent/pull/17",
+        state="OPEN",
+        is_draft=True,
+        base_branch="main",
+        head_branch=candidate.branch,
+        candidate_commit=candidate.candidate_commit,
+    )
+    events: list[ExperimentEvent] = list(phase3_build_events())
+    events.extend(
+        (
+            ExperimentEvent.create(
+                experiment_id=manifest.experiment_id,
+                stage_attempt_id="parity-retry",
+                event_type=EventType.RETRY_SCHEDULED,
+                occurred_at="2026-08-10T12:00:08Z",
+                payload=_retry_payload(
+                    attempt=1,
+                    scheduled_at="2026-08-10T12:00:08Z",
+                    changed_action="retry with isolated state",
+                ),
+            ),
+            ExperimentEvent.create(
+                experiment_id=manifest.experiment_id,
+                stage_attempt_id="parity-live-spend",
+                event_type=EventType.LIVE_SPEND_RECORDED,
+                occurred_at="2026-08-10T12:00:09Z",
+                payload={"live_microdollars": 500, "run_id": "run-parity-001"},
+            ),
+            _leased_event(
+                attempt="parity-workspace",
+                event_type=EventType.WORKSPACE_PREPARED,
+                occurred_at="2026-08-10T12:01:01Z",
+                payload=prepared_candidate().to_canonical_dict(),
+            ),
+            _leased_event(
+                attempt="parity-sealed",
+                event_type=EventType.CANDIDATE_SEALED,
+                occurred_at="2026-08-10T12:01:02Z",
+                payload=candidate.to_canonical_dict(),
+            ),
+            _state_event(
+                attempt="parity-deterministic",
+                source=ExperimentState.BUILDING,
+                target=ExperimentState.DETERMINISTIC_VALIDATION,
+                occurred_at="2026-08-10T12:01:03Z",
+            ),
+            _state_event(
+                attempt="parity-paired",
+                source=ExperimentState.DETERMINISTIC_VALIDATION,
+                target=ExperimentState.PAIRED_EVALUATION,
+                occurred_at="2026-08-10T12:01:04Z",
+            ),
+            _leased_event(
+                attempt="parity-evidence",
+                event_type=EventType.PAIRED_EVIDENCE_RECORDED,
+                occurred_at="2026-08-10T12:01:05Z",
+                payload=evidence.to_canonical_dict(),
+            ),
+            ExperimentEvent.create(
+                experiment_id=manifest.experiment_id,
+                stage_attempt_id="parity-publication",
+                event_type=EventType.EXPERIMENTAL_PUBLISHED,
+                occurred_at="2026-08-10T12:01:06Z",
+                payload={
+                    "branch": "experimental/parity",
+                    "candidate_packet_digest": candidate.digest,
+                    "commit": candidate.candidate_commit,
+                    "tree": "b" * 40,
+                },
+            ),
+            ExperimentEvent.create(
+                experiment_id=manifest.experiment_id,
+                stage_attempt_id="parity-protected",
+                event_type=EventType.PROTECTED_VALIDATION_RECORDED,
+                occurred_at="2026-08-10T12:01:07Z",
+                payload={
+                    "candidate_commit": candidate.candidate_commit,
+                    "candidate_tree": "b" * 40,
+                    "receipt_digest": "c" * 64,
+                },
+            ),
+        )
+    )
+    for index, role in enumerate(roles, start=8):
+        events.append(
+            _leased_event(
+                attempt=f"parity-packet-{role}",
+                event_type=EventType.REVIEW_PACKET_RECORDED,
+                occurred_at=f"2026-08-10T12:01:{index:02d}Z",
+                payload=packets[role].to_canonical_dict(),
+            )
+        )
+    for index, role in enumerate(roles, start=12):
+        events.append(
+            _leased_event(
+                attempt=f"parity-attestation-{role}",
+                event_type=EventType.REVIEW_ATTESTED,
+                occurred_at=f"2026-08-10T12:01:{index:02d}Z",
+                payload=attestations[role].to_canonical_dict(),
+            )
+        )
+    events.extend(
+        (
+            _leased_event(
+                attempt="parity-draft-request",
+                event_type=EventType.DRAFT_PR_REQUESTED,
+                occurred_at="2026-08-10T12:01:16Z",
+                payload={
+                    "base_branch": "main",
+                    "candidate_commit": candidate.candidate_commit,
+                    "expected_remote_url": "https://github.com/StephenBickel/carl-agent.git",
+                    "head_branch": candidate.branch,
+                    "repository": "StephenBickel/carl-agent",
+                },
+            ),
+            _leased_event(
+                attempt="parity-draft-recorded",
+                event_type=EventType.DRAFT_PR_RECORDED,
+                occurred_at="2026-08-10T12:01:17Z",
+                payload=draft.to_canonical_dict(),
+            ),
+            _leased_event(
+                attempt="parity-workspace-disposed",
+                event_type=EventType.WORKSPACE_DISPOSED,
+                occurred_at="2026-08-10T12:01:18Z",
+                payload={
+                    "branch": candidate.branch,
+                    "candidate_commit": candidate.candidate_commit,
+                },
+            ),
+            _state_event(
+                attempt="parity-holdout",
+                source=ExperimentState.PAIRED_EVALUATION,
+                target=ExperimentState.HOLDOUT_VALIDATION,
+                occurred_at="2026-08-10T12:01:19Z",
+            ),
+        )
+    )
+    for index, (role, marker) in enumerate(zip(roles, "bcde", strict=True), start=20):
+        events.append(
+            _leased_event(
+                attempt=f"parity-role-{role}",
+                event_type=EventType.ROLE_RECORDED,
+                occurred_at=f"2026-08-10T12:01:{index:02d}Z",
+                payload={
+                    "artifact_digest": marker * 64,
+                    "role": role,
+                    "verdict": "approve" if index < 23 else "reject",
+                },
+            )
+        )
+    events.extend(
+        (
+            _state_event(
+                attempt="parity-review-complete",
+                source=ExperimentState.HOLDOUT_VALIDATION,
+                target=ExperimentState.REVIEW_COMPLETE,
+                occurred_at="2026-08-10T12:01:24Z",
+            ),
+            _state_event(
+                attempt="parity-pr-open",
+                source=ExperimentState.REVIEW_COMPLETE,
+                target=ExperimentState.PR_OPEN,
+                occurred_at="2026-08-10T12:01:25Z",
+            ),
+            _state_event(
+                attempt="parity-merged",
+                source=ExperimentState.PR_OPEN,
+                target=ExperimentState.MERGED,
+                occurred_at="2026-08-10T12:01:26Z",
+            ),
+            _state_event(
+                attempt="parity-soaking",
+                source=ExperimentState.MERGED,
+                target=ExperimentState.SOAKING,
+                occurred_at="2026-08-10T12:01:27Z",
+            ),
+            ExperimentEvent.create(
+                experiment_id=manifest.experiment_id,
+                stage_attempt_id="parity-promotion",
+                event_type=EventType.PROMOTION_RECORDED,
+                occurred_at="2026-08-10T12:01:28Z",
+                payload={"merge_commit": "d" * 40, "merge_tree": "e" * 40},
+            ),
+            ExperimentEvent.create(
+                experiment_id=manifest.experiment_id,
+                stage_attempt_id="parity-lease-reconciled",
+                event_type=EventType.LEASE_RECONCILED,
+                occurred_at="2026-08-11T11:59:00Z",
+                payload={"lease_stage_attempt_id": "lease-phase3", "worker_not_live": True},
+            ),
+            ExperimentEvent.create(
+                experiment_id=manifest.experiment_id,
+                stage_attempt_id="parity-soak-lease",
+                event_type=EventType.LEASE_ACQUIRED,
+                occurred_at="2026-08-11T12:00:00Z",
+                payload={"expires_at": "2026-08-11T18:00:00Z", "owner_id": "soak-worker"},
+            ),
+            ExperimentEvent.create(
+                experiment_id=manifest.experiment_id,
+                stage_attempt_id="parity-soak-failed",
+                event_type=EventType.SOAK_OBSERVED,
+                occurred_at="2026-08-11T12:01:00Z",
+                payload={
+                    "evidence_digest": "f" * 64,
+                    "healthy": False,
+                    "merge_commit": "d" * 40,
+                    "observed_at": "2026-08-11T12:01:00Z",
+                },
+            ),
+            ExperimentEvent.create(
+                experiment_id=manifest.experiment_id,
+                stage_attempt_id="parity-revert",
+                event_type=EventType.REVERT_RECORDED,
+                occurred_at="2026-08-11T12:01:30Z",
+                payload={
+                    "hard_failure_digest": "f" * 64,
+                    "merge_commit": "d" * 40,
+                    "restored_tree": "1" * 40,
+                    "revert_candidate_commit": "2" * 40,
+                    "revert_merge_commit": "3" * 40,
+                    "revert_pull_request_number": 18,
+                },
+            ),
+            ExperimentEvent.create(
+                experiment_id=manifest.experiment_id,
+                stage_attempt_id="parity-soak-healthy",
+                event_type=EventType.SOAK_OBSERVED,
+                occurred_at="2026-08-11T12:02:00Z",
+                payload={
+                    "evidence_digest": "4" * 64,
+                    "healthy": True,
+                    "merge_commit": "d" * 40,
+                    "observed_at": "2026-08-11T12:02:00Z",
+                },
+            ),
+            _state_event(
+                attempt="parity-accepted",
+                source=ExperimentState.SOAKING,
+                target=ExperimentState.ACCEPTED,
+                occurred_at="2026-08-11T12:03:00Z",
+                lease_attempt="parity-soak-lease",
+                lease_owner="soak-worker",
+            ),
+            ExperimentEvent.create(
+                experiment_id=manifest.experiment_id,
+                stage_attempt_id="parity-lease-release",
+                event_type=EventType.LEASE_RELEASED,
+                occurred_at="2026-08-11T12:04:00Z",
+                payload={"lease_stage_attempt_id": "parity-soak-lease"},
+            ),
+        )
+    )
+    return tuple(events)
+
+
+def _event_authority(event: ExperimentEvent) -> str:
+    return PostgresStateBackend._event_authority(event)
+
+
+def _backend(postgres: object) -> PostgresStateBackend:
+    from psycopg import sql
+    from psycopg.rows import dict_row
+
+    assert POSTGRES_DSN is not None
+
+    def connect(dsn: str):
+        connection = postgres.connect(dsn, row_factory=dict_row)  # type: ignore[attr-defined]
+        connection.execute(sql.SQL("SET ROLE {}").format(sql.Identifier("carl_state_backend")))
+        return connection
+
+    return PostgresStateBackend.from_config(
+        PostgresStateConfig(
+            dsn=POSTGRES_DSN,
+            database_role="carl_state_backend",
+            authority_key=AUTHORITY_KEY,
+            dead_holder_key=LIVENESS_KEY,
+            clock=lambda: datetime(2026, 8, 11, 12, 4, tzinfo=UTC),
+            connect=connect,
+        )
+    )
 
 
 def _dead_holder(
@@ -271,6 +654,67 @@ def test_schema_has_all_strict_transactional_state_tables(postgres: object) -> N
         }
 
 
+def test_every_authorized_event_appends_through_real_history_and_replays(
+    postgres: object,
+) -> None:
+    manifest = sample_manifest()
+    with _as_role(postgres, "carl_builder") as builder:
+        assert _register_manifest(builder, manifest) is True
+
+    backend = _backend(postgres)
+    observed_types: set[EventType] = set()
+    for event in _full_event_history():
+        with _as_role(postgres, f"carl_{_event_authority(event)}") as connection:
+            assert _append_event(connection, event)["appended"] is True
+        backend.load_projection(manifest.experiment_id)
+        observed_types.add(event.event_type)
+
+    assert observed_types == set(EventType)
+
+
+@pytest.mark.parametrize("event_type", tuple(EventType))
+def test_invalid_payload_for_each_authorized_event_does_not_mutate_chain(
+    postgres: object, event_type: EventType
+) -> None:
+    manifest = sample_manifest()
+    history = _full_event_history()
+    target_index = next(
+        index for index, event in enumerate(history) if event.event_type is event_type
+    )
+    with _as_role(postgres, "carl_builder") as builder:
+        _register_manifest(builder, manifest)
+    for event in history[:target_index]:
+        with _as_role(postgres, f"carl_{_event_authority(event)}") as connection:
+            _append_event(connection, event)
+
+    target = history[target_index]
+    invalid = ExperimentEvent.create(
+        experiment_id=target.experiment_id,
+        stage_attempt_id=f"invalid-{event_type.value}",
+        event_type=event_type,
+        occurred_at=target.occurred_at,
+        payload={**target.payload, "unexpected": True},
+    )
+    with _as_role(postgres, "carl_coordinator") as reader:
+        before = reader.execute(
+            "SELECT * FROM carl_autonomy.load_experiment_events(%s)",
+            (manifest.experiment_id,),
+        ).fetchall()
+    with (
+        _as_role(postgres, f"carl_{_event_authority(target)}") as connection,
+        pytest.raises(psycopg.Error),
+    ):
+        _append_event(connection, invalid)
+    with _as_role(postgres, "carl_coordinator") as reader:
+        after = reader.execute(
+            "SELECT * FROM carl_autonomy.load_experiment_events(%s)",
+            (manifest.experiment_id,),
+        ).fetchall()
+
+    assert after == before
+    _backend(postgres).load_projection(manifest.experiment_id)
+
+
 def test_workflow_roles_have_no_direct_table_dml_and_public_has_no_execute(
     postgres: object,
 ) -> None:
@@ -296,7 +740,7 @@ def test_workflow_roles_have_no_direct_table_dml_and_public_has_no_execute(
                 "append_event",
             ),
         ).fetchone()
-    assert row == {"direct_dml": False, "public_execute": False, "role_execute": True}
+    assert row == {"direct_dml": False, "public_execute": False, "role_execute": False}
 
 
 def test_registered_dead_holder_identity_and_observer_reconciler_role_separation(
@@ -311,7 +755,7 @@ def test_registered_dead_holder_identity_and_observer_reconciler_role_separation
 
     def observer_connect(dsn: str):
         connection = postgres.connect(dsn, row_factory=dict_row)  # type: ignore[attr-defined]
-        connection.execute(sql.SQL("SET ROLE {}").format(sql.Identifier("carl_observer")))
+        connection.execute(sql.SQL("SET ROLE {}").format(sql.Identifier("carl_state_backend")))
         return connection
 
     observation = _dead_holder(
@@ -323,7 +767,7 @@ def test_registered_dead_holder_identity_and_observer_reconciler_role_separation
     observer_backend = PostgresStateBackend.from_config(
         PostgresStateConfig(
             dsn=POSTGRES_DSN,
-            database_role="carl_observer",
+            database_role="carl_state_backend",
             authority_key=AUTHORITY_KEY,
             dead_holder_key=LIVENESS_KEY,
             clock=lambda: datetime(2026, 8, 20, 12, 2, tzinfo=UTC),
@@ -589,117 +1033,14 @@ def test_database_rejects_impossible_transitions_and_missing_prerequisites_atomi
 def test_trusted_autonomy_event_vocabulary_replays_with_persisted_authority(
     postgres: object,
 ) -> None:
-    from datetime import UTC, datetime
-
-    from psycopg import sql
-    from psycopg.rows import dict_row
-
     manifest = sample_manifest()
-    publication = ExperimentEvent.create(
-        experiment_id=manifest.experiment_id,
-        stage_attempt_id="trusted-publication",
-        event_type=EventType.EXPERIMENTAL_PUBLISHED,
-        occurred_at="2026-08-20T12:01:00Z",
-        payload={
-            "branch": "experimental/trusted",
-            "candidate_packet_digest": DIGEST_A,
-            "commit": "c" * 40,
-            "tree": "d" * 40,
-        },
-    )
-    protected = ExperimentEvent.create(
-        experiment_id=manifest.experiment_id,
-        stage_attempt_id="trusted-protected-validation",
-        event_type=EventType.PROTECTED_VALIDATION_RECORDED,
-        occurred_at="2026-08-20T12:02:00Z",
-        payload={
-            "candidate_commit": "c" * 40,
-            "candidate_tree": "d" * 40,
-            "receipt_digest": "e" * 64,
-        },
-    )
-    promotion = ExperimentEvent.create(
-        experiment_id=manifest.experiment_id,
-        stage_attempt_id="trusted-promotion",
-        event_type=EventType.PROMOTION_RECORDED,
-        occurred_at="2026-08-20T12:03:00Z",
-        payload={"merge_commit": "f" * 40, "merge_tree": "1" * 40},
-    )
-    healthy = ExperimentEvent.create(
-        experiment_id=manifest.experiment_id,
-        stage_attempt_id="trusted-soak-healthy",
-        event_type=EventType.SOAK_OBSERVED,
-        occurred_at="2026-08-20T12:04:00Z",
-        payload={
-            "evidence_digest": "2" * 64,
-            "healthy": True,
-            "merge_commit": "f" * 40,
-            "observed_at": "2026-08-20T12:04:00Z",
-        },
-    )
-    failed = ExperimentEvent.create(
-        experiment_id=manifest.experiment_id,
-        stage_attempt_id="trusted-soak-failed",
-        event_type=EventType.SOAK_OBSERVED,
-        occurred_at="2026-08-20T12:05:00Z",
-        payload={
-            "evidence_digest": "3" * 64,
-            "healthy": False,
-            "merge_commit": "f" * 40,
-            "observed_at": "2026-08-20T12:05:00Z",
-        },
-    )
-    revert = ExperimentEvent.create(
-        experiment_id=manifest.experiment_id,
-        stage_attempt_id="trusted-revert",
-        event_type=EventType.REVERT_RECORDED,
-        occurred_at="2026-08-20T12:06:00Z",
-        payload={
-            "hard_failure_digest": "3" * 64,
-            "merge_commit": "f" * 40,
-            "restored_tree": "4" * 40,
-            "revert_candidate_commit": "5" * 40,
-            "revert_merge_commit": "6" * 40,
-            "revert_pull_request_number": 82,
-        },
-    )
-
     with _as_role(postgres, "carl_builder") as builder:
         _register_manifest(builder, manifest)
-        _append_event(builder, publication)
-    assert POSTGRES_DSN is not None
-    with postgres.connect(POSTGRES_DSN, autocommit=True) as owner:  # type: ignore[attr-defined]
-        owner.execute(
-            "UPDATE carl_autonomy.experiment_projection_guards "
-            "SET lifecycle_state = 'paired_evaluation', candidate_sealed = true, "
-            "paired_evidence_recorded = true WHERE experiment_id = %s",
-            (manifest.experiment_id,),
-        )
-    with _as_role(postgres, "carl_validator") as validator:
-        _append_event(validator, protected)
-    with _as_role(postgres, "carl_promoter") as promoter:
-        _append_event(promoter, promotion)
-    with _as_role(postgres, "carl_soak") as soak:
-        _append_event(soak, healthy)
-        _append_event(soak, failed)
-        _append_event(soak, revert)
+    for event in _full_event_history():
+        with _as_role(postgres, f"carl_{_event_authority(event)}") as connection:
+            _append_event(connection, event)
 
-    def coordinator_connect(dsn: str):
-        connection = postgres.connect(dsn, row_factory=dict_row)  # type: ignore[attr-defined]
-        connection.execute(sql.SQL("SET ROLE {}").format(sql.Identifier("carl_coordinator")))
-        return connection
-
-    backend = PostgresStateBackend.from_config(
-        PostgresStateConfig(
-            dsn=POSTGRES_DSN,
-            database_role="carl_coordinator",
-            authority_key=AUTHORITY_KEY,
-            dead_holder_key=LIVENESS_KEY,
-            clock=lambda: datetime(2026, 8, 20, 12, 6, tzinfo=UTC),
-            connect=coordinator_connect,
-        )
-    )
-    _experiment, autonomy = backend.load_projection(manifest.experiment_id)
+    _experiment, autonomy = _backend(postgres).load_projection(manifest.experiment_id)
     assert autonomy.promotion is not None
     assert autonomy.revert is not None
 
@@ -997,14 +1338,14 @@ def test_command_completion_and_event_append_are_atomic(postgres: object) -> Non
 
     def coordinator_connect(dsn: str):
         connection = postgres.connect(dsn, row_factory=dict_row)  # type: ignore[attr-defined]
-        connection.execute(sql.SQL("SET ROLE {}").format(sql.Identifier("carl_coordinator")))
+        connection.execute(sql.SQL("SET ROLE {}").format(sql.Identifier("carl_state_backend")))
         return connection
 
     assert POSTGRES_DSN is not None
     backend = PostgresStateBackend.from_config(
         PostgresStateConfig(
             dsn=POSTGRES_DSN,
-            database_role="carl_coordinator",
+            database_role="carl_state_backend",
             authority_key=AUTHORITY_KEY,
             dead_holder_key=LIVENESS_KEY,
             clock=lambda: datetime(2026, 8, 20, 12, tzinfo=UTC),

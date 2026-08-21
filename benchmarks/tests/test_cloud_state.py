@@ -1552,7 +1552,12 @@ def test_state_backend_wrappers_enforce_exact_actions_before_storage_hooks() -> 
     )
     health = HealthSnapshot(observed_at=_TIMESTAMP, healthy=True, detail_digest=_DIGEST)
     manifest = SimpleNamespace(experiment_id="experiment-01")
-    event = SimpleNamespace(experiment_id="experiment-01", stage_attempt_id="attempt-01")
+    event = SimpleNamespace(
+        experiment_id="experiment-01",
+        stage_attempt_id="attempt-01",
+        event_type=EventType.ROLE_RECORDED,
+        payload={},
+    )
     resolution = SimpleNamespace(status="resolved")
     dead_claim = _dead_holder_observation(
         scope_kind="command",

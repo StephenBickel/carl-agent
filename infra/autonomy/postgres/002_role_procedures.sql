@@ -2,6 +2,9 @@ BEGIN;
 
 DO $$
 BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'carl_state_backend') THEN
+        CREATE ROLE carl_state_backend NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT;
+    END IF;
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'carl_autonomy_workflow') THEN
         CREATE ROLE carl_autonomy_workflow NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT;
     END IF;
@@ -19,16 +22,19 @@ BEGIN
     LOOP
         IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = role_name) THEN
             EXECUTE format(
-                'CREATE ROLE %I NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE INHERIT',
+                'CREATE ROLE %I NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT',
                 role_name
             );
         END IF;
-        EXECUTE format('GRANT carl_autonomy_workflow TO %I', role_name);
+        EXECUTE format('ALTER ROLE %I NOLOGIN NOINHERIT', role_name);
+        EXECUTE format('REVOKE carl_autonomy_workflow FROM %I', role_name);
+        EXECUTE format('REVOKE %I FROM carl_autonomy_workflow', role_name);
     END LOOP;
 END;
 $$;
 
-GRANT USAGE ON SCHEMA carl_autonomy TO carl_autonomy_workflow;
+GRANT USAGE ON SCHEMA carl_autonomy TO carl_state_backend;
+REVOKE ALL ON SCHEMA carl_autonomy FROM carl_autonomy_workflow;
 REVOKE ALL ON ALL TABLES IN SCHEMA carl_autonomy FROM carl_autonomy_workflow;
 REVOKE ALL ON ALL SEQUENCES IN SCHEMA carl_autonomy FROM carl_autonomy_workflow;
 
@@ -39,10 +45,15 @@ STABLE
 SECURITY INVOKER
 SET search_path = pg_catalog, carl_autonomy
 AS $$
-    SELECT CASE
-        WHEN current_setting('role', true) IS NULL OR current_setting('role', true) = 'none'
-            THEN session_user::text
-        ELSE current_setting('role', true)
+    SELECT CASE current_setting('carl_autonomy.authority', true)
+        WHEN 'builder' THEN 'carl_builder'
+        WHEN 'validator' THEN 'carl_validator'
+        WHEN 'promoter' THEN 'carl_promoter'
+        WHEN 'soak' THEN 'carl_soak'
+        WHEN 'supervisor' THEN 'carl_supervisor'
+        WHEN 'coordinator' THEN 'carl_coordinator'
+        WHEN 'observer' THEN 'carl_observer'
+        ELSE NULL
     END
 $$;
 
@@ -55,8 +66,15 @@ SET search_path = pg_catalog, carl_autonomy
 AS $$
 DECLARE
     role_name text := carl_autonomy.caller_role();
+    database_role text := CASE
+        WHEN current_setting('role', true) IS NULL OR current_setting('role', true) = 'none'
+            THEN session_user::text
+        ELSE current_setting('role', true)
+    END;
 BEGIN
-    IF role_name <> ALL(allowed_roles) THEN
+    IF database_role <> 'carl_state_backend' OR role_name IS NULL
+        OR role_name <> ALL(allowed_roles)
+    THEN
         RAISE EXCEPTION USING ERRCODE = '42501', MESSAGE = 'database_role_denied';
     END IF;
     RETURN role_name;
@@ -492,9 +510,12 @@ BEGIN
         WHEN 'experimental_published' THEN
             IF guard.experimental_published OR jsonb_object_length(p_payload) <> 4
                 OR NOT p_payload ?& ARRAY['branch', 'candidate_packet_digest', 'commit', 'tree']
+                OR jsonb_typeof(p_payload->'branch') <> 'string'
+                OR p_payload->>'branch' !~ '^experimental/'
+                OR octet_length(p_payload->>'branch') > 256
                 OR p_payload->>'candidate_packet_digest' !~ '^[0-9a-f]{64}$'
-                OR p_payload->>'commit' !~ '^[0-9a-f]{40}$'
-                OR p_payload->>'tree' !~ '^[0-9a-f]{40}$'
+                OR p_payload->>'commit' !~ '^([0-9a-f]{40}|[0-9a-f]{64})$'
+                OR p_payload->>'tree' !~ '^([0-9a-f]{40}|[0-9a-f]{64})$'
             THEN
                 RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'experimental_already_published';
             END IF;
@@ -1966,44 +1987,42 @@ REVOKE ALL ON ALL SEQUENCES IN SCHEMA carl_autonomy FROM PUBLIC, carl_autonomy_w
 REVOKE ALL ON ALL FUNCTIONS IN SCHEMA carl_autonomy FROM PUBLIC, carl_autonomy_workflow;
 
 GRANT EXECUTE ON FUNCTION carl_autonomy.register_manifest(text, text, timestamptz)
-    TO carl_builder;
+    TO carl_state_backend;
 GRANT EXECUTE ON FUNCTION carl_autonomy.append_event(text, text, text, timestamptz)
-    TO carl_builder, carl_validator, carl_promoter, carl_soak, carl_coordinator;
+    TO carl_state_backend;
 GRANT EXECUTE ON FUNCTION carl_autonomy.load_experiment_manifest(text),
     carl_autonomy.load_experiment_events(text),
     carl_autonomy.latest_health_snapshot()
-    TO carl_builder, carl_validator, carl_promoter, carl_soak,
-       carl_supervisor, carl_coordinator, carl_observer;
+    TO carl_state_backend;
 
 GRANT EXECUTE ON FUNCTION carl_autonomy.create_command(text, timestamptz),
     carl_autonomy.claim_command(text, timestamptz),
     carl_autonomy.fail_command(text, timestamptz)
-    TO carl_builder, carl_validator, carl_promoter, carl_soak,
-       carl_supervisor, carl_coordinator, carl_observer;
+    TO carl_state_backend;
 GRANT EXECUTE ON FUNCTION carl_autonomy.reconcile_expired_claim(text, text, timestamptz)
-    TO carl_supervisor, carl_coordinator;
+    TO carl_state_backend;
 
 GRANT EXECUTE ON FUNCTION carl_autonomy.register_dead_holder_observation(
     text, text, timestamptz
-) TO carl_observer;
+) TO carl_state_backend;
 
 GRANT EXECUTE ON FUNCTION carl_autonomy.acquire_lease(text, timestamptz),
     carl_autonomy.reconcile_lease(text, text, timestamptz),
     carl_autonomy.release_lease(text, timestamptz)
-    TO carl_coordinator, carl_supervisor;
+    TO carl_state_backend;
 
 GRANT EXECUTE ON FUNCTION carl_autonomy.create_supervisor_trigger(text, timestamptz)
-    TO carl_coordinator;
+    TO carl_state_backend;
 GRANT EXECUTE ON FUNCTION carl_autonomy.claim_supervisor_trigger(text, text, integer, timestamptz),
     carl_autonomy.resolve_supervisor_trigger(text, text, integer, text, timestamptz)
-    TO carl_supervisor;
+    TO carl_state_backend;
 
 GRANT EXECUTE ON FUNCTION carl_autonomy.register_evidence(text, timestamptz)
-    TO carl_validator, carl_observer;
+    TO carl_state_backend;
 GRANT EXECUTE ON FUNCTION carl_autonomy.record_health(text, timestamptz)
-    TO carl_observer;
+    TO carl_state_backend;
 GRANT EXECUTE ON FUNCTION carl_autonomy.complete_command_and_append_event(
     text, text, text, text, timestamptz
-) TO carl_builder, carl_validator, carl_promoter, carl_soak, carl_coordinator;
+) TO carl_state_backend;
 
 COMMIT;

@@ -1796,6 +1796,8 @@ class StateBackend(ABC):
             revision=0,
             now=now,
         )
+        if not _event_authority_allowed(capability.authority, event):
+            raise CloudStateError("event_authority_denied")
         return self._append_event(event, observed_at=now)
 
     @final

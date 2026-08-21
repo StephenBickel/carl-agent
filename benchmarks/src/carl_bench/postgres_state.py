@@ -50,17 +50,31 @@ from carl_bench.supervisor_triggers import (
 
 MAX_STATE_REVISION = 2_147_483_647
 _ZERO_DIGEST = "0" * 64
-_DATABASE_ROLES = frozenset(
-    {
-        "carl_builder",
-        "carl_coordinator",
-        "carl_observer",
-        "carl_promoter",
-        "carl_soak",
-        "carl_supervisor",
-        "carl_validator",
-    }
+_DATABASE_ROLE = "carl_state_backend"
+_WORKFLOW_AUTHORITIES = frozenset(
+    {"builder", "coordinator", "observer", "promoter", "soak", "supervisor", "validator"}
 )
+_EVENT_AUTHORITIES = {
+    EventType.ROLE_RECORDED: "builder",
+    EventType.WORKSPACE_PREPARED: "builder",
+    EventType.CANDIDATE_SEALED: "builder",
+    EventType.EXPERIMENTAL_PUBLISHED: "builder",
+    EventType.PAIRED_EVIDENCE_RECORDED: "validator",
+    EventType.REVIEW_PACKET_RECORDED: "validator",
+    EventType.REVIEW_ATTESTED: "validator",
+    EventType.PROTECTED_VALIDATION_RECORDED: "validator",
+    EventType.DRAFT_PR_REQUESTED: "promoter",
+    EventType.DRAFT_PR_RECORDED: "promoter",
+    EventType.WORKSPACE_DISPOSED: "promoter",
+    EventType.PROMOTION_RECORDED: "promoter",
+    EventType.SOAK_OBSERVED: "soak",
+    EventType.REVERT_RECORDED: "soak",
+    EventType.LEASE_ACQUIRED: "coordinator",
+    EventType.LEASE_RECONCILED: "coordinator",
+    EventType.LEASE_RELEASED: "coordinator",
+    EventType.LIVE_SPEND_RECORDED: "coordinator",
+    EventType.RETRY_SCHEDULED: "coordinator",
+}
 _TRUSTED_EVENT_AUTHORITIES = {
     EventType.PAIRED_EVIDENCE_RECORDED: "validator",
     EventType.REVIEW_PACKET_RECORDED: "validator",
@@ -96,7 +110,7 @@ def _utc_now() -> datetime:
 
 @dataclass(frozen=True, slots=True)
 class PostgresStateConfig:
-    """Protected connection and trust-root configuration for one workflow role."""
+    """Protected connection and trust roots for the isolated state-controller service."""
 
     dsn: str
     database_role: str
@@ -108,7 +122,7 @@ class PostgresStateConfig:
     def __post_init__(self) -> None:
         if not isinstance(self.dsn, str) or not self.dsn or len(self.dsn) > 8_192:
             raise PostgresStateError("postgres_dsn_invalid")
-        if self.database_role not in _DATABASE_ROLES:
+        if self.database_role != _DATABASE_ROLE:
             raise PostgresStateError("database_role_invalid")
         if not isinstance(self.authority_key, TrustedAuthorityKey) or not isinstance(
             self.dead_holder_key, TrustedAuthorityKey
@@ -259,6 +273,12 @@ class PostgresStateBackend(StateBackend):
             raise PostgresStateError("database_role_mismatch")
 
     @staticmethod
+    def _set_authority(cursor: Any, authority: str) -> None:
+        if authority not in _WORKFLOW_AUTHORITIES:
+            raise PostgresStateError("database_authority_invalid")
+        cursor.execute("SELECT set_config('carl_autonomy.authority', %s, true)", (authority,))
+
+    @staticmethod
     def _one(cursor: Any, query: str, parameters: tuple[object, ...]) -> dict[str, Any]:
         cursor.execute(query, parameters)
         row = cursor.fetchone()
@@ -270,6 +290,7 @@ class PostgresStateBackend(StateBackend):
 
     def _mutation(
         self,
+        authority: str,
         query: str,
         parameters: tuple[object, ...],
         decode: Callable[[dict[str, Any]], Any],
@@ -278,6 +299,7 @@ class PostgresStateBackend(StateBackend):
         try:
             with connection.transaction(), connection.cursor() as cursor:
                 self._verify_role(cursor)
+                self._set_authority(cursor, authority)
                 return decode(self._one(cursor, query, parameters))
         except Exception as error:
             if isinstance(error, PostgresStateError | CloudStateError | GraphContractError):
@@ -385,6 +407,7 @@ class PostgresStateBackend(StateBackend):
         return cast(
             bool,
             self._mutation(
+                "builder",
                 "SELECT * FROM carl_autonomy.register_manifest(%s, %s, %s)",
                 (_canonical_text(manifest.to_canonical_dict()), manifest.digest, observed_at),
                 self._decode_applied,
@@ -414,6 +437,7 @@ class PostgresStateBackend(StateBackend):
         return cast(
             AppendResult,
             self._mutation(
+                self._event_authority(event),
                 "SELECT * FROM carl_autonomy.append_event(%s, %s, %s, %s)",
                 (
                     _canonical_text(event.to_canonical_dict()),
@@ -425,12 +449,27 @@ class PostgresStateBackend(StateBackend):
             ),
         )
 
+    @staticmethod
+    def _event_authority(event: ExperimentEvent) -> str:
+        if event.event_type is EventType.STATE_TRANSITIONED:
+            if (
+                event.payload.get("from_state") == "soaking"
+                and event.payload.get("to_state") == "accepted"
+            ):
+                return "soak"
+            return "coordinator"
+        try:
+            return _EVENT_AUTHORITIES[event.event_type]
+        except KeyError as error:
+            raise PostgresStateError("event_authority_invalid") from error
+
     def _register_dead_holder_observation(
         self, observation: DeadHolderObservation, *, observed_at: datetime
     ) -> bool:
         return cast(
             bool,
             self._mutation(
+                "observer",
                 "SELECT * FROM carl_autonomy.register_dead_holder_observation(%s, %s, %s)",
                 (
                     _canonical_text(observation.to_canonical_dict()),
@@ -445,6 +484,7 @@ class PostgresStateBackend(StateBackend):
         return cast(
             CommandMutation,
             self._mutation(
+                command.authority,
                 "SELECT * FROM carl_autonomy.create_command(%s, %s)",
                 (_canonical_text(command.to_canonical_dict()), observed_at),
                 self._decode_command,
@@ -455,6 +495,7 @@ class PostgresStateBackend(StateBackend):
         return cast(
             CommandMutation,
             self._mutation(
+                claim.authority,
                 "SELECT * FROM carl_autonomy.claim_command(%s, %s)",
                 (_canonical_text(claim.to_canonical_dict()), observed_at),
                 self._decode_command,
@@ -501,6 +542,7 @@ class PostgresStateBackend(StateBackend):
         return cast(
             tuple[CommandMutation, AppendResult],
             self._mutation(
+                transition.authority,
                 "SELECT * FROM carl_autonomy.complete_command_and_append_event(%s, %s, %s, %s, %s)",
                 (
                     _canonical_text(transition.to_canonical_dict()),
@@ -519,6 +561,7 @@ class PostgresStateBackend(StateBackend):
         return cast(
             CommandMutation,
             self._mutation(
+                transition.authority,
                 "SELECT * FROM carl_autonomy.fail_command(%s, %s)",
                 (_canonical_text(transition.to_canonical_dict()), observed_at),
                 self._decode_command,
@@ -535,6 +578,7 @@ class PostgresStateBackend(StateBackend):
         return cast(
             CommandMutation,
             self._mutation(
+                reconciliation.authority,
                 "SELECT * FROM carl_autonomy.reconcile_expired_claim(%s, %s, %s)",
                 (
                     _canonical_text(reconciliation.to_canonical_dict()),
@@ -549,6 +593,7 @@ class PostgresStateBackend(StateBackend):
         return cast(
             LeaseMutation,
             self._mutation(
+                desired.authority,
                 "SELECT * FROM carl_autonomy.acquire_lease(%s, %s)",
                 (_canonical_text(desired.to_canonical_dict()), observed_at),
                 self._decode_lease,
@@ -565,6 +610,7 @@ class PostgresStateBackend(StateBackend):
         return cast(
             LeaseMutation,
             self._mutation(
+                reconciliation.authority,
                 "SELECT * FROM carl_autonomy.reconcile_lease(%s, %s, %s)",
                 (
                     _canonical_text(reconciliation.to_canonical_dict()),
@@ -579,6 +625,7 @@ class PostgresStateBackend(StateBackend):
         return cast(
             LeaseMutation,
             self._mutation(
+                release.authority,
                 "SELECT * FROM carl_autonomy.release_lease(%s, %s)",
                 (_canonical_text(release.to_canonical_dict()), observed_at),
                 self._decode_lease,
@@ -596,6 +643,7 @@ class PostgresStateBackend(StateBackend):
         return cast(
             TriggerMutation,
             self._mutation(
+                "supervisor",
                 "SELECT * FROM carl_autonomy.claim_supervisor_trigger(%s, %s, %s, %s)",
                 (trigger_id, claim_id, expected_revision, observed_at),
                 self._decode_trigger,
@@ -614,6 +662,7 @@ class PostgresStateBackend(StateBackend):
         return cast(
             TriggerMutation,
             self._mutation(
+                "supervisor",
                 "SELECT * FROM carl_autonomy.resolve_supervisor_trigger(%s, %s, %s, %s, %s)",
                 (
                     trigger_id,
@@ -630,6 +679,7 @@ class PostgresStateBackend(StateBackend):
         return cast(
             bool,
             self._mutation(
+                evidence.producer,
                 "SELECT * FROM carl_autonomy.register_evidence(%s, %s)",
                 (_canonical_text(evidence.to_canonical_dict()), observed_at),
                 self._decode_applied,
@@ -645,6 +695,7 @@ class PostgresStateBackend(StateBackend):
         return cast(
             bool,
             self._mutation(
+                "observer",
                 "SELECT * FROM carl_autonomy.record_health(%s, %s)",
                 (_canonical_text(snapshot_value), observed_at),
                 self._decode_applied,
@@ -683,6 +734,7 @@ class PostgresStateBackend(StateBackend):
                 with connection.cursor() as cursor:
                     cursor.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
                     self._verify_role(cursor)
+                    self._set_authority(cursor, "coordinator")
                     manifest_row = self._one(
                         cursor,
                         "SELECT * FROM carl_autonomy.load_experiment_manifest(%s)",
@@ -787,6 +839,7 @@ class PostgresStateBackend(StateBackend):
             with connection.transaction():  # noqa: SIM117
                 with connection.cursor() as cursor:
                     self._verify_role(cursor)
+                    self._set_authority(cursor, "observer")
                     row = self._one(
                         cursor,
                         "SELECT * FROM carl_autonomy.latest_health_snapshot()",
