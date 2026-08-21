@@ -31,6 +31,7 @@ from carl_bench.cloud_state import (
     TrustedAuthorityKey,
 )
 from carl_bench.experiment import (
+    _ISOLATED_AUTHORITY_REQUIRED_EVENTS,
     EventType,
     ExperimentEvent,
     ExperimentManifest,
@@ -60,9 +61,18 @@ _DATABASE_ROLES = frozenset(
         "carl_validator",
     }
 )
-_TRUSTED_CANONICAL_EVENTS = frozenset(
-    {EventType.PAIRED_EVIDENCE_RECORDED, EventType.PROTECTED_VALIDATION_RECORDED}
-)
+_TRUSTED_EVENT_AUTHORITIES = {
+    EventType.PAIRED_EVIDENCE_RECORDED: "validator",
+    EventType.REVIEW_PACKET_RECORDED: "validator",
+    EventType.REVIEW_ATTESTED: "validator",
+    EventType.DRAFT_PR_REQUESTED: "promoter",
+    EventType.DRAFT_PR_RECORDED: "promoter",
+    EventType.WORKSPACE_DISPOSED: "promoter",
+    EventType.PROTECTED_VALIDATION_RECORDED: "validator",
+    EventType.PROMOTION_RECORDED: "promoter",
+    EventType.SOAK_OBSERVED: "soak",
+    EventType.REVERT_RECORDED: "soak",
+}
 
 
 class PostgresStateError(ValueError):
@@ -415,6 +425,22 @@ class PostgresStateBackend(StateBackend):
             ),
         )
 
+    def _register_dead_holder_observation(
+        self, observation: DeadHolderObservation, *, observed_at: datetime
+    ) -> bool:
+        return cast(
+            bool,
+            self._mutation(
+                "SELECT * FROM carl_autonomy.register_dead_holder_observation(%s, %s, %s)",
+                (
+                    _canonical_text(observation.to_canonical_dict()),
+                    observation.digest,
+                    observed_at,
+                ),
+                self._decode_applied,
+            ),
+        )
+
     def _create_command(self, command: CloudCommand, *, observed_at: datetime) -> CommandMutation:
         return cast(
             CommandMutation,
@@ -438,12 +464,52 @@ class PostgresStateBackend(StateBackend):
     def _complete_command(
         self, transition: StateTransition, *, observed_at: datetime
     ) -> CommandMutation:
+        raise PostgresStateError("atomic_completion_event_required")
+
+    def _complete_command_with_event(
+        self,
+        transition: StateTransition,
+        event: ExperimentEvent,
+        *,
+        observed_at: datetime,
+    ) -> tuple[CommandMutation, AppendResult]:
+        atomic_fields = self._COMMAND_FIELDS | {
+            "appended",
+            "chain_digest",
+            "event_digest",
+            "ordinal",
+        }
+
+        def decode(row: dict[str, Any]) -> tuple[CommandMutation, AppendResult]:
+            value = _strict_row(row, atomic_fields)
+            command = self._decode_command({name: value[name] for name in self._COMMAND_FIELDS})
+            ordinal = value["ordinal"]
+            if type(ordinal) is not int or not 1 <= ordinal <= MAX_STATE_REVISION:
+                raise PostgresStateError("event_ordinal_invalid")
+            if value["event_digest"] != event.digest:
+                raise PostgresStateError("event_digest_mismatch")
+            if not isinstance(value["chain_digest"], str) or len(value["chain_digest"]) != 64:
+                raise PostgresStateError("event_digest_invalid")
+            append = AppendResult(
+                ordinal=ordinal,
+                event_digest=value["event_digest"],
+                chain_digest=value["chain_digest"],
+                appended=_strict_bool(value["appended"]),
+            )
+            return command, append
+
         return cast(
-            CommandMutation,
+            tuple[CommandMutation, AppendResult],
             self._mutation(
-                "SELECT * FROM carl_autonomy.complete_command(%s, %s)",
-                (_canonical_text(transition.to_canonical_dict()), observed_at),
-                self._decode_command,
+                "SELECT * FROM carl_autonomy.complete_command_and_append_event(%s, %s, %s, %s, %s)",
+                (
+                    _canonical_text(transition.to_canonical_dict()),
+                    _canonical_text(event.to_canonical_dict()),
+                    event.digest,
+                    event.payload_json,
+                    observed_at,
+                ),
+                decode,
             ),
         )
 
@@ -463,7 +529,7 @@ class PostgresStateBackend(StateBackend):
         self,
         reconciliation: ClaimReconciliation,
         *,
-        dead_holder: DeadHolderObservation,
+        observation_digest: str,
         observed_at: datetime,
     ) -> CommandMutation:
         return cast(
@@ -472,7 +538,7 @@ class PostgresStateBackend(StateBackend):
                 "SELECT * FROM carl_autonomy.reconcile_expired_claim(%s, %s, %s)",
                 (
                     _canonical_text(reconciliation.to_canonical_dict()),
-                    _canonical_text(dead_holder.to_canonical_dict()),
+                    observation_digest,
                     observed_at,
                 ),
                 self._decode_command,
@@ -493,7 +559,7 @@ class PostgresStateBackend(StateBackend):
         self,
         reconciliation: LeaseReconciliation,
         *,
-        dead_holder: DeadHolderObservation,
+        observation_digest: str,
         observed_at: datetime,
     ) -> LeaseMutation:
         return cast(
@@ -502,7 +568,7 @@ class PostgresStateBackend(StateBackend):
                 "SELECT * FROM carl_autonomy.reconcile_lease(%s, %s, %s)",
                 (
                     _canonical_text(reconciliation.to_canonical_dict()),
-                    _canonical_text(dead_holder.to_canonical_dict()),
+                    observation_digest,
                     observed_at,
                 ),
                 self._decode_lease,
@@ -646,6 +712,7 @@ class PostgresStateBackend(StateBackend):
                     event_fields = frozenset(
                         {
                             "authority",
+                            "trusted_authority",
                             "chain_digest",
                             "event_digest",
                             "event_json",
@@ -676,8 +743,22 @@ class PostgresStateBackend(StateBackend):
                         )
                         if row["chain_digest"] != expected_chain:
                             raise PostgresStateError("event_chain_digest_mismatch")
-                        if event.event_type in _TRUSTED_CANONICAL_EVENTS:
-                            if row["authority"] != "validator":
+                        trusted_authority = row["trusted_authority"]
+                        if type(trusted_authority) is not bool:
+                            raise PostgresStateError("event_authority_invalid")
+                        required_authority = _TRUSTED_EVENT_AUTHORITIES.get(event.event_type)
+                        if event.event_type in _ISOLATED_AUTHORITY_REQUIRED_EVENTS:
+                            if not trusted_authority or row["authority"] != required_authority:
+                                raise PostgresStateError("event_authority_invalid")
+                            trusted.add(event.digest)
+                        elif trusted_authority:
+                            is_acceptance = (
+                                event.event_type is EventType.STATE_TRANSITIONED
+                                and row["authority"] == "soak"
+                                and event.payload.get("from_state") == "soaking"
+                                and event.payload.get("to_state") == "accepted"
+                            )
+                            if not is_acceptance:
                                 raise PostgresStateError("event_authority_invalid")
                             trusted.add(event.digest)
                         events.append(event)

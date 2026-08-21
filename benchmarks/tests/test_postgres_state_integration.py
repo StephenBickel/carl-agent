@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import os
 import time
@@ -9,28 +10,34 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from test_experiment import manifest as sample_manifest
 
 from carl_bench.canonical import canonical_json_bytes
 from carl_bench.cloud_state import (
+    AuthorityCapability,
     ClaimReconciliation,
     CloudCommand,
     CloudLease,
     CommandClaim,
+    DeadHolderObservation,
     EvidenceObject,
     HealthSnapshot,
     LeaseReconciliation,
     LeaseRelease,
     StateTransition,
+    TrustedAuthorityKey,
 )
 from carl_bench.experiment import EventType, ExperimentEvent
+from carl_bench.postgres_state import PostgresStateBackend, PostgresStateConfig, PostgresStateError
 from carl_bench.supervisor_triggers import (
     RecoveryAttempt,
     SupervisorTrigger,
     TriggerResolution,
 )
 
-POSTGRES_DSN = os.environ.get("CARL_POSTGRES_TEST_DSN")
+POSTGRES_DSN = os.environ.get("CARL_POSTGRES_TEST_DSN") or None
 pytestmark = pytest.mark.skipif(
     POSTGRES_DSN is None,
     reason="CARL_POSTGRES_TEST_DSN is unset; PostgreSQL 16 integration is mandatory in CI",
@@ -44,6 +51,24 @@ MIGRATIONS = (
 NOW = "2026-08-20T12:00:00Z"
 DIGEST_A = "a" * 64
 DIGEST_B = "b" * 64
+AUTHORITY_PRIVATE = Ed25519PrivateKey.generate()
+LIVENESS_PRIVATE = Ed25519PrivateKey.generate()
+AUTHORITY_KEY = TrustedAuthorityKey(
+    key_id="integration-authority-v1",
+    purpose="authority_capability",
+    public_key_pem=AUTHORITY_PRIVATE.public_key().public_bytes(
+        serialization.Encoding.PEM,
+        serialization.PublicFormat.SubjectPublicKeyInfo,
+    ),
+)
+LIVENESS_KEY = TrustedAuthorityKey(
+    key_id="integration-liveness-v1",
+    purpose="dead_holder_observation",
+    public_key_pem=LIVENESS_PRIVATE.public_key().public_bytes(
+        serialization.Encoding.PEM,
+        serialization.PublicFormat.SubjectPublicKeyInfo,
+    ),
+)
 
 
 def _canonical(value: dict[str, Any]) -> str:
@@ -70,7 +95,8 @@ def clean_state(postgres: object) -> None:
             "TRUNCATE carl_autonomy.experiment_events, "
             "carl_autonomy.experiment_manifests, carl_autonomy.commands, "
             "carl_autonomy.leases, carl_autonomy.supervisor_triggers, "
-            "carl_autonomy.evidence_objects, carl_autonomy.monitor_snapshots "
+            "carl_autonomy.evidence_objects, carl_autonomy.monitor_snapshots, "
+            "carl_autonomy.dead_holder_observations "
             "RESTART IDENTITY CASCADE"
         )
 
@@ -101,6 +127,83 @@ def _append_event(connection: object, event: ExperimentEvent) -> dict[str, Any]:
         "SELECT * FROM carl_autonomy.append_event(%s, %s, %s, %s)",
         (_canonical(event.to_canonical_dict()), event.digest, event.payload_json, NOW),
     ).fetchone()
+
+
+def _retry_payload(*, attempt: int, scheduled_at: str, changed_action: str) -> dict[str, Any]:
+    return {
+        "attempt": attempt,
+        "changed_action": changed_action,
+        "failed_stage_attempt_id": "failed-stage-001",
+        "failure_class": "infrastructure",
+        "scheduled_at": scheduled_at,
+    }
+
+
+def _dead_holder(
+    *,
+    scope_kind: str,
+    scope_key: str,
+    subject_id: str,
+    revision: int,
+    authority: str = "coordinator",
+) -> DeadHolderObservation:
+    unsigned = DeadHolderObservation(
+        schema_version=1,
+        authority=authority,
+        subject_id=subject_id,
+        scope_kind=scope_kind,
+        scope_key=scope_key,
+        revision=revision,
+        issued_at="2026-08-20T11:55:00Z",
+        observed_at="2026-08-20T12:02:00Z",
+        expires_at="2026-08-20T12:05:00Z",
+        live=False,
+        key_id=LIVENESS_KEY.key_id,
+        signature_base64=base64.b64encode(bytes(64)).decode("ascii"),
+    )
+    return replace(
+        unsigned,
+        signature_base64=base64.b64encode(LIVENESS_PRIVATE.sign(unsigned.signing_payload())).decode(
+            "ascii"
+        ),
+    )
+
+
+def _capability(
+    *, action: str, authority: str, subject_id: str, scope_kind: str, scope_key: str, revision: int
+) -> AuthorityCapability:
+    unsigned = AuthorityCapability(
+        schema_version=1,
+        authority=authority,
+        action=action,
+        subject_id=subject_id,
+        scope_kind=scope_kind,
+        scope_key=scope_key,
+        revision=revision,
+        issued_at="2026-08-20T11:55:00Z",
+        expires_at="2026-08-20T12:05:00Z",
+        key_id=AUTHORITY_KEY.key_id,
+        signature_base64=base64.b64encode(bytes(64)).decode("ascii"),
+    )
+    return replace(
+        unsigned,
+        signature_base64=base64.b64encode(
+            AUTHORITY_PRIVATE.sign(unsigned.signing_payload())
+        ).decode("ascii"),
+    )
+
+
+def _register_observation(postgres: object, observation: DeadHolderObservation) -> None:
+    with _as_role(postgres, "carl_observer") as observer:
+        row = observer.execute(
+            "SELECT * FROM carl_autonomy.register_dead_holder_observation(%s, %s, %s)",
+            (
+                _canonical(observation.to_canonical_dict()),
+                observation.digest,
+                observation.observed_at,
+            ),
+        ).fetchone()
+        assert row["applied"] is True
 
 
 def _command(*, occurred_at: str = NOW, request_digest: str = DIGEST_A) -> CloudCommand:
@@ -157,9 +260,11 @@ def test_schema_has_all_strict_transactional_state_tables(postgres: object) -> N
     with postgres.connect(POSTGRES_DSN, row_factory=dict_row) as connection:  # type: ignore[attr-defined]
         assert _required_tables(connection) == {
             "commands",
+            "dead_holder_observations",
             "evidence_objects",
             "experiment_events",
             "experiment_manifests",
+            "experiment_projection_guards",
             "leases",
             "monitor_snapshots",
             "supervisor_triggers",
@@ -194,6 +299,119 @@ def test_workflow_roles_have_no_direct_table_dml_and_public_has_no_execute(
     assert row == {"direct_dml": False, "public_execute": False, "role_execute": True}
 
 
+def test_registered_dead_holder_identity_and_observer_reconciler_role_separation(
+    postgres: object,
+) -> None:
+    from datetime import UTC, datetime
+
+    from psycopg import sql
+    from psycopg.rows import dict_row
+
+    assert POSTGRES_DSN is not None
+
+    def observer_connect(dsn: str):
+        connection = postgres.connect(dsn, row_factory=dict_row)  # type: ignore[attr-defined]
+        connection.execute(sql.SQL("SET ROLE {}").format(sql.Identifier("carl_observer")))
+        return connection
+
+    observation = _dead_holder(
+        scope_kind="command",
+        scope_key="dispatch-exp-001",
+        subject_id="claim-001",
+        revision=8,
+    )
+    observer_backend = PostgresStateBackend.from_config(
+        PostgresStateConfig(
+            dsn=POSTGRES_DSN,
+            database_role="carl_observer",
+            authority_key=AUTHORITY_KEY,
+            dead_holder_key=LIVENESS_KEY,
+            clock=lambda: datetime(2026, 8, 20, 12, 2, tzinfo=UTC),
+            connect=observer_connect,
+        )
+    )
+    capability = _capability(
+        action="register_dead_holder_observation",
+        authority="observer",
+        subject_id=observation.digest,
+        scope_kind="dead_holder_observation",
+        scope_key=observation.digest,
+        revision=observation.revision,
+    )
+    assert (
+        observer_backend.register_dead_holder_observation(observation, capability=capability)
+        is True
+    )
+
+    command = _command()
+    reconciliation = ClaimReconciliation(
+        command_key=command.command_key,
+        claim_id="claim-001",
+        authority="coordinator",
+        expected_revision=8,
+        next_revision=9,
+        observed_at="2026-08-20T12:02:00Z",
+    )
+    with _as_role(postgres, "carl_coordinator") as coordinator:
+        coordinator.execute(
+            "SELECT * FROM carl_autonomy.create_command(%s, %s)",
+            (_canonical(command.to_canonical_dict()), NOW),
+        )
+        coordinator.execute(
+            "SELECT * FROM carl_autonomy.claim_command(%s, %s)",
+            (_canonical(_claim().to_canonical_dict()), NOW),
+        )
+        with pytest.raises(Exception, match="dead_holder_observation_unregistered"):
+            coordinator.execute(
+                "SELECT * FROM carl_autonomy.reconcile_expired_claim(%s, %s, %s)",
+                (_canonical(reconciliation.to_canonical_dict()), "f" * 64, "2026-08-20T12:02:00Z"),
+            )
+        wrong = _dead_holder(
+            scope_kind="command",
+            scope_key=command.command_key,
+            subject_id="claim-001",
+            revision=8,
+            authority="supervisor",
+        )
+    _register_observation(postgres, wrong)
+    with _as_role(postgres, "carl_coordinator") as coordinator:
+        with pytest.raises(Exception, match="dead_holder_observation_mismatch"):
+            coordinator.execute(
+                "SELECT * FROM carl_autonomy.reconcile_expired_claim(%s, %s, %s)",
+                (
+                    _canonical(reconciliation.to_canonical_dict()),
+                    wrong.digest,
+                    "2026-08-20T12:02:00Z",
+                ),
+            )
+        reconciled = coordinator.execute(
+            "SELECT * FROM carl_autonomy.reconcile_expired_claim(%s, %s, %s)",
+            (
+                _canonical(reconciliation.to_canonical_dict()),
+                observation.digest,
+                "2026-08-20T12:02:00Z",
+            ),
+        ).fetchone()
+        assert reconciled["revision"] == 9
+        with pytest.raises(Exception, match="permission denied"):
+            coordinator.execute(
+                "SELECT * FROM carl_autonomy.register_dead_holder_observation(%s, %s, %s)",
+                (_canonical(observation.to_canonical_dict()), observation.digest, NOW),
+            )
+    with (
+        _as_role(postgres, "carl_observer") as observer,
+        pytest.raises(Exception, match="permission denied"),
+    ):
+        observer.execute(
+            "SELECT * FROM carl_autonomy.reconcile_expired_claim(%s, %s, %s)",
+            (
+                _canonical(reconciliation.to_canonical_dict()),
+                observation.digest,
+                "2026-08-20T12:02:00Z",
+            ),
+        )
+
+
 def test_manifest_event_chain_global_attempt_replay_and_role_denial(postgres: object) -> None:
     parent = sample_manifest()
     child = replace(
@@ -217,21 +435,25 @@ def test_manifest_event_chain_global_attempt_replay_and_role_denial(postgres: ob
         stage_attempt_id="retry-attempt-global-001",
         event_type=EventType.RETRY_SCHEDULED,
         occurred_at=NOW,
-        payload={"attempt": 1},
+        payload=_retry_payload(attempt=1, scheduled_at=NOW, changed_action="retry with telemetry"),
     )
     second = ExperimentEvent.create(
         experiment_id=parent.experiment_id,
         stage_attempt_id="retry-attempt-002",
         event_type=EventType.RETRY_SCHEDULED,
         occurred_at="2026-08-20T12:00:01Z",
-        payload={"attempt": 2},
+        payload=_retry_payload(
+            attempt=2,
+            scheduled_at="2026-08-20T12:00:01Z",
+            changed_action="retry with isolated cache",
+        ),
     )
     conflict = ExperimentEvent.create(
         experiment_id=child.experiment_id,
         stage_attempt_id=first.stage_attempt_id,
         event_type=EventType.RETRY_SCHEDULED,
         occurred_at=NOW,
-        payload={"attempt": 99},
+        payload=_retry_payload(attempt=1, scheduled_at=NOW, changed_action="conflicting replay"),
     )
     protected = ExperimentEvent.create(
         experiment_id=parent.experiment_id,
@@ -265,12 +487,236 @@ def test_manifest_event_chain_global_attempt_replay_and_role_denial(postgres: ob
         _append_event(builder, protected)
 
 
+def test_database_rejects_impossible_transitions_and_missing_prerequisites_atomically(
+    postgres: object,
+) -> None:
+    manifest = sample_manifest()
+    with _as_role(postgres, "carl_builder") as builder:
+        _register_manifest(builder, manifest)
+
+    impossible = ExperimentEvent.create(
+        experiment_id=manifest.experiment_id,
+        stage_attempt_id="impossible-queued-building",
+        event_type=EventType.STATE_TRANSITIONED,
+        occurred_at=NOW,
+        payload={"from_state": "queued", "to_state": "building"},
+    )
+    with _as_role(postgres, "carl_coordinator") as coordinator:
+        with pytest.raises(Exception, match="invalid_transition"):
+            _append_event(coordinator, impossible)
+        assert coordinator.execute(
+            "SELECT lifecycle_state, lifecycle_revision "
+            "FROM carl_autonomy.experiment_projection_guards "
+            "WHERE experiment_id = %s",
+            (manifest.experiment_id,),
+        ).fetchone() == {"lifecycle_revision": 0, "lifecycle_state": "queued"}
+        assert (
+            coordinator.execute(
+                "SELECT count(*) AS count FROM carl_autonomy.load_experiment_events(%s)",
+                (manifest.experiment_id,),
+            ).fetchone()["count"]
+            == 0
+        )
+
+    transitions = (
+        ("queued", "baselining"),
+        ("baselining", "diagnosing"),
+        ("diagnosing", "proposal_review"),
+    )
+    with _as_role(postgres, "carl_coordinator") as coordinator:
+        for index, (source, target) in enumerate(transitions, start=1):
+            _append_event(
+                coordinator,
+                ExperimentEvent.create(
+                    experiment_id=manifest.experiment_id,
+                    stage_attempt_id=f"prerequisite-transition-{index}",
+                    event_type=EventType.STATE_TRANSITIONED,
+                    occurred_at=f"2026-08-20T12:00:0{index}Z",
+                    payload={"from_state": source, "to_state": target},
+                ),
+            )
+    with _as_role(postgres, "carl_builder") as builder:
+        _append_event(
+            builder,
+            ExperimentEvent.create(
+                experiment_id=manifest.experiment_id,
+                stage_attempt_id="only-one-proposal-approval",
+                event_type=EventType.ROLE_RECORDED,
+                occurred_at="2026-08-20T12:00:04Z",
+                payload={"artifact_digest": DIGEST_A, "role": "causal", "verdict": "approve"},
+            ),
+        )
+    with _as_role(postgres, "carl_coordinator") as coordinator:
+        _append_event(
+            coordinator,
+            ExperimentEvent.create(
+                experiment_id=manifest.experiment_id,
+                stage_attempt_id="proposal-lease",
+                event_type=EventType.LEASE_ACQUIRED,
+                occurred_at="2026-08-20T12:00:05Z",
+                payload={"expires_at": "2026-08-20T18:00:05Z", "owner_id": "director-1"},
+            ),
+        )
+        missing_quorum = ExperimentEvent.create(
+            experiment_id=manifest.experiment_id,
+            stage_attempt_id="building-missing-quorum",
+            event_type=EventType.STATE_TRANSITIONED,
+            occurred_at="2026-08-20T12:00:06Z",
+            payload={
+                "_lease": {"owner_id": "director-1", "stage_attempt_id": "proposal-lease"},
+                "from_state": "proposal_review",
+                "to_state": "building",
+            },
+        )
+        with pytest.raises(Exception, match="proposal_quorum_unsatisfied"):
+            _append_event(coordinator, missing_quorum)
+        guard = coordinator.execute(
+            "SELECT lifecycle_state, lifecycle_revision "
+            "FROM carl_autonomy.experiment_projection_guards "
+            "WHERE experiment_id = %s",
+            (manifest.experiment_id,),
+        ).fetchone()
+        assert guard == {"lifecycle_revision": 3, "lifecycle_state": "proposal_review"}
+        assert (
+            coordinator.execute(
+                "SELECT count(*) AS count FROM carl_autonomy.load_experiment_events(%s)",
+                (manifest.experiment_id,),
+            ).fetchone()["count"]
+            == 5
+        )
+
+
+def test_trusted_autonomy_event_vocabulary_replays_with_persisted_authority(
+    postgres: object,
+) -> None:
+    from datetime import UTC, datetime
+
+    from psycopg import sql
+    from psycopg.rows import dict_row
+
+    manifest = sample_manifest()
+    publication = ExperimentEvent.create(
+        experiment_id=manifest.experiment_id,
+        stage_attempt_id="trusted-publication",
+        event_type=EventType.EXPERIMENTAL_PUBLISHED,
+        occurred_at="2026-08-20T12:01:00Z",
+        payload={
+            "branch": "experimental/trusted",
+            "candidate_packet_digest": DIGEST_A,
+            "commit": "c" * 40,
+            "tree": "d" * 40,
+        },
+    )
+    protected = ExperimentEvent.create(
+        experiment_id=manifest.experiment_id,
+        stage_attempt_id="trusted-protected-validation",
+        event_type=EventType.PROTECTED_VALIDATION_RECORDED,
+        occurred_at="2026-08-20T12:02:00Z",
+        payload={
+            "candidate_commit": "c" * 40,
+            "candidate_tree": "d" * 40,
+            "receipt_digest": "e" * 64,
+        },
+    )
+    promotion = ExperimentEvent.create(
+        experiment_id=manifest.experiment_id,
+        stage_attempt_id="trusted-promotion",
+        event_type=EventType.PROMOTION_RECORDED,
+        occurred_at="2026-08-20T12:03:00Z",
+        payload={"merge_commit": "f" * 40, "merge_tree": "1" * 40},
+    )
+    healthy = ExperimentEvent.create(
+        experiment_id=manifest.experiment_id,
+        stage_attempt_id="trusted-soak-healthy",
+        event_type=EventType.SOAK_OBSERVED,
+        occurred_at="2026-08-20T12:04:00Z",
+        payload={
+            "evidence_digest": "2" * 64,
+            "healthy": True,
+            "merge_commit": "f" * 40,
+            "observed_at": "2026-08-20T12:04:00Z",
+        },
+    )
+    failed = ExperimentEvent.create(
+        experiment_id=manifest.experiment_id,
+        stage_attempt_id="trusted-soak-failed",
+        event_type=EventType.SOAK_OBSERVED,
+        occurred_at="2026-08-20T12:05:00Z",
+        payload={
+            "evidence_digest": "3" * 64,
+            "healthy": False,
+            "merge_commit": "f" * 40,
+            "observed_at": "2026-08-20T12:05:00Z",
+        },
+    )
+    revert = ExperimentEvent.create(
+        experiment_id=manifest.experiment_id,
+        stage_attempt_id="trusted-revert",
+        event_type=EventType.REVERT_RECORDED,
+        occurred_at="2026-08-20T12:06:00Z",
+        payload={
+            "hard_failure_digest": "3" * 64,
+            "merge_commit": "f" * 40,
+            "restored_tree": "4" * 40,
+            "revert_candidate_commit": "5" * 40,
+            "revert_merge_commit": "6" * 40,
+            "revert_pull_request_number": 82,
+        },
+    )
+
+    with _as_role(postgres, "carl_builder") as builder:
+        _register_manifest(builder, manifest)
+        _append_event(builder, publication)
+    assert POSTGRES_DSN is not None
+    with postgres.connect(POSTGRES_DSN, autocommit=True) as owner:  # type: ignore[attr-defined]
+        owner.execute(
+            "UPDATE carl_autonomy.experiment_projection_guards "
+            "SET lifecycle_state = 'paired_evaluation', candidate_sealed = true, "
+            "paired_evidence_recorded = true WHERE experiment_id = %s",
+            (manifest.experiment_id,),
+        )
+    with _as_role(postgres, "carl_validator") as validator:
+        _append_event(validator, protected)
+    with _as_role(postgres, "carl_promoter") as promoter:
+        _append_event(promoter, promotion)
+    with _as_role(postgres, "carl_soak") as soak:
+        _append_event(soak, healthy)
+        _append_event(soak, failed)
+        _append_event(soak, revert)
+
+    def coordinator_connect(dsn: str):
+        connection = postgres.connect(dsn, row_factory=dict_row)  # type: ignore[attr-defined]
+        connection.execute(sql.SQL("SET ROLE {}").format(sql.Identifier("carl_coordinator")))
+        return connection
+
+    backend = PostgresStateBackend.from_config(
+        PostgresStateConfig(
+            dsn=POSTGRES_DSN,
+            database_role="carl_coordinator",
+            authority_key=AUTHORITY_KEY,
+            dead_holder_key=LIVENESS_KEY,
+            clock=lambda: datetime(2026, 8, 20, 12, 6, tzinfo=UTC),
+            connect=coordinator_connect,
+        )
+    )
+    _experiment, autonomy = backend.load_projection(manifest.experiment_id)
+    assert autonomy.promotion is not None
+    assert autonomy.revert is not None
+
+
 def test_command_persist_replay_skip_locked_retry_and_terminal_revision_chain(
     postgres: object,
 ) -> None:
     command = _command()
     replay = _command(occurred_at="2026-08-20T12:00:30Z")
     conflict = _command(request_digest="c" * 64)
+    dead_holder = _dead_holder(
+        scope_kind="command",
+        scope_key=command.command_key,
+        subject_id="claim-001",
+        revision=8,
+    )
+    _register_observation(postgres, dead_holder)
 
     with _as_role(postgres, "carl_coordinator") as coordinator:
         created = coordinator.execute(
@@ -323,25 +769,11 @@ def test_command_persist_replay_skip_locked_retry_and_terminal_revision_chain(
             next_revision=9,
             observed_at="2026-08-20T12:02:00Z",
         )
-        dead_holder = {
-            "authority": "coordinator",
-            "expires_at": "2026-08-20T12:05:00Z",
-            "issued_at": "2026-08-20T11:55:00Z",
-            "key_id": "integration-liveness",
-            "live": False,
-            "observed_at": "2026-08-20T12:02:00Z",
-            "revision": 8,
-            "schema_version": 1,
-            "scope_key": command.command_key,
-            "scope_kind": "command",
-            "signature_base64": "A" * 88,
-            "subject_id": "claim-001",
-        }
         pending = coordinator.execute(
             "SELECT * FROM carl_autonomy.reconcile_expired_claim(%s, %s, %s)",
             (
                 _canonical(reconciliation.to_canonical_dict()),
-                _canonical(dead_holder),
+                dead_holder.digest,
                 "2026-08-20T12:02:00Z",
             ),
         ).fetchone()
@@ -356,25 +788,30 @@ def test_command_persist_replay_skip_locked_retry_and_terminal_revision_chain(
             (_canonical(retry_claim.to_canonical_dict()), "2026-08-20T12:02:00Z"),
         ).fetchone()
         assert retried["revision"] == 10
-        transition = _transition(revision=10)
+        transition = replace(
+            _transition(revision=10),
+            status="failed",
+            result_digest=None,
+            failure_code="runner_failed",
+        )
         terminal = coordinator.execute(
-            "SELECT * FROM carl_autonomy.complete_command(%s, %s)",
+            "SELECT * FROM carl_autonomy.fail_command(%s, %s)",
             (_canonical(transition.to_canonical_dict()), "2026-08-20T12:03:00Z"),
         ).fetchone()
         duplicate = coordinator.execute(
-            "SELECT * FROM carl_autonomy.complete_command(%s, %s)",
+            "SELECT * FROM carl_autonomy.fail_command(%s, %s)",
             (_canonical(transition.to_canonical_dict()), "2026-08-20T12:03:00Z"),
         ).fetchone()
         assert (terminal["status"], terminal["revision"], terminal["applied"]) == (
-            "completed",
+            "failed",
             11,
             True,
         )
         assert duplicate["applied"] is False
         with pytest.raises(Exception, match="command_result_conflict"):
-            changed = replace(transition, result_digest="d" * 64)
+            changed = replace(transition, failure_code="different_failure")
             coordinator.execute(
-                "SELECT * FROM carl_autonomy.complete_command(%s, %s)",
+                "SELECT * FROM carl_autonomy.fail_command(%s, %s)",
                 (_canonical(changed.to_canonical_dict()), "2026-08-20T12:03:00Z"),
             ).fetchone()
 
@@ -388,6 +825,13 @@ def test_lease_trigger_evidence_and_health_contracts(postgres: object) -> None:
         acquired_at=NOW,
         expires_at="2026-08-20T12:01:00Z",
     )
+    dead_holder = _dead_holder(
+        scope_kind="lease",
+        scope_key="coordinator",
+        subject_id="worker-001",
+        revision=1,
+    )
+    _register_observation(postgres, dead_holder)
     with _as_role(postgres, "carl_coordinator") as coordinator:
         lease = coordinator.execute(
             "SELECT * FROM carl_autonomy.acquire_lease(%s, %s)",
@@ -407,25 +851,11 @@ def test_lease_trigger_evidence_and_health_contracts(postgres: object) -> None:
             next_revision=2,
             observed_at="2026-08-20T12:02:00Z",
         )
-        dead_holder = {
-            "authority": "coordinator",
-            "expires_at": "2026-08-20T12:05:00Z",
-            "issued_at": "2026-08-20T11:55:00Z",
-            "key_id": "integration-liveness",
-            "live": False,
-            "observed_at": "2026-08-20T12:02:00Z",
-            "revision": 1,
-            "schema_version": 1,
-            "scope_key": "coordinator",
-            "scope_kind": "lease",
-            "signature_base64": "A" * 88,
-            "subject_id": "worker-001",
-        }
         reconciled = coordinator.execute(
             "SELECT * FROM carl_autonomy.reconcile_lease(%s, %s, %s)",
             (
                 _canonical(reconciliation.to_canonical_dict()),
-                _canonical(dead_holder),
+                dead_holder.digest,
                 "2026-08-20T12:02:00Z",
             ),
         ).fetchone()
@@ -536,17 +966,17 @@ def test_command_completion_and_event_append_are_atomic(postgres: object) -> Non
     transition = _transition(revision=8)
     invalid_event = ExperimentEvent.create(
         experiment_id=manifest.experiment_id,
-        stage_attempt_id="atomic-promotion-invalid",
-        event_type=EventType.PROMOTION_RECORDED,
+        stage_attempt_id="atomic-retry-invalid",
+        event_type=EventType.RETRY_SCHEDULED,
         occurred_at=NOW,
-        payload={"promotion_digest": DIGEST_A},
+        payload={"attempt": 1},
     )
     valid_event = ExperimentEvent.create(
         experiment_id=manifest.experiment_id,
         stage_attempt_id="atomic-retry-valid",
         event_type=EventType.RETRY_SCHEDULED,
         occurred_at=NOW,
-        payload={"attempt": 1},
+        payload=_retry_payload(attempt=1, scheduled_at=NOW, changed_action="atomic retry"),
     )
 
     with _as_role(postgres, "carl_builder") as builder:
@@ -560,17 +990,51 @@ def test_command_completion_and_event_append_are_atomic(postgres: object) -> Non
             "SELECT * FROM carl_autonomy.claim_command(%s, %s)",
             (_canonical(claim.to_canonical_dict()), NOW),
         ).fetchone()
-        with pytest.raises(Exception, match="event_authority_denied"):
-            coordinator.execute(
-                "SELECT * FROM carl_autonomy.complete_command_and_append_event(%s, %s, %s, %s, %s)",
-                (
-                    _canonical(transition.to_canonical_dict()),
-                    _canonical(invalid_event.to_canonical_dict()),
-                    invalid_event.digest,
-                    invalid_event.payload_json,
-                    NOW,
-                ),
-            ).fetchone()
+    from datetime import UTC, datetime
+
+    from psycopg import sql
+    from psycopg.rows import dict_row
+
+    def coordinator_connect(dsn: str):
+        connection = postgres.connect(dsn, row_factory=dict_row)  # type: ignore[attr-defined]
+        connection.execute(sql.SQL("SET ROLE {}").format(sql.Identifier("carl_coordinator")))
+        return connection
+
+    assert POSTGRES_DSN is not None
+    backend = PostgresStateBackend.from_config(
+        PostgresStateConfig(
+            dsn=POSTGRES_DSN,
+            database_role="carl_coordinator",
+            authority_key=AUTHORITY_KEY,
+            dead_holder_key=LIVENESS_KEY,
+            clock=lambda: datetime(2026, 8, 20, 12, tzinfo=UTC),
+            connect=coordinator_connect,
+        )
+    )
+    command_capability = _capability(
+        action="complete_command_with_event",
+        authority="coordinator",
+        subject_id=transition.claim_id,
+        scope_kind="command",
+        scope_key=transition.command_key,
+        revision=transition.expected_revision,
+    )
+    invalid_event_capability = _capability(
+        action="append_event",
+        authority="coordinator",
+        subject_id=invalid_event.stage_attempt_id,
+        scope_kind="event",
+        scope_key=invalid_event.experiment_id,
+        revision=0,
+    )
+    with pytest.raises(PostgresStateError, match="postgres_mutation_failed"):
+        backend.complete_command_with_event(
+            transition,
+            invalid_event,
+            command_capability=command_capability,
+            event_capability=invalid_event_capability,
+        )
+    with _as_role(postgres, "carl_coordinator") as coordinator:
         state = coordinator.execute(
             "SELECT * FROM carl_autonomy.create_command(%s, %s)",
             (_canonical(command.to_canonical_dict()), NOW),
@@ -586,18 +1050,22 @@ def test_command_completion_and_event_append_are_atomic(postgres: object) -> Non
         )
         assert events == []
 
-        completed = coordinator.execute(
-            "SELECT * FROM carl_autonomy.complete_command_and_append_event(%s, %s, %s, %s, %s)",
-            (
-                _canonical(transition.to_canonical_dict()),
-                _canonical(valid_event.to_canonical_dict()),
-                valid_event.digest,
-                valid_event.payload_json,
-                NOW,
-            ),
-        ).fetchone()
-        assert (completed["status"], completed["revision"], completed["ordinal"]) == (
-            "completed",
-            9,
-            1,
-        )
+    valid_event_capability = _capability(
+        action="append_event",
+        authority="coordinator",
+        subject_id=valid_event.stage_attempt_id,
+        scope_kind="event",
+        scope_key=valid_event.experiment_id,
+        revision=0,
+    )
+    completed, appended = backend.complete_command_with_event(
+        transition,
+        valid_event,
+        command_capability=command_capability,
+        event_capability=valid_event_capability,
+    )
+    assert (completed.state.status, completed.state.revision, appended.ordinal) == (
+        "completed",
+        9,
+        1,
+    )

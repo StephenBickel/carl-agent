@@ -40,6 +40,7 @@ from carl_bench.cloud_state import (
     release_lease,
     replay_command,
 )
+from carl_bench.experiment import EventType, ExperimentEvent
 
 _DIGEST = "a" * 64
 _RESULT_DIGEST = "b" * 64
@@ -1354,6 +1355,10 @@ class _FakeStateBackend(StateBackend):
     def _append_event(self, event, *, observed_at):
         return self._record("append_event")
 
+    def _register_dead_holder_observation(self, observation, *, observed_at):
+        self.last_dead_holder = observation
+        return self._record("register_dead_holder_observation")
+
     def _create_command(self, command, *, observed_at):
         return self._record("create_command")
 
@@ -1363,16 +1368,22 @@ class _FakeStateBackend(StateBackend):
     def _complete_command(self, transition, *, observed_at):
         return self._record("complete_command")
 
+    def _complete_command_with_event(self, transition, event, *, observed_at):
+        self.atomic_observed_at = observed_at
+        return self._record("complete_command_with_event")
+
     def _fail_command(self, transition, *, observed_at):
         return self._record("fail_command")
 
-    def _reconcile_expired_claim(self, reconciliation, *, dead_holder, observed_at):
+    def _reconcile_expired_claim(self, reconciliation, *, observation_digest, observed_at):
+        self.last_observation_digest = observation_digest
         return self._record("reconcile_expired_claim")
 
     def _acquire_lease(self, desired, *, observed_at):
         return self._record("acquire_lease")
 
-    def _reconcile_lease(self, reconciliation, *, dead_holder, observed_at):
+    def _reconcile_lease(self, reconciliation, *, observation_digest, observed_at):
+        self.last_observation_digest = observation_digest
         return self._record("reconcile_lease")
 
     def _release_lease(self, release, *, observed_at):
@@ -1397,6 +1408,98 @@ class _FakeStateBackend(StateBackend):
 
     def health_snapshot(self):
         raise NotImplementedError
+
+
+def test_state_backend_registers_only_verified_dead_holder_observations() -> None:
+    backend = _FakeStateBackend(verifier=_VERIFIER)
+    backend.hook_calls = []
+    observation = _dead_holder_observation(
+        scope_kind="command",
+        scope_key="dispatch-01",
+        holder_id="claim-01",
+        authority="coordinator",
+        revision=8,
+    )
+    capability = _authority_capability(
+        action="register_dead_holder_observation",
+        authority="observer",
+        subject_id=observation.digest,
+        scope_kind="dead_holder_observation",
+        scope_key=observation.digest,
+        revision=observation.revision,
+    )
+
+    assert (
+        backend.register_dead_holder_observation(observation, capability=capability)
+        == "register_dead_holder_observation"
+    )
+    assert backend.last_dead_holder is observation
+
+    forged = replace(observation, signature_base64=base64.b64encode(bytes(64)).decode("ascii"))
+    forged_capability = _authority_capability(
+        action="register_dead_holder_observation",
+        authority="observer",
+        subject_id=forged.digest,
+        scope_kind="dead_holder_observation",
+        scope_key=forged.digest,
+        revision=forged.revision,
+    )
+    before = list(backend.hook_calls)
+    with pytest.raises(CloudStateError, match="trusted_authority_signature_invalid"):
+        backend.register_dead_holder_observation(forged, capability=forged_capability)
+    assert backend.hook_calls == before
+
+
+def test_state_backend_atomic_completion_verifies_both_envelopes_with_one_clock_read() -> None:
+    clock_reads = 0
+
+    def counting_clock() -> datetime:
+        nonlocal clock_reads
+        clock_reads += 1
+        return _fixed_clock()
+
+    verifier = AuthorityVerifier(
+        authority_key=_TRUSTED_KEY,
+        dead_holder_key=_OBSERVATION_KEY,
+        clock=counting_clock,
+    )
+    backend = _FakeStateBackend(verifier=verifier)
+    backend.hook_calls = []
+    transition = _complete_transition()
+    event = ExperimentEvent.create(
+        experiment_id="experiment-01",
+        stage_attempt_id="attempt-complete-01",
+        event_type=EventType.RETRY_SCHEDULED,
+        occurred_at=_TIMESTAMP,
+        payload={"attempt": 1},
+    )
+    command_capability = _authority_capability(
+        action="complete_command_with_event",
+        authority=transition.authority,
+        subject_id=transition.claim_id,
+        scope_kind="command",
+        scope_key=transition.command_key,
+        revision=transition.expected_revision,
+    )
+    event_capability = _authority_capability(
+        action="append_event",
+        authority="coordinator",
+        subject_id=event.stage_attempt_id,
+        scope_kind="event",
+        scope_key=event.experiment_id,
+        revision=0,
+    )
+
+    assert (
+        backend.complete_command_with_event(
+            transition,
+            event,
+            command_capability=command_capability,
+            event_capability=event_capability,
+        )
+        == "complete_command_with_event"
+    )
+    assert clock_reads == 1
 
 
 def test_state_backend_wrappers_enforce_exact_actions_before_storage_hooks() -> None:

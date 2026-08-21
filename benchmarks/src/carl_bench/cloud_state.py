@@ -44,7 +44,16 @@ _TRANSITION_STATUSES = frozenset({"completed", "failed"})
 _LEASE_AUTHORITIES = frozenset({"coordinator", "supervisor"})
 _EVIDENCE_PRODUCERS = frozenset({"validator", "observer"})
 _CAPABILITY_SCOPE_KINDS = frozenset(
-    {"command", "evidence", "event", "health", "lease", "manifest", "supervisor_trigger"}
+    {
+        "command",
+        "dead_holder_observation",
+        "evidence",
+        "event",
+        "health",
+        "lease",
+        "manifest",
+        "supervisor_trigger",
+    }
 )
 _CAPABILITY_ACTIONS = frozenset(
     {
@@ -53,12 +62,14 @@ _CAPABILITY_ACTIONS = frozenset(
         "claim_command",
         "claim_supervisor_trigger",
         "complete_command",
+        "complete_command_with_event",
         "create_command",
         "fail_command",
         "reconcile_expired_claim",
         "reconcile_lease",
         "record_health",
         "register_evidence",
+        "register_dead_holder_observation",
         "register_manifest",
         "release_lease",
         "resolve_supervisor_trigger",
@@ -1597,9 +1608,11 @@ _BACKEND_MUTATIONS = frozenset(
     {
         "register_manifest",
         "append_event",
+        "register_dead_holder_observation",
         "create_command",
         "claim_command",
         "complete_command",
+        "complete_command_with_event",
         "fail_command",
         "reconcile_expired_claim",
         "acquire_lease",
@@ -1631,6 +1644,49 @@ def _backend_verifier(backend: StateBackend) -> AuthorityVerifier:
     if type(verifier) is not AuthorityVerifier:
         raise CloudStateError("authority_verifier_required")
     return verifier
+
+
+_EVENTS_BY_AUTHORITY = {
+    "builder": frozenset(
+        {"role_recorded", "workspace_prepared", "candidate_sealed", "experimental_published"}
+    ),
+    "validator": frozenset(
+        {
+            "paired_evidence_recorded",
+            "review_packet_recorded",
+            "review_attested",
+            "protected_validation_recorded",
+        }
+    ),
+    "promoter": frozenset(
+        {"draft_pr_requested", "draft_pr_recorded", "workspace_disposed", "promotion_recorded"}
+    ),
+    "soak": frozenset({"soak_observed", "revert_recorded", "state_transitioned"}),
+    "coordinator": frozenset(
+        {
+            "state_transitioned",
+            "lease_acquired",
+            "lease_reconciled",
+            "lease_released",
+            "live_spend_recorded",
+            "retry_scheduled",
+        }
+    ),
+}
+
+
+def _event_authority_allowed(authority: str, event: ExperimentEvent) -> bool:
+    event_type = getattr(getattr(event, "event_type", None), "value", None)
+    if event_type not in _EVENTS_BY_AUTHORITY.get(authority, frozenset()):
+        return False
+    if authority == "soak" and event_type == "state_transitioned":
+        payload = getattr(event, "payload", None)
+        return (
+            isinstance(payload, dict)
+            and payload.get("from_state") == "soaking"
+            and payload.get("to_state") == "accepted"
+        )
+    return True
 
 
 class StateBackend(ABC):
@@ -1743,6 +1799,38 @@ class StateBackend(ABC):
         return self._append_event(event, observed_at=now)
 
     @final
+    def register_dead_holder_observation(
+        self,
+        observation: DeadHolderObservation,
+        *,
+        capability: AuthorityCapability,
+    ) -> bool:
+        """Persist an observer-signed non-live fact before any reconciliation can consume it."""
+        now = _mutation_time(_backend_verifier(self))
+        StateBackend._authorize(
+            self,
+            capability,
+            action="register_dead_holder_observation",
+            authority="observer",
+            subject_id=observation.digest,
+            scope_kind="dead_holder_observation",
+            scope_key=observation.digest,
+            revision=observation.revision,
+            now=now,
+        )
+        verified = _require_dead_holder(
+            _backend_verifier(self),
+            observation,
+            authority=observation.authority,
+            subject_id=observation.subject_id,
+            scope_kind=observation.scope_kind,
+            scope_key=observation.scope_key,
+            revision=observation.revision,
+            now=now,
+        )
+        return self._register_dead_holder_observation(verified, observed_at=now)
+
+    @final
     def create_command(
         self, command: CloudCommand, *, capability: AuthorityCapability
     ) -> CommandMutation:
@@ -1797,6 +1885,43 @@ class StateBackend(ABC):
         return self._complete_command(transition, observed_at=now)
 
     @final
+    def complete_command_with_event(
+        self,
+        transition: StateTransition,
+        event: ExperimentEvent,
+        *,
+        command_capability: AuthorityCapability,
+        event_capability: AuthorityCapability,
+    ) -> tuple[CommandMutation, AppendResult]:
+        """Complete a command and append its authorized outcome at one storage boundary."""
+        now = _mutation_time(_backend_verifier(self))
+        StateBackend._authorize(
+            self,
+            command_capability,
+            action="complete_command_with_event",
+            authority=transition.authority,
+            subject_id=transition.claim_id,
+            scope_kind="command",
+            scope_key=transition.command_key,
+            revision=transition.expected_revision,
+            now=now,
+        )
+        StateBackend._authorize(
+            self,
+            event_capability,
+            action="append_event",
+            authority=transition.authority,
+            subject_id=event.stage_attempt_id,
+            scope_kind="event",
+            scope_key=event.experiment_id,
+            revision=0,
+            now=now,
+        )
+        if not _event_authority_allowed(transition.authority, event):
+            raise CloudStateError("event_authority_denied")
+        return self._complete_command_with_event(transition, event, observed_at=now)
+
+    @final
     def fail_command(
         self, transition: StateTransition, *, capability: AuthorityCapability
     ) -> CommandMutation:
@@ -1847,7 +1972,7 @@ class StateBackend(ABC):
         if reconciliation.observed_at != observation.observed_at:
             raise CloudStateError("dead_holder_observation_mismatch")
         return self._reconcile_expired_claim(
-            reconciliation, dead_holder=observation, observed_at=now
+            reconciliation, observation_digest=observation.digest, observed_at=now
         )
 
     @final
@@ -1900,7 +2025,9 @@ class StateBackend(ABC):
         )
         if reconciliation.observed_at != observation.observed_at:
             raise CloudStateError("dead_holder_observation_mismatch")
-        return self._reconcile_lease(reconciliation, dead_holder=observation, observed_at=now)
+        return self._reconcile_lease(
+            reconciliation, observation_digest=observation.digest, observed_at=now
+        )
 
     @final
     def release_lease(
@@ -2021,6 +2148,11 @@ class StateBackend(ABC):
     def _append_event(self, event: ExperimentEvent, *, observed_at: datetime) -> AppendResult: ...
 
     @abstractmethod
+    def _register_dead_holder_observation(
+        self, observation: DeadHolderObservation, *, observed_at: datetime
+    ) -> bool: ...
+
+    @abstractmethod
     def _create_command(
         self, command: CloudCommand, *, observed_at: datetime
     ) -> CommandMutation: ...
@@ -2034,6 +2166,15 @@ class StateBackend(ABC):
     ) -> CommandMutation: ...
 
     @abstractmethod
+    def _complete_command_with_event(
+        self,
+        transition: StateTransition,
+        event: ExperimentEvent,
+        *,
+        observed_at: datetime,
+    ) -> tuple[CommandMutation, AppendResult]: ...
+
+    @abstractmethod
     def _fail_command(
         self, transition: StateTransition, *, observed_at: datetime
     ) -> CommandMutation: ...
@@ -2043,7 +2184,7 @@ class StateBackend(ABC):
         self,
         reconciliation: ClaimReconciliation,
         *,
-        dead_holder: DeadHolderObservation,
+        observation_digest: str,
         observed_at: datetime,
     ) -> CommandMutation: ...
 
@@ -2055,7 +2196,7 @@ class StateBackend(ABC):
         self,
         reconciliation: LeaseReconciliation,
         *,
-        dead_holder: DeadHolderObservation,
+        observation_digest: str,
         observed_at: datetime,
     ) -> LeaseMutation: ...
 

@@ -43,6 +43,7 @@ CREATE TABLE carl_autonomy.experiment_events (
     authority varchar(32) NOT NULL CHECK (
         authority IN ('builder', 'validator', 'promoter', 'soak', 'supervisor', 'coordinator', 'observer')
     ),
+    trusted_authority boolean NOT NULL,
     provenance_json text NOT NULL CHECK (octet_length(provenance_json) BETWEEN 2 AND 2048),
     appended_at timestamptz NOT NULL,
     UNIQUE (experiment_id, ordinal),
@@ -51,6 +52,85 @@ CREATE TABLE carl_autonomy.experiment_events (
 
 CREATE INDEX experiment_events_experiment_order
     ON carl_autonomy.experiment_events(experiment_id, ordinal);
+
+CREATE TABLE carl_autonomy.experiment_projection_guards (
+    experiment_id varchar(128) PRIMARY KEY
+        REFERENCES carl_autonomy.experiment_manifests(experiment_id),
+    lifecycle_state varchar(32) NOT NULL DEFAULT 'queued' CHECK (
+        lifecycle_state IN (
+            'queued', 'baselining', 'diagnosing', 'proposal_review', 'building',
+            'deterministic_validation', 'paired_evaluation', 'holdout_validation',
+            'review_complete', 'pr_open', 'merged', 'soaking', 'accepted', 'rejected',
+            'inconclusive', 'blocked', 'budget_exhausted', 'reverted', 'abandoned'
+        )
+    ),
+    lifecycle_revision integer NOT NULL DEFAULT 0
+        CHECK (lifecycle_revision BETWEEN 0 AND 2147483647),
+    proposal_approvals smallint NOT NULL DEFAULT 0 CHECK (proposal_approvals BETWEEN 0 AND 3),
+    candidate_approvals smallint NOT NULL DEFAULT 0 CHECK (candidate_approvals BETWEEN 0 AND 4),
+    proposal_roles text[] NOT NULL DEFAULT '{}',
+    candidate_roles text[] NOT NULL DEFAULT '{}',
+    review_packet_roles text[] NOT NULL DEFAULT '{}',
+    review_attestation_roles text[] NOT NULL DEFAULT '{}',
+    lease_active boolean NOT NULL DEFAULT false,
+    lease_reconciled boolean NOT NULL DEFAULT false,
+    lease_attempt_id varchar(128),
+    lease_owner_id varchar(192),
+    lease_expires_at timestamptz,
+    workspace_prepared boolean NOT NULL DEFAULT false,
+    candidate_sealed boolean NOT NULL DEFAULT false,
+    paired_evidence_recorded boolean NOT NULL DEFAULT false,
+    protected_validation_recorded boolean NOT NULL DEFAULT false,
+    review_packet_count smallint NOT NULL DEFAULT 0 CHECK (review_packet_count BETWEEN 0 AND 4),
+    review_attestation_count smallint NOT NULL DEFAULT 0
+        CHECK (review_attestation_count BETWEEN 0 AND 4),
+    draft_pr_requested boolean NOT NULL DEFAULT false,
+    draft_pr_recorded boolean NOT NULL DEFAULT false,
+    workspace_disposed boolean NOT NULL DEFAULT false,
+    experimental_published boolean NOT NULL DEFAULT false,
+    experimental_commit character(40),
+    experimental_tree character(40),
+    promotion_recorded boolean NOT NULL DEFAULT false,
+    promotion_merge_commit character(40),
+    soak_failure_recorded boolean NOT NULL DEFAULT false,
+    soak_failure_digest character(64),
+    updated_at timestamptz NOT NULL,
+    CHECK (
+        (lease_active AND lease_attempt_id IS NOT NULL AND lease_owner_id IS NOT NULL
+            AND lease_expires_at IS NOT NULL)
+        OR
+        (NOT lease_active AND NOT lease_reconciled
+            AND lease_attempt_id IS NULL AND lease_owner_id IS NULL
+            AND lease_expires_at IS NULL)
+    )
+);
+
+CREATE TABLE carl_autonomy.dead_holder_observations (
+    observation_digest character(64) PRIMARY KEY
+        CHECK (observation_digest ~ '^[0-9a-f]{64}$'),
+    observation_json text NOT NULL CHECK (octet_length(observation_json) BETWEEN 2 AND 16384),
+    authority varchar(32) NOT NULL CHECK (
+        authority IN ('builder', 'validator', 'promoter', 'soak', 'supervisor', 'coordinator', 'observer')
+    ),
+    subject_id varchar(192) NOT NULL,
+    scope_kind varchar(32) NOT NULL CHECK (scope_kind IN ('command', 'lease')),
+    scope_key varchar(192) NOT NULL,
+    revision integer NOT NULL CHECK (revision BETWEEN 0 AND 2147483647),
+    issued_at timestamptz NOT NULL,
+    issued_at_text varchar(64) NOT NULL,
+    observed_at timestamptz NOT NULL,
+    observed_at_text varchar(64) NOT NULL,
+    expires_at timestamptz NOT NULL,
+    expires_at_text varchar(64) NOT NULL,
+    live boolean NOT NULL,
+    key_id varchar(128) NOT NULL,
+    signature_base64 varchar(128) NOT NULL,
+    registered_at timestamptz NOT NULL,
+    CHECK (observed_at >= issued_at AND expires_at > observed_at),
+    CHECK (subject_id ~ '^[A-Za-z0-9][A-Za-z0-9._:/-]{0,191}$'),
+    CHECK (scope_key ~ '^[A-Za-z0-9][A-Za-z0-9._:/-]{0,191}$'),
+    CHECK (key_id ~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$')
+);
 
 CREATE TABLE carl_autonomy.commands (
     command_key varchar(192) PRIMARY KEY,
@@ -206,6 +286,10 @@ FOR EACH ROW EXECUTE FUNCTION carl_autonomy.reject_immutable_mutation();
 
 CREATE TRIGGER experiment_events_append_only
 BEFORE UPDATE OR DELETE ON carl_autonomy.experiment_events
+FOR EACH ROW EXECUTE FUNCTION carl_autonomy.reject_immutable_mutation();
+
+CREATE TRIGGER dead_holder_observations_immutable
+BEFORE UPDATE OR DELETE ON carl_autonomy.dead_holder_observations
 FOR EACH ROW EXECUTE FUNCTION carl_autonomy.reject_immutable_mutation();
 
 CREATE TRIGGER evidence_objects_immutable

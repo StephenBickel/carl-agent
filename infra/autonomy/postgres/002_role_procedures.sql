@@ -224,7 +224,369 @@ BEGIN
         experiment_key, parent_key, p_manifest_json, p_manifest_digest,
         registered_time, registered_text, p_observed_at
     );
+    INSERT INTO carl_autonomy.experiment_projection_guards(experiment_id, updated_at)
+    VALUES (experiment_key, p_observed_at);
     RETURN QUERY SELECT true;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION carl_autonomy.validate_and_advance_event(
+    p_experiment_id text,
+    p_event_type text,
+    p_payload jsonb,
+    p_stage_attempt_id text,
+    p_occurred_at timestamptz,
+    p_observed_at timestamptz
+)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, carl_autonomy
+AS $$
+DECLARE
+    guard carl_autonomy.experiment_projection_guards%ROWTYPE;
+    source_state text;
+    target_state text;
+    role_name text;
+    verdict_name text;
+    expected_target text;
+    lease_required boolean := false;
+BEGIN
+    SELECT g.* INTO guard
+    FROM carl_autonomy.experiment_projection_guards AS g
+    WHERE g.experiment_id = p_experiment_id
+    FOR UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION USING ERRCODE = '23503', MESSAGE = 'experiment_projection_missing';
+    END IF;
+
+    IF p_event_type = 'state_transitioned' THEN
+        source_state := p_payload->>'from_state';
+        target_state := p_payload->>'to_state';
+        IF source_state IS NULL OR target_state IS NULL THEN
+            RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'invalid_transition_payload';
+        END IF;
+        IF guard.lifecycle_state IN (
+            'accepted', 'rejected', 'inconclusive', 'blocked', 'budget_exhausted',
+            'reverted', 'abandoned'
+        ) THEN
+            RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'terminal_state';
+        END IF;
+        IF source_state <> guard.lifecycle_state THEN
+            RAISE EXCEPTION USING ERRCODE = '40001', MESSAGE = 'stale_source_state';
+        END IF;
+        expected_target := CASE source_state
+            WHEN 'queued' THEN 'baselining'
+            WHEN 'baselining' THEN 'diagnosing'
+            WHEN 'diagnosing' THEN 'proposal_review'
+            WHEN 'proposal_review' THEN 'building'
+            WHEN 'building' THEN 'deterministic_validation'
+            WHEN 'deterministic_validation' THEN 'paired_evaluation'
+            WHEN 'paired_evaluation' THEN 'holdout_validation'
+            WHEN 'holdout_validation' THEN 'review_complete'
+            WHEN 'review_complete' THEN 'pr_open'
+            WHEN 'pr_open' THEN 'merged'
+            WHEN 'merged' THEN 'soaking'
+            WHEN 'soaking' THEN 'accepted'
+            ELSE NULL
+        END;
+        IF target_state <> expected_target AND target_state NOT IN (
+            'rejected', 'inconclusive', 'blocked', 'budget_exhausted', 'reverted', 'abandoned'
+        ) THEN
+            RAISE EXCEPTION USING ERRCODE = '23514', MESSAGE = 'invalid_transition';
+        END IF;
+        lease_required := target_state IN (
+            'building', 'deterministic_validation', 'paired_evaluation', 'holdout_validation',
+            'review_complete', 'pr_open', 'merged', 'soaking', 'accepted'
+        );
+        IF lease_required AND (
+            NOT guard.lease_active
+            OR guard.lease_reconciled
+            OR p_payload->'_lease'->>'owner_id' IS DISTINCT FROM guard.lease_owner_id
+            OR p_payload->'_lease'->>'stage_attempt_id' IS DISTINCT FROM guard.lease_attempt_id
+            OR p_occurred_at > guard.lease_expires_at
+        ) THEN
+            RAISE EXCEPTION USING ERRCODE = '42501', MESSAGE = 'lease_capability_invalid';
+        END IF;
+        IF target_state = 'building' AND guard.proposal_approvals < 2 THEN
+            RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'proposal_quorum_unsatisfied';
+        END IF;
+        IF target_state = 'deterministic_validation'
+            AND guard.workspace_prepared AND NOT guard.candidate_sealed
+        THEN
+            RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'sealed_candidate_required';
+        END IF;
+        IF target_state = 'holdout_validation'
+            AND (NOT guard.paired_evidence_recorded OR NOT guard.protected_validation_recorded)
+        THEN
+            RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'phase4_protected_validation_required';
+        END IF;
+        IF target_state = 'review_complete' AND (
+            guard.candidate_approvals < 3 OR cardinality(guard.candidate_roles) <> 4
+        ) THEN
+            RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'candidate_quorum_unsatisfied';
+        END IF;
+        UPDATE carl_autonomy.experiment_projection_guards
+        SET lifecycle_state = target_state,
+            lifecycle_revision = lifecycle_revision + 1,
+            updated_at = p_observed_at
+        WHERE experiment_id = p_experiment_id;
+        RETURN;
+    END IF;
+
+    IF p_event_type = 'role_recorded' THEN
+        role_name := p_payload->>'role';
+        verdict_name := p_payload->>'verdict';
+        IF p_payload->>'artifact_digest' !~ '^[0-9a-f]{64}$'
+            OR verdict_name NOT IN ('approve', 'reject', 'hard_objection')
+        THEN
+            RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'invalid_review_payload';
+        END IF;
+        IF role_name IN ('causal', 'product', 'evaluation') THEN
+            IF guard.lifecycle_state <> 'proposal_review' OR role_name = ANY(guard.proposal_roles) THEN
+                RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'proposal_review_invalid';
+            END IF;
+            UPDATE carl_autonomy.experiment_projection_guards
+            SET proposal_roles = array_append(proposal_roles, role_name),
+                proposal_approvals = proposal_approvals + (verdict_name = 'approve')::integer,
+                updated_at = p_observed_at
+            WHERE experiment_id = p_experiment_id;
+        ELSE
+            IF guard.lifecycle_state <> 'holdout_validation'
+                OR role_name NOT IN ('correctness', 'security', 'maintainability', 'benchmark_integrity')
+                OR role_name = ANY(guard.candidate_roles)
+                OR NOT guard.lease_active OR guard.lease_reconciled
+                OR p_payload->'_lease'->>'owner_id' IS DISTINCT FROM guard.lease_owner_id
+                OR p_payload->'_lease'->>'stage_attempt_id' IS DISTINCT FROM guard.lease_attempt_id
+                OR p_occurred_at > guard.lease_expires_at
+            THEN
+                RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'candidate_review_invalid';
+            END IF;
+            UPDATE carl_autonomy.experiment_projection_guards
+            SET candidate_roles = array_append(candidate_roles, role_name),
+                candidate_approvals = candidate_approvals + (verdict_name = 'approve')::integer,
+                updated_at = p_observed_at
+            WHERE experiment_id = p_experiment_id;
+        END IF;
+        RETURN;
+    END IF;
+
+    IF p_event_type = 'lease_acquired' THEN
+        IF NOT (
+                (guard.lifecycle_state = 'proposal_review' AND NOT guard.lease_active)
+                OR (guard.lease_active AND guard.lease_reconciled AND guard.lifecycle_state IN (
+                    'building', 'deterministic_validation', 'paired_evaluation',
+                    'holdout_validation', 'review_complete', 'pr_open', 'merged', 'soaking'
+                ))
+            )
+            OR p_payload->>'owner_id' IS NULL OR p_payload->>'expires_at' IS NULL
+            OR (p_payload->>'expires_at')::timestamptz <= p_occurred_at
+            OR (p_payload->>'expires_at')::timestamptz > p_occurred_at + interval '6 hours'
+        THEN
+            RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'lease_wrong_state';
+        END IF;
+        UPDATE carl_autonomy.experiment_projection_guards
+        SET lease_active = true, lease_reconciled = false, lease_attempt_id = p_stage_attempt_id,
+            lease_owner_id = p_payload->>'owner_id',
+            lease_expires_at = (p_payload->>'expires_at')::timestamptz,
+            updated_at = p_observed_at
+        WHERE experiment_id = p_experiment_id;
+        RETURN;
+    END IF;
+
+    IF p_event_type IN (
+        'workspace_prepared', 'candidate_sealed', 'paired_evidence_recorded',
+        'review_packet_recorded', 'review_attested', 'draft_pr_requested',
+        'draft_pr_recorded', 'workspace_disposed'
+    ) AND (
+        NOT guard.lease_active
+        OR guard.lease_reconciled
+        OR p_payload->'_lease'->>'owner_id' IS DISTINCT FROM guard.lease_owner_id
+        OR p_payload->'_lease'->>'stage_attempt_id' IS DISTINCT FROM guard.lease_attempt_id
+        OR p_occurred_at > guard.lease_expires_at
+    ) THEN
+        RAISE EXCEPTION USING ERRCODE = '42501', MESSAGE = 'lease_capability_invalid';
+    END IF;
+
+    CASE p_event_type
+        WHEN 'workspace_prepared' THEN
+            IF guard.lifecycle_state <> 'building' OR guard.workspace_prepared THEN
+                RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'candidate_prepare_wrong_state';
+            END IF;
+            UPDATE carl_autonomy.experiment_projection_guards SET workspace_prepared = true,
+                updated_at = p_observed_at WHERE experiment_id = p_experiment_id;
+        WHEN 'candidate_sealed' THEN
+            IF guard.lifecycle_state <> 'building' OR NOT guard.workspace_prepared
+                OR guard.candidate_sealed
+            THEN
+                RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'prepared_candidate_required';
+            END IF;
+            UPDATE carl_autonomy.experiment_projection_guards SET candidate_sealed = true,
+                updated_at = p_observed_at WHERE experiment_id = p_experiment_id;
+        WHEN 'paired_evidence_recorded' THEN
+            IF guard.lifecycle_state <> 'paired_evaluation' OR NOT guard.candidate_sealed
+                OR guard.paired_evidence_recorded
+            THEN
+                RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'paired_evidence_prerequisite_missing';
+            END IF;
+            UPDATE carl_autonomy.experiment_projection_guards SET paired_evidence_recorded = true,
+                updated_at = p_observed_at WHERE experiment_id = p_experiment_id;
+        WHEN 'protected_validation_recorded' THEN
+            IF guard.lifecycle_state <> 'paired_evaluation' OR NOT guard.candidate_sealed
+                OR NOT guard.paired_evidence_recorded OR NOT guard.experimental_published
+                OR guard.protected_validation_recorded
+                OR jsonb_object_length(p_payload) <> 3
+                OR NOT p_payload ?& ARRAY['candidate_commit', 'candidate_tree', 'receipt_digest']
+                OR p_payload->>'candidate_commit' IS DISTINCT FROM guard.experimental_commit
+                OR p_payload->>'candidate_tree' IS DISTINCT FROM guard.experimental_tree
+                OR p_payload->>'receipt_digest' !~ '^[0-9a-f]{64}$'
+            THEN
+                RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'protected_validation_prerequisite_missing';
+            END IF;
+            UPDATE carl_autonomy.experiment_projection_guards
+            SET protected_validation_recorded = true, updated_at = p_observed_at
+            WHERE experiment_id = p_experiment_id;
+        WHEN 'review_packet_recorded' THEN
+            role_name := p_payload->>'role';
+            IF guard.lifecycle_state <> 'paired_evaluation' OR NOT guard.paired_evidence_recorded
+                OR role_name IS NULL OR role_name = ANY(guard.review_packet_roles)
+            THEN
+                RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'review_packet_prerequisite_missing';
+            END IF;
+            UPDATE carl_autonomy.experiment_projection_guards
+            SET review_packet_roles = array_append(review_packet_roles, role_name),
+                review_packet_count = review_packet_count + 1, updated_at = p_observed_at
+            WHERE experiment_id = p_experiment_id;
+        WHEN 'review_attested' THEN
+            role_name := p_payload->>'role';
+            IF guard.lifecycle_state <> 'paired_evaluation'
+                OR NOT role_name = ANY(guard.review_packet_roles)
+                OR role_name = ANY(guard.review_attestation_roles)
+            THEN
+                RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'review_packet_required';
+            END IF;
+            UPDATE carl_autonomy.experiment_projection_guards
+            SET review_attestation_roles = array_append(review_attestation_roles, role_name),
+                review_attestation_count = review_attestation_count + 1,
+                updated_at = p_observed_at WHERE experiment_id = p_experiment_id;
+        WHEN 'draft_pr_requested' THEN
+            IF guard.lifecycle_state <> 'paired_evaluation'
+                OR guard.review_attestation_count <> 4 OR guard.draft_pr_requested
+            THEN
+                RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'candidate_attestation_quorum_unsatisfied';
+            END IF;
+            UPDATE carl_autonomy.experiment_projection_guards SET draft_pr_requested = true,
+                updated_at = p_observed_at WHERE experiment_id = p_experiment_id;
+        WHEN 'draft_pr_recorded' THEN
+            IF NOT guard.draft_pr_requested OR guard.draft_pr_recorded THEN
+                RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'draft_pr_authorization_required';
+            END IF;
+            UPDATE carl_autonomy.experiment_projection_guards SET draft_pr_recorded = true,
+                updated_at = p_observed_at WHERE experiment_id = p_experiment_id;
+        WHEN 'workspace_disposed' THEN
+            IF NOT guard.draft_pr_recorded OR guard.workspace_disposed THEN
+                RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'draft_pr_required';
+            END IF;
+            UPDATE carl_autonomy.experiment_projection_guards SET workspace_disposed = true,
+                updated_at = p_observed_at WHERE experiment_id = p_experiment_id;
+        WHEN 'experimental_published' THEN
+            IF guard.experimental_published OR jsonb_object_length(p_payload) <> 4
+                OR NOT p_payload ?& ARRAY['branch', 'candidate_packet_digest', 'commit', 'tree']
+                OR p_payload->>'candidate_packet_digest' !~ '^[0-9a-f]{64}$'
+                OR p_payload->>'commit' !~ '^[0-9a-f]{40}$'
+                OR p_payload->>'tree' !~ '^[0-9a-f]{40}$'
+            THEN
+                RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'experimental_already_published';
+            END IF;
+            UPDATE carl_autonomy.experiment_projection_guards SET experimental_published = true,
+                experimental_commit = p_payload->>'commit', experimental_tree = p_payload->>'tree',
+                updated_at = p_observed_at WHERE experiment_id = p_experiment_id;
+        WHEN 'promotion_recorded' THEN
+            IF NOT guard.protected_validation_recorded OR guard.promotion_recorded
+                OR jsonb_object_length(p_payload) <> 2
+                OR NOT p_payload ?& ARRAY['merge_commit', 'merge_tree']
+                OR p_payload->>'merge_commit' !~ '^[0-9a-f]{40}$'
+                OR p_payload->>'merge_tree' !~ '^[0-9a-f]{40}$'
+            THEN
+                RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'promotion_prerequisite_missing';
+            END IF;
+            UPDATE carl_autonomy.experiment_projection_guards SET promotion_recorded = true,
+                promotion_merge_commit = p_payload->>'merge_commit',
+                updated_at = p_observed_at WHERE experiment_id = p_experiment_id;
+        WHEN 'soak_observed' THEN
+            IF NOT guard.promotion_recorded OR jsonb_object_length(p_payload) <> 4
+                OR NOT p_payload ?& ARRAY[
+                    'evidence_digest', 'healthy', 'merge_commit', 'observed_at'
+                ]
+                OR p_payload->>'evidence_digest' !~ '^[0-9a-f]{64}$'
+                OR p_payload->>'merge_commit' IS DISTINCT FROM guard.promotion_merge_commit
+                OR (p_payload->>'observed_at')::timestamptz <> p_occurred_at
+                OR jsonb_typeof(p_payload->'healthy') <> 'boolean'
+            THEN
+                RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'soak_prerequisite_missing';
+            END IF;
+            UPDATE carl_autonomy.experiment_projection_guards
+            SET soak_failure_recorded = soak_failure_recorded OR (p_payload->>'healthy')::boolean = false,
+                soak_failure_digest = CASE WHEN (p_payload->>'healthy')::boolean = false
+                    THEN p_payload->>'evidence_digest' ELSE soak_failure_digest END,
+                updated_at = p_observed_at WHERE experiment_id = p_experiment_id;
+        WHEN 'revert_recorded' THEN
+            IF NOT guard.soak_failure_recorded OR jsonb_object_length(p_payload) <> 6
+                OR NOT p_payload ?& ARRAY[
+                    'hard_failure_digest', 'merge_commit', 'restored_tree',
+                    'revert_candidate_commit', 'revert_merge_commit', 'revert_pull_request_number'
+                ]
+                OR p_payload->>'hard_failure_digest' IS DISTINCT FROM guard.soak_failure_digest
+                OR p_payload->>'merge_commit' IS DISTINCT FROM guard.promotion_merge_commit
+            THEN
+                RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'hard_failure_required';
+            END IF;
+        WHEN 'lease_reconciled' THEN
+            IF NOT guard.lease_active OR guard.lease_reconciled
+                OR p_payload->>'lease_stage_attempt_id' IS DISTINCT FROM guard.lease_attempt_id
+                OR p_payload->>'worker_not_live' <> 'true'
+                OR p_occurred_at < guard.lease_expires_at
+            THEN
+                RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'invalid_lease_reconciliation';
+            END IF;
+            UPDATE carl_autonomy.experiment_projection_guards SET lease_reconciled = true,
+                updated_at = p_observed_at WHERE experiment_id = p_experiment_id;
+        WHEN 'lease_released' THEN
+            IF NOT guard.lease_active
+                OR p_payload->>'lease_stage_attempt_id' IS DISTINCT FROM guard.lease_attempt_id
+                OR guard.lifecycle_state IN (
+                    'building', 'deterministic_validation', 'paired_evaluation',
+                    'holdout_validation', 'review_complete', 'pr_open', 'merged', 'soaking'
+                )
+            THEN
+                RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'invalid_lease_release';
+            END IF;
+            UPDATE carl_autonomy.experiment_projection_guards
+            SET lease_active = false, lease_reconciled = false, lease_attempt_id = NULL,
+                lease_owner_id = NULL, lease_expires_at = NULL, updated_at = p_observed_at
+            WHERE experiment_id = p_experiment_id;
+        WHEN 'live_spend_recorded' THEN
+            IF jsonb_object_length(p_payload) <> 2
+                OR NOT p_payload ?& ARRAY['live_microdollars', 'run_id']
+                OR jsonb_typeof(p_payload->'live_microdollars') <> 'number'
+                OR (p_payload->>'live_microdollars')::bigint NOT BETWEEN 1 AND 1000000000
+            THEN
+                RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'invalid_spend_payload';
+            END IF;
+        WHEN 'retry_scheduled' THEN
+            IF jsonb_object_length(p_payload) <> 5
+                OR NOT p_payload ?& ARRAY[
+                    'attempt', 'changed_action', 'failed_stage_attempt_id',
+                    'failure_class', 'scheduled_at'
+                ]
+                OR (p_payload->>'attempt')::integer NOT BETWEEN 1 AND 3
+                OR (p_payload->>'scheduled_at')::timestamptz <> p_occurred_at
+            THEN
+                RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'invalid_retry_payload';
+            END IF;
+        ELSE
+            RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'unsupported_event_type';
+    END CASE;
 END;
 $$;
 
@@ -303,6 +665,9 @@ BEGIN
     IF NOT FOUND THEN
         RAISE EXCEPTION USING ERRCODE = '23503', MESSAGE = 'experiment_not_found';
     END IF;
+    PERFORM carl_autonomy.validate_and_advance_event(
+        experiment_key, type_name, payload, attempt_key, occurred_time, p_observed_at
+    );
     SELECT e.ordinal, e.chain_digest::text
     INTO next_ordinal, previous_hash
     FROM carl_autonomy.experiment_events AS e
@@ -327,11 +692,18 @@ BEGIN
     INSERT INTO carl_autonomy.experiment_events(
         experiment_id, ordinal, schema_version, stage_attempt_id, event_type,
         occurred_at, occurred_at_text, payload_json, event_json, event_digest,
-        previous_chain_digest, chain_digest, authority, provenance_json, appended_at
+        previous_chain_digest, chain_digest, authority, trusted_authority,
+        provenance_json, appended_at
     ) VALUES (
         experiment_key, next_ordinal, 1, attempt_key, type_name,
         occurred_time, occurred_text, p_payload_json, p_event_json, p_event_digest,
         previous_hash, next_chain, authority_name,
+        type_name IN (
+            'paired_evidence_recorded', 'review_packet_recorded', 'review_attested',
+            'draft_pr_requested', 'draft_pr_recorded', 'workspace_disposed',
+            'protected_validation_recorded', 'promotion_recorded', 'soak_observed',
+            'revert_recorded'
+        ) OR (authority_name = 'soak' AND type_name = 'state_transitioned'),
         json_build_object('database_role', caller, 'observed_at', p_observed_at)::text,
         p_observed_at
     );
@@ -361,6 +733,7 @@ $$;
 CREATE OR REPLACE FUNCTION carl_autonomy.load_experiment_events(p_experiment_id text)
 RETURNS TABLE(
     authority text,
+    trusted_authority boolean,
     chain_digest text,
     event_digest text,
     event_json text,
@@ -378,7 +751,7 @@ BEGIN
         'carl_supervisor', 'carl_coordinator', 'carl_observer'
     ]);
     RETURN QUERY
-    SELECT e.authority::text, e.chain_digest::text, e.event_digest::text,
+    SELECT e.authority::text, e.trusted_authority, e.chain_digest::text, e.event_digest::text,
         e.event_json, e.ordinal, e.previous_chain_digest::text
     FROM carl_autonomy.experiment_events AS e
     WHERE e.experiment_id = p_experiment_id
@@ -627,9 +1000,81 @@ BEGIN
 END;
 $$;
 
+CREATE OR REPLACE FUNCTION carl_autonomy.register_dead_holder_observation(
+    p_observation_json text,
+    p_observation_digest text,
+    p_registered_at timestamptz
+)
+RETURNS TABLE(applied boolean)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, carl_autonomy
+AS $$
+DECLARE
+    value jsonb;
+    issued_time timestamptz;
+    observed_time timestamptz;
+    expires_time timestamptz;
+    revision_value integer;
+    existing carl_autonomy.dead_holder_observations%ROWTYPE;
+BEGIN
+    PERFORM carl_autonomy.require_role(ARRAY['carl_observer']);
+    value := carl_autonomy.parse_object(p_observation_json, 'dead_holder_observation_invalid');
+    IF carl_autonomy.sha256_text(p_observation_json) <> p_observation_digest
+        OR value->>'schema_version' <> '1'
+        OR value->>'authority' IS NULL
+        OR value->>'subject_id' IS NULL
+        OR value->>'scope_kind' NOT IN ('command', 'lease')
+        OR value->>'scope_key' IS NULL
+        OR value->>'key_id' IS NULL
+        OR value->>'signature_base64' IS NULL
+        OR length(value->>'signature_base64') <> 88
+    THEN
+        RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'dead_holder_observation_invalid';
+    END IF;
+    BEGIN
+        revision_value := (value->>'revision')::integer;
+        issued_time := (value->>'issued_at')::timestamptz;
+        observed_time := (value->>'observed_at')::timestamptz;
+        expires_time := (value->>'expires_at')::timestamptz;
+    EXCEPTION WHEN OTHERS THEN
+        RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'dead_holder_observation_invalid';
+    END;
+    IF revision_value < 0 OR value->>'live' <> 'false'
+        OR observed_time < issued_time OR observed_time > p_registered_at
+        OR expires_time <= observed_time
+        OR expires_time <= p_registered_at
+    THEN
+        RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'dead_holder_observation_invalid';
+    END IF;
+    SELECT d.* INTO existing
+    FROM carl_autonomy.dead_holder_observations AS d
+    WHERE d.observation_digest = p_observation_digest;
+    IF FOUND THEN
+        IF existing.observation_json = p_observation_json THEN
+            RETURN QUERY SELECT false;
+            RETURN;
+        END IF;
+        RAISE EXCEPTION USING ERRCODE = '23505', MESSAGE = 'dead_holder_observation_conflict';
+    END IF;
+    INSERT INTO carl_autonomy.dead_holder_observations(
+        observation_digest, observation_json, authority, subject_id, scope_kind,
+        scope_key, revision, issued_at, issued_at_text, observed_at, observed_at_text,
+        expires_at, expires_at_text, live, key_id, signature_base64, registered_at
+    ) VALUES (
+        p_observation_digest, p_observation_json, value->>'authority', value->>'subject_id',
+        value->>'scope_kind', value->>'scope_key', revision_value,
+        issued_time, value->>'issued_at', observed_time, value->>'observed_at',
+        expires_time, value->>'expires_at', false, value->>'key_id',
+        value->>'signature_base64', p_registered_at
+    );
+    RETURN QUERY SELECT true;
+END;
+$$;
+
 CREATE OR REPLACE FUNCTION carl_autonomy.reconcile_expired_claim(
     p_reconciliation_json text,
-    p_dead_holder_json text,
+    p_observation_digest text,
     p_observed_at timestamptz
 )
 RETURNS TABLE(
@@ -650,7 +1095,7 @@ DECLARE
     caller text;
     caller_authority text;
     value jsonb;
-    dead_value jsonb;
+    observation carl_autonomy.dead_holder_observations%ROWTYPE;
     command_key_value text;
     claim_key text;
     authority_value text;
@@ -665,7 +1110,6 @@ BEGIN
     ]);
     caller_authority := carl_autonomy.role_authority(caller);
     value := carl_autonomy.parse_object(p_reconciliation_json, 'claim_reconciliation_invalid');
-    dead_value := carl_autonomy.parse_object(p_dead_holder_json, 'dead_holder_observation_invalid');
     command_key_value := value->>'command_key';
     claim_key := value->>'claim_id';
     authority_value := value->>'authority';
@@ -676,14 +1120,22 @@ BEGIN
     EXCEPTION WHEN OTHERS THEN
         RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'claim_reconciliation_invalid';
     END;
+    SELECT d.* INTO observation
+    FROM carl_autonomy.dead_holder_observations AS d
+    WHERE d.observation_digest = p_observation_digest
+    FOR SHARE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION USING ERRCODE = '23503', MESSAGE = 'dead_holder_observation_unregistered';
+    END IF;
     IF authority_value <> caller_authority OR next_value <> expected_value + 1
-        OR dead_value->>'authority' <> authority_value
-        OR dead_value->>'subject_id' <> claim_key
-        OR dead_value->>'scope_kind' <> 'command'
-        OR dead_value->>'scope_key' <> command_key_value
-        OR (dead_value->>'revision')::integer <> expected_value
-        OR (dead_value->>'live')::boolean IS DISTINCT FROM false
-        OR dead_value->>'observed_at' <> observed_text
+        OR observation.authority <> authority_value
+        OR observation.subject_id <> claim_key
+        OR observation.scope_kind <> 'command'
+        OR observation.scope_key <> command_key_value
+        OR observation.revision <> expected_value
+        OR observation.live
+        OR observation.observed_at_text <> observed_text
+        OR observation.expires_at <= p_observed_at
     THEN
         RAISE EXCEPTION USING ERRCODE = '42501', MESSAGE = 'dead_holder_observation_mismatch';
     END IF;
@@ -691,7 +1143,9 @@ BEGIN
     FROM carl_autonomy.commands AS c
     WHERE c.command_key = command_key_value
     FOR UPDATE;
-    IF NOT FOUND OR current_state.status <> 'claimed' OR current_state.claim_id <> claim_key THEN
+    IF NOT FOUND OR current_state.status <> 'claimed' OR current_state.claim_id <> claim_key
+        OR current_state.authority <> authority_value
+    THEN
         RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'command_not_reconcilable';
     END IF;
     IF current_state.revision <> expected_value THEN
@@ -994,7 +1448,7 @@ $$;
 
 CREATE OR REPLACE FUNCTION carl_autonomy.reconcile_lease(
     p_reconciliation_json text,
-    p_dead_holder_json text,
+    p_observation_digest text,
     p_observed_at timestamptz
 )
 RETURNS TABLE(applied boolean, lease_json text, revision integer)
@@ -1006,7 +1460,7 @@ DECLARE
     caller text;
     caller_authority text;
     value jsonb;
-    dead_value jsonb;
+    observation carl_autonomy.dead_holder_observations%ROWTYPE;
     lease_key_value text;
     holder_value text;
     authority_value text;
@@ -1020,7 +1474,6 @@ BEGIN
     caller := carl_autonomy.require_role(ARRAY['carl_coordinator', 'carl_supervisor']);
     caller_authority := carl_autonomy.role_authority(caller);
     value := carl_autonomy.parse_object(p_reconciliation_json, 'lease_reconciliation_invalid');
-    dead_value := carl_autonomy.parse_object(p_dead_holder_json, 'dead_holder_observation_invalid');
     lease_key_value := value->>'lease_key';
     holder_value := value->>'holder_id';
     authority_value := value->>'authority';
@@ -1031,14 +1484,22 @@ BEGIN
     EXCEPTION WHEN OTHERS THEN
         RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'lease_reconciliation_invalid';
     END;
+    SELECT d.* INTO observation
+    FROM carl_autonomy.dead_holder_observations AS d
+    WHERE d.observation_digest = p_observation_digest
+    FOR SHARE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION USING ERRCODE = '23503', MESSAGE = 'dead_holder_observation_unregistered';
+    END IF;
     IF authority_value <> caller_authority OR next_value <> expected_value + 1
-        OR dead_value->>'authority' <> authority_value
-        OR dead_value->>'subject_id' <> holder_value
-        OR dead_value->>'scope_kind' <> 'lease'
-        OR dead_value->>'scope_key' <> lease_key_value
-        OR (dead_value->>'revision')::integer <> expected_value
-        OR (dead_value->>'live')::boolean IS DISTINCT FROM false
-        OR dead_value->>'observed_at' <> observed_text
+        OR observation.authority <> authority_value
+        OR observation.subject_id <> holder_value
+        OR observation.scope_kind <> 'lease'
+        OR observation.scope_key <> lease_key_value
+        OR observation.revision <> expected_value
+        OR observation.live
+        OR observation.observed_at_text <> observed_text
+        OR observation.expires_at <= p_observed_at
     THEN
         RAISE EXCEPTION USING ERRCODE = '42501', MESSAGE = 'dead_holder_observation_mismatch';
     END IF;
@@ -1057,7 +1518,7 @@ BEGIN
     IF p_observed_at < current_state.expires_at THEN
         RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'lease_active';
     END IF;
-    observation_digest := carl_autonomy.sha256_text(p_dead_holder_json);
+    observation_digest := p_observation_digest;
     document := carl_autonomy.lease_document(
         lease_key_value, holder_value, authority_value, next_value,
         current_state.acquired_at_text, current_state.expires_at_text,
@@ -1516,11 +1977,15 @@ GRANT EXECUTE ON FUNCTION carl_autonomy.load_experiment_manifest(text),
 
 GRANT EXECUTE ON FUNCTION carl_autonomy.create_command(text, timestamptz),
     carl_autonomy.claim_command(text, timestamptz),
-    carl_autonomy.reconcile_expired_claim(text, text, timestamptz),
-    carl_autonomy.complete_command(text, timestamptz),
     carl_autonomy.fail_command(text, timestamptz)
     TO carl_builder, carl_validator, carl_promoter, carl_soak,
        carl_supervisor, carl_coordinator, carl_observer;
+GRANT EXECUTE ON FUNCTION carl_autonomy.reconcile_expired_claim(text, text, timestamptz)
+    TO carl_supervisor, carl_coordinator;
+
+GRANT EXECUTE ON FUNCTION carl_autonomy.register_dead_holder_observation(
+    text, text, timestamptz
+) TO carl_observer;
 
 GRANT EXECUTE ON FUNCTION carl_autonomy.acquire_lease(text, timestamptz),
     carl_autonomy.reconcile_lease(text, text, timestamptz),
@@ -1539,6 +2004,6 @@ GRANT EXECUTE ON FUNCTION carl_autonomy.record_health(text, timestamptz)
     TO carl_observer;
 GRANT EXECUTE ON FUNCTION carl_autonomy.complete_command_and_append_event(
     text, text, text, text, timestamptz
-) TO carl_coordinator;
+) TO carl_builder, carl_validator, carl_promoter, carl_soak, carl_coordinator;
 
 COMMIT;

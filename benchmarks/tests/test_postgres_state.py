@@ -140,6 +140,8 @@ class FakeDatabase:
     @staticmethod
     def operation(query: str) -> str:
         for operation in (
+            "register_dead_holder_observation",
+            "complete_command_and_append_event",
             "register_manifest",
             "append_event",
             "create_command",
@@ -297,6 +299,142 @@ def _capability(
     )
 
 
+def _dead_holder(
+    *,
+    scope_kind: str = "command",
+    scope_key: str = "dispatch-exp-001",
+    subject_id: str = "claim-exp-001",
+    revision: int = 8,
+) -> DeadHolderObservation:
+    unsigned = DeadHolderObservation(
+        schema_version=1,
+        authority="coordinator",
+        subject_id=subject_id,
+        scope_kind=scope_kind,
+        scope_key=scope_key,
+        revision=revision,
+        issued_at="2026-08-20T11:55:00Z",
+        observed_at=NOW_TEXT,
+        expires_at="2026-08-20T12:05:00Z",
+        live=False,
+        key_id=LIVENESS_KEY.key_id,
+        signature_base64=base64.b64encode(bytes(64)).decode("ascii"),
+    )
+    return replace(
+        unsigned,
+        signature_base64=base64.b64encode(LIVENESS_PRIVATE.sign(unsigned.signing_payload())).decode(
+            "ascii"
+        ),
+    )
+
+
+def test_adapter_rejects_forged_observation_before_registration_sql() -> None:
+    database = FakeDatabase(database_role="carl_observer")
+    backend = _backend(database, role="carl_observer")
+    observation = _dead_holder()
+    forged = replace(observation, signature_base64=base64.b64encode(bytes(64)).decode("ascii"))
+    capability = _capability(
+        action="register_dead_holder_observation",
+        authority="observer",
+        subject_id=observation.digest,
+        scope_kind="dead_holder_observation",
+        scope_key=observation.digest,
+        revision=observation.revision,
+    )
+    capability = replace(
+        capability,
+        subject_id=forged.digest,
+        scope_key=forged.digest,
+        signature_base64=base64.b64encode(bytes(64)).decode("ascii"),
+    )
+    capability = replace(
+        capability,
+        signature_base64=base64.b64encode(
+            AUTHORITY_PRIVATE.sign(capability.signing_payload())
+        ).decode("ascii"),
+    )
+
+    with pytest.raises(ValueError, match="trusted_authority_signature_invalid"):
+        backend.register_dead_holder_observation(forged, capability=capability)
+
+    assert database.calls == []
+
+
+def test_observation_registration_and_reconciliation_bind_digest_only() -> None:
+    database = FakeDatabase(database_role="carl_observer")
+    database.responses["register_dead_holder_observation"] = [{"applied": True}]
+    backend = _backend(database, role="carl_observer")
+    observation = _dead_holder()
+
+    assert backend._register_dead_holder_observation(observation, observed_at=NOW) is True
+    query, parameters = next(
+        call for call in database.calls if "register_dead_holder_observation" in call[0]
+    )
+    assert "%s" in query
+    assert parameters == (
+        _canonical(observation.to_canonical_dict()),
+        observation.digest,
+        NOW,
+    )
+
+    coordinator_db = FakeDatabase()
+    coordinator_db.responses["reconcile_expired_claim"] = [
+        _command_row(status="pending", revision=9)
+    ]
+    reconciliation = ClaimReconciliation(
+        command_key="dispatch-exp-001",
+        claim_id="claim-exp-001",
+        authority="coordinator",
+        expected_revision=8,
+        next_revision=9,
+        observed_at=NOW_TEXT,
+    )
+    _backend(coordinator_db)._reconcile_expired_claim(
+        reconciliation,
+        observation_digest=observation.digest,
+        observed_at=NOW,
+    )
+    _query, reconcile_parameters = next(
+        call for call in coordinator_db.calls if "reconcile_expired_claim" in call[0]
+    )
+    assert reconcile_parameters == (
+        _canonical(reconciliation.to_canonical_dict()),
+        observation.digest,
+        NOW,
+    )
+
+
+def test_atomic_completion_uses_one_combined_procedure_transaction() -> None:
+    database = FakeDatabase()
+    event = ExperimentEvent.create(
+        experiment_id=sample_manifest().experiment_id,
+        stage_attempt_id="atomic-retry-001",
+        event_type=EventType.RETRY_SCHEDULED,
+        occurred_at=NOW_TEXT,
+        payload={"attempt": 1},
+    )
+    database.responses["complete_command_and_append_event"] = [
+        {
+            **_command_row(status="completed", revision=9),
+            "appended": True,
+            "chain_digest": DIGEST_A,
+            "event_digest": event.digest,
+            "ordinal": 1,
+        }
+    ]
+
+    command_result, append_result = _backend(database)._complete_command_with_event(
+        _transition(), event, observed_at=NOW
+    )
+
+    assert command_result.state.status == "completed"
+    assert append_result.event_digest == event.digest
+    mutation_calls = [call for call in database.calls if "carl_autonomy." in call[0]]
+    assert len(mutation_calls) == 1
+    assert "complete_command_and_append_event" in mutation_calls[0][0]
+    assert database.transactions_started == database.transactions_committed == 1
+
+
 def test_backend_constructs_and_owns_verifier_from_protected_config() -> None:
     database = FakeDatabase()
     backend = _backend(database)
@@ -399,20 +537,7 @@ def test_every_state_backend_hook_maps_to_its_transactional_procedure() -> None:
         next_revision=2,
         observed_at="2026-08-20T12:05:00Z",
     )
-    dead_holder = DeadHolderObservation(
-        schema_version=1,
-        authority="coordinator",
-        subject_id="claim-exp-001",
-        scope_kind="command",
-        scope_key=command.command_key,
-        revision=8,
-        issued_at="2026-08-20T11:55:00Z",
-        observed_at=NOW_TEXT,
-        expires_at="2026-08-20T12:05:00Z",
-        live=False,
-        key_id=LIVENESS_KEY.key_id,
-        signature_base64=base64.b64encode(bytes(64)).decode("ascii"),
-    )
+    dead_holder = _dead_holder()
     evidence = EvidenceObject(
         digest=DIGEST_A,
         object_key=f"evidence/{DIGEST_A}",
@@ -446,9 +571,18 @@ def test_every_state_backend_hook_maps_to_its_transactional_procedure() -> None:
                     "ordinal": 1,
                 }
             ],
+            "register_dead_holder_observation": [{"applied": True}],
             "create_command": [_command_row()],
             "claim_command": [_command_row(status="claimed", revision=8)],
-            "complete_command": [_command_row(status="completed", revision=9)],
+            "complete_command_and_append_event": [
+                {
+                    **_command_row(status="completed", revision=9),
+                    "appended": True,
+                    "chain_digest": DIGEST_B,
+                    "event_digest": event.digest,
+                    "ordinal": 1,
+                }
+            ],
             "fail_command": [_command_row(status="failed", revision=9)],
             "reconcile_expired_claim": [_command_row(status="pending", revision=9)],
             "acquire_lease": [_lease_row(acquired_lease)],
@@ -510,21 +644,28 @@ def test_every_state_backend_hook_maps_to_its_transactional_procedure() -> None:
 
     operations = (
         ("append_event", lambda: backend._append_event(event, observed_at=NOW)),
+        (
+            "register_dead_holder_observation",
+            lambda: backend._register_dead_holder_observation(dead_holder, observed_at=NOW),
+        ),
         ("create_command", lambda: backend._create_command(command, observed_at=NOW)),
         ("claim_command", lambda: backend._claim_command(claim, observed_at=NOW)),
-        ("complete_command", lambda: backend._complete_command(completed, observed_at=NOW)),
+        (
+            "complete_command_and_append_event",
+            lambda: backend._complete_command_with_event(completed, event, observed_at=NOW),
+        ),
         ("fail_command", lambda: backend._fail_command(failed, observed_at=NOW)),
         (
             "reconcile_expired_claim",
             lambda: backend._reconcile_expired_claim(
-                reconciliation, dead_holder=dead_holder, observed_at=NOW
+                reconciliation, observation_digest=dead_holder.digest, observed_at=NOW
             ),
         ),
         ("acquire_lease", lambda: backend._acquire_lease(desired_lease, observed_at=NOW)),
         (
             "reconcile_lease",
             lambda: backend._reconcile_lease(
-                lease_reconciliation, dead_holder=dead_holder, observed_at=NOW
+                lease_reconciliation, observation_digest=dead_holder.digest, observed_at=NOW
             ),
         ),
         ("release_lease", lambda: backend._release_lease(release, observed_at=NOW)),
@@ -637,6 +778,7 @@ def test_load_projection_uses_one_read_only_snapshot_and_revalidates_chain() -> 
     database.responses["load_experiment_events"] = [
         {
             "authority": "coordinator",
+            "trusted_authority": False,
             "chain_digest": DIGEST_B,
             "event_digest": event.digest,
             "event_json": _canonical(event.to_canonical_dict()),
