@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+import carl_bench.cloud_harness as cloud_harness
 from carl_bench.cloud_harness import CloudHarnessError, evaluate_carl_pair
 
 PARENT = "1" * 40
@@ -144,6 +145,43 @@ def _evaluate(tmp_path: Path, *, parent_ok: bool = False, candidate_ok: bool = T
         policy_path=objects["policy"],
         mode="improvement",
     )
+
+
+def test_contract_hash_and_parser_share_one_held_file_description(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    contract = _objects(tmp_path)["experiment"]
+    original_payload = contract.read_bytes()
+    replacement = tmp_path / "replacement.json"
+    replacement_payload = json.dumps(
+        json.loads(original_payload) | {"objective": "attacker replacement"},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    replacement.write_bytes(replacement_payload)
+    original_hash = cloud_harness._hash_regular_file
+
+    def replace_after_hash(path: Path, *, code: str, maximum_bytes: int) -> str:
+        digest = original_hash(path, code=code, maximum_bytes=maximum_bytes)
+        os.replace(replacement, contract)
+        return digest
+
+    monkeypatch.setattr(cloud_harness, "_hash_regular_file", replace_after_hash)
+
+    value, digest = cloud_harness._load_contract(contract, kind="experiment")
+
+    assert value["objective"] == "Expose a stable user-visible Carl version command."
+    assert digest == hashlib.sha256(original_payload).hexdigest()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires POSIX hard-link metadata")
+def test_contract_reader_rejects_linked_descriptors(tmp_path: Path) -> None:
+    original = _objects(tmp_path)["experiment"]
+    linked = tmp_path / "linked-experiment.json"
+    os.link(original, linked)
+
+    with pytest.raises(CloudHarnessError, match="experiment_contract_invalid"):
+        cloud_harness._load_contract(linked, kind="experiment")
 
 
 def test_trusted_harness_executes_exact_carl_binaries_and_owns_scoring(tmp_path: Path) -> None:

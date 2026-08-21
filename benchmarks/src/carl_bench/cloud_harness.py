@@ -111,6 +111,61 @@ def _hash_regular_file(path: Path, *, code: str, maximum_bytes: int) -> str:
     return digest.hexdigest()
 
 
+def _read_held_regular_file(path: Path, *, code: str, maximum_bytes: int) -> bytes:
+    descriptor = -1
+    try:
+        no_follow = getattr(os, "O_NOFOLLOW", 0)
+        if not no_follow:
+            raise CloudHarnessError(code)
+        descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | no_follow)
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or before.st_size > maximum_bytes
+        ):
+            raise CloudHarnessError(code)
+        chunks: list[bytes] = []
+        total = 0
+        while chunk := os.read(descriptor, min(64 * 1024, maximum_bytes + 1 - total)):
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > maximum_bytes:
+                raise CloudHarnessError(code)
+        after = os.fstat(descriptor)
+    except CloudHarnessError:
+        raise
+    except OSError as error:
+        raise CloudHarnessError(code) from error
+    finally:
+        if descriptor >= 0:
+            with contextlib.suppress(OSError):
+                os.close(descriptor)
+    identity = (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mode,
+        before.st_nlink,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    )
+    if identity != (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mode,
+        after.st_nlink,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    ):
+        raise CloudHarnessError(code)
+    payload = b"".join(chunks)
+    if len(payload) != before.st_size:
+        raise CloudHarnessError(code)
+    return payload
+
+
 def _object_without_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     value: dict[str, Any] = {}
     for key, item in pairs:
@@ -121,13 +176,15 @@ def _object_without_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 
 
 def _load_contract(path: Path, *, kind: str) -> tuple[dict[str, Any], str]:
-    digest = _hash_regular_file(
-        path, code=f"{kind}_contract_invalid", maximum_bytes=_MAX_CONTRACT_BYTES
+    payload = _read_held_regular_file(
+        path,
+        code=f"{kind}_contract_invalid",
+        maximum_bytes=_MAX_CONTRACT_BYTES,
     )
+    digest = hashlib.sha256(payload).hexdigest()
     try:
-        payload = path.read_bytes()
         value = json.loads(payload, object_pairs_hook=_object_without_duplicates)
-    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
+    except (UnicodeError, json.JSONDecodeError, ValueError) as error:
         raise CloudHarnessError(f"{kind}_contract_invalid") from error
     if (
         not isinstance(value, dict)

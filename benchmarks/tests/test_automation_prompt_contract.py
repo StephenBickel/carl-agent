@@ -341,15 +341,80 @@ def test_sanitized_live_manifest_matches_the_complete_canonical_portfolio() -> N
 
 
 def test_autonomous_workflows_resolve_inputs_only_through_the_versioned_registry() -> None:
-    improvement = IMPROVEMENT_WORKFLOW_PATH.read_text(encoding="utf-8")
-    soak = SOAK_WORKFLOW_PATH.read_text(encoding="utf-8")
+    def run_steps(path: Path) -> list[tuple[str, str, str]]:
+        steps: list[tuple[str, str, str]] = []
+        job = ""
+        name = ""
+        lines = path.read_text(encoding="utf-8").splitlines()
+        index = 0
+        while index < len(lines):
+            line = lines[index]
+            job_match = re.fullmatch(r"  ([a-z][a-z0-9_-]*):", line)
+            if job_match:
+                job = job_match.group(1)
+            name_match = re.fullmatch(r"      - name: (.+)", line)
+            if name_match:
+                name = name_match.group(1)
+            if line == "        run: |":
+                block: list[str] = []
+                index += 1
+                while index < len(lines) and (
+                    not lines[index].strip() or lines[index].startswith("          ")
+                ):
+                    block.append(lines[index][10:] if lines[index] else "")
+                    index += 1
+                steps.append((job, name, "\n".join(block)))
+                continue
+            index += 1
+        return steps
 
-    for workflow in (improvement, soak):
-        assert "python -m carl_bench.immutable_inputs resolve-set" in workflow
-        assert "benchmarks/immutable-inputs/registry.json" in workflow
-        assert "benchmarks/immutable-inputs/$kind/$digest" not in workflow
+    workflows = {
+        "improvement": (
+            IMPROVEMENT_WORKFLOW_PATH,
+            "application/vnd.carl.improvement-task-set+json",
+        ),
+        "soak": (SOAK_WORKFLOW_PATH, "application/vnd.carl.soak-task-set+tar"),
+    }
+    for mode, (path, task_media_type) in workflows.items():
+        workflow = path.read_text(encoding="utf-8")
+        steps = run_steps(path)
+        resolvers = [(job, name, run) for job, name, run in steps if " resolve-set " in run]
+        consumers = [
+            (job, name, run)
+            for job, name, run in steps
+            if re.search(
+                r"\$RUNNER_TEMP/immutable-inputs/(?:experiment|task-set|metric-pack|policy)",
+                run,
+            )
+        ]
+
+        assert {job for job, _, _ in resolvers} == {"commission", "evaluate"}, mode
+        assert consumers, mode
+        for job, name, run in consumers:
+            assert "python -m carl_bench.immutable_inputs resolve-set" in run, (mode, job, name)
+            assert "--registry trusted-source/benchmarks/immutable-inputs/registry.json" in run
+            assert "--root trusted-source/benchmarks/immutable-inputs" in run
+            assert f"--mode {mode}" in run
+            assert f"--task-media-type {task_media_type}" in run
+            for variable, argument in (
+                ("EXPERIMENT_DIGEST", "experiment-digest"),
+                ("TASK_SET_DIGEST", "task-set-digest"),
+                ("METRIC_PACK_DIGEST", "metric-pack-digest"),
+                ("POLICY_DIGEST", "policy-digest"),
+            ):
+                assert f'--{argument} "${variable}"' in run, (mode, job, name, variable)
+            assert '--output-dir "$RUNNER_TEMP/immutable-inputs"' in run, (mode, job, name)
+
+        assert not re.search(r"benchmarks/immutable-inputs/(?:public|private)/", workflow)
+        assert not re.search(
+            r"benchmarks/immutable-inputs/[^\s]*\$(?:[A-Z_]*DIGEST|digest|kind)",
+            workflow,
+        )
+        assert not re.search(r"immutable-inputs/public/[^\s]*\$(?:[A-Z_]*DIGEST|digest)", workflow)
         assert "private/sha256" not in workflow
         assert "set -x" not in workflow
+    improvement = IMPROVEMENT_WORKFLOW_PATH.read_text(encoding="utf-8")
+    soak = SOAK_WORKFLOW_PATH.read_text(encoding="utf-8")
     assert "application/vnd.carl.improvement-task-set+json" in improvement
     assert "application/vnd.carl.soak-task-set+tar" in soak
     assert "python -m carl_bench.immutable_inputs soak-health" in soak

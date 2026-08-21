@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import fcntl
 import hashlib
 import io
 import json
@@ -14,7 +15,7 @@ import sys
 import tarfile
 import tempfile
 import unicodedata
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -332,6 +333,86 @@ def _write_registry(path: Path, entries: Sequence[RegistryEntry]) -> None:
     _atomic_write(path, payload)
 
 
+@contextlib.contextmanager
+def _publication_lock(registry_path: Path) -> Iterator[None]:
+    registry_path = Path(registry_path)
+    lock_path = registry_path.with_name(f".{registry_path.name}.lock")
+    descriptor = -1
+    locked = False
+    try:
+        parent = registry_path.parent.lstat()
+        if not stat.S_ISDIR(parent.st_mode) or stat.S_ISLNK(parent.st_mode):
+            raise ImmutableInputError("registry_lock_invalid")
+        no_follow = getattr(os, "O_NOFOLLOW", 0)
+        if not no_follow:
+            raise ImmutableInputError("registry_lock_unsupported")
+        descriptor = os.open(
+            lock_path,
+            os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | no_follow,
+            0o600,
+        )
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_mode & 0o077
+        ):
+            raise ImmutableInputError("registry_lock_invalid")
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        locked = True
+        metadata = os.fstat(descriptor)
+        current = lock_path.lstat()
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_mode & 0o077
+            or (metadata.st_dev, metadata.st_ino) != (current.st_dev, current.st_ino)
+        ):
+            raise ImmutableInputError("registry_lock_invalid")
+        yield
+    except ImmutableInputError:
+        raise
+    except OSError as error:
+        raise ImmutableInputError("registry_lock_invalid") from error
+    finally:
+        if locked:
+            with contextlib.suppress(OSError):
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+        if descriptor >= 0:
+            with contextlib.suppress(OSError):
+                os.close(descriptor)
+
+
+def _reconcile_crash_temps(*directories: Path) -> None:
+    for directory in directories:
+        removed = False
+        try:
+            candidates = tuple(directory.glob(".immutable-*.tmp"))
+            if len(candidates) > 128:
+                raise ImmutableInputError("publication_recovery_invalid")
+            for candidate in candidates:
+                metadata = candidate.lstat()
+                if (
+                    stat.S_ISREG(metadata.st_mode)
+                    and metadata.st_nlink == 1
+                    and metadata.st_uid == os.geteuid()
+                ):
+                    candidate.unlink()
+                    removed = True
+            if removed:
+                descriptor = os.open(directory, os.O_RDONLY | os.O_CLOEXEC)
+                try:
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
+        except ImmutableInputError:
+            raise
+        except OSError as error:
+            raise ImmutableInputError("publication_recovery_invalid") from error
+
+
 def _validate_improvement_task_set(value: object) -> None:
     if not isinstance(value, dict) or set(value) != {
         "adapter",
@@ -567,6 +648,49 @@ def _add_entry(registry_path: Path, registry: Registry, entry: RegistryEntry) ->
     return entry
 
 
+def _publish_entry(
+    registry_path: Path,
+    entry: RegistryEntry,
+    *,
+    public_payload: bytes | None = None,
+    public_root: Path | None = None,
+) -> RegistryEntry:
+    with _publication_lock(registry_path):
+        cleanup_directories = [registry_path.parent]
+        if public_root is not None:
+            cleanup_directories.append(public_root / "public")
+        _reconcile_crash_temps(*cleanup_directories)
+        registry = load_registry(registry_path)
+        by_digest = {item.digest: item for item in registry.entries}
+        existing = by_digest.get(entry.digest)
+        if existing is not None and existing != entry:
+            raise ImmutableInputError("registry_entry_conflict")
+        if any(
+            item.object_key == entry.object_key and item.digest != entry.digest
+            for item in registry.entries
+        ):
+            raise ImmutableInputError("registry_object_key_conflict")
+        if existing is None and len(registry.entries) >= MAX_REGISTRY_ENTRIES:
+            raise ImmutableInputError("registry_too_large")
+        if public_payload is not None:
+            if public_root is None:
+                raise ImmutableInputError("registry_root_invalid")
+            target = public_root / "public" / entry.digest
+            if target.exists() or target.is_symlink():
+                current = _read_regular(
+                    target,
+                    maximum_bytes=MAX_OBJECT_BYTES,
+                    code="public_object_conflict",
+                )
+                if current != public_payload:
+                    raise ImmutableInputError("public_object_conflict")
+            else:
+                _atomic_write(target, public_payload, mode=0o444)
+        if existing is None:
+            _write_registry(registry_path, (*registry.entries, entry))
+        return existing or entry
+
+
 def publish_public(
     registry_path: Path,
     *,
@@ -587,24 +711,12 @@ def publish_public(
         object_key=f"public/{digest}",
         visibility="public",
     )
-    registry = load_registry(registry_path)
-    existing = next((item for item in registry.entries if item.digest == digest), None)
-    if existing is not None and existing != entry:
-        raise ImmutableInputError("registry_entry_conflict")
-    if any(
-        item.object_key == entry.object_key and item.digest != digest for item in registry.entries
-    ):
-        raise ImmutableInputError("registry_object_key_conflict")
-    target = root / "public" / digest
-    if target.exists() or target.is_symlink():
-        current = _read_regular(
-            target, maximum_bytes=MAX_OBJECT_BYTES, code="public_object_conflict"
-        )
-        if current != payload:
-            raise ImmutableInputError("public_object_conflict")
-    else:
-        _atomic_write(target, payload, mode=0o444)
-    return _add_entry(registry_path, registry, entry)
+    return _publish_entry(
+        registry_path,
+        entry,
+        public_payload=payload,
+        public_root=root,
+    )
 
 
 def publish_private_commitment(
@@ -624,7 +736,6 @@ def publish_private_commitment(
         raise ImmutableInputError("registry_size_invalid")
     media_type, media_version = _validate_media(media_type, media_version)
     object_key = _validate_object_key(object_key, visibility="private", digest=digest)
-    registry = load_registry(registry_path)
     entry = RegistryEntry(
         digest=digest,
         size_bytes=size_bytes,
@@ -633,7 +744,7 @@ def publish_private_commitment(
         object_key=object_key,
         visibility="private",
     )
-    return _add_entry(registry_path, registry, entry)
+    return _publish_entry(registry_path, entry)
 
 
 def _entry_for_digest(registry: Registry, digest: str) -> RegistryEntry:

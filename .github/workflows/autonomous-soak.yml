@@ -217,10 +217,25 @@ jobs:
       - name: Run repository health probes without workflow commands or credentials
         id: health
         env:
+          EXPERIMENT_DIGEST: ${{ inputs.experiment_digest }}
           MERGE_COMMIT: ${{ inputs.candidate_commit }}
+          METRIC_PACK_DIGEST: ${{ inputs.metric_pack_digest }}
+          POLICY_DIGEST: ${{ inputs.policy_digest }}
+          TASK_SET_DIGEST: ${{ inputs.task_set_digest }}
         run: |
           set -euo pipefail
           chmod 700 "$(dirname "$GITHUB_ENV")"
+          mkdir -p "$RUNNER_TEMP/immutable-inputs"
+          PYTHONPATH=trusted-source/benchmarks/src python -m carl_bench.immutable_inputs resolve-set \
+            --registry trusted-source/benchmarks/immutable-inputs/registry.json \
+            --root trusted-source/benchmarks/immutable-inputs \
+            --mode soak \
+            --task-media-type application/vnd.carl.soak-task-set+tar \
+            --experiment-digest "$EXPERIMENT_DIGEST" \
+            --task-set-digest "$TASK_SET_DIGEST" \
+            --metric-pack-digest "$METRIC_PACK_DIGEST" \
+            --policy-digest "$POLICY_DIGEST" \
+            --output-dir "$RUNNER_TEMP/immutable-inputs" >/dev/null
           test "$(git -C subject-merge rev-parse HEAD)" = "$MERGE_COMMIT"
           eval_root="$RUNNER_TEMP/eval-merge"; sandbox="$RUNNER_TEMP/sandbox-merge"
           cp -R -- subject-merge "$eval_root"

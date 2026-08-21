@@ -270,10 +270,25 @@ jobs:
         id: pair
         env:
           CANDIDATE_COMMIT: ${{ inputs.candidate_commit }}
+          EXPERIMENT_DIGEST: ${{ inputs.experiment_digest }}
+          METRIC_PACK_DIGEST: ${{ inputs.metric_pack_digest }}
           PARENT_COMMIT: ${{ inputs.parent_commit }}
+          POLICY_DIGEST: ${{ inputs.policy_digest }}
+          TASK_SET_DIGEST: ${{ inputs.task_set_digest }}
         run: |
           set -euo pipefail
           chmod 700 "$(dirname "$GITHUB_ENV")"
+          mkdir -p "$RUNNER_TEMP/immutable-inputs"
+          PYTHONPATH=trusted-source/benchmarks/src python -m carl_bench.immutable_inputs resolve-set \
+            --registry trusted-source/benchmarks/immutable-inputs/registry.json \
+            --root trusted-source/benchmarks/immutable-inputs \
+            --mode improvement \
+            --task-media-type application/vnd.carl.improvement-task-set+json \
+            --experiment-digest "$EXPERIMENT_DIGEST" \
+            --task-set-digest "$TASK_SET_DIGEST" \
+            --metric-pack-digest "$METRIC_PACK_DIGEST" \
+            --policy-digest "$POLICY_DIGEST" \
+            --output-dir "$RUNNER_TEMP/immutable-inputs" >/dev/null
           results="$RUNNER_TEMP/paired-results"
           sandbox="$RUNNER_TEMP/harness-sandbox"
           bound="$RUNNER_TEMP/bound-subjects"

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import io
+import multiprocessing
+import os
 import tarfile
 from pathlib import Path
 
@@ -32,6 +34,72 @@ from carl_bench.immutable_inputs import (
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 COMMITTED_REGISTRY = REPOSITORY_ROOT / "benchmarks/immutable-inputs/registry.json"
+
+
+def _force_pre_lock_registry_race(barrier: object) -> None:
+    import carl_bench.immutable_inputs as immutable_inputs
+
+    original = immutable_inputs._add_entry
+
+    def synchronized_add(registry_path: Path, registry: object, entry: object) -> object:
+        barrier.wait(timeout=10)  # type: ignore[attr-defined]
+        return original(registry_path, registry, entry)
+
+    immutable_inputs._add_entry = synchronized_add
+
+
+def _publish_public_worker(
+    root_text: str, payload: bytes, barrier: object, results: object
+) -> None:
+    _force_pre_lock_registry_race(barrier)
+    barrier.wait(timeout=10)  # type: ignore[attr-defined]
+    try:
+        entry = publish_public(
+            Path(root_text) / "registry.json",
+            root=Path(root_text),
+            payload=payload,
+            media_type=POLICY_MEDIA_TYPE,
+            media_version=1,
+        )
+        results.put(("ok", entry.digest))  # type: ignore[attr-defined]
+    except ImmutableInputError as error:
+        results.put(("error", error.code))  # type: ignore[attr-defined]
+
+
+def _publish_conflicting_private_worker(
+    registry_text: str,
+    digest: str,
+    media_type: str,
+    barrier: object,
+    results: object,
+) -> None:
+    _force_pre_lock_registry_race(barrier)
+    barrier.wait(timeout=10)  # type: ignore[attr-defined]
+    try:
+        entry = publish_private_commitment(
+            Path(registry_text),
+            digest=digest,
+            size_bytes=17,
+            media_type=media_type,
+            media_version=1,
+            object_key=f"private/sha256/{digest}",
+        )
+        results.put(("ok", entry.media_type))  # type: ignore[attr-defined]
+    except ImmutableInputError as error:
+        results.put(("error", error.code))  # type: ignore[attr-defined]
+
+
+def _join_publishers(processes: tuple[object, object]) -> None:
+    for process in processes:
+        process.join(timeout=15)  # type: ignore[attr-defined]
+    try:
+        assert all(not process.is_alive() for process in processes)  # type: ignore[attr-defined]
+        assert all(process.exitcode == 0 for process in processes)  # type: ignore[attr-defined]
+    finally:
+        for process in processes:
+            if process.is_alive():  # type: ignore[attr-defined]
+                process.terminate()  # type: ignore[attr-defined]
+                process.join(timeout=5)  # type: ignore[attr-defined]
 
 
 def test_repository_commits_the_versioned_immutable_input_registry() -> None:
@@ -298,6 +366,132 @@ def test_public_publish_is_atomic_create_or_reconcile_and_conflicts_fail(tmp_pat
             media_version=1,
             object_key="private/sha256/shared-object",
         )
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires POSIX flock and fork")
+def test_concurrent_distinct_publishers_retain_both_registry_entries(tmp_path: Path) -> None:
+    registry_path = _write_empty_registry(tmp_path)
+    context = multiprocessing.get_context("fork")
+    barrier = context.Barrier(2)
+    results = context.Queue()
+    payloads = (
+        canonical_json_bytes({"policy": "first", "schema_version": 1}),
+        canonical_json_bytes({"policy": "second", "schema_version": 1}),
+    )
+    processes = tuple(
+        context.Process(
+            target=_publish_public_worker,
+            args=(str(tmp_path), payload, barrier, results),
+        )
+        for payload in payloads
+    )
+
+    for process in processes:
+        process.start()
+    _join_publishers(processes)
+
+    outcomes = {results.get(timeout=2) for _ in processes}
+    expected_digests = {hashlib.sha256(payload).hexdigest() for payload in payloads}
+    assert outcomes == {("ok", digest) for digest in expected_digests}
+    assert {entry.digest for entry in load_registry(registry_path).entries} == expected_digests
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires POSIX flock and fork")
+def test_concurrent_conflicting_publishers_have_one_winner_and_one_conflict(
+    tmp_path: Path,
+) -> None:
+    registry_path = _write_empty_registry(tmp_path)
+    context = multiprocessing.get_context("fork")
+    barrier = context.Barrier(2)
+    results = context.Queue()
+    digest = hashlib.sha256(b"same committed private object").hexdigest()
+    media_types = (EXPERIMENT_MEDIA_TYPE, POLICY_MEDIA_TYPE)
+    processes = tuple(
+        context.Process(
+            target=_publish_conflicting_private_worker,
+            args=(str(registry_path), digest, media_type, barrier, results),
+        )
+        for media_type in media_types
+    )
+
+    for process in processes:
+        process.start()
+    _join_publishers(processes)
+
+    outcomes = [results.get(timeout=2) for _ in processes]
+    successes = [value for status, value in outcomes if status == "ok"]
+    failures = [value for status, value in outcomes if status == "error"]
+    assert len(successes) == 1
+    assert failures == ["registry_entry_conflict"]
+    assert load_registry(registry_path).entries[0].media_type == successes[0]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires POSIX no-follow open")
+def test_publication_rejects_unsafe_lock_files_and_reconciles_crash_temps(
+    tmp_path: Path,
+) -> None:
+    registry_path = _write_empty_registry(tmp_path)
+    lock_path = tmp_path / ".registry.json.lock"
+    victim = tmp_path / "victim"
+    victim.write_bytes(b"do not touch")
+    lock_path.symlink_to(victim)
+    payload = canonical_json_bytes({"policy": "safe", "schema_version": 1})
+
+    with pytest.raises(ImmutableInputError, match="registry_lock_invalid"):
+        publish_public(
+            registry_path,
+            root=tmp_path,
+            payload=payload,
+            media_type=POLICY_MEDIA_TYPE,
+            media_version=1,
+        )
+    assert victim.read_bytes() == b"do not touch"
+
+    lock_path.unlink()
+    lock_path.write_bytes(b"")
+    lock_path.chmod(0o644)
+    with pytest.raises(ImmutableInputError, match="registry_lock_invalid"):
+        publish_public(
+            registry_path,
+            root=tmp_path,
+            payload=payload,
+            media_type=POLICY_MEDIA_TYPE,
+            media_version=1,
+        )
+    lock_path.unlink()
+    lock_source = tmp_path / "lock-source"
+    lock_source.write_bytes(b"")
+    lock_source.chmod(0o600)
+    os.link(lock_source, lock_path)
+    with pytest.raises(ImmutableInputError, match="registry_lock_invalid"):
+        publish_public(
+            registry_path,
+            root=tmp_path,
+            payload=payload,
+            media_type=POLICY_MEDIA_TYPE,
+            media_version=1,
+        )
+
+    lock_path.unlink()
+    stale_registry_temp = tmp_path / ".immutable-crashed.tmp"
+    stale_object_temp = tmp_path / "public/.immutable-crashed.tmp"
+    linked_temp = tmp_path / ".immutable-linked.tmp"
+    stale_registry_temp.write_bytes(b"partial registry")
+    stale_object_temp.write_bytes(b"partial object")
+    linked_temp.symlink_to(victim)
+
+    publish_public(
+        registry_path,
+        root=tmp_path,
+        payload=payload,
+        media_type=POLICY_MEDIA_TYPE,
+        media_version=1,
+    )
+
+    assert not stale_registry_temp.exists()
+    assert not stale_object_temp.exists()
+    assert linked_temp.is_symlink()
+    assert victim.read_bytes() == b"do not touch"
 
 
 def test_public_resolution_stays_under_public_dir_and_verifies_every_commitment(
