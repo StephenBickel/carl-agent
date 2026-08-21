@@ -31,6 +31,28 @@ _ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 _MAX_CONTRACT_BYTES = 1_048_576
 _MAX_BINARY_BYTES = 512 * 1_048_576
 _LIVE_GATE_REASON = "live_acp_credential_missing"
+_CONTRACT_FIELDS = {
+    "experiment": {
+        "affected_probe_ids",
+        "experiment_id",
+        "guard_probe_ids",
+        "held_out_probe_ids",
+        "objective",
+        "schema_version",
+    },
+    "task_set": {"adapter", "attempts", "probes", "schema_version"},
+    "metric_pack": {"algorithm", "probe_weights", "schema_version"},
+    "policy": {
+        "maximum_payload_bytes",
+        "maximum_probe_output_bytes",
+        "minimum_gain_basis_points",
+        "require_affected_improvement",
+        "require_guard_non_regression",
+        "require_held_out_non_regression",
+        "schema_version",
+        "soak_minimum_score_basis_points",
+    },
+}
 
 
 class CloudHarnessError(ValueError):
@@ -89,15 +111,30 @@ def _hash_regular_file(path: Path, *, code: str, maximum_bytes: int) -> str:
     return digest.hexdigest()
 
 
+def _object_without_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("duplicate key")
+        value[key] = item
+    return value
+
+
 def _load_contract(path: Path, *, kind: str) -> tuple[dict[str, Any], str]:
     digest = _hash_regular_file(
         path, code=f"{kind}_contract_invalid", maximum_bytes=_MAX_CONTRACT_BYTES
     )
     try:
-        value = json.loads(path.read_bytes())
-    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        payload = path.read_bytes()
+        value = json.loads(payload, object_pairs_hook=_object_without_duplicates)
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
         raise CloudHarnessError(f"{kind}_contract_invalid") from error
-    if not isinstance(value, dict) or value.get("schema_version") != 1:
+    if (
+        not isinstance(value, dict)
+        or value.get("schema_version") != 1
+        or set(value) != _CONTRACT_FIELDS[kind]
+        or canonical_json_bytes(value) != payload
+    ):
         raise CloudHarnessError(f"{kind}_contract_invalid")
     return value, digest
 
@@ -249,7 +286,14 @@ def _parse_contracts(
     probes: list[_Probe] = []
     probe_ids: list[str] = []
     for value in raw_probes:
-        if not isinstance(value, dict):
+        required_probe_fields = {"argv", "expected_exit", "id", "timeout_seconds"}
+        optional_probe_fields = {"stdout_contains", "stdout_regex"}
+        if (
+            not isinstance(value, dict)
+            or not required_probe_fields
+            <= set(value)
+            <= required_probe_fields | optional_probe_fields
+        ):
             raise CloudHarnessError("task_set_probe_invalid")
         probe_id = value.get("id")
         if not isinstance(probe_id, str) or not _ID_RE.fullmatch(probe_id):

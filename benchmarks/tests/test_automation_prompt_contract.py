@@ -8,19 +8,13 @@ from dataclasses import dataclass
 from pathlib import Path
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
-PORTFOLIO_PATH = (
-    REPOSITORY_ROOT
-    / "docs"
-    / "automation-prompts"
-    / "carl-autonomous-improvement.md"
-)
-LIVE_MANIFEST_PATH = PORTFOLIO_PATH.with_name(
-    "carl-autonomous-improvement-live-manifest.json"
-)
+PORTFOLIO_PATH = REPOSITORY_ROOT / "docs" / "automation-prompts" / "carl-autonomous-improvement.md"
+LIVE_MANIFEST_PATH = PORTFOLIO_PATH.with_name("carl-autonomous-improvement-live-manifest.json")
 SUPERVISOR_TRIGGER_PATH = (
-    "/Users/openclaw/.codex/automations/.shared-private/"
-    "carl-autonomy-supervisor-triggers.sqlite3"
+    "/Users/openclaw/.codex/automations/.shared-private/carl-autonomy-supervisor-triggers.sqlite3"
 )
+IMPROVEMENT_WORKFLOW_PATH = REPOSITORY_ROOT / ".github/workflows/autonomous-improvement.yml"
+SOAK_WORKFLOW_PATH = REPOSITORY_ROOT / ".github/workflows/autonomous-soak.yml"
 
 
 @dataclass(frozen=True)
@@ -84,12 +78,8 @@ def _load_portfolio() -> dict[str, PromptSnapshot]:
 
     for section in sections:
         heading, body = section.split("\n", 1)
-        metadata_match = re.search(
-            r"```toml automation\n(?P<value>.*?)\n```", body, re.DOTALL
-        )
-        prompt_match = re.search(
-            r"```text prompt\n(?P<value>.*?)\n```", body, re.DOTALL
-        )
+        metadata_match = re.search(r"```toml automation\n(?P<value>.*?)\n```", body, re.DOTALL)
+        prompt_match = re.search(r"```text prompt\n(?P<value>.*?)\n```", body, re.DOTALL)
         assert metadata_match is not None, f"missing automation metadata for {heading}"
         assert prompt_match is not None, f"missing canonical prompt for {heading}"
 
@@ -347,6 +337,22 @@ def test_sanitized_live_manifest_matches_the_complete_canonical_portfolio() -> N
         entry = entries[automation_id]
         assert entry["status"] == "ACTIVE"
         assert entry["configuration"] == snapshot.metadata
-        assert entry["prompt_sha256"] == hashlib.sha256(
-            snapshot.prompt.encode("utf-8")
-        ).hexdigest()
+        assert entry["prompt_sha256"] == hashlib.sha256(snapshot.prompt.encode("utf-8")).hexdigest()
+
+
+def test_autonomous_workflows_resolve_inputs_only_through_the_versioned_registry() -> None:
+    improvement = IMPROVEMENT_WORKFLOW_PATH.read_text(encoding="utf-8")
+    soak = SOAK_WORKFLOW_PATH.read_text(encoding="utf-8")
+
+    for workflow in (improvement, soak):
+        assert "python -m carl_bench.immutable_inputs resolve-set" in workflow
+        assert "benchmarks/immutable-inputs/registry.json" in workflow
+        assert "benchmarks/immutable-inputs/$kind/$digest" not in workflow
+        assert "private/sha256" not in workflow
+        assert "set -x" not in workflow
+    assert "application/vnd.carl.improvement-task-set+json" in improvement
+    assert "application/vnd.carl.soak-task-set+tar" in soak
+    assert "python -m carl_bench.immutable_inputs soak-health" in soak
+    for check_variable in ("benchmark_smoke", "python_contracts", "rust_contracts"):
+        assert f"{check_variable}=false" in soak
+        assert f"{check_variable}=true" in soak

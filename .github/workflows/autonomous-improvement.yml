@@ -16,7 +16,7 @@ name: Autonomous improvement evidence
         required: true
         type: string
       task_set_digest:
-        description: Immutable task-set archive SHA-256
+        description: Canonical improvement task-set JSON SHA-256
         required: true
         type: string
       metric_pack_digest:
@@ -136,18 +136,18 @@ jobs:
           set -euo pipefail
           resolved="$RUNNER_TEMP/immutable-inputs"
           mkdir -p "$resolved"
-          resolve() {
-            kind="$1"; digest="$2"
-            source="trusted-source/benchmarks/immutable-inputs/$kind/$digest"
-            test -f "$source"; test ! -L "$source"
-            printf '%s  %s\n' "$digest" "$source" | sha256sum --check --strict -
-            cp -- "$source" "$resolved/$kind"
-          }
-          resolve experiment "$EXPERIMENT_DIGEST"
-          resolve task-set "$TASK_SET_DIGEST"
-          resolve metric-pack "$METRIC_PACK_DIGEST"
-          resolve policy "$POLICY_DIGEST"
-          aggregate="$(find "$resolved" -maxdepth 1 -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1)"
+          aggregate="$(
+            PYTHONPATH=trusted-source/benchmarks/src python -m carl_bench.immutable_inputs resolve-set \
+              --registry trusted-source/benchmarks/immutable-inputs/registry.json \
+              --root trusted-source/benchmarks/immutable-inputs \
+              --mode improvement \
+              --task-media-type application/vnd.carl.improvement-task-set+json \
+              --experiment-digest "$EXPERIMENT_DIGEST" \
+              --task-set-digest "$TASK_SET_DIGEST" \
+              --metric-pack-digest "$METRIC_PACK_DIGEST" \
+              --policy-digest "$POLICY_DIGEST" \
+              --output-dir "$resolved"
+          )"
           printf 'trusted_inputs_digest=%s\n' "$aggregate" >> "$GITHUB_OUTPUT"
 
   evaluate:
@@ -203,17 +203,22 @@ jobs:
           test "$(git -C subject-parent rev-parse HEAD)" = "$PARENT_COMMIT"
           test "$(git -C subject-candidate rev-parse HEAD)" = "$CANDIDATE_COMMIT"
           mkdir -p "$RUNNER_TEMP/immutable-inputs"
-          resolve() {
-            kind="$1"; digest="$2"
-            source="trusted-source/benchmarks/immutable-inputs/$kind/$digest"
-            test -f "$source"; test ! -L "$source"
-            printf '%s  %s\n' "$digest" "$source" | sha256sum --check --strict -
-            cp -- "$source" "$RUNNER_TEMP/immutable-inputs/$kind"
-          }
-          resolve experiment "$EXPERIMENT_DIGEST"
-          resolve task-set "$TASK_SET_DIGEST"
-          resolve metric-pack "$METRIC_PACK_DIGEST"
-          resolve policy "$POLICY_DIGEST"
+          PYTHONPATH=trusted-source/benchmarks/src python -m carl_bench.immutable_inputs resolve-set \
+            --registry trusted-source/benchmarks/immutable-inputs/registry.json \
+            --root trusted-source/benchmarks/immutable-inputs \
+            --mode improvement \
+            --task-media-type application/vnd.carl.improvement-task-set+json \
+            --experiment-digest "$EXPERIMENT_DIGEST" \
+            --task-set-digest "$TASK_SET_DIGEST" \
+            --metric-pack-digest "$METRIC_PACK_DIGEST" \
+            --policy-digest "$POLICY_DIGEST" \
+            --output-dir "$RUNNER_TEMP/immutable-inputs" >/dev/null
+          printf '%s  %s\n' \
+            "$EXPERIMENT_DIGEST" "$RUNNER_TEMP/immutable-inputs/experiment" \
+            "$TASK_SET_DIGEST" "$RUNNER_TEMP/immutable-inputs/task-set" \
+            "$METRIC_PACK_DIGEST" "$RUNNER_TEMP/immutable-inputs/metric-pack" \
+            "$POLICY_DIGEST" "$RUNNER_TEMP/immutable-inputs/policy" \
+            | sha256sum --check --strict -
       - name: Build and bind exact subjects under distinct identities
         id: build
         env:

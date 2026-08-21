@@ -1,0 +1,529 @@
+from __future__ import annotations
+
+import hashlib
+import io
+import tarfile
+from pathlib import Path
+
+import pytest
+
+from carl_bench.canonical import canonical_json_bytes
+from carl_bench.immutable_inputs import (
+    EXPERIMENT_MEDIA_TYPE,
+    IMPROVEMENT_TASK_SET_MEDIA_TYPE,
+    IMPROVEMENT_TASK_SET_VERSION,
+    MAX_SOAK_ARCHIVE_ENTRIES,
+    MAX_SOAK_MEMBER_BYTES,
+    METRIC_PACK_MEDIA_TYPE,
+    POLICY_MEDIA_TYPE,
+    REGISTRY_MEDIA_TYPE,
+    SOAK_TASK_SET_MEDIA_TYPE,
+    SOAK_TASK_SET_VERSION,
+    ImmutableInputError,
+    evaluate_soak_health,
+    load_registry,
+    pack_improvement_task_set,
+    pack_soak_archive,
+    publish_private_commitment,
+    publish_public,
+    resolve_entry,
+    verify_soak_archive,
+)
+
+REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+COMMITTED_REGISTRY = REPOSITORY_ROOT / "benchmarks/immutable-inputs/registry.json"
+
+
+def test_repository_commits_the_versioned_immutable_input_registry() -> None:
+    assert COMMITTED_REGISTRY.is_file()
+    assert load_registry(COMMITTED_REGISTRY).entries == ()
+
+
+def _improvement_task_set() -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "probes": [
+            {
+                "timeout_seconds": 5,
+                "stdout_contains": ["carl"],
+                "id": "version",
+                "expected_exit": 0,
+                "argv": ["--version"],
+            }
+        ],
+        "attempts": 1,
+        "adapter": "trusted-carl-cli-v1",
+    }
+
+
+def _write_empty_registry(root: Path) -> Path:
+    public = root / "public"
+    public.mkdir(parents=True)
+    registry = root / "registry.json"
+    registry.write_bytes(
+        canonical_json_bytes({"entries": [], "media_type": REGISTRY_MEDIA_TYPE, "media_version": 1})
+        + b"\n"
+    )
+    return registry
+
+
+def _raw_tar(members: list[tarfile.TarInfo], contents: list[bytes]) -> bytes:
+    target = io.BytesIO()
+    with tarfile.open(fileobj=target, mode="w", format=tarfile.USTAR_FORMAT) as archive:
+        for member, content in zip(members, contents, strict=True):
+            archive.addfile(member, io.BytesIO(content) if member.isreg() else None)
+    return target.getvalue()
+
+
+def _file_member(name: str, content: bytes) -> tarfile.TarInfo:
+    member = tarfile.TarInfo(name)
+    member.size = len(content)
+    member.mode = 0o644
+    return member
+
+
+def _soak_contracts() -> tuple[bytes, bytes, bytes, bytes, dict[str, bool]]:
+    check_ids = ["benchmark-smoke", "workflow-contracts"]
+    experiment = canonical_json_bytes({"schema_version": 1, "soak_check_ids": check_ids})
+    task_set = pack_soak_archive(
+        {
+            "soak-contract.json": canonical_json_bytes(
+                {"check_ids": check_ids, "schema_version": 1}
+            ),
+            "tasks/health.json": b'{"kind":"health"}',
+        }
+    )
+    metric_pack = canonical_json_bytes(
+        {
+            "algorithm": "weighted-binary-soak-v1",
+            "check_weights": {"benchmark-smoke": 3, "workflow-contracts": 1},
+            "schema_version": 1,
+        }
+    )
+    policy = canonical_json_bytes(
+        {
+            "minimum_score_basis_points": 7000,
+            "require_all_checks": False,
+            "schema_version": 1,
+        }
+    )
+    observations = {"benchmark-smoke": True, "workflow-contracts": False}
+    return experiment, task_set, metric_pack, policy, observations
+
+
+def test_improvement_task_set_is_strict_canonical_json_with_distinct_media_version() -> None:
+    encoded = pack_improvement_task_set(_improvement_task_set())
+
+    assert encoded == (
+        b'{"adapter":"trusted-carl-cli-v1","attempts":1,"probes":['
+        b'{"argv":["--version"],"expected_exit":0,"id":"version",'
+        b'"stdout_contains":["carl"],"timeout_seconds":5}],"schema_version":1}'
+    )
+    assert IMPROVEMENT_TASK_SET_MEDIA_TYPE != SOAK_TASK_SET_MEDIA_TYPE
+    assert (IMPROVEMENT_TASK_SET_MEDIA_TYPE, IMPROVEMENT_TASK_SET_VERSION) != (
+        SOAK_TASK_SET_MEDIA_TYPE,
+        SOAK_TASK_SET_VERSION,
+    )
+
+    smuggled = _improvement_task_set() | {"unused_policy": {"minimum": 0}}
+    with pytest.raises(ImmutableInputError, match="improvement_task_set_invalid"):
+        pack_improvement_task_set(smuggled)
+
+
+def test_soak_archive_is_byte_deterministic_and_normalizes_all_metadata() -> None:
+    first = pack_soak_archive({"z.txt": b"z", "nested/a.txt": b"a"})
+    second = pack_soak_archive({"nested/a.txt": b"a", "z.txt": b"z"})
+
+    assert first == second
+    assert verify_soak_archive(first) == {"nested/a.txt": b"a", "z.txt": b"z"}
+    with tarfile.open(fileobj=io.BytesIO(first), mode="r:") as archive:
+        members = archive.getmembers()
+    assert [member.name for member in members] == ["nested/a.txt", "z.txt"]
+    assert all(member.mtime == member.uid == member.gid == 0 for member in members)
+    assert all(member.uname == member.gname == "" for member in members)
+    assert all(member.mode == 0o644 and member.isreg() for member in members)
+
+
+@pytest.mark.parametrize("name", ("/absolute", "../traversal", "a/../../traversal"))
+def test_soak_archive_rejects_absolute_and_traversal_paths(name: str) -> None:
+    content = b"x"
+    payload = _raw_tar([_file_member(name, content)], [content])
+
+    with pytest.raises(ImmutableInputError, match="soak_archive_path_invalid"):
+        verify_soak_archive(payload)
+
+
+def test_soak_archive_rejects_duplicate_normalized_paths() -> None:
+    first = b"first"
+    second = b"second"
+    payload = _raw_tar(
+        [_file_member("café.txt", first), _file_member("café.txt", second)],
+        [first, second],
+    )
+
+    with pytest.raises(ImmutableInputError, match="soak_archive_path_duplicate"):
+        verify_soak_archive(payload)
+
+
+@pytest.mark.parametrize("member_type", (tarfile.SYMTYPE, tarfile.LNKTYPE, tarfile.CHRTYPE))
+def test_soak_archive_rejects_links_and_special_files(member_type: bytes) -> None:
+    member = tarfile.TarInfo("unsafe")
+    member.type = member_type
+    if member_type in {tarfile.SYMTYPE, tarfile.LNKTYPE}:
+        member.linkname = "target"
+    payload = _raw_tar([member], [b""])
+
+    with pytest.raises(ImmutableInputError, match="soak_archive_entry_invalid"):
+        verify_soak_archive(payload)
+
+
+def test_soak_archive_rejects_count_and_size_bombs() -> None:
+    count_bomb_files = {
+        f"task-{index:04d}.json": b"{}" for index in range(MAX_SOAK_ARCHIVE_ENTRIES + 1)
+    }
+    oversized_content = b"x" * (MAX_SOAK_MEMBER_BYTES + 1)
+    size_bomb_files = {"huge.bin": oversized_content}
+    count_members = [_file_member(name, content) for name, content in count_bomb_files.items()]
+    count_bomb_archive = _raw_tar(count_members, list(count_bomb_files.values()))
+    size_bomb_archive = _raw_tar([_file_member("huge.bin", oversized_content)], [oversized_content])
+
+    with pytest.raises(ImmutableInputError, match="soak_archive_too_many_entries"):
+        pack_soak_archive(count_bomb_files)
+    with pytest.raises(ImmutableInputError, match="soak_archive_member_too_large"):
+        pack_soak_archive(size_bomb_files)
+    with pytest.raises(ImmutableInputError, match="soak_archive_too_many_entries"):
+        verify_soak_archive(count_bomb_archive)
+    with pytest.raises(ImmutableInputError, match="soak_archive_member_too_large"):
+        verify_soak_archive(size_bomb_archive)
+
+
+def test_soak_archive_rejects_non_normalized_metadata() -> None:
+    content = b"health"
+    member = _file_member("health.txt", content)
+    member.mtime = 1
+
+    with pytest.raises(ImmutableInputError, match="soak_archive_entry_invalid"):
+        verify_soak_archive(_raw_tar([member], [content]))
+
+
+@pytest.mark.parametrize(
+    ("payload", "code"),
+    (
+        (
+            b'{"entries":[],"entries":[],"media_type":"'
+            + REGISTRY_MEDIA_TYPE.encode()
+            + b'","media_version":1}',
+            "registry_json_invalid",
+        ),
+        (
+            canonical_json_bytes(
+                {
+                    "entries": [],
+                    "media_type": REGISTRY_MEDIA_TYPE,
+                    "media_version": 1,
+                    "unknown": True,
+                }
+            ),
+            "registry_schema_invalid",
+        ),
+        (
+            b'{ "entries":[],"media_type":"'
+            + REGISTRY_MEDIA_TYPE.encode()
+            + b'","media_version":1}',
+            "registry_not_canonical",
+        ),
+    ),
+)
+def test_registry_is_duplicate_aware_unknown_field_closed_and_canonical(
+    tmp_path: Path, payload: bytes, code: str
+) -> None:
+    registry_path = tmp_path / "registry.json"
+    registry_path.write_bytes(payload)
+
+    with pytest.raises(ImmutableInputError, match=code):
+        load_registry(registry_path)
+
+
+def test_public_publish_is_atomic_create_or_reconcile_and_conflicts_fail(tmp_path: Path) -> None:
+    registry_path = _write_empty_registry(tmp_path)
+    payload = pack_improvement_task_set(_improvement_task_set())
+
+    first = publish_public(
+        registry_path,
+        root=tmp_path,
+        payload=payload,
+        media_type=IMPROVEMENT_TASK_SET_MEDIA_TYPE,
+        media_version=IMPROVEMENT_TASK_SET_VERSION,
+    )
+    second = publish_public(
+        registry_path,
+        root=tmp_path,
+        payload=payload,
+        media_type=IMPROVEMENT_TASK_SET_MEDIA_TYPE,
+        media_version=IMPROVEMENT_TASK_SET_VERSION,
+    )
+
+    assert first == second
+    assert first.object_key == f"public/{first.digest}"
+    assert (tmp_path / first.object_key).read_bytes() == payload
+    assert not list((tmp_path / "public").glob(".*.tmp"))
+    assert load_registry(registry_path).entries == (first,)
+
+    with pytest.raises(ImmutableInputError, match="registry_entry_conflict"):
+        publish_private_commitment(
+            registry_path,
+            digest=first.digest,
+            size_bytes=len(payload),
+            media_type=SOAK_TASK_SET_MEDIA_TYPE,
+            media_version=SOAK_TASK_SET_VERSION,
+            object_key=f"private/sha256/{first.digest}",
+        )
+
+    other_digest = hashlib.sha256(b"other").hexdigest()
+    private = publish_private_commitment(
+        registry_path,
+        digest=other_digest,
+        size_bytes=5,
+        media_type=POLICY_MEDIA_TYPE,
+        media_version=1,
+        object_key="private/sha256/shared-object",
+    )
+    assert private.visibility == "private"
+    with pytest.raises(ImmutableInputError, match="registry_object_key_conflict"):
+        publish_private_commitment(
+            registry_path,
+            digest=hashlib.sha256(b"third").hexdigest(),
+            size_bytes=5,
+            media_type=POLICY_MEDIA_TYPE,
+            media_version=1,
+            object_key="private/sha256/shared-object",
+        )
+
+
+def test_public_resolution_stays_under_public_dir_and_verifies_every_commitment(
+    tmp_path: Path,
+) -> None:
+    registry_path = _write_empty_registry(tmp_path)
+    payload = pack_improvement_task_set(_improvement_task_set())
+    entry = publish_public(
+        registry_path,
+        root=tmp_path,
+        payload=payload,
+        media_type=IMPROVEMENT_TASK_SET_MEDIA_TYPE,
+        media_version=IMPROVEMENT_TASK_SET_VERSION,
+    )
+
+    assert (
+        resolve_entry(
+            registry_path,
+            root=tmp_path,
+            digest=entry.digest,
+            expected_media_type=IMPROVEMENT_TASK_SET_MEDIA_TYPE,
+            expected_media_version=IMPROVEMENT_TASK_SET_VERSION,
+        )
+        == payload
+    )
+    public_object = tmp_path / entry.object_key
+    public_object.chmod(0o644)
+    public_object.write_bytes(b"tampered")
+    with pytest.raises(ImmutableInputError, match="object_size_mismatch"):
+        resolve_entry(
+            registry_path,
+            root=tmp_path,
+            digest=entry.digest,
+            expected_media_type=IMPROVEMENT_TASK_SET_MEDIA_TYPE,
+            expected_media_version=IMPROVEMENT_TASK_SET_VERSION,
+        )
+    with pytest.raises(ImmutableInputError, match="object_media_mismatch"):
+        resolve_entry(
+            registry_path,
+            root=tmp_path,
+            digest=entry.digest,
+            expected_media_type=SOAK_TASK_SET_MEDIA_TYPE,
+            expected_media_version=SOAK_TASK_SET_VERSION,
+        )
+
+
+def test_private_resolution_uses_only_bounded_injected_store_after_commitment_lookup(
+    tmp_path: Path,
+) -> None:
+    registry_path = _write_empty_registry(tmp_path)
+    payload = pack_improvement_task_set(_improvement_task_set())
+    digest = hashlib.sha256(payload).hexdigest()
+    locator = f"private/sha256/{digest}"
+    entry = publish_private_commitment(
+        registry_path,
+        digest=digest,
+        size_bytes=len(payload),
+        media_type=IMPROVEMENT_TASK_SET_MEDIA_TYPE,
+        media_version=IMPROVEMENT_TASK_SET_VERSION,
+        object_key=locator,
+    )
+
+    class Store:
+        def __init__(self, content: bytes) -> None:
+            self.content = content
+            self.calls: list[tuple[str, int]] = []
+
+        def fetch(self, object_key: str, *, max_bytes: int) -> bytes:
+            self.calls.append((object_key, max_bytes))
+            return self.content
+
+    store = Store(payload)
+    resolved = resolve_entry(
+        registry_path,
+        root=tmp_path,
+        digest=digest,
+        expected_media_type=IMPROVEMENT_TASK_SET_MEDIA_TYPE,
+        expected_media_version=IMPROVEMENT_TASK_SET_VERSION,
+        object_store=store,
+    )
+
+    assert resolved == payload
+    assert store.calls == [(locator, len(payload))]
+    registry_bytes = registry_path.read_bytes()
+    assert payload not in registry_bytes
+    assert str(tmp_path).encode() not in registry_bytes
+    assert entry.object_key.encode() in registry_bytes
+
+    oversized = Store(payload + b"x")
+    with pytest.raises(ImmutableInputError, match="object_size_mismatch"):
+        resolve_entry(
+            registry_path,
+            root=tmp_path,
+            digest=digest,
+            expected_media_type=IMPROVEMENT_TASK_SET_MEDIA_TYPE,
+            expected_media_version=IMPROVEMENT_TASK_SET_VERSION,
+            object_store=oversized,
+        )
+
+    corrupted = Store(payload[:-1] + b"x")
+    with pytest.raises(ImmutableInputError, match="object_digest_mismatch"):
+        resolve_entry(
+            registry_path,
+            root=tmp_path,
+            digest=digest,
+            expected_media_type=IMPROVEMENT_TASK_SET_MEDIA_TYPE,
+            expected_media_version=IMPROVEMENT_TASK_SET_VERSION,
+            object_store=corrupted,
+        )
+
+
+def test_soak_experiment_contract_cannot_omit_a_task_set_check() -> None:
+    _, task_set, metric_pack, policy, observations = _soak_contracts()
+    experiment = canonical_json_bytes({"schema_version": 1, "soak_check_ids": ["benchmark-smoke"]})
+
+    with pytest.raises(ImmutableInputError, match="soak_contract_identity_mismatch"):
+        evaluate_soak_health(experiment, task_set, metric_pack, policy, observations)
+
+
+def test_soak_task_set_failed_check_changes_health_decision() -> None:
+    experiment, task_set, metric_pack, policy, observations = _soak_contracts()
+
+    healthy = evaluate_soak_health(experiment, task_set, metric_pack, policy, observations)
+    failed = evaluate_soak_health(
+        experiment,
+        task_set,
+        metric_pack,
+        policy,
+        observations | {"benchmark-smoke": False},
+    )
+
+    assert healthy.healthy is True
+    assert failed.healthy is False
+    assert failed.reasons == ("soak_minimum_score_not_met",)
+
+
+def test_soak_task_set_contract_cannot_omit_an_experiment_check() -> None:
+    experiment, task_set, metric_pack, policy, observations = _soak_contracts()
+    files = verify_soak_archive(task_set)
+    files["soak-contract.json"] = canonical_json_bytes(
+        {"check_ids": ["benchmark-smoke"], "schema_version": 1}
+    )
+
+    with pytest.raises(ImmutableInputError, match="soak_contract_identity_mismatch"):
+        evaluate_soak_health(
+            experiment,
+            pack_soak_archive(files),
+            metric_pack,
+            policy,
+            observations,
+        )
+
+
+def test_soak_metric_weights_change_health_decision() -> None:
+    experiment, task_set, _, policy, observations = _soak_contracts()
+    failing_weighted_metric = canonical_json_bytes(
+        {
+            "algorithm": "weighted-binary-soak-v1",
+            "check_weights": {"benchmark-smoke": 1, "workflow-contracts": 3},
+            "schema_version": 1,
+        }
+    )
+
+    decision = evaluate_soak_health(
+        experiment, task_set, failing_weighted_metric, policy, observations
+    )
+
+    assert decision.healthy is False
+    assert decision.score_basis_points == 2500
+
+
+def test_soak_policy_gate_changes_health_decision() -> None:
+    experiment, task_set, metric_pack, _, observations = _soak_contracts()
+    require_all_policy = canonical_json_bytes(
+        {
+            "minimum_score_basis_points": 7000,
+            "require_all_checks": True,
+            "schema_version": 1,
+        }
+    )
+
+    decision = evaluate_soak_health(
+        experiment, task_set, metric_pack, require_all_policy, observations
+    )
+
+    assert decision.healthy is False
+    assert decision.reasons == ("soak_required_check_failed",)
+
+
+def test_soak_contract_media_types_are_registered_independently(tmp_path: Path) -> None:
+    registry_path = _write_empty_registry(tmp_path)
+    experiment, task_set, metric_pack, policy, _ = _soak_contracts()
+    entries = (
+        publish_public(
+            registry_path,
+            root=tmp_path,
+            payload=experiment,
+            media_type=EXPERIMENT_MEDIA_TYPE,
+            media_version=1,
+        ),
+        publish_public(
+            registry_path,
+            root=tmp_path,
+            payload=task_set,
+            media_type=SOAK_TASK_SET_MEDIA_TYPE,
+            media_version=SOAK_TASK_SET_VERSION,
+        ),
+        publish_public(
+            registry_path,
+            root=tmp_path,
+            payload=metric_pack,
+            media_type=METRIC_PACK_MEDIA_TYPE,
+            media_version=1,
+        ),
+        publish_public(
+            registry_path,
+            root=tmp_path,
+            payload=policy,
+            media_type=POLICY_MEDIA_TYPE,
+            media_version=1,
+        ),
+    )
+
+    assert {entry.media_type for entry in entries} == {
+        EXPERIMENT_MEDIA_TYPE,
+        SOAK_TASK_SET_MEDIA_TYPE,
+        METRIC_PACK_MEDIA_TYPE,
+        POLICY_MEDIA_TYPE,
+    }

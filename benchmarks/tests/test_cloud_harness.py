@@ -15,7 +15,7 @@ CANDIDATE = "2" * 40
 
 def _write_json(path: Path, value: object) -> Path:
     path.write_text(
-        json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n",
+        json.dumps(value, sort_keys=True, separators=(",", ":")),
         encoding="utf-8",
     )
     return path
@@ -359,6 +359,27 @@ def test_harness_rejects_non_regular_or_mutated_input_contracts(tmp_path: Path) 
     _write_json(objects["metric_pack"], metric)
 
     with pytest.raises(CloudHarnessError, match="metric_probe_identity_mismatch"):
+        evaluate_carl_pair(
+            parent_binary=_subject(tmp_path / "parent-carl", version_ok=False),
+            candidate_binary=_subject(tmp_path / "candidate-carl", version_ok=True),
+            parent_commit=PARENT,
+            candidate_commit=CANDIDATE,
+            experiment_path=objects["experiment"],
+            task_set_path=objects["task_set"],
+            metric_pack_path=objects["metric_pack"],
+            policy_path=objects["policy"],
+            mode="improvement",
+        )
+
+
+@pytest.mark.parametrize("kind", ("experiment", "metric_pack", "policy"))
+def test_harness_rejects_smuggled_unused_contract_fields(tmp_path: Path, kind: str) -> None:
+    objects = _objects(tmp_path)
+    value = json.loads(objects[kind].read_text(encoding="utf-8"))
+    value["unused_smuggled_input"] = {"ignored": True}
+    _write_json(objects[kind], value)
+
+    with pytest.raises(CloudHarnessError, match=f"{kind}_contract_invalid"):
         evaluate_carl_pair(
             parent_binary=_subject(tmp_path / "parent-carl", version_ok=False),
             candidate_binary=_subject(tmp_path / "candidate-carl", version_ok=True),
