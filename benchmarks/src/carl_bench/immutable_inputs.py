@@ -292,11 +292,7 @@ def _parse_registry_entry(value: object) -> RegistryEntry:
     )
 
 
-def load_registry(path: Path) -> Registry:
-    """Load one bounded, duplicate-aware, exact-schema canonical registry."""
-    payload = _read_regular(
-        Path(path), maximum_bytes=MAX_REGISTRY_BYTES, code="registry_file_invalid"
-    )
+def _parse_registry(payload: bytes) -> Registry:
     try:
         value = json.loads(payload.decode("utf-8"), object_pairs_hook=_object_without_duplicates)
     except (UnicodeError, json.JSONDecodeError, RecursionError, ValueError) as error:
@@ -325,53 +321,244 @@ def load_registry(path: Path) -> Registry:
     return Registry(entries=entries)
 
 
-def _write_registry(path: Path, entries: Sequence[RegistryEntry]) -> None:
-    registry = Registry(entries=tuple(sorted(entries, key=lambda item: item.digest)))
-    payload = canonical_json_bytes(registry.to_canonical_dict()) + b"\n"
-    if len(payload) > MAX_REGISTRY_BYTES:
-        raise ImmutableInputError("registry_too_large")
-    _atomic_write(path, payload)
+def load_registry(path: Path) -> Registry:
+    """Load one bounded, duplicate-aware, exact-schema canonical registry."""
+    payload = _read_regular(
+        Path(path), maximum_bytes=MAX_REGISTRY_BYTES, code="registry_file_invalid"
+    )
+    return _parse_registry(payload)
+
+
+def _safe_directory(metadata: os.stat_result) -> bool:
+    return (
+        stat.S_ISDIR(metadata.st_mode)
+        and metadata.st_uid == os.geteuid()
+        and not metadata.st_mode & 0o022
+    )
+
+
+def _same_inode(left: os.stat_result, right: os.stat_result) -> bool:
+    return (left.st_dev, left.st_ino) == (right.st_dev, right.st_ino)
+
+
+def _read_regular_at(
+    directory_fd: int,
+    name: str,
+    *,
+    maximum_bytes: int,
+    code: str,
+) -> bytes:
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=directory_fd,
+        )
+        before = os.fstat(descriptor)
+        named = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or before.st_uid != os.geteuid()
+            or before.st_mode & 0o022
+            or before.st_size > maximum_bytes
+            or not _same_inode(before, named)
+        ):
+            raise ImmutableInputError(code)
+        chunks: list[bytes] = []
+        remaining = maximum_bytes + 1
+        while remaining:
+            chunk = os.read(descriptor, min(remaining, 65_536))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        payload = b"".join(chunks)
+        after = os.fstat(descriptor)
+        current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if (
+            len(payload) > maximum_bytes
+            or (before.st_dev, before.st_ino, before.st_size, before.st_mode)
+            != (after.st_dev, after.st_ino, after.st_size, after.st_mode)
+            or not _same_inode(after, current)
+        ):
+            raise ImmutableInputError(code)
+        return payload
+    except ImmutableInputError:
+        raise
+    except OSError as error:
+        raise ImmutableInputError(code) from error
+    finally:
+        if descriptor >= 0:
+            with contextlib.suppress(OSError):
+                os.close(descriptor)
+
+
+@dataclass(slots=True)
+class _PublicationTransaction:
+    root_parent_fd: int
+    root_fd: int
+    root_name: str
+    root_metadata: os.stat_result
+    lock_fd: int
+    lock_name: str
+    lock_metadata: os.stat_result
+    public_fd: int | None
+    public_metadata: os.stat_result | None
+
+    def verify(self) -> None:
+        try:
+            root_open = os.fstat(self.root_fd)
+            root_named = os.stat(
+                self.root_name,
+                dir_fd=self.root_parent_fd,
+                follow_symlinks=False,
+            )
+            lock_open = os.fstat(self.lock_fd)
+            lock_named = os.stat(
+                self.lock_name,
+                dir_fd=self.root_fd,
+                follow_symlinks=False,
+            )
+            if (
+                not _safe_directory(root_open)
+                or not _same_inode(root_open, self.root_metadata)
+                or not _same_inode(root_open, root_named)
+            ):
+                raise ImmutableInputError("registry_root_invalid")
+            if (
+                not stat.S_ISREG(lock_open.st_mode)
+                or lock_open.st_nlink != 1
+                or lock_open.st_uid != os.geteuid()
+                or lock_open.st_mode & 0o077
+                or not _same_inode(lock_open, self.lock_metadata)
+                or not _same_inode(lock_open, lock_named)
+            ):
+                raise ImmutableInputError("registry_lock_invalid")
+            if self.public_fd is not None and self.public_metadata is not None:
+                public_open = os.fstat(self.public_fd)
+                public_named = os.stat("public", dir_fd=self.root_fd, follow_symlinks=False)
+                if (
+                    not _safe_directory(public_open)
+                    or not _same_inode(public_open, self.public_metadata)
+                    or not _same_inode(public_open, public_named)
+                ):
+                    raise ImmutableInputError("registry_root_invalid")
+        except ImmutableInputError:
+            raise
+        except OSError as error:
+            raise ImmutableInputError("registry_root_invalid") from error
+
+
+def _open_public_directory(root_fd: int) -> tuple[int, os.stat_result]:
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            "public",
+            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=root_fd,
+        )
+        metadata = os.fstat(descriptor)
+        named = os.stat("public", dir_fd=root_fd, follow_symlinks=False)
+        if not _safe_directory(metadata) or not _same_inode(metadata, named):
+            raise ImmutableInputError("registry_root_invalid")
+        return descriptor, metadata
+    except ImmutableInputError:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise
+    except OSError as error:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise ImmutableInputError("registry_root_invalid") from error
 
 
 @contextlib.contextmanager
-def _publication_lock(registry_path: Path) -> Iterator[None]:
+def _publication_lock(
+    registry_path: Path,
+    *,
+    require_public: bool = False,
+) -> Iterator[_PublicationTransaction]:
     registry_path = Path(registry_path)
-    lock_path = registry_path.with_name(f".{registry_path.name}.lock")
-    descriptor = -1
+    root_path = registry_path.parent
+    if registry_path.name != "registry.json" or not root_path.name:
+        raise ImmutableInputError("registry_root_invalid")
+    no_follow = getattr(os, "O_NOFOLLOW", 0)
+    directory = getattr(os, "O_DIRECTORY", 0)
+    if not no_follow or not directory:
+        raise ImmutableInputError("registry_lock_unsupported")
+    root_parent_fd = root_fd = lock_fd = public_fd = -1
     locked = False
     try:
-        parent = registry_path.parent.lstat()
-        if not stat.S_ISDIR(parent.st_mode) or stat.S_ISLNK(parent.st_mode):
-            raise ImmutableInputError("registry_lock_invalid")
-        no_follow = getattr(os, "O_NOFOLLOW", 0)
-        if not no_follow:
-            raise ImmutableInputError("registry_lock_unsupported")
-        descriptor = os.open(
-            lock_path,
-            os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | no_follow,
-            0o600,
+        root_parent_fd = os.open(
+            root_path.parent,
+            os.O_RDONLY | directory | os.O_CLOEXEC | no_follow,
         )
-        metadata = os.fstat(descriptor)
+        root_fd = os.open(
+            root_path.name,
+            os.O_RDONLY | directory | os.O_CLOEXEC | no_follow,
+            dir_fd=root_parent_fd,
+        )
+        root_metadata = os.fstat(root_fd)
+        root_named = os.stat(
+            root_path.name,
+            dir_fd=root_parent_fd,
+            follow_symlinks=False,
+        )
+        if not _safe_directory(root_metadata) or not _same_inode(root_metadata, root_named):
+            raise ImmutableInputError("registry_root_invalid")
+        lock_name = f".{registry_path.name}.lock"
+        for _ in range(128):
+            try:
+                lock_fd = os.open(
+                    lock_name,
+                    os.O_RDWR | os.O_CLOEXEC | no_follow,
+                    dir_fd=root_fd,
+                )
+                break
+            except FileNotFoundError:
+                try:
+                    lock_fd = os.open(
+                        lock_name,
+                        os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
+                        0o600,
+                        dir_fd=root_fd,
+                    )
+                    break
+                except FileExistsError:
+                    continue
+        else:
+            raise ImmutableInputError("registry_lock_invalid")
+        lock_metadata = os.fstat(lock_fd)
+        lock_named = os.stat(lock_name, dir_fd=root_fd, follow_symlinks=False)
         if (
-            not stat.S_ISREG(metadata.st_mode)
-            or metadata.st_nlink != 1
-            or metadata.st_uid != os.geteuid()
-            or metadata.st_mode & 0o077
+            not stat.S_ISREG(lock_metadata.st_mode)
+            or lock_metadata.st_nlink != 1
+            or lock_metadata.st_uid != os.geteuid()
+            or lock_metadata.st_mode & 0o077
+            or not _same_inode(lock_metadata, lock_named)
         ):
             raise ImmutableInputError("registry_lock_invalid")
-        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
         locked = True
-        metadata = os.fstat(descriptor)
-        current = lock_path.lstat()
-        if (
-            not stat.S_ISREG(metadata.st_mode)
-            or metadata.st_nlink != 1
-            or metadata.st_uid != os.geteuid()
-            or metadata.st_mode & 0o077
-            or (metadata.st_dev, metadata.st_ino) != (current.st_dev, current.st_ino)
-        ):
-            raise ImmutableInputError("registry_lock_invalid")
-        yield
+        public_metadata: os.stat_result | None = None
+        if require_public:
+            public_fd, public_metadata = _open_public_directory(root_fd)
+        transaction = _PublicationTransaction(
+            root_parent_fd=root_parent_fd,
+            root_fd=root_fd,
+            root_name=root_path.name,
+            root_metadata=root_metadata,
+            lock_fd=lock_fd,
+            lock_name=lock_name,
+            lock_metadata=lock_metadata,
+            public_fd=public_fd if public_fd >= 0 else None,
+            public_metadata=public_metadata,
+        )
+        transaction.verify()
+        yield transaction
+        transaction.verify()
     except ImmutableInputError:
         raise
     except OSError as error:
@@ -379,38 +566,129 @@ def _publication_lock(registry_path: Path) -> Iterator[None]:
     finally:
         if locked:
             with contextlib.suppress(OSError):
-                fcntl.flock(descriptor, fcntl.LOCK_UN)
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        for descriptor in (public_fd, lock_fd, root_fd, root_parent_fd):
+            if descriptor >= 0:
+                with contextlib.suppress(OSError):
+                    os.close(descriptor)
+
+
+def _temporary_name() -> str:
+    return f".immutable-{os.urandom(16).hex()}.tmp"
+
+
+def _atomic_write_at(
+    directory_fd: int,
+    name: str,
+    payload: bytes,
+    *,
+    mode: int,
+    transaction: _PublicationTransaction,
+) -> None:
+    temporary: str | None = None
+    descriptor = -1
+    try:
+        for _ in range(128):
+            temporary = _temporary_name()
+            try:
+                descriptor = os.open(
+                    temporary,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+                    mode,
+                    dir_fd=directory_fd,
+                )
+                break
+            except FileExistsError:
+                continue
+        else:
+            raise ImmutableInputError("publication_atomic_write_failed")
+        os.fchmod(descriptor, mode)
+        view = memoryview(payload)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise OSError("short publication write")
+            view = view[written:]
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        transaction.verify()
+        os.replace(
+            temporary,
+            name,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        temporary = None
+        os.fsync(directory_fd)
+        transaction.verify()
+    except ImmutableInputError:
+        raise
+    except OSError as error:
+        raise ImmutableInputError("publication_atomic_write_failed") from error
+    finally:
         if descriptor >= 0:
             with contextlib.suppress(OSError):
                 os.close(descriptor)
+        if temporary is not None:
+            with contextlib.suppress(OSError):
+                os.unlink(temporary, dir_fd=directory_fd)
 
 
-def _reconcile_crash_temps(*directories: Path) -> None:
-    for directory in directories:
-        removed = False
-        try:
-            candidates = tuple(directory.glob(".immutable-*.tmp"))
-            if len(candidates) > 128:
-                raise ImmutableInputError("publication_recovery_invalid")
-            for candidate in candidates:
-                metadata = candidate.lstat()
-                if (
-                    stat.S_ISREG(metadata.st_mode)
-                    and metadata.st_nlink == 1
-                    and metadata.st_uid == os.geteuid()
-                ):
-                    candidate.unlink()
-                    removed = True
-            if removed:
-                descriptor = os.open(directory, os.O_RDONLY | os.O_CLOEXEC)
-                try:
-                    os.fsync(descriptor)
-                finally:
-                    os.close(descriptor)
-        except ImmutableInputError:
-            raise
-        except OSError as error:
-            raise ImmutableInputError("publication_recovery_invalid") from error
+def _reconcile_crash_temps_at(directory_fd: int) -> None:
+    removed = False
+    try:
+        candidates = tuple(
+            name
+            for name in os.listdir(directory_fd)
+            if name.startswith(".immutable-") and name.endswith(".tmp")
+        )
+        if len(candidates) > 128:
+            raise ImmutableInputError("publication_recovery_invalid")
+        for candidate in candidates:
+            metadata = os.stat(candidate, dir_fd=directory_fd, follow_symlinks=False)
+            if (
+                stat.S_ISREG(metadata.st_mode)
+                and metadata.st_nlink == 1
+                and metadata.st_uid == os.geteuid()
+            ):
+                os.unlink(candidate, dir_fd=directory_fd)
+                removed = True
+        if removed:
+            os.fsync(directory_fd)
+    except ImmutableInputError:
+        raise
+    except OSError as error:
+        raise ImmutableInputError("publication_recovery_invalid") from error
+
+
+def _load_registry_at(transaction: _PublicationTransaction) -> Registry:
+    transaction.verify()
+    payload = _read_regular_at(
+        transaction.root_fd,
+        "registry.json",
+        maximum_bytes=MAX_REGISTRY_BYTES,
+        code="registry_file_invalid",
+    )
+    transaction.verify()
+    return _parse_registry(payload)
+
+
+def _write_registry_at(
+    transaction: _PublicationTransaction,
+    entries: Sequence[RegistryEntry],
+) -> None:
+    registry = Registry(entries=tuple(sorted(entries, key=lambda item: item.digest)))
+    payload = canonical_json_bytes(registry.to_canonical_dict()) + b"\n"
+    if len(payload) > MAX_REGISTRY_BYTES:
+        raise ImmutableInputError("registry_too_large")
+    _atomic_write_at(
+        transaction.root_fd,
+        "registry.json",
+        payload,
+        mode=0o644,
+        transaction=transaction,
+    )
 
 
 def _validate_improvement_task_set(value: object) -> None:
@@ -634,20 +912,6 @@ def _registry_root(registry_path: Path, root: Path) -> tuple[Path, Path]:
     return registry_path, root
 
 
-def _add_entry(registry_path: Path, registry: Registry, entry: RegistryEntry) -> RegistryEntry:
-    by_digest = {item.digest: item for item in registry.entries}
-    if existing := by_digest.get(entry.digest):
-        if existing == entry:
-            return existing
-        raise ImmutableInputError("registry_entry_conflict")
-    if any(item.object_key == entry.object_key for item in registry.entries):
-        raise ImmutableInputError("registry_object_key_conflict")
-    if len(registry.entries) >= MAX_REGISTRY_ENTRIES:
-        raise ImmutableInputError("registry_too_large")
-    _write_registry(registry_path, (*registry.entries, entry))
-    return entry
-
-
 def _publish_entry(
     registry_path: Path,
     entry: RegistryEntry,
@@ -655,12 +919,19 @@ def _publish_entry(
     public_payload: bytes | None = None,
     public_root: Path | None = None,
 ) -> RegistryEntry:
-    with _publication_lock(registry_path):
-        cleanup_directories = [registry_path.parent]
-        if public_root is not None:
-            cleanup_directories.append(public_root / "public")
-        _reconcile_crash_temps(*cleanup_directories)
-        registry = load_registry(registry_path)
+    if public_root is not None and Path(public_root) != Path(registry_path).parent:
+        raise ImmutableInputError("registry_root_invalid")
+    with _publication_lock(
+        registry_path,
+        require_public=public_payload is not None,
+    ) as transaction:
+        transaction.verify()
+        _reconcile_crash_temps_at(transaction.root_fd)
+        if transaction.public_fd is not None:
+            transaction.verify()
+            _reconcile_crash_temps_at(transaction.public_fd)
+        transaction.verify()
+        registry = _load_registry_at(transaction)
         by_digest = {item.digest: item for item in registry.entries}
         existing = by_digest.get(entry.digest)
         if existing is not None and existing != entry:
@@ -673,21 +944,38 @@ def _publish_entry(
         if existing is None and len(registry.entries) >= MAX_REGISTRY_ENTRIES:
             raise ImmutableInputError("registry_too_large")
         if public_payload is not None:
-            if public_root is None:
+            if public_root is None or transaction.public_fd is None:
                 raise ImmutableInputError("registry_root_invalid")
-            target = public_root / "public" / entry.digest
-            if target.exists() or target.is_symlink():
-                current = _read_regular(
-                    target,
+            try:
+                target = os.stat(
+                    entry.digest,
+                    dir_fd=transaction.public_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                target = None
+            except OSError as error:
+                raise ImmutableInputError("public_object_conflict") from error
+            if target is not None:
+                current = _read_regular_at(
+                    transaction.public_fd,
+                    entry.digest,
                     maximum_bytes=MAX_OBJECT_BYTES,
                     code="public_object_conflict",
                 )
                 if current != public_payload:
                     raise ImmutableInputError("public_object_conflict")
             else:
-                _atomic_write(target, public_payload, mode=0o444)
+                _atomic_write_at(
+                    transaction.public_fd,
+                    entry.digest,
+                    public_payload,
+                    mode=0o444,
+                    transaction=transaction,
+                )
         if existing is None:
-            _write_registry(registry_path, (*registry.entries, entry))
+            _write_registry_at(transaction, (*registry.entries, entry))
+        transaction.verify()
         return existing or entry
 
 

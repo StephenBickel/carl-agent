@@ -7,6 +7,8 @@ import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 
+import pytest
+
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 PORTFOLIO_PATH = REPOSITORY_ROOT / "docs" / "automation-prompts" / "carl-autonomous-improvement.md"
 LIVE_MANIFEST_PATH = PORTFOLIO_PATH.with_name("carl-autonomous-improvement-live-manifest.json")
@@ -69,6 +71,158 @@ class PromptSnapshot:
             "critical after two consecutive completed builder cycles with zero "
             "experimental candidates",
         )
+
+
+@dataclass(frozen=True)
+class WorkflowStep:
+    job: str
+    name: str
+    identifier: str | None
+    environment: dict[str, str]
+    run: str
+
+
+def _parse_workflow_steps(document: str) -> list[WorkflowStep]:
+    """Parse the jobs/steps YAML structure used by the two protected workflows."""
+    steps: list[WorkflowStep] = []
+    lines = document.splitlines()
+    in_jobs = False
+    job = ""
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        if line == "jobs:":
+            in_jobs = True
+            index += 1
+            continue
+        if not in_jobs:
+            index += 1
+            continue
+        job_match = re.fullmatch(r"  ([a-z][a-z0-9_-]*):", line)
+        if job_match:
+            job = job_match.group(1)
+            index += 1
+            continue
+        name_match = re.fullmatch(r"      - name: (.+)", line)
+        if not name_match:
+            index += 1
+            continue
+        name = name_match.group(1)
+        identifier: str | None = None
+        environment: dict[str, str] = {}
+        run = ""
+        index += 1
+        while index < len(lines) and not re.fullmatch(r"      - name: .+", lines[index]):
+            if re.fullmatch(r"  [a-z][a-z0-9_-]*:", lines[index]):
+                break
+            identifier_match = re.fullmatch(r"        id: ([a-zA-Z0-9_-]+)", lines[index])
+            if identifier_match:
+                identifier = identifier_match.group(1)
+            if lines[index] == "        env:":
+                index += 1
+                while index < len(lines):
+                    env_match = re.fullmatch(r"          ([A-Z][A-Z0-9_]*): (.+)", lines[index])
+                    if env_match is None:
+                        break
+                    environment[env_match.group(1)] = env_match.group(2)
+                    index += 1
+                continue
+            if lines[index] == "        run: |":
+                block: list[str] = []
+                index += 1
+                while index < len(lines) and (
+                    not lines[index].strip() or lines[index].startswith("          ")
+                ):
+                    block.append(lines[index][10:] if lines[index] else "")
+                    index += 1
+                run = "\n".join(block)
+                continue
+            index += 1
+        steps.append(WorkflowStep(job, name, identifier, environment, run))
+    return steps
+
+
+def _assert_immutable_consumer_contract(document: str, *, mode: str) -> None:
+    specs = {
+        "improvement": (
+            "pair",
+            "Run the protected-parent harness against both exact binaries",
+            "python -m carl_bench.cloud_harness",
+            "application/vnd.carl.improvement-task-set+json",
+        ),
+        "soak": (
+            "health",
+            "Run repository health probes without workflow commands or credentials",
+            "python -m carl_bench.immutable_inputs soak-health",
+            "application/vnd.carl.soak-task-set+tar",
+        ),
+    }
+    consumer_id, consumer_name, command, task_media_type = specs[mode]
+    steps = _parse_workflow_steps(document)
+    matches = [
+        step
+        for step in steps
+        if step.identifier == consumer_id and step.name == consumer_name and command in step.run
+    ]
+    assert len(matches) == 1, (mode, consumer_id)
+    consumer = matches[0]
+    consumer_index = steps.index(consumer)
+    resolvers = [
+        step
+        for step in steps[:consumer_index]
+        if step.job == consumer.job
+        and "python -m carl_bench.immutable_inputs resolve-set" in step.run
+    ]
+    assert len(resolvers) == 1, (mode, consumer.job, "preceding resolver")
+    resolver = resolvers[0]
+    assert resolver.identifier == "immutable_inputs", (mode, consumer.job)
+    assert f"--mode {mode}" in resolver.run
+    assert f"--task-media-type {task_media_type}" in resolver.run
+    assert "--registry trusted-source/benchmarks/immutable-inputs/registry.json" in resolver.run
+    assert "--root trusted-source/benchmarks/immutable-inputs" in resolver.run
+    assert set(re.findall(r"--([a-z-]+)-digest\b", resolver.run)) == {
+        "experiment",
+        "task-set",
+        "metric-pack",
+        "policy",
+    }
+
+    required = {
+        "EXPERIMENT_INPUT": ("experiment", "experiment-digest"),
+        "TASK_SET_INPUT": ("task-set", "task-set-digest"),
+        "METRIC_PACK_INPUT": ("metric-pack", "metric-pack-digest"),
+        "POLICY_INPUT": ("policy", "policy-digest"),
+    }
+    for variable, (kind, digest_argument) in required.items():
+        digest_variable = kind.replace("-", "_").upper() + "_DIGEST"
+        output_name = kind.replace("-", "_")
+        assert f'--{digest_argument} "${digest_variable}"' in resolver.run
+        assert f'{output_name}=%s\\n\' "$resolved/{kind}"' in resolver.run
+        assert consumer.environment.get(variable) == (
+            f"${{{{ steps.{resolver.identifier}.outputs.{output_name} }}}}"
+        )
+        assert f'"${variable}"' in consumer.run
+
+    assert not any(name.endswith("_DIGEST") for name in consumer.environment)
+    assert " resolve-set " not in consumer.run
+    assert "trusted-source/benchmarks/immutable-inputs" not in consumer.run
+    assert "$RUNNER_TEMP/immutable-inputs" not in consumer.run
+    assert not re.search(r"(?:public|private)/[^\s]*", consumer.run)
+    assert not re.search(r"[^\s]*(?:DIGEST|digest)[^\s]*/", consumer.run)
+
+
+def _remove_named_step(document: str, name: str) -> str:
+    lines = document.splitlines(keepends=True)
+    start = next(index for index, line in enumerate(lines) if line == f"      - name: {name}\n")
+    end = next(
+        (
+            index
+            for index in range(start + 1, len(lines))
+            if lines[index].startswith("      - name:")
+        ),
+        len(lines),
+    )
+    return "".join((*lines[:start], *lines[end:]))
 
 
 def _load_portfolio() -> dict[str, PromptSnapshot]:
@@ -341,83 +495,39 @@ def test_sanitized_live_manifest_matches_the_complete_canonical_portfolio() -> N
 
 
 def test_autonomous_workflows_resolve_inputs_only_through_the_versioned_registry() -> None:
-    def run_steps(path: Path) -> list[tuple[str, str, str]]:
-        steps: list[tuple[str, str, str]] = []
-        job = ""
-        name = ""
-        lines = path.read_text(encoding="utf-8").splitlines()
-        index = 0
-        while index < len(lines):
-            line = lines[index]
-            job_match = re.fullmatch(r"  ([a-z][a-z0-9_-]*):", line)
-            if job_match:
-                job = job_match.group(1)
-            name_match = re.fullmatch(r"      - name: (.+)", line)
-            if name_match:
-                name = name_match.group(1)
-            if line == "        run: |":
-                block: list[str] = []
-                index += 1
-                while index < len(lines) and (
-                    not lines[index].strip() or lines[index].startswith("          ")
-                ):
-                    block.append(lines[index][10:] if lines[index] else "")
-                    index += 1
-                steps.append((job, name, "\n".join(block)))
-                continue
-            index += 1
-        return steps
-
-    workflows = {
-        "improvement": (
-            IMPROVEMENT_WORKFLOW_PATH,
-            "application/vnd.carl.improvement-task-set+json",
-        ),
-        "soak": (SOAK_WORKFLOW_PATH, "application/vnd.carl.soak-task-set+tar"),
-    }
-    for mode, (path, task_media_type) in workflows.items():
-        workflow = path.read_text(encoding="utf-8")
-        steps = run_steps(path)
-        resolvers = [(job, name, run) for job, name, run in steps if " resolve-set " in run]
-        consumers = [
-            (job, name, run)
-            for job, name, run in steps
-            if re.search(
-                r"\$RUNNER_TEMP/immutable-inputs/(?:experiment|task-set|metric-pack|policy)",
-                run,
-            )
-        ]
-
-        assert {job for job, _, _ in resolvers} == {"commission", "evaluate"}, mode
-        assert consumers, mode
-        for job, name, run in consumers:
-            assert "python -m carl_bench.immutable_inputs resolve-set" in run, (mode, job, name)
-            assert "--registry trusted-source/benchmarks/immutable-inputs/registry.json" in run
-            assert "--root trusted-source/benchmarks/immutable-inputs" in run
-            assert f"--mode {mode}" in run
-            assert f"--task-media-type {task_media_type}" in run
-            for variable, argument in (
-                ("EXPERIMENT_DIGEST", "experiment-digest"),
-                ("TASK_SET_DIGEST", "task-set-digest"),
-                ("METRIC_PACK_DIGEST", "metric-pack-digest"),
-                ("POLICY_DIGEST", "policy-digest"),
-            ):
-                assert f'--{argument} "${variable}"' in run, (mode, job, name, variable)
-            assert '--output-dir "$RUNNER_TEMP/immutable-inputs"' in run, (mode, job, name)
-
-        assert not re.search(r"benchmarks/immutable-inputs/(?:public|private)/", workflow)
-        assert not re.search(
-            r"benchmarks/immutable-inputs/[^\s]*\$(?:[A-Z_]*DIGEST|digest|kind)",
-            workflow,
-        )
-        assert not re.search(r"immutable-inputs/public/[^\s]*\$(?:[A-Z_]*DIGEST|digest)", workflow)
-        assert "private/sha256" not in workflow
-        assert "set -x" not in workflow
     improvement = IMPROVEMENT_WORKFLOW_PATH.read_text(encoding="utf-8")
     soak = SOAK_WORKFLOW_PATH.read_text(encoding="utf-8")
+    _assert_immutable_consumer_contract(improvement, mode="improvement")
+    _assert_immutable_consumer_contract(soak, mode="soak")
+    for workflow in (improvement, soak):
+        assert not re.search(r"benchmarks/immutable-inputs/(?:public|private)/", workflow)
+        assert "private/sha256" not in workflow
+        assert "set -x" not in workflow
     assert "application/vnd.carl.improvement-task-set+json" in improvement
     assert "application/vnd.carl.soak-task-set+tar" in soak
-    assert "python -m carl_bench.immutable_inputs soak-health" in soak
     for check_variable in ("benchmark_smoke", "python_contracts", "rust_contracts"):
         assert f"{check_variable}=false" in soak
         assert f"{check_variable}=true" in soak
+
+
+def test_workflow_contract_rejects_consumer_path_or_resolver_bypass_mutations() -> None:
+    improvement = IMPROVEMENT_WORKFLOW_PATH.read_text(encoding="utf-8")
+    soak = SOAK_WORKFLOW_PATH.read_text(encoding="utf-8")
+
+    changed_output = improvement.replace(
+        "${{ steps.immutable_inputs.outputs.policy }}",
+        "${{ steps.untrusted.outputs.policy }}",
+        1,
+    )
+    assert changed_output != improvement
+    with pytest.raises(AssertionError):
+        _assert_immutable_consumer_contract(changed_output, mode="improvement")
+
+    direct_path = soak.replace('"$POLICY_INPUT"', '"$RUNNER_TEMP/other/policy"', 1)
+    assert direct_path != soak
+    with pytest.raises(AssertionError):
+        _assert_immutable_consumer_contract(direct_path, mode="soak")
+
+    without_resolver = _remove_named_step(soak, "Verify immutable inputs outside subject authority")
+    with pytest.raises(AssertionError):
+        _assert_immutable_consumer_contract(without_resolver, mode="soak")

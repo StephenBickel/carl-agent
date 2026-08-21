@@ -5,6 +5,7 @@ import io
 import multiprocessing
 import os
 import tarfile
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -36,22 +37,32 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 COMMITTED_REGISTRY = REPOSITORY_ROOT / "benchmarks/immutable-inputs/registry.json"
 
 
-def _force_pre_lock_registry_race(barrier: object) -> None:
+def _hold_publication_lock(entered: object, release: object) -> None:
     import carl_bench.immutable_inputs as immutable_inputs
 
-    original = immutable_inputs._add_entry
+    original = immutable_inputs._publication_lock
 
-    def synchronized_add(registry_path: Path, registry: object, entry: object) -> object:
-        barrier.wait(timeout=10)  # type: ignore[attr-defined]
-        return original(registry_path, registry, entry)
+    @contextmanager
+    def synchronized_lock(*args: object, **kwargs: object):
+        with original(*args, **kwargs) as transaction:
+            entered.set()  # type: ignore[attr-defined]
+            if not release.wait(timeout=10):  # type: ignore[attr-defined]
+                raise RuntimeError("publication test release timed out")
+            yield transaction
 
-    immutable_inputs._add_entry = synchronized_add
+    immutable_inputs._publication_lock = synchronized_lock
 
 
 def _publish_public_worker(
-    root_text: str, payload: bytes, barrier: object, results: object
+    root_text: str,
+    payload: bytes,
+    barrier: object,
+    results: object,
+    entered: object | None = None,
+    release: object | None = None,
 ) -> None:
-    _force_pre_lock_registry_race(barrier)
+    if entered is not None and release is not None:
+        _hold_publication_lock(entered, release)
     barrier.wait(timeout=10)  # type: ignore[attr-defined]
     try:
         entry = publish_public(
@@ -73,7 +84,6 @@ def _publish_conflicting_private_worker(
     barrier: object,
     results: object,
 ) -> None:
-    _force_pre_lock_registry_race(barrier)
     barrier.wait(timeout=10)  # type: ignore[attr-defined]
     try:
         entry = publish_private_commitment(
@@ -492,6 +502,102 @@ def test_publication_rejects_unsafe_lock_files_and_reconciles_crash_temps(
     assert not stale_object_temp.exists()
     assert linked_temp.is_symlink()
     assert victim.read_bytes() == b"do not touch"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires POSIX no-follow open and fork")
+def test_publication_fails_closed_when_registry_root_is_replaced_while_locked(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "registry-root"
+    root.mkdir(mode=0o700)
+    _write_empty_registry(root)
+    outside = tmp_path / "outside"
+    outside.mkdir(mode=0o700)
+    _write_empty_registry(outside)
+    payload = canonical_json_bytes({"policy": "pinned-root", "schema_version": 1})
+    context = multiprocessing.get_context("fork")
+    barrier = context.Barrier(1)
+    entered = context.Event()
+    release = context.Event()
+    results = context.Queue()
+    process = context.Process(
+        target=_publish_public_worker,
+        args=(str(root), payload, barrier, results, entered, release),
+    )
+
+    process.start()
+    assert entered.wait(timeout=10)
+    parked = tmp_path / "parked-root"
+    root.rename(parked)
+    root.symlink_to(outside, target_is_directory=True)
+    release.set()
+    process.join(timeout=15)
+    assert not process.is_alive()
+    assert process.exitcode == 0
+
+    assert results.get(timeout=2) == ("error", "registry_root_invalid")
+    assert load_registry(outside / "registry.json").entries == ()
+    assert list((outside / "public").iterdir()) == []
+    assert load_registry(parked / "registry.json").entries == ()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires POSIX flock and fork")
+def test_publication_rejects_replaced_lock_before_any_commit(tmp_path: Path) -> None:
+    root = tmp_path / "registry-root"
+    root.mkdir(mode=0o700)
+    registry_path = _write_empty_registry(root)
+    first = canonical_json_bytes({"policy": "old-lock", "schema_version": 1})
+    second = canonical_json_bytes({"policy": "new-lock", "schema_version": 1})
+    context = multiprocessing.get_context("fork")
+    barrier = context.Barrier(1)
+    entered = context.Event()
+    release = context.Event()
+    first_results = context.Queue()
+    first_process = context.Process(
+        target=_publish_public_worker,
+        args=(str(root), first, barrier, first_results, entered, release),
+    )
+
+    first_process.start()
+    assert entered.wait(timeout=10)
+    lock_path = root / ".registry.json.lock"
+    lock_path.unlink()
+    lock_path.write_bytes(b"")
+    lock_path.chmod(0o600)
+
+    second_results = context.Queue()
+    second_process = context.Process(
+        target=_publish_public_worker,
+        args=(str(root), second, context.Barrier(1), second_results),
+    )
+    second_process.start()
+    second_process.join(timeout=10)
+    assert second_process.exitcode == 0
+    assert second_results.get(timeout=2)[0] == "ok"
+    release.set()
+    first_process.join(timeout=10)
+    assert first_process.exitcode == 0
+
+    assert first_results.get(timeout=2) == ("error", "registry_lock_invalid")
+    entries = load_registry(registry_path).entries
+    assert [entry.digest for entry in entries] == [hashlib.sha256(second).hexdigest()]
+    assert not (root / "public" / hashlib.sha256(first).hexdigest()).exists()
+
+
+def test_publication_rejects_group_or_world_writable_registry_root(tmp_path: Path) -> None:
+    root = tmp_path / "registry-root"
+    root.mkdir(mode=0o700)
+    registry_path = _write_empty_registry(root)
+    root.chmod(0o777)
+
+    with pytest.raises(ImmutableInputError, match="registry_root_invalid"):
+        publish_public(
+            registry_path,
+            root=root,
+            payload=canonical_json_bytes({"policy": "unsafe-root", "schema_version": 1}),
+            media_type=POLICY_MEDIA_TYPE,
+            media_version=1,
+        )
 
 
 def test_public_resolution_stays_under_public_dir_and_verifies_every_commitment(

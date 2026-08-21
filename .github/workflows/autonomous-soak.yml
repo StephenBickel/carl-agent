@@ -190,6 +190,7 @@ jobs:
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.97.0 --profile minimal --no-self-update
       - name: Verify immutable inputs outside subject authority
+        id: immutable_inputs
         env:
           EXPERIMENT_DIGEST: ${{ inputs.experiment_digest }}
           METRIC_PACK_DIGEST: ${{ inputs.metric_pack_digest }}
@@ -197,7 +198,8 @@ jobs:
           TASK_SET_DIGEST: ${{ inputs.task_set_digest }}
         run: |
           set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/immutable-inputs"
+          resolved="$RUNNER_TEMP/immutable-inputs"
+          mkdir -p "$resolved"
           PYTHONPATH=trusted-source/benchmarks/src python -m carl_bench.immutable_inputs resolve-set \
             --registry trusted-source/benchmarks/immutable-inputs/registry.json \
             --root trusted-source/benchmarks/immutable-inputs \
@@ -207,42 +209,35 @@ jobs:
             --task-set-digest "$TASK_SET_DIGEST" \
             --metric-pack-digest "$METRIC_PACK_DIGEST" \
             --policy-digest "$POLICY_DIGEST" \
-            --output-dir "$RUNNER_TEMP/immutable-inputs" >/dev/null
+            --output-dir "$resolved" >/dev/null
           printf '%s  %s\n' \
             "$EXPERIMENT_DIGEST" "$RUNNER_TEMP/immutable-inputs/experiment" \
             "$TASK_SET_DIGEST" "$RUNNER_TEMP/immutable-inputs/task-set" \
             "$METRIC_PACK_DIGEST" "$RUNNER_TEMP/immutable-inputs/metric-pack" \
             "$POLICY_DIGEST" "$RUNNER_TEMP/immutable-inputs/policy" \
             | sha256sum --check --strict -
+          printf 'experiment=%s\n' "$resolved/experiment" >> "$GITHUB_OUTPUT"
+          printf 'task_set=%s\n' "$resolved/task-set" >> "$GITHUB_OUTPUT"
+          printf 'metric_pack=%s\n' "$resolved/metric-pack" >> "$GITHUB_OUTPUT"
+          printf 'policy=%s\n' "$resolved/policy" >> "$GITHUB_OUTPUT"
       - name: Run repository health probes without workflow commands or credentials
         id: health
         env:
-          EXPERIMENT_DIGEST: ${{ inputs.experiment_digest }}
+          EXPERIMENT_INPUT: ${{ steps.immutable_inputs.outputs.experiment }}
           MERGE_COMMIT: ${{ inputs.candidate_commit }}
-          METRIC_PACK_DIGEST: ${{ inputs.metric_pack_digest }}
-          POLICY_DIGEST: ${{ inputs.policy_digest }}
-          TASK_SET_DIGEST: ${{ inputs.task_set_digest }}
+          METRIC_PACK_INPUT: ${{ steps.immutable_inputs.outputs.metric_pack }}
+          POLICY_INPUT: ${{ steps.immutable_inputs.outputs.policy }}
+          TASK_SET_INPUT: ${{ steps.immutable_inputs.outputs.task_set }}
         run: |
           set -euo pipefail
           chmod 700 "$(dirname "$GITHUB_ENV")"
-          mkdir -p "$RUNNER_TEMP/immutable-inputs"
-          PYTHONPATH=trusted-source/benchmarks/src python -m carl_bench.immutable_inputs resolve-set \
-            --registry trusted-source/benchmarks/immutable-inputs/registry.json \
-            --root trusted-source/benchmarks/immutable-inputs \
-            --mode soak \
-            --task-media-type application/vnd.carl.soak-task-set+tar \
-            --experiment-digest "$EXPERIMENT_DIGEST" \
-            --task-set-digest "$TASK_SET_DIGEST" \
-            --metric-pack-digest "$METRIC_PACK_DIGEST" \
-            --policy-digest "$POLICY_DIGEST" \
-            --output-dir "$RUNNER_TEMP/immutable-inputs" >/dev/null
           test "$(git -C subject-merge rev-parse HEAD)" = "$MERGE_COMMIT"
           eval_root="$RUNNER_TEMP/eval-merge"; sandbox="$RUNNER_TEMP/sandbox-merge"
           cp -R -- subject-merge "$eval_root"
           rm -rf -- "$eval_root/benchmarks/tests" "$eval_root/benchmarks/tasks/dev"
           cp -R -- trusted-source/benchmarks/tests "$eval_root/benchmarks/tests"
           mkdir -p "$eval_root/benchmarks/tasks/dev"
-          tar --extract --file "$RUNNER_TEMP/immutable-inputs/task-set" \
+          tar --extract --file "$TASK_SET_INPUT" \
             --directory "$eval_root/benchmarks/tasks/dev" --no-same-owner --no-same-permissions
           cp -- trusted-source/scripts/benchmark-smoke.sh "$eval_root/scripts/benchmark-smoke.sh"
           chmod -R a-w "$eval_root"
@@ -282,10 +277,10 @@ jobs:
             > "$observations"
           result="$RUNNER_TEMP/health-result.json"
           PYTHONPATH=trusted-source/benchmarks/src python -m carl_bench.immutable_inputs soak-health \
-            --experiment "$RUNNER_TEMP/immutable-inputs/experiment" \
-            --task-set "$RUNNER_TEMP/immutable-inputs/task-set" \
-            --metric-pack "$RUNNER_TEMP/immutable-inputs/metric-pack" \
-            --policy "$RUNNER_TEMP/immutable-inputs/policy" \
+            --experiment "$EXPERIMENT_INPUT" \
+            --task-set "$TASK_SET_INPUT" \
+            --metric-pack "$METRIC_PACK_INPUT" \
+            --policy "$POLICY_INPUT" \
             --observations "$observations" \
             --output "$result"
           printf 'health_result_digest=%s\n' "$(sha256sum "$result" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"

@@ -191,6 +191,7 @@ jobs:
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.97.0 --profile minimal --no-self-update
       - name: Verify exact subjects and immutable inputs
+        id: immutable_inputs
         env:
           CANDIDATE_COMMIT: ${{ inputs.candidate_commit }}
           EXPERIMENT_DIGEST: ${{ inputs.experiment_digest }}
@@ -202,7 +203,8 @@ jobs:
           set -euo pipefail
           test "$(git -C subject-parent rev-parse HEAD)" = "$PARENT_COMMIT"
           test "$(git -C subject-candidate rev-parse HEAD)" = "$CANDIDATE_COMMIT"
-          mkdir -p "$RUNNER_TEMP/immutable-inputs"
+          resolved="$RUNNER_TEMP/immutable-inputs"
+          mkdir -p "$resolved"
           PYTHONPATH=trusted-source/benchmarks/src python -m carl_bench.immutable_inputs resolve-set \
             --registry trusted-source/benchmarks/immutable-inputs/registry.json \
             --root trusted-source/benchmarks/immutable-inputs \
@@ -212,13 +214,17 @@ jobs:
             --task-set-digest "$TASK_SET_DIGEST" \
             --metric-pack-digest "$METRIC_PACK_DIGEST" \
             --policy-digest "$POLICY_DIGEST" \
-            --output-dir "$RUNNER_TEMP/immutable-inputs" >/dev/null
+            --output-dir "$resolved" >/dev/null
           printf '%s  %s\n' \
             "$EXPERIMENT_DIGEST" "$RUNNER_TEMP/immutable-inputs/experiment" \
             "$TASK_SET_DIGEST" "$RUNNER_TEMP/immutable-inputs/task-set" \
             "$METRIC_PACK_DIGEST" "$RUNNER_TEMP/immutable-inputs/metric-pack" \
             "$POLICY_DIGEST" "$RUNNER_TEMP/immutable-inputs/policy" \
             | sha256sum --check --strict -
+          printf 'experiment=%s\n' "$resolved/experiment" >> "$GITHUB_OUTPUT"
+          printf 'task_set=%s\n' "$resolved/task-set" >> "$GITHUB_OUTPUT"
+          printf 'metric_pack=%s\n' "$resolved/metric-pack" >> "$GITHUB_OUTPUT"
+          printf 'policy=%s\n' "$resolved/policy" >> "$GITHUB_OUTPUT"
       - name: Build and bind exact subjects under distinct identities
         id: build
         env:
@@ -270,25 +276,14 @@ jobs:
         id: pair
         env:
           CANDIDATE_COMMIT: ${{ inputs.candidate_commit }}
-          EXPERIMENT_DIGEST: ${{ inputs.experiment_digest }}
-          METRIC_PACK_DIGEST: ${{ inputs.metric_pack_digest }}
+          EXPERIMENT_INPUT: ${{ steps.immutable_inputs.outputs.experiment }}
+          METRIC_PACK_INPUT: ${{ steps.immutable_inputs.outputs.metric_pack }}
           PARENT_COMMIT: ${{ inputs.parent_commit }}
-          POLICY_DIGEST: ${{ inputs.policy_digest }}
-          TASK_SET_DIGEST: ${{ inputs.task_set_digest }}
+          POLICY_INPUT: ${{ steps.immutable_inputs.outputs.policy }}
+          TASK_SET_INPUT: ${{ steps.immutable_inputs.outputs.task_set }}
         run: |
           set -euo pipefail
           chmod 700 "$(dirname "$GITHUB_ENV")"
-          mkdir -p "$RUNNER_TEMP/immutable-inputs"
-          PYTHONPATH=trusted-source/benchmarks/src python -m carl_bench.immutable_inputs resolve-set \
-            --registry trusted-source/benchmarks/immutable-inputs/registry.json \
-            --root trusted-source/benchmarks/immutable-inputs \
-            --mode improvement \
-            --task-media-type application/vnd.carl.improvement-task-set+json \
-            --experiment-digest "$EXPERIMENT_DIGEST" \
-            --task-set-digest "$TASK_SET_DIGEST" \
-            --metric-pack-digest "$METRIC_PACK_DIGEST" \
-            --policy-digest "$POLICY_DIGEST" \
-            --output-dir "$RUNNER_TEMP/immutable-inputs" >/dev/null
           results="$RUNNER_TEMP/paired-results"
           sandbox="$RUNNER_TEMP/harness-sandbox"
           bound="$RUNNER_TEMP/bound-subjects"
@@ -312,10 +307,10 @@ jobs:
               --parent-binary "$RUNNER_TEMP/build-parent/target/release/carl" \
               --candidate-binary "$RUNNER_TEMP/build-candidate/target/release/carl" \
               --parent-commit "$PARENT_COMMIT" --candidate-commit "$CANDIDATE_COMMIT" \
-              --experiment "$RUNNER_TEMP/immutable-inputs/experiment" \
-              --task-set "$RUNNER_TEMP/immutable-inputs/task-set" \
-              --metric-pack "$RUNNER_TEMP/immutable-inputs/metric-pack" \
-              --policy "$RUNNER_TEMP/immutable-inputs/policy" \
+              --experiment "$EXPERIMENT_INPUT" \
+              --task-set "$TASK_SET_INPUT" \
+              --metric-pack "$METRIC_PACK_INPUT" \
+              --policy "$POLICY_INPUT" \
               --parent-uid carlparent --candidate-uid carlcandidate \
               --mode improvement --output "$results/paired-result.json"
           (cd / && sha256sum --check "$bound/parent.sha256")
