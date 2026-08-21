@@ -50,8 +50,8 @@ from carl_bench.experiment import (
     reduce_events,
 )
 from carl_bench.experimental_publication import (
-    ExperimentalEligibilityTrustedKey,
     ExperimentalEligibilityVerifier,
+    ExperimentalPublicationPolicy,
     ExperimentalPublicationRequest,
     SignedExperimentalPublicationEligibility,
     candidate_tree,
@@ -69,8 +69,8 @@ from carl_bench.tasks import BenchmarkTask, TaskContractError, discover_tasks
 REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
 MAX_SCORECARD_BYTES = 4 * 1_048_576
 MAX_CONTROL_INPUT_BYTES = 1_048_576
-_EXPERIMENTAL_ELIGIBILITY_PUBLIC_KEY_ENV = "CARL_EXPERIMENTAL_ELIGIBILITY_PUBLIC_KEY_PATH"
-_EXPERIMENTAL_ELIGIBILITY_KEY_ID_ENV = "CARL_EXPERIMENTAL_ELIGIBILITY_KEY_ID"
+_EXPERIMENTAL_ELIGIBILITY_POLICY = Path("/etc/carl/experimental-eligibility-policy.json")
+_MAX_EXPERIMENTAL_POLICY_BYTES = 32 * 1024
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -468,32 +468,137 @@ def _read_control_object(path: Path) -> dict[str, Any]:
     return value
 
 
-def _experimental_eligibility_verifier() -> ExperimentalEligibilityVerifier:
-    key_path_value = os.environ.get(_EXPERIMENTAL_ELIGIBILITY_PUBLIC_KEY_ENV)
-    key_id = os.environ.get(_EXPERIMENTAL_ELIGIBILITY_KEY_ID_ENV)
-    if not key_path_value or not key_id:
-        raise ValueError("experimental eligibility protected verifier is not configured")
-    source = _anchored(Path(key_path_value))
+def _experimental_eligibility_policy_path() -> Path:
+    return _EXPERIMENTAL_ELIGIBILITY_POLICY
+
+
+def _experimental_eligibility_policy_root() -> Path:
+    return Path(os.sep)
+
+
+def _trusted_controller_owner(owner: int) -> bool:
+    allowed = {0}
+    if hasattr(os, "geteuid"):
+        allowed.add(os.geteuid())
+    return owner in allowed
+
+
+def _secure_directory(fd: int) -> None:
+    metadata = os.fstat(fd)
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or not _trusted_controller_owner(metadata.st_uid)
+        or stat.S_IMODE(metadata.st_mode) & 0o022
+    ):
+        raise ValueError("experimental eligibility protected policy directory is unsafe")
+
+
+def _experimental_eligibility_policy() -> ExperimentalPublicationPolicy:
+    """Load the fixed controller policy without following mutable path components."""
+    source = _experimental_eligibility_policy_path()
+    root = _experimental_eligibility_policy_root()
     try:
-        metadata = source.lstat()
+        relative = source.relative_to(root)
+    except ValueError as error:
+        raise ValueError("experimental eligibility protected policy path is invalid") from error
+    if (
+        not source.is_absolute()
+        or not root.is_absolute()
+        or not relative.parts
+        or any(part in {"", ".", ".."} for part in relative.parts)
+    ):
+        raise ValueError("experimental eligibility protected policy path is invalid")
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    file_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    directory_fd: int | None = None
+    file_fd: int | None = None
+    try:
+        directory_fd = os.open(root, directory_flags)
+        _secure_directory(directory_fd)
+        for component in relative.parts[:-1]:
+            next_fd: int | None = None
+            try:
+                next_fd = os.open(component, directory_flags, dir_fd=directory_fd)
+                _secure_directory(next_fd)
+            except BaseException:
+                if next_fd is not None:
+                    os.close(next_fd)
+                raise
+            os.close(directory_fd)
+            directory_fd = next_fd
+        file_fd = os.open(relative.parts[-1], file_flags, dir_fd=directory_fd)
+        metadata = os.fstat(file_fd)
         if (
             not stat.S_ISREG(metadata.st_mode)
-            or stat.S_ISLNK(metadata.st_mode)
             or metadata.st_nlink != 1
-            or metadata.st_size > 16_384
-            or (os.name != "nt" and stat.S_IMODE(metadata.st_mode) & 0o022)
-            or (hasattr(os, "getuid") and metadata.st_uid != os.getuid())
+            or metadata.st_size > _MAX_EXPERIMENTAL_POLICY_BYTES
+            or not _trusted_controller_owner(metadata.st_uid)
+            or stat.S_IMODE(metadata.st_mode) & 0o022
         ):
-            raise ValueError("experimental eligibility protected verifier is unsafe")
-        public_key_pem = source.read_bytes()
-    except OSError as error:
-        raise ValueError("experimental eligibility protected verifier is unavailable") from error
-    return ExperimentalEligibilityVerifier(
-        trusted_key=ExperimentalEligibilityTrustedKey(
-            key_id=key_id,
-            public_key_pem=public_key_pem,
+            raise ValueError("experimental eligibility protected policy file is unsafe")
+        chunks: list[bytes] = []
+        total = 0
+        while total <= _MAX_EXPERIMENTAL_POLICY_BYTES:
+            chunk = os.read(file_fd, min(8192, _MAX_EXPERIMENTAL_POLICY_BYTES + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+        raw = b"".join(chunks)
+        if len(raw) > _MAX_EXPERIMENTAL_POLICY_BYTES or len(raw) != metadata.st_size:
+            raise ValueError("experimental eligibility protected policy is invalid")
+        value = json.loads(raw.decode("utf-8"), object_pairs_hook=_object_without_duplicates)
+        policy = ExperimentalPublicationPolicy.from_canonical_dict(value)
+        if raw != canonical_json_bytes(policy.to_canonical_dict()):
+            raise ValueError("experimental eligibility protected policy is noncanonical")
+        return policy
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
+        if isinstance(error, ValueError) and str(error).startswith(
+            "experimental eligibility protected policy"
+        ):
+            raise
+        raise ValueError("experimental eligibility protected policy is unavailable") from error
+    finally:
+        if file_fd is not None:
+            os.close(file_fd)
+        if directory_fd is not None:
+            os.close(directory_fd)
+
+
+def _experimental_eligibility_verifier() -> ExperimentalEligibilityVerifier:
+    return ExperimentalEligibilityVerifier(policy=_experimental_eligibility_policy())
+
+
+def _experimental_remote_destination(
+    repository: Path,
+    remote: str,
+    git_executable: Path,
+) -> str:
+    if not isinstance(remote, str) or not remote:
+        raise ValueError("experimental publication remote alias is invalid")
+    try:
+        result = subprocess.run(
+            (
+                os.fspath(git_executable),
+                "-C",
+                os.fspath(repository),
+                "remote",
+                "get-url",
+                "--push",
+                "--all",
+                remote,
+            ),
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
         )
-    )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise ValueError("experimental publication remote destination is unavailable") from error
+    lines = result.stdout.splitlines()
+    if result.returncode != 0 or len(lines) != 1:
+        raise ValueError("experimental publication remote destination is unavailable")
+    return lines[0]
 
 
 def _private_ledger(path: Path) -> ExperimentLedger:
@@ -905,23 +1010,32 @@ def _candidate_command(args: argparse.Namespace) -> int:
             _read_control_object(args.eligibility_receipt)
         )
         verifier = _experimental_eligibility_verifier()
+        repository = _anchored(args.repository)
+        git_executable = _anchored(args.git_executable)
+        actual_remote_url = _experimental_remote_destination(
+            repository,
+            args.remote,
+            git_executable,
+        )
+        if actual_remote_url != verifier.remote_url:
+            raise ValueError("experimental publication remote destination mismatch")
         request = ExperimentalPublicationRequest(
             experiment_id=args.experiment_id,
             branch=args.branch,
             candidate_packet=packet,
-            candidate_tree=candidate_tree(
-                _anchored(args.repository), packet.candidate_commit, _anchored(args.git_executable)
-            ),
+            candidate_tree=candidate_tree(repository, packet.candidate_commit, git_executable),
             request_id=args.stage_attempt_id,
             requested_at=args.occurred_at,
+            repository_id=verifier.repository_id,
+            remote_url=actual_remote_url,
         )
         decision = publish_experimental_branch(
             request,
             verifier=verifier,
             eligibility=eligibility,
-            repository=_anchored(args.repository),
+            repository=repository,
             remote=args.remote,
-            git_executable=_anchored(args.git_executable),
+            git_executable=git_executable,
         )
         if decision.outcome.startswith("blocked_"):
             raise ValueError("experimental publication is not eligible")

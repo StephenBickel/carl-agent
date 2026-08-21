@@ -13,6 +13,9 @@ from carl_bench.canonical import canonical_json_bytes
 
 _DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
+_REPOSITORY_ID_RE = re.compile(
+    r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/[A-Za-z0-9](?:[A-Za-z0-9._-]{0,99})$"
+)
 _CLAIM_TYPES = frozenset({"capability", "compatibility", "correctness"})
 _TRANSFER_TYPES = frozenset({"adversarial", "fixture_probe", "held_out", "unit_contract"})
 _BEHAVIORAL_TRANSFER_TYPES = frozenset({"adversarial", "held_out"})
@@ -90,6 +93,25 @@ def _experimental_digest(value: Any) -> str:
 def _experimental_object(value: Any) -> str:
     if not isinstance(value, str) or not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", value):
         raise ExperimentalEligibilityError("experimental_eligibility_object_invalid")
+    return value
+
+
+def experimental_repository_id(value: Any) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value.encode("utf-8")) > 140
+        or _REPOSITORY_ID_RE.fullmatch(value) is None
+        or value.endswith(".git")
+    ):
+        raise ExperimentalEligibilityError("experimental_repository_id_invalid")
+    return value
+
+
+def experimental_remote_url(value: Any, repository_id: Any) -> str:
+    selected_repository = experimental_repository_id(repository_id)
+    expected = f"https://github.com/{selected_repository}.git"
+    if not isinstance(value, str) or value != expected:
+        raise ExperimentalEligibilityError("experimental_remote_url_invalid")
     return value
 
 
@@ -282,6 +304,8 @@ def experimental_publication_request_digest(
     candidate_packet_digest: Any,
     candidate_commit: Any,
     candidate_tree: Any,
+    repository_id: Any,
+    remote_url: Any,
 ) -> str:
     """Bind one eligibility receipt to one exact immutable publication effect."""
     payload = {
@@ -295,6 +319,8 @@ def experimental_publication_request_digest(
         "ref": f"refs/heads/{branch}",
         "request_id": _experimental_identifier(request_id),
         "requested_at": requested_at,
+        "repository_id": experimental_repository_id(repository_id),
+        "remote_url": experimental_remote_url(remote_url, repository_id),
         "schema_version": 1,
     }
     _experimental_timestamp(requested_at)
@@ -347,6 +373,8 @@ class ExperimentalPublicationEligibility:
     key_id: str
     request_id: str
     requested_at: str
+    repository_id: str
+    remote_url: str
     request_digest: str
     effect_digest: str
     experiment_id: str
@@ -381,6 +409,8 @@ class ExperimentalPublicationEligibility:
             candidate_packet_digest=self.candidate_packet_digest,
             candidate_commit=self.candidate_commit,
             candidate_tree=self.candidate_tree,
+            repository_id=self.repository_id,
+            remote_url=self.remote_url,
         )
         if self.request_digest != expected_request:
             raise ExperimentalEligibilityError("experimental_eligibility_request_digest_invalid")
@@ -477,6 +507,8 @@ class ExperimentalPublicationEligibility:
             "request_digest": self.request_digest,
             "request_id": self.request_id,
             "requested_at": self.requested_at,
+            "remote_url": self.remote_url,
+            "repository_id": self.repository_id,
             "required_checks": [item.to_canonical_dict() for item in self.required_checks],
             "review_dispositions": [item.to_canonical_dict() for item in self.review_dispositions],
             "schema_version": self.schema_version,
@@ -509,6 +541,8 @@ class ExperimentalPublicationEligibility:
             "request_digest",
             "request_id",
             "requested_at",
+            "remote_url",
+            "repository_id",
             "required_checks",
             "review_dispositions",
             "schema_version",

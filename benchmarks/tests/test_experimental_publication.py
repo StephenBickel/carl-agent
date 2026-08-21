@@ -17,6 +17,7 @@ from test_candidate_git import _repository
 from test_experiment import manifest, sealed_candidate
 
 from carl_bench import cli
+from carl_bench.canonical import canonical_json_bytes
 from carl_bench.capability_validation import (
     ExperimentalCheckResult,
     ExperimentalLocalGateResult,
@@ -26,9 +27,9 @@ from carl_bench.capability_validation import (
     experimental_publication_request_digest,
 )
 from carl_bench.experimental_publication import (
-    ExperimentalEligibilityTrustedKey,
     ExperimentalEligibilityVerifier,
     ExperimentalPublicationError,
+    ExperimentalPublicationPolicy,
     ExperimentalPublicationRequest,
     SignedExperimentalPublicationEligibility,
     publish_experimental_branch,
@@ -46,14 +47,40 @@ ELIGIBILITY_PUBLIC_KEY = ELIGIBILITY_PRIVATE_KEY.public_key().public_bytes(
     serialization.Encoding.PEM,
     serialization.PublicFormat.SubjectPublicKeyInfo,
 )
+REPOSITORY_ID = "StephenBickel/carl-agent"
+CANONICAL_REMOTE_URL = "https://github.com/StephenBickel/carl-agent.git"
+
+
+def _policy() -> ExperimentalPublicationPolicy:
+    return ExperimentalPublicationPolicy(
+        schema_version=1,
+        key_id=ELIGIBILITY_KEY_ID,
+        public_key_pem=ELIGIBILITY_PUBLIC_KEY,
+        repository_id=REPOSITORY_ID,
+        remote_url=CANONICAL_REMOTE_URL,
+    )
+
+
+def _policy_json() -> dict[str, object]:
+    return {
+        "key_id": ELIGIBILITY_KEY_ID,
+        "public_key_pem": ELIGIBILITY_PUBLIC_KEY.decode("ascii"),
+        "remote_url": CANONICAL_REMOTE_URL,
+        "repository_id": REPOSITORY_ID,
+        "schema_version": 1,
+    }
+
+
+def _write_policy(path: Path) -> None:
+    path.parent.mkdir(parents=True, mode=0o700)
+    path.parent.chmod(0o700)
+    path.write_bytes(canonical_json_bytes(_policy_json()))
+    path.chmod(0o600)
 
 
 def test_experimental_eligibility_verifier_is_immutable_and_production_distinct() -> None:
     verifier = ExperimentalEligibilityVerifier(
-        trusted_key=ExperimentalEligibilityTrustedKey(
-            key_id=ELIGIBILITY_KEY_ID,
-            public_key_pem=ELIGIBILITY_PUBLIC_KEY,
-        ),
+        policy=_policy(),
         clock=lambda: datetime(2026, 8, 10, 12, 2, tzinfo=UTC),
     )
 
@@ -73,7 +100,7 @@ def test_experimental_eligibility_verifier_is_immutable_and_production_distinct(
 
     with pytest.raises(TypeError, match="cannot be subclassed"):
 
-        class BypassTrustedKey(ExperimentalEligibilityTrustedKey):
+        class BypassPolicy(ExperimentalPublicationPolicy):
             pass
 
     with pytest.raises(TypeError, match="cannot be subclassed"):
@@ -94,6 +121,72 @@ def test_experimental_eligibility_verifier_is_immutable_and_production_distinct(
         )
 
 
+def test_fixed_policy_loader_securely_reads_one_canonical_controller_policy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "controller" / "experimental-eligibility-policy.json"
+    tmp_path.chmod(0o700)
+    _write_policy(path)
+    monkeypatch.setattr(cli, "_experimental_eligibility_policy_root", lambda: tmp_path)
+    monkeypatch.setattr(cli, "_experimental_eligibility_policy_path", lambda: path)
+
+    assert cli._experimental_eligibility_policy() == _policy()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["missing", "file_symlink", "parent_symlink", "writable_file", "writable_parent"],
+)
+def test_fixed_policy_loader_rejects_missing_symlinked_or_writable_policy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str
+) -> None:
+    path = tmp_path / "controller" / "experimental-eligibility-policy.json"
+    tmp_path.chmod(0o700)
+    _write_policy(path)
+    if mutation == "missing":
+        path.unlink()
+    elif mutation == "file_symlink":
+        target = tmp_path / "policy-target.json"
+        target.write_bytes(canonical_json_bytes(_policy_json()))
+        target.chmod(0o600)
+        path.unlink()
+        path.symlink_to(target)
+    elif mutation == "parent_symlink":
+        target_parent = tmp_path / "protected-controller"
+        target_path = target_parent / path.name
+        _write_policy(target_path)
+        path.unlink()
+        path.parent.rmdir()
+        path.parent.symlink_to(target_parent, target_is_directory=True)
+    elif mutation == "writable_file":
+        path.chmod(0o622)
+    else:
+        path.parent.chmod(0o722)
+    monkeypatch.setattr(cli, "_experimental_eligibility_policy_root", lambda: tmp_path)
+    monkeypatch.setattr(cli, "_experimental_eligibility_policy_path", lambda: path)
+
+    with pytest.raises(ValueError, match="experimental eligibility protected policy"):
+        cli._experimental_eligibility_policy()
+
+
+@pytest.mark.parametrize("content", [b'{"schema_version":1}', b'{ "schema_version": 1 }'])
+def test_fixed_policy_loader_rejects_nonexact_or_noncanonical_policy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    content: bytes,
+) -> None:
+    path = tmp_path / "controller" / "experimental-eligibility-policy.json"
+    tmp_path.chmod(0o700)
+    _write_policy(path)
+    path.write_bytes(content)
+    path.chmod(0o600)
+    monkeypatch.setattr(cli, "_experimental_eligibility_policy_root", lambda: tmp_path)
+    monkeypatch.setattr(cli, "_experimental_eligibility_policy_path", lambda: path)
+
+    with pytest.raises(ValueError, match="experimental eligibility protected policy"):
+        cli._experimental_eligibility_policy()
+
+
 def _eligibility(
     request: ExperimentalPublicationRequest,
     **changes: object,
@@ -107,6 +200,8 @@ def _eligibility(
         "key_id": ELIGIBILITY_KEY_ID,
         "request_id": request.request_id,
         "requested_at": request.requested_at,
+        "repository_id": request.repository_id,
+        "remote_url": request.remote_url,
         "request_digest": "",
         "effect_digest": "",
         "experiment_id": request.experiment_id,
@@ -177,6 +272,8 @@ def _eligibility(
         candidate_packet_digest=values["candidate_packet_digest"],
         candidate_commit=values["candidate_commit"],
         candidate_tree=values["candidate_tree"],
+        repository_id=values["repository_id"],
+        remote_url=values["remote_url"],
     )
     values["effect_digest"] = values["request_digest"]
     values["evidence_digest"] = experimental_evidence_digest(
@@ -215,10 +312,7 @@ def _verifier(
 ) -> ExperimentalEligibilityVerifier:
     selected_clock = clock if clock is not None else (lambda: now)
     return ExperimentalEligibilityVerifier(
-        trusted_key=ExperimentalEligibilityTrustedKey(
-            key_id=ELIGIBILITY_KEY_ID,
-            public_key_pem=ELIGIBILITY_PUBLIC_KEY,
-        ),
+        policy=_policy(),
         clock=selected_clock,  # type: ignore[arg-type]
     )
 
@@ -245,6 +339,8 @@ def _request(
         candidate_tree=candidate_tree,
         request_id=request_id,
         requested_at=requested_at,
+        repository_id=REPOSITORY_ID,
+        remote_url=CANONICAL_REMOTE_URL,
     )
     return request
 
@@ -333,6 +429,8 @@ def test_eligibility_is_frozen_canonical_request_bound_and_not_a_production_rece
         candidate_packet_digest=request.candidate_packet.digest,
         candidate_commit=request.candidate_packet.candidate_commit,
         candidate_tree=request.candidate_tree,
+        repository_id=request.repository_id,
+        remote_url=request.remote_url,
     )
     with pytest.raises(AttributeError):
         eligibility.security_result = "fail"  # type: ignore[misc]
@@ -493,6 +591,64 @@ def test_signed_receipt_replays_only_the_same_immutable_effect() -> None:
         _reconcile(replace(request, branch="experimental/other"), None, eligibility=envelope)
 
 
+@pytest.mark.parametrize(
+    "repository_id,remote_url",
+    [
+        ("attacker/carl-agent", "https://github.com/attacker/carl-agent.git"),
+        (
+            "StephenBickel/carl-agent-fork",
+            "https://github.com/StephenBickel/carl-agent-fork.git",
+        ),
+    ],
+)
+def test_signed_receipt_cannot_be_replayed_for_another_destination(
+    repository_id: str,
+    remote_url: str,
+) -> None:
+    request = _request()
+    envelope = _signed_eligibility(request)
+
+    changed = replace(request, repository_id=repository_id, remote_url=remote_url)
+    decision = _reconcile(changed, None, eligibility=envelope)
+
+    assert decision.outcome == "blocked_candidate_not_locally_eligible"
+
+
+def test_publication_effect_identity_changes_with_destination() -> None:
+    request = _request()
+    changed = replace(
+        request,
+        repository_id="StephenBickel/carl-agent-fork",
+        remote_url="https://github.com/StephenBickel/carl-agent-fork.git",
+    )
+
+    assert _eligibility(request).effect_digest != _eligibility(changed).effect_digest
+
+
+@pytest.mark.parametrize(
+    "repository_id,remote_url",
+    [
+        ("StephenBickel/carl-agent", "ssh://github.com/StephenBickel/carl-agent.git"),
+        ("StephenBickel/carl-agent", "https://user@github.com/StephenBickel/carl-agent.git"),
+        ("StephenBickel/carl-agent", "https://github.com/StephenBickel/carl-agent.git?q=1"),
+        ("StephenBickel/carl-agent", "https://github.com/StephenBickel/carl-agent.git#main"),
+        ("StephenBickel/carl-agent", "https://github.com/StephenBickel/carl-agent"),
+        ("StephenBickel/carl-agent", "origin"),
+    ],
+)
+def test_policy_rejects_noncanonical_or_alias_remote_destination(
+    repository_id: str, remote_url: str
+) -> None:
+    with pytest.raises(ValueError, match="experimental_(repository|remote)"):
+        ExperimentalPublicationPolicy(
+            schema_version=1,
+            key_id=ELIGIBILITY_KEY_ID,
+            public_key_pem=ELIGIBILITY_PUBLIC_KEY,
+            repository_id=repository_id,
+            remote_url=remote_url,
+        )
+
+
 def test_verifier_reads_trusted_clock_once_per_publication_decision() -> None:
     calls = 0
 
@@ -556,6 +712,8 @@ def test_publish_cli_records_one_immutable_branch_without_protected_validation(
         candidate_tree=candidate_tree,
         request_id="publish-experimental-001",
         requested_at=REQUESTED_AT,
+        repository_id=REPOSITORY_ID,
+        remote_url=CANONICAL_REMOTE_URL,
     )
     eligibility_path = private / "experimental-eligibility.json"
     signed_eligibility = _signed_eligibility(
@@ -566,10 +724,19 @@ def test_publish_cli_records_one_immutable_branch_without_protected_validation(
     eligibility_path.write_text(
         json.dumps(signed_eligibility.to_canonical_dict()), encoding="utf-8"
     )
-    public_key_path = private / "experimental-eligibility-public.pem"
-    public_key_path.write_bytes(ELIGIBILITY_PUBLIC_KEY)
-    monkeypatch.setenv("CARL_EXPERIMENTAL_ELIGIBILITY_PUBLIC_KEY_PATH", os.fspath(public_key_path))
-    monkeypatch.setenv("CARL_EXPERIMENTAL_ELIGIBILITY_KEY_ID", ELIGIBILITY_KEY_ID)
+    attacker_key = Ed25519PrivateKey.generate()
+    attacker_public_key_path = private / "attacker-experimental-eligibility-public.pem"
+    attacker_public_key_path.write_bytes(
+        attacker_key.public_key().public_bytes(
+            serialization.Encoding.PEM,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+    )
+    monkeypatch.setenv(
+        "CARL_EXPERIMENTAL_ELIGIBILITY_PUBLIC_KEY_PATH", os.fspath(attacker_public_key_path)
+    )
+    monkeypatch.setenv("CARL_EXPERIMENTAL_ELIGIBILITY_KEY_ID", "attacker-selected-key")
+    monkeypatch.setattr(cli, "_experimental_eligibility_policy", _policy)
     git_log = private / "git-log.jsonl"
     fake_git = private / "fake-git.py"
     fake_git.write_text(
@@ -577,6 +744,11 @@ def test_publish_cli_records_one_immutable_branch_without_protected_validation(
         "import json, os, subprocess, sys\n"
         "with open(os.environ['CARL_TEST_GIT_LOG'], 'a', encoding='utf-8') as handle:\n"
         "    handle.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+        "if 'remote' in sys.argv[1:] and 'get-url' in sys.argv[1:]:\n"
+        "    if sys.argv[-1] != 'origin':\n"
+        "        raise SystemExit(2)\n"
+        "    print(os.environ['CARL_TEST_EXPECTED_REMOTE_URL'])\n"
+        "    raise SystemExit(0)\n"
         "result = subprocess.run([os.environ['CARL_TEST_REAL_GIT'], *sys.argv[1:]])\n"
         "raise SystemExit(result.returncode)\n",
         encoding="utf-8",
@@ -609,21 +781,10 @@ def test_publish_cli_records_one_immutable_branch_without_protected_validation(
         "--public-result",
         os.fspath(result),
     ]
-    previous_log = os.environ.get("CARL_TEST_GIT_LOG")
-    previous_git = os.environ.get("CARL_TEST_REAL_GIT")
-    os.environ["CARL_TEST_GIT_LOG"] = os.fspath(git_log)
-    os.environ["CARL_TEST_REAL_GIT"] = "/usr/bin/git"
-    try:
-        assert cli.main(command) == 0
-    finally:
-        if previous_log is None:
-            os.environ.pop("CARL_TEST_GIT_LOG", None)
-        else:
-            os.environ["CARL_TEST_GIT_LOG"] = previous_log
-        if previous_git is None:
-            os.environ.pop("CARL_TEST_REAL_GIT", None)
-        else:
-            os.environ["CARL_TEST_REAL_GIT"] = previous_git
+    monkeypatch.setenv("CARL_TEST_GIT_LOG", os.fspath(git_log))
+    monkeypatch.setenv("CARL_TEST_REAL_GIT", "/usr/bin/git")
+    monkeypatch.setenv("CARL_TEST_EXPECTED_REMOTE_URL", CANONICAL_REMOTE_URL)
+    assert cli.main(command) == 0
 
     remote_experimental = subprocess.run(
         ("git", "ls-remote", "origin", f"refs/heads/experimental/{selected.experiment_id}"),
@@ -656,6 +817,9 @@ def test_publish_cli_records_one_immutable_branch_without_protected_validation(
     )
     assert all("--force" not in command for command in commands)
     assert all("main" not in command for command in commands)
+    assert any(
+        command[-5:] == ["remote", "get-url", "--push", "--all", "origin"] for command in commands
+    )
     assert (
         ExperimentLedger(ledger_path)
         .autonomy_projection(selected.experiment_id)
@@ -663,12 +827,20 @@ def test_publish_cli_records_one_immutable_branch_without_protected_validation(
         is None
     )
 
-    monkeypatch.delenv("CARL_EXPERIMENTAL_ELIGIBILITY_PUBLIC_KEY_PATH")
-    assert cli.main(command) == 2
-    monkeypatch.setenv("CARL_EXPERIMENTAL_ELIGIBILITY_PUBLIC_KEY_PATH", os.fspath(public_key_path))
-    monkeypatch.setenv("CARL_EXPERIMENTAL_ELIGIBILITY_KEY_ID", "untrusted-key")
-    assert cli.main(command) == 2
-    monkeypatch.setenv("CARL_EXPERIMENTAL_ELIGIBILITY_KEY_ID", ELIGIBILITY_KEY_ID)
+    forged_path = private / "forged-experimental-eligibility.json"
+    forged_path.write_text(
+        json.dumps(
+            _signed_eligibility(eligibility_request, private_key=attacker_key).to_canonical_dict()
+        ),
+        encoding="utf-8",
+    )
+    forged_command = list(command)
+    forged_command[forged_command.index("--eligibility-receipt") + 1] = os.fspath(forged_path)
+    assert cli.main(forged_command) == 2
+
+    alias_command = list(command)
+    alias_command[alias_command.index("--remote") + 1] = "attacker-origin"
+    assert cli.main(alias_command) == 2
 
     canonical = eligibility_path.read_text(encoding="utf-8")
     trust_override = signed_eligibility.to_canonical_dict()
@@ -688,6 +860,31 @@ def test_publish_cli_records_one_immutable_branch_without_protected_validation(
         invalid_command = list(command)
         invalid_command[receipt_index] = os.fspath(malformed)
         assert cli.main(invalid_command) == 2
+
+
+def test_remote_destination_rejects_multiple_push_urls(tmp_path: Path) -> None:
+    repository, _, _ = _repository(tmp_path)
+    subprocess.run(
+        ("git", "remote", "set-url", "--add", "--push", "origin", CANONICAL_REMOTE_URL),
+        cwd=repository,
+        check=True,
+    )
+    subprocess.run(
+        (
+            "git",
+            "remote",
+            "set-url",
+            "--add",
+            "--push",
+            "origin",
+            "https://github.com/attacker/carl-agent.git",
+        ),
+        cwd=repository,
+        check=True,
+    )
+
+    with pytest.raises(ValueError, match="remote destination is unavailable"):
+        cli._experimental_remote_destination(repository, "origin", Path("/usr/bin/git"))
 
 
 def test_create_only_push_never_fast_forwards_a_ref_created_after_the_snapshot(
@@ -728,6 +925,8 @@ def test_create_only_push_never_fast_forwards_a_ref_created_after_the_snapshot(
         candidate_tree=candidate_tree,
         request_id="publish-experimental-race-001",
         requested_at=REQUESTED_AT,
+        repository_id=REPOSITORY_ID,
+        remote_url=CANONICAL_REMOTE_URL,
     )
     eligibility = _signed_eligibility(request)
     ref = f"refs/heads/experimental/{selected.experiment_id}"

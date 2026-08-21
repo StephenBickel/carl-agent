@@ -3192,6 +3192,8 @@ def test_component_scenarios_cannot_self_issue_commissioning_pass(
         candidate_tree=disposable_git.valid_tree,
         request_id="publish-commissioning-001",
         requested_at="2026-08-19T12:00:00Z",
+        repository_id="StephenBickel/carl-agent",
+        remote_url="https://github.com/StephenBickel/carl-agent.git",
     )
     publication_eligibility = signed_experimental_eligibility(
         publication_request,

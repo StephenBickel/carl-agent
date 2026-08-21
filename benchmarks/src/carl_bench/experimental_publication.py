@@ -22,6 +22,8 @@ from carl_bench.capability_validation import (
     ExperimentalCheckResult,
     ExperimentalPublicationEligibility,
     experimental_publication_request_digest,
+    experimental_remote_url,
+    experimental_repository_id,
 )
 
 _OBJECT_ID_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
@@ -55,16 +57,21 @@ def _canonical_signature(value: object) -> bytes:
 
 
 @dataclass(frozen=True, slots=True)
-class ExperimentalEligibilityTrustedKey:
-    """Pinned public key for the protected experimental eligibility issuer."""
+class ExperimentalPublicationPolicy:
+    """Backend-owned trust root and exact Git destination for experimental publication."""
 
+    schema_version: int
     key_id: str
     public_key_pem: bytes
+    repository_id: str
+    remote_url: str
 
     def __init_subclass__(cls, **kwargs: object) -> None:
-        raise TypeError("ExperimentalEligibilityTrustedKey cannot be subclassed")
+        raise TypeError("ExperimentalPublicationPolicy cannot be subclassed")
 
     def __post_init__(self) -> None:
+        if self.schema_version != 1:
+            raise ExperimentalPublicationError("experimental_policy_schema_invalid")
         if not isinstance(self.key_id, str) or _KEY_ID_RE.fullmatch(self.key_id) is None:
             raise ExperimentalPublicationError("experimental_eligibility_key_id_invalid")
         if not isinstance(self.public_key_pem, bytes) or len(self.public_key_pem) > 16_384:
@@ -77,6 +84,11 @@ class ExperimentalEligibilityTrustedKey:
             ) from error
         if not isinstance(key, Ed25519PublicKey):
             raise ExperimentalPublicationError("experimental_eligibility_public_key_invalid")
+        try:
+            experimental_repository_id(self.repository_id)
+            experimental_remote_url(self.remote_url, self.repository_id)
+        except ValueError as error:
+            raise ExperimentalPublicationError(str(error)) from error
 
     @property
     def public_key(self) -> Ed25519PublicKey:
@@ -84,6 +96,41 @@ class ExperimentalEligibilityTrustedKey:
         if not isinstance(key, Ed25519PublicKey):  # pragma: no cover - constructor guards
             raise ExperimentalPublicationError("experimental_eligibility_public_key_invalid")
         return key
+
+    def to_canonical_dict(self) -> dict[str, Any]:
+        return {
+            "key_id": self.key_id,
+            "public_key_pem": self.public_key_pem.decode("ascii"),
+            "remote_url": self.remote_url,
+            "repository_id": self.repository_id,
+            "schema_version": self.schema_version,
+        }
+
+    @classmethod
+    def from_canonical_dict(cls, value: object) -> ExperimentalPublicationPolicy:
+        if type(value) is not dict or set(value) != {
+            "key_id",
+            "public_key_pem",
+            "remote_url",
+            "repository_id",
+            "schema_version",
+        }:
+            raise ExperimentalPublicationError("experimental_policy_keys_invalid")
+        public_key_pem = value["public_key_pem"]
+        if not isinstance(public_key_pem, str):
+            raise ExperimentalPublicationError("experimental_eligibility_public_key_invalid")
+        try:
+            return cls(
+                schema_version=value["schema_version"],
+                key_id=value["key_id"],
+                public_key_pem=public_key_pem.encode("ascii"),
+                repository_id=value["repository_id"],
+                remote_url=value["remote_url"],
+            )
+        except (TypeError, UnicodeEncodeError, ValueError) as error:
+            if isinstance(error, ExperimentalPublicationError):
+                raise
+            raise ExperimentalPublicationError("experimental_policy_invalid") from error
 
 
 @dataclass(frozen=True, slots=True)
@@ -150,7 +197,7 @@ class ExperimentalEligibilityVerifier:
     Hostile code already executing inside this trusted process is outside this object boundary.
     """
 
-    __slots__ = ("_clock", "_trusted_key")
+    __slots__ = ("_clock", "_policy")
 
     def __init_subclass__(cls, **kwargs: object) -> None:
         raise TypeError("ExperimentalEligibilityVerifier cannot be subclassed")
@@ -158,14 +205,14 @@ class ExperimentalEligibilityVerifier:
     def __init__(
         self,
         *,
-        trusted_key: ExperimentalEligibilityTrustedKey,
+        policy: ExperimentalPublicationPolicy,
         clock: Callable[[], datetime] = _utc_now,
     ) -> None:
-        if type(trusted_key) is not ExperimentalEligibilityTrustedKey:
-            raise ExperimentalPublicationError("experimental_eligibility_trusted_key_missing")
+        if type(policy) is not ExperimentalPublicationPolicy:
+            raise ExperimentalPublicationError("experimental_eligibility_policy_missing")
         if not callable(clock):
             raise ExperimentalPublicationError("experimental_eligibility_trusted_clock_missing")
-        object.__setattr__(self, "_trusted_key", trusted_key)
+        object.__setattr__(self, "_policy", policy)
         object.__setattr__(self, "_clock", clock)
 
     def __setattr__(self, name: str, value: object) -> None:
@@ -186,6 +233,14 @@ class ExperimentalEligibilityVerifier:
     def __reduce_ex__(self, protocol: int) -> object:
         raise TypeError("ExperimentalEligibilityVerifier cannot be copied or serialized")
 
+    @property
+    def repository_id(self) -> str:
+        return object.__getattribute__(self, "_policy").repository_id
+
+    @property
+    def remote_url(self) -> str:
+        return object.__getattribute__(self, "_policy").remote_url
+
     def require(
         self,
         envelope: SignedExperimentalPublicationEligibility,
@@ -197,11 +252,18 @@ class ExperimentalEligibilityVerifier:
         if type(envelope) is not SignedExperimentalPublicationEligibility:
             raise ExperimentalPublicationError("experimental_eligibility_envelope_invalid")
         receipt = envelope.receipt
-        trusted_key = object.__getattribute__(self, "_trusted_key")
-        if receipt.key_id != trusted_key.key_id:
+        policy = object.__getattribute__(self, "_policy")
+        if receipt.key_id != policy.key_id:
             raise ExperimentalPublicationError("experimental_eligibility_key_mismatch")
+        if (
+            request.repository_id != policy.repository_id
+            or request.remote_url != policy.remote_url
+            or receipt.repository_id != policy.repository_id
+            or receipt.remote_url != policy.remote_url
+        ):
+            raise ExperimentalPublicationError("experimental_eligibility_destination_mismatch")
         try:
-            trusted_key.public_key.verify(
+            policy.public_key.verify(
                 _canonical_signature(envelope.signature_base64),
                 SignedExperimentalPublicationEligibility.signing_payload(envelope),
             )
@@ -227,6 +289,15 @@ class ExperimentalPublicationRequest:
     candidate_tree: str
     request_id: str
     requested_at: str
+    repository_id: str
+    remote_url: str
+
+    def __post_init__(self) -> None:
+        try:
+            experimental_repository_id(self.repository_id)
+            experimental_remote_url(self.remote_url, self.repository_id)
+        except ValueError as error:
+            raise ExperimentalPublicationError(str(error)) from error
 
 
 @dataclass(frozen=True, slots=True)
@@ -319,6 +390,8 @@ def _eligible_for_request(
             candidate_packet_digest=packet.digest,
             candidate_commit=packet.candidate_commit,
             candidate_tree=request.candidate_tree,
+            repository_id=request.repository_id,
+            remote_url=request.remote_url,
         )
     except ValueError:
         return False
@@ -333,6 +406,8 @@ def _eligible_for_request(
         and receipt.candidate_packet_digest == packet.digest
         and receipt.candidate_commit == packet.candidate_commit
         and receipt.candidate_tree == request.candidate_tree
+        and receipt.repository_id == request.repository_id
+        and receipt.remote_url == request.remote_url
         and receipt.required_checks == checks
     )
 
