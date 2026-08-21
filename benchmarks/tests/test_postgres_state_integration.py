@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import time
@@ -672,6 +673,85 @@ def test_every_authorized_event_appends_through_real_history_and_replays(
         observed_types.add(event.event_type)
 
     assert observed_types == set(EventType)
+
+
+@pytest.mark.parametrize("mutation", ("extra", "missing_payload"))
+def test_noncanonical_event_envelope_does_not_mutate_chain(postgres: object, mutation: str) -> None:
+    manifest = sample_manifest()
+    event = ExperimentEvent.create(
+        experiment_id=manifest.experiment_id,
+        stage_attempt_id=f"invalid-envelope-{mutation}",
+        event_type=EventType.RETRY_SCHEDULED,
+        occurred_at=NOW,
+        payload=_retry_payload(attempt=1, scheduled_at=NOW, changed_action="canonical envelope"),
+    )
+    envelope = event.to_canonical_dict()
+    if mutation == "extra":
+        envelope["unexpected"] = True
+    else:
+        envelope.pop("payload")
+    event_json = _canonical(envelope)
+    event_digest = hashlib.sha256(event_json.encode("utf-8")).hexdigest()
+
+    with _as_role(postgres, "carl_builder") as builder:
+        _register_manifest(builder, manifest)
+    with _as_role(postgres, "carl_coordinator") as coordinator:
+        before = coordinator.execute(
+            "SELECT * FROM carl_autonomy.load_experiment_events(%s)",
+            (manifest.experiment_id,),
+        ).fetchall()
+        with pytest.raises(psycopg.Error):
+            coordinator.execute(
+                "SELECT * FROM carl_autonomy.append_event(%s, %s, %s, %s)",
+                (event_json, event_digest, event.payload_json, NOW),
+            ).fetchone()
+        after = coordinator.execute(
+            "SELECT * FROM carl_autonomy.load_experiment_events(%s)",
+            (manifest.experiment_id,),
+        ).fetchall()
+
+    assert after == before == []
+
+
+def test_equivalent_but_nonidentical_soak_timestamp_text_does_not_mutate_chain(
+    postgres: object,
+) -> None:
+    manifest = sample_manifest()
+    history = _full_event_history()
+    target_index = next(
+        index
+        for index, event in enumerate(history)
+        if event.stage_attempt_id == "parity-soak-failed"
+    )
+    with _as_role(postgres, "carl_builder") as builder:
+        _register_manifest(builder, manifest)
+    for event in history[:target_index]:
+        with _as_role(postgres, f"carl_{_event_authority(event)}") as connection:
+            _append_event(connection, event)
+
+    target = history[target_index]
+    mismatch = ExperimentEvent.create(
+        experiment_id=target.experiment_id,
+        stage_attempt_id="invalid-soak-timestamp-text",
+        event_type=target.event_type,
+        occurred_at="2026-08-11T12:01:00.1Z",
+        payload={**target.payload, "observed_at": "2026-08-11T12:01:00.10Z"},
+    )
+    with _as_role(postgres, "carl_coordinator") as reader:
+        before = reader.execute(
+            "SELECT * FROM carl_autonomy.load_experiment_events(%s)",
+            (manifest.experiment_id,),
+        ).fetchall()
+    with _as_role(postgres, "carl_soak") as soak, pytest.raises(psycopg.Error):
+        _append_event(soak, mismatch)
+    with _as_role(postgres, "carl_coordinator") as reader:
+        after = reader.execute(
+            "SELECT * FROM carl_autonomy.load_experiment_events(%s)",
+            (manifest.experiment_id,),
+        ).fetchall()
+
+    assert after == before
+    _backend(postgres).load_projection(manifest.experiment_id)
 
 
 @pytest.mark.parametrize("event_type", tuple(EventType))
@@ -1806,6 +1886,37 @@ def test_command_completion_and_event_append_are_atomic(postgres: object) -> Non
             event_capability=invalid_event_capability,
         )
     with _as_role(postgres, "carl_coordinator") as coordinator:
+        state = coordinator.execute(
+            "SELECT * FROM carl_autonomy.create_command(%s, %s)",
+            (_canonical(command.to_canonical_dict()), NOW),
+        ).fetchone()
+        events = coordinator.execute(
+            "SELECT * FROM carl_autonomy.load_experiment_events(%s)",
+            (manifest.experiment_id,),
+        ).fetchall()
+        assert (state["status"], state["revision"], state["applied"]) == (
+            "claimed",
+            8,
+            False,
+        )
+        assert events == []
+
+    malformed_envelope = valid_event.to_canonical_dict()
+    malformed_envelope["unexpected"] = True
+    malformed_event_json = _canonical(malformed_envelope)
+    malformed_event_digest = hashlib.sha256(malformed_event_json.encode("utf-8")).hexdigest()
+    with _as_role(postgres, "carl_coordinator") as coordinator:
+        with pytest.raises(psycopg.Error):
+            coordinator.execute(
+                "SELECT * FROM carl_autonomy.complete_command_and_append_event(%s, %s, %s, %s, %s)",
+                (
+                    _canonical(transition.to_canonical_dict()),
+                    malformed_event_json,
+                    malformed_event_digest,
+                    valid_event.payload_json,
+                    NOW,
+                ),
+            ).fetchone()
         state = coordinator.execute(
             "SELECT * FROM carl_autonomy.create_command(%s, %s)",
             (_canonical(command.to_canonical_dict()), NOW),

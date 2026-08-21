@@ -175,6 +175,65 @@ def test_sql_requires_canonical_utc_z_event_timestamps() -> None:
     )
 
 
+def test_append_and_atomic_event_ingress_require_exact_top_level_keys() -> None:
+    append = re.search(
+        r"FUNCTION\s+carl_autonomy\.append_event\(.*?"
+        r"AS\s+\$\$(?P<body>.*?)\$\$;",
+        ROLE_PROCEDURES_SQL,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    assert append is not None
+    body = append.group("body")
+    assert re.search(r"jsonb_object_length\(value\)\s*<>\s*6", body, re.I)
+    assert re.search(
+        r"value\s+\?&\s+ARRAY\[\s*'schema_version',\s*'experiment_id',\s*"
+        r"'stage_attempt_id',\s*'event_type',\s*'occurred_at',\s*'payload'\s*\]",
+        body,
+        re.I | re.S,
+    )
+    atomic = re.search(
+        r"FUNCTION\s+carl_autonomy\.complete_command_and_append_event\(.*?"
+        r"AS\s+\$\$(?P<body>.*?)\$\$;",
+        ROLE_PROCEDURES_SQL,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    assert atomic is not None
+    assert "carl_autonomy.append_event" in atomic.group("body")
+
+
+def test_reducer_timestamp_identity_uses_canonical_text_equality() -> None:
+    validator = re.search(
+        r"FUNCTION\s+carl_autonomy\.validate_and_advance_event.*?"
+        r"AS\s+\$\$(?P<body>.*?)\$\$;",
+        ROLE_PROCEDURES_SQL,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    assert validator is not None
+    body = validator.group("body")
+    soak = re.search(
+        r"WHEN\s+'soak_observed'\s+THEN(?P<body>.*?)WHEN\s+'revert_recorded'",
+        body,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    retry = re.search(
+        r"WHEN\s+'retry_scheduled'\s+THEN(?P<body>.*?)ELSE",
+        body,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    assert soak is not None
+    assert retry is not None
+    assert re.search(
+        r"p_payload->>'observed_at'\s+IS\s+DISTINCT\s+FROM\s+p_occurred_at_text",
+        soak.group("body"),
+        re.I,
+    )
+    assert re.search(
+        r"p_payload->>'scheduled_at'\s+IS\s+DISTINCT\s+FROM\s+p_occurred_at_text",
+        retry.group("body"),
+        re.I,
+    )
+
+
 def test_sql_draft_base_branch_matches_python_128_byte_bound() -> None:
     draft_shape = re.search(
         r"WHEN\s+'draft_pr_requested'\s+THEN(?P<body>.*?)"

@@ -1286,7 +1286,7 @@ BEGIN
                 ]
                 OR p_payload->>'evidence_digest' !~ '^[0-9a-f]{64}$'
                 OR p_payload->>'merge_commit' IS DISTINCT FROM guard.promotion_merge_commit
-                OR (p_payload->>'observed_at')::timestamptz <> p_occurred_at
+                OR p_payload->>'observed_at' IS DISTINCT FROM p_occurred_at_text
                 OR jsonb_typeof(p_payload->'healthy') <> 'boolean'
             THEN
                 RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'soak_prerequisite_missing';
@@ -1442,6 +1442,14 @@ BEGIN
     authority_name := carl_autonomy.role_authority(caller);
     value := carl_autonomy.parse_object(p_event_json, 'event_json_invalid');
     payload := carl_autonomy.parse_object(p_payload_json, 'event_payload_invalid');
+    IF jsonb_object_length(value) <> 6
+        OR NOT value ?& ARRAY[
+            'schema_version', 'experiment_id', 'stage_attempt_id',
+            'event_type', 'occurred_at', 'payload'
+        ]
+    THEN
+        RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'event_json_invalid';
+    END IF;
     IF carl_autonomy.sha256_text(p_event_json) <> p_event_digest
         OR value->'payload' <> payload
     THEN
