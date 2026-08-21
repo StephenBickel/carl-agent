@@ -43,7 +43,7 @@ _TRANSITION_STATUSES = frozenset({"completed", "failed"})
 _LEASE_AUTHORITIES = frozenset({"coordinator", "supervisor"})
 _EVIDENCE_PRODUCERS = frozenset({"validator", "observer"})
 _CAPABILITY_SCOPE_KINDS = frozenset(
-    {"command", "evidence", "event", "lease", "manifest", "supervisor_trigger"}
+    {"command", "evidence", "event", "health", "lease", "manifest", "supervisor_trigger"}
 )
 _CAPABILITY_ACTIONS = frozenset(
     {
@@ -56,6 +56,7 @@ _CAPABILITY_ACTIONS = frozenset(
         "fail_command",
         "reconcile_expired_claim",
         "reconcile_lease",
+        "record_health",
         "register_evidence",
         "register_manifest",
         "release_lease",
@@ -392,7 +393,13 @@ def _utc_now() -> datetime:
 
 
 class AuthorityVerifier:
-    """Controller-owned verifier for raw signed envelopes and its trusted clock."""
+    """Immutable controller-owned verifier for raw signed envelopes and trusted time.
+
+    Hostile arbitrary code already executing in the trusted controller process is outside this
+    boundary; Python reflection can bypass ordinary object access controls in that environment.
+    """
+
+    __slots__ = ("_authority_key", "_clock", "_dead_holder_key")
 
     def __init__(
         self,
@@ -411,9 +418,38 @@ class AuthorityVerifier:
             raise CloudStateError("trusted_authority_key_mismatch")
         if dead_holder_key.purpose != "dead_holder_observation":
             raise CloudStateError("trusted_authority_key_mismatch")
-        self._authority_key = authority_key
-        self._dead_holder_key = dead_holder_key
-        self._clock = clock
+        authority_key_bytes = authority_key.public_key.public_bytes(
+            serialization.Encoding.Raw, serialization.PublicFormat.Raw
+        )
+        dead_holder_key_bytes = dead_holder_key.public_key.public_bytes(
+            serialization.Encoding.Raw, serialization.PublicFormat.Raw
+        )
+        if (
+            authority_key.key_id == dead_holder_key.key_id
+            or authority_key_bytes == dead_holder_key_bytes
+        ):
+            raise CloudStateError("trusted_authority_keys_not_separated")
+        object.__setattr__(self, "_authority_key", authority_key)
+        object.__setattr__(self, "_dead_holder_key", dead_holder_key)
+        object.__setattr__(self, "_clock", clock)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise AttributeError("AuthorityVerifier is immutable")
+
+    def __delattr__(self, name: str) -> None:
+        raise AttributeError("AuthorityVerifier is immutable")
+
+    def __copy__(self) -> AuthorityVerifier:
+        raise TypeError("AuthorityVerifier cannot be copied or serialized")
+
+    def __deepcopy__(self, memo: object) -> AuthorityVerifier:
+        raise TypeError("AuthorityVerifier cannot be copied or serialized")
+
+    def __reduce__(self) -> object:
+        raise TypeError("AuthorityVerifier cannot be copied or serialized")
+
+    def __reduce_ex__(self, protocol: int) -> object:
+        raise TypeError("AuthorityVerifier cannot be copied or serialized")
 
     def _now(self) -> datetime:
         now = self._clock()
@@ -436,14 +472,36 @@ class AuthorityVerifier:
         scope_key: str,
         revision: int,
     ) -> None:
+        self._require_authority_at(
+            capability,
+            now=self._now(),
+            action=action,
+            authority=authority,
+            subject_id=subject_id,
+            scope_kind=scope_kind,
+            scope_key=scope_key,
+            revision=revision,
+        )
+
+    def _require_authority_at(
+        self,
+        capability: AuthorityCapability,
+        *,
+        now: datetime,
+        action: str,
+        authority: str,
+        subject_id: str,
+        scope_kind: str,
+        scope_key: str,
+        revision: int,
+    ) -> None:
         if not isinstance(capability, AuthorityCapability):
             raise CloudStateError("invalid_authority_capability")
-        now = self._now()
-        if not (
-            _timestamp("capability_issued_at", capability.issued_at)
-            <= now
-            <= _timestamp("capability_expires_at", capability.expires_at)
-        ):
+        issued = _timestamp("capability_issued_at", capability.issued_at)
+        expires = _timestamp("capability_expires_at", capability.expires_at)
+        if now < issued:
+            raise CloudStateError("authority_capability_not_yet_valid")
+        if now >= expires:
             raise CloudStateError("authority_capability_expired")
         _verify_signed(
             payload=capability.signing_payload(),
@@ -472,13 +530,35 @@ class AuthorityVerifier:
         scope_key: str,
         revision: int,
     ) -> DeadHolderObservation:
+        return self._require_dead_holder_at(
+            observation,
+            now=self._now(),
+            authority=authority,
+            subject_id=subject_id,
+            scope_kind=scope_kind,
+            scope_key=scope_key,
+            revision=revision,
+        )
+
+    def _require_dead_holder_at(
+        self,
+        observation: DeadHolderObservation,
+        *,
+        now: datetime,
+        authority: str,
+        subject_id: str,
+        scope_kind: str,
+        scope_key: str,
+        revision: int,
+    ) -> DeadHolderObservation:
         if not isinstance(observation, DeadHolderObservation):
             raise CloudStateError("invalid_dead_holder_observation")
-        now = self._now()
         issued = _timestamp("capability_issued_at", observation.issued_at)
         observed = _timestamp("dead_holder_observed_at", observation.observed_at)
         expires = _timestamp("capability_expires_at", observation.expires_at)
-        if not (issued <= observed <= now <= expires):
+        if now < issued or now < observed:
+            raise CloudStateError("dead_holder_observation_future")
+        if now >= expires:
             raise CloudStateError("dead_holder_observation_expired")
         if observation.live:
             raise CloudStateError("dead_holder_observation_live")
@@ -510,11 +590,13 @@ def _require_capability(
     scope_kind: str,
     scope_key: str,
     revision: int,
+    now: datetime,
 ) -> None:
-    if not isinstance(verifier, AuthorityVerifier):
+    if type(verifier) is not AuthorityVerifier:
         raise CloudStateError("authority_verifier_required")
-    verifier.require_authority(
+    verifier._require_authority_at(
         capability,
+        now=now,
         action=action,
         authority=authority,
         subject_id=subject_id,
@@ -533,17 +615,25 @@ def _require_dead_holder(
     scope_kind: str,
     scope_key: str,
     revision: int,
+    now: datetime,
 ) -> DeadHolderObservation:
-    if not isinstance(verifier, AuthorityVerifier):
+    if type(verifier) is not AuthorityVerifier:
         raise CloudStateError("authority_verifier_required")
-    return verifier.require_dead_holder(
+    return verifier._require_dead_holder_at(
         dead_holder,
+        now=now,
         authority=authority,
         subject_id=subject_id,
         scope_kind=scope_kind,
         scope_key=scope_key,
         revision=revision,
     )
+
+
+def _mutation_time(verifier: AuthorityVerifier) -> datetime:
+    if type(verifier) is not AuthorityVerifier:
+        raise CloudStateError("authority_verifier_required")
+    return verifier._now()
 
 
 def _effect_key(*, command_key: str, authority: str, operation: str, request_digest: str) -> str:
@@ -1047,6 +1137,7 @@ def authorize_evidence(
     """Require a signed, scope-bound authority capability before evidence is persisted."""
     if not isinstance(evidence, EvidenceObject):
         raise CloudStateError("invalid_evidence_object")
+    observed = _mutation_time(verifier)
     _require_capability(
         verifier,
         capability,
@@ -1056,6 +1147,7 @@ def authorize_evidence(
         scope_kind="evidence",
         scope_key=evidence.object_key,
         revision=0,
+        now=observed,
     )
     return evidence
 
@@ -1145,6 +1237,7 @@ def claim_command(
         raise CloudStateError("claim_command_mismatch")
     if state.command.authority != claim.authority:
         raise CloudStateError("command_authority_denied")
+    observed = _mutation_time(verifier)
     _require_capability(
         verifier,
         capability,
@@ -1154,8 +1247,9 @@ def claim_command(
         scope_kind="command",
         scope_key=state.command.command_key,
         revision=state.revision,
+        now=observed,
     )
-    if verifier.now() >= _timestamp("claim_expires_at", claim.expires_at):
+    if observed >= _timestamp("claim_expires_at", claim.expires_at):
         raise CloudStateError("command_claim_expired")
     if state.status == "claimed" and state.claim == claim:
         return state
@@ -1187,6 +1281,7 @@ def _terminal_successor(
         raise CloudStateError("invalid_state_transition")
     if transition.status != expected_status:
         raise CloudStateError("transition_status_mismatch")
+    observed = _mutation_time(verifier)
     if state.status == expected_status:
         _require_capability(
             verifier,
@@ -1197,8 +1292,9 @@ def _terminal_successor(
             scope_kind="command",
             scope_key=state.command.command_key,
             revision=transition.expected_revision,
+            now=observed,
         )
-        if state.claim is not None and verifier.now() >= _timestamp(
+        if state.claim is not None and observed >= _timestamp(
             "claim_expires_at", state.claim.expires_at
         ):
             raise CloudStateError("command_claim_expired")
@@ -1228,8 +1324,9 @@ def _terminal_successor(
         scope_kind="command",
         scope_key=state.command.command_key,
         revision=transition.expected_revision,
+        now=observed,
     )
-    if state.claim is not None and verifier.now() >= _timestamp(
+    if state.claim is not None and observed >= _timestamp(
         "claim_expires_at", state.claim.expires_at
     ):
         raise CloudStateError("command_claim_expired")
@@ -1294,6 +1391,7 @@ def reconcile_expired_claim(
         raise CloudStateError("claim_reconciliation_mismatch")
     if reconciliation.expected_revision != state.revision:
         raise CloudStateError("command_cas_mismatch")
+    observed = _mutation_time(verifier)
     _require_capability(
         verifier,
         capability,
@@ -1303,8 +1401,9 @@ def reconcile_expired_claim(
         scope_kind="command",
         scope_key=state.command.command_key,
         revision=reconciliation.expected_revision,
+        now=observed,
     )
-    if verifier.now() < _timestamp("claim_expires_at", state.claim.expires_at):
+    if observed < _timestamp("claim_expires_at", state.claim.expires_at):
         raise CloudStateError("command_claim_active")
     _require_dead_holder(
         verifier,
@@ -1314,6 +1413,7 @@ def reconcile_expired_claim(
         scope_kind="command",
         scope_key=state.command.command_key,
         revision=reconciliation.expected_revision,
+        now=observed,
     )
     if reconciliation.observed_at != dead_holder.observed_at:
         raise CloudStateError("dead_holder_observation_mismatch")
@@ -1347,7 +1447,7 @@ def acquire_lease(
         desired, CloudLease
     ):
         raise CloudStateError("invalid_cloud_lease")
-    observed = verifier.now()
+    observed = _mutation_time(verifier)
     _require_capability(
         verifier,
         capability,
@@ -1357,6 +1457,7 @@ def acquire_lease(
         scope_kind="lease",
         scope_key=desired.lease_key,
         revision=desired.revision,
+        now=observed,
     )
     if _timestamp("lease_desired_acquired_at", desired.acquired_at) < observed:
         raise CloudStateError("lease_acquisition_precedes_observation")
@@ -1405,6 +1506,7 @@ def reconcile_lease(
         raise CloudStateError("lease_reconciliation_mismatch")
     if reconciliation.expected_revision != lease.revision:
         raise CloudStateError("lease_cas_mismatch")
+    observed = _mutation_time(verifier)
     _require_capability(
         verifier,
         capability,
@@ -1414,8 +1516,9 @@ def reconcile_lease(
         scope_kind="lease",
         scope_key=lease.lease_key,
         revision=reconciliation.expected_revision,
+        now=observed,
     )
-    if verifier.now() < _timestamp("lease_expires_at", lease.expires_at):
+    if observed < _timestamp("lease_expires_at", lease.expires_at):
         raise CloudStateError("lease_active")
     observation = _require_dead_holder(
         verifier,
@@ -1425,6 +1528,7 @@ def reconcile_lease(
         scope_kind="lease",
         scope_key=lease.lease_key,
         revision=reconciliation.expected_revision,
+        now=observed,
     )
     if reconciliation.observed_at != observation.observed_at:
         raise CloudStateError("dead_holder_observation_mismatch")
@@ -1458,6 +1562,7 @@ def release_lease(
         raise CloudStateError("lease_release_mismatch")
     if release.expected_revision != lease.revision:
         raise CloudStateError("lease_cas_mismatch")
+    observed = _mutation_time(verifier)
     _require_capability(
         verifier,
         capability,
@@ -1467,6 +1572,7 @@ def release_lease(
         scope_kind="lease",
         scope_key=lease.lease_key,
         revision=release.expected_revision,
+        now=observed,
     )
     if lease.status == "reconciled":
         if release.observation_digest != lease.reconciliation_observation_digest:
@@ -1487,13 +1593,24 @@ def release_lease(
 
 
 class StateBackend(Protocol):
-    """Transactional persistence boundary implemented by the cloud state adapter."""
+    """Transactional adapter boundary that owns one immutable authority verifier.
+
+    Every mutation accepts its raw signed capability and verifies the action matching the method
+    name, except ``record_health`` which uses that same explicit action. Reconciliations also
+    verify the raw dead-holder observation with the backend-owned verifier.
+    """
+
+    def __init__(self, *, verifier: AuthorityVerifier) -> None:
+        """Retain the controller-owned verifier for the backend instance's lifetime."""
+        ...
+
+    @property
+    def verifier(self) -> AuthorityVerifier: ...
 
     def register_manifest(
         self,
         manifest: ExperimentManifest,
         *,
-        verifier: AuthorityVerifier,
         capability: AuthorityCapability,
     ) -> bool: ...
 
@@ -1501,23 +1618,21 @@ class StateBackend(Protocol):
         self,
         event: ExperimentEvent,
         *,
-        verifier: AuthorityVerifier,
         capability: AuthorityCapability,
     ) -> AppendResult: ...
 
     def create_command(
-        self, command: CloudCommand, *, verifier: AuthorityVerifier, capability: AuthorityCapability
+        self, command: CloudCommand, *, capability: AuthorityCapability
     ) -> CommandMutation: ...
 
     def claim_command(
-        self, claim: CommandClaim, *, verifier: AuthorityVerifier, capability: AuthorityCapability
+        self, claim: CommandClaim, *, capability: AuthorityCapability
     ) -> CommandMutation: ...
 
     def complete_command(
         self,
         transition: StateTransition,
         *,
-        verifier: AuthorityVerifier,
         capability: AuthorityCapability,
     ) -> CommandMutation: ...
 
@@ -1525,7 +1640,6 @@ class StateBackend(Protocol):
         self,
         transition: StateTransition,
         *,
-        verifier: AuthorityVerifier,
         capability: AuthorityCapability,
     ) -> CommandMutation: ...
 
@@ -1533,26 +1647,24 @@ class StateBackend(Protocol):
         self,
         reconciliation: ClaimReconciliation,
         *,
-        verifier: AuthorityVerifier,
         capability: AuthorityCapability,
         dead_holder: DeadHolderObservation,
     ) -> CommandMutation: ...
 
     def acquire_lease(
-        self, desired: CloudLease, *, verifier: AuthorityVerifier, capability: AuthorityCapability
+        self, desired: CloudLease, *, capability: AuthorityCapability
     ) -> LeaseMutation: ...
 
     def reconcile_lease(
         self,
         reconciliation: LeaseReconciliation,
         *,
-        verifier: AuthorityVerifier,
         capability: AuthorityCapability,
         dead_holder: DeadHolderObservation,
     ) -> LeaseMutation: ...
 
     def release_lease(
-        self, release: LeaseRelease, *, verifier: AuthorityVerifier, capability: AuthorityCapability
+        self, release: LeaseRelease, *, capability: AuthorityCapability
     ) -> LeaseMutation: ...
 
     def claim_supervisor_trigger(
@@ -1561,7 +1673,6 @@ class StateBackend(Protocol):
         trigger_id: str,
         claim_id: str,
         expected_revision: int,
-        verifier: AuthorityVerifier,
         capability: AuthorityCapability,
     ) -> TriggerMutation: ...
 
@@ -1572,7 +1683,6 @@ class StateBackend(Protocol):
         claim_id: str,
         expected_revision: int,
         resolution: TriggerResolution,
-        verifier: AuthorityVerifier,
         capability: AuthorityCapability,
     ) -> TriggerMutation: ...
 
@@ -1584,7 +1694,13 @@ class StateBackend(Protocol):
         self,
         evidence: EvidenceObject,
         *,
-        verifier: AuthorityVerifier,
+        capability: AuthorityCapability,
+    ) -> bool: ...
+
+    def record_health(
+        self,
+        snapshot: HealthSnapshot,
+        *,
         capability: AuthorityCapability,
     ) -> bool: ...
 
