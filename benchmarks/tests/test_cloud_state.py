@@ -1344,10 +1344,6 @@ def test_every_backend_mutation_has_an_exact_action_and_scope_binding(
 
 
 class _FakeStateBackend(StateBackend):
-    def __init__(self, *, verifier: AuthorityVerifier) -> None:
-        self.hook_calls: list[str] = []
-        super().__init__(verifier=verifier)
-
     def _record(self, name: str) -> str:
         self.hook_calls.append(name)
         return name
@@ -1405,6 +1401,7 @@ class _FakeStateBackend(StateBackend):
 
 def test_state_backend_wrappers_enforce_exact_actions_before_storage_hooks() -> None:
     backend = _FakeStateBackend(verifier=_VERIFIER)
+    backend.hook_calls = []
     command = _command()
     claim = _claim()
     transition = _complete_transition()
@@ -1650,3 +1647,33 @@ def test_state_backend_rejects_public_mutation_overrides() -> None:
         class UnsafeBackend(_FakeStateBackend):
             def claim_command(self, claim, *, capability):
                 return self._claim_command(claim, observed_at=_fixed_clock())
+
+
+@pytest.mark.parametrize(
+    ("member_name", "replacement"),
+    (
+        ("_authorize", lambda self, *args, **kwargs: None),
+        ("__init__", lambda self, **kwargs: None),
+        ("__setattr__", object.__setattr__),
+        ("__delattr__", object.__delattr__),
+        ("__getattribute__", object.__getattribute__),
+        ("__init_subclass__", classmethod(lambda cls, **kwargs: None)),
+        ("verifier", property(lambda self: _VERIFIER)),
+        ("_verifier", property(lambda self: _VERIFIER)),
+        ("_StateBackend__verifier", property(lambda self: _VERIFIER)),
+    ),
+)
+def test_state_backend_rejects_enforcement_boundary_overrides(
+    member_name: str, replacement: object
+) -> None:
+    with pytest.raises(TypeError, match="cannot override backend enforcement"):
+        type("UnsafeBackend", (_FakeStateBackend,), {member_name: replacement})
+
+
+def test_state_backend_rejects_inherited_enforcement_bypass_ahead_of_boundary() -> None:
+    class AuthorizationBypassMixin:
+        def _authorize(self, *args, **kwargs):
+            return None
+
+    with pytest.raises(TypeError, match="cannot override backend enforcement"):
+        type("UnsafeBackend", (AuthorizationBypassMixin, _FakeStateBackend), {})

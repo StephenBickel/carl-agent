@@ -1611,6 +1611,26 @@ _BACKEND_MUTATIONS = frozenset(
         "record_health",
     }
 )
+_BACKEND_ENFORCEMENT_MEMBERS = frozenset(
+    {
+        "_StateBackend__verifier",
+        "_authorize",
+        "_verifier",
+        "__delattr__",
+        "__getattribute__",
+        "__init__",
+        "__init_subclass__",
+        "__setattr__",
+        "verifier",
+    }
+)
+
+
+def _backend_verifier(backend: StateBackend) -> AuthorityVerifier:
+    verifier = object.__getattribute__(backend, "_StateBackend__verifier")
+    if type(verifier) is not AuthorityVerifier:
+        raise CloudStateError("authority_verifier_required")
+    return verifier
 
 
 class StateBackend(ABC):
@@ -1622,28 +1642,43 @@ class StateBackend(ABC):
     outside this ordinary Python object boundary.
     """
 
-    __slots__ = ("_verifier",)
+    __slots__ = ("__verifier",)
 
     def __init_subclass__(cls, **kwargs: object) -> None:
         super().__init_subclass__(**kwargs)
-        overridden = _BACKEND_MUTATIONS.intersection(cls.__dict__)
-        if overridden:
-            names = ", ".join(sorted(overridden))
+        boundary_index = cls.__mro__.index(StateBackend)
+        adapter_layers = cls.__mro__[:boundary_index]
+        mutation_overrides = frozenset().union(
+            *(_BACKEND_MUTATIONS.intersection(layer.__dict__) for layer in adapter_layers)
+        )
+        if mutation_overrides:
+            names = ", ".join(sorted(mutation_overrides))
             raise TypeError(f"cannot override authorized mutation: {names}")
+        enforcement_overrides = frozenset().union(
+            *(_BACKEND_ENFORCEMENT_MEMBERS.intersection(layer.__dict__) for layer in adapter_layers)
+        )
+        if enforcement_overrides:
+            names = ", ".join(sorted(enforcement_overrides))
+            raise TypeError(f"cannot override backend enforcement: {names}")
 
     def __init__(self, *, verifier: AuthorityVerifier) -> None:
         if type(verifier) is not AuthorityVerifier:
             raise CloudStateError("authority_verifier_required")
-        object.__setattr__(self, "_verifier", verifier)
+        object.__setattr__(self, "_StateBackend__verifier", verifier)
 
     def __setattr__(self, name: str, value: object) -> None:
-        if name == "_verifier" and hasattr(self, "_verifier"):
+        if name in {"_StateBackend__verifier", "_verifier", "verifier"}:
             raise AttributeError("StateBackend verifier is immutable")
         object.__setattr__(self, name, value)
 
+    def __delattr__(self, name: str) -> None:
+        if name in {"_StateBackend__verifier", "_verifier", "verifier"}:
+            raise AttributeError("StateBackend verifier is immutable")
+        object.__delattr__(self, name)
+
     @property
     def verifier(self) -> AuthorityVerifier:
-        return self._verifier
+        return _backend_verifier(self)
 
     def _authorize(
         self,
@@ -1658,7 +1693,7 @@ class StateBackend(ABC):
         now: datetime,
     ) -> None:
         _require_capability(
-            self._verifier,
+            _backend_verifier(self),
             capability,
             action=action,
             authority=authority,
@@ -1673,8 +1708,9 @@ class StateBackend(ABC):
     def register_manifest(
         self, manifest: ExperimentManifest, *, capability: AuthorityCapability
     ) -> bool:
-        now = _mutation_time(self._verifier)
-        self._authorize(
+        now = _mutation_time(_backend_verifier(self))
+        StateBackend._authorize(
+            self,
             capability,
             action="register_manifest",
             authority="builder",
@@ -1692,8 +1728,9 @@ class StateBackend(ABC):
     ) -> AppendResult:
         if not isinstance(capability, AuthorityCapability):
             raise CloudStateError("invalid_authority_capability")
-        now = _mutation_time(self._verifier)
-        self._authorize(
+        now = _mutation_time(_backend_verifier(self))
+        StateBackend._authorize(
+            self,
             capability,
             action="append_event",
             authority=capability.authority,
@@ -1709,8 +1746,9 @@ class StateBackend(ABC):
     def create_command(
         self, command: CloudCommand, *, capability: AuthorityCapability
     ) -> CommandMutation:
-        now = _mutation_time(self._verifier)
-        self._authorize(
+        now = _mutation_time(_backend_verifier(self))
+        StateBackend._authorize(
+            self,
             capability,
             action="create_command",
             authority=command.authority,
@@ -1726,8 +1764,9 @@ class StateBackend(ABC):
     def claim_command(
         self, claim: CommandClaim, *, capability: AuthorityCapability
     ) -> CommandMutation:
-        now = _mutation_time(self._verifier)
-        self._authorize(
+        now = _mutation_time(_backend_verifier(self))
+        StateBackend._authorize(
+            self,
             capability,
             action="claim_command",
             authority=claim.authority,
@@ -1743,8 +1782,9 @@ class StateBackend(ABC):
     def complete_command(
         self, transition: StateTransition, *, capability: AuthorityCapability
     ) -> CommandMutation:
-        now = _mutation_time(self._verifier)
-        self._authorize(
+        now = _mutation_time(_backend_verifier(self))
+        StateBackend._authorize(
+            self,
             capability,
             action="complete_command",
             authority=transition.authority,
@@ -1760,8 +1800,9 @@ class StateBackend(ABC):
     def fail_command(
         self, transition: StateTransition, *, capability: AuthorityCapability
     ) -> CommandMutation:
-        now = _mutation_time(self._verifier)
-        self._authorize(
+        now = _mutation_time(_backend_verifier(self))
+        StateBackend._authorize(
+            self,
             capability,
             action="fail_command",
             authority=transition.authority,
@@ -1781,8 +1822,9 @@ class StateBackend(ABC):
         capability: AuthorityCapability,
         dead_holder: DeadHolderObservation,
     ) -> CommandMutation:
-        now = _mutation_time(self._verifier)
-        self._authorize(
+        now = _mutation_time(_backend_verifier(self))
+        StateBackend._authorize(
+            self,
             capability,
             action="reconcile_expired_claim",
             authority=reconciliation.authority,
@@ -1793,7 +1835,7 @@ class StateBackend(ABC):
             now=now,
         )
         observation = _require_dead_holder(
-            self._verifier,
+            _backend_verifier(self),
             dead_holder,
             authority=reconciliation.authority,
             subject_id=reconciliation.claim_id,
@@ -1812,8 +1854,9 @@ class StateBackend(ABC):
     def acquire_lease(
         self, desired: CloudLease, *, capability: AuthorityCapability
     ) -> LeaseMutation:
-        now = _mutation_time(self._verifier)
-        self._authorize(
+        now = _mutation_time(_backend_verifier(self))
+        StateBackend._authorize(
+            self,
             capability,
             action="acquire_lease",
             authority=desired.authority,
@@ -1833,8 +1876,9 @@ class StateBackend(ABC):
         capability: AuthorityCapability,
         dead_holder: DeadHolderObservation,
     ) -> LeaseMutation:
-        now = _mutation_time(self._verifier)
-        self._authorize(
+        now = _mutation_time(_backend_verifier(self))
+        StateBackend._authorize(
+            self,
             capability,
             action="reconcile_lease",
             authority=reconciliation.authority,
@@ -1845,7 +1889,7 @@ class StateBackend(ABC):
             now=now,
         )
         observation = _require_dead_holder(
-            self._verifier,
+            _backend_verifier(self),
             dead_holder,
             authority=reconciliation.authority,
             subject_id=reconciliation.holder_id,
@@ -1862,8 +1906,9 @@ class StateBackend(ABC):
     def release_lease(
         self, release: LeaseRelease, *, capability: AuthorityCapability
     ) -> LeaseMutation:
-        now = _mutation_time(self._verifier)
-        self._authorize(
+        now = _mutation_time(_backend_verifier(self))
+        StateBackend._authorize(
+            self,
             capability,
             action="release_lease",
             authority=release.authority,
@@ -1884,8 +1929,9 @@ class StateBackend(ABC):
         expected_revision: int,
         capability: AuthorityCapability,
     ) -> TriggerMutation:
-        now = _mutation_time(self._verifier)
-        self._authorize(
+        now = _mutation_time(_backend_verifier(self))
+        StateBackend._authorize(
+            self,
             capability,
             action="claim_supervisor_trigger",
             authority="supervisor",
@@ -1912,8 +1958,9 @@ class StateBackend(ABC):
         resolution: TriggerResolution,
         capability: AuthorityCapability,
     ) -> TriggerMutation:
-        now = _mutation_time(self._verifier)
-        self._authorize(
+        now = _mutation_time(_backend_verifier(self))
+        StateBackend._authorize(
+            self,
             capability,
             action="resolve_supervisor_trigger",
             authority="supervisor",
@@ -1935,8 +1982,9 @@ class StateBackend(ABC):
     def register_evidence(
         self, evidence: EvidenceObject, *, capability: AuthorityCapability
     ) -> bool:
-        now = _mutation_time(self._verifier)
-        self._authorize(
+        now = _mutation_time(_backend_verifier(self))
+        StateBackend._authorize(
+            self,
             capability,
             action="register_evidence",
             authority=evidence.producer,
@@ -1950,8 +1998,9 @@ class StateBackend(ABC):
 
     @final
     def record_health(self, snapshot: HealthSnapshot, *, capability: AuthorityCapability) -> bool:
-        now = _mutation_time(self._verifier)
-        self._authorize(
+        now = _mutation_time(_backend_verifier(self))
+        StateBackend._authorize(
+            self,
             capability,
             action="record_health",
             authority="observer",
