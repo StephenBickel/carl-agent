@@ -5,6 +5,7 @@ import json
 import os
 import time
 from contextlib import contextmanager
+from copy import deepcopy
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -14,7 +15,7 @@ import psycopg
 import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-from postgres_event_policy import EVENT_PAYLOAD_KEY_SETS
+from postgres_event_policy import EVENT_PAYLOAD_KEY_SETS, INVALID_EVENT_PAYLOAD_TYPES
 from test_experiment import (
     candidate_artifact,
     paired_evidence,
@@ -717,6 +718,58 @@ def test_invalid_payload_for_each_authorized_event_does_not_mutate_chain(
     _backend(postgres).load_projection(manifest.experiment_id)
 
 
+@pytest.mark.parametrize(("event_type", "path", "invalid_value"), INVALID_EVENT_PAYLOAD_TYPES)
+def test_reducer_invalid_payload_types_do_not_mutate_live_chain(
+    postgres: object,
+    event_type: EventType,
+    path: tuple[str | int, ...],
+    invalid_value: Any,
+) -> None:
+    manifest = sample_manifest()
+    history = _full_event_history()
+    target_index = next(
+        index for index, event in enumerate(history) if event.event_type is event_type
+    )
+    with _as_role(postgres, "carl_builder") as builder:
+        _register_manifest(builder, manifest)
+    for event in history[:target_index]:
+        with _as_role(postgres, f"carl_{_event_authority(event)}") as connection:
+            _append_event(connection, event)
+
+    target = history[target_index]
+    invalid_payload = deepcopy(target.payload)
+    destination: Any = invalid_payload
+    for key in path[:-1]:
+        destination = destination[key]
+        assert isinstance(destination, dict | list)
+    destination[path[-1]] = invalid_value
+    invalid = ExperimentEvent.create(
+        experiment_id=target.experiment_id,
+        stage_attempt_id=f"invalid-type-{event_type.value}",
+        event_type=event_type,
+        occurred_at=target.occurred_at,
+        payload=invalid_payload,
+    )
+    with _as_role(postgres, "carl_coordinator") as reader:
+        before = reader.execute(
+            "SELECT * FROM carl_autonomy.load_experiment_events(%s)",
+            (manifest.experiment_id,),
+        ).fetchall()
+    with (
+        _as_role(postgres, f"carl_{_event_authority(target)}") as connection,
+        pytest.raises(psycopg.Error),
+    ):
+        _append_event(connection, invalid)
+    with _as_role(postgres, "carl_coordinator") as reader:
+        after = reader.execute(
+            "SELECT * FROM carl_autonomy.load_experiment_events(%s)",
+            (manifest.experiment_id,),
+        ).fetchall()
+
+    assert after == before
+    _backend(postgres).load_projection(manifest.experiment_id)
+
+
 @pytest.mark.parametrize(
     ("event_type", "field", "value"),
     (
@@ -766,6 +819,65 @@ def test_candidate_publication_identity_mismatch_does_not_mutate_chain(
 
     assert after == before
     _backend(postgres).load_projection(manifest.experiment_id)
+
+
+def test_canonical_candidate_digest_seals_publishes_and_replays(postgres: object) -> None:
+    manifest = sample_manifest()
+    candidate = sealed_candidate()
+    history = _full_event_history()
+    publication_index = next(
+        index
+        for index, event in enumerate(history)
+        if event.event_type is EventType.EXPERIMENTAL_PUBLISHED
+    )
+    with _as_role(postgres, "carl_builder") as builder:
+        _register_manifest(builder, manifest)
+    for event in history[:publication_index]:
+        with _as_role(postgres, f"carl_{_event_authority(event)}") as connection:
+            _append_event(connection, event)
+
+    with _as_role(postgres, "carl_coordinator") as reader:
+        guard = reader.execute(
+            "SELECT candidate_packet_digest FROM "
+            "carl_autonomy.experiment_projection_guards WHERE experiment_id = %s",
+            (manifest.experiment_id,),
+        ).fetchone()
+        before = reader.execute(
+            "SELECT * FROM carl_autonomy.load_experiment_events(%s)",
+            (manifest.experiment_id,),
+        ).fetchall()
+    assert candidate.digest == "278d2d94d70cd9d1e54baed3fdbe617e4a88aaee0ac93dbb5e4895cbd9bd3b54"
+    assert guard["candidate_packet_digest"] == candidate.digest
+
+    publication = history[publication_index]
+    mismatch = ExperimentEvent.create(
+        experiment_id=publication.experiment_id,
+        stage_attempt_id="candidate-envelope-digest-mismatch",
+        event_type=EventType.EXPERIMENTAL_PUBLISHED,
+        occurred_at=publication.occurred_at,
+        payload={
+            **publication.payload,
+            "candidate_packet_digest": (
+                "63451549980c44835ba0879b978e928bf7e5225887b5856e2fcc28a13839ed31"
+            ),
+        },
+    )
+    with _as_role(postgres, "carl_builder") as builder, pytest.raises(psycopg.Error):
+        _append_event(builder, mismatch)
+    with _as_role(postgres, "carl_coordinator") as reader:
+        after_rejection = reader.execute(
+            "SELECT * FROM carl_autonomy.load_experiment_events(%s)",
+            (manifest.experiment_id,),
+        ).fetchall()
+    assert after_rejection == before
+
+    with _as_role(postgres, "carl_builder") as builder:
+        assert _append_event(builder, publication)["appended"] is True
+    projection, autonomy = _backend(postgres).load_projection(manifest.experiment_id)
+    assert projection.candidate is not None
+    assert projection.candidate.digest == candidate.digest
+    assert autonomy.experimental_publication is not None
+    assert autonomy.experimental_publication.candidate_packet_digest == candidate.digest
 
 
 def test_retry_sequence_rejects_nonfirst_skipped_and_repeated_attempts(postgres: object) -> None:

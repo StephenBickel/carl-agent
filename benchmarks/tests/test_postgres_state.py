@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import base64
+import hashlib
+import json
 import re
 from contextlib import AbstractContextManager
 from dataclasses import replace
@@ -11,8 +13,15 @@ from typing import Any
 import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-from postgres_event_policy import EVENT_PAYLOAD_KEY_SETS
+from postgres_event_policy import (
+    EVENT_BOOLEAN_FIELDS,
+    EVENT_INTEGER_FIELDS,
+    EVENT_PAYLOAD_KEY_SETS,
+    EVENT_STRING_FIELDS,
+    INVALID_EVENT_PAYLOAD_TYPES,
+)
 from test_experiment import manifest as sample_manifest
+from test_experiment import sealed_candidate
 
 from carl_bench.canonical import canonical_json_bytes
 from carl_bench.cloud_state import (
@@ -79,6 +88,15 @@ EVENT_POLICY_CASES = (
     (EventType.SOAK_OBSERVED, frozenset({"soak"}), "case"),
     (EventType.REVERT_RECORDED, frozenset({"soak"}), "case"),
 )
+
+
+def test_shared_event_policy_keys_equal_production_event_type() -> None:
+    production = set(EventType)
+
+    assert set(EVENT_PAYLOAD_KEY_SETS) == production
+    assert set(EVENT_STRING_FIELDS) == production
+    assert {event_type for event_type, _path, _value in INVALID_EVENT_PAYLOAD_TYPES} == production
+
 
 AUTHORITY_PRIVATE = Ed25519PrivateKey.generate()
 LIVENESS_PRIVATE = Ed25519PrivateKey.generate()
@@ -252,9 +270,16 @@ def test_sql_grants_no_state_procedure_execution_to_workflow_roles() -> None:
 
 
 def test_sql_binds_experimental_publication_branch_to_experiment() -> None:
+    validator = re.search(
+        r"FUNCTION\s+carl_autonomy\.validate_and_advance_event.*?"
+        r"AS\s+\$\$(?P<body>.*?)\$\$;",
+        ROLE_PROCEDURES_SQL,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    assert validator is not None
     branch = re.search(
         r"WHEN\s+'experimental_published'\s+THEN(?P<body>.*?)WHEN\s+'promotion_recorded'",
-        ROLE_PROCEDURES_SQL,
+        validator.group("body"),
         flags=re.IGNORECASE | re.DOTALL,
     )
 
@@ -355,26 +380,38 @@ def test_sql_binds_experimental_publication_to_sealed_candidate_guard() -> None:
     assert re.search(r"candidate_packet_digest\s+character\(64\)", INITIAL_SQL, flags=re.IGNORECASE)
     assert re.search(r"candidate_commit\s+varchar\(64\)", INITIAL_SQL, flags=re.IGNORECASE)
 
+    validator = re.search(
+        r"FUNCTION\s+carl_autonomy\.validate_and_advance_event.*?"
+        r"AS\s+\$\$(?P<body>.*?)\$\$;",
+        ROLE_PROCEDURES_SQL,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    assert validator is not None
     sealed = re.search(
         r"WHEN\s+'candidate_sealed'\s+THEN(?P<body>.*?)"
         r"WHEN\s+'paired_evidence_recorded'",
-        ROLE_PROCEDURES_SQL,
+        validator.group("body"),
         flags=re.IGNORECASE | re.DOTALL,
     )
     publication = re.search(
         r"WHEN\s+'experimental_published'\s+THEN(?P<body>.*?)"
         r"WHEN\s+'promotion_recorded'",
-        ROLE_PROCEDURES_SQL,
+        validator.group("body"),
         flags=re.IGNORECASE | re.DOTALL,
     )
     protected = re.search(
         r"WHEN\s+'protected_validation_recorded'\s+THEN(?P<body>.*?)"
         r"WHEN\s+'review_packet_recorded'",
-        ROLE_PROCEDURES_SQL,
+        validator.group("body"),
         flags=re.IGNORECASE | re.DOTALL,
     )
     assert sealed is not None and publication is not None and protected is not None
-    assert re.search(r"candidate_packet_digest\s*=\s*p_payload_digest", sealed.group("body"), re.I)
+    assert re.search(
+        r"candidate_packet_digest\s*=\s*"
+        r"carl_autonomy\.candidate_payload_digest\(p_payload\)",
+        sealed.group("body"),
+        re.I,
+    )
     assert re.search(
         r"candidate_commit\s*=\s*p_payload->>'candidate_commit'", sealed.group("body"), re.I
     )
@@ -401,6 +438,258 @@ def test_sql_binds_experimental_publication_to_sealed_candidate_guard() -> None:
         protected.group("body"),
         re.I,
     )
+
+
+def test_sql_candidate_digest_matches_hand_derived_python_known_vector() -> None:
+    candidate = sealed_candidate()
+    leased_payload = {
+        **candidate.to_canonical_dict(),
+        "_lease": {"owner_id": "director-phase3", "stage_attempt_id": "lease-phase3"},
+    }
+
+    assert candidate.digest == "278d2d94d70cd9d1e54baed3fdbe617e4a88aaee0ac93dbb5e4895cbd9bd3b54"
+    assert hashlib.sha256(canonical_json_bytes(leased_payload)).hexdigest() == (
+        "63451549980c44835ba0879b978e928bf7e5225887b5856e2fcc28a13839ed31"
+    )
+    assert candidate.digest != hashlib.sha256(canonical_json_bytes(leased_payload)).hexdigest()
+    assert re.search(
+        r"candidate_packet_digest\s*=\s*"
+        r"carl_autonomy\.candidate_payload_digest\(p_payload\)",
+        ROLE_PROCEDURES_SQL,
+        flags=re.IGNORECASE,
+    )
+
+
+def test_shared_sql_payload_boundary_distinguishes_worker_liveness_boolean_type() -> None:
+    string_payload = json.loads(
+        '{"lease_stage_attempt_id":"lease-phase3","worker_not_live":"true"}'
+    )
+    boolean_payload = json.loads('{"lease_stage_attempt_id":"lease-phase3","worker_not_live":true}')
+
+    assert string_payload["worker_not_live"] == "true"
+    assert boolean_payload["worker_not_live"] is True
+    validator = re.search(
+        r"FUNCTION\s+carl_autonomy\.event_payload_shape_valid\(.*?"
+        r"AS\s+\$\$(?P<body>.*?)\$\$;",
+        ROLE_PROCEDURES_SQL,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    assert validator is not None
+    assert re.search(
+        r"jsonb_typeof\(p_payload->'worker_not_live'\)\s*=\s*'boolean'",
+        validator.group("body"),
+        flags=re.IGNORECASE,
+    )
+    assert re.search(
+        r"p_payload->'worker_not_live'\s*=\s*'true'::jsonb",
+        validator.group("body"),
+        flags=re.IGNORECASE,
+    )
+
+
+@pytest.mark.parametrize(
+    ("event_type", "required_checks"),
+    (
+        ("workspace_prepared", ("lease_payload_valid", "artifact_payload_valid")),
+        (
+            "candidate_sealed",
+            ("lease_payload_valid", "artifact_payload_valid", "check_array_payload_valid"),
+        ),
+        ("paired_evidence_recorded", ("lease_payload_valid", "artifact_payload_valid")),
+        ("review_packet_recorded", ("lease_payload_valid",)),
+        ("review_attested", ("lease_payload_valid", "artifact_payload_valid")),
+        ("draft_pr_requested", ("lease_payload_valid",)),
+        ("draft_pr_recorded", ("lease_payload_valid",)),
+        ("workspace_disposed", ("lease_payload_valid",)),
+    ),
+)
+def test_sql_nested_payload_family_uses_exact_typed_helpers(
+    event_type: str, required_checks: tuple[str, ...]
+) -> None:
+    validator = re.search(
+        r"FUNCTION\s+carl_autonomy\.event_payload_shape_valid\(.*?"
+        r"AS\s+\$\$(?P<body>.*?)\$\$;",
+        ROLE_PROCEDURES_SQL,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    assert validator is not None
+    branch = re.search(
+        rf"WHEN\s+'{event_type}'\s+THEN(?P<body>.*?)(?=WHEN\s+'|ELSE)",
+        validator.group("body"),
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    assert branch is not None
+    for helper in required_checks:
+        assert f"carl_autonomy.{helper}" in branch.group("body")
+
+    assert re.search(
+        r"FUNCTION\s+carl_autonomy\.lease_payload_valid\(.*?"
+        r"jsonb_typeof\(value\)\s*=\s*'object'.*?"
+        r"jsonb_object_length\(value\)\s*=\s*2.*?"
+        r"value\s+\?&\s+ARRAY\['owner_id',\s*'stage_attempt_id'\]",
+        ROLE_PROCEDURES_SQL,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    assert re.search(
+        r"FUNCTION\s+carl_autonomy\.artifact_payload_valid\(.*?"
+        r"jsonb_object_length\(value\)\s*=\s*5.*?"
+        r"jsonb_typeof\(value->'byte_size'\)\s*=\s*'number'",
+        ROLE_PROCEDURES_SQL,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    assert re.search(
+        r"FUNCTION\s+carl_autonomy\.check_array_payload_valid\(.*?"
+        r"jsonb_typeof\(value\)\s*=\s*'array'.*?"
+        r"jsonb_array_length\(value\)\s*>\s*0",
+        ROLE_PROCEDURES_SQL,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+
+@pytest.mark.parametrize(("event_type", "fields"), tuple(EVENT_STRING_FIELDS.items()))
+def test_sql_string_fields_check_json_type_before_text_use(
+    event_type: EventType, fields: frozenset[str]
+) -> None:
+    validator = re.search(
+        r"FUNCTION\s+carl_autonomy\.event_payload_shape_valid\(.*?"
+        r"AS\s+\$\$(?P<body>.*?)\$\$;",
+        ROLE_PROCEDURES_SQL,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    assert validator is not None
+    branch = re.search(
+        rf"WHEN\s+'{event_type.value}'\s+THEN(?P<body>.*?)(?=WHEN\s+'|ELSE)",
+        validator.group("body"),
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    assert branch is not None
+    for field in fields:
+        assert re.search(
+            rf"jsonb_typeof\(p_payload->'{field}'\)\s*=\s*'string'",
+            branch.group("body"),
+            flags=re.IGNORECASE,
+        ), field
+
+
+@pytest.mark.parametrize(("event_type", "fields"), tuple(EVENT_INTEGER_FIELDS.items()))
+def test_sql_integer_fields_reject_non_integral_json_numbers(
+    event_type: EventType, fields: dict[str, tuple[int, int] | None]
+) -> None:
+    validator = re.search(
+        r"FUNCTION\s+carl_autonomy\.event_payload_shape_valid\(.*?"
+        r"AS\s+\$\$(?P<body>.*?)\$\$;",
+        ROLE_PROCEDURES_SQL,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    assert validator is not None
+    branch = re.search(
+        rf"WHEN\s+'{event_type.value}'\s+THEN(?P<body>.*?)(?=WHEN\s+'|ELSE)",
+        validator.group("body"),
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    assert branch is not None
+    for field, bounds in fields.items():
+        if bounds is None:
+            pattern = rf"carl_autonomy\.jsonb_positive_integer\(p_payload->'{field}'\)"
+        else:
+            minimum, maximum = bounds
+            pattern = (
+                rf"carl_autonomy\.jsonb_integer_between\("
+                rf"p_payload->'{field}',\s*{minimum},\s*{maximum}\)"
+            )
+        assert re.search(pattern, branch.group("body"), flags=re.IGNORECASE), field
+
+
+@pytest.mark.parametrize(("event_type", "fields"), tuple(EVENT_BOOLEAN_FIELDS.items()))
+def test_sql_boolean_fields_require_json_booleans(
+    event_type: EventType, fields: dict[str, bool | None]
+) -> None:
+    validator = re.search(
+        r"FUNCTION\s+carl_autonomy\.event_payload_shape_valid\(.*?"
+        r"AS\s+\$\$(?P<body>.*?)\$\$;",
+        ROLE_PROCEDURES_SQL,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    assert validator is not None
+    branch = re.search(
+        rf"WHEN\s+'{event_type.value}'\s+THEN(?P<body>.*?)(?=WHEN\s+'|ELSE)",
+        validator.group("body"),
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    assert branch is not None
+    for field, required in fields.items():
+        assert re.search(
+            rf"jsonb_typeof\(p_payload->'{field}'\)\s*=\s*'boolean'",
+            branch.group("body"),
+            flags=re.IGNORECASE,
+        ), field
+        if required is not None:
+            literal = str(required).lower()
+            assert re.search(
+                rf"p_payload->'{field}'\s*=\s*'{literal}'::jsonb",
+                branch.group("body"),
+                flags=re.IGNORECASE,
+            ), field
+
+
+def test_valid_draft_url_validation_does_not_construct_postgres_nul_text() -> None:
+    validator = re.search(
+        r"FUNCTION\s+carl_autonomy\.event_payload_shape_valid\(.*?"
+        r"AS\s+\$\$(?P<body>.*?)\$\$;",
+        ROLE_PROCEDURES_SQL,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    assert validator is not None
+    draft = re.search(
+        r"WHEN\s+'draft_pr_requested'\s+THEN(?P<body>.*?)(?=WHEN\s+')",
+        validator.group("body"),
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    assert draft is not None
+    assert "chr(0)" not in draft.group("body").lower()
+
+
+def test_sql_role_handler_preserves_candidate_hard_finding_verdict() -> None:
+    validator = re.search(
+        r"FUNCTION\s+carl_autonomy\.validate_and_advance_event.*?"
+        r"AS\s+\$\$(?P<body>.*?)\$\$;",
+        ROLE_PROCEDURES_SQL,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    assert validator is not None
+    role = re.search(
+        r"IF\s+p_event_type\s*=\s*'role_recorded'\s+THEN(?P<body>.*?)RETURN;",
+        validator.group("body"),
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    assert role is not None
+    assert not re.search(
+        r"verdict_name\s+NOT\s+IN\s*\('approve',\s*'reject',\s*'hard_objection'\)",
+        role.group("body"),
+        flags=re.IGNORECASE,
+    )
+
+
+def test_soak_transition_authorization_checks_json_string_types() -> None:
+    policy = re.search(
+        r"FUNCTION\s+carl_autonomy\.event_role_allowed.*?"
+        r"AS\s+\$\$(?P<body>.*?)\$\$;",
+        ROLE_PROCEDURES_SQL,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    assert policy is not None
+    soak = re.search(
+        r"WHEN\s+'carl_soak'\s+THEN(?P<body>.*?)(?=WHEN\s+'carl_|ELSE)",
+        policy.group("body"),
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    assert soak is not None
+    for field in ("from_state", "to_state"):
+        assert re.search(
+            rf"jsonb_typeof\(payload->'{field}'\)\s*=\s*'string'",
+            soak.group("body"),
+            flags=re.IGNORECASE,
+        )
 
 
 def test_sql_enforces_retry_first_attempt_and_monotonic_sequence() -> None:

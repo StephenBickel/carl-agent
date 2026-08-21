@@ -138,6 +138,59 @@ AS $$
     SELECT encode(carl_autonomy.digest(convert_to(value, 'UTF8'), 'sha256'), 'hex')
 $$;
 
+CREATE OR REPLACE FUNCTION carl_autonomy.canonical_jsonb(value jsonb)
+RETURNS text
+LANGUAGE plpgsql
+IMMUTABLE
+STRICT
+SECURITY INVOKER
+SET search_path = pg_catalog, carl_autonomy
+AS $$
+DECLARE
+    result text := '';
+    separator text := '';
+    item record;
+BEGIN
+    IF jsonb_typeof(value) = 'object' THEN
+        FOR item IN
+            SELECT field.key, field.value
+            FROM jsonb_each(value) AS field
+            ORDER BY convert_to(field.key, 'UTF8')
+        LOOP
+            result := result || separator || to_json(item.key)::text || ':'
+                || carl_autonomy.canonical_jsonb(item.value);
+            separator := ',';
+        END LOOP;
+        RETURN '{' || result || '}';
+    END IF;
+    IF jsonb_typeof(value) = 'array' THEN
+        FOR item IN
+            SELECT element.value
+            FROM jsonb_array_elements(value) WITH ORDINALITY AS element(value, ordinal)
+            ORDER BY element.ordinal
+        LOOP
+            result := result || separator || carl_autonomy.canonical_jsonb(item.value);
+            separator := ',';
+        END LOOP;
+        RETURN '[' || result || ']';
+    END IF;
+    RETURN value::text;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION carl_autonomy.candidate_payload_digest(p_payload jsonb)
+RETURNS text
+LANGUAGE sql
+IMMUTABLE
+STRICT
+SECURITY INVOKER
+SET search_path = pg_catalog, carl_autonomy
+AS $$
+    SELECT carl_autonomy.sha256_text(
+        carl_autonomy.canonical_jsonb(p_payload - '_lease')
+    )
+$$;
+
 CREATE OR REPLACE FUNCTION carl_autonomy.event_payload_key_policy()
 RETURNS TABLE(event_type text, required_keys text[])
 LANGUAGE sql
@@ -226,6 +279,387 @@ AS $$
     )
 $$;
 
+CREATE OR REPLACE FUNCTION carl_autonomy.jsonb_integer_between(
+    value jsonb,
+    minimum numeric,
+    maximum numeric
+)
+RETURNS boolean
+LANGUAGE plpgsql
+IMMUTABLE
+SECURITY INVOKER
+SET search_path = pg_catalog, carl_autonomy
+AS $$
+BEGIN
+    IF jsonb_typeof(value) <> 'number' OR value::text !~ '^-?(0|[1-9][0-9]*)$' THEN
+        RETURN false;
+    END IF;
+    RETURN value::text::numeric BETWEEN minimum AND maximum;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION carl_autonomy.jsonb_positive_integer(value jsonb)
+RETURNS boolean
+LANGUAGE plpgsql
+IMMUTABLE
+SECURITY INVOKER
+SET search_path = pg_catalog, carl_autonomy
+AS $$
+BEGIN
+    IF jsonb_typeof(value) <> 'number' OR value::text !~ '^(0|[1-9][0-9]*)$' THEN
+        RETURN false;
+    END IF;
+    RETURN value::text::numeric > 0;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION carl_autonomy.lease_payload_valid(value jsonb)
+RETURNS boolean
+LANGUAGE sql
+IMMUTABLE
+SECURITY INVOKER
+SET search_path = pg_catalog, carl_autonomy
+AS $$
+    SELECT jsonb_typeof(value) = 'object'
+        AND jsonb_object_length(value) = 2
+        AND value ?& ARRAY['owner_id', 'stage_attempt_id']
+        AND jsonb_typeof(value->'owner_id') = 'string'
+        AND jsonb_typeof(value->'stage_attempt_id') = 'string'
+        AND value->>'owner_id' ~ '^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$'
+        AND value->>'stage_attempt_id' ~ '^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$'
+$$;
+
+CREATE OR REPLACE FUNCTION carl_autonomy.artifact_payload_valid(value jsonb)
+RETURNS boolean
+LANGUAGE sql
+IMMUTABLE
+SECURITY INVOKER
+SET search_path = pg_catalog, carl_autonomy
+AS $$
+    SELECT jsonb_typeof(value) = 'object'
+        AND jsonb_object_length(value) = 5
+        AND value ?& ARRAY['byte_size', 'digest', 'evidence_kind', 'media_type', 'schema_version']
+        AND carl_autonomy.jsonb_integer_between(value->'schema_version', 1, 1)
+        AND jsonb_typeof(value->'digest') = 'string'
+        AND value->>'digest' ~ '^[0-9a-f]{64}$'
+        AND jsonb_typeof(value->'byte_size') = 'number'
+        AND carl_autonomy.jsonb_integer_between(value->'byte_size', 0, 16777216)
+        AND jsonb_typeof(value->'evidence_kind') = 'string'
+        AND value->>'evidence_kind' ~ '^[a-z][a-z0-9_]{0,63}$'
+        AND jsonb_typeof(value->'media_type') = 'string'
+        AND value->>'media_type'
+            ~ '^[a-z0-9][a-z0-9.+-]{0,63}/[a-z0-9][a-z0-9.+-]{0,63}$'
+$$;
+
+CREATE OR REPLACE FUNCTION carl_autonomy.check_payload_valid(value jsonb)
+RETURNS boolean
+LANGUAGE sql
+IMMUTABLE
+SECURITY INVOKER
+SET search_path = pg_catalog, carl_autonomy
+AS $$
+    SELECT jsonb_typeof(value) = 'object'
+        AND jsonb_object_length(value) = 5
+        AND value ?& ARRAY['check_id', 'elapsed_ms', 'exit_code', 'output_artifact', 'status']
+        AND jsonb_typeof(value->'check_id') = 'string'
+        AND value->>'check_id' ~ '^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$'
+        AND jsonb_typeof(value->'status') = 'string'
+        AND value->>'status' = 'passed'
+        AND carl_autonomy.jsonb_integer_between(value->'exit_code', 0, 0)
+        AND carl_autonomy.jsonb_integer_between(value->'elapsed_ms', 0, 86400000)
+        AND carl_autonomy.artifact_payload_valid(value->'output_artifact')
+$$;
+
+CREATE OR REPLACE FUNCTION carl_autonomy.check_array_payload_valid(value jsonb)
+RETURNS boolean
+LANGUAGE sql
+IMMUTABLE
+SECURITY INVOKER
+SET search_path = pg_catalog, carl_autonomy
+AS $$
+    SELECT jsonb_typeof(value) = 'array'
+        AND jsonb_array_length(value) > 0
+        AND NOT EXISTS (
+            SELECT 1
+            FROM jsonb_array_elements(value) AS checks(item)
+            WHERE NOT carl_autonomy.check_payload_valid(item)
+        )
+        AND NOT EXISTS (
+            SELECT 1
+            FROM (
+                SELECT convert_to(item->>'check_id', 'UTF8') AS check_id,
+                    lag(convert_to(item->>'check_id', 'UTF8')) OVER (ORDER BY ordinal) AS prior_id
+                FROM jsonb_array_elements(value) WITH ORDINALITY AS checks(item, ordinal)
+            ) AS ordered
+            WHERE prior_id >= check_id
+        )
+$$;
+
+CREATE OR REPLACE FUNCTION carl_autonomy.event_payload_shape_valid(
+    p_event_type text,
+    p_payload jsonb
+)
+RETURNS boolean
+LANGUAGE sql
+IMMUTABLE
+SECURITY INVOKER
+SET search_path = pg_catalog, carl_autonomy
+AS $$
+    SELECT CASE p_event_type
+        WHEN 'state_transitioned' THEN
+            jsonb_typeof(p_payload->'from_state') = 'string'
+            AND jsonb_typeof(p_payload->'to_state') = 'string'
+            AND p_payload->>'from_state' IN (
+                'queued', 'baselining', 'diagnosing', 'proposal_review', 'building',
+                'deterministic_validation', 'paired_evaluation', 'holdout_validation',
+                'review_complete', 'pr_open', 'merged', 'soaking', 'accepted', 'rejected',
+                'inconclusive', 'blocked', 'budget_exhausted', 'reverted', 'abandoned'
+            )
+            AND p_payload->>'to_state' IN (
+                'queued', 'baselining', 'diagnosing', 'proposal_review', 'building',
+                'deterministic_validation', 'paired_evaluation', 'holdout_validation',
+                'review_complete', 'pr_open', 'merged', 'soaking', 'accepted', 'rejected',
+                'inconclusive', 'blocked', 'budget_exhausted', 'reverted', 'abandoned'
+            )
+            AND (
+                NOT (p_payload ? '_lease')
+                OR carl_autonomy.lease_payload_valid(p_payload->'_lease')
+            )
+        WHEN 'role_recorded' THEN
+            jsonb_typeof(p_payload->'artifact_digest') = 'string'
+            AND p_payload->>'artifact_digest' ~ '^[0-9a-f]{64}$'
+            AND jsonb_typeof(p_payload->'role') = 'string'
+            AND jsonb_typeof(p_payload->'verdict') = 'string'
+            AND (
+                (
+                    p_payload->>'role' IN ('causal', 'product', 'evaluation')
+                    AND p_payload->>'verdict' IN ('approve', 'reject', 'hard_objection')
+                )
+                OR (
+                    p_payload->>'role' IN (
+                        'correctness', 'security', 'maintainability', 'benchmark_integrity'
+                    )
+                    AND p_payload->>'verdict' IN ('approve', 'reject', 'hard_finding')
+                )
+            )
+            AND (
+                NOT (p_payload ? '_lease')
+                OR carl_autonomy.lease_payload_valid(p_payload->'_lease')
+            )
+        WHEN 'lease_acquired' THEN
+            jsonb_typeof(p_payload->'expires_at') = 'string'
+            AND jsonb_typeof(p_payload->'owner_id') = 'string'
+            AND p_payload->>'owner_id' ~ '^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$'
+        WHEN 'lease_reconciled' THEN
+            jsonb_typeof(p_payload->'lease_stage_attempt_id') = 'string'
+            AND p_payload->>'lease_stage_attempt_id'
+                ~ '^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$'
+            AND jsonb_typeof(p_payload->'worker_not_live') = 'boolean'
+            AND p_payload->'worker_not_live' = 'true'::jsonb
+        WHEN 'lease_released' THEN
+            jsonb_typeof(p_payload->'lease_stage_attempt_id') = 'string'
+            AND p_payload->>'lease_stage_attempt_id'
+                ~ '^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$'
+        WHEN 'live_spend_recorded' THEN
+            jsonb_typeof(p_payload->'run_id') = 'string'
+            AND p_payload->>'run_id' ~ '^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$'
+            AND carl_autonomy.jsonb_integer_between(p_payload->'live_microdollars', 1, 1000000000)
+        WHEN 'workspace_prepared' THEN
+            carl_autonomy.lease_payload_valid(p_payload->'_lease')
+            AND carl_autonomy.jsonb_integer_between(p_payload->'schema_version', 1, 1)
+            AND jsonb_typeof(p_payload->'branch') = 'string'
+            AND p_payload->>'branch'
+                ~ '^codex/experiment-[a-z0-9][a-z0-9-]*-[0-9a-f]{10}$'
+            AND jsonb_typeof(p_payload->'experiment_id') = 'string'
+            AND p_payload->>'experiment_id' ~ '^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$'
+            AND jsonb_typeof(p_payload->'manifest_digest') = 'string'
+            AND p_payload->>'manifest_digest' ~ '^[0-9a-f]{64}$'
+            AND jsonb_typeof(p_payload->'parent_commit') = 'string'
+            AND p_payload->>'parent_commit' ~ '^([0-9a-f]{40}|[0-9a-f]{64})$'
+            AND carl_autonomy.artifact_payload_valid(p_payload->'request_artifact')
+        WHEN 'candidate_sealed' THEN
+            carl_autonomy.lease_payload_valid(p_payload->'_lease')
+            AND carl_autonomy.jsonb_integer_between(p_payload->'schema_version', 1, 1)
+            AND carl_autonomy.jsonb_integer_between(p_payload->'changed_path_count', 1, 4096)
+            AND jsonb_typeof(p_payload->'branch') = 'string'
+            AND p_payload->>'branch'
+                ~ '^codex/experiment-[a-z0-9][a-z0-9-]*-[0-9a-f]{10}$'
+            AND jsonb_typeof(p_payload->'candidate_commit') = 'string'
+            AND p_payload->>'candidate_commit' ~ '^([0-9a-f]{40}|[0-9a-f]{64})$'
+            AND jsonb_typeof(p_payload->'experiment_id') = 'string'
+            AND p_payload->>'experiment_id' ~ '^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$'
+            AND jsonb_typeof(p_payload->'manifest_digest') = 'string'
+            AND p_payload->>'manifest_digest' ~ '^[0-9a-f]{64}$'
+            AND jsonb_typeof(p_payload->'parent_commit') = 'string'
+            AND p_payload->>'parent_commit' ~ '^([0-9a-f]{40}|[0-9a-f]{64})$'
+            AND p_payload->>'candidate_commit' <> p_payload->>'parent_commit'
+            AND carl_autonomy.artifact_payload_valid(p_payload->'diff_artifact')
+            AND carl_autonomy.artifact_payload_valid(p_payload->'report_artifact')
+            AND carl_autonomy.artifact_payload_valid(p_payload->'changed_paths_artifact')
+            AND carl_autonomy.check_array_payload_valid(p_payload->'checks')
+        WHEN 'paired_evidence_recorded' THEN
+            carl_autonomy.lease_payload_valid(p_payload->'_lease')
+            AND carl_autonomy.jsonb_integer_between(p_payload->'schema_version', 1, 1)
+            AND carl_autonomy.jsonb_integer_between(p_payload->'paired_trials', 0, 1000000)
+            AND carl_autonomy.jsonb_integer_between(p_payload->'pass_rate_delta_basis_points', -10000, 10000)
+            AND carl_autonomy.jsonb_integer_between(p_payload->'confidence_lower_basis_points', -10000, 10000)
+            AND jsonb_typeof(p_payload->'baseline_scorecard_digest') = 'string'
+            AND p_payload->>'baseline_scorecard_digest' ~ '^[0-9a-f]{64}$'
+            AND jsonb_typeof(p_payload->'candidate_commit') = 'string'
+            AND p_payload->>'candidate_commit' ~ '^([0-9a-f]{40}|[0-9a-f]{64})$'
+            AND jsonb_typeof(p_payload->'candidate_scorecard_digest') = 'string'
+            AND p_payload->>'candidate_scorecard_digest' ~ '^[0-9a-f]{64}$'
+            AND jsonb_typeof(p_payload->'decision') = 'string'
+            AND p_payload->>'decision' IN ('improvement', 'rejected', 'insufficient_evidence')
+            AND jsonb_typeof(p_payload->'experiment_id') = 'string'
+            AND p_payload->>'experiment_id' ~ '^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$'
+            AND jsonb_typeof(p_payload->'manifest_digest') = 'string'
+            AND p_payload->>'manifest_digest' ~ '^[0-9a-f]{64}$'
+            AND jsonb_typeof(p_payload->'parent_commit') = 'string'
+            AND p_payload->>'parent_commit' ~ '^([0-9a-f]{40}|[0-9a-f]{64})$'
+            AND carl_autonomy.artifact_payload_valid(p_payload->'comparison_artifact')
+        WHEN 'review_packet_recorded' THEN
+            carl_autonomy.lease_payload_valid(p_payload->'_lease')
+            AND carl_autonomy.jsonb_integer_between(p_payload->'schema_version', 1, 1)
+            AND jsonb_typeof(p_payload->'candidate_commit') = 'string'
+            AND p_payload->>'candidate_commit' ~ '^([0-9a-f]{40}|[0-9a-f]{64})$'
+            AND jsonb_typeof(p_payload->'deterministic_evidence_digest') = 'string'
+            AND p_payload->>'deterministic_evidence_digest' ~ '^[0-9a-f]{64}$'
+            AND jsonb_typeof(p_payload->'diff_digest') = 'string'
+            AND p_payload->>'diff_digest' ~ '^[0-9a-f]{64}$'
+            AND jsonb_typeof(p_payload->'experiment_id') = 'string'
+            AND p_payload->>'experiment_id' ~ '^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$'
+            AND jsonb_typeof(p_payload->'manifest_digest') = 'string'
+            AND p_payload->>'manifest_digest' ~ '^[0-9a-f]{64}$'
+            AND jsonb_typeof(p_payload->'paired_evidence_digest') = 'string'
+            AND p_payload->>'paired_evidence_digest' ~ '^[0-9a-f]{64}$'
+            AND jsonb_typeof(p_payload->'review_contract_version') = 'string'
+            AND p_payload->>'review_contract_version' = 'candidate-review-v1'
+            AND jsonb_typeof(p_payload->'role') = 'string'
+            AND p_payload->>'role' IN (
+                'correctness', 'security', 'maintainability', 'benchmark_integrity'
+            )
+        WHEN 'review_attested' THEN
+            carl_autonomy.lease_payload_valid(p_payload->'_lease')
+            AND carl_autonomy.jsonb_integer_between(p_payload->'schema_version', 1, 1)
+            AND jsonb_typeof(p_payload->'candidate_commit') = 'string'
+            AND p_payload->>'candidate_commit' ~ '^([0-9a-f]{40}|[0-9a-f]{64})$'
+            AND jsonb_typeof(p_payload->'context_id') = 'string'
+            AND p_payload->>'context_id' ~ '^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$'
+            AND jsonb_typeof(p_payload->'experiment_id') = 'string'
+            AND p_payload->>'experiment_id' ~ '^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$'
+            AND jsonb_typeof(p_payload->'manifest_digest') = 'string'
+            AND p_payload->>'manifest_digest' ~ '^[0-9a-f]{64}$'
+            AND jsonb_typeof(p_payload->'packet_digest') = 'string'
+            AND p_payload->>'packet_digest' ~ '^[0-9a-f]{64}$'
+            AND jsonb_typeof(p_payload->'reviewer_id') = 'string'
+            AND p_payload->>'reviewer_id' ~ '^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$'
+            AND p_payload->>'reviewer_id' <> p_payload->>'context_id'
+            AND jsonb_typeof(p_payload->'role') = 'string'
+            AND p_payload->>'role' IN (
+                'correctness', 'security', 'maintainability', 'benchmark_integrity'
+            )
+            AND jsonb_typeof(p_payload->'verdict') = 'string'
+            AND p_payload->>'verdict' IN ('approve', 'reject', 'hard_finding')
+            AND carl_autonomy.artifact_payload_valid(p_payload->'report_artifact')
+        WHEN 'draft_pr_requested' THEN
+            carl_autonomy.lease_payload_valid(p_payload->'_lease')
+            AND jsonb_typeof(p_payload->'base_branch') = 'string'
+            AND p_payload->>'base_branch' ~ '^[A-Za-z0-9][A-Za-z0-9._/-]*$'
+            AND jsonb_typeof(p_payload->'candidate_commit') = 'string'
+            AND p_payload->>'candidate_commit' ~ '^([0-9a-f]{40}|[0-9a-f]{64})$'
+            AND jsonb_typeof(p_payload->'expected_remote_url') = 'string'
+            AND octet_length(p_payload->>'expected_remote_url') BETWEEN 1 AND 4096
+            AND jsonb_typeof(p_payload->'head_branch') = 'string'
+            AND p_payload->>'head_branch'
+                ~ '^codex/experiment-[a-z0-9][a-z0-9-]*-[0-9a-f]{10}$'
+            AND jsonb_typeof(p_payload->'repository') = 'string'
+            AND p_payload->>'repository'
+                ~ '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'
+        WHEN 'draft_pr_recorded' THEN
+            carl_autonomy.lease_payload_valid(p_payload->'_lease')
+            AND carl_autonomy.jsonb_integer_between(p_payload->'schema_version', 1, 1)
+            AND carl_autonomy.jsonb_positive_integer(p_payload->'number')
+            AND jsonb_typeof(p_payload->'is_draft') = 'boolean'
+            AND p_payload->'is_draft' = 'true'::jsonb
+            AND jsonb_typeof(p_payload->'base_branch') = 'string'
+            AND p_payload->>'base_branch' ~ '^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$'
+            AND jsonb_typeof(p_payload->'candidate_commit') = 'string'
+            AND p_payload->>'candidate_commit' ~ '^([0-9a-f]{40}|[0-9a-f]{64})$'
+            AND jsonb_typeof(p_payload->'head_branch') = 'string'
+            AND p_payload->>'head_branch'
+                ~ '^codex/experiment-[a-z0-9][a-z0-9-]*-[0-9a-f]{10}$'
+            AND jsonb_typeof(p_payload->'repository') = 'string'
+            AND p_payload->>'repository' ~ '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'
+            AND jsonb_typeof(p_payload->'state') = 'string'
+            AND p_payload->>'state' = 'OPEN'
+            AND jsonb_typeof(p_payload->'url') = 'string'
+            AND p_payload->>'url' = 'https://github.com/' || p_payload->>'repository'
+                || '/pull/' || (p_payload->'number')::text
+        WHEN 'workspace_disposed' THEN
+            carl_autonomy.lease_payload_valid(p_payload->'_lease')
+            AND jsonb_typeof(p_payload->'branch') = 'string'
+            AND p_payload->>'branch'
+                ~ '^codex/experiment-[a-z0-9][a-z0-9-]*-[0-9a-f]{10}$'
+            AND jsonb_typeof(p_payload->'candidate_commit') = 'string'
+            AND p_payload->>'candidate_commit' ~ '^([0-9a-f]{40}|[0-9a-f]{64})$'
+        WHEN 'retry_scheduled' THEN
+            carl_autonomy.jsonb_integer_between(p_payload->'attempt', 1, 3)
+            AND
+            jsonb_typeof(p_payload->'changed_action') = 'string'
+            AND octet_length(p_payload->>'changed_action') BETWEEN 1 AND 1024
+            AND jsonb_typeof(p_payload->'failed_stage_attempt_id') = 'string'
+            AND p_payload->>'failed_stage_attempt_id'
+                ~ '^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$'
+            AND jsonb_typeof(p_payload->'failure_class') = 'string'
+            AND p_payload->>'failure_class' ~ '^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$'
+            AND jsonb_typeof(p_payload->'scheduled_at') = 'string'
+        WHEN 'experimental_published' THEN
+            jsonb_typeof(p_payload->'branch') = 'string'
+            AND octet_length(p_payload->>'branch') BETWEEN 1 AND 256
+            AND p_payload->>'branch' LIKE 'experimental/%'
+            AND jsonb_typeof(p_payload->'candidate_packet_digest') = 'string'
+            AND p_payload->>'candidate_packet_digest' ~ '^[0-9a-f]{64}$'
+            AND jsonb_typeof(p_payload->'commit') = 'string'
+            AND p_payload->>'commit' ~ '^([0-9a-f]{40}|[0-9a-f]{64})$'
+            AND jsonb_typeof(p_payload->'tree') = 'string'
+            AND p_payload->>'tree' ~ '^([0-9a-f]{40}|[0-9a-f]{64})$'
+        WHEN 'protected_validation_recorded' THEN
+            jsonb_typeof(p_payload->'candidate_commit') = 'string'
+            AND p_payload->>'candidate_commit' ~ '^([0-9a-f]{40}|[0-9a-f]{64})$'
+            AND jsonb_typeof(p_payload->'candidate_tree') = 'string'
+            AND p_payload->>'candidate_tree' ~ '^([0-9a-f]{40}|[0-9a-f]{64})$'
+            AND jsonb_typeof(p_payload->'receipt_digest') = 'string'
+            AND p_payload->>'receipt_digest' ~ '^[0-9a-f]{64}$'
+        WHEN 'promotion_recorded' THEN
+            jsonb_typeof(p_payload->'merge_commit') = 'string'
+            AND p_payload->>'merge_commit' ~ '^([0-9a-f]{40}|[0-9a-f]{64})$'
+            AND jsonb_typeof(p_payload->'merge_tree') = 'string'
+            AND p_payload->>'merge_tree' ~ '^([0-9a-f]{40}|[0-9a-f]{64})$'
+        WHEN 'soak_observed' THEN
+            jsonb_typeof(p_payload->'evidence_digest') = 'string'
+            AND p_payload->>'evidence_digest' ~ '^[0-9a-f]{64}$'
+            AND jsonb_typeof(p_payload->'merge_commit') = 'string'
+            AND p_payload->>'merge_commit' ~ '^([0-9a-f]{40}|[0-9a-f]{64})$'
+            AND jsonb_typeof(p_payload->'observed_at') = 'string'
+            AND jsonb_typeof(p_payload->'healthy') = 'boolean'
+        WHEN 'revert_recorded' THEN
+            carl_autonomy.jsonb_positive_integer(p_payload->'revert_pull_request_number')
+            AND
+            jsonb_typeof(p_payload->'hard_failure_digest') = 'string'
+            AND p_payload->>'hard_failure_digest' ~ '^[0-9a-f]{64}$'
+            AND jsonb_typeof(p_payload->'merge_commit') = 'string'
+            AND p_payload->>'merge_commit' ~ '^([0-9a-f]{40}|[0-9a-f]{64})$'
+            AND jsonb_typeof(p_payload->'restored_tree') = 'string'
+            AND p_payload->>'restored_tree' ~ '^([0-9a-f]{40}|[0-9a-f]{64})$'
+            AND jsonb_typeof(p_payload->'revert_candidate_commit') = 'string'
+            AND p_payload->>'revert_candidate_commit' ~ '^([0-9a-f]{40}|[0-9a-f]{64})$'
+            AND jsonb_typeof(p_payload->'revert_merge_commit') = 'string'
+            AND p_payload->>'revert_merge_commit' ~ '^([0-9a-f]{40}|[0-9a-f]{64})$'
+        ELSE true
+    END
+$$;
+
 CREATE OR REPLACE FUNCTION carl_autonomy.event_role_allowed(
     role_name text,
     event_type text,
@@ -250,6 +684,8 @@ AS $$
         )
         WHEN 'carl_soak' THEN event_type IN ('soak_observed', 'revert_recorded') OR (
             event_type = 'state_transitioned'
+            AND jsonb_typeof(payload->'from_state') = 'string'
+            AND jsonb_typeof(payload->'to_state') = 'string'
             AND payload->>'from_state' = 'soaking'
             AND payload->>'to_state' = 'accepted'
         )
@@ -373,6 +809,9 @@ BEGIN
     IF NOT carl_autonomy.event_payload_keys_exact(p_event_type, p_payload) THEN
         RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'invalid_event_payload_keys';
     END IF;
+    IF NOT carl_autonomy.event_payload_shape_valid(p_event_type, p_payload) THEN
+        RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'invalid_event_payload_shape';
+    END IF;
 
     IF p_event_type = 'state_transitioned' THEN
         source_state := p_payload->>'from_state';
@@ -451,11 +890,6 @@ BEGIN
     IF p_event_type = 'role_recorded' THEN
         role_name := p_payload->>'role';
         verdict_name := p_payload->>'verdict';
-        IF p_payload->>'artifact_digest' !~ '^[0-9a-f]{64}$'
-            OR verdict_name NOT IN ('approve', 'reject', 'hard_objection')
-        THEN
-            RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'invalid_review_payload';
-        END IF;
         IF role_name IN ('causal', 'product', 'evaluation') THEN
             IF guard.lifecycle_state <> 'proposal_review' OR role_name = ANY(guard.proposal_roles) THEN
                 RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'proposal_review_invalid';
@@ -538,7 +972,7 @@ BEGIN
             END IF;
             UPDATE carl_autonomy.experiment_projection_guards
             SET candidate_sealed = true,
-                candidate_packet_digest = p_payload_digest,
+                candidate_packet_digest = carl_autonomy.candidate_payload_digest(p_payload),
                 candidate_commit = p_payload->>'candidate_commit',
                 updated_at = p_observed_at WHERE experiment_id = p_experiment_id;
         WHEN 'paired_evidence_recorded' THEN
