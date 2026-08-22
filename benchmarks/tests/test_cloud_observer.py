@@ -264,6 +264,58 @@ def test_observer_hashes_and_parses_the_same_single_downloaded_bytes() -> None:
     assert github.downloads == 1
 
 
+def test_whole_observer_retry_replays_exact_original_signed_result() -> None:
+    cloud_request = request()
+    current = [NOW]
+    github = FakeGitHub(cloud_request)
+    store = Store()
+    key = Ed25519PrivateKey.generate()
+    policy = ProtectedSigningPolicy(
+        repository=REPOSITORY,
+        key_id="observer-kms-v1",
+        algorithm="ED25519_SHA_512",
+        purpose="commissioning-receipt",
+        domain="carl-autonomy/cloud-evidence/v1",
+        public_key_pem=key.public_key().public_bytes(
+            serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo
+        ),
+    )
+    value = CloudObserver._for_testing(
+        github=github,
+        archive=EvidenceArchive._for_testing(store=store, clock=lambda: current[0]),
+        signer=CloudReceiptSigner._for_testing(kms=Kms(key, store), policy=policy),
+        clock=lambda: current[0],
+    )
+    first = value.observe_success(cloud_request, attempt=1, dispatched_at=DISPATCHED)
+    current[0] = datetime(2026, 8, 22, 13, tzinfo=UTC)
+    replay = value.observe_success(cloud_request, attempt=1, dispatched_at=DISPATCHED)
+    assert replay.archive == first.archive
+    assert replay.signed_receipt == first.signed_receipt
+
+
+def test_observer_rejects_any_additional_artifact() -> None:
+    cloud_request = request()
+    value, github, _ = observer(cloud_request)
+    github.artifacts = (
+        github.artifacts[0],
+        replace(github.artifacts[0], artifact_id=100, name="untrusted-extra"),
+    )
+    with pytest.raises(CloudObserverError, match="cloud_artifact_collection_invalid"):
+        value.observe_success(cloud_request, attempt=1, dispatched_at=DISPATCHED)
+
+
+def test_observer_redacts_raw_gateway_exception_causes() -> None:
+    cloud_request = request()
+    value, github, _ = observer(cloud_request)
+    github.observe_run = lambda *_: (_ for _ in ()).throw(  # type: ignore[method-assign]
+        RuntimeError("secret-token provider-body https://private.invalid")
+    )
+    with pytest.raises(CloudObserverError) as caught:
+        value.observe_success(cloud_request, attempt=1, dispatched_at=DISPATCHED)
+    assert caught.value.__cause__ is None
+    assert str(caught.value) == "cloud_observer_run_unavailable"
+
+
 def test_observer_rejects_workflow_claimed_signature_and_synthetic_receipt_fields() -> None:
     cloud_request = request()
     value, github, _ = observer(cloud_request)

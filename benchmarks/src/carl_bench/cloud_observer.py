@@ -22,7 +22,6 @@ _DIGEST = re.compile(r"^[0-9a-f]{64}$")
 _OBJECT = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 _REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _NAME = re.compile(r"^[A-Za-z0-9_.-]{1,180}$")
-_MAX_ARTIFACTS = 16
 _MAX_ARTIFACT_BYTES = 8_388_608
 _DISPATCH_WINDOW = timedelta(minutes=10)
 
@@ -196,22 +195,22 @@ class CloudObserver:
         if not isinstance(dispatched_at, datetime) or dispatched_at.tzinfo != UTC:
             raise CloudObserverError("cloud_observer_dispatch_time_invalid")
         observed_at_value = self.__clock()
-        observed_at = _timestamp(observed_at_value)
+        _timestamp(observed_at_value)
         attempt_key = request.attempt_key(attempt)
         try:
             run = self.__github.observe_run(request.request_digest, attempt_key)
-        except Exception as error:
-            raise CloudObserverError("cloud_observer_run_unavailable") from error
+        except Exception:
+            raise CloudObserverError("cloud_observer_run_unavailable") from None
         self._validate_run(request, run, attempt, attempt_key, dispatched_at, observed_at_value)
         try:
             artifacts = self.__github.list_run_artifacts(run.run_id)
-        except Exception as error:
-            raise CloudObserverError("cloud_observer_artifacts_unavailable") from error
+        except Exception:
+            raise CloudObserverError("cloud_observer_artifacts_unavailable") from None
         artifact = self._select_artifact(request, run, artifacts, observed_at_value)
         try:
             payload = self.__github.download_run_artifact(run.run_id, artifact.artifact_id)
-        except Exception as error:
-            raise CloudObserverError("cloud_observer_download_unavailable") from error
+        except Exception:
+            raise CloudObserverError("cloud_observer_download_unavailable") from None
         if not isinstance(payload, bytes) or not 0 < len(payload) <= _MAX_ARTIFACT_BYTES:
             raise CloudObserverError("cloud_evidence_payload_invalid")
         if len(payload) != artifact.size_in_bytes:
@@ -252,7 +251,7 @@ class CloudObserver:
             run_id=run.run_id,
             status="completed",
             conclusion="success",
-            observed_at=observed_at,
+            observed_at=run.completed_at,
             artifact_id=artifact.artifact_id,
             artifact_name=artifact.name,
             artifact_digest=payload_digest,
@@ -306,7 +305,7 @@ class CloudObserver:
     ) -> CloudArtifactMetadata:
         if (
             type(artifacts) is not tuple
-            or not 1 <= len(artifacts) <= _MAX_ARTIFACTS
+            or len(artifacts) != 1
             or any(not isinstance(item, CloudArtifactMetadata) for item in artifacts)
         ):
             raise CloudObserverError("cloud_artifact_collection_invalid")

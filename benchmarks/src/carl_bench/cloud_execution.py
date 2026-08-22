@@ -520,13 +520,13 @@ class SignedCommissioningReceipt:
 
     @classmethod
     def from_canonical_dict(cls, value: object) -> SignedCommissioningReceipt:
-        decoded = _codec_fields(
-            value,
-            frozenset(cls.__dataclass_fields__),
-            "signed_cloud_commissioning_receipt_invalid",
-        )
+        current_fields = frozenset(cls.__dataclass_fields__)
+        legacy_fields = current_fields - {"protected_binding"}
+        if type(value) is not dict or set(value) not in {current_fields, legacy_fields}:
+            raise CloudExecutionError("signed_cloud_commissioning_receipt_invalid")
+        decoded = _codec_output(value)
         receipt = CommissioningReceipt.from_canonical_dict(decoded["receipt"])
-        binding_value = decoded["protected_binding"]
+        binding_value = decoded.get("protected_binding")
         binding = (
             None
             if binding_value is None
@@ -853,9 +853,10 @@ class CloudRunSnapshot:
         receipt_value = decoded["commissioning_receipt"]
         if receipt_value is None:
             receipt: CommissioningReceipt | SignedCommissioningReceipt | None = None
-        elif type(receipt_value) is dict and set(receipt_value) == set(
-            SignedCommissioningReceipt.__dataclass_fields__
-        ):
+        elif type(receipt_value) is dict and frozenset(receipt_value) in {
+            frozenset(SignedCommissioningReceipt.__dataclass_fields__),
+            frozenset(SignedCommissioningReceipt.__dataclass_fields__) - {"protected_binding"},
+        }:
             receipt = SignedCommissioningReceipt.from_canonical_dict(receipt_value)
         else:
             receipt = CommissioningReceipt.from_canonical_dict(receipt_value)
@@ -1621,12 +1622,16 @@ def _commissioning_failure(
     snapshot: CloudRunSnapshot,
     artifact: CloudArtifact,
     trusted_receipt_key: TrustedCloudReceiptKey | None,
+    *,
+    require_protected_archive: bool = False,
 ) -> str | None:
     envelope = snapshot.commissioning_receipt
     if envelope is None:
         return "cloud_commissioning_receipt_missing"
     if isinstance(envelope, CommissioningReceipt):
         return "cloud_commissioning_signature_missing"
+    if require_protected_archive and envelope.protected_binding is None:
+        return "cloud_commissioning_protected_archive_missing"
     try:
         signature = envelope.signature
     except (ValueError, binascii.Error):
@@ -1652,6 +1657,14 @@ def _commissioning_failure(
     )
     if signature_failure is not None:
         return signature_failure
+    if envelope.protected_binding is not None:
+        retention_end = _utc(
+            "cloud_commissioning_archive_retain_until",
+            envelope.protected_binding.retain_until,
+        )
+        snapshot_time = _utc("cloud_commissioning_snapshot_observed_at", snapshot.observed_at)
+        if retention_end <= snapshot_time:
+            return "cloud_commissioning_archive_retention_expired"
     receipt = envelope.receipt
     bindings: tuple[tuple[object, object, str], ...] = (
         (receipt.repository, request.repository, "cloud_commissioning_repository_mismatch"),
@@ -1724,9 +1737,14 @@ def reconcile_cloud_run(
     snapshot: CloudRunSnapshot,
     *,
     trusted_receipt_key: TrustedCloudReceiptKey | None = None,
+    require_protected_archive: bool = False,
 ) -> CloudRunDecision:
     """Choose one restart-safe control-plane action without executing local work."""
-    if not isinstance(request, CloudRunRequest) or not isinstance(snapshot, CloudRunSnapshot):
+    if (
+        not isinstance(request, CloudRunRequest)
+        or not isinstance(snapshot, CloudRunSnapshot)
+        or type(require_protected_archive) is not bool
+    ):
         raise CloudExecutionError("invalid_cloud_reconciliation")
     if snapshot.local_fallback_command is not None and _HEAVY_LOCAL_RE.search(
         snapshot.local_fallback_command
@@ -1818,6 +1836,7 @@ def reconcile_cloud_run(
         snapshot,
         artifact,
         trusted_receipt_key,
+        require_protected_archive=require_protected_archive,
     )
     if commissioning_failure is not None:
         return _decision("blocked", commissioning_failure, request, snapshot)

@@ -172,13 +172,16 @@ class EvidenceArchive:
         try:
             provider = self.__store.create_immutable(key, payload, metadata)
         except ArchiveResponseLost:
-            provider = self.__store.head_immutable(key)
+            try:
+                provider = self.__store.head_immutable(key)
+            except Exception:
+                raise EvidenceArchiveError("evidence_archive_unavailable") from None
             if provider is None:
                 raise EvidenceArchiveError("evidence_archive_response_ambiguous") from None
         except EvidenceArchiveError:
             raise
-        except Exception as error:
-            raise EvidenceArchiveError("evidence_archive_unavailable") from error
+        except Exception:
+            raise EvidenceArchiveError("evidence_archive_unavailable") from None
         return self._validated_record(
             identity=identity,
             key=key,

@@ -206,13 +206,16 @@ class CloudReceiptSigner:
         try:
             result = self.__kms.sign_cloud_evidence(request)
         except SignResponseLost:
-            result = self.__kms.reconcile_cloud_signature(request.request_digest)
+            try:
+                result = self.__kms.reconcile_cloud_signature(request.request_digest)
+            except Exception:
+                raise CloudSignerError("cloud_signer_unavailable") from None
             if result is None:
                 raise CloudSignerError("cloud_signer_response_ambiguous") from None
         except CloudSignerError:
             raise
-        except Exception as error:
-            raise CloudSignerError("cloud_signer_unavailable") from error
+        except Exception:
+            raise CloudSignerError("cloud_signer_unavailable") from None
         self._validate_result(request, result)
         return SignedCommissioningReceipt(
             receipt=receipt,

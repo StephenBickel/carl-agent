@@ -4,13 +4,19 @@ import base64
 import hashlib
 from dataclasses import replace
 from datetime import UTC, datetime
+from types import SimpleNamespace
 
 import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
+from carl_bench import cloud_execution
 from carl_bench.canonical import canonical_json_bytes
-from carl_bench.cloud_execution import CommissioningReceipt
+from carl_bench.cloud_execution import (
+    CommissioningReceipt,
+    SignedCommissioningReceipt,
+    TrustedCloudReceiptKey,
+)
 from carl_bench.cloud_signer import (
     CloudReceiptSigner,
     KmsSignResult,
@@ -151,6 +157,18 @@ def test_archive_rejects_unbounded_or_invalid_caller_selected_identity() -> None
         replace(identity(), media_type="application/octet-stream")
 
 
+def test_archive_redacts_provider_exception_causes() -> None:
+    class ExplodingStore(FakeStore):
+        def create_immutable(self, key, payload, metadata):
+            raise RuntimeError("secret-token provider-body https://private.invalid")
+
+    archive = EvidenceArchive._for_testing(store=ExplodingStore(), clock=lambda: NOW)
+    with pytest.raises(EvidenceArchiveError) as caught:
+        archive.archive(identity(), ARCHIVE_PAYLOAD)
+    assert caught.value.__cause__ is None
+    assert str(caught.value) == "evidence_archive_unavailable"
+
+
 class FakeKms:
     def __init__(self, private_key: Ed25519PrivateKey) -> None:
         self.private_key = private_key
@@ -268,6 +286,25 @@ def test_signer_rejects_cross_repository_and_verifier_rejects_wrong_key_id() -> 
     assert verify_protected_receipt(signed, replace(policy, key_id="wrong"), archive) is not None
 
 
+def test_signer_redacts_raw_kms_exception_causes() -> None:
+    private = Ed25519PrivateKey.generate()
+
+    class ExplodingKms(FakeKms):
+        def sign_cloud_evidence(self, request):
+            raise RuntimeError("secret-token provider-body https://private.invalid")
+
+    archive = EvidenceArchive._for_testing(store=FakeStore(), clock=lambda: NOW).archive(
+        identity(), ARCHIVE_PAYLOAD
+    )
+    signer = CloudReceiptSigner._for_testing(
+        kms=ExplodingKms(private), policy=signing_policy(private)
+    )
+    with pytest.raises(ValueError) as caught:
+        signer.sign_commissioning_receipt(receipt(), archive)
+    assert caught.value.__cause__ is None
+    assert str(caught.value) == "cloud_signer_unavailable"
+
+
 def test_verifier_rejects_mutation_wrong_archive_and_malformed_signature() -> None:
     private = Ed25519PrivateKey.generate()
     policy = signing_policy(private)
@@ -288,3 +325,61 @@ def test_verifier_rejects_mutation_wrong_archive_and_malformed_signature() -> No
     assert verify_protected_receipt(signed, policy, changed_media) is not None
     malformed = replace(signed, signature_base64=base64.b64encode(b"x" * 64).decode())
     assert verify_protected_receipt(malformed, policy, archive) is not None
+
+
+def test_cloud_ingestion_rejects_protected_receipt_after_archive_retention() -> None:
+    private = Ed25519PrivateKey.generate()
+    policy = signing_policy(private)
+    archive = EvidenceArchive._for_testing(store=FakeStore(), clock=lambda: NOW).archive(
+        identity(), ARCHIVE_PAYLOAD
+    )
+    signed = CloudReceiptSigner._for_testing(
+        kms=FakeKms(private), policy=policy
+    ).sign_commissioning_receipt(receipt(), archive)
+    trusted = TrustedCloudReceiptKey(policy.key_id, policy.public_key_pem)
+    snapshot = SimpleNamespace(
+        commissioning_receipt=signed,
+        observed_at="2028-08-22T12:00:00Z",
+        run_id=42,
+        status="completed",
+        conclusion="success",
+    )
+    assert (
+        cloud_execution._commissioning_failure(None, snapshot, None, trusted)
+        == "cloud_commissioning_archive_retention_expired"
+    )
+
+
+def test_historical_signed_receipt_without_protected_binding_still_decodes() -> None:
+    private = Ed25519PrivateKey.generate()
+    legacy = SignedCommissioningReceipt(
+        receipt=receipt(),
+        receipt_digest=receipt().digest,
+        key_id="legacy-observer-v1",
+        signature_base64=base64.b64encode(
+            private.sign(canonical_json_bytes(receipt().to_canonical_dict()))
+        ).decode(),
+    ).to_canonical_dict()
+    legacy.pop("protected_binding")
+    decoded = SignedCommissioningReceipt.from_canonical_dict(legacy)
+    assert decoded.protected_binding is None
+    assert decoded.receipt == receipt()
+
+
+def test_remote_ingestion_mode_rejects_legacy_receipt_downgrade() -> None:
+    private = Ed25519PrivateKey.generate()
+    legacy = SignedCommissioningReceipt(
+        receipt=receipt(),
+        receipt_digest=receipt().digest,
+        key_id="legacy-observer-v1",
+        signature_base64=base64.b64encode(
+            private.sign(canonical_json_bytes(receipt().to_canonical_dict()))
+        ).decode(),
+    )
+    snapshot = SimpleNamespace(commissioning_receipt=legacy)
+    assert (
+        cloud_execution._commissioning_failure(
+            None, snapshot, None, None, require_protected_archive=True
+        )
+        == "cloud_commissioning_protected_archive_missing"
+    )
