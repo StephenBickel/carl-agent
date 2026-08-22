@@ -6,12 +6,47 @@ import os
 import socket
 import threading
 from collections.abc import Mapping
+from dataclasses import dataclass, field
 
 from carl_bench.live_gateway_http import _serve_loopback_listener
 from carl_bench.live_gateway_runner import ProtectedLiveGatewayRunner
 from carl_bench.live_runner_service import _serve_runner_listener
 
 _RUNNER_SOCKET_PATH = "/run/carl/live-runner.sock"
+
+
+@dataclass(slots=True)
+class _GatewayListenerMonitor:
+    thread: threading.Thread
+    failed: threading.Event
+    _errors: list[BaseException] = field(repr=False)
+
+    def check(self) -> None:
+        if self.failed.is_set():
+            error = self._errors[0] if self._errors else None
+            raise RuntimeError("live_gateway_listener_failed") from error
+        if not self.thread.is_alive():
+            raise RuntimeError("live_gateway_listener_failed")
+
+
+def _start_gateway_listener(*, listener_fd: int, server: object) -> _GatewayListenerMonitor:
+    failed = threading.Event()
+    errors: list[BaseException] = []
+
+    def serve() -> None:
+        try:
+            _serve_loopback_listener(listener_fd=listener_fd, server=server)
+        except BaseException as error:
+            errors.append(error)
+            failed.set()
+
+    thread = threading.Thread(
+        target=serve,
+        daemon=True,
+        name="carl-live-model-gateway",
+    )
+    thread.start()
+    return _GatewayListenerMonitor(thread=thread, failed=failed, _errors=errors)
 
 
 def _activation_descriptors(*, environment: Mapping[str, str], process_id: int) -> tuple[int, int]:
@@ -46,18 +81,16 @@ def main() -> int:
         environment=os.environ,
         process_id=os.getpid(),
     )
-    gateway_thread = threading.Thread(
-        target=_serve_loopback_listener,
-        kwargs={"listener_fd": gateway_descriptor, "server": runner.gateway_server},
-        daemon=True,
-        name="carl-live-model-gateway",
+    gateway_monitor = _start_gateway_listener(
+        listener_fd=gateway_descriptor,
+        server=runner.gateway_server,
     )
-    gateway_thread.start()
     with _runner_listener(runner_descriptor) as listener:
         _serve_runner_listener(
             listener=listener,
             allowed_client_uid=0,
             runner=runner,
+            health_check=gateway_monitor.check,
         )
     return 0
 

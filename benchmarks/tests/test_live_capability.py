@@ -5,6 +5,7 @@ import hashlib
 import json
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import ClassVar
 
 import pytest
@@ -946,6 +947,151 @@ def test_protected_authority_rejects_live_pair_without_signed_execution_receipts
 
     with pytest.raises(LiveEvaluationAuthorityError, match="live_execution_receipt_missing"):
         authority.seal_live_pair(missing)
+
+
+@pytest.mark.parametrize(
+    ("field", "drift"),
+    (
+        ("worker_uid", 63_001),
+        ("worker_gid", 63_001),
+        ("cgroup_unit", "drifted-live-gateway.service"),
+        ("cgroup_path", "/system.slice/carl-live-gateway.service/worker-drifted"),
+        ("argv", ("/srv/carl/checkouts/drifted/carl", "--bounded-live")),
+        ("timeout_seconds", 31),
+        ("executable_inode", 99_999),
+        ("executable_digest", digest("drifted-executable")),
+    ),
+)
+def test_evaluator_rejects_validly_signed_execution_actuals_drifted_from_commissioning(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    drift: object,
+) -> None:
+    from carl_bench.live_execution_policy import LiveExecutionCommissioningPolicy
+
+    pair, gateway = protected_pair(monkeypatch)
+    trial = pair.parent_trials[0]
+    assert trial.model_result is not None
+    assert trial.execution_receipt is not None
+    checkout_root = tmp_path / "checkouts"
+    checkout = checkout_root / PARENT
+    checkout.mkdir(parents=True)
+    executable = checkout / "carl"
+    executable.write_bytes(b"#!/bin/sh\nexit 0\n")
+    executable.chmod(0o755)
+    executable_details = executable.stat()
+    checkout_details = checkout.stat()
+    executable_identity = (
+        executable_details.st_dev,
+        executable_details.st_ino,
+        executable_details.st_size,
+        executable_details.st_mode,
+        executable_details.st_mtime_ns,
+    )
+    executable_digest = hashlib.sha256(executable.read_bytes()).hexdigest()
+    checkout_digest = hashlib.sha256(
+        canonical_json_bytes(
+            {
+                "commit": PARENT,
+                "executable_digest": executable_digest,
+                "executable_identity": list(executable_identity),
+                "root_device": checkout_details.st_dev,
+                "root_inode": checkout_details.st_ino,
+                "tree": pair.identity.parent_tree,
+            }
+        )
+    ).hexdigest()
+    execution_digest = hashlib.sha256(
+        canonical_json_bytes(
+            {
+                "attempt": trial.attempt,
+                "checkout_digest": checkout_digest,
+                "pair_request_digest": pair.identity.request_digest,
+                "subject": "parent",
+                "task_id": trial.task.task_id,
+            }
+        )
+    ).hexdigest()
+    exact_fields = trial.execution_receipt.unsigned_canonical_dict()
+    exact_fields.update(
+        {
+            "argv": (str(executable), "--bounded-live"),
+            "checkout_device": checkout_details.st_dev,
+            "checkout_digest": checkout_digest,
+            "checkout_inode": checkout_details.st_ino,
+            "cgroup_path": (
+                f"/system.slice/carl-live-gateway.service/worker-{execution_digest[:32]}"
+            ),
+            "cgroup_unit": "carl-live-gateway.service",
+            "executable_device": executable_details.st_dev,
+            "executable_digest": executable_digest,
+            "executable_inode": executable_details.st_ino,
+            "executable_mode": executable_details.st_mode,
+            "executable_mtime_ns": executable_details.st_mtime_ns,
+            "executable_size": executable_details.st_size,
+            "timeout_seconds": 30,
+            "worker_gid": 62_001,
+            "worker_uid": 62_001,
+        }
+    )
+    commissioning = LiveExecutionCommissioningPolicy._for_testing(
+        checkout_root=checkout_root,
+        executable_relative_path="carl",
+        arguments=("--bounded-live",),
+        timeout_seconds=30,
+        workers=((62_001, 62_001), (62_002, 62_002)),
+        cgroup_unit="carl-live-gateway.service",
+    )
+
+    class Isolation:
+        def begin(self, execution_digest: str) -> object:
+            del execution_digest
+            return object()
+
+    authority = ProtectedLiveEvaluationAuthority._for_testing(
+        archive=_ProtectedArchive(),
+        gateway=gateway,
+        grader=_ProtectedFixtureGrader(),
+        clock=lambda: NOW,
+        deterministic_key=bytes(range(32)),
+        live_key=bytes(range(32, 64)),
+        execution_key=EXECUTION_KEY,
+        result_key=bytes(reversed(range(32))),
+        grader_key=b"G" * 32,
+        worker_identities=((62_001, 62_001), (62_002, 62_002)),
+        worker_isolation=Isolation(),
+        execution_commissioning=commissioning,
+    )
+    exact = sign_execution_receipt(fields=exact_fields, key=EXECUTION_KEY)
+    verification_arguments = {
+        "identity": pair.identity,
+        "policy": pair.policy,
+        "task": trial.task,
+        "subject": "parent",
+        "attempt": trial.attempt,
+        "seed": trial.seed,
+        "model_result_digest": model_result_digest(trial.model_result),
+        "model_request_digest": trial.model_result.request_digest,
+        "model_output_digest": trial.model_result.output_digest,
+        "response_id": trial.model_result.response_id,
+    }
+    assert (
+        authority._verify_trial_execution_receipt(
+            receipt=exact,
+            **verification_arguments,
+        )
+        == exact
+    )
+    drifted_fields = dict(exact_fields)
+    drifted_fields[field] = drift
+    drifted = sign_execution_receipt(fields=drifted_fields, key=EXECUTION_KEY)
+
+    with pytest.raises(LiveEvaluationAuthorityError, match="live_execution_receipt_invalid"):
+        authority._verify_trial_execution_receipt(
+            receipt=drifted,
+            **verification_arguments,
+        )
 
 
 def test_promotion_verifier_rejects_authenticated_archive_with_omitted_execution_receipt(

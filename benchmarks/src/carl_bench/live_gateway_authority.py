@@ -19,6 +19,7 @@ from carl_bench.live_capability import (
     LivePairPolicy,
     LiveTaskIdentity,
 )
+from carl_bench.live_execution_receipt import ProtectedLiveExecutionResult
 from carl_bench.live_gateway_store import LiveGatewayStateError, SQLiteLiveGatewayStateStore
 from carl_bench.openai_gateway import (
     OpenAIGatewayError,
@@ -175,6 +176,14 @@ class _GatewayState(Protocol):
 
     def take_result(self, token_digest: str) -> tuple[dict[str, Any], dict[str, Any]]: ...
 
+    def peek_result(self, token_digest: str) -> tuple[dict[str, Any], dict[str, Any]]: ...
+
+    def load_sealed_bundle(self, runner_request_digest: str) -> dict[str, Any] | None: ...
+
+    def seal_result_bundle(
+        self, token_digest: str, *, runner_request_digest: str, bundle: dict[str, Any]
+    ) -> dict[str, Any]: ...
+
     def record_infrastructure_invalid(self, token_digest: str, code: str) -> None: ...
 
     def invalidate_execution(self, token_digest: str, code: str) -> None: ...
@@ -330,6 +339,8 @@ class _MemoryGatewayState:
             "collected": False,
             "infrastructure_code": None,
             "provider_request_digest": None,
+            "runner_request_digest": None,
+            "sealed_bundle": None,
         }
 
     def load_grant(self, token_digest: str) -> dict[str, Any]:
@@ -407,6 +418,55 @@ class _MemoryGatewayState:
             raise LiveGatewayStateError("live_gateway_result_unavailable")
         row["collected"] = True
         return row["grant"], row["result"]
+
+    def peek_result(self, token_digest: str) -> tuple[dict[str, Any], dict[str, Any]]:
+        row = self.rows.get(token_digest)
+        if row is None:
+            raise LiveGatewayStateError("live_gateway_capability_invalid")
+        if row["claim_state"] != "completed" or row["result"] is None:
+            raise LiveGatewayStateError("live_gateway_result_unavailable")
+        return row["grant"], row["result"]
+
+    def load_sealed_bundle(self, runner_request_digest: str) -> dict[str, Any] | None:
+        for row in self.rows.values():
+            if row["runner_request_digest"] == runner_request_digest:
+                if row["sealed_bundle"] is None:
+                    raise LiveGatewayStateError("live_gateway_bundle_invalid")
+                return row["sealed_bundle"]
+        return None
+
+    def seal_result_bundle(
+        self,
+        token_digest: str,
+        *,
+        runner_request_digest: str,
+        bundle: dict[str, Any],
+    ) -> dict[str, Any]:
+        row = self.rows.get(token_digest)
+        if row is None:
+            raise LiveGatewayStateError("live_gateway_capability_invalid")
+        if row["sealed_bundle"] is not None:
+            if (
+                row["runner_request_digest"] != runner_request_digest
+                or row["sealed_bundle"] != bundle
+            ):
+                raise LiveGatewayStateError("live_gateway_bundle_conflict")
+            return row["sealed_bundle"]
+        if (
+            row["collected"]
+            or row["claim_state"] != "completed"
+            or row["result"] is None
+            or bundle.get("model_result") != row["result"]
+            or any(
+                existing["runner_request_digest"] == runner_request_digest
+                for existing in self.rows.values()
+            )
+        ):
+            raise LiveGatewayStateError("live_gateway_bundle_conflict")
+        row["runner_request_digest"] = runner_request_digest
+        row["sealed_bundle"] = bundle
+        row["collected"] = True
+        return bundle
 
     def record_infrastructure_invalid(self, token_digest: str, code: str) -> None:
         row = self.rows.get(token_digest)
@@ -1000,6 +1060,19 @@ class ProtectedModelGatewayServer:
             grant_document, result_document = self._state.take_result(token_digest)
         except LiveGatewayStateError as error:
             raise LiveGatewayAuthorityError(error.code) from error
+        return self._validated_completed_result(
+            capability=capability,
+            grant_document=grant_document,
+            result_document=result_document,
+        )
+
+    def _validated_completed_result(
+        self,
+        *,
+        capability: BoundedModelGatewayCapability,
+        grant_document: dict[str, Any],
+        result_document: dict[str, Any],
+    ) -> ProtectedOpenAIModelResult:
         grant = _grant_from_document(grant_document)
         if (
             capability.pair_request_digest != grant.identity.request_digest
@@ -1015,6 +1088,72 @@ class ProtectedModelGatewayServer:
             raise LiveGatewayAuthorityError("live_model_provenance_invalid") from error
         if not verified:
             raise LiveGatewayAuthorityError("live_model_provenance_invalid")
+        return result
+
+    def peek_completed_result(
+        self, capability: BoundedModelGatewayCapability
+    ) -> ProtectedOpenAIModelResult:
+        """Read a completed result without consuming it before bundle sealing."""
+        if not isinstance(capability, BoundedModelGatewayCapability):
+            raise LiveGatewayAuthorityError("live_gateway_capability_invalid")
+        token_digest = hashlib.sha256(capability.token.encode()).hexdigest()
+        try:
+            grant_document, result_document = self._state.peek_result(token_digest)
+        except LiveGatewayStateError as error:
+            raise LiveGatewayAuthorityError(error.code) from error
+        return self._validated_completed_result(
+            capability=capability,
+            grant_document=grant_document,
+            result_document=result_document,
+        )
+
+    def replay_sealed_execution_bundle(
+        self, runner_request_digest: str
+    ) -> ProtectedLiveExecutionResult | None:
+        _digest(runner_request_digest, "live_gateway_bundle_invalid")
+        try:
+            document = self._state.load_sealed_bundle(runner_request_digest)
+        except LiveGatewayStateError as error:
+            raise LiveGatewayAuthorityError(error.code) from error
+        if document is None:
+            return None
+        try:
+            bundle = ProtectedLiveExecutionResult.from_canonical_dict(document)
+            verified = self._gateway.verify_protected_result(bundle.model_result)
+        except Exception as error:
+            raise LiveGatewayAuthorityError("live_gateway_bundle_invalid") from error
+        if not verified:
+            raise LiveGatewayAuthorityError("live_gateway_bundle_invalid")
+        return bundle
+
+    def seal_execution_bundle(
+        self,
+        capability: BoundedModelGatewayCapability,
+        *,
+        runner_request_digest: str,
+        bundle: ProtectedLiveExecutionResult,
+    ) -> ProtectedLiveExecutionResult:
+        if not isinstance(capability, BoundedModelGatewayCapability) or not isinstance(
+            bundle, ProtectedLiveExecutionResult
+        ):
+            raise LiveGatewayAuthorityError("live_gateway_bundle_invalid")
+        _digest(runner_request_digest, "live_gateway_bundle_invalid")
+        completed = self.peek_completed_result(capability)
+        if bundle.model_result != completed:
+            raise LiveGatewayAuthorityError("live_gateway_bundle_conflict")
+        token_digest = hashlib.sha256(capability.token.encode()).hexdigest()
+        try:
+            sealed = self._state.seal_result_bundle(
+                token_digest,
+                runner_request_digest=runner_request_digest,
+                bundle=bundle.to_canonical_dict(),
+            )
+            result = ProtectedLiveExecutionResult.from_canonical_dict(sealed)
+        except (LiveGatewayStateError, ValueError) as error:
+            code = getattr(error, "code", "live_gateway_bundle_invalid")
+            raise LiveGatewayAuthorityError(code) from error
+        if result != bundle:
+            raise LiveGatewayAuthorityError("live_gateway_bundle_conflict")
         return result
 
     def reconcile_provider_result(self, token: str, result: ProtectedOpenAIModelResult) -> None:

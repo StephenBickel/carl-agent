@@ -143,7 +143,9 @@ class SQLiteLiveGatewayStateStore:
                     claim_started_at INTEGER,
                     claim_expires_at INTEGER,
                     provider_request_digest TEXT,
-                    dispatched_at INTEGER
+                    dispatched_at INTEGER,
+                    runner_request_digest TEXT UNIQUE,
+                    sealed_bundle_json TEXT
                 );
                 """
             )
@@ -158,6 +160,8 @@ class SQLiteLiveGatewayStateStore:
                 "claim_expires_at": "INTEGER",
                 "provider_request_digest": "TEXT",
                 "dispatched_at": "INTEGER",
+                "runner_request_digest": "TEXT",
+                "sealed_bundle_json": "TEXT",
             }
             for name, definition in additions.items():
                 if name not in columns:
@@ -185,6 +189,11 @@ class SQLiteLiveGatewayStateStore:
                            infrastructure_code, 'gateway_legacy_dispatch_ambiguous'
                        )
                    WHERE claim_state = 'in_progress'"""
+            )
+            connection.execute(
+                """CREATE UNIQUE INDEX IF NOT EXISTS gateway_grants_runner_request
+                   ON gateway_grants(runner_request_digest)
+                   WHERE runner_request_digest IS NOT NULL"""
             )
         except sqlite3.Error as error:
             raise LiveGatewayStateError("live_gateway_state_unavailable") from error
@@ -449,6 +458,107 @@ class SQLiteLiveGatewayStateStore:
                 _decode(row["grant_json"], "live_gateway_grant_invalid"),
                 _decode(row["result_json"], "live_gateway_result_invalid"),
             )
+        except LiveGatewayStateError:
+            connection.rollback()
+            raise
+        except sqlite3.Error as error:
+            connection.rollback()
+            raise LiveGatewayStateError("live_gateway_state_unavailable") from error
+        finally:
+            connection.close()
+
+    def peek_result(self, token_digest: str) -> tuple[dict[str, Any], dict[str, Any]]:
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                """SELECT grant_json, result_json, claim_state
+                   FROM gateway_grants WHERE token_digest = ?""",
+                (token_digest,),
+            ).fetchone()
+            if row is None:
+                raise LiveGatewayStateError("live_gateway_capability_invalid")
+            if row["claim_state"] != "completed" or row["result_json"] is None:
+                raise LiveGatewayStateError("live_gateway_result_unavailable")
+            return (
+                _decode(row["grant_json"], "live_gateway_grant_invalid"),
+                _decode(row["result_json"], "live_gateway_result_invalid"),
+            )
+        except LiveGatewayStateError:
+            raise
+        except sqlite3.Error as error:
+            raise LiveGatewayStateError("live_gateway_state_unavailable") from error
+        finally:
+            connection.close()
+
+    def load_sealed_bundle(self, runner_request_digest: str) -> dict[str, Any] | None:
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                """SELECT sealed_bundle_json FROM gateway_grants
+                   WHERE runner_request_digest = ?""",
+                (runner_request_digest,),
+            ).fetchone()
+            if row is None:
+                return None
+            if row["sealed_bundle_json"] is None:
+                raise LiveGatewayStateError("live_gateway_bundle_invalid")
+            return _decode(row["sealed_bundle_json"], "live_gateway_bundle_invalid")
+        except LiveGatewayStateError:
+            raise
+        except sqlite3.Error as error:
+            raise LiveGatewayStateError("live_gateway_state_unavailable") from error
+        finally:
+            connection.close()
+
+    def seal_result_bundle(
+        self,
+        token_digest: str,
+        *,
+        runner_request_digest: str,
+        bundle: dict[str, Any],
+    ) -> dict[str, Any]:
+        payload = _canonical_text(bundle, "live_gateway_bundle_invalid")
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """SELECT result_json, collected, claim_state, runner_request_digest,
+                          sealed_bundle_json
+                   FROM gateway_grants WHERE token_digest = ?""",
+                (token_digest,),
+            ).fetchone()
+            if row is None:
+                raise LiveGatewayStateError("live_gateway_capability_invalid")
+            if row["sealed_bundle_json"] is not None:
+                if (
+                    row["runner_request_digest"] != runner_request_digest
+                    or row["sealed_bundle_json"] != payload
+                ):
+                    raise LiveGatewayStateError("live_gateway_bundle_conflict")
+                connection.commit()
+                return _decode(row["sealed_bundle_json"], "live_gateway_bundle_invalid")
+            if (
+                row["collected"]
+                or row["claim_state"] != "completed"
+                or row["result_json"] is None
+                or type(bundle.get("model_result")) is not dict
+                or _canonical_text(bundle["model_result"], "live_gateway_bundle_invalid")
+                != row["result_json"]
+            ):
+                raise LiveGatewayStateError("live_gateway_bundle_conflict")
+            updated = connection.execute(
+                """UPDATE gateway_grants
+                   SET runner_request_digest = ?, sealed_bundle_json = ?, collected = 1
+                   WHERE token_digest = ? AND collected = 0 AND sealed_bundle_json IS NULL""",
+                (runner_request_digest, payload, token_digest),
+            )
+            if updated.rowcount != 1:
+                raise LiveGatewayStateError("live_gateway_bundle_conflict")
+            connection.commit()
+            return _decode(payload, "live_gateway_bundle_invalid")
+        except sqlite3.IntegrityError as error:
+            connection.rollback()
+            raise LiveGatewayStateError("live_gateway_bundle_conflict") from error
         except LiveGatewayStateError:
             connection.rollback()
             raise

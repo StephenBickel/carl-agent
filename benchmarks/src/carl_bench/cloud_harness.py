@@ -744,17 +744,32 @@ def _bounded_process(
     except Exception as error:
         raise CloudHarnessError("subject_isolation_not_commissioned") from error
     finally:
-        if process is not None:
-            _cleanup_process_group(process)
-        if isolation_scope is not None:
+        cleanup_errors: list[Exception] = []
+        try:
+            if process is not None:
+                try:
+                    _cleanup_process_group(process)
+                except Exception as error:
+                    cleanup_errors.append(error)
+        finally:
             try:
-                isolation_scope.cleanup_and_verify_empty()
-            except Exception as error:
-                raise CloudHarnessError("subject_isolation_cleanup_failed") from error
-        for descriptor in (read_descriptor, write_descriptor, executable_descriptor):
-            if descriptor >= 0:
-                with contextlib.suppress(OSError):
-                    os.close(descriptor)
+                if isolation_scope is not None:
+                    try:
+                        isolation_scope.cleanup_and_verify_empty()
+                    except Exception as error:
+                        cleanup_errors.append(CloudHarnessError("subject_isolation_cleanup_failed"))
+                        cleanup_errors[-1].__cause__ = error
+            finally:
+                for descriptor in (read_descriptor, write_descriptor, executable_descriptor):
+                    if descriptor >= 0:
+                        with contextlib.suppress(OSError):
+                            os.close(descriptor)
+        if len(cleanup_errors) == 1:
+            raise cleanup_errors[0]
+        if cleanup_errors:
+            raise CloudHarnessError("subject_cleanup_failed") from ExceptionGroup(
+                "subject cleanup failures", cleanup_errors
+            )
 
 
 def _observe(

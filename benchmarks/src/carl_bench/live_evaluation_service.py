@@ -31,7 +31,7 @@ from carl_bench.unix_socket_security import (
     socket_identity_at,
 )
 
-_SOCKET_PATH = Path("/run/carl/live-evaluator.sock")
+_SOCKET_PATH = Path("/run/carl-live-evaluator/live-evaluator.sock")
 _CONNECTION_TIMEOUT_SECONDS = 2.0
 _ACTIVATION_PROBE_TIMEOUT_SECONDS = 1.0
 

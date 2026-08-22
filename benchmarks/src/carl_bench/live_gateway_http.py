@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import socket
+from contextlib import suppress
 from typing import Any
 
 from carl_bench.canonical import canonical_json_bytes
@@ -185,7 +186,9 @@ def _serve_loopback_listener(
             connection, _ = listener.accept()
             with connection:
                 connection.settimeout(30)
-                _serve_connection(connection, server)
+                # A reset or broken pipe belongs to this untrusted client only.
+                with suppress(OSError):
+                    _serve_connection(connection, server)
             served += 1
     finally:
         listener.close()

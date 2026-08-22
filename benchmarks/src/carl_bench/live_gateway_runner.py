@@ -21,12 +21,14 @@ from carl_bench.live_execution_receipt import (
     ProtectedLiveExecutionResult,
     model_result_digest,
     sign_execution_receipt,
+    verify_execution_receipt,
 )
 from carl_bench.live_gateway_authority import (
     LiveGatewayAuthorityError,
     ProtectedExecutionObservation,
     ProtectedModelGatewayServer,
 )
+from carl_bench.live_runner_ipc import ProtectedLiveRunnerRequest
 from carl_bench.live_worker_isolation import CgroupV2WorkerIsolation, LiveWorkerIsolationError
 
 _MAX_WORKER_SECONDS = 3_600
@@ -338,6 +340,25 @@ class ProtectedLiveGatewayRunner:
             or any(not isinstance(item, str) or "\x00" in item for item in arguments)
         ):
             raise LiveGatewayAuthorityError("live_worker_request_invalid")
+        try:
+            runner_request_digest = ProtectedLiveRunnerRequest.create(
+                identity=identity,
+                policy=policy,
+                task=task,
+                subject=subject,
+                attempt=attempt,
+                checkout=checkout,
+                executable=executable,
+                arguments=tuple(arguments),
+                timeout_seconds=timeout_seconds,
+            ).digest
+        except ValueError as error:
+            raise LiveGatewayAuthorityError("live_worker_request_invalid") from error
+        replayed = self._server.replay_sealed_execution_bundle(runner_request_digest)
+        if replayed is not None:
+            if not verify_execution_receipt(replayed.execution_receipt, key=self._execution_key):
+                raise LiveGatewayAuthorityError("live_gateway_bundle_invalid")
+            return replayed
         expected_commit = (
             identity.parent_commit if subject == "parent" else identity.candidate_commit
         )
@@ -493,7 +514,7 @@ class ProtectedLiveGatewayRunner:
             except LiveWorkerIsolationError as error:
                 invalidate_execution("runner_isolation_cleanup_failed")
                 raise LiveGatewayAuthorityError(error.code) from error
-            model_result = self._server.take_completed_result(prepared)
+            model_result = self._server.peek_completed_result(prepared)
             try:
                 isolation_observation = isolation_scope.receipt_observation()
             except Exception as error:
@@ -539,12 +560,17 @@ class ProtectedLiveGatewayRunner:
                 "model_output_digest": model_result.output_digest,
                 "response_id": model_result.response_id,
             }
-            return ProtectedLiveExecutionResult(
+            bundle = ProtectedLiveExecutionResult(
                 model_result=model_result,
                 execution_receipt=sign_execution_receipt(
                     fields=fields,
                     key=self._execution_key,
                 ),
+            )
+            return self._server.seal_execution_bundle(
+                prepared,
+                runner_request_digest=runner_request_digest,
+                bundle=bundle,
             )
         except OSError as error:
             if process is not None:

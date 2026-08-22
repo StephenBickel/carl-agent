@@ -20,8 +20,6 @@ ProtectKernelTunables=yes
 ProtectSystem=strict
 ReadOnlyPaths=/srv/carl/checkouts
 RestrictAddressFamilies=AF_UNIX
-RuntimeDirectory=carl
-RuntimeDirectoryMode=0700
 UMask=0077
 
 [Install]

@@ -592,6 +592,92 @@ def test_runner_owns_launch_observation_capability_and_cross_process_result(
     assert thread.is_alive() is False
 
 
+@pytest.mark.skipif(os.name == "nt", reason="requires POSIX worker execution")
+def test_runner_exact_request_replays_same_durable_execution_bundle_after_restart(
+    tmp_path: Path,
+) -> None:
+    from carl_bench.live_gateway_store import SQLiteLiveGatewayStateStore
+
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(2)
+    port = listener.getsockname()[1]
+    endpoint = f"http://127.0.0.1:{port}/v1/evaluate"
+    executable, parent_commit, parent_tree = _checkout(tmp_path / "parent", port)
+    identity, policy, task = _case(
+        endpoint=endpoint,
+        parent_commit=parent_commit,
+        parent_tree=parent_tree,
+    )
+    state_path = tmp_path / "gateway.sqlite3"
+    first_server = ProtectedModelGatewayServer._for_testing(
+        gateway=_Gateway(),
+        endpoint=endpoint,
+        token_source=lambda: "runner-owned-token-1234567890",
+        state=SQLiteLiveGatewayStateStore._for_testing(state_path),
+    )
+    first_runner = ProtectedLiveGatewayRunner._for_testing(
+        server=first_server,
+        workers=((os.geteuid(), os.getegid()), (os.geteuid() + 1, os.getegid() + 1)),
+        isolation=_FakeIsolation(),
+        execution_key=b"E" * 32,
+    )
+    thread = threading.Thread(
+        target=_serve_loopback_listener,
+        kwargs={
+            "listener_fd": listener.fileno(),
+            "server": first_server,
+            "maximum_connections": 1,
+        },
+        daemon=True,
+    )
+    thread.start()
+    try:
+        first = first_runner.execute_worker(
+            identity=identity,
+            policy=policy,
+            task=task,
+            subject="parent",
+            attempt=1,
+            checkout=tmp_path / "parent",
+            executable=executable,
+            timeout_seconds=5,
+        )
+    finally:
+        thread.join(3)
+        listener.close()
+
+    # An exact IPC replay returns the sealed bundle before observing or executing
+    # the now-dirty checkout, and it does not require another provider connection.
+    (tmp_path / "parent" / "post-delivery-mutation").write_text("dirty", encoding="utf-8")
+    replay_scope = _FakeIsolationScope()
+    restarted = ProtectedLiveGatewayRunner._for_testing(
+        server=ProtectedModelGatewayServer._for_testing(
+            gateway=_Gateway(),
+            endpoint=endpoint,
+            token_source=lambda: "must-not-be-issued-1234567890",
+            state=SQLiteLiveGatewayStateStore._for_testing(state_path),
+        ),
+        workers=((os.geteuid(), os.getegid()), (os.geteuid() + 1, os.getegid() + 1)),
+        isolation=_FakeIsolation(replay_scope),
+        execution_key=b"E" * 32,
+    )
+
+    replayed = restarted.execute_worker(
+        identity=identity,
+        policy=policy,
+        task=task,
+        subject="parent",
+        attempt=1,
+        checkout=tmp_path / "parent",
+        executable=executable,
+        timeout_seconds=5,
+    )
+
+    assert replayed == first
+    assert replay_scope.process_id == -1
+
+
 @pytest.mark.skipif(os.name == "nt", reason="requires POSIX process-group semantics")
 def test_runner_reaps_candidate_background_process_tree(
     tmp_path: Path,
@@ -927,3 +1013,72 @@ def test_gateway_service_requires_exact_two_socket_activation(
             environment=environment,
             process_id=os.getpid(),
         )
+
+
+def test_gateway_listener_contains_connection_reset_and_keeps_accepting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from carl_bench import live_gateway_http
+
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(2)
+    port = listener.getsockname()[1]
+    server = ProtectedModelGatewayServer._for_testing(
+        gateway=_Gateway(),
+        endpoint=f"http://127.0.0.1:{port}/v1/evaluate",
+        token_source=lambda: "unused-listener-token-1234567890",
+    )
+    calls = 0
+
+    def flaky_connection(connection: socket.socket, actual_server: object) -> None:
+        nonlocal calls
+        del connection
+        assert actual_server is server
+        calls += 1
+        if calls == 1:
+            raise ConnectionResetError("client reset")
+
+    monkeypatch.setattr(live_gateway_http, "_serve_connection", flaky_connection)
+    thread = threading.Thread(
+        target=live_gateway_http._serve_loopback_listener,
+        kwargs={
+            "listener_fd": listener.fileno(),
+            "server": server,
+            "maximum_connections": 2,
+        },
+        daemon=True,
+    )
+    thread.start()
+    try:
+        for _ in range(2):
+            with socket.create_connection(("127.0.0.1", port), timeout=2):
+                pass
+        thread.join(3)
+    finally:
+        listener.close()
+
+    assert calls == 2
+    assert thread.is_alive() is False
+
+
+def test_gateway_listener_thread_failure_is_fatal_to_service(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from carl_bench import live_gateway_service
+
+    def fail_listener(**kwargs: object) -> None:
+        del kwargs
+        raise RuntimeError("listener died")
+
+    monkeypatch.setattr(live_gateway_service, "_serve_loopback_listener", fail_listener)
+    monitor = live_gateway_service._start_gateway_listener(
+        listener_fd=3,
+        server=object(),
+    )
+    assert monitor.failed.wait(2)
+
+    with pytest.raises(RuntimeError, match="live_gateway_listener_failed") as raised:
+        monitor.check()
+
+    assert isinstance(raised.value.__cause__, RuntimeError)

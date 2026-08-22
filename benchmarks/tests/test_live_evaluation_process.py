@@ -184,6 +184,7 @@ def test_protected_service_constructs_its_pinned_archive_gateway_clock_and_keys(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from carl_bench.live_evaluation_service import _load_protected_authority
+    from carl_bench.live_execution_policy import LiveExecutionCommissioningPolicy
     from carl_bench.live_grader import ProtectedGraderBundle
     from carl_bench.live_worker_isolation import CgroupV2WorkerIsolation
 
@@ -197,11 +198,23 @@ def test_protected_service_constructs_its_pinned_archive_gateway_clock_and_keys(
             del execution_digest
             return object()
 
+    class ExecutionCommissioning:
+        workers = ((62_001, 62_001), (62_002, 62_002))
+
+        def verifies(self, receipt: object) -> bool:
+            del receipt
+            return True
+
     monkeypatch.setattr(ProtectedGraderBundle, "from_protected_process", lambda: Grader())
     monkeypatch.setattr(
         CgroupV2WorkerIsolation,
         "from_live_evaluator_process",
         lambda: Isolation(),
+    )
+    monkeypatch.setattr(
+        LiveExecutionCommissioningPolicy,
+        "from_protected_process",
+        lambda *, workers: ExecutionCommissioning(),
     )
 
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test-1234567890123456")
@@ -281,13 +294,12 @@ def test_live_evaluator_systemd_contract_commissions_deterministic_cgroup_isolat
         "ProtectSystem": "strict",
         "ReadOnlyPaths": "/srv/carl/checkouts",
         "RestrictAddressFamilies": "AF_UNIX",
-        "RuntimeDirectory": "carl",
-        "RuntimeDirectoryMode": "0700",
         "UMask": "0077",
     }
     assert socket_unit["Socket"] == {
         "FileDescriptorName": "live-evaluator",
-        "ListenStream": "/run/carl/live-evaluator.sock",
+        "ListenStream": "/run/carl-live-evaluator/live-evaluator.sock",
+        "DirectoryMode": "0700",
         "SocketMode": "0600",
         "Service": "carl-live-evaluator.service",
     }

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import socket
 import struct
+from collections.abc import Callable
 
 from carl_bench.canonical import canonical_json_bytes
 from carl_bench.live_execution_receipt import ProtectedLiveExecutionResult
@@ -82,10 +83,18 @@ def _serve_runner_listener(
     allowed_client_uid: int,
     runner: object,
     maximum_connections: int | None = None,
+    health_check: Callable[[], None] | None = None,
 ) -> None:
+    if health_check is not None:
+        listener.settimeout(0.5)
     served = 0
     while maximum_connections is None or served < maximum_connections:
-        connection, _ = listener.accept()
+        if health_check is not None:
+            health_check()
+        try:
+            connection, _ = listener.accept()
+        except TimeoutError:
+            continue
         with connection:
             if _peer_uid(connection) != allowed_client_uid:
                 continue

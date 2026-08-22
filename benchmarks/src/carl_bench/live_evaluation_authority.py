@@ -301,6 +301,7 @@ class ProtectedLiveEvaluationAuthority:
         "_clock",
         "_det_key",
         "_deterministic_runs",
+        "_execution_commissioning",
         "_execution_key",
         "_gateway",
         "_grader",
@@ -350,6 +351,7 @@ class ProtectedLiveEvaluationAuthority:
     def from_protected_process(cls) -> ProtectedLiveEvaluationAuthority:
         """Construct every production dependency from fixed protected-process policy."""
         from carl_bench.live_archive_client import ProtectedArchiveSocketReader
+        from carl_bench.live_execution_policy import LiveExecutionCommissioningPolicy
         from carl_bench.live_grader import ProtectedGraderBundle
         from carl_bench.live_worker_isolation import CgroupV2WorkerIsolation
 
@@ -383,6 +385,9 @@ class ProtectedLiveEvaluationAuthority:
             grader_key=cls._environment_key("CARL_GRADER_ATTESTATION_KEY_B64"),
             worker_identities=worker_identities,
             worker_isolation=CgroupV2WorkerIsolation.from_live_evaluator_process(),
+            execution_commissioning=LiveExecutionCommissioningPolicy.from_protected_process(
+                workers=worker_identities
+            ),
         )
 
     @classmethod
@@ -400,6 +405,7 @@ class ProtectedLiveEvaluationAuthority:
         grader_key: bytes | None = None,
         worker_identities: tuple[tuple[int, int], tuple[int, int]] | None = None,
         worker_isolation: object | None = None,
+        execution_commissioning: object | None = None,
     ) -> ProtectedLiveEvaluationAuthority:
         if (
             not callable(getattr(archive, "read_exact", None))
@@ -420,6 +426,7 @@ class ProtectedLiveEvaluationAuthority:
             grader_key=grader_key,
             worker_identities=worker_identities,
             worker_isolation=worker_isolation,
+            execution_commissioning=execution_commissioning,
         )
 
     @classmethod
@@ -437,11 +444,20 @@ class ProtectedLiveEvaluationAuthority:
         grader_key: bytes | None,
         worker_identities: tuple[tuple[int, int], tuple[int, int]] | None,
         worker_isolation: object | None,
+        execution_commissioning: object | None,
     ) -> ProtectedLiveEvaluationAuthority:
         if worker_identities is not None and worker_identities[0][0] == worker_identities[1][0]:
             raise LiveEvaluationAuthorityError("live_worker_identity_invalid")
         if worker_identities is not None and not callable(getattr(worker_isolation, "begin", None)):
             raise LiveEvaluationAuthorityError("subject_isolation_not_commissioned")
+        if (worker_identities is None) != (execution_commissioning is None) or (
+            execution_commissioning is not None
+            and (
+                not callable(getattr(execution_commissioning, "verifies", None))
+                or getattr(execution_commissioning, "workers", None) != worker_identities
+            )
+        ):
+            raise LiveEvaluationAuthorityError("live_execution_commissioning_invalid")
         if (grader is None) != (grader_key is None) or (
             grader is not None and not callable(getattr(grader, "grade", None))
         ):
@@ -465,6 +481,7 @@ class ProtectedLiveEvaluationAuthority:
         value._det_key = deterministic_key
         value._live_key = live_key
         value._execution_key = execution_key
+        value._execution_commissioning = execution_commissioning
         value._result_key = result_key
         value._worker_identities = worker_identities
         value._worker_isolation = worker_isolation
@@ -1020,6 +1037,10 @@ class ProtectedLiveEvaluationAuthority:
             or receipt.model_request_digest != model_request_digest
             or receipt.model_output_digest != model_output_digest
             or (response_id is not None and receipt.response_id != response_id)
+            or (
+                self._execution_commissioning is not None
+                and not self._execution_commissioning.verifies(receipt)
+            )
         ):
             raise LiveEvaluationAuthorityError("live_execution_receipt_invalid")
         return receipt

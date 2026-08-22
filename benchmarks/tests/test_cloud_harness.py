@@ -788,6 +788,53 @@ def test_protected_bounded_process_cleans_scope_when_attach_fails(tmp_path: Path
     assert isolation.scope.cleaned is True
 
 
+def test_protected_bounded_process_always_cleans_cgroup_when_process_cleanup_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    executable = _subject(tmp_path / "subject", version_ok=True)
+
+    class Scope:
+        cleaned = False
+        attestation_digest = hashlib.sha256(b"cleanup-scope").hexdigest()
+
+        def attach_and_observe(
+            self, process_id: int, *, expected_uid: int, expected_gid: int
+        ) -> tuple[int, int]:
+            assert process_id > 0
+            return expected_uid, expected_gid
+
+        def cleanup_and_verify_empty(self) -> None:
+            self.cleaned = True
+
+    class Isolation:
+        def __init__(self) -> None:
+            self.scope = Scope()
+
+        def begin(self, execution_digest: str) -> Scope:
+            assert len(execution_digest) == 64
+            return self.scope
+
+    isolation = Isolation()
+
+    def fail_process_cleanup(process: object) -> None:
+        del process
+        raise CloudHarnessError("subject_process_cleanup_failed")
+
+    monkeypatch.setattr(cloud_harness, "_cleanup_process_group", fail_process_cleanup)
+
+    with pytest.raises(CloudHarnessError, match="subject_process_cleanup_failed"):
+        cloud_harness._bounded_process(
+            executable,
+            ("--version",),
+            timeout_seconds=2,
+            output_limit=4_096,
+            subject_identity=None,
+            worker_isolation=isolation,
+        )
+
+    assert isolation.scope.cleaned is True
+
+
 @pytest.mark.skipif(os.name == "nt", reason="requires POSIX process groups")
 def test_bounded_process_reaps_subject_when_collection_errors(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
