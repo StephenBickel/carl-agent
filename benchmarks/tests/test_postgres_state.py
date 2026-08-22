@@ -295,9 +295,35 @@ def test_effect_fence_migration_compares_exact_catalog_contract_before_replaceme
         "prosecdef",
         "proconfig",
         "aclexplode",
+        "attcollation",
+        "indnkeyatts",
+        "indnullsnotdistinct",
+        "indisprimary",
+        "indisunique",
+        "indkey",
+        "indoption",
+        "indexprs",
+        "pg_catalog.pg_opfamily",
+        "pg_catalog.pg_tablespace",
+        "attacl",
     ):
         assert catalog_contract in GITHUB_EFFECT_FENCES_SQL
-    assert "CREATE TEMP TABLE expected_effect_attempts" in GITHUB_EFFECT_FENCES_SQL
+    assert not re.search(
+        r"CREATE\s+TEMP(?:ORARY)?\s+TABLE\b.*?"
+        r"REFERENCES\s+carl_autonomy\.commands",
+        GITHUB_EFFECT_FENCES_SQL,
+        re.IGNORECASE | re.DOTALL,
+    )
+    assert re.search(
+        r"CREATE\s+TABLE\s+carl_autonomy\._migration_expected_effect_attempts\b",
+        GITHUB_EFFECT_FENCES_SQL,
+        re.IGNORECASE,
+    )
+    assert re.search(
+        r"DROP\s+TABLE\s+carl_autonomy\._migration_expected_effect_attempts\b",
+        GITHUB_EFFECT_FENCES_SQL,
+        re.IGNORECASE,
+    )
     assert "unexpected_grantee" in GITHUB_EFFECT_FENCES_SQL
     assert "effect_fence_function_invalid" in GITHUB_EFFECT_FENCES_SQL
 

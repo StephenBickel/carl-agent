@@ -10,6 +10,10 @@ DECLARE
     table_namespace text;
     table_kind "char";
 BEGIN
+IF to_regclass('carl_autonomy._migration_expected_effect_attempts') IS NOT NULL THEN
+    RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'effect_fence_scratch_exists';
+END IF;
+
 IF to_regclass('carl_autonomy.effect_attempts') IS NULL THEN
 EXECUTE $ddl$CREATE TABLE carl_autonomy.effect_attempts (
     effect_key varchar(192) PRIMARY KEY REFERENCES carl_autonomy.commands(effect_key),
@@ -62,8 +66,7 @@ EXECUTE $ddl$CREATE TABLE carl_autonomy.effect_attempts (
 )$ddl$;
 END IF;
 
-DROP TABLE IF EXISTS pg_temp.expected_effect_attempts;
-CREATE TEMP TABLE expected_effect_attempts (
+CREATE TABLE carl_autonomy._migration_expected_effect_attempts (
     effect_key varchar(192) PRIMARY KEY REFERENCES carl_autonomy.commands(effect_key),
     command_key varchar(192) NOT NULL UNIQUE REFERENCES carl_autonomy.commands(command_key),
     claim_id varchar(192) NOT NULL,
@@ -122,6 +125,8 @@ WHERE c.oid = 'carl_autonomy.effect_attempts'::regclass;
 SELECT string_agg(
     a.attnum::text || ':' || a.attname || ':'
     || pg_catalog.format_type(a.atttypid, a.atttypmod) || ':'
+    || a.attcollation::text || ':' || coalesce(cn.nspname, '<none>') || ':'
+    || coalesce(coll.collname, '<none>') || ':'
     || a.attnotnull::text || ':' || a.attidentity || ':' || a.attgenerated || ':'
     || a.attstorage || ':' || a.attcompression || ':'
     || coalesce(pg_catalog.pg_get_expr(d.adbin, d.adrelid), '<none>'),
@@ -131,12 +136,16 @@ INTO actual_column_signature
 FROM pg_catalog.pg_attribute AS a
 LEFT JOIN pg_catalog.pg_attrdef AS d
     ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+LEFT JOIN pg_catalog.pg_collation AS coll ON coll.oid = a.attcollation
+LEFT JOIN pg_catalog.pg_namespace AS cn ON cn.oid = coll.collnamespace
 WHERE a.attrelid = 'carl_autonomy.effect_attempts'::regclass
     AND a.attnum > 0 AND NOT a.attisdropped;
 
 SELECT string_agg(
     a.attnum::text || ':' || a.attname || ':'
     || pg_catalog.format_type(a.atttypid, a.atttypmod) || ':'
+    || a.attcollation::text || ':' || coalesce(cn.nspname, '<none>') || ':'
+    || coalesce(coll.collname, '<none>') || ':'
     || a.attnotnull::text || ':' || a.attidentity || ':' || a.attgenerated || ':'
     || a.attstorage || ':' || a.attcompression || ':'
     || coalesce(pg_catalog.pg_get_expr(d.adbin, d.adrelid), '<none>'),
@@ -146,7 +155,9 @@ INTO expected_column_signature
 FROM pg_catalog.pg_attribute AS a
 LEFT JOIN pg_catalog.pg_attrdef AS d
     ON d.adrelid = a.attrelid AND d.adnum = a.attnum
-WHERE a.attrelid = 'pg_temp.expected_effect_attempts'::regclass
+LEFT JOIN pg_catalog.pg_collation AS coll ON coll.oid = a.attcollation
+LEFT JOIN pg_catalog.pg_namespace AS cn ON cn.oid = coll.collnamespace
+WHERE a.attrelid = 'carl_autonomy._migration_expected_effect_attempts'::regclass
     AND a.attnum > 0 AND NOT a.attisdropped;
 
 SELECT string_agg(
@@ -171,7 +182,7 @@ SELECT string_agg(
 )
 INTO expected_constraint_signature
 FROM pg_catalog.pg_constraint AS c
-WHERE c.conrelid = 'pg_temp.expected_effect_attempts'::regclass;
+WHERE c.conrelid = 'carl_autonomy._migration_expected_effect_attempts'::regclass;
 
 IF table_owner <> CURRENT_USER OR table_namespace <> 'carl_autonomy' OR table_kind <> 'r'
     OR actual_column_signature IS DISTINCT FROM expected_column_signature
@@ -187,116 +198,146 @@ CREATE INDEX IF NOT EXISTS effect_attempts_reconciliation
     ON carl_autonomy.effect_attempts(attempt_state, not_before, effect_key)
     WHERE attempt_state IN ('retry_scheduled', 'uncertain');
 
-CREATE INDEX expected_effect_attempts_reconciliation
-    ON pg_temp.expected_effect_attempts(attempt_state, not_before, effect_key)
+CREATE INDEX _migration_expected_effect_attempts_reconciliation
+    ON carl_autonomy._migration_expected_effect_attempts(
+        attempt_state, not_before, effect_key
+    )
     WHERE attempt_state IN ('retry_scheduled', 'uncertain');
 
 DO $migration$
 DECLARE
-    key_columns text[];
-    predicate text;
-    expected_predicate text;
-    valid boolean;
-    ready boolean;
-    live boolean;
-    unique_index boolean;
-    primary_index boolean;
-    exclusion_index boolean;
-    immediate_index boolean;
-    clustered_index boolean;
-    replica_identity boolean;
-    access_method text;
-    index_owner text;
-    index_namespace text;
-    opclasses text[];
-    collations text[];
-    index_options smallint[];
-    expected_opclasses text[];
-    expected_collations text[];
-    expected_index_options smallint[];
-    nonconstraint_indexes integer;
+    actual_index_signature jsonb;
+    expected_index_signature jsonb;
 BEGIN
-    SELECT array_agg(a.attname ORDER BY k.ordinality),
-        pg_catalog.pg_get_expr(i.indpred, i.indrelid), i.indisvalid, i.indisready,
-        i.indislive, i.indisunique, i.indisprimary, i.indisexclusion, i.indimmediate,
-        i.indisclustered, i.indisreplident, am.amname,
-        pg_catalog.pg_get_userbyid(idx.relowner), ni.nspname,
-        ARRAY(
-            SELECT opc.opcname
-            FROM unnest(i.indclass) WITH ORDINALITY AS oc(opcoid, ordinal)
-            JOIN pg_catalog.pg_opclass AS opc ON opc.oid = oc.opcoid
-            ORDER BY oc.ordinal
-        ),
-        ARRAY(
-            SELECT coalesce(coll.collname, '')
-            FROM unnest(i.indcollation) WITH ORDINALITY AS co(colloid, ordinal)
-            LEFT JOIN pg_catalog.pg_collation AS coll ON coll.oid = co.colloid
-            ORDER BY co.ordinal
-        ),
-        ARRAY(SELECT option FROM unnest(i.indoption) AS option)
-    INTO key_columns, predicate, valid, ready, live, unique_index, primary_index,
-        exclusion_index, immediate_index, clustered_index, replica_identity,
-        access_method, index_owner, index_namespace, opclasses, collations, index_options
-    FROM pg_catalog.pg_index AS i
-    JOIN pg_catalog.pg_class AS idx ON idx.oid = i.indexrelid
-    JOIN pg_catalog.pg_namespace AS ni ON ni.oid = idx.relnamespace
-    JOIN pg_catalog.pg_class AS tab ON tab.oid = i.indrelid
-    JOIN pg_catalog.pg_namespace AS n ON n.oid = tab.relnamespace
-    JOIN pg_catalog.pg_am AS am ON am.oid = idx.relam
-    JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS k(attnum, ordinality) ON true
-    JOIN pg_catalog.pg_attribute AS a ON a.attrelid = tab.oid AND a.attnum = k.attnum
-    WHERE n.nspname = 'carl_autonomy' AND tab.relname = 'effect_attempts'
-        AND idx.relname = 'effect_attempts_reconciliation'
-    GROUP BY i.indexrelid, i.indpred, i.indrelid, i.indisvalid, i.indisready,
-        i.indislive, i.indisunique, i.indisprimary, i.indisexclusion, i.indimmediate,
-        i.indisclustered, i.indisreplident, i.indclass, i.indcollation, i.indoption,
-        am.amname, idx.relowner, ni.nspname;
+    WITH target(catalog_side, relid) AS (
+        VALUES
+            ('actual', 'carl_autonomy.effect_attempts'::regclass),
+            (
+                'expected',
+                'carl_autonomy._migration_expected_effect_attempts'::regclass
+            )
+    ), index_contract AS (
+        SELECT target.catalog_side, pg_catalog.jsonb_build_object(
+            'indnatts', i.indnatts,
+            'indnkeyatts', i.indnkeyatts,
+            'indisunique', i.indisunique,
+            'indnullsnotdistinct', i.indnullsnotdistinct,
+            'indisprimary', i.indisprimary,
+            'indisexclusion', i.indisexclusion,
+            'indimmediate', i.indimmediate,
+            'indisclustered', i.indisclustered,
+            'indisvalid', i.indisvalid,
+            'indcheckxmin', i.indcheckxmin,
+            'indisready', i.indisready,
+            'indislive', i.indislive,
+            'indisreplident', i.indisreplident,
+            'indkey', i.indkey::text,
+            'indcollation', i.indcollation::text,
+            'indclass', i.indclass::text,
+            'indoption', i.indoption::text,
+            'indexprs', pg_catalog.pg_get_expr(i.indexprs, i.indrelid, true),
+            'indpred', pg_catalog.pg_get_expr(i.indpred, i.indrelid, true),
+            'access_method_oid', am.oid,
+            'access_method_name', am.amname,
+            'access_method_type', am.amtype,
+            'index_owner', pg_catalog.pg_get_userbyid(idx.relowner),
+            'index_namespace', ni.nspname,
+            'index_relkind', idx.relkind,
+            'index_relpersistence', idx.relpersistence,
+            'index_relam', idx.relam,
+            'index_reltablespace', idx.reltablespace,
+            'index_tablespace_name', ts.spcname,
+            'index_reloptions', idx.reloptions,
+            'key_columns', (
+                SELECT coalesce(pg_catalog.jsonb_agg(
+                    pg_catalog.jsonb_build_object(
+                        'position', key.position,
+                        'attnum', key.attnum,
+                        'attname', attribute.attname,
+                        'expression', key.attnum = 0
+                    ) ORDER BY key.position
+                ), '[]'::jsonb)
+                FROM unnest(i.indkey) WITH ORDINALITY AS key(attnum, position)
+                LEFT JOIN pg_catalog.pg_attribute AS attribute
+                    ON attribute.attrelid = i.indrelid
+                    AND attribute.attnum = key.attnum
+            ),
+            'include_columns', (
+                SELECT coalesce(pg_catalog.jsonb_agg(
+                    pg_catalog.jsonb_build_object(
+                        'position', included.position,
+                        'attnum', included.attnum,
+                        'attname', attribute.attname
+                    ) ORDER BY included.position
+                ), '[]'::jsonb)
+                FROM unnest(i.indkey) WITH ORDINALITY AS included(attnum, position)
+                LEFT JOIN pg_catalog.pg_attribute AS attribute
+                    ON attribute.attrelid = i.indrelid
+                    AND attribute.attnum = included.attnum
+                WHERE included.position > i.indnkeyatts
+            ),
+            'opclasses', (
+                SELECT coalesce(pg_catalog.jsonb_agg(
+                    pg_catalog.jsonb_build_object(
+                        'position', opclass.position,
+                        'oid', opc.oid,
+                        'namespace_oid', opn.oid,
+                        'namespace_name', opn.nspname,
+                        'name', opc.opcname,
+                        'input_type_oid', opc.opcintype,
+                        'key_type_oid', opc.opckeytype,
+                        'family_oid', opf.oid,
+                        'family_namespace_oid', opfn.oid,
+                        'family_namespace_name', opfn.nspname,
+                        'family_name', opf.opfname
+                    ) ORDER BY opclass.position
+                ), '[]'::jsonb)
+                FROM unnest(i.indclass) WITH ORDINALITY AS opclass(oid, position)
+                JOIN pg_catalog.pg_opclass AS opc ON opc.oid = opclass.oid
+                JOIN pg_catalog.pg_namespace AS opn ON opn.oid = opc.opcnamespace
+                JOIN pg_catalog.pg_opfamily AS opf ON opf.oid = opc.opcfamily
+                JOIN pg_catalog.pg_namespace AS opfn ON opfn.oid = opf.opfnamespace
+            ),
+            'collations', (
+                SELECT coalesce(pg_catalog.jsonb_agg(
+                    pg_catalog.jsonb_build_object(
+                        'position', index_collation.position,
+                        'oid', index_collation.oid,
+                        'namespace_oid', coln.oid,
+                        'namespace_name', coln.nspname,
+                        'name', coll.collname
+                    ) ORDER BY index_collation.position
+                ), '[]'::jsonb)
+                FROM unnest(i.indcollation)
+                    WITH ORDINALITY AS index_collation(oid, position)
+                LEFT JOIN pg_catalog.pg_collation AS coll
+                    ON coll.oid = index_collation.oid
+                LEFT JOIN pg_catalog.pg_namespace AS coln
+                    ON coln.oid = coll.collnamespace
+            )
+        ) AS signature
+        FROM target
+        JOIN pg_catalog.pg_index AS i ON i.indrelid = target.relid
+        JOIN pg_catalog.pg_class AS idx ON idx.oid = i.indexrelid
+        JOIN pg_catalog.pg_namespace AS ni ON ni.oid = idx.relnamespace
+        JOIN pg_catalog.pg_am AS am ON am.oid = idx.relam
+        LEFT JOIN pg_catalog.pg_tablespace AS ts ON ts.oid = idx.reltablespace
+    )
+    SELECT
+        coalesce(pg_catalog.jsonb_agg(signature ORDER BY signature::text)
+            FILTER (WHERE catalog_side = 'actual'), '[]'::jsonb),
+        coalesce(pg_catalog.jsonb_agg(signature ORDER BY signature::text)
+            FILTER (WHERE catalog_side = 'expected'), '[]'::jsonb)
+    INTO actual_index_signature, expected_index_signature
+    FROM index_contract;
 
-    SELECT pg_catalog.pg_get_expr(i.indpred, i.indrelid),
-        ARRAY(
-            SELECT opc.opcname
-            FROM unnest(i.indclass) WITH ORDINALITY AS oc(opcoid, ordinal)
-            JOIN pg_catalog.pg_opclass AS opc ON opc.oid = oc.opcoid
-            ORDER BY oc.ordinal
-        ),
-        ARRAY(
-            SELECT coalesce(coll.collname, '')
-            FROM unnest(i.indcollation) WITH ORDINALITY AS co(colloid, ordinal)
-            LEFT JOIN pg_catalog.pg_collation AS coll ON coll.oid = co.colloid
-            ORDER BY co.ordinal
-        ),
-        ARRAY(SELECT option FROM unnest(i.indoption) AS option)
-    INTO expected_predicate, expected_opclasses, expected_collations,
-        expected_index_options
-    FROM pg_catalog.pg_index AS i
-    JOIN pg_catalog.pg_class AS idx ON idx.oid = i.indexrelid
-    WHERE i.indrelid = 'pg_temp.expected_effect_attempts'::regclass
-        AND idx.relname = 'expected_effect_attempts_reconciliation';
-
-    SELECT count(*) INTO nonconstraint_indexes
-    FROM pg_catalog.pg_index AS i
-    WHERE i.indrelid = 'carl_autonomy.effect_attempts'::regclass
-        AND NOT EXISTS (
-            SELECT 1 FROM pg_catalog.pg_constraint AS c WHERE c.conindid = i.indexrelid
-        );
-
-    IF key_columns <> ARRAY['attempt_state', 'not_before', 'effect_key']
-        OR predicate IS DISTINCT FROM expected_predicate
-        OR NOT valid OR NOT ready OR NOT live OR unique_index OR primary_index
-        OR exclusion_index OR NOT immediate_index OR clustered_index OR replica_identity
-        OR access_method <> 'btree' OR index_owner <> CURRENT_USER
-        OR index_namespace <> 'carl_autonomy'
-        OR opclasses IS DISTINCT FROM expected_opclasses
-        OR collations IS DISTINCT FROM expected_collations
-        OR index_options IS DISTINCT FROM expected_index_options
-        OR nonconstraint_indexes <> 1
-    THEN
+    IF actual_index_signature IS DISTINCT FROM expected_index_signature THEN
         RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'effect_fence_schema_invalid';
     END IF;
 END;
 $migration$;
 
-DROP TABLE pg_temp.expected_effect_attempts;
+DROP TABLE carl_autonomy._migration_expected_effect_attempts;
 
 CREATE OR REPLACE FUNCTION carl_autonomy.resolve_claimed_command(
     p_command_key text,
@@ -753,9 +794,33 @@ ALTER FUNCTION carl_autonomy.mark_effect_completed(
 DO $acl_normalization$
 DECLARE
     unexpected_grantee oid;
+    column_record record;
     sequence_record record;
     function_record record;
 BEGIN
+    FOR column_record IN
+        SELECT DISTINCT a.attname, acl.grantee
+        FROM pg_catalog.pg_attribute AS a
+        CROSS JOIN LATERAL pg_catalog.aclexplode(a.attacl) AS acl
+        WHERE a.attrelid = 'carl_autonomy.effect_attempts'::regclass
+            AND a.attnum > 0 AND NOT a.attisdropped
+    LOOP
+        IF column_record.grantee = 0 THEN
+            EXECUTE format(
+                'REVOKE ALL PRIVILEGES (%I) ON TABLE '
+                'carl_autonomy.effect_attempts FROM PUBLIC',
+                column_record.attname
+            );
+        ELSE
+            EXECUTE format(
+                'REVOKE ALL PRIVILEGES (%I) ON TABLE '
+                'carl_autonomy.effect_attempts FROM %I',
+                column_record.attname,
+                pg_catalog.pg_get_userbyid(column_record.grantee)
+            );
+        END IF;
+    END LOOP;
+
     FOR unexpected_grantee IN
         SELECT DISTINCT acl.grantee
         FROM pg_catalog.pg_class AS c
@@ -877,6 +942,7 @@ DECLARE
     backend_function_grants integer;
     table_acl_count integer;
     owner_table_grants integer;
+    column_acl_count integer;
 BEGIN
     SELECT count(*), count(*) FILTER (WHERE
             n.nspname <> 'carl_autonomy'
@@ -914,6 +980,14 @@ BEGIN
     ) AS acl
     WHERE c.oid = 'carl_autonomy.effect_attempts'::regclass;
     IF table_acl_count <> 7 OR owner_table_grants <> 7 THEN
+        RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'effect_fence_acl_invalid';
+    END IF;
+
+    SELECT count(*) INTO column_acl_count
+    FROM pg_catalog.pg_attribute AS a
+    WHERE a.attrelid = 'carl_autonomy.effect_attempts'::regclass
+        AND a.attnum > 0 AND NOT a.attisdropped AND a.attacl IS NOT NULL;
+    IF column_acl_count <> 0 THEN
         RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'effect_fence_acl_invalid';
     END IF;
 
@@ -956,6 +1030,10 @@ BEGIN
     LIMIT 1;
     IF FOUND THEN
         RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'effect_fence_acl_invalid';
+    END IF;
+
+    IF to_regclass('carl_autonomy._migration_expected_effect_attempts') IS NOT NULL THEN
+        RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'effect_fence_scratch_not_dropped';
     END IF;
 END;
 $contract_verification$;

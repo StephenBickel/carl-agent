@@ -962,6 +962,7 @@ def test_effect_fence_migration_rejects_incompatible_existing_table(postgres: ob
     assert POSTGRES_DSN is not None
     with postgres.connect(POSTGRES_DSN, autocommit=True) as admin:  # type: ignore[attr-defined]
         admin.execute("DROP SCHEMA IF EXISTS carl_autonomy CASCADE")
+        admin.execute("DROP SCHEMA IF EXISTS carl_poison CASCADE")
         for migration in BASE_MIGRATIONS:
             admin.execute(migration.read_text(encoding="utf-8"), prepare=False)
         admin.execute("CREATE TABLE carl_autonomy.effect_attempts(effect_key text PRIMARY KEY)")
@@ -970,6 +971,43 @@ def test_effect_fence_migration_rejects_incompatible_existing_table(postgres: ob
                 GITHUB_EFFECT_FENCES_MIGRATION.read_text(encoding="utf-8"),
                 prepare=False,
             )
+        admin.execute("DROP SCHEMA IF EXISTS carl_autonomy CASCADE")
+        for migration in MIGRATIONS:
+            admin.execute(migration.read_text(encoding="utf-8"), prepare=False)
+
+
+def test_effect_fence_migration_rejects_scratch_poison_and_drops_its_own_scratch(
+    postgres: object,
+) -> None:
+    from psycopg.rows import dict_row
+
+    assert POSTGRES_DSN is not None
+    scratch = "carl_autonomy._migration_expected_effect_attempts"
+    with postgres.connect(POSTGRES_DSN, autocommit=True, row_factory=dict_row) as admin:  # type: ignore[attr-defined]
+        admin.execute("DROP SCHEMA IF EXISTS carl_autonomy CASCADE")
+        for migration in BASE_MIGRATIONS:
+            admin.execute(migration.read_text(encoding="utf-8"), prepare=False)
+        admin.execute(f"CREATE TABLE {scratch}(poison integer)")
+        with pytest.raises(Exception, match="effect_fence_scratch_exists"):
+            admin.execute(
+                GITHUB_EFFECT_FENCES_MIGRATION.read_text(encoding="utf-8"),
+                prepare=False,
+            )
+        assert admin.execute(
+            "SELECT to_regclass(%s) IS NOT NULL AS poison_preserved",
+            (scratch,),
+        ).fetchone() == {"poison_preserved": True}
+        admin.execute(f"DROP TABLE {scratch}")
+
+        admin.execute(
+            GITHUB_EFFECT_FENCES_MIGRATION.read_text(encoding="utf-8"),
+            prepare=False,
+        )
+        assert admin.execute(
+            "SELECT to_regclass(%s) IS NULL AS scratch_dropped",
+            (scratch,),
+        ).fetchone() == {"scratch_dropped": True}
+
         admin.execute("DROP SCHEMA IF EXISTS carl_autonomy CASCADE")
         for migration in MIGRATIONS:
             admin.execute(migration.read_text(encoding="utf-8"), prepare=False)
@@ -994,6 +1032,43 @@ def test_effect_fence_migration_rejects_incompatible_existing_table(postgres: ob
         "DROP INDEX carl_autonomy.effect_attempts_reconciliation; "
         "CREATE INDEX effect_attempts_reconciliation ON carl_autonomy.effect_attempts"
         "(attempt_state,not_before,effect_key) WHERE attempt_state='uncertain'",
+        "CREATE SCHEMA carl_poison; "
+        'CREATE COLLATION carl_poison."default" FROM pg_catalog."default"; '
+        "ALTER TABLE carl_autonomy.effect_attempts ALTER COLUMN command_key "
+        'TYPE varchar(192) COLLATE carl_poison."default"',
+        "ALTER TABLE carl_autonomy.effect_attempts "
+        "DROP CONSTRAINT effect_attempts_command_key_key; "
+        "CREATE INDEX effect_attempts_command_key_key "
+        "ON carl_autonomy.effect_attempts(command_key)",
+        "CREATE SCHEMA carl_poison; "
+        "CREATE OPERATOR CLASS carl_poison.text_ops FOR TYPE text USING btree AS "
+        "OPERATOR 1 < (text,text), OPERATOR 2 <= (text,text), "
+        "OPERATOR 3 = (text,text), OPERATOR 4 >= (text,text), "
+        "OPERATOR 5 > (text,text), "
+        "FUNCTION 1 pg_catalog.bttextcmp(text,text), "
+        "FUNCTION 2 pg_catalog.bttextsortsupport(internal), "
+        "FUNCTION 4 pg_catalog.btvarstrequalimage(oid); "
+        "DROP INDEX carl_autonomy.effect_attempts_reconciliation; "
+        "CREATE INDEX effect_attempts_reconciliation ON carl_autonomy.effect_attempts"
+        "(attempt_state carl_poison.text_ops,not_before,effect_key) "
+        "WHERE attempt_state IN ('retry_scheduled','uncertain')",
+        "ALTER TABLE carl_autonomy.effect_attempts "
+        "DROP CONSTRAINT effect_attempts_command_key_key; "
+        "ALTER TABLE carl_autonomy.effect_attempts "
+        "ADD CONSTRAINT effect_attempts_command_key_key UNIQUE (command_key) DEFERRABLE",
+        "ALTER TABLE carl_autonomy.effect_attempts "
+        "DROP CONSTRAINT effect_attempts_command_key_key; "
+        "ALTER TABLE carl_autonomy.effect_attempts "
+        "ADD CONSTRAINT effect_attempts_command_key_key "
+        "UNIQUE NULLS NOT DISTINCT (command_key)",
+        "DROP INDEX carl_autonomy.effect_attempts_reconciliation; "
+        "CREATE INDEX effect_attempts_reconciliation ON carl_autonomy.effect_attempts"
+        "(attempt_state DESC,not_before,effect_key) INCLUDE (claim_id) "
+        "WHERE attempt_state IN ('retry_scheduled','uncertain')",
+        "DROP INDEX carl_autonomy.effect_attempts_reconciliation; "
+        "CREATE INDEX effect_attempts_reconciliation ON carl_autonomy.effect_attempts"
+        "(attempt_state,not_before,lower(effect_key)) "
+        "WHERE attempt_state IN ('retry_scheduled','uncertain')",
     ),
 )
 def test_effect_fence_migration_rejects_exact_catalog_poison(
@@ -1002,13 +1077,16 @@ def test_effect_fence_migration_rejects_exact_catalog_poison(
     assert POSTGRES_DSN is not None
     with postgres.connect(POSTGRES_DSN, autocommit=True) as admin:  # type: ignore[attr-defined]
         admin.execute("DROP SCHEMA IF EXISTS carl_autonomy CASCADE")
+        admin.execute("DROP SCHEMA IF EXISTS carl_poison CASCADE")
         for migration in BASE_MIGRATIONS:
             admin.execute(migration.read_text(encoding="utf-8"), prepare=False)
         admin.execute(HISTORICAL_EFFECT_FENCE_FIXTURE.read_text(encoding="utf-8"), prepare=False)
+        admin.execute(GITHUB_EFFECT_FENCES_MIGRATION.read_text(encoding="utf-8"), prepare=False)
         admin.execute(poison_sql, prepare=False)
         with pytest.raises(Exception, match="effect_fence_schema_invalid"):
             admin.execute(GITHUB_EFFECT_FENCES_MIGRATION.read_text(encoding="utf-8"), prepare=False)
         admin.execute("DROP SCHEMA IF EXISTS carl_autonomy CASCADE")
+        admin.execute("DROP SCHEMA IF EXISTS carl_poison CASCADE")
         for migration in MIGRATIONS:
             admin.execute(migration.read_text(encoding="utf-8"), prepare=False)
 
@@ -1029,6 +1107,13 @@ def test_effect_fence_migration_revokes_every_arbitrary_catalog_grantee(
         admin.execute("CREATE SEQUENCE carl_autonomy.effect_poison_sequence")
         admin.execute(
             "GRANT SELECT, INSERT ON carl_autonomy.effect_attempts TO carl_effect_intruder"
+        )
+        admin.execute(
+            "GRANT SELECT(effect_key), UPDATE(claim_id), INSERT(operation), "
+            "REFERENCES(command_key) ON carl_autonomy.effect_attempts TO carl_effect_intruder"
+        )
+        admin.execute(
+            "GRANT SELECT(effect_key), UPDATE(claim_id) ON carl_autonomy.effect_attempts TO PUBLIC"
         )
         admin.execute(
             "GRANT EXECUTE ON FUNCTION "
@@ -1074,9 +1159,15 @@ def test_effect_fence_migration_revokes_every_arbitrary_catalog_grantee(
             "coalesce(c.relacl,acldefault('s',c.relowner))) acl "
             "WHERE c.oid='carl_autonomy.effect_poison_sequence'::regclass"
         ).fetchone()
+        column_acl = admin.execute(
+            "SELECT count(*) AS total FROM pg_attribute "
+            "WHERE attrelid='carl_autonomy.effect_attempts'::regclass "
+            "AND attnum > 0 AND NOT attisdropped AND attacl IS NOT NULL"
+        ).fetchone()
         assert table_acl == {"owner": 7, "total": 7}
         assert function_acl == {"backend": 5, "owner": 5, "total": 10}
         assert sequence_acl == {"owner": 3, "total": 3}
+        assert column_acl == {"total": 0}
         assert leaked == {"leaked": False}
 
         admin.execute("DROP SCHEMA IF EXISTS carl_autonomy CASCADE")
