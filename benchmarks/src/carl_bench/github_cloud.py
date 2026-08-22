@@ -19,6 +19,13 @@ from urllib.parse import parse_qsl, urlencode, urlsplit
 from carl_bench.canonical import canonical_json_bytes
 from carl_bench.cloud_execution import CloudRunRequest
 from carl_bench.cloud_state import CommandState
+from carl_bench.github_effect_client import GitHubEffectSocketClient
+from carl_bench.github_effect_ipc import (
+    REQUEST_DOMAIN,
+    GitHubEffectOperation,
+    GitHubEffectRequest,
+    GitHubEffectResponse,
+)
 from carl_bench.github_promotion import APPROVED_REQUIRED_CHECKS
 
 _API_ORIGIN = "https://api.github.com"
@@ -3906,42 +3913,85 @@ class _InjectedGitHubCloudGateway:
             raise GitHubCloudError("github_dispatch_response_invalid")
 
 
-def _run_protected_operation(operation: str, command_key: str, request: object) -> object:
-    """Execute one named high-level operation without returning the credential-bearing service."""
-    allowed = {
-        "create_or_reconcile_experimental_branch",
-        "create_or_reconcile_pull_request",
-        "create_or_reconcile_revert_branch",
-        "create_or_reconcile_revert_pull_request",
-        "dispatch_workflow",
-        "enable_pull_request_auto_merge",
-        "mark_pull_request_ready",
-        "observe_required_checks",
-        "update_pull_request",
+_PRODUCTION_REPOSITORY = "StephenBickel/carl-agent"
+
+
+def _ipc_effect_key(binding: GitHubCommandBinding) -> str:
+    descriptor = {
+        "authority": binding.authority,
+        "command_key": binding.command_key,
+        "operation": binding.operation,
+        "request_digest": binding.request_digest,
     }
-    if operation not in allowed:
-        raise GitHubCloudError("github_operation_not_allowed")
-    policy = _load_protected_policy()
-    token = os.environ.get(_PROTECTED_TOKEN_ENV)
-    if token is None:
-        raise GitHubCloudError("github_credentials_missing")
-    gateway = _InjectedGitHubCloudGateway._construct_test_gateway(
-        repository=policy.repository,
-        token=token,
-        transport=_ProtectedGitHubTransport(),
-        clock=_system_clock,
-        state_controller=_ProtectedStateControllerClient(),
-        workflow_ref=policy.workflow_ref,
-        dispatch_actor_login=policy.dispatch_actor_login,
-    )
-    high_level_operation = getattr(gateway, operation)
-    return high_level_operation(command_key, request)
+    return f"cloud-effect-{hashlib.sha256(canonical_json_bytes(descriptor)).hexdigest()}"
+
+
+def _ipc_parameters(request: object) -> dict[str, object]:
+    if isinstance(request, CloudRunRequest):
+        excluded = {"dispatch_key", "request_digest", "schema_version"}
+    else:
+        excluded = set()
+    try:
+        fields = request.__dataclass_fields__
+    except AttributeError as error:
+        raise GitHubCloudError("github_operation_request_invalid") from error
+    value: dict[str, object] = {}
+    for name in fields:
+        if name in excluded:
+            continue
+        item = getattr(request, name)
+        value[name] = list(item) if isinstance(item, tuple) else item
+    return value
+
+
+def _result_from_ipc(
+    response: GitHubEffectResponse,
+    *,
+    request: GitHubEffectRequest,
+    expected_type: type,
+) -> object:
+    if response.status == "rejected":
+        raise GitHubCloudError(response.error_code or "github_effect_service_rejected")
+    if response.status == "retry_scheduled":
+        attempt_match = re.search(r"-attempt-([1-3])$", request.command_key)
+        attempt = int(attempt_match.group(1)) if attempt_match else 1
+        return GitHubRetryDecision(
+            status="retry_scheduled",
+            reason="github_rate_limited",
+            request_key=request.request_key,
+            attempt_key=request.command_key,
+            effect_key=request.effect_key,
+            command_occurred_at=request.occurred_at,
+            retry_not_before=response.retry_not_before or request.occurred_at,
+            attempt=attempt,
+            max_attempts=3,
+        )
+    if response.status != "completed" or type(response.result) is not dict:
+        raise GitHubCloudError("github_effect_service_response_invalid")
+    if set(response.result) != {"result_type", "value"}:
+        raise GitHubCloudError("github_effect_service_response_invalid")
+    if response.result["result_type"] != expected_type.__name__:
+        raise GitHubCloudError("github_effect_service_response_invalid")
+    value = response.result["value"]
+    if type(value) is not dict:
+        raise GitHubCloudError("github_effect_service_response_invalid")
+    if expected_type is RequiredChecksSnapshot:
+        decoded = dict(value)
+        checks = decoded.get("checks")
+        if type(checks) is not list:
+            raise GitHubCloudError("github_effect_service_response_invalid")
+        decoded["checks"] = tuple(RequiredCheckObservation(**item) for item in checks)
+        value = decoded
+    try:
+        return expected_type(**value)
+    except (TypeError, ValueError) as error:
+        raise GitHubCloudError("github_effect_service_response_invalid") from error
 
 
 class GitHubCloudGateway:
-    """Attribute-free production facade; dependencies exist only during a typed operation."""
+    """Credential-free typed facade over the protected Unix-socket service."""
 
-    __slots__ = ()
+    __slots__ = ("_client",)
 
     def __new__(cls, *args: object, **kwargs: object) -> GitHubCloudGateway:
         del cls, args, kwargs
@@ -3972,60 +4022,146 @@ class GitHubCloudGateway:
 
     @classmethod
     def from_protected_environment(cls) -> GitHubCloudGateway:
-        """Return an attribute-free facade over one fixed protected operation boundary."""
-        _load_protected_policy()
-        token = os.environ.get(_PROTECTED_TOKEN_ENV)
-        if token is None:
-            raise GitHubCloudError("github_credentials_missing")
-        if not token or len(token.encode()) > 4_096:
-            raise GitHubCloudError("github_credentials_invalid")
-        return object.__new__(cls)
+        """Return a client that never reads credentials or protected state."""
+        gateway = object.__new__(cls)
+        gateway._client = GitHubEffectSocketClient.from_protected_environment()
+        return gateway
+
+    def _execute_ipc(
+        self,
+        *,
+        operation: GitHubEffectOperation,
+        command_key: str,
+        occurred_at: str,
+        typed_request: object,
+        binding: GitHubCommandBinding,
+        expected_type: type,
+    ) -> object:
+        request = GitHubEffectRequest.from_canonical_dict(
+            {
+                "command_key": command_key,
+                "domain": REQUEST_DOMAIN,
+                "effect_key": _ipc_effect_key(binding),
+                "occurred_at": occurred_at,
+                "operation": operation.value,
+                "parameters": _ipc_parameters(typed_request),
+                "request_key": binding.request_key,
+                "schema_version": 1,
+            }
+        )
+        if command_key != binding.command_key:
+            raise GitHubCloudError("github_command_binding_mismatch")
+        return _result_from_ipc(
+            self._client.execute(request), request=request, expected_type=expected_type
+        )
 
     def create_or_reconcile_experimental_branch(
-        self, command_key: str, request: ExperimentalBranchRequest
+        self, command_key: str, request: ExperimentalBranchRequest, *, occurred_at: str
     ) -> GitReferenceSnapshot | GitHubRetryDecision:
-        return _run_protected_operation(
-            "create_or_reconcile_experimental_branch", command_key, request
+        return self._execute_ipc(
+            operation=GitHubEffectOperation.CREATE_EXPERIMENTAL_REF,
+            command_key=command_key,
+            occurred_at=occurred_at,
+            typed_request=request,
+            binding=experimental_branch_binding(_PRODUCTION_REPOSITORY, request),
+            expected_type=GitReferenceSnapshot,
         )
 
     def create_or_reconcile_pull_request(
-        self, command_key: str, request: PullRequestCreateRequest
+        self, command_key: str, request: PullRequestCreateRequest, *, occurred_at: str
     ) -> PullRequestEffectSnapshot | GitHubRetryDecision:
-        return _run_protected_operation("create_or_reconcile_pull_request", command_key, request)
+        return self._execute_ipc(
+            operation=GitHubEffectOperation.CREATE_PULL_REQUEST,
+            command_key=command_key,
+            occurred_at=occurred_at,
+            typed_request=request,
+            binding=pull_request_create_binding(_PRODUCTION_REPOSITORY, request),
+            expected_type=PullRequestEffectSnapshot,
+        )
 
     def create_or_reconcile_revert_branch(
-        self, command_key: str, request: RevertBranchRequest
+        self, command_key: str, request: RevertBranchRequest, *, occurred_at: str
     ) -> GitReferenceSnapshot | GitHubRetryDecision:
-        return _run_protected_operation("create_or_reconcile_revert_branch", command_key, request)
+        return self._execute_ipc(
+            operation=GitHubEffectOperation.CREATE_REVERT_REF,
+            command_key=command_key,
+            occurred_at=occurred_at,
+            typed_request=request,
+            binding=revert_branch_binding(_PRODUCTION_REPOSITORY, request),
+            expected_type=GitReferenceSnapshot,
+        )
 
     def create_or_reconcile_revert_pull_request(
-        self, command_key: str, request: RevertPullRequestRequest
+        self, command_key: str, request: RevertPullRequestRequest, *, occurred_at: str
     ) -> PullRequestEffectSnapshot | GitHubRetryDecision:
-        return _run_protected_operation(
-            "create_or_reconcile_revert_pull_request", command_key, request
+        return self._execute_ipc(
+            operation=GitHubEffectOperation.CREATE_REVERT_PULL_REQUEST,
+            command_key=command_key,
+            occurred_at=occurred_at,
+            typed_request=request,
+            binding=revert_pull_request_binding(_PRODUCTION_REPOSITORY, request),
+            expected_type=PullRequestEffectSnapshot,
         )
 
     def dispatch_workflow(
-        self, command_key: str, request: CloudRunRequest
+        self, command_key: str, request: CloudRunRequest, *, occurred_at: str
     ) -> WorkflowDispatchSnapshot | GitHubRetryDecision:
-        return _run_protected_operation("dispatch_workflow", command_key, request)
+        attempt_match = re.search(r"-attempt-([1-3])$", command_key)
+        if attempt_match is None:
+            raise GitHubCloudError("github_command_binding_mismatch")
+        return self._execute_ipc(
+            operation=GitHubEffectOperation.DISPATCH_WORKFLOW,
+            command_key=command_key,
+            occurred_at=occurred_at,
+            typed_request=request,
+            binding=workflow_dispatch_binding(request, attempt=int(attempt_match.group(1))),
+            expected_type=WorkflowDispatchSnapshot,
+        )
 
     def enable_pull_request_auto_merge(
-        self, command_key: str, request: PullRequestAutoMergeRequest
+        self, command_key: str, request: PullRequestAutoMergeRequest, *, occurred_at: str
     ) -> PullRequestEffectSnapshot | GitHubRetryDecision:
-        return _run_protected_operation("enable_pull_request_auto_merge", command_key, request)
+        return self._execute_ipc(
+            operation=GitHubEffectOperation.ENABLE_PULL_REQUEST_AUTO_MERGE,
+            command_key=command_key,
+            occurred_at=occurred_at,
+            typed_request=request,
+            binding=pull_request_auto_merge_binding(_PRODUCTION_REPOSITORY, request),
+            expected_type=PullRequestEffectSnapshot,
+        )
 
     def mark_pull_request_ready(
-        self, command_key: str, request: PullRequestReadyRequest
+        self, command_key: str, request: PullRequestReadyRequest, *, occurred_at: str
     ) -> PullRequestEffectSnapshot | GitHubRetryDecision:
-        return _run_protected_operation("mark_pull_request_ready", command_key, request)
+        return self._execute_ipc(
+            operation=GitHubEffectOperation.MARK_PULL_REQUEST_READY,
+            command_key=command_key,
+            occurred_at=occurred_at,
+            typed_request=request,
+            binding=pull_request_ready_binding(_PRODUCTION_REPOSITORY, request),
+            expected_type=PullRequestEffectSnapshot,
+        )
 
     def observe_required_checks(
-        self, command_key: str, request: RequiredChecksRequest
+        self, command_key: str, request: RequiredChecksRequest, *, occurred_at: str
     ) -> RequiredChecksSnapshot | GitHubRetryDecision:
-        return _run_protected_operation("observe_required_checks", command_key, request)
+        return self._execute_ipc(
+            operation=GitHubEffectOperation.OBSERVE_REQUIRED_CHECKS,
+            command_key=command_key,
+            occurred_at=occurred_at,
+            typed_request=request,
+            binding=required_checks_binding(_PRODUCTION_REPOSITORY, request),
+            expected_type=RequiredChecksSnapshot,
+        )
 
     def update_pull_request(
-        self, command_key: str, request: PullRequestUpdateRequest
+        self, command_key: str, request: PullRequestUpdateRequest, *, occurred_at: str
     ) -> PullRequestEffectSnapshot | GitHubRetryDecision:
-        return _run_protected_operation("update_pull_request", command_key, request)
+        return self._execute_ipc(
+            operation=GitHubEffectOperation.UPDATE_PULL_REQUEST,
+            command_key=command_key,
+            occurred_at=occurred_at,
+            typed_request=request,
+            binding=pull_request_update_binding(_PRODUCTION_REPOSITORY, request),
+            expected_type=PullRequestEffectSnapshot,
+        )

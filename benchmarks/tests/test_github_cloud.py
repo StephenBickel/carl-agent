@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import subprocess
 from collections import deque
-from contextlib import suppress
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from inspect import getmembers, isfunction, signature
@@ -2680,39 +2679,35 @@ def test_future_command_timestamp_rejects_before_transport() -> None:
     assert transport.requests == []
 
 
-def test_production_gateway_loads_only_fixed_protected_policy_and_token_source(
-    tmp_path, monkeypatch: pytest.MonkeyPatch
+def test_production_gateway_factory_is_credential_and_policy_free(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    policy_dir = tmp_path / "protected"
-    policy_dir.mkdir(mode=0o700)
-    policy_path = policy_dir / "github-cloud-policy.json"
-    policy_path.write_bytes(
-        b'{"api_origin":"https://api.github.com",'
-        b'"dispatch_actor_login":"carl-autonomy[bot]",'
-        b'"repository":"StephenBickel/carl-agent","schema_version":1,'
-        b'"workflow_ref":"main"}'
+    monkeypatch.delenv("CARL_GITHUB_APP_INSTALLATION_TOKEN", raising=False)
+    monkeypatch.setattr(
+        github_cloud,
+        "_load_protected_policy",
+        lambda: pytest.fail("client must not load protected policy"),
     )
-    policy_path.chmod(0o600)
-    monkeypatch.setattr(github_cloud, "_PROTECTED_CONFIG_DIR", policy_dir)
-    monkeypatch.setenv("CARL_GITHUB_APP_INSTALLATION_TOKEN", "github_pat_protected_test")
-    request = _request()
-    state = _claimed_dispatch_command(request)
-    controller = FakeDurableEffectController(commands={state.command.command_key: state})
-    transport = FakeTransport(
-        deque([_empty_runs(), GitHubHttpResponse(status=204, headers=(), body=b"")])
+    monkeypatch.setattr(
+        github_cloud,
+        "_ProtectedGitHubTransport",
+        lambda: pytest.fail("client must not construct HTTP transport"),
     )
-    monkeypatch.setattr(github_cloud, "_ProtectedGitHubTransport", lambda: transport)
-    monkeypatch.setattr(github_cloud, "_system_clock", _clock)
-    monkeypatch.setattr(github_cloud, "_ProtectedStateControllerClient", lambda: controller)
+    monkeypatch.setattr(
+        github_cloud,
+        "_ProtectedStateControllerClient",
+        lambda: pytest.fail("client must not construct protected state"),
+    )
 
     gateway = GitHubCloudGateway.from_protected_environment()
-    result = gateway.dispatch_workflow(state.command.command_key, request)
 
-    assert result.status == "dispatched"
+    assert "token" not in repr(gateway).lower()
     assert signature(GitHubCloudGateway.from_protected_environment).parameters == {}
 
 
-def test_protected_policy_symlink_is_rejected(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_protected_service_policy_symlink_is_rejected(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     policy_dir = tmp_path / "protected"
     policy_dir.mkdir(mode=0o700)
     target = tmp_path / "candidate-policy.json"
@@ -2724,10 +2719,8 @@ def test_protected_policy_symlink_is_rejected(tmp_path, monkeypatch: pytest.Monk
     )
     (policy_dir / "github-cloud-policy.json").symlink_to(target)
     monkeypatch.setattr(github_cloud, "_PROTECTED_CONFIG_DIR", policy_dir)
-    monkeypatch.setenv("CARL_GITHUB_APP_INSTALLATION_TOKEN", "github_pat_protected_test")
-
     with pytest.raises(GitHubCloudError, match="github_protected_configuration_invalid"):
-        GitHubCloudGateway.from_protected_environment()
+        github_cloud._load_protected_policy()
 
 
 @pytest.mark.parametrize(
@@ -2815,55 +2808,24 @@ def test_production_factory_exposes_no_transport_clock_or_credential_callback(
     assert recorder.requests == []
 
 
-def test_production_gateway_rejects_post_construction_dependency_and_policy_substitution(
-    tmp_path, monkeypatch: pytest.MonkeyPatch
+def test_production_gateway_post_construction_substitution_has_no_credentials(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    policy_dir = tmp_path / "protected"
-    policy_dir.mkdir(mode=0o700)
-    policy_path = policy_dir / "github-cloud-policy.json"
-    policy_path.write_bytes(
-        b'{"api_origin":"https://api.github.com",'
-        b'"dispatch_actor_login":"carl-autonomy[bot]",'
-        b'"repository":"StephenBickel/carl-agent","schema_version":1,'
-        b'"workflow_ref":"main"}'
-    )
-    policy_path.chmod(0o600)
-    monkeypatch.setattr(github_cloud, "_PROTECTED_CONFIG_DIR", policy_dir)
-    monkeypatch.setenv("CARL_GITHUB_APP_INSTALLATION_TOKEN", "github_pat_protected_test")
-    state = _claimed_dispatch_command(_request())
-    controller = FakeDurableEffectController(commands={state.command.command_key: state})
-    protected_transport = FakeTransport(
-        deque([_empty_runs(), GitHubHttpResponse(status=204, headers=(), body=b"")])
-    )
-    recorder = FakeTransport(
-        deque([_empty_runs(), GitHubHttpResponse(status=204, headers=(), body=b"")])
-    )
-    monkeypatch.setattr(github_cloud, "_ProtectedGitHubTransport", lambda: protected_transport)
-    monkeypatch.setattr(github_cloud, "_system_clock", _clock)
-    monkeypatch.setattr(github_cloud, "_ProtectedStateControllerClient", lambda: controller)
+    monkeypatch.delenv("CARL_GITHUB_APP_INSTALLATION_TOKEN", raising=False)
     gateway = GitHubCloudGateway.from_protected_environment()
+    recorder = FakeTransport(deque())
 
-    with suppress(AttributeError, TypeError, GitHubCloudError):
-        object.__setattr__(gateway, "_transport", recorder)
-    gateway.dispatch_workflow(state.command.command_key, _request())
-
-    assert recorder.requests == []
-    assert [request.method for request in protected_transport.requests] == ["GET", "POST"]
     for attribute, replacement in (
+        ("_transport", recorder),
         ("_state_controller", FakeDurableEffectController(commands={})),
-        ("_clock", lambda: datetime(2030, 1, 1, tzinfo=UTC)),
         ("_token", "attacker-token"),
         ("_repository", "attacker/repository"),
-        ("_workflow_ref", "attacker-ref"),
-        ("_dispatch_actor_login", "attacker[bot]"),
     ):
-        fresh = GitHubCloudGateway.from_protected_environment()
-        with pytest.raises((AttributeError, TypeError, GitHubCloudError)):
-            setattr(fresh, attribute, replacement)
-        with pytest.raises((AttributeError, TypeError, GitHubCloudError)):
-            object.__setattr__(fresh, attribute, replacement)
-        with pytest.raises((AttributeError, TypeError, GitHubCloudError)):
-            object.__delattr__(fresh, attribute)
+        with pytest.raises((AttributeError, TypeError)):
+            setattr(gateway, attribute, replacement)
+
+    assert recorder.requests == []
+    assert "github_pat" not in repr(gateway)
 
 
 def test_reflected_effect_authority_cannot_forge_a_raw_mutation() -> None:
