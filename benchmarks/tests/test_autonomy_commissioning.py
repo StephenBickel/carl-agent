@@ -3957,13 +3957,15 @@ def test_live_workflows_require_durable_provider_reconciliation_and_never_fake_s
 
     for workflow in (improvement, soak):
         assert "Require commissioned durable provider reconciliation" in workflow
-        assert "cloud commission-live" in workflow
+        assert "commission-live" in workflow
+        assert "CoordinatorSocketClient.from_protected_environment()" in workflow
         assert "direct-openai" not in workflow.lower()
         assert "OPENAI_API_KEY" not in workflow
         assert "synthetic" not in workflow.lower()
         assert "hard-coded" not in workflow.lower()
-        assert "action == 'frozen'" in workflow
-        assert "raise SystemExit(2)" in workflow
+        assert 'value["status"] != "completed"' in workflow
+        assert 'result["node"] != expected_node' in workflow
+        assert "persist_exact_node_freeze" in workflow
 
 
 def test_protected_workflow_handoffs_bind_request_attempt_parent_and_exact_subject() -> None:
@@ -3980,4 +3982,4 @@ def test_protected_workflow_handoffs_bind_request_attempt_parent_and_exact_subje
         ):
             assert workflow.count(binding) >= 2, (workflow_name, binding)
         assert "cloud_configuration_unavailable" not in workflow
-        assert "protected cloud coordinator decision" in workflow.lower()
+        assert "carl.coordinator.ipc.response.v1" in workflow

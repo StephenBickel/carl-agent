@@ -633,9 +633,12 @@ def test_protected_workflows_separate_cloud_authorities_and_close_permissions() 
         ),
         "evidence": (
             "carl-autonomy-observer",
-            {"contents": "read", "id-token": "write"},
+            {"actions": "read", "contents": "read", "id-token": "write"},
         ),
-        "promotion_handoff": ("carl-autonomy-promoter", {"contents": "read"}),
+        "promotion_handoff": (
+            "carl-autonomy-promoter",
+            {"actions": "read", "contents": "read"},
+        ),
     }
     expected_soak = {
         "commission": ("carl-autonomy-soak", {"contents": "read"}),
@@ -646,7 +649,7 @@ def test_protected_workflows_separate_cloud_authorities_and_close_permissions() 
         ),
         "evidence": (
             "carl-autonomy-observer",
-            {"contents": "read", "id-token": "write"},
+            {"actions": "read", "contents": "read", "id-token": "write"},
         ),
         "rollback_handoff": ("carl-autonomy-promoter", {"contents": "read"}),
     }
@@ -665,14 +668,19 @@ def test_improvement_workflow_uses_protected_live_observe_archive_ingest_chain()
     document = IMPROVEMENT_WORKFLOW_PATH.read_text(encoding="utf-8")
     jobs = _workflow_job_blocks(document)
 
-    assert "cloud publish-input" in jobs["publish_private_inputs"]
-    assert "cloud commission-live" in jobs["live_validation"]
+    assert 'publish-input "$PROTECTED_NODE" register_hypothesis' in jobs["publish_private_inputs"]
+    assert 'commission-live "$PROTECTED_NODE" observe_validation' in jobs["live_validation"]
     handoff = jobs["evidence"]
-    for node in ("observe_validation", "archive_validation", "ingest_validation"):
+    for node in (
+        "observe_validation",
+        "archive_validation",
+        "ingest_validation",
+        "record_disposition",
+    ):
         assert f"PROTECTED_NODE={node}" in handoff
     assert handoff.count("run_node observe ") == 2
-    assert handoff.count("run_node ingest ") == 1
-    assert "cloud coordinate" in jobs["promotion_handoff"]
+    assert handoff.count("run_node ingest ") == 2
+    assert 'coordinate "$PROTECTED_NODE" observe_required_checks' in jobs["promotion_handoff"]
     assert "GITHUB_TOKEN" not in jobs["promotion_handoff"]
     assert "live_acp_credential_missing" not in document
     assert 'get("eligible") is not False' not in document
@@ -690,28 +698,156 @@ def test_soak_workflow_is_six_hour_exact_merge_bound_and_protected() -> None:
     assert 'test "$SOAK_CADENCE_HOURS" = "6"' in jobs["commission"]
     assert "rev-list --parents -n 1" in jobs["commission"]
     assert 'test "${MERGE_TOPOLOGY[1]}" = "$PARENT_COMMIT"' in jobs["commission"]
-    assert "run_node commission-live observe_soak" in jobs["live_soak"]
+    assert "commission-live observe_soak accept_soak" in jobs["live_soak"]
     handoff = jobs["evidence"]
-    for node in ("observe_soak", "accept_soak"):
-        assert f"PROTECTED_NODE={node}" in handoff
+    assert "PROTECTED_NODE=accept_soak" in handoff
     assert "archive sign and ingest" in handoff
-    assert "cloud health" in jobs["rollback_handoff"]
+    assert 'health "$PROTECTED_NODE" supervisor_reconciled' in jobs["rollback_handoff"]
     assert "GITHUB_TOKEN" not in jobs["rollback_handoff"]
     assert "github.sha" not in jobs["live_soak"]
     assert "inputs.candidate_commit" in jobs["live_soak"]
 
 
-def test_each_protected_workflow_uploads_one_bounded_request_named_artifact() -> None:
-    for path, prefix in (
-        (IMPROVEMENT_WORKFLOW_PATH, "autonomous-improvement-evidence"),
-        (SOAK_WORKFLOW_PATH, "autonomous-soak-observation"),
+def test_each_protected_workflow_uses_bounded_private_objects_and_public_receipts() -> None:
+    for path, outcome_prefix, receipt_prefix, upload_count, download_count in (
+        (
+            IMPROVEMENT_WORKFLOW_PATH,
+            "protected-improvement-outcome",
+            "autonomous-improvement-evidence",
+            2,
+            2,
+        ),
+        (
+            SOAK_WORKFLOW_PATH,
+            "protected-soak-health",
+            "autonomous-soak-observation",
+            3,
+            2,
+        ),
     ):
         document = path.read_text(encoding="utf-8")
-        assert document.count("actions/upload-artifact@") == 1
-        assert f"name: {prefix}-${{{{ inputs.request_digest }}}}" in document
+        assert document.count("actions/upload-artifact@") == upload_count
+        assert document.count("actions/download-artifact@") == download_count
+        assert f"name: {outcome_prefix}-${{{{ inputs.request_digest }}}}" in document
+        assert f"name: {receipt_prefix}-${{{{ inputs.request_digest }}}}" in document
+        assert "retention-days: 1" in document
         assert "MAX_PUBLIC_HANDOFF_BYTES: 1048576" in document
         assert '"provider"' not in document
         assert '"model"' not in document
         assert "secret" not in "\n".join(
             line.lower() for line in document.splitlines() if "cloud-handoff" in line
         )
+
+
+def test_evaluator_outputs_cross_only_the_protected_object_and_receipt_chain() -> None:
+    improvement = _workflow_job_blocks(IMPROVEMENT_WORKFLOW_PATH.read_text(encoding="utf-8"))
+    soak = _workflow_job_blocks(SOAK_WORKFLOW_PATH.read_text(encoding="utf-8"))
+
+    improvement_evaluate = improvement["evaluate"]
+    improvement_evidence = improvement["evidence"]
+    promotion = improvement["promotion_handoff"]
+    assert "paired-result.json" in improvement_evaluate
+    assert "protected-improvement-outcome-${{ inputs.request_digest }}" in improvement_evaluate
+    assert "paired_result_digest" in improvement_evaluate
+    assert "actions/upload-artifact@" in improvement_evaluate
+    assert "actions/download-artifact@" in improvement_evidence
+    assert "EXPECTED_OUTCOME_DIGEST: ${{ needs.evaluate.outputs.paired_result_digest }}" in (
+        improvement_evidence
+    )
+    assert 'value["contract_eligible"] is not True' in improvement_evidence
+    assert 'value["candidate"]["commit"] != os.environ["CANDIDATE_COMMIT"]' in (
+        improvement_evidence
+    )
+    assert "protected_receipt_digest" in improvement_evidence
+    assert (
+        "EXPECTED_IMPROVEMENT_RECEIPT: ${{ needs.evidence.outputs.protected_receipt_digest }}"
+    ) in promotion
+    assert "EXPECTED_OUTCOME_DIGEST" in promotion
+    assert "actions/download-artifact@" in promotion
+    assert "autonomous-improvement-evidence-${{ inputs.request_digest }}" in promotion
+    assert "verify_exact_improvement_handoff" in promotion
+    assert 'handoff["candidate_commit"] != os.environ["CANDIDATE_COMMIT"]' in promotion
+    assert 'handoff["outcome_digest"] != outcome_digest' in promotion
+    assert 'handoff["protected_receipt_digest"] != expected_receipt' in promotion
+
+    soak_evaluate = soak["evaluate"]
+    soak_evidence = soak["evidence"]
+    assert "health-result.json" in soak_evaluate
+    assert "protected-soak-health-${{ inputs.request_digest }}" in soak_evaluate
+    assert "health_result_digest" in soak_evaluate
+    assert "actions/upload-artifact@" in soak_evaluate
+    assert "actions/download-artifact@" in soak_evidence
+    assert "EXPECTED_OUTCOME_DIGEST: ${{ needs.evaluate.outputs.health_result_digest }}" in (
+        soak_evidence
+    )
+    assert 'value["healthy"] is not True' in soak_evidence
+    assert "protected_receipt_digest" in soak_evidence
+    assert "accept_soak" in soak_evidence
+    assert "EXPECTED_HEALTH_RECEIPT" in soak_evidence
+    assert "protected-soak-receipt-${{ inputs.request_digest }}" in soak["live_soak"]
+    assert "protected-soak-receipt-${{ inputs.request_digest }}" in soak_evidence
+    assert "verify_exact_health_receipt" in soak_evidence
+    assert 'payload["health_receipt_digest"] != os.environ["EXPECTED_OUTCOME_DIGEST"]' in (
+        soak_evidence
+    )
+
+
+def test_every_protected_stage_uses_exact_fail_closed_response_contract() -> None:
+    for path in (IMPROVEMENT_WORKFLOW_PATH, SOAK_WORKFLOW_PATH):
+        document = path.read_text(encoding="utf-8")
+        assert "carl.coordinator.ipc.response.v1" in document
+        assert 'set(value) != {"domain", "error_code", "request_digest", "result",' in document
+        assert 'value["status"] != "completed"' in document
+        assert 'value["request_digest"] != expected_ipc_digest' in document
+        assert 'result["node"] != expected_node' in document
+        assert 'if action == "complete_command"' in document
+        assert 'result["reason"] != "observed_effect_completion_required"' in document
+        assert "expected_successor" in document
+        assert "workflow_stage_response_invalid" in document
+        assert "persist_exact_node_freeze" in document
+        assert "reject_request_freeze" in document
+        assert "carl.workflow-stage-freeze.v1" in document
+        assert "/var/lib/carl/protected-workflow-freezes" in document
+        assert "os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW" in document
+        assert "while written < len(raw)" in document
+        assert '"node": expected_node' in document
+        assert '"request_digest": workflow_request_digest' in document
+        assert '"successor": expected_successor' in document
+        assert "except Exception:" in document
+        assert "expected_remote_effect" in document
+        assert 'result["result_digest"] is not None' in document
+        assert 'result["effect_key"] != command_value["effect_key"]' in document
+        assert "not in (None, sys.argv[2])" not in document
+        assert "if action == 'frozen'" not in document
+    improvement_jobs = _workflow_job_blocks(IMPROVEMENT_WORKFLOW_PATH.read_text(encoding="utf-8"))
+    assert (
+        'expected_successor != "register_hypothesis"' in improvement_jobs["publish_private_inputs"]
+    )
+    assert 'expected_successor != "observe_validation"' in improvement_jobs["live_validation"]
+
+
+def test_soak_acceptance_uses_signed_durable_cadence_and_trusted_time() -> None:
+    soak = SOAK_WORKFLOW_PATH.read_text(encoding="utf-8")
+    jobs = _workflow_job_blocks(soak)
+    live_soak = jobs["live_soak"]
+    evidence = jobs["evidence"]
+
+    assert "load_previous_signed_soak_receipt" in live_soak
+    assert "verify_previous_signed_soak_receipt" in live_soak
+    assert "PREVIOUS_SOAK_RECEIPT_PATH: /var/lib/carl/soak/previous-signed-receipt.json" in (
+        live_soak
+    )
+    assert "/run/carl/soak/previous-signed-receipt.json" not in live_soak
+    assert "trusted_current_time" in live_soak
+    assert "previous_observed_at" in live_soak
+    assert "timedelta(hours=6)" in live_soak
+    assert "timedelta(hours=26)" in live_soak
+    assert "soak_observation_too_early" in live_soak
+    assert "soak_observation_stale_critical" in live_soak
+    assert "active_merge_commit" in live_soak
+    assert 'active_merge_commit != os.environ["CANDIDATE_COMMIT"]' in live_soak
+    assert 'payload["request_digest"] != os.environ["REQUEST_DIGEST"]' in live_soak
+    assert 'payload["merged_at"] != context["merged_at"]' in live_soak
+    assert "accept_soak" in evidence
+    assert "EXPECTED_HEALTH_RECEIPT" in evidence
+    assert "verify_exact_health_receipt" in evidence

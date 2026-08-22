@@ -59,6 +59,7 @@ INPUTS = {
 }
 PINNED_ACTIONS = {
     "actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683",
+    "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093",
     "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
     "astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990",
 }
@@ -1487,7 +1488,8 @@ def test_workflow_dispatch_contract_is_parsed_and_immutable(name: str) -> None:
     jobs = _jobs(workflow)
     assert set(jobs) >= {"commission", "evaluate", "evidence"}
     assert jobs["evidence"]["needs"] == [
-        "live_validation" if name == "autonomous-improvement.yml" else "live_soak"
+        "evaluate",
+        "live_validation" if name == "autonomous-improvement.yml" else "live_soak",
     ]
     actions = [
         step["uses"]
@@ -1512,6 +1514,10 @@ def test_workflow_dispatch_contract_is_parsed_and_immutable(name: str) -> None:
         expected_permissions = {"contents": "read"}
         if job_name in oidc_jobs:
             expected_permissions["id-token"] = "write"
+        if job_name == "evidence" or (
+            name == "autonomous-improvement.yml" and job_name == "promotion_handoff"
+        ):
+            expected_permissions["actions"] = "read"
         assert job["permissions"] == expected_permissions
         assert job["runs-on"] == (
             ["self-hosted", "linux", "x64", "carl-autonomy-cloud"]
@@ -1587,8 +1593,13 @@ def test_candidate_execution_isolated_from_trusted_evidence_and_inputs(name: str
         assert "-p no:cacheprovider" in evaluate_commands
     assert "sha256sum --check" in evaluate_commands
     assert "immutable-inputs" in evaluate_commands
-    assert "actions/upload-artifact" not in json.dumps(evaluate)
+    evaluate_serialized = json.dumps(evaluate, sort_keys=True)
+    assert evaluate_serialized.count("actions/upload-artifact") == 1
+    assert "actions/download-artifact" not in evaluate_serialized
+    assert '"retention-days": 1' in evaluate_serialized
     assert "actions/checkout" not in evidence_serialized
+    expected_downloads = 2 if name == "autonomous-soak.yml" else 1
+    assert evidence_serialized.count("actions/download-artifact") == expected_downloads
     assert evidence_serialized.count("actions/upload-artifact") == 1
 
 
@@ -1646,12 +1657,14 @@ def test_improvement_workflow_runs_real_exact_parent_candidate_pair() -> None:
     evidence_commands = "\n".join(
         step["run"] for step in jobs["evidence"]["steps"] if "run" in step
     )
-    assert '"decisions"' in evidence_commands
+    assert '"stage_receipts"' in evidence_commands
+    assert '"outcome_digest"' in evidence_commands
+    assert '"protected_receipt_digest"' in evidence_commands
     assert "observe_validation" in evidence_commands
     assert "archive_validation" in evidence_commands
     assert "ingest_validation" in evidence_commands
     assert "live_acp_credential_missing" not in evidence
-    assert jobs["evidence"]["needs"] == ["live_validation"]
+    assert jobs["evidence"]["needs"] == ["evaluate", "live_validation"]
 
 
 def test_improvement_workflow_runs_locked_suites_and_uploads_bounded_evidence() -> None:
