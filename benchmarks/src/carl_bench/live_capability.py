@@ -902,17 +902,27 @@ class DeterministicPairEvidence:
 
     @staticmethod
     def _derive(result: object) -> tuple[LiveEvaluationIdentity, bool, tuple[str, ...], bytes]:
-        from carl_bench.cloud_harness import CloudHarnessResult, SubjectResult
+        from carl_bench.cloud_harness import (
+            CloudHarnessResult,
+            SubjectResult,
+            _is_executed_cloud_harness_result,
+        )
 
-        if not isinstance(result, CloudHarnessResult) or not isinstance(
-            result.live_evaluation_identity, LiveEvaluationIdentity
+        if (
+            not _is_executed_cloud_harness_result(result)
+            or not isinstance(result, CloudHarnessResult)
+            or not isinstance(result.live_evaluation_identity, LiveEvaluationIdentity)
         ):
-            raise LiveCapabilityError("deterministic_evidence_invalid")
+            raise LiveCapabilityError("deterministic_evidence_unprotected")
         identity = result.live_evaluation_identity
         reasons = tuple(sorted(result.contract_reasons))
         if (
             not isinstance(result.parent, SubjectResult)
             or not isinstance(result.candidate, SubjectResult)
+            or not result.parent.observations
+            or not result.candidate.observations
+            or tuple(item.probe_id for item in result.parent.observations) != identity.task_order
+            or tuple(item.probe_id for item in result.candidate.observations) != identity.task_order
             or result.mode != "improvement"
             or result.parent.commit != identity.parent_commit
             or result.candidate.commit != identity.candidate_commit
@@ -960,7 +970,57 @@ class DeterministicPairEvidence:
         object.__setattr__(value, "_source_payload", payload)
         return value
 
+    @classmethod
+    def _for_testing(
+        cls,
+        *,
+        identity: LiveEvaluationIdentity,
+        contract_eligible: bool,
+        contract_reasons: tuple[str, ...],
+    ) -> DeterministicPairEvidence:
+        """Mint explicitly synthetic evidence for unit tests; it is never production eligible."""
+        if (
+            not isinstance(identity, LiveEvaluationIdentity)
+            or type(contract_eligible) is not bool
+            or not isinstance(contract_reasons, tuple)
+            or contract_eligible == bool(contract_reasons)
+        ):
+            raise LiveCapabilityError("deterministic_evidence_invalid")
+        payload = canonical_json_bytes(
+            {
+                "contract_eligible": contract_eligible,
+                "contract_reasons": list(contract_reasons),
+                "identity": identity.to_canonical_dict(),
+                "kind": "synthetic_deterministic_pair_evidence",
+                "schema_version": 1,
+            }
+        )
+        value = object.__new__(cls)
+        object.__setattr__(value, "identity", identity)
+        object.__setattr__(value, "contract_eligible", contract_eligible)
+        object.__setattr__(value, "contract_reasons", contract_reasons)
+        object.__setattr__(value, "evidence_digest", hashlib.sha256(payload).hexdigest())
+        object.__setattr__(value, "_source_result", None)
+        object.__setattr__(value, "_source_payload", payload)
+        return value
+
     def verify_source(self) -> None:
+        if self._source_result is None:
+            payload = canonical_json_bytes(
+                {
+                    "contract_eligible": self.contract_eligible,
+                    "contract_reasons": list(self.contract_reasons),
+                    "identity": self.identity.to_canonical_dict(),
+                    "kind": "synthetic_deterministic_pair_evidence",
+                    "schema_version": 1,
+                }
+            )
+            if (
+                payload != self._source_payload
+                or hashlib.sha256(payload).hexdigest() != self.evidence_digest
+            ):
+                raise LiveCapabilityError("deterministic_evidence_invalid")
+            return
         identity, eligible, reasons, payload = self._derive(self._source_result)
         if (
             payload != self._source_payload
@@ -988,7 +1048,14 @@ def combine_paired_evidence(
         try:
             gateway = OpenAIModelGateway.from_protected_environment()
         except OpenAIGatewayError as error:
-            if error.code == "openai_credentials_missing" and live_evidence is None:
+            if (
+                error.code
+                in {
+                    "openai_credentials_missing",
+                    "openai_provenance_key_missing",
+                }
+                and live_evidence is None
+            ):
                 return CombinedCapabilityEvidence(
                     identity=identity,
                     eligible=False,
@@ -1008,22 +1075,11 @@ def combine_paired_evidence(
     pair = verify_live_pair(live_evidence, key=key, gateway=gateway, now=now)
     if pair.identity != identity:
         raise LiveCapabilityError("deterministic_live_identity_mismatch")
-    if not deterministic_evidence.contract_eligible:
-        return CombinedCapabilityEvidence(
-            identity=identity,
-            eligible=False,
-            disposition="rejected",
-            reasons=deterministic_evidence.contract_reasons,
-            live_pair_digest=pair.digest,
-            task_deltas=pair.task_deltas,
-        )
     return CombinedCapabilityEvidence(
         identity=identity,
-        eligible=pair.eligible,
-        disposition="improvement"
-        if pair.eligible
-        else ("inconclusive" if pair.inconclusive else "rejected"),
-        reasons=pair.reasons,
+        eligible=False,
+        disposition="insufficient_evidence",
+        reasons=("synthetic_evidence_ineligible",),
         live_pair_digest=pair.digest,
         task_deltas=pair.task_deltas,
     )

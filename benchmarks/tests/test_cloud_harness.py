@@ -3,6 +3,9 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
+import subprocess
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -10,6 +13,10 @@ import pytest
 import carl_bench.cloud_harness as cloud_harness
 from carl_bench.cloud_harness import CloudHarnessError, evaluate_carl_pair
 from carl_bench.live_capability import LiveEvaluationIdentity
+from carl_bench.live_evaluation_authority import (
+    LiveEvaluationAuthorityError,
+    ProtectedLiveEvaluationAuthority,
+)
 
 PARENT = "1" * 40
 CANDIDATE = "2" * 40
@@ -148,6 +155,35 @@ def _evaluate(tmp_path: Path, *, parent_ok: bool = False, candidate_ok: bool = T
     )
 
 
+def _git_subject(path: Path, *, version_ok: bool) -> tuple[Path, str, str]:
+    path.mkdir()
+    binary = _subject(path / "carl", version_ok=version_ok)
+    subprocess.run(("git", "init", "-q"), cwd=path, check=True)
+    subprocess.run(("git", "config", "user.name", "Carl Test"), cwd=path, check=True)
+    subprocess.run(
+        ("git", "config", "user.email", "carl-test@example.invalid"),
+        cwd=path,
+        check=True,
+    )
+    subprocess.run(("git", "add", "carl"), cwd=path, check=True)
+    subprocess.run(("git", "commit", "-q", "-m", "fixture"), cwd=path, check=True)
+    commit = subprocess.run(
+        ("git", "rev-parse", "HEAD"),
+        cwd=path,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    tree = subprocess.run(
+        ("git", "rev-parse", "HEAD^{tree}"),
+        cwd=path,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    return binary, commit, tree
+
+
 def test_contract_hash_and_parser_share_one_held_file_description(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -268,6 +304,126 @@ def test_deterministic_harness_binds_the_exact_live_pair_identity(tmp_path: Path
     assert result.to_canonical_dict()["live_evaluation_identity"] == (
         pair_identity.to_canonical_dict()
     )
+
+
+def test_deterministic_receipt_requires_one_clean_checkout_lease_across_execution(
+    tmp_path: Path,
+) -> None:
+    objects = _objects(tmp_path / "contracts")
+    immutable = {
+        kind: hashlib.sha256(path.read_bytes()).hexdigest() for kind, path in objects.items()
+    }
+    parent_binary, parent_commit, parent_tree = _git_subject(tmp_path / "parent", version_ok=False)
+    candidate_binary, candidate_commit, candidate_tree = _git_subject(
+        tmp_path / "candidate", version_ok=True
+    )
+    pair_identity = LiveEvaluationIdentity.create(
+        repository="StephenBickel/carl-agent",
+        parent_commit=parent_commit,
+        parent_tree=parent_tree,
+        candidate_commit=candidate_commit,
+        candidate_tree=candidate_tree,
+        experiment_digest=immutable["experiment"],
+        workflow_revision="5" * 40,
+        workflow_digest="6" * 64,
+        task_set_digest=immutable["task_set"],
+        metric_pack_digest=immutable["metric_pack"],
+        policy_digest=immutable["policy"],
+        model_policy_digest="7" * 64,
+        grader_digest="8" * 64,
+        environment_digest="9" * 64,
+        model="gpt-5.2",
+        reasoning_policy="medium/no-summary",
+        tool_protocol_revision="acp-v2/bounded-openai-v1",
+        task_order=("help", "memory-help", "version"),
+        seeds=(41000, 41001, 41002),
+        attempts=3,
+    )
+
+    class Archive:
+        def read_exact(self, object_key: str, version_id: str) -> object:
+            del object_key, version_id
+            raise AssertionError("sealing must not read archive storage")
+
+    class Gateway:
+        def protected_execution_policy(self) -> dict[str, str]:
+            return {}
+
+        def verify_protected_result(self, value: object) -> bool:
+            del value
+            return False
+
+    authority = ProtectedLiveEvaluationAuthority._for_testing(
+        archive=Archive(),
+        gateway=Gateway(),
+        clock=lambda: datetime(2026, 8, 22, 12, tzinfo=UTC),
+        deterministic_key=b"D" * 32,
+        live_key=b"L" * 32,
+        result_key=b"R" * 32,
+    )
+    lease = authority.begin_deterministic_run(
+        identity=pair_identity,
+        parent_checkout=tmp_path / "parent",
+        candidate_checkout=tmp_path / "candidate",
+        parent_binary=parent_binary,
+        candidate_binary=candidate_binary,
+    )
+    result = authority.execute_deterministic_run(
+        lease=lease,
+        experiment_path=objects["experiment"],
+        task_set_path=objects["task_set"],
+        metric_pack_path=objects["metric_pack"],
+        policy_path=objects["policy"],
+    )
+
+    sealed = json.loads(authority.seal_deterministic_run(result, lease=lease))
+
+    assert sealed["payload"]["checkout_attestation_digest"] == lease.checkout_digest
+    with pytest.raises(LiveEvaluationAuthorityError, match="deterministic_run_lease_consumed"):
+        authority.seal_deterministic_run(result, lease=lease)
+
+    unbound_result = evaluate_carl_pair(
+        parent_binary=parent_binary,
+        candidate_binary=candidate_binary,
+        parent_commit=parent_commit,
+        candidate_commit=candidate_commit,
+        experiment_path=objects["experiment"],
+        task_set_path=objects["task_set"],
+        metric_pack_path=objects["metric_pack"],
+        policy_path=objects["policy"],
+        mode="improvement",
+        live_evaluation_identity=pair_identity,
+    )
+    unbound_lease = authority.begin_deterministic_run(
+        identity=pair_identity,
+        parent_checkout=tmp_path / "parent",
+        candidate_checkout=tmp_path / "candidate",
+        parent_binary=parent_binary,
+        candidate_binary=candidate_binary,
+    )
+    with pytest.raises(LiveEvaluationAuthorityError, match="deterministic_evidence_unprotected"):
+        authority.seal_deterministic_run(unbound_result, lease=unbound_lease)
+
+    replacement_lease = authority.begin_deterministic_run(
+        identity=pair_identity,
+        parent_checkout=tmp_path / "parent",
+        candidate_checkout=tmp_path / "candidate",
+        parent_binary=parent_binary,
+        candidate_binary=candidate_binary,
+    )
+    replacement_result = authority.execute_deterministic_run(
+        lease=replacement_lease,
+        experiment_path=objects["experiment"],
+        task_set_path=objects["task_set"],
+        metric_pack_path=objects["metric_pack"],
+        policy_path=objects["policy"],
+    )
+    candidate_original = tmp_path / "candidate-original"
+    os.replace(tmp_path / "candidate", candidate_original)
+    shutil.copytree(candidate_original, tmp_path / "candidate", symlinks=True)
+
+    with pytest.raises(LiveEvaluationAuthorityError, match="deterministic_checkout_changed"):
+        authority.seal_deterministic_run(replacement_result, lease=replacement_lease)
 
 
 def test_protected_harness_rejects_shared_or_harness_subject_uid(tmp_path: Path) -> None:

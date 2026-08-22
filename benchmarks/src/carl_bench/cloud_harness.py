@@ -21,6 +21,7 @@ import subprocess
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +32,7 @@ _ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 _MAX_CONTRACT_BYTES = 1_048_576
 _MAX_BINARY_BYTES = 512 * 1_048_576
 _LIVE_GATE_REASON = "live_acp_credential_missing"
+_HARNESS_EXECUTION_ORIGIN = object()
 _CONTRACT_FIELDS = {
     "experiment": {
         "affected_probe_ids",
@@ -295,6 +297,12 @@ class CloudHarnessResult:
     disposition: str = "insufficient_evidence"
     reasons: tuple[str, ...] = (_LIVE_GATE_REASON,)
     live_evaluation_identity: object | None = None
+    _execution_origin: object | None = dataclass_field(
+        default=None,
+        init=False,
+        repr=False,
+        compare=False,
+    )
 
     def to_canonical_dict(self) -> dict[str, Any]:
         value = {
@@ -319,6 +327,13 @@ class CloudHarnessResult:
                 raise CloudHarnessError("live_evaluation_identity_invalid")
             value["live_evaluation_identity"] = self.live_evaluation_identity.to_canonical_dict()
         return value
+
+
+def _is_executed_cloud_harness_result(value: object) -> bool:
+    """Recognize results minted by this process's real harness execution path."""
+    return (
+        type(value) is CloudHarnessResult and value._execution_origin is _HARNESS_EXECUTION_ORIGIN
+    )
 
 
 def _parse_contracts(
@@ -793,6 +808,7 @@ def evaluate_carl_pair(
         contract_reasons=tuple(reasons),
         live_evaluation_identity=live_evaluation_identity,
     )
+    object.__setattr__(result, "_execution_origin", _HARNESS_EXECUTION_ORIGIN)
     if len(canonical_json_bytes(result.to_canonical_dict())) > policy["maximum_payload_bytes"]:
         raise CloudHarnessError("evidence_payload_too_large")
     return result

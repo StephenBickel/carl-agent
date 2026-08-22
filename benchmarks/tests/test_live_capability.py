@@ -23,6 +23,12 @@ from carl_bench.live_capability import (
     combine_paired_evidence,
     verify_live_pair,
 )
+from carl_bench.live_evaluation_authority import (
+    LiveEvaluationAuthorityError,
+    ProtectedArchiveVersion,
+    ProtectedEvidenceLocator,
+    ProtectedLiveEvaluationAuthority,
+)
 from carl_bench.openai_gateway import (
     OpenAIModelGateway,
     OpenAIUsage,
@@ -263,33 +269,11 @@ def attested(monkeypatch: pytest.MonkeyPatch):
 def deterministic_evidence(
     pair_identity: LiveEvaluationIdentity, *, eligible: bool = True
 ) -> DeterministicPairEvidence:
-    source = CloudHarnessResult(
-        mode="improvement",
-        immutable_inputs={
-            "experiment": pair_identity.experiment_digest,
-            "metric_pack": pair_identity.metric_pack_digest,
-            "policy": pair_identity.policy_digest,
-            "task_set": pair_identity.task_set_digest,
-        },
-        parent=SubjectResult(
-            commit=pair_identity.parent_commit,
-            binary_digest=digest("parent-binary"),
-            score_basis_points=4_000,
-            observations=(),
-        ),
-        candidate=SubjectResult(
-            commit=pair_identity.candidate_commit,
-            binary_digest=digest("candidate-binary"),
-            score_basis_points=8_000 if eligible else 3_000,
-            observations=(),
-        ),
-        gain_basis_points=4_000 if eligible else -1_000,
+    return DeterministicPairEvidence._for_testing(
+        identity=pair_identity,
         contract_eligible=eligible,
-        contract_disposition="improvement" if eligible else "rejected",
         contract_reasons=() if eligible else ("deterministic_contract_regression",),
-        live_evaluation_identity=pair_identity,
     )
-    return DeterministicPairEvidence.from_cloud_harness(source)
 
 
 def test_pair_identity_is_exact_immutable_and_subject_checkouts_are_isolated() -> None:
@@ -623,7 +607,7 @@ def test_combiner_rejects_duplicate_reordered_or_missing_trials(
             )
 
 
-def test_exact_attested_pair_combines_with_deterministic_identity(
+def test_public_exact_attested_pair_remains_structurally_synthetic(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     pair, gateway, envelope = attested(monkeypatch)
@@ -637,9 +621,9 @@ def test_exact_attested_pair_combines_with_deterministic_identity(
     )
 
     assert verify_live_pair(envelope, key=KEY, gateway=gateway, now=NOW) == pair
-    assert result.eligible is True
-    assert result.disposition == "improvement"
-    assert result.reasons == ()
+    assert result.eligible is False
+    assert result.disposition == "insufficient_evidence"
+    assert result.reasons == ("synthetic_evidence_ineligible",)
     encoded = canonical_json_bytes(result.to_canonical_dict())
     assert b"bounded fixture output" not in encoded
     assert b"OPENAI_API_KEY" not in encoded
@@ -653,6 +637,57 @@ def test_direct_deterministic_evidence_cannot_claim_an_arbitrary_digest() -> Non
             contract_reasons=(),
             evidence_digest=digest("attacker-selected-evidence"),
         )
+
+
+def test_caller_constructed_harness_result_cannot_mint_production_evidence() -> None:
+    pair_identity = identity()
+    fabricated = CloudHarnessResult(
+        mode="improvement",
+        immutable_inputs={
+            "experiment": pair_identity.experiment_digest,
+            "metric_pack": pair_identity.metric_pack_digest,
+            "policy": pair_identity.policy_digest,
+            "task_set": pair_identity.task_set_digest,
+        },
+        parent=SubjectResult(
+            commit=pair_identity.parent_commit,
+            binary_digest=digest("fabricated-parent"),
+            score_basis_points=0,
+            observations=(),
+        ),
+        candidate=SubjectResult(
+            commit=pair_identity.candidate_commit,
+            binary_digest=digest("fabricated-candidate"),
+            score_basis_points=10_000,
+            observations=(),
+        ),
+        gain_basis_points=10_000,
+        contract_eligible=True,
+        contract_disposition="improvement",
+        contract_reasons=(),
+        live_evaluation_identity=pair_identity,
+    )
+
+    with pytest.raises(LiveCapabilityError, match="deterministic_evidence_unprotected"):
+        DeterministicPairEvidence.from_cloud_harness(fabricated)
+
+
+def test_local_signer_and_constructed_archive_cannot_mint_production_eligibility(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pair, gateway, locally_attested = attested(monkeypatch)
+
+    result = combine_paired_evidence(
+        deterministic_evidence=deterministic_evidence(pair.identity),
+        live_evidence=locally_attested,
+        key=KEY,
+        gateway=gateway,
+        now=NOW,
+    )
+
+    assert result.eligible is False
+    assert result.disposition == "insufficient_evidence"
+    assert result.reasons == ("synthetic_evidence_ineligible",)
 
 
 def test_missing_live_evidence_preserves_stable_disposition(
@@ -672,7 +707,25 @@ def test_missing_live_evidence_preserves_stable_disposition(
     assert result.reasons == ("live_acp_credential_missing",)
 
 
-def test_live_win_cannot_override_a_deterministic_contract_regression(
+def test_missing_provenance_credential_preserves_stable_disposition(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-1234567890123456")
+    monkeypatch.delenv("CARL_OPENAI_PROVENANCE_KEY_B64", raising=False)
+
+    result = combine_paired_evidence(
+        deterministic_evidence=deterministic_evidence(identity()),
+        live_evidence=None,
+        key=KEY,
+        now=NOW,
+    )
+
+    assert result.eligible is False
+    assert result.disposition == "insufficient_evidence"
+    assert result.reasons == ("live_acp_credential_missing",)
+
+
+def test_public_live_win_and_deterministic_regression_remain_synthetic(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     pair, gateway, envelope = attested(monkeypatch)
@@ -686,8 +739,8 @@ def test_live_win_cannot_override_a_deterministic_contract_regression(
     )
 
     assert result.eligible is False
-    assert result.disposition == "rejected"
-    assert result.reasons == ("deterministic_contract_regression",)
+    assert result.disposition == "insufficient_evidence"
+    assert result.reasons == ("synthetic_evidence_ineligible",)
 
 
 def test_attested_payload_is_canonical_bounded_and_contains_no_raw_provider_text(
@@ -700,3 +753,217 @@ def test_attested_payload_is_canonical_bounded_and_contains_no_raw_provider_text
     assert len(encoded) < 1_048_576
     assert decoded["payload"]["digest"] == pair.digest
     assert "bounded fixture output" not in encoded.decode()
+
+
+class _ProtectedArchive:
+    def __init__(self) -> None:
+        self.objects: dict[tuple[str, str], ProtectedArchiveVersion] = {}
+        self.reads: list[tuple[str, str]] = []
+
+    def add(
+        self,
+        *,
+        kind: str,
+        payload: bytes,
+        version_id: str,
+        retain_until: str = "2027-08-22T12:00:00Z",
+    ) -> ProtectedEvidenceLocator:
+        digest_value = hashlib.sha256(payload).hexdigest()
+        key = f"carl-evidence/v1/sha256/{digest_value[:2]}/{digest_value}"
+        self.objects[(key, version_id)] = ProtectedArchiveVersion(
+            object_key=key,
+            version_id=version_id,
+            payload=payload,
+            checksum_sha256=digest_value,
+            byte_length=len(payload),
+            retention_mode="COMPLIANCE",
+            retain_until=retain_until,
+            created_at="2026-08-22T11:59:00Z",
+        )
+        return ProtectedEvidenceLocator(kind, key, version_id, digest_value)
+
+    def read_exact(self, object_key: str, version_id: str) -> ProtectedArchiveVersion:
+        self.reads.append((object_key, version_id))
+        return self.objects[(object_key, version_id)]
+
+
+def _protected_authority(
+    archive: _ProtectedArchive,
+    gateway: OpenAIModelGateway,
+    *,
+    deterministic_key: bytes = bytes(range(32)),
+    live_key: bytes = bytes(range(32, 64)),
+) -> ProtectedLiveEvaluationAuthority:
+    return ProtectedLiveEvaluationAuthority._for_testing(
+        archive=archive,
+        gateway=gateway,
+        clock=lambda: NOW,
+        deterministic_key=deterministic_key,
+        live_key=live_key,
+        result_key=bytes(reversed(range(32))),
+    )
+
+
+def test_protected_authority_reads_exact_versions_and_is_the_only_eligible_join(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pair, gateway = protected_pair(monkeypatch)
+    archive = _ProtectedArchive()
+    authority = _protected_authority(archive, gateway)
+    deterministic_locator = archive.add(
+        kind="protected_deterministic_pair",
+        payload=authority._seal_deterministic_summary_for_testing(
+            identity=pair.identity,
+            contract_eligible=True,
+            contract_reasons=(),
+        ),
+        version_id="det-v1",
+    )
+    live_locator = archive.add(
+        kind="protected_live_pair",
+        payload=authority.seal_live_pair(pair),
+        version_id="live-v9",
+    )
+
+    receipt = authority.combine(
+        request_digest=digest("protected-join-request"),
+        deterministic_locator=deterministic_locator,
+        live_locator=live_locator,
+    )
+
+    assert receipt.eligible is True
+    assert receipt.disposition == "improvement"
+    assert authority.verify_combined_receipt(receipt) is True
+    assert archive.reads == [
+        (deterministic_locator.object_key, "det-v1"),
+        (live_locator.object_key, "live-v9"),
+    ]
+    encoded = canonical_json_bytes(receipt.to_canonical_dict())
+    assert b"bounded fixture output" not in encoded
+    assert b"OPENAI_API_KEY" not in encoded
+
+
+def test_protected_authority_never_overrides_deterministic_regression(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pair, gateway = protected_pair(monkeypatch)
+    archive = _ProtectedArchive()
+    authority = _protected_authority(archive, gateway)
+    deterministic_locator = archive.add(
+        kind="protected_deterministic_pair",
+        payload=authority._seal_deterministic_summary_for_testing(
+            identity=pair.identity,
+            contract_eligible=False,
+            contract_reasons=("deterministic_contract_regression",),
+        ),
+        version_id="det-regression-v1",
+    )
+    live_locator = archive.add(
+        kind="protected_live_pair",
+        payload=authority.seal_live_pair(pair),
+        version_id="live-win-v1",
+    )
+
+    receipt = authority.combine(
+        request_digest=digest("protected-regression-join"),
+        deterministic_locator=deterministic_locator,
+        live_locator=live_locator,
+    )
+
+    assert receipt.eligible is False
+    assert receipt.disposition == "rejected"
+    assert receipt.reasons == ("deterministic_contract_regression",)
+
+
+def test_locally_selected_signer_cannot_satisfy_pinned_production_authority(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pair, gateway = protected_pair(monkeypatch)
+    archive = _ProtectedArchive()
+    attacker = _protected_authority(
+        archive,
+        gateway,
+        deterministic_key=b"A" * 32,
+        live_key=b"B" * 32,
+    )
+    production = _protected_authority(archive, gateway)
+    deterministic_locator = archive.add(
+        kind="protected_deterministic_pair",
+        payload=attacker._seal_deterministic_summary_for_testing(
+            identity=pair.identity,
+            contract_eligible=True,
+            contract_reasons=(),
+        ),
+        version_id="attacker-det-v1",
+    )
+    live_locator = archive.add(
+        kind="protected_live_pair",
+        payload=attacker.seal_live_pair(pair),
+        version_id="attacker-live-v1",
+    )
+
+    with pytest.raises(LiveEvaluationAuthorityError, match="live_authority_signature_invalid"):
+        production.combine(
+            request_digest=digest("attacker-join"),
+            deterministic_locator=deterministic_locator,
+            live_locator=live_locator,
+        )
+
+
+def test_constructed_archive_receipt_cannot_replace_protected_storage_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pair, gateway, constructed = attested(monkeypatch)
+    authority = _protected_authority(_ProtectedArchive(), gateway)
+
+    with pytest.raises(LiveEvaluationAuthorityError, match="live_authority_locator_invalid"):
+        authority.combine(
+            request_digest=digest("constructed-archive"),
+            deterministic_locator=constructed,  # type: ignore[arg-type]
+            live_locator=constructed,  # type: ignore[arg-type]
+        )
+    assert pair.eligible is True
+
+
+def test_archive_replacement_and_stale_retention_are_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pair, gateway = protected_pair(monkeypatch)
+    archive = _ProtectedArchive()
+    authority = _protected_authority(archive, gateway)
+    deterministic_locator = archive.add(
+        kind="protected_deterministic_pair",
+        payload=authority._seal_deterministic_summary_for_testing(
+            identity=pair.identity,
+            contract_eligible=True,
+            contract_reasons=(),
+        ),
+        version_id="det-v1",
+    )
+    live_locator = archive.add(
+        kind="protected_live_pair",
+        payload=authority.seal_live_pair(pair),
+        version_id="live-v1",
+        retain_until="2026-08-22T12:00:00Z",
+    )
+
+    with pytest.raises(LiveEvaluationAuthorityError, match="archive_retention"):
+        authority.combine(
+            request_digest=digest("stale-retention"),
+            deterministic_locator=deterministic_locator,
+            live_locator=live_locator,
+        )
+
+    fresh = archive.objects[(deterministic_locator.object_key, "det-v1")]
+    archive.objects[(deterministic_locator.object_key, "det-v1")] = replace(
+        fresh,
+        payload=b'{"attacker":"replacement"}',
+        checksum_sha256=hashlib.sha256(b'{"attacker":"replacement"}').hexdigest(),
+        byte_length=len(b'{"attacker":"replacement"}'),
+    )
+    with pytest.raises(LiveEvaluationAuthorityError, match="live_authority_archive_invalid"):
+        authority.combine(
+            request_digest=digest("archive-replacement"),
+            deterministic_locator=deterministic_locator,
+            live_locator=live_locator,
+        )
