@@ -1887,7 +1887,7 @@ BEGIN
 END;
 $$;
 
-CREATE OR REPLACE FUNCTION carl_autonomy.apply_coordinator_decision(
+CREATE OR REPLACE FUNCTION carl_autonomy.apply_coordinator_decision_unchecked(
     p_decision_json text,
     p_observed_at timestamptz
 )
@@ -2460,7 +2460,7 @@ BEGIN
 END;
 $$;
 
-CREATE OR REPLACE FUNCTION carl_autonomy.prepare_coordinator_effect(
+CREATE OR REPLACE FUNCTION carl_autonomy.prepare_coordinator_effect_unchecked(
     p_decision_json text,
     p_observed_at timestamptz
 )
@@ -2623,7 +2623,7 @@ BEGIN
 END;
 $$;
 
-CREATE OR REPLACE FUNCTION carl_autonomy.complete_coordinator_effect(
+CREATE OR REPLACE FUNCTION carl_autonomy.complete_coordinator_effect_unchecked(
     p_decision_json text,
     p_response_json text,
     p_observed_at timestamptz
@@ -2865,7 +2865,7 @@ BEGIN
 END;
 $$;
 
-CREATE OR REPLACE FUNCTION carl_autonomy.execute_coordinator_local_effect(
+CREATE OR REPLACE FUNCTION carl_autonomy.execute_coordinator_local_effect_unchecked(
     p_decision_json text,
     p_observed_at timestamptz
 )
@@ -3073,6 +3073,246 @@ BEGIN
 END;
 $$;
 
+CREATE OR REPLACE FUNCTION carl_autonomy.coordinator_authoritative_receipt_failure(
+    failure_code text
+)
+RETURNS boolean
+LANGUAGE sql
+IMMUTABLE
+STRICT
+SECURITY INVOKER
+SET search_path = pg_catalog, carl_autonomy
+AS $$
+    SELECT failure_code = ANY(ARRAY[
+        'coordinator_completion_event_invalid',
+        'coordinator_completion_event_mismatch',
+        'coordinator_completion_identity_invalid',
+        'coordinator_completion_receipt_conflict',
+        'coordinator_completion_receipt_required',
+        'coordinator_effect_command_mismatch',
+        'coordinator_effect_digest_mismatch',
+        'coordinator_effect_identity_mismatch',
+        'coordinator_effect_occurrence_conflict',
+        'coordinator_effect_occurrence_missing',
+        'coordinator_effect_receipt_missing',
+        'coordinator_effect_request_json_invalid',
+        'coordinator_effect_response_conflict',
+        'coordinator_effect_response_json_invalid',
+        'coordinator_effect_response_mismatch'
+    ]::text[])
+$$;
+
+CREATE OR REPLACE FUNCTION carl_autonomy.freeze_coordinator_receipt_failure(
+    p_decision_json text,
+    p_observed_at timestamptz,
+    p_failure_code text
+)
+RETURNS TABLE(applied boolean, decision_json text)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, carl_autonomy
+AS $$
+DECLARE
+    source_decision jsonb;
+    runtime carl_autonomy.coordinator_runtime%ROWTYPE;
+    snapshot_value jsonb;
+    ready_node jsonb;
+    identity_value jsonb;
+    frozen_identity text;
+    frozen_decision text;
+BEGIN
+    PERFORM carl_autonomy.require_role(ARRAY['carl_coordinator']);
+    IF NOT carl_autonomy.coordinator_authoritative_receipt_failure(p_failure_code) THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '22023', MESSAGE = 'coordinator_receipt_failure_invalid';
+    END IF;
+    source_decision := carl_autonomy.parse_object(
+        p_decision_json, 'coordinator_decision_json_invalid'
+    );
+    SELECT item.* INTO runtime
+    FROM carl_autonomy.coordinator_runtime AS item
+    WHERE item.experiment_id = source_decision->>'experiment_id'
+        AND item.revision = (source_decision->>'revision')::integer
+    FOR UPDATE;
+    IF NOT FOUND OR runtime.status = 'frozen' THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '40001', MESSAGE = 'coordinator_decision_cas_mismatch';
+    END IF;
+    snapshot_value := carl_autonomy.parse_object(
+        runtime.snapshot_json, 'coordinator_snapshot_json_invalid'
+    );
+    SELECT node INTO ready_node
+    FROM jsonb_array_elements(snapshot_value->'nodes') AS node
+    WHERE node->>'status' IN ('ready', 'failed')
+    ORDER BY carl_autonomy.coordinator_node_priority(node->>'kind'), node->>'node_id'
+    LIMIT 1;
+    IF ready_node IS NULL
+        OR source_decision->>'node' IS DISTINCT FROM ready_node->>'kind'
+    THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '55000', MESSAGE = 'coordinator_decision_node_mismatch';
+    END IF;
+    identity_value := jsonb_build_object(
+        'action', 'frozen',
+        'experiment_id', runtime.experiment_id,
+        'node_id', ready_node->>'node_id',
+        'reason', 'authoritative_completion_receipt_invalid',
+        'revision', runtime.revision
+    );
+    frozen_identity := carl_autonomy.sha256_text(
+        carl_autonomy.canonical_jsonb(identity_value)
+    );
+    frozen_decision := carl_autonomy.canonical_jsonb(jsonb_build_object(
+        'action', 'frozen',
+        'command', NULL,
+        'consequential', true,
+        'effect_key', NULL,
+        'event', NULL,
+        'experiment_id', runtime.experiment_id,
+        'identity', frozen_identity,
+        'node', ready_node->>'kind',
+        'reason', 'authoritative_completion_receipt_invalid',
+        'remote_effect', false,
+        'result_digest', NULL,
+        'revision', runtime.revision,
+        'schema_version', 1
+    ));
+    RETURN QUERY
+    SELECT result.applied, result.decision_json
+    FROM carl_autonomy.apply_coordinator_decision_unchecked(
+        frozen_decision, p_observed_at
+    ) AS result;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION carl_autonomy.apply_coordinator_decision(
+    p_decision_json text,
+    p_observed_at timestamptz
+)
+RETURNS TABLE(applied boolean, decision_json text)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, carl_autonomy
+AS $$
+DECLARE
+    failure_code text;
+BEGIN
+    BEGIN
+        RETURN QUERY
+        SELECT result.applied, result.decision_json
+        FROM carl_autonomy.apply_coordinator_decision_unchecked(
+            p_decision_json, p_observed_at
+        ) AS result;
+        RETURN;
+    EXCEPTION WHEN OTHERS THEN
+        failure_code := SQLERRM;
+        IF NOT carl_autonomy.coordinator_authoritative_receipt_failure(failure_code) THEN
+            RAISE;
+        END IF;
+    END;
+    RETURN QUERY SELECT * FROM carl_autonomy.freeze_coordinator_receipt_failure(
+        p_decision_json, p_observed_at, failure_code
+    );
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION carl_autonomy.prepare_coordinator_effect(
+    p_decision_json text,
+    p_observed_at timestamptz
+)
+RETURNS TABLE(effect_family text, request_json text)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, carl_autonomy
+AS $$
+DECLARE
+    failure_code text;
+    frozen_result record;
+BEGIN
+    BEGIN
+        RETURN QUERY
+        SELECT result.effect_family, result.request_json
+        FROM carl_autonomy.prepare_coordinator_effect_unchecked(
+            p_decision_json, p_observed_at
+        ) AS result;
+        RETURN;
+    EXCEPTION WHEN OTHERS THEN
+        failure_code := SQLERRM;
+        IF NOT carl_autonomy.coordinator_authoritative_receipt_failure(failure_code) THEN
+            RAISE;
+        END IF;
+    END;
+    SELECT result.* INTO STRICT frozen_result
+    FROM carl_autonomy.freeze_coordinator_receipt_failure(
+        p_decision_json, p_observed_at, failure_code
+    ) AS result;
+    RETURN QUERY SELECT NULL::text, frozen_result.decision_json::text;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION carl_autonomy.complete_coordinator_effect(
+    p_decision_json text,
+    p_response_json text,
+    p_observed_at timestamptz
+)
+RETURNS TABLE(applied boolean, decision_json text)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, carl_autonomy
+AS $$
+DECLARE
+    failure_code text;
+BEGIN
+    BEGIN
+        RETURN QUERY
+        SELECT result.applied, result.decision_json
+        FROM carl_autonomy.complete_coordinator_effect_unchecked(
+            p_decision_json, p_response_json, p_observed_at
+        ) AS result;
+        RETURN;
+    EXCEPTION WHEN OTHERS THEN
+        failure_code := SQLERRM;
+        IF NOT carl_autonomy.coordinator_authoritative_receipt_failure(failure_code) THEN
+            RAISE;
+        END IF;
+    END;
+    RETURN QUERY SELECT * FROM carl_autonomy.freeze_coordinator_receipt_failure(
+        p_decision_json, p_observed_at, failure_code
+    );
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION carl_autonomy.execute_coordinator_local_effect(
+    p_decision_json text,
+    p_observed_at timestamptz
+)
+RETURNS TABLE(applied boolean, decision_json text)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, carl_autonomy
+AS $$
+DECLARE
+    failure_code text;
+BEGIN
+    BEGIN
+        RETURN QUERY
+        SELECT result.applied, result.decision_json
+        FROM carl_autonomy.execute_coordinator_local_effect_unchecked(
+            p_decision_json, p_observed_at
+        ) AS result;
+        RETURN;
+    EXCEPTION WHEN OTHERS THEN
+        failure_code := SQLERRM;
+        IF NOT carl_autonomy.coordinator_authoritative_receipt_failure(failure_code) THEN
+            RAISE;
+        END IF;
+    END;
+    RETURN QUERY SELECT * FROM carl_autonomy.freeze_coordinator_receipt_failure(
+        p_decision_json, p_observed_at, failure_code
+    );
+END;
+$$;
+
 REVOKE ALL ON FUNCTION
     carl_autonomy.coordinator_timestamp(timestamptz),
     carl_autonomy.coordinator_node_priority(text),
@@ -3080,6 +3320,8 @@ REVOKE ALL ON FUNCTION
     carl_autonomy.coordinator_node_authority(text),
     carl_autonomy.coordinator_node_operation(text),
     carl_autonomy.coordinator_freeze_reason_valid(text, text),
+    carl_autonomy.coordinator_authoritative_receipt_failure(text),
+    carl_autonomy.freeze_coordinator_receipt_failure(text, timestamptz, text),
     carl_autonomy.build_coordinator_completion_event(
         text, text, integer, text, text, text, text, timestamptz
     ),
@@ -3095,9 +3337,13 @@ REVOKE ALL ON FUNCTION
     carl_autonomy.renew_coordinator_lease(text, text, integer, timestamptz),
     carl_autonomy.coordinator_frozen_status(text),
     carl_autonomy.load_coordinator_snapshot(text, timestamptz),
+    carl_autonomy.apply_coordinator_decision_unchecked(text, timestamptz),
     carl_autonomy.apply_coordinator_decision(text, timestamptz),
+    carl_autonomy.prepare_coordinator_effect_unchecked(text, timestamptz),
     carl_autonomy.prepare_coordinator_effect(text, timestamptz),
+    carl_autonomy.complete_coordinator_effect_unchecked(text, text, timestamptz),
     carl_autonomy.complete_coordinator_effect(text, text, timestamptz),
+    carl_autonomy.execute_coordinator_local_effect_unchecked(text, timestamptz),
     carl_autonomy.execute_coordinator_local_effect(text, timestamptz),
     carl_autonomy.coordinator_effect_family(text)
 FROM PUBLIC, carl_autonomy_workflow;

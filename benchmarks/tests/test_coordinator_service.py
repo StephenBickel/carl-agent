@@ -17,6 +17,7 @@ from test_cloud_coordinator import claimed_command_for, lease, node, snapshot
 from carl_bench import coordinator_service
 from carl_bench.canonical import canonical_json_bytes
 from carl_bench.cloud_coordinator import (
+    CloudCoordinatorDecision,
     CloudCoordinatorError,
     EffectObservation,
     ProtectedCoordinatorExecutor,
@@ -338,99 +339,28 @@ def test_protected_receipt_failure_is_persisted_once_then_returns_durable_idle()
     assert second.reason == "no_applicable_node"
 
 
-@pytest.mark.parametrize(
-    "receipt_error",
-    (
-        "coordinator_completion_receipt_required",
-        "coordinator_completion_event_mismatch",
-        "coordinator_completion_receipt_conflict",
-    ),
-)
-def test_authoritative_completion_failure_freezes_once_and_replay_is_already_frozen(
-    receipt_error: str,
-) -> None:
-    selected = node("archive_builder")
+def test_sql_atomic_receipt_freeze_is_returned_without_a_second_state_mutation() -> None:
+    selected = node("observe_builder")
+    current = snapshot(
+        selected,
+        current_lease=lease(),
+        command=claimed_command_for(selected),
+        effect=EffectObservation(
+            effect_key=selected.effect_key,
+            status="applied",
+            result_digest="a" * 64,
+            observed_at=NOW_TEXT,
+        ),
+    )
 
-    class State:
+    class AtomicState:
         def __init__(self) -> None:
-            self.current = snapshot(
-                selected,
-                current_lease=lease(),
-                command=claimed_command_for(selected),
-                effect=EffectObservation(
-                    effect_key=selected.effect_key,
-                    status="applied",
-                    result_digest="a" * 64,
-                    observed_at=NOW_TEXT,
-                ),
-            )
-            self.completion_attempts = 0
-            self.freeze_mutations = 0
-            self.effect_mutations = 0
+            self.mutations = 0
             self.frozen = False
-
-        def reconstruct(self, command: str, *, observed_at: datetime):
-            assert command == "coordinate"
-            assert observed_at == datetime(2026, 8, 22, 12, tzinfo=UTC)
-            return None if self.frozen else self.current
-
-        def frozen_status(self, command: str, *, observed_at: datetime) -> bool:
-            assert command == "coordinate"
-            assert observed_at == datetime(2026, 8, 22, 12, tzinfo=UTC)
-            return self.frozen
-
-        def apply(self, decision, *, observed_at: datetime):
-            assert observed_at == datetime(2026, 8, 22, 12, tzinfo=UTC)
-            if decision.action == "complete_command":
-                self.completion_attempts += 1
-                raise PostgresStateError(receipt_error)
-            if decision.action == "frozen":
-                self.freeze_mutations += 1
-                self.frozen = True
-                return decision
-            raise AssertionError(decision.action)
-
-    state = State()
-    controller = ProtectedCoordinatorExecutor._for_testing(
-        state=state,
-        effects=NoEffects(),
-        clock=lambda: datetime(2026, 8, 22, 12, tzinfo=UTC),
-    )
-
-    first = controller.advance("coordinate")
-    replay = controller.advance("coordinate")
-
-    assert (first.action, first.reason, first.consequential) == (
-        "frozen",
-        "authoritative_completion_receipt_invalid",
-        True,
-    )
-    assert (replay.action, replay.reason, replay.consequential) == (
-        "idle",
-        "already_frozen",
-        False,
-    )
-    assert state.completion_attempts == 1
-    assert state.effect_mutations == 0
-    assert state.freeze_mutations == 1
-
-
-def test_authoritative_effect_receipt_failure_uses_the_same_durable_freeze_path() -> None:
-    selected = node("archive_builder")
-
-    class State:
-        def __init__(self) -> None:
-            self.frozen = False
-            self.freeze_mutations = 0
-            self.current = snapshot(
-                selected,
-                current_lease=lease(),
-                command=claimed_command_for(selected),
-            )
 
         def reconstruct(self, command: str, *, observed_at: datetime):
             del command, observed_at
-            return None if self.frozen else self.current
+            return None if self.frozen else current
 
         def frozen_status(self, command: str, *, observed_at: datetime) -> bool:
             del command, observed_at
@@ -438,44 +368,121 @@ def test_authoritative_effect_receipt_failure_uses_the_same_durable_freeze_path(
 
         def apply(self, decision, *, observed_at: datetime):
             del observed_at
-            assert decision.action == "frozen"
+            self.mutations += 1
             self.frozen = True
-            self.freeze_mutations += 1
-            return decision
+            assert decision.action == "complete_command"
+            identity = hashlib.sha256(
+                canonical_json_bytes(
+                    {
+                        "action": "frozen",
+                        "experiment_id": decision.experiment_id,
+                        "node_id": selected.node_id,
+                        "reason": "authoritative_completion_receipt_invalid",
+                        "revision": decision.revision,
+                    }
+                )
+            ).hexdigest()
+            return CloudCoordinatorDecision(
+                schema_version=1,
+                action="frozen",
+                reason="authoritative_completion_receipt_invalid",
+                identity=identity,
+                experiment_id=decision.experiment_id,
+                revision=decision.revision,
+                node=decision.node,
+                command=None,
+                effect_key=None,
+                result_digest=None,
+                consequential=True,
+                remote_effect=False,
+                event=None,
+            )
 
-    class MissingReceipt:
-        def __init__(self) -> None:
-            self.attempts = 0
-
-        def execute(self, decision, *, observed_at):
-            del decision, observed_at
-            self.attempts += 1
-            raise PostgresStateError("coordinator_effect_receipt_missing")
-
-    state = State()
-    effects = MissingReceipt()
+    state = AtomicState()
     controller = ProtectedCoordinatorExecutor._for_testing(
         state=state,
-        effects=effects,
+        effects=NoEffects(),
         clock=lambda: datetime(2026, 8, 22, 12, tzinfo=UTC),
     )
 
-    first = controller.advance("coordinate")
+    result = controller.advance("coordinate")
     replay = controller.advance("coordinate")
 
-    assert (first.action, first.reason) == (
-        "frozen",
-        "authoritative_completion_receipt_invalid",
-    )
+    assert result.action == "frozen"
+    assert result.reason == "authoritative_completion_receipt_invalid"
     assert (replay.action, replay.reason) == ("idle", "already_frozen")
-    assert effects.attempts == 1
-    assert state.freeze_mutations == 1
+    assert state.mutations == 1
+
+
+def test_atomic_prepare_freeze_never_reaches_the_protected_effect_service() -> None:
+    selected = node("publish_input")
+    decision = choose_next_action(
+        snapshot(
+            selected,
+            current_lease=lease(),
+            command=claimed_command_for(selected),
+        )
+    )
+    frozen_identity = hashlib.sha256(
+        canonical_json_bytes(
+            {
+                "action": "frozen",
+                "experiment_id": decision.experiment_id,
+                "node_id": selected.node_id,
+                "reason": "authoritative_completion_receipt_invalid",
+                "revision": decision.revision,
+            }
+        )
+    ).hexdigest()
+    frozen = CloudCoordinatorDecision(
+        schema_version=1,
+        action="frozen",
+        reason="authoritative_completion_receipt_invalid",
+        identity=frozen_identity,
+        experiment_id=decision.experiment_id,
+        revision=decision.revision,
+        node=decision.node,
+        command=None,
+        effect_key=None,
+        result_digest=None,
+        consequential=True,
+        remote_effect=False,
+        event=None,
+    )
+
+    class Backend:
+        def prepare_coordinator_effect(self, actual, *, expected_family, observed_at):
+            assert actual == decision
+            assert expected_family == "input"
+            assert observed_at == datetime(2026, 8, 22, 12, tzinfo=UTC)
+            return frozen
+
+        def complete_coordinator_effect(self, *args, **kwargs):  # pragma: no cover
+            del args, kwargs
+            raise AssertionError("an atomic prepare freeze is already terminal")
+
+    class InputPublisher:
+        def publish(self, request):  # pragma: no cover
+            del request
+            raise AssertionError("an invalid durable receipt must prevent the effect")
+
+    router = coordinator_service._ProtectedCoordinatorEffectRouter._for_testing(
+        backend=Backend(),
+        github=None,
+        input_publisher=InputPublisher(),
+        observer=None,
+        archive=None,
+        evaluator=None,
+    )
+
+    assert router.execute(decision, observed_at=datetime(2026, 8, 22, 12, tzinfo=UTC)) == frozen
 
 
 def test_systemd_commissions_every_fixed_effect_socket_before_coordinator_start() -> None:
     root = Path(__file__).parents[2] / "infra/autonomy/systemd"
     policy = Path(__file__).parents[2] / "infra/autonomy/policies/coordinator-effects-policy.json"
     service = (root / "carl-coordinator.service").read_text(encoding="utf-8")
+    coordinator_socket = (root / "carl-coordinator.socket").read_text(encoding="utf-8")
     units = {
         "archive": "carl-archive-effect.socket",
         "evaluator": "carl-evaluator-effect.socket",
@@ -488,9 +495,10 @@ def test_systemd_commissions_every_fixed_effect_socket_before_coordinator_start(
         unit = (root / unit_name).read_text(encoding="utf-8")
         assert f"FileDescriptorName={family}-effect" in unit
         assert f"ListenStream=/run/carl/{family}-effect.sock" in unit
+        assert "DirectoryMode=0711" in unit
         assert "SocketMode=0600" in unit
-        assert "SocketUser=root" in unit
-        assert "SocketGroup=root" in unit
+        assert "SocketUser=carl-autonomy-coordinator" in unit
+        assert "SocketGroup=carl-autonomy-coordinator" in unit
         responder = (root / unit_name.replace(".socket", ".service")).read_text(encoding="utf-8")
         assert f"User=carl-autonomy-{family}" in responder
         assert f"Group=carl-autonomy-{family}" in responder
@@ -502,10 +510,41 @@ def test_systemd_commissions_every_fixed_effect_socket_before_coordinator_start(
         assert "NoNewPrivileges=true" in responder
         assert "ProtectSystem=strict" in responder
         assert "UnsetEnvironment=PYTHONPATH PYTHONHOME PYTHONSTARTUP PYTHONUSERBASE" in responder
+        assert "InaccessiblePaths=/etc/carl/coordinator.env" in responder
+        inaccessible = next(
+            line for line in responder.splitlines() if line.startswith("InaccessiblePaths=")
+        )
+        for other in units:
+            if other != family:
+                assert f"/etc/carl/{other}-effect.env" in inaccessible
+        assert "/etc/carl/github-effect.env" in inaccessible
         assert f"Service=carl-{family}-effect.service" in unit
 
+    assert "User=carl-autonomy-coordinator" in service
+    assert "Group=carl-autonomy-coordinator" in service
+    assert "User=root" not in service
     assert "ReadOnlyPaths=/etc/carl/coordinator-effects-policy.json" in service
+    assert (
+        "InaccessiblePaths=/etc/carl/github-effect.env /etc/carl/archive-effect.env "
+        "/etc/carl/evaluator-effect.env "
+        "/etc/carl/input-effect.env /etc/carl/observer-effect.env" in service
+    )
+    assert "DirectoryMode=0711" in coordinator_socket
+    assert "carl-github-effect.socket" in service
+    github_socket = (root / "carl-github-effect.socket").read_text(encoding="utf-8")
+    github_service = (root / "carl-github-effect.service").read_text(encoding="utf-8")
+    assert "ListenStream=/run/carl/github-effect.sock" in github_socket
+    assert "DirectoryMode=0711" in github_socket
+    assert "SocketMode=0600" in github_socket
+    assert "SocketUser=carl-autonomy-coordinator" in github_socket
+    assert "SocketGroup=carl-autonomy-coordinator" in github_socket
+    assert "Service=carl-github-effect.service" in github_socket
+    assert "User=root" in github_service
+    assert "Group=root" in github_service
+    assert "EnvironmentFile=/etc/carl/github-effect.env" in github_service
+    assert "InaccessiblePaths=/etc/carl/coordinator.env" in github_service
     assert json.loads(policy.read_text(encoding="utf-8")) == {
+        "coordinator_user": "carl-autonomy-coordinator",
         "domain": "carl.coordinator-effect-policy.v1",
         "required_families": ["archive", "evaluator", "input", "observer"],
         "schema_version": 1,

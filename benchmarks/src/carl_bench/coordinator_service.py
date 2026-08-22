@@ -446,6 +446,8 @@ class _ProtectedCoordinatorEffectRouter:
         prepared = self.__backend.prepare_coordinator_effect(  # type: ignore[attr-defined]
             decision, expected_family=family, observed_at=observed_at
         )
+        if isinstance(prepared, CloudCoordinatorDecision):
+            return prepared
         if not isinstance(prepared, PreparedCoordinatorEffect) or prepared.family != family:
             raise CloudCoordinatorError("coordinator_prepared_effect_invalid")
         try:

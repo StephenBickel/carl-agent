@@ -121,11 +121,14 @@ github._system_clock = lambda: now
 os.environ[github._PROTECTED_TOKEN_ENV] = "test-protected-token"
 service._SOCKET_PATH = Path(sys.argv[1])
 service._protected_graphql_documents = object
+service._protected_coordinator_uid = lambda: os.getuid()
+service._require_protected_service_uid = lambda: None
 serve = service._serve_activated_listener
 
 def serve_as_test_uid(**kwargs):
     kwargs["allowed_client_uid"] = os.getuid()
     kwargs["service_uid"] = os.getuid()
+    kwargs["expected_parent_uid"] = os.getuid()
     return serve(**kwargs)
 
 service._serve_activated_listener = serve_as_test_uid
@@ -585,6 +588,38 @@ def test_socket_client_surface_has_no_raw_http_graphql_or_dependency_injection()
     } & set(signature(client_type._for_testing).parameters)
 
 
+def test_coordinator_github_socket_separates_parent_socket_and_responder_identities(
+    tmp_path: Path,
+) -> None:
+    client_module = _client_module()
+
+    client = client_module.GitHubEffectSocketClient._for_testing(
+        socket_path=tmp_path / "github-effect.sock",
+        expected_parent_uid=0,
+        expected_socket_uid=4100,
+        expected_peer_uid=0,
+        timeout_seconds=1,
+    )
+
+    assert client._expected_parent_uid == 0
+    assert client._expected_socket_uid == 4100
+    assert client._expected_peer_uid == 0
+
+
+def test_github_responder_authorizes_exact_nonroot_coordinator_uid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _module("carl_bench.github_effect_service", "effect service is required")
+    monkeypatch.setattr(
+        service.pwd,
+        "getpwnam",
+        lambda name: SimpleNamespace(pw_uid=4100) if name == "carl-autonomy-coordinator" else None,
+    )
+
+    assert service._protected_coordinator_uid() == 4100
+    assert service._protected_coordinator_uid() != 0
+
+
 def test_protected_service_has_a_dedicated_packaged_entrypoint() -> None:
     project = tomllib.loads((Path(__file__).parents[1] / "pyproject.toml").read_text())
 
@@ -691,7 +726,9 @@ def test_production_gateway_monkeypatches_cannot_change_separate_service_wire(
     try:
         monkeypatch.delenv("CARL_GITHUB_APP_INSTALLATION_TOKEN", raising=False)
         monkeypatch.setattr(client_module, "_PROTECTED_SOCKET_PATH", socket_path)
+        monkeypatch.setattr(client_module, "_PROTECTED_PARENT_UID", os.getuid())
         monkeypatch.setattr(client_module, "_PROTECTED_SERVICE_UID", os.getuid())
+        monkeypatch.setattr(client_module, "_protected_socket_uid", os.getuid)
         captured: list[object] = []
         for name in (
             "_ProtectedGitHubTransport",

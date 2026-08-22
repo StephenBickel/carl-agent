@@ -140,10 +140,65 @@ def _validate_peer(connection: socket.socket, expected_uid: int) -> None:
     raise CoordinatorEffectClientError("coordinator_effect_service_identity_invalid")
 
 
+def _enable_authenticated_response(connection: object) -> bool:
+    passcred = getattr(socket, "SO_PASSCRED", None)
+    credentials_type = getattr(socket, "SCM_CREDENTIALS", None)
+    if (
+        isinstance(passcred, int)
+        and isinstance(credentials_type, int)
+        and callable(getattr(connection, "recvmsg", None))
+    ):
+        try:
+            connection.setsockopt(socket.SOL_SOCKET, passcred, 1)
+        except OSError as error:
+            raise CoordinatorEffectClientError("coordinator_effect_service_unavailable") from error
+        return True
+    return False
+
+
+def _recv_authenticated_prefix(
+    connection: object,
+    count: int,
+    *,
+    expected_sender_uid: int,
+    response_credentials_enabled: bool,
+) -> bytes:
+    """Authenticate the response sender, not systemd's inherited listener."""
+    credentials_type = getattr(socket, "SCM_CREDENTIALS", None)
+    recvmsg = getattr(connection, "recvmsg", None)
+    if response_credentials_enabled:
+        if not isinstance(credentials_type, int) or not callable(recvmsg):
+            raise CoordinatorEffectClientError("coordinator_effect_service_identity_invalid")
+        try:
+            payload, ancillary, flags, _ = recvmsg(count, socket.CMSG_SPACE(12))
+        except OSError as error:
+            raise CoordinatorEffectClientError("coordinator_effect_service_unavailable") from error
+        if flags & getattr(socket, "MSG_CTRUNC", 0):
+            raise CoordinatorEffectClientError("coordinator_effect_service_identity_invalid")
+        identities = [
+            data
+            for level, message_type, data in ancillary
+            if level == socket.SOL_SOCKET and message_type == credentials_type
+        ]
+        if len(identities) != 1 or len(identities[0]) < 12:
+            raise CoordinatorEffectClientError("coordinator_effect_service_identity_invalid")
+        _, sender_uid, _ = struct.unpack("3i", identities[0][:12])
+        if sender_uid != expected_sender_uid:
+            raise CoordinatorEffectClientError("coordinator_effect_service_identity_invalid")
+        if not payload or len(payload) > count:
+            raise CoordinatorEffectClientError("coordinator_effect_service_unavailable")
+        return payload + _recv_exact(connection, count - len(payload))
+    if not isinstance(connection, socket.socket):
+        raise CoordinatorEffectClientError("coordinator_effect_service_identity_invalid")
+    _validate_peer(connection, expected_sender_uid)
+    return _recv_exact(connection, count)
+
+
 @dataclass(frozen=True, slots=True)
 class CoordinatorEffectSocketClient:
     family: EffectFamily
     _socket_path: Path
+    _expected_parent_uid: int
     _expected_socket_uid: int
     _expected_peer_uid: int
     _timeout_seconds: float
@@ -157,8 +212,10 @@ class CoordinatorEffectSocketClient:
         expected_peer_uid: int,
         timeout_seconds: float,
         expected_socket_uid: int | None = None,
+        expected_parent_uid: int | None = None,
     ) -> CoordinatorEffectSocketClient:
         socket_uid = expected_peer_uid if expected_socket_uid is None else expected_socket_uid
+        parent_uid = socket_uid if expected_parent_uid is None else expected_parent_uid
         if (
             family not in _EXTERNAL_FAMILIES
             or not isinstance(socket_path, Path)
@@ -166,6 +223,9 @@ class CoordinatorEffectSocketClient:
             or isinstance(socket_uid, bool)
             or not isinstance(socket_uid, int)
             or socket_uid < 0
+            or isinstance(parent_uid, bool)
+            or not isinstance(parent_uid, int)
+            or parent_uid < 0
             or isinstance(expected_peer_uid, bool)
             or not isinstance(expected_peer_uid, int)
             or expected_peer_uid < 0
@@ -177,6 +237,7 @@ class CoordinatorEffectSocketClient:
         return cls(
             cast(EffectFamily, family),
             socket_path,
+            parent_uid,
             socket_uid,
             expected_peer_uid,
             float(timeout_seconds),
@@ -189,15 +250,15 @@ class CoordinatorEffectSocketClient:
         parent_fd: int | None = None
         try:
             parent_fd = open_pinned_parent(
-                self._socket_path, expected_uid=self._expected_socket_uid
+                self._socket_path, expected_uid=self._expected_parent_uid
             )
             before = socket_identity_at(
                 parent_fd, self._socket_path.name, expected_uid=self._expected_socket_uid
             )
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
                 connection.settimeout(self._timeout_seconds)
+                response_credentials_enabled = _enable_authenticated_response(connection)
                 connection.connect(os.fspath(self._socket_path))
-                _validate_peer(connection, self._expected_peer_uid)
                 after = socket_identity_at(
                     parent_fd,
                     self._socket_path.name,
@@ -208,7 +269,15 @@ class CoordinatorEffectSocketClient:
                         "coordinator_effect_service_identity_invalid"
                     )
                 connection.sendall(struct.pack(">I", len(payload)) + payload)
-                size = struct.unpack(">I", _recv_exact(connection, 4))[0]
+                size = struct.unpack(
+                    ">I",
+                    _recv_authenticated_prefix(
+                        connection,
+                        4,
+                        expected_sender_uid=self._expected_peer_uid,
+                        response_credentials_enabled=response_credentials_enabled,
+                    ),
+                )[0]
                 if not 0 < size <= MAX_EFFECT_FRAME_BYTES:
                     raise CoordinatorEffectClientError("coordinator_effect_response_invalid")
                 response = decode_effect_response_bytes(_recv_exact(connection, size))
@@ -290,6 +359,7 @@ def load_protected_coordinator_effect_clients(
     *,
     _testing_policy_path: Path | None = None,
     _testing_expected_owner_uid: int | None = None,
+    _testing_coordinator_uid: int | None = None,
     _testing_service_uids: Mapping[str, int] | None = None,
     _testing_socket_paths: Mapping[str, Path] | None = None,
 ) -> ProtectedCoordinatorEffectClients:
@@ -303,7 +373,12 @@ def load_protected_coordinator_effect_clients(
         or not isinstance(expected_owner_uid, int)
         or expected_owner_uid < 0
         or (
-            (_testing_socket_paths is not None or _testing_service_uids is not None) and not testing
+            (
+                _testing_socket_paths is not None
+                or _testing_service_uids is not None
+                or _testing_coordinator_uid is not None
+            )
+            and not testing
         )
     ):
         raise CoordinatorEffectClientError("coordinator_effect_policy_invalid")
@@ -315,12 +390,26 @@ def load_protected_coordinator_effect_clients(
         "observer": "carl-autonomy-observer",
     }
     expected = {
+        "coordinator_user": "carl-autonomy-coordinator",
         "domain": "carl.coordinator-effect-policy.v1",
         "required_families": ["archive", "evaluator", "input", "observer"],
         "schema_version": 1,
         "service_users": service_users,
     }
     if value != expected:
+        raise CoordinatorEffectClientError("coordinator_effect_policy_invalid")
+    if _testing_coordinator_uid is None:
+        try:
+            coordinator_uid = pwd.getpwnam("carl-autonomy-coordinator").pw_uid
+        except KeyError as error:
+            raise CoordinatorEffectClientError("coordinator_effect_policy_invalid") from error
+    else:
+        coordinator_uid = _testing_coordinator_uid
+    if (
+        isinstance(coordinator_uid, bool)
+        or not isinstance(coordinator_uid, int)
+        or coordinator_uid <= 0
+    ):
         raise CoordinatorEffectClientError("coordinator_effect_policy_invalid")
     paths = (
         PROTECTED_EFFECT_SOCKET_PATHS if _testing_socket_paths is None else _testing_socket_paths
@@ -347,7 +436,8 @@ def load_protected_coordinator_effect_clients(
         return CoordinatorEffectSocketClient._for_testing(
             family=family,
             socket_path=paths[family],
-            expected_socket_uid=expected_owner_uid,
+            expected_parent_uid=expected_owner_uid,
+            expected_socket_uid=coordinator_uid,
             expected_peer_uid=service_uids[family],
             timeout_seconds=_SOCKET_TIMEOUT_SECONDS,
         )

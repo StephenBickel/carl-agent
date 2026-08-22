@@ -90,6 +90,52 @@ def _serve_activated_effect(
     )
 
 
+class _ActivatedResponseSocket:
+    """Exact Linux SCM_CREDENTIALS semantic without requiring root in unit tests."""
+
+    def __init__(self, *, sender_uid: int, payload: bytes) -> None:
+        self.sender_uid = sender_uid
+        self.payload = payload
+        self.offset = 0
+        self.options: list[tuple[int, int, int]] = []
+        self.sent = b""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        del args
+
+    def settimeout(self, timeout: float) -> None:
+        assert timeout == 1
+
+    def setsockopt(self, level: int, option: int, value: int) -> None:
+        self.options.append((level, option, value))
+
+    def connect(self, path: str) -> None:
+        assert path.endswith("input.sock")
+
+    def sendall(self, payload: bytes) -> None:
+        self.sent += payload
+
+    def recvmsg(self, count: int, ancillary_size: int):
+        del ancillary_size
+        credentials = struct.pack("3i", 4321, self.sender_uid, self.sender_uid)
+        payload = self.payload[self.offset : self.offset + count]
+        self.offset += len(payload)
+        return (
+            payload,
+            [(socket.SOL_SOCKET, getattr(socket, "SCM_CREDENTIALS", 2), credentials)],
+            0,
+            None,
+        )
+
+    def recv(self, count: int) -> bytes:
+        payload = self.payload[self.offset : self.offset + count]
+        self.offset += len(payload)
+        return payload
+
+
 @pytest.mark.parametrize(
     ("family", "method_name"),
     (
@@ -182,7 +228,99 @@ def test_each_packaged_protected_effect_service_responds_on_its_activated_socket
             if process.is_alive():
                 process.kill()
                 process.join(2)
-        assert process.exitcode == 0
+    assert process.exitcode == 0
+
+
+def test_linux_socket_activation_authenticates_response_sender_not_root_listener(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from carl_bench import coordinator_effect_client
+
+    monkeypatch.setattr(coordinator_effect_client.socket, "SO_PASSCRED", 16, raising=False)
+    monkeypatch.setattr(coordinator_effect_client.socket, "SCM_CREDENTIALS", 2, raising=False)
+    expected_service_uid = 4104
+    inherited_root_listener = _ActivatedResponseSocket(
+        sender_uid=expected_service_uid,
+        payload=struct.pack(">I", 17),
+    )
+
+    enabled = coordinator_effect_client._enable_authenticated_response(inherited_root_listener)
+    prefix = coordinator_effect_client._recv_authenticated_prefix(
+        inherited_root_listener,
+        4,
+        expected_sender_uid=expected_service_uid,
+        response_credentials_enabled=enabled,
+    )
+
+    assert prefix == struct.pack(">I", 17)
+    assert inherited_root_listener.options == [(socket.SOL_SOCKET, 16, 1)]
+
+    spoofed_root_response = _ActivatedResponseSocket(
+        sender_uid=0,
+        payload=struct.pack(">I", 17),
+    )
+    with pytest.raises(
+        coordinator_effect_client.CoordinatorEffectClientError,
+        match="coordinator_effect_service_identity_invalid",
+    ):
+        spoofed_enabled = coordinator_effect_client._enable_authenticated_response(
+            spoofed_root_response
+        )
+        coordinator_effect_client._recv_authenticated_prefix(
+            spoofed_root_response,
+            4,
+            expected_sender_uid=expected_service_uid,
+            response_credentials_enabled=spoofed_enabled,
+        )
+
+
+def test_root_activated_socket_accepts_first_publish_input_from_exact_responder(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from carl_bench import coordinator_effect_client
+
+    request = _request("input")
+    response = CoordinatorNodeEffectResponse.completed(
+        request=request,
+        result_digest=RESULT_DIGEST,
+        observed_at=NOW,
+    )
+    response_payload = coordinator_effect_client.encode_effect_response_bytes(response)
+    connection = _ActivatedResponseSocket(
+        sender_uid=4101,
+        payload=struct.pack(">I", len(response_payload)) + response_payload,
+    )
+    parent_fd = os.open(tmp_path, os.O_RDONLY)
+    monkeypatch.setattr(coordinator_effect_client.socket, "SO_PASSCRED", 16, raising=False)
+    monkeypatch.setattr(coordinator_effect_client.socket, "SCM_CREDENTIALS", 2, raising=False)
+    monkeypatch.setattr(coordinator_effect_client.socket, "socket", lambda *args: connection)
+
+    def pinned_parent(path: Path, *, expected_uid: int) -> int:
+        assert path == tmp_path / "input.sock"
+        assert expected_uid == 0
+        return parent_fd
+
+    def socket_identity(parent: int, name: str, *, expected_uid: int) -> tuple[int, ...]:
+        assert parent == parent_fd
+        assert name == "input.sock"
+        assert expected_uid == 4100
+        return (1, 2, 3, 4100, 4100, 4)
+
+    monkeypatch.setattr(coordinator_effect_client, "open_pinned_parent", pinned_parent)
+    monkeypatch.setattr(coordinator_effect_client, "socket_identity_at", socket_identity)
+    client = coordinator_effect_client.CoordinatorEffectSocketClient._for_testing(
+        family="input",
+        socket_path=tmp_path / "input.sock",
+        expected_parent_uid=0,
+        expected_socket_uid=4100,
+        expected_peer_uid=4101,
+        timeout_seconds=1,
+    )
+
+    assert client.publish(request) == response
+    sent_size = struct.unpack(">I", connection.sent[:4])[0]
+    assert sent_size == len(connection.sent[4:])
+    assert coordinator_effect_client.decode_effect_request_bytes(connection.sent[4:]) == request
 
 
 def test_all_four_effect_services_are_distinct_long_lived_responders() -> None:
@@ -247,6 +385,23 @@ def test_protected_responder_names_the_exact_uncommissioned_family(family: str) 
     assert response.error_code == f"{family}_service_uncommissioned"
 
 
+def test_protected_responder_authorizes_only_the_dedicated_coordinator_uid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+
+    from carl_bench import coordinator_effect_service
+
+    monkeypatch.setattr(
+        coordinator_effect_service.pwd,
+        "getpwnam",
+        lambda name: SimpleNamespace(pw_uid=4201) if name == "carl-autonomy-coordinator" else None,
+    )
+
+    assert coordinator_effect_service._protected_coordinator_uid() == 4201
+    assert coordinator_effect_service._protected_coordinator_uid() != 0
+
+
 def test_protected_policy_loader_commissions_all_fixed_families_without_endpoints(
     tmp_path: Path,
 ) -> None:
@@ -262,6 +417,7 @@ def test_protected_policy_loader_commissions_all_fixed_families_without_endpoint
                 "domain": "carl.coordinator-effect-policy.v1",
                 "required_families": ["archive", "evaluator", "input", "observer"],
                 "schema_version": 1,
+                "coordinator_user": "carl-autonomy-coordinator",
                 "service_users": {
                     "archive": "carl-autonomy-archive",
                     "evaluator": "carl-autonomy-evaluator",
@@ -280,6 +436,7 @@ def test_protected_policy_loader_commissions_all_fixed_families_without_endpoint
     clients = load_protected_coordinator_effect_clients(
         _testing_policy_path=policy,
         _testing_expected_owner_uid=os.getuid(),
+        _testing_coordinator_uid=os.getuid() + 2,
         _testing_service_uids={family: os.getuid() + 1 for family in PROTECTED_EFFECT_SOCKET_PATHS},
         _testing_socket_paths={
             family: tmp_path / path.name for family, path in PROTECTED_EFFECT_SOCKET_PATHS.items()
@@ -296,7 +453,8 @@ def test_protected_policy_loader_commissions_all_fixed_families_without_endpoint
         clients.archive,
         clients.evaluator,
     ):
-        assert client._expected_socket_uid == os.getuid()
+        assert client._expected_parent_uid == os.getuid()
+        assert client._expected_socket_uid == os.getuid() + 2
         assert client._expected_peer_uid == os.getuid() + 1
     assert "socket" not in policy.read_text(encoding="utf-8")
 
@@ -314,6 +472,7 @@ def test_protected_policy_rejects_missing_family_or_caller_selected_endpoint(
         "domain": "carl.coordinator-effect-policy.v1",
         "required_families": ["archive", "evaluator", "input"],
         "schema_version": 1,
+        "coordinator_user": "carl-autonomy-coordinator",
         "service_users": {
             "archive": "carl-autonomy-archive",
             "evaluator": "carl-autonomy-evaluator",
@@ -329,6 +488,7 @@ def test_protected_policy_rejects_missing_family_or_caller_selected_endpoint(
             load_protected_coordinator_effect_clients(
                 _testing_policy_path=policy,
                 _testing_expected_owner_uid=os.getuid(),
+                _testing_coordinator_uid=os.getuid(),
                 _testing_service_uids={
                     "archive": os.getuid(),
                     "evaluator": os.getuid(),

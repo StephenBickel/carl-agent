@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 import pytest
 
 from carl_bench.canonical import canonical_json_bytes
+from carl_bench.coordinator_recovery import CoordinatorRecoveryRequest
 from carl_bench.live_evaluation_authority import ProtectedArchiveVersion
 
 NOW = datetime(2026, 8, 22, 12, tzinfo=UTC)
@@ -56,7 +57,14 @@ def _archive(payload: bytes) -> ProtectedArchiveVersion:
 
 
 def test_recovery_receipt_hashes_actual_archived_bytes_and_exact_freeze_identity() -> None:
-    from carl_bench.coordinator_recovery_archive import verify_archived_recovery_artifact
+    from carl_bench.coordinator_recovery_archive import (
+        CoordinatorRecoveryArchiveError,
+        VerifiedCoordinatorRecoveryReceipt,
+        verify_archived_recovery_artifact,
+    )
+
+    with pytest.raises(CoordinatorRecoveryArchiveError):
+        VerifiedCoordinatorRecoveryReceipt()
 
     payload = canonical_json_bytes(_artifact())
 
@@ -147,3 +155,159 @@ def test_recovery_receipt_rejects_metadata_for_bytes_the_archive_did_not_return(
 
     with pytest.raises(CoordinatorRecoveryArchiveError):
         verify_archived_recovery_artifact(forged, observed_at=NOW)
+
+
+def test_production_recovery_reads_verifies_registers_then_reactivates() -> None:
+    from carl_bench.coordinator_recovery_archive import recover_coordinator_node_from_archive
+
+    payload = canonical_json_bytes(_artifact())
+    archive = _archive(payload)
+    order: list[str] = []
+
+    class Reader:
+        def read_exact(self, object_key: str, version_id: str) -> ProtectedArchiveVersion:
+            assert (object_key, version_id) == (archive.object_key, archive.version_id)
+            order.append("read")
+            return archive
+
+    class Registrar:
+        def register_verified_coordinator_recovery_receipt(
+            self, receipt: object, *, observed_at: datetime
+        ) -> bool:
+            assert receipt.evidence_digest == archive.checksum_sha256  # type: ignore[attr-defined]
+            assert observed_at == NOW
+            order.append("register")
+            return True
+
+    class State:
+        def reactivate_verified_coordinator_node(
+            self,
+            recovery: CoordinatorRecoveryRequest,
+            receipt: object,
+            *,
+            observed_at: datetime,
+        ) -> dict[str, object]:
+            assert recovery.evidence_digest == archive.checksum_sha256
+            assert recovery.repair_fingerprint == _artifact()["repair_fingerprint"]
+            assert receipt.evidence_digest == archive.checksum_sha256  # type: ignore[attr-defined]
+            assert observed_at == NOW
+            order.append("reactivate")
+            return {
+                "applied": True,
+                "attempt": 2,
+                "request_digest": "a" * 64,
+                "revision": 8,
+            }
+
+    recovery = CoordinatorRecoveryRequest(
+        schema_version=1,
+        domain="carl.coordinator.recovery.v1",
+        experiment_id="experiment-1",
+        node_id="experiment-1:archive_builder",
+        node_kind="archive_builder",
+        expected_revision=7,
+        evidence_digest=archive.checksum_sha256,
+        repair_fingerprint=str(_artifact()["repair_fingerprint"]),
+        requested_at="2026-08-22T12:00:00Z",
+    )
+
+    result = recover_coordinator_node_from_archive(
+        recovery,
+        object_key=archive.object_key,
+        version_id=archive.version_id,
+        archive_reader=Reader(),
+        receipt_registrar=Registrar(),
+        state=State(),
+        observed_at=NOW,
+    )
+
+    assert result["applied"] is True
+    assert order == ["read", "register", "reactivate"]
+
+
+def test_production_recovery_never_registers_or_reactivates_unverified_bytes() -> None:
+    from carl_bench.coordinator_recovery_archive import (
+        CoordinatorRecoveryArchiveError,
+        recover_coordinator_node_from_archive,
+    )
+
+    payload = canonical_json_bytes(_artifact()) + b" "
+    archive = _archive(canonical_json_bytes(_artifact()))
+    forged = ProtectedArchiveVersion(
+        object_key=archive.object_key,
+        version_id=archive.version_id,
+        payload=payload,
+        checksum_sha256=archive.checksum_sha256,
+        byte_length=archive.byte_length,
+        retention_mode=archive.retention_mode,
+        retain_until=archive.retain_until,
+        created_at=archive.created_at,
+    )
+    called: list[str] = []
+
+    class Reader:
+        def read_exact(self, object_key: str, version_id: str) -> ProtectedArchiveVersion:
+            del object_key, version_id
+            return forged
+
+    class Denied:
+        def register_verified_coordinator_recovery_receipt(self, *args: object, **kwargs: object):
+            del args, kwargs
+            called.append("register")
+            raise AssertionError("register")
+
+        def reactivate_verified_coordinator_node(self, *args: object, **kwargs: object):
+            del args, kwargs
+            called.append("reactivate")
+            raise AssertionError("reactivate")
+
+    artifact = _artifact()
+    recovery = CoordinatorRecoveryRequest(
+        schema_version=1,
+        domain="carl.coordinator.recovery.v1",
+        experiment_id="experiment-1",
+        node_id="experiment-1:archive_builder",
+        node_kind="archive_builder",
+        expected_revision=7,
+        evidence_digest=archive.checksum_sha256,
+        repair_fingerprint=str(artifact["repair_fingerprint"]),
+        requested_at="2026-08-22T12:00:00Z",
+    )
+
+    with pytest.raises(CoordinatorRecoveryArchiveError):
+        recover_coordinator_node_from_archive(
+            recovery,
+            object_key=archive.object_key,
+            version_id=archive.version_id,
+            archive_reader=Reader(),
+            receipt_registrar=Denied(),
+            state=Denied(),
+            observed_at=NOW,
+        )
+
+    assert called == []
+
+
+def test_archive_receipt_registrar_redacts_connection_failures() -> None:
+    from carl_bench.coordinator_recovery_archive import verify_archived_recovery_artifact
+    from carl_bench.postgres_state import (
+        PostgresCoordinatorRecoveryReceiptRegistrar,
+        PostgresStateError,
+    )
+
+    receipt = verify_archived_recovery_artifact(
+        _archive(canonical_json_bytes(_artifact())), observed_at=NOW
+    )
+
+    def unavailable(dsn: str):
+        assert dsn == "postgresql://protected-archive"
+        raise RuntimeError("private connection detail")
+
+    registrar = PostgresCoordinatorRecoveryReceiptRegistrar._for_testing(
+        dsn="postgresql://protected-archive", connect=unavailable
+    )
+
+    with pytest.raises(PostgresStateError, match="postgres_archive_connection_failed") as error:
+        registrar.register_verified_coordinator_recovery_receipt(receipt, observed_at=NOW)
+
+    assert error.value.__cause__ is None

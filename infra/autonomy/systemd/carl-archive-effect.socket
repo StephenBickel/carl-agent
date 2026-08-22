@@ -5,10 +5,10 @@ Description=Carl protected archive effect socket
 Service=carl-archive-effect.service
 FileDescriptorName=archive-effect
 ListenStream=/run/carl/archive-effect.sock
-DirectoryMode=0700
+DirectoryMode=0711
 SocketMode=0600
-SocketUser=root
-SocketGroup=root
+SocketUser=carl-autonomy-coordinator
+SocketGroup=carl-autonomy-coordinator
 RemoveOnStop=false
 
 [Install]

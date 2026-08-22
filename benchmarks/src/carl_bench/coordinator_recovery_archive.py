@@ -7,10 +7,11 @@ import json
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Protocol
 
 from carl_bench.canonical import CanonicalizationError, canonical_json_bytes
 from carl_bench.cloud_coordinator import NODE_ORDER, effect_family_for_node
+from carl_bench.coordinator_recovery import CoordinatorRecoveryRequest
 from carl_bench.live_evaluation_authority import ProtectedArchiveVersion
 
 _DOMAIN = "carl.coordinator-recovery-artifact.v1"
@@ -81,6 +82,26 @@ class CoordinatorRecoveryArchiveError(ValueError):
         super().__init__(code)
 
 
+class CoordinatorRecoveryArchiveReader(Protocol):
+    def read_exact(self, object_key: str, version_id: str) -> ProtectedArchiveVersion: ...
+
+
+class CoordinatorRecoveryReceiptRegistrar(Protocol):
+    def register_verified_coordinator_recovery_receipt(
+        self, receipt: VerifiedCoordinatorRecoveryReceipt, *, observed_at: datetime
+    ) -> bool: ...
+
+
+class VerifiedCoordinatorRecoveryState(Protocol):
+    def reactivate_verified_coordinator_node(
+        self,
+        recovery: CoordinatorRecoveryRequest,
+        receipt: VerifiedCoordinatorRecoveryReceipt,
+        *,
+        observed_at: datetime,
+    ) -> dict[str, object]: ...
+
+
 def _pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for key, value in pairs:
@@ -128,7 +149,7 @@ def _freeze_reason_valid(node_kind: str, reason: object) -> bool:
     )
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, init=False)
 class VerifiedCoordinatorRecoveryReceipt:
     artifact: dict[str, Any]
     evidence_digest: str
@@ -140,6 +161,19 @@ class VerifiedCoordinatorRecoveryReceipt:
     retained_until: str
     archive_created_at: str
     verified_at: str
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise CoordinatorRecoveryArchiveError()
+
+    @classmethod
+    def _mint(cls, **fields: object) -> VerifiedCoordinatorRecoveryReceipt:
+        if set(fields) != set(cls.__dataclass_fields__):
+            raise CoordinatorRecoveryArchiveError()
+        value = object.__new__(cls)
+        for name in cls.__dataclass_fields__:
+            object.__setattr__(value, name, fields[name])
+        return value
 
     @property
     def freeze_fingerprint(self) -> str:
@@ -263,7 +297,7 @@ def verify_archived_recovery_artifact(
         or retained_until <= observed_at
     ):
         raise CoordinatorRecoveryArchiveError()
-    return VerifiedCoordinatorRecoveryReceipt(
+    return VerifiedCoordinatorRecoveryReceipt._mint(
         artifact=artifact,
         evidence_digest=digest,
         archive_object_key=archive.object_key,
@@ -275,3 +309,67 @@ def verify_archived_recovery_artifact(
         archive_created_at=archive.created_at,
         verified_at=observed_at.isoformat().replace("+00:00", "Z"),
     )
+
+
+def recover_coordinator_node_from_archive(
+    recovery: CoordinatorRecoveryRequest,
+    *,
+    object_key: str,
+    version_id: str,
+    archive_reader: CoordinatorRecoveryArchiveReader,
+    receipt_registrar: CoordinatorRecoveryReceiptRegistrar,
+    state: VerifiedCoordinatorRecoveryState,
+    observed_at: datetime,
+) -> dict[str, object]:
+    """Execute the only recovery path: protected bytes first, SQL effects second."""
+    if (
+        not isinstance(recovery, CoordinatorRecoveryRequest)
+        or not isinstance(observed_at, datetime)
+        or observed_at.tzinfo != UTC
+        or not isinstance(object_key, str)
+        or not isinstance(version_id, str)
+        or not callable(getattr(archive_reader, "read_exact", None))
+        or not callable(
+            getattr(
+                receipt_registrar,
+                "register_verified_coordinator_recovery_receipt",
+                None,
+            )
+        )
+        or not callable(getattr(state, "reactivate_verified_coordinator_node", None))
+    ):
+        raise CoordinatorRecoveryArchiveError()
+    try:
+        archive = archive_reader.read_exact(object_key, version_id)
+    except Exception as error:
+        raise CoordinatorRecoveryArchiveError("coordinator_recovery_archive_unavailable") from error
+    receipt = verify_archived_recovery_artifact(archive, observed_at=observed_at)
+    artifact = receipt.artifact
+    if (
+        archive.object_key != object_key
+        or archive.version_id != version_id
+        or recovery.experiment_id != artifact["experiment_id"]
+        or recovery.node_id != artifact["node_id"]
+        or recovery.node_kind != artifact["node_kind"]
+        or recovery.expected_revision != artifact["runtime_revision"]
+        or recovery.evidence_digest != receipt.evidence_digest
+        or recovery.repair_fingerprint != artifact["repair_fingerprint"]
+    ):
+        raise CoordinatorRecoveryArchiveError()
+    try:
+        registered = receipt_registrar.register_verified_coordinator_recovery_receipt(
+            receipt, observed_at=observed_at
+        )
+    except Exception as error:
+        raise CoordinatorRecoveryArchiveError("coordinator_recovery_registration_failed") from error
+    if type(registered) is not bool:
+        raise CoordinatorRecoveryArchiveError("coordinator_recovery_registration_failed")
+    try:
+        result = state.reactivate_verified_coordinator_node(
+            recovery, receipt, observed_at=observed_at
+        )
+    except Exception as error:
+        raise CoordinatorRecoveryArchiveError("coordinator_recovery_reactivation_failed") from error
+    if type(result) is not dict:
+        raise CoordinatorRecoveryArchiveError("coordinator_recovery_reactivation_failed")
+    return result

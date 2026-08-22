@@ -1,10 +1,10 @@
 [Unit]
-Description=Carl protected immutable-input effect socket
+Description=Carl protected coordinator GitHub effect socket
 
 [Socket]
-Service=carl-input-effect.service
-FileDescriptorName=input-effect
-ListenStream=/run/carl/input-effect.sock
+Service=carl-github-effect.service
+FileDescriptorName=github-effect
+ListenStream=/run/carl/github-effect.sock
 DirectoryMode=0711
 SocketMode=0600
 SocketUser=carl-autonomy-coordinator

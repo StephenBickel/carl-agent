@@ -10,7 +10,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
-from test_cloud_coordinator import claimed_command_for, lease, node, snapshot
+from test_cloud_coordinator import NODE_BINDINGS, claimed_command_for, lease, node, snapshot
 from test_coordinator_service import durable_production_receipts
 
 from carl_bench import cloud_coordinator, coordinator_service
@@ -116,6 +116,8 @@ class RestartableBackend:
 
     def _observe(self, decision: CloudCoordinatorDecision, route: str) -> None:
         assert decision.node is not None
+        assert decision.command is not None
+        assert decision.command.authority == NODE_BINDINGS[decision.node][0]
         self.routes.append((route, decision.node))
         self.state.consequences.append(f"effect:{decision.node}")
         self.state.current = replace(

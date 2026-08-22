@@ -29,7 +29,12 @@ from test_experiment import manifest as sample_manifest
 from test_experiment import sealed_candidate
 
 from carl_bench.canonical import canonical_json_bytes
-from carl_bench.cloud_coordinator import EFFECT_FAMILY_BY_NODE, choose_next_action
+from carl_bench.cloud_coordinator import (
+    EFFECT_FAMILY_BY_NODE,
+    CloudCoordinatorDecision,
+    EffectObservation,
+    choose_next_action,
+)
 from carl_bench.cloud_execution import CloudRunRequest
 from carl_bench.cloud_state import (
     AuthorityCapability,
@@ -59,6 +64,7 @@ from carl_bench.github_effect_ipc import (
     GitHubEffectRequest,
     GitHubEffectResponse,
 )
+from carl_bench.live_evaluation_authority import ProtectedArchiveVersion
 from carl_bench.postgres_state import (
     MAX_STATE_REVISION,
     PostgresStateBackend,
@@ -218,19 +224,19 @@ def test_sql_exposes_exact_coordinator_reconstruction_and_effect_fences() -> Non
 
 def test_coordinator_sql_strictly_validates_typed_effect_documents() -> None:
     prepare = re.search(
-        r"FUNCTION\s+carl_autonomy\.prepare_coordinator_effect\b.*?"
+        r"FUNCTION\s+carl_autonomy\.prepare_coordinator_effect_unchecked\b.*?"
         r"AS\s+\$\$(?P<body>.*?)\$\$;",
         COORDINATOR_RUNTIME_SQL,
         re.IGNORECASE | re.DOTALL,
     )
     complete = re.search(
-        r"FUNCTION\s+carl_autonomy\.complete_coordinator_effect\b.*?"
+        r"FUNCTION\s+carl_autonomy\.complete_coordinator_effect_unchecked\b.*?"
         r"AS\s+\$\$(?P<body>.*?)\$\$;",
         COORDINATOR_RUNTIME_SQL,
         re.IGNORECASE | re.DOTALL,
     )
     local = re.search(
-        r"FUNCTION\s+carl_autonomy\.execute_coordinator_local_effect\b.*?"
+        r"FUNCTION\s+carl_autonomy\.execute_coordinator_local_effect_unchecked\b.*?"
         r"AS\s+\$\$(?P<body>.*?)\$\$;",
         COORDINATOR_RUNTIME_SQL,
         re.IGNORECASE | re.DOTALL,
@@ -269,13 +275,13 @@ def test_coordinator_sql_strictly_validates_typed_effect_documents() -> None:
 
 def test_coordinator_sql_binds_each_selected_node_and_fences_every_non_github_family() -> None:
     apply = re.search(
-        r"FUNCTION\s+carl_autonomy\.apply_coordinator_decision\b.*?"
+        r"FUNCTION\s+carl_autonomy\.apply_coordinator_decision_unchecked\b.*?"
         r"AS\s+\$\$(?P<body>.*?)\$\$;",
         COORDINATOR_RUNTIME_SQL,
         re.IGNORECASE | re.DOTALL,
     )
     local = re.search(
-        r"FUNCTION\s+carl_autonomy\.execute_coordinator_local_effect\b.*?"
+        r"FUNCTION\s+carl_autonomy\.execute_coordinator_local_effect_unchecked\b.*?"
         r"AS\s+\$\$(?P<body>.*?)\$\$;",
         COORDINATOR_RUNTIME_SQL,
         re.IGNORECASE | re.DOTALL,
@@ -299,7 +305,7 @@ def test_coordinator_sql_binds_each_selected_node_and_fences_every_non_github_fa
 
 def test_non_github_reconciliation_can_replace_only_a_nonterminal_observation() -> None:
     complete = re.search(
-        r"FUNCTION\s+carl_autonomy\.complete_coordinator_effect\b.*?"
+        r"FUNCTION\s+carl_autonomy\.complete_coordinator_effect_unchecked\b.*?"
         r"AS\s+\$\$(?P<body>.*?)\$\$;",
         COORDINATOR_RUNTIME_SQL,
         re.IGNORECASE | re.DOTALL,
@@ -514,7 +520,7 @@ def test_sql_reconstructs_mutable_coordinator_truth_from_protected_tables() -> N
 
 def test_sql_applies_every_consequential_coordinator_action_or_fails_closed() -> None:
     apply = re.search(
-        r"FUNCTION\s+carl_autonomy\.apply_coordinator_decision\b.*?"
+        r"FUNCTION\s+carl_autonomy\.apply_coordinator_decision_unchecked\b.*?"
         r"AS\s+\$\$(?P<body>.*?)\$\$;",
         COORDINATOR_RUNTIME_SQL,
         re.IGNORECASE | re.DOTALL,
@@ -2543,13 +2549,130 @@ def test_postgres_coordinator_prepares_and_completes_exact_typed_family() -> Non
     assert database.transactions_committed == 2
 
 
+def test_postgres_prepare_decodes_atomic_freeze_without_changing_the_sql_return_shape() -> None:
+    selected = coordinator_node("observe_builder")
+    decision = choose_next_action(
+        coordinator_snapshot(
+            selected,
+            current_lease=coordinator_lease(),
+            command=coordinator_claimed_command(selected),
+        )
+    )
+    frozen_identity = hashlib.sha256(
+        canonical_json_bytes(
+            {
+                "action": "frozen",
+                "experiment_id": decision.experiment_id,
+                "node_id": selected.node_id,
+                "reason": "authoritative_completion_receipt_invalid",
+                "revision": decision.revision,
+            }
+        )
+    ).hexdigest()
+    frozen = CloudCoordinatorDecision(
+        schema_version=1,
+        action="frozen",
+        reason="authoritative_completion_receipt_invalid",
+        identity=frozen_identity,
+        experiment_id=decision.experiment_id,
+        revision=decision.revision,
+        node=decision.node,
+        command=None,
+        effect_key=None,
+        result_digest=None,
+        consequential=True,
+        remote_effect=False,
+        event=None,
+    )
+    database = FakeDatabase()
+    database.responses["prepare_coordinator_effect"] = [
+        {
+            "effect_family": None,
+            "request_json": _canonical(frozen.to_canonical_dict()),
+        }
+    ]
+
+    prepared = _backend(database).prepare_coordinator_effect(
+        decision, expected_family="observer", observed_at=NOW
+    )
+
+    assert prepared == frozen
+    assert database.transactions_started == 1
+    assert database.transactions_committed == 1
+
+
+def test_postgres_accepts_only_the_sql_minted_atomic_receipt_freeze() -> None:
+    selected = coordinator_node("observe_builder")
+    decision = choose_next_action(
+        coordinator_snapshot(
+            selected,
+            current_lease=coordinator_lease(),
+            command=coordinator_claimed_command(selected),
+            effect=EffectObservation(
+                effect_key=selected.effect_key,
+                status="applied",
+                result_digest=DIGEST_B,
+                observed_at=NOW_TEXT,
+            ),
+        )
+    )
+    assert decision.action == "complete_command"
+    frozen_identity = hashlib.sha256(
+        canonical_json_bytes(
+            {
+                "action": "frozen",
+                "experiment_id": decision.experiment_id,
+                "node_id": selected.node_id,
+                "reason": "authoritative_completion_receipt_invalid",
+                "revision": decision.revision,
+            }
+        )
+    ).hexdigest()
+    frozen = CloudCoordinatorDecision(
+        schema_version=1,
+        action="frozen",
+        reason="authoritative_completion_receipt_invalid",
+        identity=frozen_identity,
+        experiment_id=decision.experiment_id,
+        revision=decision.revision,
+        node=decision.node,
+        command=None,
+        effect_key=None,
+        result_digest=None,
+        consequential=True,
+        remote_effect=False,
+        event=None,
+    )
+    database = FakeDatabase()
+    database.responses["apply_coordinator_decision"] = [
+        {"applied": True, "decision_json": _canonical(frozen.to_canonical_dict())}
+    ]
+
+    applied = _backend(database).apply_coordinator_decision(decision, observed_at=NOW)
+
+    assert applied == frozen
+    assert database.transactions_started == 1
+    assert database.transactions_committed == 1
+
+
 @pytest.mark.parametrize(
     "message",
     (
+        "coordinator_completion_event_invalid",
+        "coordinator_completion_identity_invalid",
         "coordinator_completion_receipt_required",
         "coordinator_completion_event_mismatch",
         "coordinator_completion_receipt_conflict",
+        "coordinator_effect_command_mismatch",
+        "coordinator_effect_digest_mismatch",
+        "coordinator_effect_identity_mismatch",
+        "coordinator_effect_occurrence_conflict",
+        "coordinator_effect_occurrence_missing",
         "coordinator_effect_receipt_missing",
+        "coordinator_effect_request_json_invalid",
+        "coordinator_effect_response_conflict",
+        "coordinator_effect_response_json_invalid",
+        "coordinator_effect_response_mismatch",
     ),
 )
 def test_postgres_preserves_only_allowlisted_authoritative_receipt_failures(message: str) -> None:
@@ -2582,6 +2705,52 @@ def test_postgres_preserves_only_allowlisted_authoritative_receipt_failures(mess
 
     assert str(failure.value) == message
     assert failure.value.__cause__ is None
+
+
+def test_postgres_receipt_failure_codes_exactly_match_the_authoritative_sql_surface() -> None:
+    from carl_bench import postgres_state
+
+    expected = frozenset(
+        {
+            "coordinator_completion_event_invalid",
+            "coordinator_completion_event_mismatch",
+            "coordinator_completion_identity_invalid",
+            "coordinator_completion_receipt_conflict",
+            "coordinator_completion_receipt_required",
+            "coordinator_effect_command_mismatch",
+            "coordinator_effect_digest_mismatch",
+            "coordinator_effect_identity_mismatch",
+            "coordinator_effect_occurrence_conflict",
+            "coordinator_effect_occurrence_missing",
+            "coordinator_effect_receipt_missing",
+            "coordinator_effect_request_json_invalid",
+            "coordinator_effect_response_conflict",
+            "coordinator_effect_response_json_invalid",
+            "coordinator_effect_response_mismatch",
+        }
+    )
+    sql_function = re.search(
+        r"FUNCTION\s+carl_autonomy\.coordinator_authoritative_receipt_failure\b.*?"
+        r"AS\s+\$\$(?P<body>.*?)\$\$;",
+        COORDINATOR_RUNTIME_SQL,
+        re.IGNORECASE | re.DOTALL,
+    )
+
+    assert sql_function is not None
+    assert frozenset(re.findall(r"'([^']+)'", sql_function.group("body"))) == expected
+    assert expected == postgres_state._AUTHORITATIVE_RECEIPT_FAILURES
+
+
+def test_sql_guards_receipt_rejection_and_freeze_in_one_database_transaction() -> None:
+    body = COORDINATOR_RUNTIME_SQL
+
+    assert "apply_coordinator_decision_unchecked" in body
+    assert "prepare_coordinator_effect_unchecked" in body
+    assert "complete_coordinator_effect_unchecked" in body
+    assert "freeze_coordinator_receipt_failure" in body
+    assert "coordinator_authoritative_receipt_failure" in body
+    assert body.count("EXCEPTION WHEN OTHERS THEN") >= 4
+    assert "RETURN QUERY SELECT * FROM carl_autonomy.freeze_coordinator_receipt_failure(" in body
 
 
 def test_postgres_scrubs_nonallowlisted_database_errors() -> None:
@@ -2687,7 +2856,43 @@ def test_postgres_coordinator_enqueue_empty_manifest_queue_is_idempotent() -> No
     assert database.transactions_committed == 1
 
 
-def test_postgres_coordinator_recovery_uses_supervisor_only_typed_cas() -> None:
+def test_postgres_coordinator_recovery_uses_verified_archive_then_supervisor_cas() -> None:
+    identity = {
+        "attempt": 1,
+        "changed_action_digest": "d" * 64,
+        "command_key": "experiment-1:archive_builder:attempt:1",
+        "decision_identity": "c" * 64,
+        "effect_key": f"cloud-effect-{'f' * 64}",
+        "experiment_id": "experiment-1",
+        "freeze_fingerprint": "e" * 64,
+        "node_id": "experiment-1:archive_builder",
+        "node_kind": "archive_builder",
+        "occurrence_key": f"coordinator-freeze/{'e' * 64}",
+        "reason": "authoritative_completion_receipt_invalid",
+        "request_digest": "f" * 64,
+        "runtime_revision": 7,
+    }
+    repair_fingerprint = hashlib.sha256(canonical_json_bytes(identity)).hexdigest()
+    payload = canonical_json_bytes(
+        {
+            **identity,
+            "domain": "carl.coordinator-recovery-artifact.v1",
+            "repair_fingerprint": repair_fingerprint,
+            "repaired_at": NOW_TEXT,
+            "schema_version": 1,
+        }
+    )
+    evidence_digest = hashlib.sha256(payload).hexdigest()
+    archive = ProtectedArchiveVersion(
+        object_key=f"carl-evidence/v1/sha256/{evidence_digest[:2]}/{evidence_digest}",
+        version_id="recovery-v1",
+        payload=payload,
+        checksum_sha256=evidence_digest,
+        byte_length=len(payload),
+        retention_mode="COMPLIANCE",
+        retain_until="2027-08-20T12:00:00Z",
+        created_at=NOW_TEXT,
+    )
     recovery = CoordinatorRecoveryRequest(
         schema_version=1,
         domain="carl.coordinator.recovery.v1",
@@ -2695,8 +2900,8 @@ def test_postgres_coordinator_recovery_uses_supervisor_only_typed_cas() -> None:
         node_id="experiment-1:archive_builder",
         node_kind="archive_builder",
         expected_revision=7,
-        evidence_digest=DIGEST_A,
-        repair_fingerprint=DIGEST_B,
+        evidence_digest=evidence_digest,
+        repair_fingerprint=repair_fingerprint,
         requested_at=NOW_TEXT,
     )
     database = FakeDatabase()
@@ -2709,7 +2914,33 @@ def test_postgres_coordinator_recovery_uses_supervisor_only_typed_cas() -> None:
         }
     ]
 
-    result = _backend(database).reactivate_coordinator_node(recovery, observed_at=NOW)
+    class Reader:
+        def read_exact(self, object_key: str, version_id: str) -> ProtectedArchiveVersion:
+            assert (object_key, version_id) == (archive.object_key, archive.version_id)
+            return archive
+
+    class Registrar:
+        def __init__(self) -> None:
+            self.receipts = 0
+
+        def register_verified_coordinator_recovery_receipt(
+            self, receipt: object, *, observed_at: datetime
+        ) -> bool:
+            assert receipt.evidence_digest == evidence_digest  # type: ignore[attr-defined]
+            assert observed_at == NOW
+            self.receipts += 1
+            return True
+
+    registrar = Registrar()
+
+    result = _backend(database).reactivate_coordinator_node(
+        recovery,
+        object_key=archive.object_key,
+        version_id=archive.version_id,
+        archive_reader=Reader(),
+        receipt_registrar=registrar,
+        observed_at=NOW,
+    )
 
     assert result == {
         "applied": True,
@@ -2726,3 +2957,4 @@ def test_postgres_coordinator_recovery_uses_supervisor_only_typed_cas() -> None:
         for query, parameters in database.calls
         if "set_config('carl_autonomy.authority'" in query
     )
+    assert registrar.receipts == 1

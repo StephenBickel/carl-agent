@@ -60,6 +60,8 @@ _DATABASE_ROLE = "carl_state_backend"
 _PROTECTED_STATE_CONFIG_DIR = Path("/etc/carl")
 _PROTECTED_STATE_CONFIG_NAME = "postgres-state-policy.json"
 _PROTECTED_STATE_DSN_ENV = "CARL_AUTONOMY_POSTGRES_DSN"
+_PROTECTED_ARCHIVE_STATE_DSN_ENV = "CARL_AUTONOMY_ARCHIVE_POSTGRES_DSN"
+_ARCHIVE_DATABASE_ROLE = "carl_archive_backend"
 _WORKFLOW_AUTHORITIES = frozenset(
     {
         "builder",
@@ -75,10 +77,19 @@ _AUTHORITATIVE_RECEIPT_FAILURES = frozenset(
     {
         "coordinator_completion_event_invalid",
         "coordinator_completion_event_mismatch",
+        "coordinator_completion_identity_invalid",
         "coordinator_completion_receipt_conflict",
         "coordinator_completion_receipt_required",
+        "coordinator_effect_command_mismatch",
+        "coordinator_effect_digest_mismatch",
+        "coordinator_effect_identity_mismatch",
+        "coordinator_effect_occurrence_conflict",
         "coordinator_effect_occurrence_missing",
         "coordinator_effect_receipt_missing",
+        "coordinator_effect_request_json_invalid",
+        "coordinator_effect_response_conflict",
+        "coordinator_effect_response_json_invalid",
+        "coordinator_effect_response_mismatch",
     }
 )
 _EVENT_AUTHORITIES = {
@@ -164,6 +175,77 @@ class _PostgresRuntime:
     dsn: str
     database_role: str
     connect: Callable[[str], Any]
+
+
+class PostgresCoordinatorRecoveryReceiptRegistrar:
+    """Single-purpose archive-role writer for verified recovery receipts."""
+
+    __slots__ = ("_runtime",)
+
+    def __init__(self, runtime: _PostgresRuntime, *, _testing: bool = False) -> None:
+        if not _testing or runtime.database_role != _ARCHIVE_DATABASE_ROLE:
+            raise PostgresStateError("postgres_archive_registrar_invalid")
+        self._runtime = runtime
+
+    @classmethod
+    def _for_testing(
+        cls, *, dsn: str, connect: Callable[[str], Any]
+    ) -> PostgresCoordinatorRecoveryReceiptRegistrar:
+        if not isinstance(dsn, str) or not dsn or not callable(connect):
+            raise PostgresStateError("postgres_archive_registrar_invalid")
+        return cls(_PostgresRuntime(dsn, _ARCHIVE_DATABASE_ROLE, connect), _testing=True)
+
+    @classmethod
+    def from_protected_environment(cls) -> PostgresCoordinatorRecoveryReceiptRegistrar:
+        dsn = os.environ.get(_PROTECTED_ARCHIVE_STATE_DSN_ENV)
+        if not isinstance(dsn, str) or not dsn:
+            raise PostgresStateError("postgres_archive_dsn_missing")
+        return cls(_PostgresRuntime(dsn, _ARCHIVE_DATABASE_ROLE, _default_connect), _testing=True)
+
+    def register_verified_coordinator_recovery_receipt(
+        self, receipt: object, *, observed_at: datetime
+    ) -> bool:
+        from carl_bench.coordinator_recovery_archive import (
+            VerifiedCoordinatorRecoveryReceipt,
+        )
+
+        if (
+            not isinstance(receipt, VerifiedCoordinatorRecoveryReceipt)
+            or not isinstance(observed_at, datetime)
+            or observed_at.tzinfo != UTC
+        ):
+            raise PostgresStateError("coordinator_recovery_archive_invalid")
+        try:
+            connection = self._runtime.connect(self._runtime.dsn)
+        except Exception:
+            raise PostgresStateError("postgres_archive_connection_failed") from None
+        try:
+            with connection.transaction(), connection.cursor() as cursor:
+                cursor.execute("SELECT current_user AS database_role")
+                row = _strict_row(cursor.fetchone(), frozenset({"database_role"}))
+                if cursor.fetchone() is not None or row["database_role"] != _ARCHIVE_DATABASE_ROLE:
+                    raise PostgresStateError("database_role_mismatch")
+                cursor.execute(
+                    "SELECT * FROM carl_autonomy.register_coordinator_recovery_receipt(%s, %s)",
+                    (_canonical_text(receipt.to_canonical_dict()), observed_at),
+                )
+                result = _strict_row(cursor.fetchone(), frozenset({"applied"}))
+                if cursor.fetchone() is not None:
+                    raise PostgresStateError("postgres_result_shape_invalid")
+                return _strict_bool(result["applied"])
+        except PostgresStateError:
+            raise
+        except Exception as error:
+            primary = getattr(getattr(error, "diag", None), "message_primary", None)
+            if primary in {
+                "coordinator_recovery_archive_invalid",
+                "coordinator_recovery_freeze_mismatch",
+                "coordinator_recovery_receipt_conflict",
+            }:
+                raise PostgresStateError(primary) from None
+            raise PostgresStateError("postgres_archive_registration_failed") from None
+        finally:
+            connection.close()
 
 
 def _canonical_text(value: Mapping[str, Any]) -> str:
@@ -1221,14 +1303,24 @@ class PostgresStateBackend(StateBackend):
             ),
         )
 
-    def reactivate_coordinator_node(
-        self, recovery: object, *, observed_at: datetime
+    def reactivate_verified_coordinator_node(
+        self, recovery: object, receipt: object, *, observed_at: datetime
     ) -> dict[str, object]:
-        """Apply one supervisor-only, evidence-backed frozen-node recovery CAS."""
+        """Apply a recovery already admitted through the protected archive registrar."""
         from carl_bench.coordinator_recovery import CoordinatorRecoveryRequest
+        from carl_bench.coordinator_recovery_archive import (
+            VerifiedCoordinatorRecoveryReceipt,
+        )
 
         if (
             not isinstance(recovery, CoordinatorRecoveryRequest)
+            or not isinstance(receipt, VerifiedCoordinatorRecoveryReceipt)
+            or receipt.evidence_digest != recovery.evidence_digest
+            or receipt.artifact["repair_fingerprint"] != recovery.repair_fingerprint
+            or receipt.artifact["experiment_id"] != recovery.experiment_id
+            or receipt.artifact["node_id"] != recovery.node_id
+            or receipt.artifact["node_kind"] != recovery.node_kind
+            or receipt.artifact["runtime_revision"] != recovery.expected_revision
             or not isinstance(observed_at, datetime)
             or observed_at.tzinfo != UTC
         ):
@@ -1261,9 +1353,61 @@ class PostgresStateBackend(StateBackend):
             ),
         )
 
+    def reactivate_coordinator_node(
+        self,
+        recovery: object,
+        *,
+        object_key: str,
+        version_id: str,
+        archive_reader: object,
+        receipt_registrar: object,
+        observed_at: datetime,
+    ) -> dict[str, object]:
+        """Read, verify, register, and reactivate through the production authority chain."""
+        from carl_bench.coordinator_recovery_archive import (
+            recover_coordinator_node_from_archive,
+        )
+
+        return recover_coordinator_node_from_archive(
+            recovery,  # type: ignore[arg-type]
+            object_key=object_key,
+            version_id=version_id,
+            archive_reader=archive_reader,  # type: ignore[arg-type]
+            receipt_registrar=receipt_registrar,  # type: ignore[arg-type]
+            state=self,
+            observed_at=observed_at,
+        )
+
+    def reactivate_coordinator_node_from_protected_archive(
+        self,
+        recovery: object,
+        *,
+        object_key: str,
+        version_id: str,
+        observed_at: datetime,
+    ) -> dict[str, object]:
+        """Closed production constructor: no caller-selected archive or database seams."""
+        from carl_bench.live_archive_client import ProtectedArchiveSocketReader
+
+        return self.reactivate_coordinator_node(
+            recovery,
+            object_key=object_key,
+            version_id=version_id,
+            archive_reader=ProtectedArchiveSocketReader.from_protected_environment(),
+            receipt_registrar=(
+                PostgresCoordinatorRecoveryReceiptRegistrar.from_protected_environment()
+            ),
+            observed_at=observed_at,
+        )
+
     @staticmethod
-    def _decode_coordinator_decision(row: dict[str, Any], *, expected: object) -> object:
-        from carl_bench.cloud_coordinator import CloudCoordinatorDecision
+    def _decode_coordinator_decision(
+        row: dict[str, Any], *, expected: object, allow_atomic_receipt_freeze: bool = False
+    ) -> object:
+        from carl_bench.cloud_coordinator import (
+            CloudCoordinatorDecision,
+            _is_atomic_receipt_freeze,
+        )
 
         value = _strict_row(row, frozenset({"applied", "decision_json"}))
         _strict_bool(value["applied"])
@@ -1275,7 +1419,11 @@ class PostgresStateBackend(StateBackend):
             )
         except Exception as error:
             raise PostgresStateError("coordinator_decision_invalid") from error
-        if decision != expected:
+        if decision != expected and not (
+            allow_atomic_receipt_freeze
+            and isinstance(expected, CloudCoordinatorDecision)
+            and _is_atomic_receipt_freeze(decision, expected=expected)
+        ):
             raise PostgresStateError("coordinator_decision_identity_mismatch")
         return decision
 
@@ -1295,7 +1443,9 @@ class PostgresStateBackend(StateBackend):
             "coordinator",
             "SELECT * FROM carl_autonomy.apply_coordinator_decision(%s, %s)",
             (_canonical_text(decision.to_canonical_dict()), observed_at),
-            lambda row: self._decode_coordinator_decision(row, expected=decision),
+            lambda row: self._decode_coordinator_decision(
+                row, expected=decision, allow_atomic_receipt_freeze=True
+            ),
         )
 
     def execute_github_coordinator_effect(
@@ -1320,8 +1470,14 @@ class PostgresStateBackend(StateBackend):
         ):
             raise PostgresStateError("coordinator_effect_invalid")
 
-        def prepare(row: dict[str, Any]) -> GitHubEffectRequest:
+        def prepare(row: dict[str, Any]) -> object:
             value = _strict_row(row, frozenset({"effect_family", "request_json"}))
+            if value["effect_family"] is None:
+                return self._decode_coordinator_decision(
+                    {"applied": True, "decision_json": value["request_json"]},
+                    expected=decision,
+                    allow_atomic_receipt_freeze=True,
+                )
             if value["effect_family"] != "github":
                 raise PostgresStateError("coordinator_effect_family_invalid")
             try:
@@ -1346,6 +1502,10 @@ class PostgresStateBackend(StateBackend):
             (_canonical_text(decision.to_canonical_dict()), observed_at),
             prepare,
         )
+        if isinstance(request, CloudCoordinatorDecision):
+            return request
+        if not isinstance(request, GitHubEffectRequest):
+            raise PostgresStateError("coordinator_effect_result_invalid")
         try:
             response = github.execute(request)
         except Exception as error:
@@ -1363,7 +1523,9 @@ class PostgresStateBackend(StateBackend):
                 _canonical_text(response.to_canonical_dict()),
                 observed_at,
             ),
-            lambda row: self._decode_coordinator_decision(row, expected=decision),
+            lambda row: self._decode_coordinator_decision(
+                row, expected=decision, allow_atomic_receipt_freeze=True
+            ),
         )
 
     def execute_coordinator_effect(
@@ -1410,6 +1572,12 @@ class PostgresStateBackend(StateBackend):
 
         def decode(row: dict[str, Any]) -> object:
             value = _strict_row(row, frozenset({"effect_family", "request_json"}))
+            if value["effect_family"] is None:
+                return self._decode_coordinator_decision(
+                    {"applied": True, "decision_json": value["request_json"]},
+                    expected=decision,
+                    allow_atomic_receipt_freeze=True,
+                )
             if value["effect_family"] != expected_family:
                 raise PostgresStateError("coordinator_effect_family_invalid")
             try:
@@ -1466,7 +1634,9 @@ class PostgresStateBackend(StateBackend):
                 _canonical_text(response.to_canonical_dict()),
                 observed_at,
             ),
-            lambda row: self._decode_coordinator_decision(row, expected=decision),
+            lambda row: self._decode_coordinator_decision(
+                row, expected=decision, allow_atomic_receipt_freeze=True
+            ),
         )
 
     def execute_local_coordinator_effect(
@@ -1499,5 +1669,7 @@ class PostgresStateBackend(StateBackend):
             "coordinator",
             "SELECT * FROM carl_autonomy.execute_coordinator_local_effect(%s, %s)",
             (_canonical_text(decision.to_canonical_dict()), observed_at),
-            lambda row: self._decode_coordinator_decision(row, expected=decision),
+            lambda row: self._decode_coordinator_decision(
+                row, expected=decision, allow_atomic_receipt_freeze=True
+            ),
         )

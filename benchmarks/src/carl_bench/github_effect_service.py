@@ -10,6 +10,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import os
+import pwd
 import re
 import select
 import socket
@@ -39,7 +40,7 @@ from carl_bench.unix_socket_security import (
 )
 
 _SOCKET_PATH = Path("/run/carl/github-effect.sock")
-_ALLOWED_CLIENT_UID = 0
+_COORDINATOR_USER = "carl-autonomy-coordinator"
 _CONNECTION_TIMEOUT_SECONDS = 2.0
 _ACTIVATION_PROBE_TIMEOUT_SECONDS = 1.0
 
@@ -86,6 +87,21 @@ def _protected_graphql_documents() -> object:
             "6a96f13af464b95dcd16d58fe01b851362c59893e24b842a40592b04765336f4"
         ),
     )
+
+
+def _protected_coordinator_uid() -> int:
+    try:
+        uid = pwd.getpwnam(_COORDINATOR_USER).pw_uid
+    except (KeyError, AttributeError) as error:
+        raise RuntimeError("github_effect_service_identity_invalid") from error
+    if isinstance(uid, bool) or not isinstance(uid, int) or uid <= 0:
+        raise RuntimeError("github_effect_service_identity_invalid")
+    return uid
+
+
+def _require_protected_service_uid() -> None:
+    if os.geteuid() != 0:
+        raise RuntimeError("github_effect_service_identity_invalid")
 
 
 def _github_cloud():
@@ -435,12 +451,17 @@ def _prove_listener_occupies_path(
 
 @contextmanager
 def _validated_activated_listener(
-    *, listener_fd: int, socket_path: Path, expected_uid: int
+    *,
+    listener_fd: int,
+    socket_path: Path,
+    expected_uid: int,
+    expected_parent_uid: int | None = None,
 ) -> Iterator[tuple[socket.socket, list[socket.socket]]]:
     """Duplicate and validate a supervisor-owned listening Unix socket."""
+    parent_uid = expected_uid if expected_parent_uid is None else expected_parent_uid
     descriptor_before = _descriptor_identity(listener_fd, expected_uid=expected_uid)
     try:
-        parent_fd = open_pinned_parent(socket_path, expected_uid=expected_uid)
+        parent_fd = open_pinned_parent(socket_path, expected_uid=parent_uid)
         path_before = socket_identity_at(parent_fd, socket_path.name, expected_uid=expected_uid)
     except ProtectedSocketPathError as error:
         raise RuntimeError("github_effect_service_socket_identity_invalid") from error
@@ -487,6 +508,7 @@ def _serve_activated_listener(
     clock: object,
     connection_timeout_seconds: float,
     on_ready: object | None = None,
+    expected_parent_uid: int | None = None,
 ) -> None:
     """Serve requests from a validated supervisor-owned listener without path mutation."""
     if (
@@ -501,6 +523,7 @@ def _serve_activated_listener(
         listener_fd=listener_fd,
         socket_path=socket_path,
         expected_uid=service_uid,
+        expected_parent_uid=expected_parent_uid,
     ) as activated:
         listener, queued = activated
         if on_ready is not None:
@@ -539,6 +562,7 @@ def _peer_uid(connection: socket.socket) -> int | None:
 
 def main() -> int:
     """Run the fixed protected service. No caller-selected dependencies or paths."""
+    _require_protected_service_uid()
     listener_fd = _activation_descriptor_from_environment(
         environment=os.environ,
         process_id=os.getpid(),
@@ -559,16 +583,18 @@ def main() -> int:
         dispatch_actor_login=policy.dispatch_actor_login,
         graphql_documents=_protected_graphql_documents(),
     )
+    coordinator_uid = _protected_coordinator_uid()
     _serve_activated_listener(
         listener_fd=listener_fd,
         socket_path=_SOCKET_PATH,
-        allowed_client_uid=_ALLOWED_CLIENT_UID,
-        service_uid=0,
+        allowed_client_uid=coordinator_uid,
+        service_uid=coordinator_uid,
         gateway=gateway,
         policy=policy,
         state_controller=state_controller,
         clock=github._system_clock,
         connection_timeout_seconds=_CONNECTION_TIMEOUT_SECONDS,
+        expected_parent_uid=0,
     )
 
 

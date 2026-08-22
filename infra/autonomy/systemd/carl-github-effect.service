@@ -1,18 +1,18 @@
 [Unit]
-Description=Carl protected observer coordinator effect responder
-Requires=carl-observer-effect.socket
-After=network-online.target
+Description=Carl protected GitHub effect responder
+Requires=carl-github-effect.socket
+After=network-online.target carl-github-effect.socket
 Wants=network-online.target
 
 [Service]
 Type=simple
-User=carl-autonomy-observer
-Group=carl-autonomy-observer
-EnvironmentFile=/etc/carl/observer-effect.env
-InaccessiblePaths=/etc/carl/coordinator.env /etc/carl/github-effect.env /etc/carl/archive-effect.env /etc/carl/evaluator-effect.env /etc/carl/input-effect.env
+User=root
+Group=root
+EnvironmentFile=/etc/carl/github-effect.env
+InaccessiblePaths=/etc/carl/coordinator.env /etc/carl/archive-effect.env /etc/carl/evaluator-effect.env /etc/carl/input-effect.env /etc/carl/observer-effect.env
 Environment=PYTHONNOUSERSITE=1
 UnsetEnvironment=PYTHONPATH PYTHONHOME PYTHONSTARTUP PYTHONUSERBASE
-ExecStart=/opt/carl-autonomy/venv/bin/python3 -I -m carl_bench.coordinator_effect_service
+ExecStart=/opt/carl-autonomy/venv/bin/python3 -I -m carl_bench.github_effect_service
 Restart=on-failure
 RestartSec=5s
 UMask=0077
@@ -23,6 +23,7 @@ ProtectSystem=strict
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
+ReadOnlyPaths=/etc/carl/github-cloud-policy.json
 RestrictSUIDSGID=true
 LockPersonality=true
 MemoryDenyWriteExecute=true

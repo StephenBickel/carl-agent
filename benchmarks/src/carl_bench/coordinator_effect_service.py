@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import pwd
 import socket
 import struct
 from datetime import UTC, datetime
@@ -22,7 +23,7 @@ from carl_bench.coordinator_effects import (
     CoordinatorNodeEffectResponse,
 )
 
-_ALLOWED_CLIENT_UID = 0
+_COORDINATOR_USER = "carl-autonomy-coordinator"
 _CONNECTION_TIMEOUT_SECONDS = 2.0
 _FAMILIES = frozenset({"archive", "evaluator", "input", "observer"})
 
@@ -41,6 +42,18 @@ class StopSignal(Protocol):
 
 def _timestamp() -> str:
     return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+
+
+def _protected_coordinator_uid() -> int:
+    try:
+        uid = pwd.getpwnam(_COORDINATOR_USER).pw_uid
+    except (KeyError, AttributeError) as error:
+        raise CoordinatorEffectServiceError(
+            "coordinator_effect_service_identity_invalid"
+        ) from error
+    if isinstance(uid, bool) or not isinstance(uid, int) or uid <= 0:
+        raise CoordinatorEffectServiceError("coordinator_effect_service_identity_invalid")
+    return uid
 
 
 class _ProtectedEffectAuthority:
@@ -189,7 +202,7 @@ def main() -> int:
             listener,
             family=family,
             authority=_ProtectedEffectAuthority.from_protected_environment(family),
-            allowed_client_uid=_ALLOWED_CLIENT_UID,
+            allowed_client_uid=_protected_coordinator_uid(),
         )
     return 0
 

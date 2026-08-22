@@ -994,6 +994,37 @@ def _empty_queue_decision(
     )
 
 
+def _is_atomic_receipt_freeze(applied: object, *, expected: CloudCoordinatorDecision) -> bool:
+    if not isinstance(applied, CloudCoordinatorDecision) or expected.node is None:
+        return False
+    identity = hashlib.sha256(
+        canonical_json_bytes(
+            {
+                "action": "frozen",
+                "experiment_id": expected.experiment_id,
+                "node_id": f"{expected.experiment_id}:{expected.node}",
+                "reason": "authoritative_completion_receipt_invalid",
+                "revision": expected.revision,
+            }
+        )
+    ).hexdigest()
+    return applied == CloudCoordinatorDecision(
+        schema_version=1,
+        action="frozen",
+        reason="authoritative_completion_receipt_invalid",
+        identity=identity,
+        experiment_id=expected.experiment_id,
+        revision=expected.revision,
+        node=expected.node,
+        command=None,
+        effect_key=None,
+        result_digest=None,
+        consequential=True,
+        remote_effect=False,
+        event=None,
+    )
+
+
 def _lease_decision(snapshot: CoordinatorSnapshot) -> CloudCoordinatorDecision | None:
     current = snapshot.lease
     now = _timestamp(snapshot.observed_at, "coordinator_observed_at_invalid")
@@ -1360,23 +1391,12 @@ class ProtectedCoordinatorExecutor:
             try:
                 applied = self.__effects.execute(decision, observed_at=observed_at)
             except Exception as error:
-                receipt_failure = getattr(error, "code", None) in {
-                    "coordinator_completion_event_invalid",
-                    "coordinator_completion_event_mismatch",
-                    "coordinator_completion_receipt_conflict",
-                    "coordinator_completion_receipt_required",
-                    "coordinator_effect_occurrence_missing",
-                    "coordinator_effect_receipt_missing",
-                }
-                if not isinstance(error, ProtectedEffectUnavailable) and not receipt_failure:
+                if not isinstance(error, ProtectedEffectUnavailable):
                     raise
-                reason = (
-                    "authoritative_completion_receipt_invalid" if receipt_failure else error.code
-                )
                 frozen = _decision(
                     snapshot,
                     "frozen",
-                    reason,
+                    error.code,
                     node=_selected_node(snapshot),
                     consequential=True,
                 )
@@ -1385,29 +1405,9 @@ class ProtectedCoordinatorExecutor:
                     raise CloudCoordinatorError("coordinator_applied_identity_mismatch") from error
                 return frozen
         else:
-            try:
-                applied = self.__state.apply(decision, observed_at=observed_at)
-            except Exception as error:
-                if getattr(error, "code", None) not in {
-                    "coordinator_completion_event_invalid",
-                    "coordinator_completion_event_mismatch",
-                    "coordinator_completion_receipt_conflict",
-                    "coordinator_completion_receipt_required",
-                    "coordinator_effect_occurrence_missing",
-                    "coordinator_effect_receipt_missing",
-                }:
-                    raise
-                frozen = _decision(
-                    snapshot,
-                    "frozen",
-                    "authoritative_completion_receipt_invalid",
-                    node=_selected_node(snapshot),
-                    consequential=True,
-                )
-                applied = self.__state.apply(frozen, observed_at=observed_at)
-                if applied != frozen:
-                    raise CloudCoordinatorError("coordinator_applied_identity_mismatch") from error
-                return frozen
+            applied = self.__state.apply(decision, observed_at=observed_at)
+        if _is_atomic_receipt_freeze(applied, expected=decision):
+            return applied
         if applied != decision:
             raise CloudCoordinatorError("coordinator_applied_identity_mismatch")
         return decision
