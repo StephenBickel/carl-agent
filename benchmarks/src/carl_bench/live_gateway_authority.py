@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import secrets
@@ -29,6 +30,9 @@ from carl_bench.openai_gateway import (
     OpenAIModelGateway,
     OpenAIModelRequest,
     ProtectedOpenAIModelResult,
+    ProviderOperationIdentity,
+    ProviderReconciliationCapability,
+    ProviderReconciliationReceipt,
 )
 
 _DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -159,17 +163,33 @@ class _PinnedGateway(Protocol):
 
     def verify_protected_result(self, result: object) -> bool: ...
 
+    def provider_reconciliation_capability(
+        self,
+    ) -> ProviderReconciliationCapability | None: ...
+
+    def dispatch_reconciled(
+        self, request: OpenAIModelRequest, operation: ProviderOperationIdentity
+    ) -> object: ...
+
+    def reconcile_provider_operation(
+        self, request: OpenAIModelRequest, operation: ProviderOperationIdentity
+    ) -> object: ...
+
+    def verify_provider_reconciliation(
+        self, receipt: object, operation: ProviderOperationIdentity
+    ) -> bool: ...
+
 
 class _GatewayState(Protocol):
     def reserve_grant(self, **kwargs: object) -> None: ...
 
     def load_grant(self, token_digest: str) -> dict[str, Any]: ...
 
+    def load_provider_binding(self, token_digest: str) -> tuple[str | None, str]: ...
+
     def claim_grant(self, token_digest: str, **kwargs: object) -> dict[str, Any]: ...
 
     def complete_result(self, token_digest: str, claim_id: str, result: dict[str, Any]) -> None: ...
-
-    def reconcile_dispatched_result(self, token_digest: str, result: dict[str, Any]) -> None: ...
 
     def mark_provider_dispatched(
         self, token_digest: str, claim_id: str, **kwargs: object
@@ -204,6 +224,16 @@ class _GatewayState(Protocol):
     ) -> dict[str, str]: ...
 
     def reconcile_abandoned_claims(self, **kwargs: object) -> tuple[str, ...]: ...
+
+    def claim_provider_reconciliations(self, **kwargs: object) -> tuple[dict[str, Any], ...]: ...
+
+    def complete_provider_reconciliation(self, *args: object, **kwargs: object) -> None: ...
+
+    def authorize_provider_retry(self, *args: object, **kwargs: object) -> bool: ...
+
+    def defer_provider_reconciliation(self, *args: object, **kwargs: object) -> None: ...
+
+    def freeze_provider_operation(self, *args: object, **kwargs: object) -> None: ...
 
 
 @dataclass(slots=True)
@@ -364,6 +394,11 @@ class _MemoryGatewayState:
             "collected": False,
             "infrastructure_code": None,
             "provider_request_digest": None,
+            "provider_operation": None,
+            "provider_request": None,
+            "provider_reconciliation_receipt": None,
+            "provider_retry_count": 0,
+            "provider_reconciliation_count": 0,
             "runner_request_digest": kwargs.get("runner_request_digest"),
             "runner_context": kwargs.get("runner_context"),
             "sealed_bundle": None,
@@ -374,6 +409,15 @@ class _MemoryGatewayState:
         if row is None:
             raise LiveGatewayStateError("live_gateway_capability_invalid")
         return row["grant"]
+
+    def load_provider_binding(self, token_digest: str) -> tuple[str | None, str]:
+        row = self.rows.get(token_digest)
+        if row is None:
+            raise LiveGatewayStateError("live_gateway_capability_invalid")
+        return (
+            row["runner_request_digest"],
+            hashlib.sha256(canonical_json_bytes(row["grant"])).hexdigest(),
+        )
 
     def claim_grant(self, token_digest: str, **kwargs: object) -> dict[str, Any]:
         row = self.rows.get(token_digest)
@@ -407,6 +451,8 @@ class _MemoryGatewayState:
             raise LiveGatewayStateError("live_gateway_capability_invalid")
         row["claim_state"] = "dispatched"
         row["provider_request_digest"] = kwargs["request_digest"]
+        row["provider_operation"] = kwargs.get("operation")
+        row["provider_request"] = kwargs.get("request")
 
     def mark_dispatch_ambiguous(self, token_digest: str, claim_id: str, *, code: str) -> None:
         row = self.rows[token_digest]
@@ -424,15 +470,105 @@ class _MemoryGatewayState:
         row["result"] = result
         row["claim_state"] = "completed"
 
-    def reconcile_dispatched_result(self, token_digest: str, result: dict[str, Any]) -> None:
+    def claim_provider_reconciliations(self, **kwargs: object) -> tuple[dict[str, Any], ...]:
+        claimed: list[dict[str, Any]] = []
+        observed_at = kwargs["observed_at"]
+        current_boot_id = kwargs["current_boot_id"]
+        process_identity = kwargs["process_identity"]
+        for token_digest, row in sorted(self.rows.items()):
+            if (
+                row["claim_state"] not in {"dispatch_ambiguous", "reconciling"}
+                or row["claim_expires_at"] > observed_at
+            ):
+                continue
+            if row["claim_state"] == "reconciling":
+                alive = (
+                    process_identity(row["claim_pid"])
+                    if row["claim_boot_id"] == current_boot_id
+                    else None
+                )
+                if alive == row["claim_process_start"]:
+                    continue
+            if row["provider_operation"] is None or row["provider_request"] is None:
+                row["claim_state"] = "invalid"
+                row["infrastructure_code"] = "gateway_provider_operation_missing"
+                continue
+            row["claim_state"] = "reconciling"
+            row["claim_id"] = kwargs["claim_id"]
+            row["claim_boot_id"] = current_boot_id
+            row["claim_pid"] = kwargs["process_id"]
+            row["claim_process_start"] = kwargs["process_start"]
+            row["claim_expires_at"] = kwargs["expires_at"]
+            row["provider_reconciliation_count"] += 1
+            claimed.append(
+                {
+                    "claim_id": kwargs["claim_id"],
+                    "operation": row["provider_operation"],
+                    "request": row["provider_request"],
+                    "reconciliation_count": row["provider_reconciliation_count"],
+                    "retry_count": row["provider_retry_count"],
+                    "token_digest": token_digest,
+                }
+            )
+        return tuple(claimed)
+
+    def complete_provider_reconciliation(
+        self,
+        token_digest: str,
+        claim_id: str,
+        *,
+        result: dict[str, Any],
+        receipt: dict[str, Any],
+    ) -> None:
         row = self.rows[token_digest]
-        if row["claim_state"] != "dispatch_ambiguous":
-            raise LiveGatewayStateError("live_gateway_reconciliation_not_authorized")
-        if result.get("request_digest") != row["provider_request_digest"]:
+        if (
+            row["claim_state"] != "reconciling"
+            or row["claim_id"] != claim_id
+            or result.get("request_digest") != row["provider_request_digest"]
+        ):
             raise LiveGatewayStateError("live_gateway_result_conflict")
         row["result"] = result
+        row["provider_reconciliation_receipt"] = receipt
         row["claim_state"] = "completed"
         row["infrastructure_code"] = None
+
+    def authorize_provider_retry(self, token_digest: str, claim_id: str, **kwargs: object) -> bool:
+        row = self.rows[token_digest]
+        if row["claim_state"] != "reconciling" or row["claim_id"] != claim_id:
+            raise LiveGatewayStateError("live_gateway_reconciliation_not_authorized")
+        row["provider_reconciliation_receipt"] = kwargs["receipt"]
+        if row["provider_retry_count"] >= 1:
+            row["claim_state"] = "invalid"
+            row["infrastructure_code"] = "gateway_provider_retry_exhausted"
+            return False
+        row["provider_retry_count"] = 1
+        row["claim_state"] = "dispatched"
+        row["claim_expires_at"] = kwargs["expires_at"]
+        row["infrastructure_code"] = None
+        return True
+
+    def defer_provider_reconciliation(
+        self, token_digest: str, claim_id: str, **kwargs: object
+    ) -> None:
+        row = self.rows[token_digest]
+        if row["claim_state"] != "reconciling" or row["claim_id"] != claim_id:
+            raise LiveGatewayStateError("live_gateway_reconciliation_not_authorized")
+        row["claim_state"] = "dispatch_ambiguous"
+        row["infrastructure_code"] = kwargs["code"]
+        row["claim_expires_at"] = kwargs["retry_at"]
+        if kwargs["receipt"] is not None:
+            row["provider_reconciliation_receipt"] = kwargs["receipt"]
+
+    def freeze_provider_operation(self, token_digest: str, **kwargs: object) -> None:
+        row = self.rows[token_digest]
+        if row["claim_state"] == "completed" or (
+            kwargs.get("claim_id") is not None and row["claim_id"] != kwargs["claim_id"]
+        ):
+            raise LiveGatewayStateError("live_gateway_reconciliation_not_authorized")
+        row["claim_state"] = "invalid"
+        row["infrastructure_code"] = kwargs["code"]
+        if kwargs.get("receipt") is not None:
+            row["provider_reconciliation_receipt"] = kwargs["receipt"]
 
     def take_result(self, token_digest: str) -> tuple[dict[str, Any], dict[str, Any]]:
         row = self.rows.get(token_digest)
@@ -594,6 +730,32 @@ class _MemoryGatewayState:
                 row["infrastructure_code"] = "gateway_dispatch_ambiguous"
             reconciled.append(token_digest)
         return tuple(sorted(reconciled))
+
+
+def _request_document(request: OpenAIModelRequest) -> dict[str, Any]:
+    try:
+        value = json.loads(request.to_bytes())
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise LiveGatewayAuthorityError("live_gateway_provider_operation_invalid") from error
+    if type(value) is not dict:
+        raise LiveGatewayAuthorityError("live_gateway_provider_operation_invalid")
+    return value
+
+
+def _receipt_document(receipt: ProviderReconciliationReceipt) -> dict[str, Any]:
+    result_digest = (
+        None
+        if receipt.result is None
+        else hashlib.sha256(canonical_json_bytes(_result_document(receipt.result))).hexdigest()
+    )
+    return {
+        "operation_digest": receipt.operation_digest,
+        "receipt_digest": receipt.receipt_digest,
+        "request_digest": receipt.request_digest,
+        "result_digest": result_digest,
+        "schema_version": 1,
+        "status": receipt.status,
+    }
 
 
 class ProtectedModelGatewayServer:
@@ -759,6 +921,7 @@ class ProtectedModelGatewayServer:
             )
         except LiveGatewayStateError as error:
             raise LiveGatewayAuthorityError(error.code) from error
+        value.reconcile_expired_provider_operations()
         return value
 
     def _now_epoch(self) -> int:
@@ -771,6 +934,271 @@ class ProtectedModelGatewayServer:
         ):
             raise LiveGatewayAuthorityError("live_gateway_clock_invalid")
         return int(observed.timestamp())
+
+    def _provider_capability(self) -> ProviderReconciliationCapability | None:
+        operation = getattr(self._gateway, "provider_reconciliation_capability", None)
+        if not callable(operation):
+            return None
+        try:
+            capability = operation()
+        except Exception:
+            return None
+        return capability if type(capability) is ProviderReconciliationCapability else None
+
+    @staticmethod
+    def _capability_matches_operation(
+        capability: ProviderReconciliationCapability,
+        operation: ProviderOperationIdentity,
+    ) -> bool:
+        return (
+            capability.provider == operation.provider
+            and capability.project_digest == operation.project_digest
+            and capability.protocol_revision == operation.protocol_revision
+            and capability.receipt_authority_digest == operation.receipt_authority_digest
+        )
+
+    def _operation_identity(
+        self,
+        *,
+        grant: _Grant,
+        request: OpenAIModelRequest,
+        capability: ProviderReconciliationCapability,
+    ) -> ProviderOperationIdentity:
+        try:
+            runner_request_digest, grant_digest = self._state.load_provider_binding(
+                grant.token_digest
+            )
+        except LiveGatewayStateError as error:
+            raise LiveGatewayAuthorityError(error.code) from error
+        runner_binding = runner_request_digest or grant.actual.execution_context_digest
+        return ProviderOperationIdentity(
+            provider=capability.provider,
+            project_digest=capability.project_digest,
+            protocol_revision=capability.protocol_revision,
+            receipt_authority_digest=capability.receipt_authority_digest,
+            grant_digest=grant_digest,
+            runner_binding_digest=runner_binding,
+            runner_binding_kind=(
+                "runner_request" if runner_request_digest is not None else "execution_context"
+            ),
+            request_digest=request.request_digest,
+            model=grant.actual.model,
+            attempt=grant.actual.attempt,
+            immutable_inputs_digest=hashlib.sha256(request.to_bytes()).hexdigest(),
+        )
+
+    def _validate_stored_operation(
+        self,
+        *,
+        token_digest: str,
+        operation: ProviderOperationIdentity,
+        request: OpenAIModelRequest,
+    ) -> None:
+        try:
+            grant = _grant_from_document(self._state.load_grant(token_digest))
+            runner_request_digest, grant_digest = self._state.load_provider_binding(token_digest)
+        except LiveGatewayStateError as error:
+            raise LiveGatewayAuthorityError(error.code) from error
+        expected_request = grant.identity.model_request_digest(
+            subject=grant.actual.subject,
+            task=grant.task,
+            policy=grant.policy,
+            seed=grant.actual.seed,
+            attempt=grant.actual.attempt,
+        )
+        input_bytes = request.input.encode("utf-8")
+        expected_runner_binding = runner_request_digest or grant.actual.execution_context_digest
+        if (
+            operation.grant_digest != grant_digest
+            or operation.runner_binding_digest != expected_runner_binding
+            or operation.runner_binding_kind
+            != ("runner_request" if runner_request_digest is not None else "execution_context")
+            or operation.request_digest != request.request_digest
+            or operation.request_digest != expected_request
+            or operation.model != grant.actual.model
+            or operation.attempt != grant.actual.attempt
+            or operation.immutable_inputs_digest != hashlib.sha256(request.to_bytes()).hexdigest()
+            or len(input_bytes) != grant.task.input_size
+            or hashlib.sha256(input_bytes).hexdigest() != grant.task.input_digest
+        ):
+            raise LiveGatewayAuthorityError("live_gateway_provider_operation_binding_invalid")
+
+    def _verified_reconciliation_receipt(
+        self,
+        *,
+        receipt: object,
+        operation: ProviderOperationIdentity,
+        request: OpenAIModelRequest,
+    ) -> ProviderReconciliationReceipt:
+        verifier = getattr(self._gateway, "verify_provider_reconciliation", None)
+        try:
+            verified = callable(verifier) and verifier(receipt, operation)
+        except Exception:
+            verified = False
+        if (
+            type(receipt) is not ProviderReconciliationReceipt
+            or not verified
+            or receipt.operation_digest != operation.digest
+            or receipt.request_digest != request.request_digest
+        ):
+            raise LiveGatewayAuthorityError("live_gateway_provider_reconciliation_invalid")
+        return receipt
+
+    def reconcile_expired_provider_operations(self) -> tuple[str, ...]:
+        """Advance expired ambiguous creates only from authenticated provider receipts."""
+        observed_at = self._now_epoch()
+        reconciliation_id = hashlib.sha256(
+            canonical_json_bytes(
+                {
+                    "boot_id": self._claim_holder[0],
+                    "domain": "carl.live-gateway-provider-reconciliation.v1",
+                    "observed_at": observed_at,
+                    "process_id": self._claim_holder[1],
+                    "process_start": self._claim_holder[2],
+                }
+            )
+        ).hexdigest()
+        try:
+            claims = self._state.claim_provider_reconciliations(
+                observed_at=observed_at,
+                claim_id=reconciliation_id,
+                current_boot_id=self._claim_holder[0],
+                process_id=self._claim_holder[1],
+                process_start=self._claim_holder[2],
+                expires_at=observed_at + _CLAIM_LEASE_SECONDS,
+                process_identity=self._process_identity,
+            )
+        except LiveGatewayStateError as error:
+            raise LiveGatewayAuthorityError(error.code) from error
+        advanced: list[str] = []
+        for claim in claims:
+            token_digest = claim["token_digest"]
+            claim_id = claim["claim_id"]
+            try:
+                operation = ProviderOperationIdentity.from_canonical_dict(claim["operation"])
+                request = OpenAIModelRequest.from_bytes(canonical_json_bytes(claim["request"]))
+                self._validate_stored_operation(
+                    token_digest=token_digest,
+                    operation=operation,
+                    request=request,
+                )
+                capability = self._provider_capability()
+                if capability is None or not self._capability_matches_operation(
+                    capability, operation
+                ):
+                    raise LiveGatewayAuthorityError(
+                        "live_gateway_provider_reconciliation_unsupported"
+                    )
+                reconciler = getattr(self._gateway, "reconcile_provider_operation", None)
+                if not callable(reconciler):
+                    raise LiveGatewayAuthorityError(
+                        "live_gateway_provider_reconciliation_unsupported"
+                    )
+                receipt = self._verified_reconciliation_receipt(
+                    receipt=reconciler(request, operation),
+                    operation=operation,
+                    request=request,
+                )
+                receipt_document = _receipt_document(receipt)
+                if receipt.status == "completed":
+                    result = receipt.result
+                    try:
+                        protected = type(
+                            result
+                        ) is ProtectedOpenAIModelResult and self._gateway.verify_protected_result(
+                            result
+                        )
+                    except Exception:
+                        protected = False
+                    if not protected or result.request_digest != request.request_digest:
+                        raise LiveGatewayAuthorityError(
+                            "live_gateway_provider_reconciliation_invalid"
+                        )
+                    self._state.complete_provider_reconciliation(
+                        token_digest,
+                        claim_id,
+                        result=_result_document(result),
+                        receipt=receipt_document,
+                    )
+                elif receipt.status == "not_executed":
+                    if not self._state.authorize_provider_retry(
+                        token_digest,
+                        claim_id,
+                        receipt=receipt_document,
+                        dispatched_at=observed_at,
+                        expires_at=observed_at + _CLAIM_LEASE_SECONDS,
+                    ):
+                        advanced.append(token_digest)
+                        continue
+                    dispatcher = getattr(self._gateway, "dispatch_reconciled", None)
+                    if not callable(dispatcher):
+                        raise LiveGatewayAuthorityError(
+                            "live_gateway_provider_reconciliation_unsupported"
+                        )
+                    try:
+                        result = dispatcher(request, operation)
+                        verified = self._gateway.verify_protected_result(result)
+                    except OpenAIGatewayError:
+                        self._mark_dispatch_ambiguous(token_digest, claim_id)
+                        advanced.append(token_digest)
+                        continue
+                    except Exception:
+                        self._mark_dispatch_ambiguous(token_digest, claim_id)
+                        advanced.append(token_digest)
+                        continue
+                    if type(result) is not ProtectedOpenAIModelResult or not verified:
+                        self._mark_dispatch_ambiguous(token_digest, claim_id)
+                        advanced.append(token_digest)
+                        continue
+                    self._state.complete_result(
+                        token_digest,
+                        claim_id,
+                        _result_document(result),
+                    )
+                else:
+                    if claim["reconciliation_count"] >= 3:
+                        raise LiveGatewayAuthorityError(
+                            "live_gateway_provider_reconciliation_exhausted"
+                        )
+                    self._state.defer_provider_reconciliation(
+                        token_digest,
+                        claim_id,
+                        receipt=receipt_document,
+                        code="gateway_provider_reconciliation_pending",
+                        retry_at=observed_at + _CLAIM_LEASE_SECONDS,
+                    )
+                advanced.append(token_digest)
+            except LiveGatewayAuthorityError as error:
+                try:
+                    self._state.freeze_provider_operation(
+                        token_digest,
+                        claim_id=claim_id,
+                        code=error.code.removeprefix("live_"),
+                    )
+                except LiveGatewayStateError as state_error:
+                    raise LiveGatewayAuthorityError(state_error.code) from state_error
+                advanced.append(token_digest)
+            except (OpenAIGatewayError, LiveGatewayStateError) as error:
+                code = getattr(error, "code", "live_gateway_provider_reconciliation_invalid")
+                try:
+                    if claim["reconciliation_count"] >= 3:
+                        self._state.freeze_provider_operation(
+                            token_digest,
+                            claim_id=claim_id,
+                            code="gateway_provider_reconciliation_exhausted",
+                        )
+                    else:
+                        self._state.defer_provider_reconciliation(
+                            token_digest,
+                            claim_id,
+                            receipt=None,
+                            code=code.removeprefix("live_"),
+                            retry_at=observed_at + _CLAIM_LEASE_SECONDS,
+                        )
+                except LiveGatewayStateError as state_error:
+                    raise LiveGatewayAuthorityError(state_error.code) from state_error
+                advanced.append(token_digest)
+        return tuple(advanced)
 
     @staticmethod
     def _expected_actual(
@@ -1075,17 +1503,43 @@ class ProtectedModelGatewayServer:
             raise LiveGatewayAuthorityError(error.code) from error
         if claimed != grant:
             raise LiveGatewayAuthorityError("live_gateway_grant_invalid")
+        capability = self._provider_capability()
+        dispatcher = getattr(self._gateway, "dispatch_reconciled", None)
+        reconciler = getattr(self._gateway, "reconcile_provider_operation", None)
+        verifier = getattr(self._gateway, "verify_provider_reconciliation", None)
+        if (
+            capability is None
+            or not callable(dispatcher)
+            or not callable(reconciler)
+            or not callable(verifier)
+        ):
+            try:
+                self._state.freeze_provider_operation(
+                    grant.token_digest,
+                    claim_id=claim_id,
+                    code="gateway_provider_reconciliation_unsupported",
+                )
+            except LiveGatewayStateError as error:
+                raise LiveGatewayAuthorityError(error.code) from error
+            raise LiveGatewayAuthorityError("live_gateway_provider_reconciliation_unsupported")
+        operation = self._operation_identity(
+            grant=grant,
+            request=request,
+            capability=capability,
+        )
         try:
             self._state.mark_provider_dispatched(
                 grant.token_digest,
                 claim_id,
                 request_digest=request.request_digest,
+                operation=operation.to_canonical_dict(),
+                request=_request_document(request),
                 dispatched_at=self._now_epoch(),
             )
         except LiveGatewayStateError as error:
             raise LiveGatewayAuthorityError(error.code) from error
         try:
-            result = self._gateway.evaluate(request)
+            result = dispatcher(request, operation)
             verified = self._gateway.verify_protected_result(result)
         except OpenAIGatewayError as error:
             self._mark_dispatch_ambiguous(grant.token_digest, claim_id)
@@ -1324,30 +1778,9 @@ class ProtectedModelGatewayServer:
         return result
 
     def reconcile_provider_result(self, token: str, result: ProtectedOpenAIModelResult) -> None:
-        """Complete an ambiguous dispatch only from its exact authenticated provider result."""
-        grant = self._grant(token)
-        if type(result) is not ProtectedOpenAIModelResult:
-            raise LiveGatewayAuthorityError("live_model_provenance_invalid")
-        expected_request = grant.identity.model_request_digest(
-            subject=grant.actual.subject,
-            task=grant.task,
-            policy=grant.policy,
-            seed=grant.actual.seed,
-            attempt=grant.actual.attempt,
-        )
-        try:
-            verified = self._gateway.verify_protected_result(result)
-        except Exception as error:
-            raise LiveGatewayAuthorityError("live_model_provenance_invalid") from error
-        if not verified or result.request_digest != expected_request:
-            raise LiveGatewayAuthorityError("live_gateway_result_conflict")
-        try:
-            self._state.reconcile_dispatched_result(
-                grant.token_digest,
-                _result_document(result),
-            )
-        except LiveGatewayStateError as error:
-            raise LiveGatewayAuthorityError(error.code) from error
+        """Reject result-only repair; recovery requires a protected durable receipt."""
+        del token, result
+        raise LiveGatewayAuthorityError("live_gateway_provider_receipt_required")
 
     def record_infrastructure_invalid(self, token: str, code: str) -> None:
         grant = self._grant(token)

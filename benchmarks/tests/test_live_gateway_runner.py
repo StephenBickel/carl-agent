@@ -35,6 +35,8 @@ from carl_bench.openai_gateway import (
     OpenAIModelRequest,
     OpenAIUsage,
     ProtectedOpenAIModelResult,
+    ProviderReconciliationCapability,
+    ProviderReconciliationReceipt,
 )
 
 
@@ -43,6 +45,9 @@ def _digest(value: str) -> str:
 
 
 class _Gateway:
+    def __init__(self) -> None:
+        self.operation_results: dict[str, ProtectedOpenAIModelResult] = {}
+
     def protected_execution_policy(self) -> dict[str, str]:
         return {
             "model": "gpt-5.2",
@@ -65,6 +70,39 @@ class _Gateway:
 
     def verify_protected_result(self, result: object) -> bool:
         return type(result) is ProtectedOpenAIModelResult
+
+    def provider_reconciliation_capability(self) -> ProviderReconciliationCapability:
+        return ProviderReconciliationCapability(
+            provider="openai-responses-webhook",
+            project_digest=_digest("runner-provider-project"),
+            protocol_revision="durable-webhook-receipt-v1",
+            receipt_authority_digest=_digest("runner-receipt-authority"),
+        )
+
+    def dispatch_reconciled(
+        self, request: OpenAIModelRequest, operation: object
+    ) -> ProtectedOpenAIModelResult:
+        result = self.evaluate(request)
+        self.operation_results[operation.digest] = result
+        return result
+
+    def reconcile_provider_operation(
+        self, request: OpenAIModelRequest, operation: object
+    ) -> ProviderReconciliationReceipt:
+        result = self.operation_results.get(operation.digest)
+        return ProviderReconciliationReceipt(
+            operation_digest=operation.digest,
+            request_digest=request.request_digest,
+            status="completed" if result is not None else "pending",
+            receipt_digest=_digest(f"runner-receipt:{operation.digest}"),
+            result=result,
+        )
+
+    def verify_provider_reconciliation(self, receipt: object, operation: object) -> bool:
+        return (
+            type(receipt) is ProviderReconciliationReceipt
+            and receipt.operation_digest == operation.digest
+        )
 
 
 def _checkout(
@@ -691,6 +729,7 @@ def test_runner_resumes_completed_provider_result_after_preseal_crash_without_re
 
     class CountingGateway(_Gateway):
         def __init__(self) -> None:
+            super().__init__()
             self.calls = 0
 
         def evaluate(self, request: OpenAIModelRequest) -> ProtectedOpenAIModelResult:
@@ -1233,6 +1272,48 @@ def test_gateway_listener_thread_failure_is_fatal_to_service(
         monitor.check()
 
     assert isinstance(raised.value.__cause__, RuntimeError)
+
+
+def test_provider_reconciler_advances_expired_claims_without_runner_request() -> None:
+    from carl_bench import live_gateway_service
+
+    called = threading.Event()
+
+    class Server:
+        def reconcile_expired_provider_operations(self) -> tuple[str, ...]:
+            called.set()
+            return (_digest("expired-provider-operation"),)
+
+    monitor = live_gateway_service._start_provider_reconciler(
+        server=Server(), interval_seconds=0.01
+    )
+    try:
+        assert called.wait(1)
+        monitor.check()
+    finally:
+        monitor.close()
+
+
+def test_provider_reconciler_failure_is_service_fatal() -> None:
+    from carl_bench import live_gateway_service
+
+    failed = threading.Event()
+
+    class Server:
+        def reconcile_expired_provider_operations(self) -> tuple[str, ...]:
+            failed.set()
+            raise RuntimeError("reconciliation-state-unavailable")
+
+    monitor = live_gateway_service._start_provider_reconciler(
+        server=Server(), interval_seconds=0.01
+    )
+    try:
+        assert failed.wait(1)
+        monitor.thread.join(1)
+        with pytest.raises(RuntimeError, match="live_gateway_reconciler_failed"):
+            monitor.check()
+    finally:
+        monitor.close()
 
 
 def test_runner_listener_failure_interrupts_an_inflight_worker_promptly(

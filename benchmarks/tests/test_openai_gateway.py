@@ -334,6 +334,14 @@ def test_protected_construction_reads_only_controller_api_key_and_redacts_errors
         OpenAIModelGateway.from_protected_environment()
 
 
+def test_direct_responses_client_declares_provider_reconciliation_unsupported(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gateway = _gateway(monkeypatch, FakeTransport([]))
+
+    assert gateway.provider_reconciliation_capability() is None
+
+
 def test_exact_protected_responses_request_and_recorded_attestation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -383,6 +391,7 @@ def test_exact_protected_responses_request_and_recorded_attestation(
             "timeout_seconds": 30.0,
         }
     ]
+    assert "Idempotency-Key" not in transport.calls[0]["headers"]  # type: ignore[operator]
     assert result.response_id == "resp_0123456789abcdef"
     assert result.model == MODEL
     assert result.status == "completed"

@@ -248,6 +248,138 @@ class ProtectedOpenAIModelResult(OpenAIModelResult):
 
 
 @dataclass(frozen=True, slots=True)
+class ProviderReconciliationCapability:
+    """Protected adapter contract for durable provider-side outcome recovery."""
+
+    provider: str
+    project_digest: str
+    protocol_revision: str
+    receipt_authority_digest: str
+
+    def __post_init__(self) -> None:
+        if (
+            _IDENTIFIER_RE.fullmatch(self.provider) is None
+            or _IDENTIFIER_RE.fullmatch(self.protocol_revision) is None
+            or _DIGEST_RE.fullmatch(self.project_digest) is None
+            or _DIGEST_RE.fullmatch(self.receipt_authority_digest) is None
+        ):
+            raise OpenAIGatewayError("openai_reconciliation_capability_invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderOperationIdentity:
+    """Immutable identity registered before a reconciliable provider create."""
+
+    provider: str
+    project_digest: str
+    protocol_revision: str
+    receipt_authority_digest: str
+    grant_digest: str
+    runner_binding_digest: str
+    runner_binding_kind: str
+    request_digest: str
+    model: str
+    attempt: int
+    immutable_inputs_digest: str
+    digest: str = ""
+
+    def __post_init__(self) -> None:
+        if (
+            _IDENTIFIER_RE.fullmatch(self.provider) is None
+            or _IDENTIFIER_RE.fullmatch(self.protocol_revision) is None
+            or _IDENTIFIER_RE.fullmatch(self.model) is None
+            or self.runner_binding_kind not in {"runner_request", "execution_context"}
+            or isinstance(self.attempt, bool)
+            or not isinstance(self.attempt, int)
+            or not 1 <= self.attempt <= 3
+        ):
+            raise OpenAIGatewayError("openai_provider_operation_invalid")
+        for value in (
+            self.project_digest,
+            self.receipt_authority_digest,
+            self.grant_digest,
+            self.runner_binding_digest,
+            self.request_digest,
+            self.immutable_inputs_digest,
+        ):
+            if _DIGEST_RE.fullmatch(value) is None:
+                raise OpenAIGatewayError("openai_provider_operation_invalid")
+        expected = hashlib.sha256(canonical_json_bytes(self.binding_dict())).hexdigest()
+        if self.digest and self.digest != expected:
+            raise OpenAIGatewayError("openai_provider_operation_invalid")
+        object.__setattr__(self, "digest", expected)
+
+    def binding_dict(self) -> dict[str, object]:
+        return {
+            "attempt": self.attempt,
+            "grant_digest": self.grant_digest,
+            "immutable_inputs_digest": self.immutable_inputs_digest,
+            "model": self.model,
+            "project_digest": self.project_digest,
+            "protocol_revision": self.protocol_revision,
+            "provider": self.provider,
+            "receipt_authority_digest": self.receipt_authority_digest,
+            "request_digest": self.request_digest,
+            "runner_binding_digest": self.runner_binding_digest,
+            "runner_binding_kind": self.runner_binding_kind,
+            "schema_version": 1,
+        }
+
+    def to_canonical_dict(self) -> dict[str, object]:
+        return {**self.binding_dict(), "digest": self.digest}
+
+    @classmethod
+    def from_canonical_dict(cls, value: object) -> ProviderOperationIdentity:
+        if (
+            type(value) is not dict
+            or set(value)
+            != {
+                "attempt",
+                "digest",
+                "grant_digest",
+                "immutable_inputs_digest",
+                "model",
+                "project_digest",
+                "protocol_revision",
+                "provider",
+                "receipt_authority_digest",
+                "request_digest",
+                "runner_binding_digest",
+                "runner_binding_kind",
+                "schema_version",
+            }
+            or value.get("schema_version") != 1
+        ):
+            raise OpenAIGatewayError("openai_provider_operation_invalid")
+        try:
+            return cls(**{key: item for key, item in value.items() if key != "schema_version"})
+        except TypeError:
+            raise OpenAIGatewayError("openai_provider_operation_invalid") from None
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderReconciliationReceipt:
+    """Authenticated receipt returned by a commissioned reconciliation adapter."""
+
+    operation_digest: str
+    request_digest: str
+    status: str
+    receipt_digest: str
+    result: ProtectedOpenAIModelResult | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            _DIGEST_RE.fullmatch(self.operation_digest) is None
+            or _DIGEST_RE.fullmatch(self.request_digest) is None
+            or _DIGEST_RE.fullmatch(self.receipt_digest) is None
+            or self.status not in {"completed", "not_executed", "pending"}
+            or (self.status == "completed") != (type(self.result) is ProtectedOpenAIModelResult)
+            or (self.result is not None and self.result.request_digest != self.request_digest)
+        ):
+            raise OpenAIGatewayError("openai_reconciliation_receipt_invalid")
+
+
+@dataclass(frozen=True, slots=True)
 class SyntheticOpenAIModelResult(OpenAIModelResult):
     """Untrusted result produced by an injected transport."""
 
@@ -675,6 +807,10 @@ class OpenAIModelGateway:
             "policy_revision": _POLICY_REVISION,
             "reasoning_policy": "medium/no-summary",
         }
+
+    def provider_reconciliation_capability(self) -> None:
+        """The direct Responses client has no trustworthy create reconciliation protocol."""
+        return None
 
     @staticmethod
     def _result_provenance_payload(value: dict[str, Any]) -> bytes:

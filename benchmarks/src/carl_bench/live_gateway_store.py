@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sqlite3
@@ -151,6 +152,11 @@ class SQLiteLiveGatewayStateStore:
                     claim_started_at INTEGER,
                     claim_expires_at INTEGER,
                     provider_request_digest TEXT,
+                    provider_operation_json TEXT,
+                    provider_request_json TEXT,
+                    provider_reconciliation_receipt_json TEXT,
+                    provider_retry_count INTEGER NOT NULL DEFAULT 0,
+                    provider_reconciliation_count INTEGER NOT NULL DEFAULT 0,
                     dispatched_at INTEGER,
                     runner_request_digest TEXT UNIQUE,
                     runner_context_json TEXT,
@@ -168,6 +174,11 @@ class SQLiteLiveGatewayStateStore:
                 "claim_started_at": "INTEGER",
                 "claim_expires_at": "INTEGER",
                 "provider_request_digest": "TEXT",
+                "provider_operation_json": "TEXT",
+                "provider_request_json": "TEXT",
+                "provider_reconciliation_receipt_json": "TEXT",
+                "provider_retry_count": "INTEGER NOT NULL DEFAULT 0",
+                "provider_reconciliation_count": "INTEGER NOT NULL DEFAULT 0",
                 "dispatched_at": "INTEGER",
                 "runner_request_digest": "TEXT",
                 "runner_context_json": "TEXT",
@@ -283,6 +294,26 @@ class SQLiteLiveGatewayStateStore:
         finally:
             connection.close()
 
+    def load_provider_binding(self, token_digest: str) -> tuple[str | None, str]:
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                """SELECT runner_request_digest, grant_json FROM gateway_grants
+                   WHERE token_digest = ?""",
+                (token_digest,),
+            ).fetchone()
+            if row is None:
+                raise LiveGatewayStateError("live_gateway_capability_invalid")
+            grant = _decode(row["grant_json"], "live_gateway_grant_invalid")
+            grant_digest = hashlib.sha256(canonical_json_bytes(grant)).hexdigest()
+            return row["runner_request_digest"], grant_digest
+        except LiveGatewayStateError:
+            raise
+        except sqlite3.Error as error:
+            raise LiveGatewayStateError("live_gateway_state_unavailable") from error
+        finally:
+            connection.close()
+
     def claim_grant(
         self,
         token_digest: str,
@@ -342,16 +373,36 @@ class SQLiteLiveGatewayStateStore:
         claim_id: str,
         *,
         request_digest: str,
+        operation: dict[str, Any] | None = None,
+        request: dict[str, Any] | None = None,
         dispatched_at: int,
     ) -> None:
+        operation_payload = (
+            None
+            if operation is None
+            else _canonical_text(operation, "live_gateway_provider_operation_invalid")
+        )
+        request_payload = (
+            None
+            if request is None
+            else _canonical_text(request, "live_gateway_provider_operation_invalid")
+        )
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
             updated = connection.execute(
                 """UPDATE gateway_grants
-                   SET claim_state = 'dispatched', provider_request_digest = ?, dispatched_at = ?
+                   SET claim_state = 'dispatched', provider_request_digest = ?,
+                       provider_operation_json = ?, provider_request_json = ?, dispatched_at = ?
                    WHERE token_digest = ? AND claim_state = 'pre_dispatch' AND claim_id = ?""",
-                (request_digest, dispatched_at, token_digest, claim_id),
+                (
+                    request_digest,
+                    operation_payload,
+                    request_payload,
+                    dispatched_at,
+                    token_digest,
+                    claim_id,
+                ),
             )
             if updated.rowcount != 1:
                 raise LiveGatewayStateError("live_gateway_capability_invalid")
@@ -426,28 +477,258 @@ class SQLiteLiveGatewayStateStore:
         finally:
             connection.close()
 
-    def reconcile_dispatched_result(self, token_digest: str, result: dict[str, Any]) -> None:
-        payload = _canonical_text(result, "live_gateway_result_invalid")
+    def claim_provider_reconciliations(
+        self,
+        *,
+        observed_at: int,
+        claim_id: str,
+        current_boot_id: str,
+        process_id: int,
+        process_start: str,
+        expires_at: int,
+        process_identity: Callable[[int], str | None],
+    ) -> tuple[dict[str, Any], ...]:
+        connection = self._connect()
+        claimed: list[dict[str, Any]] = []
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            rows = connection.execute(
+                """SELECT token_digest, claim_state, claim_boot_id, claim_pid,
+                          claim_process_start, claim_expires_at, provider_operation_json,
+                          provider_request_json, provider_retry_count,
+                          provider_reconciliation_count
+                   FROM gateway_grants
+                   WHERE claim_state IN ('dispatch_ambiguous', 'reconciling')
+                         AND claim_expires_at <= ?
+                   ORDER BY token_digest""",
+                (observed_at,),
+            ).fetchall()
+            for row in rows:
+                if row["claim_state"] == "reconciling":
+                    alive = (
+                        process_identity(row["claim_pid"])
+                        if row["claim_boot_id"] == current_boot_id
+                        else None
+                    )
+                    if alive == row["claim_process_start"]:
+                        continue
+                if row["provider_operation_json"] is None or row["provider_request_json"] is None:
+                    connection.execute(
+                        """UPDATE gateway_grants
+                           SET claim_state = 'invalid',
+                               infrastructure_code = 'gateway_provider_operation_missing'
+                           WHERE token_digest = ?""",
+                        (row["token_digest"],),
+                    )
+                    continue
+                updated = connection.execute(
+                    """UPDATE gateway_grants
+                       SET claim_state = 'reconciling', claim_id = ?, claim_boot_id = ?,
+                           claim_pid = ?, claim_process_start = ?, claim_started_at = ?,
+                           claim_expires_at = ?, provider_reconciliation_count =
+                               provider_reconciliation_count + 1
+                       WHERE token_digest = ? AND claim_state = ? AND claim_expires_at <= ?""",
+                    (
+                        claim_id,
+                        current_boot_id,
+                        process_id,
+                        process_start,
+                        observed_at,
+                        expires_at,
+                        row["token_digest"],
+                        row["claim_state"],
+                        observed_at,
+                    ),
+                )
+                if updated.rowcount != 1:
+                    continue
+                claimed.append(
+                    {
+                        "claim_id": claim_id,
+                        "operation": _decode(
+                            row["provider_operation_json"],
+                            "live_gateway_provider_operation_invalid",
+                        ),
+                        "request": _decode(
+                            row["provider_request_json"],
+                            "live_gateway_provider_operation_invalid",
+                        ),
+                        "retry_count": row["provider_retry_count"],
+                        "reconciliation_count": row["provider_reconciliation_count"] + 1,
+                        "token_digest": row["token_digest"],
+                    }
+                )
+            connection.commit()
+            return tuple(claimed)
+        except Exception as error:
+            connection.rollback()
+            if isinstance(error, LiveGatewayStateError):
+                raise
+            raise LiveGatewayStateError("live_gateway_state_unavailable") from error
+        finally:
+            connection.close()
+
+    def complete_provider_reconciliation(
+        self,
+        token_digest: str,
+        claim_id: str,
+        *,
+        result: dict[str, Any],
+        receipt: dict[str, Any],
+    ) -> None:
+        result_payload = _canonical_text(result, "live_gateway_result_invalid")
+        receipt_payload = _canonical_text(receipt, "live_gateway_provider_reconciliation_invalid")
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
-                """SELECT claim_state, provider_request_digest, result_json
-                   FROM gateway_grants WHERE token_digest = ?""",
-                (token_digest,),
+                """SELECT provider_request_digest FROM gateway_grants
+                   WHERE token_digest = ? AND claim_state = 'reconciling' AND claim_id = ?""",
+                (token_digest, claim_id),
             ).fetchone()
-            if row is None or row["claim_state"] != "dispatch_ambiguous":
-                raise LiveGatewayStateError("live_gateway_reconciliation_not_authorized")
-            if (
-                row["result_json"] is not None
-                or result.get("request_digest") != row["provider_request_digest"]
-            ):
+            if row is None or result.get("request_digest") != row["provider_request_digest"]:
                 raise LiveGatewayStateError("live_gateway_result_conflict")
             connection.execute(
                 """UPDATE gateway_grants
-                   SET result_json = ?, claim_state = 'completed', infrastructure_code = NULL
-                   WHERE token_digest = ? AND claim_state = 'dispatch_ambiguous'""",
-                (payload, token_digest),
+                   SET result_json = ?, provider_reconciliation_receipt_json = ?,
+                       claim_state = 'completed', infrastructure_code = NULL
+                   WHERE token_digest = ? AND claim_state = 'reconciling' AND claim_id = ?""",
+                (result_payload, receipt_payload, token_digest, claim_id),
+            )
+            connection.commit()
+        except LiveGatewayStateError:
+            connection.rollback()
+            raise
+        except sqlite3.Error as error:
+            connection.rollback()
+            raise LiveGatewayStateError("live_gateway_state_unavailable") from error
+        finally:
+            connection.close()
+
+    def authorize_provider_retry(
+        self,
+        token_digest: str,
+        claim_id: str,
+        *,
+        receipt: dict[str, Any],
+        dispatched_at: int,
+        expires_at: int,
+    ) -> bool:
+        receipt_payload = _canonical_text(receipt, "live_gateway_provider_reconciliation_invalid")
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """SELECT provider_retry_count FROM gateway_grants
+                   WHERE token_digest = ? AND claim_state = 'reconciling' AND claim_id = ?""",
+                (token_digest, claim_id),
+            ).fetchone()
+            if row is None:
+                raise LiveGatewayStateError("live_gateway_reconciliation_not_authorized")
+            if row["provider_retry_count"] >= 1:
+                connection.execute(
+                    """UPDATE gateway_grants
+                       SET claim_state = 'invalid',
+                           infrastructure_code = 'gateway_provider_retry_exhausted',
+                           provider_reconciliation_receipt_json = ?
+                       WHERE token_digest = ?""",
+                    (receipt_payload, token_digest),
+                )
+                connection.commit()
+                return False
+            connection.execute(
+                """UPDATE gateway_grants
+                   SET claim_state = 'dispatched', provider_retry_count = 1,
+                       provider_reconciliation_receipt_json = ?, dispatched_at = ?,
+                       claim_expires_at = ?, infrastructure_code = NULL
+                   WHERE token_digest = ? AND claim_state = 'reconciling' AND claim_id = ?""",
+                (
+                    receipt_payload,
+                    dispatched_at,
+                    expires_at,
+                    token_digest,
+                    claim_id,
+                ),
+            )
+            connection.commit()
+            return True
+        except LiveGatewayStateError:
+            connection.rollback()
+            raise
+        except sqlite3.Error as error:
+            connection.rollback()
+            raise LiveGatewayStateError("live_gateway_state_unavailable") from error
+        finally:
+            connection.close()
+
+    def defer_provider_reconciliation(
+        self,
+        token_digest: str,
+        claim_id: str,
+        *,
+        receipt: dict[str, Any] | None,
+        code: str,
+        retry_at: int,
+    ) -> None:
+        receipt_payload = (
+            None
+            if receipt is None
+            else _canonical_text(receipt, "live_gateway_provider_reconciliation_invalid")
+        )
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            updated = connection.execute(
+                """UPDATE gateway_grants
+                   SET claim_state = 'dispatch_ambiguous', infrastructure_code = ?,
+                       provider_reconciliation_receipt_json = COALESCE(?,
+                           provider_reconciliation_receipt_json), claim_expires_at = ?
+                   WHERE token_digest = ? AND claim_state = 'reconciling' AND claim_id = ?""",
+                (code, receipt_payload, retry_at, token_digest, claim_id),
+            )
+            if updated.rowcount != 1:
+                raise LiveGatewayStateError("live_gateway_reconciliation_not_authorized")
+            connection.commit()
+        except LiveGatewayStateError:
+            connection.rollback()
+            raise
+        except sqlite3.Error as error:
+            connection.rollback()
+            raise LiveGatewayStateError("live_gateway_state_unavailable") from error
+        finally:
+            connection.close()
+
+    def freeze_provider_operation(
+        self,
+        token_digest: str,
+        *,
+        code: str,
+        receipt: dict[str, Any] | None = None,
+        claim_id: str | None = None,
+    ) -> None:
+        receipt_payload = (
+            None
+            if receipt is None
+            else _canonical_text(receipt, "live_gateway_provider_reconciliation_invalid")
+        )
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT claim_state, claim_id FROM gateway_grants WHERE token_digest = ?",
+                (token_digest,),
+            ).fetchone()
+            if row is None or row["claim_state"] == "completed":
+                raise LiveGatewayStateError("live_gateway_reconciliation_not_authorized")
+            if claim_id is not None and row["claim_id"] != claim_id:
+                raise LiveGatewayStateError("live_gateway_reconciliation_not_authorized")
+            connection.execute(
+                """UPDATE gateway_grants
+                   SET consumed = 1, claim_state = 'invalid', infrastructure_code = ?,
+                       provider_reconciliation_receipt_json = COALESCE(?,
+                           provider_reconciliation_receipt_json)
+                   WHERE token_digest = ?""",
+                (code, receipt_payload, token_digest),
             )
             connection.commit()
         except LiveGatewayStateError:

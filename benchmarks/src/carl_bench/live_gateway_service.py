@@ -29,6 +29,63 @@ class _GatewayListenerMonitor:
             raise RuntimeError("live_gateway_listener_failed")
 
 
+@dataclass(slots=True)
+class _ProviderReconciliationMonitor:
+    thread: threading.Thread
+    failed: threading.Event
+    stop: threading.Event
+    _errors: list[BaseException] = field(repr=False)
+
+    def check(self) -> None:
+        if self.failed.is_set() or not self.thread.is_alive():
+            error = self._errors[0] if self._errors else None
+            raise RuntimeError("live_gateway_reconciler_failed") from error
+
+    def close(self) -> None:
+        self.stop.set()
+        self.thread.join(5)
+        if self.thread.is_alive():
+            raise RuntimeError("live_gateway_reconciler_stop_failed")
+
+
+def _start_provider_reconciler(
+    *, server: object, interval_seconds: float = 5.0
+) -> _ProviderReconciliationMonitor:
+    reconcile = getattr(server, "reconcile_expired_provider_operations", None)
+    if (
+        not callable(reconcile)
+        or isinstance(interval_seconds, bool)
+        or not isinstance(interval_seconds, int | float)
+        or not 0 < interval_seconds <= 60
+    ):
+        raise RuntimeError("live_gateway_reconciler_configuration_invalid")
+    failed = threading.Event()
+    stop = threading.Event()
+    errors: list[BaseException] = []
+
+    def run() -> None:
+        while not stop.wait(float(interval_seconds)):
+            try:
+                reconcile()
+            except BaseException as error:
+                errors.append(error)
+                failed.set()
+                return
+
+    thread = threading.Thread(
+        target=run,
+        daemon=True,
+        name="carl-live-provider-reconciler",
+    )
+    thread.start()
+    return _ProviderReconciliationMonitor(
+        thread=thread,
+        failed=failed,
+        stop=stop,
+        _errors=errors,
+    )
+
+
 def _start_gateway_listener(*, listener_fd: int, server: object) -> _GatewayListenerMonitor:
     failed = threading.Event()
     errors: list[BaseException] = []
@@ -85,13 +142,22 @@ def main() -> int:
         listener_fd=gateway_descriptor,
         server=runner.gateway_server,
     )
-    with _runner_listener(runner_descriptor) as listener:
-        _serve_runner_listener(
-            listener=listener,
-            allowed_client_uid=0,
-            runner=runner,
-            health_check=gateway_monitor.check,
-        )
+    reconciliation_monitor = _start_provider_reconciler(server=runner.gateway_server)
+
+    def health_check() -> None:
+        gateway_monitor.check()
+        reconciliation_monitor.check()
+
+    try:
+        with _runner_listener(runner_descriptor) as listener:
+            _serve_runner_listener(
+                listener=listener,
+                allowed_client_uid=0,
+                runner=runner,
+                health_check=health_check,
+            )
+    finally:
+        reconciliation_monitor.close()
     return 0
 
 
