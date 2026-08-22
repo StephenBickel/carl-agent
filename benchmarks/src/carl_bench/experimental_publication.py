@@ -9,6 +9,7 @@ import os
 import re
 import stat
 import subprocess
+import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -457,24 +458,36 @@ class _ProtectedGitTransport:
         finally:
             os.close(descriptor)
 
-    def _command(self, *args: str) -> str:
+    def _command(
+        self,
+        *args: str,
+        git_dir: Path | None = None,
+        object_directory: Path | None = None,
+    ) -> str:
         identity, digest = self._read_identity()
         if identity != self._identity or digest != self._digest:
             raise ExperimentalPublicationError("experimental_git_identity_changed")
         environment = {
             "GIT_CONFIG_GLOBAL": "/dev/null",
             "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_SYSTEM": "/dev/null",
             "GIT_TERMINAL_PROMPT": "0",
             "HOME": "/var/empty",
             "LANG": "C",
             "LC_ALL": "C",
             "PATH": "/usr/bin:/bin",
         }
+        if (git_dir is None) != (object_directory is None):
+            raise ExperimentalPublicationError("experimental_git_context_invalid")
+        if git_dir is not None and object_directory is not None:
+            environment["GIT_DIR"] = os.fspath(git_dir)
+            environment["GIT_OBJECT_DIRECTORY"] = os.fspath(object_directory)
         try:
             result = subprocess.run(
                 (os.fspath(_PROTECTED_GIT_EXECUTABLE), *args),
                 check=False,
                 capture_output=True,
+                cwd="/var/empty",
                 env=environment,
                 text=True,
                 timeout=30,
@@ -488,11 +501,22 @@ class _ProtectedGitTransport:
     def local(self, repository: Path, *args: str) -> str:
         return self._command("-C", os.fspath(repository), *args)
 
+    def _object_directory(self, repository: Path) -> Path:
+        raw_path = self.local(
+            repository,
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "objects",
+        )
+        object_directory = Path(raw_path)
+        if not object_directory.is_absolute() or not object_directory.is_dir():
+            raise ExperimentalPublicationError("experimental_git_repository_invalid")
+        return object_directory.resolve()
+
     def network(self, repository: Path, operation: str, remote_url: str, *args: str) -> str:
         if operation not in {"fetch", "ls-remote", "push"}:
             raise ExperimentalPublicationError("experimental_git_operation_invalid")
-        # The exact URL is repeated as a same-to-same longest-prefix rewrite. This prevents a
-        # repository-local url.*.insteadOf rule from replacing the signed destination.
         protected_config = (
             "-c",
             "credential.helper=",
@@ -516,30 +540,56 @@ class _ProtectedGitTransport:
             "http.sslVerify=true",
             "-c",
             f"http.{remote_url}.sslVerify=true",
-            "-c",
-            f"url.{remote_url}.insteadOf={remote_url}",
         )
-        if operation == "ls-remote":
-            return self._command(
-                *protected_config,
-                "-C",
-                os.fspath(repository),
-                operation,
-                "--refs",
-                remote_url,
-                *args,
-            )
         if len(args) != 2:
+            if operation != "ls-remote":
+                raise ExperimentalPublicationError("experimental_git_operation_invalid")
+        elif operation == "ls-remote":
             raise ExperimentalPublicationError("experimental_git_operation_invalid")
-        return self._command(
-            *protected_config,
-            "-C",
-            os.fspath(repository),
-            operation,
-            args[0],
-            remote_url,
-            args[1],
-        )
+        object_directory = self._object_directory(repository)
+        with tempfile.TemporaryDirectory(prefix="carl-protected-git-", dir="/var/tmp") as root:
+            isolated_git_dir = Path(root) / "repository.git"
+            self._command("init", "--bare", os.fspath(isolated_git_dir))
+            if operation == "ls-remote":
+                return self._command(
+                    *protected_config,
+                    operation,
+                    "--refs",
+                    remote_url,
+                    *args,
+                    git_dir=isolated_git_dir,
+                    object_directory=object_directory,
+                )
+            result = self._command(
+                *protected_config,
+                operation,
+                args[0],
+                remote_url,
+                args[1],
+                git_dir=isolated_git_dir,
+                object_directory=object_directory,
+            )
+            if operation == "fetch":
+                refspec = args[1].split(":", 1)
+                if len(refspec) != 2 or not refspec[1].startswith("refs/carl/"):
+                    raise ExperimentalPublicationError("experimental_git_operation_invalid")
+                fetched = self._command(
+                    "rev-parse",
+                    "--verify",
+                    refspec[1],
+                    git_dir=isolated_git_dir,
+                    object_directory=object_directory,
+                )
+                self._command(
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "-C",
+                    os.fspath(repository),
+                    "update-ref",
+                    refspec[1],
+                    fetched,
+                )
+            return result
 
 
 def _protected_git_transport() -> _ProtectedGitTransport:

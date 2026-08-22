@@ -895,25 +895,211 @@ def test_local_remote_aliases_cannot_select_the_publication_destination(tmp_path
         )
 
 
+def test_protected_transport_ignores_equal_length_repository_local_url_rewrite(
+    tmp_path: Path,
+) -> None:
+    repository, intended_remote, parent = _repository(tmp_path)
+    attacker_remote = tmp_path / "attacker.git"
+    subprocess.run(("git", "init", "--bare", os.fspath(attacker_remote)), check=True)
+    marker_ref = "refs/heads/attacker-only"
+    subprocess.run(
+        ("git", "push", os.fspath(attacker_remote), f"{parent}:{marker_ref}"),
+        cwd=repository,
+        check=True,
+    )
+    signed_url = intended_remote.as_uri()
+    subprocess.run(
+        (
+            "git",
+            "config",
+            "--local",
+            f"url.{attacker_remote.as_uri()}.insteadOf",
+            signed_url,
+        ),
+        cwd=repository,
+        check=True,
+    )
+
+    snapshot = experimental_publication._ProtectedGitTransport().network(
+        repository,
+        "ls-remote",
+        signed_url,
+        marker_ref,
+    )
+
+    assert snapshot == ""
+
+
+def test_protected_transport_ignores_worktree_local_url_rewrite(tmp_path: Path) -> None:
+    repository, intended_remote, parent = _repository(tmp_path)
+    attacker_remote = tmp_path / "attacker.git"
+    subprocess.run(("git", "init", "--bare", os.fspath(attacker_remote)), check=True)
+    marker_ref = "refs/heads/attacker-only"
+    subprocess.run(
+        ("git", "push", os.fspath(attacker_remote), f"{parent}:{marker_ref}"),
+        cwd=repository,
+        check=True,
+    )
+    signed_url = intended_remote.as_uri()
+    subprocess.run(
+        ("git", "config", "extensions.worktreeConfig", "true"),
+        cwd=repository,
+        check=True,
+    )
+    subprocess.run(
+        (
+            "git",
+            "config",
+            "--worktree",
+            f"url.{attacker_remote.as_uri()}.insteadOf",
+            signed_url,
+        ),
+        cwd=repository,
+        check=True,
+    )
+
+    snapshot = experimental_publication._ProtectedGitTransport().network(
+        repository,
+        "ls-remote",
+        signed_url,
+        marker_ref,
+    )
+
+    assert snapshot == ""
+
+
+def test_protected_transport_push_ignores_repository_local_url_rewrite(
+    tmp_path: Path,
+) -> None:
+    repository, intended_remote, parent = _repository(tmp_path)
+    attacker_remote = tmp_path / "attacker.git"
+    subprocess.run(("git", "init", "--bare", os.fspath(attacker_remote)), check=True)
+    marker_ref = "refs/heads/intended-only"
+    signed_url = intended_remote.as_uri()
+    subprocess.run(
+        (
+            "git",
+            "config",
+            "--local",
+            f"url.{attacker_remote.as_uri()}.insteadOf",
+            signed_url,
+        ),
+        cwd=repository,
+        check=True,
+    )
+
+    experimental_publication._ProtectedGitTransport().network(
+        repository,
+        "push",
+        signed_url,
+        f"--force-with-lease={marker_ref}:",
+        f"{parent}:{marker_ref}",
+    )
+
+    intended_snapshot = subprocess.run(
+        ("git", "ls-remote", os.fspath(intended_remote), marker_ref),
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    attacker_snapshot = subprocess.run(
+        ("git", "ls-remote", os.fspath(attacker_remote), marker_ref),
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert intended_snapshot.split()[0] == parent
+    assert attacker_snapshot == ""
+
+
+def test_protected_transport_fetch_ignores_repository_local_url_rewrite(
+    tmp_path: Path,
+) -> None:
+    repository, intended_remote, parent = _repository(tmp_path)
+    attacker_remote = tmp_path / "attacker.git"
+    subprocess.run(("git", "init", "--bare", os.fspath(attacker_remote)), check=True)
+    source_ref = "refs/heads/fetch-source"
+    tracking_ref = "refs/carl/fetch-verification"
+    subprocess.run(
+        ("git", "push", os.fspath(intended_remote), f"{parent}:{source_ref}"),
+        cwd=repository,
+        check=True,
+    )
+    candidate_file = repository / "src" / "runtime" / "task" / "value.txt"
+    candidate_file.write_text("attacker\n", encoding="utf-8")
+    subprocess.run(("git", "add", "--all"), cwd=repository, check=True)
+    subprocess.run(("git", "commit", "-m", "attacker object"), cwd=repository, check=True)
+    attacker_commit = subprocess.run(
+        ("git", "rev-parse", "HEAD"),
+        cwd=repository,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    subprocess.run(
+        ("git", "push", os.fspath(attacker_remote), f"{attacker_commit}:{source_ref}"),
+        cwd=repository,
+        check=True,
+    )
+    signed_url = intended_remote.as_uri()
+    subprocess.run(
+        (
+            "git",
+            "config",
+            "--local",
+            f"url.{attacker_remote.as_uri()}.insteadOf",
+            signed_url,
+        ),
+        cwd=repository,
+        check=True,
+    )
+
+    experimental_publication._ProtectedGitTransport().network(
+        repository,
+        "fetch",
+        signed_url,
+        "--no-tags",
+        f"{source_ref}:{tracking_ref}",
+    )
+
+    fetched = subprocess.run(
+        ("git", "rev-parse", tracking_ref),
+        cwd=repository,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert fetched == parent
+
+
 def test_protected_transport_pins_binary_sanitizes_environment_and_passes_exact_url(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    repository, _, _ = _repository(tmp_path)
     monkeypatch.setenv("GIT_EXEC_PATH", os.fspath(tmp_path / "caller-helpers"))
     monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
     monkeypatch.setenv("HTTPS_PROXY", "http://attacker.invalid:8080")
-    invocations: list[tuple[tuple[str, ...], dict[str, str]]] = []
+    object_directory = (repository / ".git" / "objects").resolve()
+    invocations: list[tuple[tuple[str, ...], dict[str, str], str]] = []
 
     class Result:
         returncode = 0
-        stdout = ""
+
+        def __init__(self, stdout: str = "") -> None:
+            self.stdout = stdout
 
     def record(command: tuple[str, ...], **kwargs: object) -> Result:
-        invocations.append((command, kwargs["env"]))  # type: ignore[arg-type]
+        invocations.append(  # type: ignore[arg-type]
+            (command, kwargs["env"], kwargs["cwd"])
+        )
+        if "--git-path" in command:
+            return Result(os.fspath(object_directory))
+        if "--verify" in command:
+            return Result("a" * 40)
         return Result()
 
     transport = experimental_publication._ProtectedGitTransport()
     monkeypatch.setattr(experimental_publication.subprocess, "run", record)
-    repository = tmp_path / "repository"
     transport.network(repository, "ls-remote", CANONICAL_REMOTE_URL, "refs/heads/test")
     transport.network(
         repository,
@@ -930,31 +1116,40 @@ def test_protected_transport_pins_binary_sanitizes_environment_and_passes_exact_
         "refs/heads/test:refs/carl/test",
     )
 
-    assert len(invocations) == 3
-    for command, environment in invocations:
+    network_invocations = [item for item in invocations if CANONICAL_REMOTE_URL in item[0]]
+    assert len(network_invocations) == 3
+    for command, environment, cwd in network_invocations:
         assert command[0] == "/usr/bin/git"
         assert command.count(CANONICAL_REMOTE_URL) == 1
         assert "origin" not in command
         assert "core.hooksPath=/dev/null" in command
-        assert f"url.{CANONICAL_REMOTE_URL}.insteadOf={CANONICAL_REMOTE_URL}" in command
+        assert not any(item.startswith("url.") for item in command)
         assert f"http.{CANONICAL_REMOTE_URL}.proxy=" in command
         assert f"http.{CANONICAL_REMOTE_URL}.curloptResolve=" in command
         assert f"http.{CANONICAL_REMOTE_URL}.sslVerify=true" in command
-        assert environment == {
+        assert environment["GIT_DIR"].startswith("/var/tmp/carl-protected-git-")
+        assert environment["GIT_OBJECT_DIRECTORY"] == os.fspath(object_directory)
+        assert cwd == "/var/empty"
+        assert {
+            key: value
+            for key, value in environment.items()
+            if key not in {"GIT_DIR", "GIT_OBJECT_DIRECTORY"}
+        } == {
             "GIT_CONFIG_GLOBAL": "/dev/null",
             "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_SYSTEM": "/dev/null",
             "GIT_TERMINAL_PROMPT": "0",
             "HOME": "/var/empty",
             "LANG": "C",
             "LC_ALL": "C",
             "PATH": "/usr/bin:/bin",
         }
-    assert invocations[1][0][-3:] == (
+    assert network_invocations[1][0][-3:] == (
         "--force-with-lease=refs/heads/test:",
         CANONICAL_REMOTE_URL,
         "a" * 40 + ":refs/heads/test",
     )
-    assert invocations[2][0][-3:] == (
+    assert network_invocations[2][0][-3:] == (
         "--no-tags",
         CANONICAL_REMOTE_URL,
         "refs/heads/test:refs/carl/test",
