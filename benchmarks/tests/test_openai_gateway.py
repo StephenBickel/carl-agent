@@ -785,5 +785,27 @@ def test_injected_transport_can_only_return_synthetic_provenance(
 
     assert type(result) is synthetic_type
     assert not isinstance(result, protected_type)
+    with pytest.raises(AttributeError):
+        result_gateway = _gateway(
+            monkeypatch,
+            FakeTransport([_http_response(_documented_response())]),
+        )
+        result_gateway._OpenAIModelGateway__protected = True  # type: ignore[attr-defined]
+    second = result_gateway.evaluate(_request())
+    assert type(second) is synthetic_type
+    with pytest.raises(OpenAIGatewayError, match="^openai_gateway_construction_invalid$"):
+        result_gateway.verify_protected_result(second)
     protected_gateway = OpenAIModelGateway.from_protected_environment()
     assert type(protected_gateway) is OpenAIModelGateway
+    forged = protected_type(
+        response_id=second.response_id,
+        model=second.model,
+        status=second.status,
+        usage=second.usage,
+        latency_ms=second.latency_ms,
+        request_digest=second.request_digest,
+        output_digest=second.output_digest,
+        output_text=second.output_text,
+        provenance_tag="0" * 64,
+    )
+    assert protected_gateway.verify_protected_result(forged) is False

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -232,6 +233,8 @@ class OpenAIModelResult:
 class ProtectedOpenAIModelResult(OpenAIModelResult):
     """Result produced only by the fixed protected-environment gateway path."""
 
+    provenance_tag: str
+
 
 @dataclass(frozen=True, slots=True)
 class SyntheticOpenAIModelResult(OpenAIModelResult):
@@ -285,7 +288,7 @@ class _UrllibResponsesTransport:
 class OpenAIModelGateway:
     """Controller-only model boundary with fixed provider policy and transport authority."""
 
-    __slots__ = ("__api_key", "__monotonic", "__protected", "__sleep", "__transport")
+    __slots__ = ("__api_key", "__monotonic", "__sleep", "__transport")
 
     def __new__(cls, *args: object, **kwargs: object) -> OpenAIModelGateway:
         del cls, args, kwargs
@@ -303,12 +306,13 @@ class OpenAIModelGateway:
     @classmethod
     def from_protected_environment(cls) -> OpenAIModelGateway:
         """Construct the fixed production transport from controller-owned environment state."""
+        if cls is not OpenAIModelGateway:
+            raise OpenAIGatewayError("openai_gateway_construction_invalid")
         gateway = object.__new__(cls)
         gateway.__api_key = cls._read_controller_key()
         gateway.__transport = _UrllibResponsesTransport()
         gateway.__monotonic = time.monotonic
         gateway.__sleep = time.sleep
-        gateway.__protected = True
         return gateway
 
     @classmethod
@@ -326,12 +330,11 @@ class OpenAIModelGateway:
             or not callable(sleep)
         ):
             raise OpenAIGatewayError("openai_gateway_construction_invalid")
-        gateway = object.__new__(cls)
+        gateway = object.__new__(_SyntheticOpenAIModelGateway)
         gateway.__api_key = cls._read_controller_key()
         gateway.__transport = transport
         gateway.__monotonic = monotonic
         gateway.__sleep = sleep
-        gateway.__protected = False
         return gateway
 
     def evaluate(self, request: OpenAIModelRequest) -> OpenAIModelResult:
@@ -610,17 +613,53 @@ class OpenAIModelGateway:
         if finished > deadline:
             raise OpenAIGatewayError("openai_response_timeout")
         output_bytes = output_text.encode("utf-8")
-        result_type = ProtectedOpenAIModelResult if self.__protected else SyntheticOpenAIModelResult
-        return result_type(
-            response_id=value["id"],
-            model=value["model"],
-            status=status,
-            usage=usage,
-            latency_ms=round(elapsed * 1000),
-            request_digest=request.request_digest,
-            output_digest=hashlib.sha256(output_bytes).hexdigest(),
-            output_text=output_text,
+        result_fields = {
+            "latency_ms": round(elapsed * 1000),
+            "model": value["model"],
+            "output_digest": hashlib.sha256(output_bytes).hexdigest(),
+            "output_text": output_text,
+            "request_digest": request.request_digest,
+            "response_id": value["id"],
+            "status": status,
+            "usage": usage,
+        }
+        if type(self) is OpenAIModelGateway:
+            provenance_tag = hmac.new(
+                self.__api_key.encode("utf-8"),
+                self._result_provenance_payload(result_fields),
+                hashlib.sha256,
+            ).hexdigest()
+            return ProtectedOpenAIModelResult(**result_fields, provenance_tag=provenance_tag)
+        if type(self) is _SyntheticOpenAIModelGateway:
+            return SyntheticOpenAIModelResult(**result_fields)
+        else:
+            raise OpenAIGatewayError("openai_gateway_construction_invalid")
+
+    @staticmethod
+    def _result_provenance_payload(value: dict[str, Any]) -> bytes:
+        usage = value["usage"]
+        if not isinstance(usage, OpenAIUsage):
+            raise OpenAIGatewayError("openai_result_provenance_invalid")
+        return canonical_json_bytes(
+            {
+                **{name: item for name, item in value.items() if name != "usage"},
+                "usage": {name: getattr(usage, name) for name in usage.__dataclass_fields__},
+            }
         )
+
+    def verify_protected_result(self, result: object) -> bool:
+        """Authenticate protected-live provenance inside the credential-owning controller."""
+        if type(self) is not OpenAIModelGateway:
+            raise OpenAIGatewayError("openai_gateway_construction_invalid")
+        if type(result) is not ProtectedOpenAIModelResult:
+            return False
+        fields = {name: getattr(result, name) for name in OpenAIModelResult.__dataclass_fields__}
+        expected = hmac.new(
+            self.__api_key.encode("utf-8"),
+            self._result_provenance_payload(fields),
+            hashlib.sha256,
+        ).hexdigest()
+        return hmac.compare_digest(result.provenance_tag, expected)
 
     @staticmethod
     def _parse_output(value: object) -> str:
@@ -786,3 +825,9 @@ class OpenAIModelGateway:
         if isinstance(value, bool) or not isinstance(value, int | float):
             raise OpenAIGatewayError("openai_clock_invalid")
         return float(value)
+
+
+class _SyntheticOpenAIModelGateway(OpenAIModelGateway):
+    """Nominal test-only gateway whose exact type can emit only synthetic results."""
+
+    __slots__ = ()
