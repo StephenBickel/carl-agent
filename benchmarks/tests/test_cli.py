@@ -53,6 +53,59 @@ def test_candidate_publish_experimental_command_is_available() -> None:
     assert help_exit.value.code == 0
 
 
+@pytest.mark.parametrize(
+    "subcommand",
+    (
+        "request",
+        "coordinate",
+        "observe",
+        "ingest",
+        "publish-input",
+        "health",
+        "commission-live",
+    ),
+)
+def test_exact_cloud_command_surface_is_available(subcommand: str) -> None:
+    with pytest.raises(SystemExit) as help_exit:
+        cli.main(["cloud", subcommand, "--help"])
+
+    assert help_exit.value.code == 0
+
+
+def test_cloud_command_emits_one_canonical_json_result_without_prose(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    expected = {
+        "action": "idle",
+        "identity": "1" * 64,
+        "reason": "no_ready_node",
+        "schema_version": 1,
+    }
+    monkeypatch.setattr(cli, "run_protected_cloud_command", lambda command: expected)
+
+    assert cli.main(["cloud", "coordinate"]) == 0
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert captured.out == json.dumps(expected, separators=(",", ":"), sort_keys=True) + "\n"
+
+
+def test_missing_cloud_configuration_freezes_only_the_requested_node(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.delenv("CARL_AUTONOMY_POSTGRES_DSN", raising=False)
+    result = cli.main(["cloud", "observe"])
+    captured = capsys.readouterr()
+    value = json.loads(captured.out)
+
+    assert result == 2
+    assert captured.err == ""
+    assert value["action"] == "frozen"
+    assert value["reason"] == "cloud_configuration_unavailable"
+    assert value["node"] == "observe"
+    assert len(value["identity"]) == 64
+    assert "dsn" not in captured.out.casefold()
+
+
 def test_scripted_run_writes_only_sanitized_scorecard(tmp_path: Path) -> None:
     destination = tmp_path / "scorecard.json"
     assert run_scripted(destination) == 0

@@ -38,6 +38,7 @@ from carl_bench.candidate_evidence import (
 )
 from carl_bench.candidate_git import CandidateGitManager, TrustedCheckRegistry
 from carl_bench.canonical import canonical_json_bytes
+from carl_bench.cloud_coordinator import run_protected_cloud_command
 from carl_bench.experiment import (
     EventType,
     ExperimentEvent,
@@ -283,6 +284,19 @@ def _parser() -> argparse.ArgumentParser:
     )
     add_mutation(dispose)
     dispose.add_argument("--public-result", required=True, type=Path)
+
+    cloud = commands.add_parser("cloud", help="advance one protected cloud autonomy node")
+    cloud_commands = cloud.add_subparsers(dest="cloud_command", required=True)
+    for name in (
+        "request",
+        "coordinate",
+        "observe",
+        "ingest",
+        "publish-input",
+        "health",
+        "commission-live",
+    ):
+        cloud_commands.add_parser(name, help=f"run one protected {name} node")
     return parser
 
 
@@ -1377,6 +1391,12 @@ def _validate_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cloud_command(args: argparse.Namespace) -> int:
+    value = run_protected_cloud_command(args.cloud_command)
+    sys.stdout.write(canonical_json_bytes(value).decode("utf-8") + "\n")
+    return 2 if value.get("action") == "frozen" else 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
@@ -1388,6 +1408,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _experiment_command(args)
         if args.command == "candidate":
             return _candidate_command(args)
+        if args.command == "cloud":
+            return _cloud_command(args)
         if args.command == "attestation-key":
             return _init_attestation_key(args)
         if args.command == "run-attested":
