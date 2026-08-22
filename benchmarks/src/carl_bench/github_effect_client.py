@@ -44,10 +44,13 @@ def _recv_exact(connection: socket.socket, count: int) -> bytes:
 
 
 def _pin_socket_path(path: Path, expected_uid: int) -> tuple[int, tuple[int, ...]]:
+    parent_fd: int | None = None
     try:
         parent_fd = open_pinned_parent(path, expected_uid=expected_uid)
         identity = socket_identity_at(parent_fd, path.name, expected_uid=expected_uid)
     except ProtectedSocketPathError as error:
+        if parent_fd is not None:
+            os.close(parent_fd)
         raise GitHubEffectClientError("github_effect_service_identity_invalid") from error
     return parent_fd, identity
 

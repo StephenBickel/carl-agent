@@ -7,6 +7,8 @@ import multiprocessing
 import os
 import socket
 import struct
+import subprocess
+import sys
 import tempfile
 import time
 import tomllib
@@ -25,6 +27,110 @@ SHA = "2" * 40
 DIGEST = "a" * 64
 SECRET = "github_pat_REAL_PROTECTED_TOKEN"
 MAX_FRAME_BYTES = 262_144
+
+_OPERATION_BINDINGS = {
+    "create_experimental_ref": (
+        "ExperimentalBranchRequest",
+        "create_or_reconcile_experimental_branch",
+    ),
+    "create_pull_request": ("PullRequestCreateRequest", "create_or_reconcile_pull_request"),
+    "create_revert_pull_request": (
+        "RevertPullRequestRequest",
+        "create_or_reconcile_revert_pull_request",
+    ),
+    "create_revert_ref": ("RevertBranchRequest", "create_or_reconcile_revert_branch"),
+    "dispatch_workflow": ("CloudRunRequest", "dispatch_workflow"),
+    "enable_pull_request_auto_merge": (
+        "PullRequestAutoMergeRequest",
+        "enable_pull_request_auto_merge",
+    ),
+    "mark_pull_request_ready": ("PullRequestReadyRequest", "mark_pull_request_ready"),
+    "observe_required_checks": ("RequiredChecksRequest", "observe_required_checks"),
+    "update_pull_request": ("PullRequestUpdateRequest", "update_pull_request"),
+}
+
+_PACKAGED_ENTRYPOINT_SCRIPT = r"""
+from datetime import UTC, datetime
+from importlib.metadata import entry_points
+from pathlib import Path
+from types import SimpleNamespace
+import fcntl
+import importlib
+import os
+import sys
+
+if os.environ.get("CARL_TEST_ACTIVATED") != "1":
+    source_listener = int(os.environ.pop("CARL_TEST_LISTENER_FD"))
+    source_extra_text = os.environ.pop("CARL_TEST_EXTRA_FD", "")
+    source_extra = int(source_extra_text) if source_extra_text else None
+    listener_copy = fcntl.fcntl(source_listener, fcntl.F_DUPFD_CLOEXEC, 10)
+    extra_copy = (
+        fcntl.fcntl(source_extra, fcntl.F_DUPFD_CLOEXEC, 10)
+        if source_extra is not None
+        else None
+    )
+    os.close(source_listener)
+    if source_extra is not None:
+        os.close(source_extra)
+    os.dup2(listener_copy, 3, inheritable=True)
+    os.close(listener_copy)
+    if extra_copy is not None:
+        os.dup2(extra_copy, 4, inheritable=True)
+        os.close(extra_copy)
+    os.environ.update(
+        CARL_TEST_ACTIVATED="1",
+        LISTEN_PID=str(os.getpid()),
+        LISTEN_FDS="1",
+        LISTEN_FDNAMES="github-effect",
+    )
+    script = os.environ["CARL_TEST_ENTRYPOINT_SCRIPT"]
+    os.execve(sys.executable, [sys.executable, "-c", script, sys.argv[1]], os.environ)
+
+ordinary_runtime_fd = os.open(os.devnull, os.O_RDONLY)
+assert not os.get_inheritable(ordinary_runtime_fd)
+entrypoint = next(
+    entry
+    for entry in entry_points(group="console_scripts")
+    if entry.name == "carl-github-effect-service"
+)
+main = entrypoint.load()
+service = importlib.import_module("carl_bench.github_effect_service")
+github = service._github_cloud()
+now = datetime.fromisoformat("2026-08-21T12:00:00+00:00")
+
+class RejectingState:
+    def resolve_claimed_command(self, *args, **kwargs):
+        del args, kwargs
+        raise github.GitHubCloudError("github_command_not_found")
+
+class GatewayFactory:
+    @staticmethod
+    def _construct_test_gateway(**kwargs):
+        del kwargs
+        return object()
+
+github._load_protected_policy = lambda: SimpleNamespace(
+    repository="StephenBickel/carl-agent",
+    workflow_ref="main",
+    dispatch_actor_login="carl-autonomy[bot]",
+)
+github._ProtectedStateControllerClient = RejectingState
+github._InjectedGitHubCloudGateway = GatewayFactory
+github._ProtectedGitHubTransport = object
+github._system_clock = lambda: now
+os.environ[github._PROTECTED_TOKEN_ENV] = "test-protected-token"
+service._SOCKET_PATH = Path(sys.argv[1])
+service._protected_graphql_documents = object
+serve = service._serve_activated_listener
+
+def serve_as_test_uid(**kwargs):
+    kwargs["allowed_client_uid"] = os.getuid()
+    kwargs["service_uid"] = os.getuid()
+    return serve(**kwargs)
+
+service._serve_activated_listener = serve_as_test_uid
+raise SystemExit(main())
+"""
 
 
 class _DurableRejectingState:
@@ -86,6 +192,50 @@ def _start_real_listener(
     return process, ready
 
 
+def _start_packaged_entrypoint(
+    listener: socket.socket, socket_path: Path, *, extra_fd: int | None = None
+) -> subprocess.Popen[str]:
+    environment = dict(os.environ)
+    environment["CARL_TEST_LISTENER_FD"] = str(listener.fileno())
+    environment["CARL_TEST_ENTRYPOINT_SCRIPT"] = _PACKAGED_ENTRYPOINT_SCRIPT
+    source_root = os.fspath(Path(__file__).parents[1] / "src")
+    environment["PYTHONPATH"] = os.pathsep.join(
+        item for item in (source_root, environment.get("PYTHONPATH", "")) if item
+    )
+    passed = [listener.fileno()]
+    if extra_fd is not None:
+        environment["CARL_TEST_EXTRA_FD"] = str(extra_fd)
+        passed.append(extra_fd)
+    return subprocess.Popen(
+        [sys.executable, "-c", _PACKAGED_ENTRYPOINT_SCRIPT, os.fspath(socket_path)],
+        env=environment,
+        pass_fds=tuple(passed),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+
+def _entrypoint_response(process: subprocess.Popen[str], socket_path: Path) -> object:
+    client = _client_module().GitHubEffectSocketClient._for_testing(
+        socket_path=socket_path,
+        expected_peer_uid=os.getuid(),
+        timeout_seconds=0.5,
+    )
+    deadline = time.monotonic() + 5.0
+    last_error: BaseException | None = None
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            _stdout, stderr = process.communicate(timeout=1)
+            pytest.fail(f"packaged effect service exited early: {stderr}")
+        try:
+            return client.execute(_request())
+        except _client_module().GitHubEffectClientError as error:
+            last_error = error
+            time.sleep(0.02)
+    pytest.fail(f"packaged effect service did not respond: {last_error}")
+
+
 def _probe_activated_listener(
     listener: socket.socket,
     socket_path: str,
@@ -94,6 +244,10 @@ def _probe_activated_listener(
     observed: object,
 ) -> None:
     service = importlib.import_module("carl_bench.github_effect_service")
+    os.set_inheritable(listener.fileno(), True)
+    for descriptor in service._inheritable_descriptors():
+        if descriptor != listener.fileno():
+            os.set_inheritable(descriptor, False)
     environment = {
         "LISTEN_PID": str(os.getpid()),
         "LISTEN_FDS": str(declared_descriptors),
@@ -365,6 +519,13 @@ def _short_socket_path() -> Path:
     directory = Path(tempfile.mkdtemp(prefix="carl-ipc-", dir=temporary_root))
     directory.chmod(0o700)
     return directory / "effect.sock"
+
+
+def _open_descriptor_count() -> int:
+    descriptor_root = Path("/proc/self/fd")
+    if not descriptor_root.is_dir():
+        descriptor_root = Path("/dev/fd")
+    return len(tuple(descriptor_root.iterdir()))
 
 
 def _separate_process_decode_probe(payload: bytes, observed: object) -> None:
@@ -745,8 +906,16 @@ def test_service_executes_only_exact_durably_bound_high_level_request() -> None:
     assert _ipc().decode_response_bytes(_ipc().encode_response_bytes(response)) == response
 
 
-@pytest.mark.parametrize("operation", tuple(_all_operation_documents()))
-def test_service_maps_every_closed_operation_to_one_typed_domain_request(operation: str) -> None:
+@pytest.mark.parametrize(
+    ("operation", "expected_request_type", "expected_method"),
+    (
+        (operation, request_type, method)
+        for operation, (request_type, method) in _OPERATION_BINDINGS.items()
+    ),
+)
+def test_service_maps_every_closed_operation_to_its_exact_typed_request_and_executor(
+    operation: str, expected_request_type: str, expected_method: str
+) -> None:
     service = _module("carl_bench.github_effect_service", "effect service is required")
     request = _operation_request(operation, _all_operation_documents()[operation])
 
@@ -759,25 +928,22 @@ def test_service_maps_every_closed_operation_to_one_typed_domain_request(operati
         ),
     )
 
-    assert method in {
-        "create_or_reconcile_experimental_branch",
-        "create_or_reconcile_pull_request",
-        "create_or_reconcile_revert_branch",
-        "create_or_reconcile_revert_pull_request",
-        "dispatch_workflow",
-        "enable_pull_request_auto_merge",
-        "mark_pull_request_ready",
-        "observe_required_checks",
-        "update_pull_request",
-    }
+    assert type(typed).__name__ == expected_request_type
+    assert method == expected_method
     if operation in {"create_pull_request", "create_revert_pull_request", "update_pull_request"}:
         assert typed.body == request.parameters["pull_request_body"]
         assert not hasattr(typed, "pull_request_body")
 
 
-@pytest.mark.parametrize("operation", tuple(_all_operation_documents()))
+@pytest.mark.parametrize(
+    ("operation", "expected_request_type", "expected_method"),
+    (
+        (operation, request_type, method)
+        for operation, (request_type, method) in _OPERATION_BINDINGS.items()
+    ),
+)
 def test_service_executes_every_advertised_operation_through_its_typed_gateway(
-    operation: str,
+    operation: str, expected_request_type: str, expected_method: str
 ) -> None:
     service = _module("carl_bench.github_effect_service", "effect service is required")
     github = _module("carl_bench.github_cloud", "GitHub gateway module is required")
@@ -788,6 +954,8 @@ def test_service_executes_every_advertised_operation_through_its_typed_gateway(
     )
     seed = _operation_request(operation, _all_operation_documents()[operation])
     typed, binding, method = service._typed_request(seed, policy)
+    assert type(typed).__name__ == expected_request_type
+    assert method == expected_method
     command = CloudCommand.create(
         command_key=binding.command_key,
         authority=binding.authority,
@@ -832,7 +1000,7 @@ def test_service_executes_every_advertised_operation_through_its_typed_gateway(
             self.calls: list[tuple[str, str, object]] = []
 
         def __getattr__(self, name: str) -> object:
-            if name != method:
+            if name != expected_method:
                 raise AssertionError(f"unexpected gateway method: {name}")
 
             def execute(command_key: str, candidate: object) -> object:
@@ -844,7 +1012,7 @@ def test_service_executes_every_advertised_operation_through_its_typed_gateway(
                     "command_occurred_at": NOW,
                     "observed_at": NOW,
                 }
-                if method == "dispatch_workflow":
+                if expected_method == "dispatch_workflow":
                     return github.WorkflowDispatchSnapshot(
                         status="dispatched",
                         workflow_file=typed.workflow_file,
@@ -854,7 +1022,7 @@ def test_service_executes_every_advertised_operation_through_its_typed_gateway(
                         head_sha=typed.candidate_commit,
                         **common,
                     )
-                if method in {
+                if expected_method in {
                     "create_or_reconcile_experimental_branch",
                     "create_or_reconcile_revert_branch",
                 }:
@@ -868,7 +1036,7 @@ def test_service_executes_every_advertised_operation_through_its_typed_gateway(
                         commit_sha=commit_sha,
                         **common,
                     )
-                if method == "observe_required_checks":
+                if expected_method == "observe_required_checks":
                     return github.RequiredChecksSnapshot(
                         head_sha=typed.head_sha,
                         checks=(),
@@ -876,7 +1044,11 @@ def test_service_executes_every_advertised_operation_through_its_typed_gateway(
                         **common,
                     )
                 return github.PullRequestEffectSnapshot(
-                    status="updated" if method != "create_or_reconcile_pull_request" else "created",
+                    status=(
+                        "updated"
+                        if expected_method != "create_or_reconcile_pull_request"
+                        else "created"
+                    ),
                     number=getattr(typed, "number", 17),
                     url="https://github.com/StephenBickel/carl-agent/pull/17",
                     state="open",
@@ -886,7 +1058,7 @@ def test_service_executes_every_advertised_operation_through_its_typed_gateway(
                     head_sha=getattr(typed, "head_sha", None) or typed.revert_candidate_commit,
                     title=getattr(typed, "title", "Promote experiment"),
                     body=getattr(typed, "body", "Capability evidence."),
-                    auto_merge_enabled=method == "enable_pull_request_auto_merge",
+                    auto_merge_enabled=expected_method == "enable_pull_request_auto_merge",
                     **common,
                 )
 
@@ -903,7 +1075,7 @@ def test_service_executes_every_advertised_operation_through_its_typed_gateway(
 
     assert response.status == "completed"
     assert response.error_code is None
-    assert gateway.calls == [(method, binding.command_key, typed)]
+    assert gateway.calls == [(expected_method, binding.command_key, typed)]
     assert _ipc().decode_response_bytes(_ipc().encode_response_bytes(response)) == response
 
 
@@ -1023,6 +1195,33 @@ def test_supervisor_listener_survives_sigkill_and_replacement_service_reuses_it(
             socket_path.parent.rmdir()
 
 
+def test_packaged_entrypoint_reuses_inherited_fd3_after_sigkill_restart() -> None:
+    socket_path = _short_socket_path()
+    listener = _supervisor_listener(socket_path)
+    identity = socket_path.stat().st_ino
+    first = _start_packaged_entrypoint(listener, socket_path)
+    restarted: subprocess.Popen[str] | None = None
+    try:
+        assert _entrypoint_response(first, socket_path).error_code == "github_command_not_found"
+        first.kill()
+        assert first.wait(timeout=2) != 0
+        assert socket_path.stat().st_ino == identity
+
+        restarted = _start_packaged_entrypoint(listener, socket_path)
+        assert _entrypoint_response(restarted, socket_path).error_code == "github_command_not_found"
+        assert socket_path.stat().st_ino == identity
+    finally:
+        for process in (first, restarted):
+            if process is not None and process.poll() is None:
+                process.kill()
+                process.wait(timeout=2)
+            if process is not None:
+                process.communicate(timeout=1)
+        listener.close()
+        socket_path.unlink(missing_ok=True)
+        socket_path.parent.rmdir()
+
+
 def test_service_exit_never_unlinks_or_replaces_supervisor_socket() -> None:
     context = multiprocessing.get_context("spawn")
     calls = context.Value("i", 0)
@@ -1072,6 +1271,23 @@ def test_activated_listener_process_rejects_wrong_path_mode_or_owner(defect: str
         socket_path.parent.rmdir()
 
 
+def test_activated_listener_rejects_unlinked_listener_after_path_is_rebound() -> None:
+    socket_path = _short_socket_path()
+    old_listener = _supervisor_listener(socket_path)
+    socket_path.unlink()
+    current_listener = _supervisor_listener(socket_path)
+    try:
+        assert (
+            _activation_probe(old_listener, socket_path)
+            == "github_effect_service_socket_identity_invalid"
+        )
+    finally:
+        old_listener.close()
+        current_listener.close()
+        socket_path.unlink(missing_ok=True)
+        socket_path.parent.rmdir()
+
+
 @pytest.mark.parametrize("defect", ("datagram", "non_listening", "extra_descriptor"))
 def test_activated_listener_process_rejects_wrong_type_state_or_extra_fd(defect: str) -> None:
     socket_path = _short_socket_path()
@@ -1091,6 +1307,55 @@ def test_activated_listener_process_rejects_wrong_type_state_or_extra_fd(defect:
         assert _activation_probe(listener, socket_path, declared_descriptors=count) == expected
         assert socket_path.is_socket()
     finally:
+        listener.close()
+        socket_path.unlink(missing_ok=True)
+        socket_path.parent.rmdir()
+
+
+def test_activation_contract_rejects_undeclared_inheritable_descriptor() -> None:
+    service = _module("carl_bench.github_effect_service", "effect service is required")
+    socket_path = _short_socket_path()
+    listener = _supervisor_listener(socket_path)
+    extra_read, extra_write = os.pipe()
+    os.set_inheritable(listener.fileno(), True)
+    os.set_inheritable(extra_read, True)
+    try:
+        with pytest.raises(RuntimeError, match="github_effect_service_activation_invalid"):
+            service._activation_descriptor_from_environment(
+                environment={
+                    "LISTEN_PID": str(os.getpid()),
+                    "LISTEN_FDS": "1",
+                    "LISTEN_FDNAMES": "github-effect",
+                },
+                process_id=os.getpid(),
+                descriptor_fd=listener.fileno(),
+            )
+    finally:
+        os.close(extra_read)
+        os.close(extra_write)
+        listener.close()
+        socket_path.unlink(missing_ok=True)
+        socket_path.parent.rmdir()
+
+
+def test_packaged_entrypoint_rejects_undeclared_inherited_fd4() -> None:
+    socket_path = _short_socket_path()
+    listener = _supervisor_listener(socket_path)
+    identity = socket_path.stat().st_ino
+    extra_read, extra_write = os.pipe()
+    process = _start_packaged_entrypoint(listener, socket_path, extra_fd=extra_read)
+    try:
+        return_code = process.wait(timeout=5)
+        _stdout, stderr = process.communicate(timeout=1)
+        assert return_code != 0
+        assert "github_effect_service_activation_invalid" in stderr
+        assert socket_path.stat().st_ino == identity
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=2)
+        os.close(extra_read)
+        os.close(extra_write)
         listener.close()
         socket_path.unlink(missing_ok=True)
         socket_path.parent.rmdir()
@@ -1163,6 +1428,22 @@ def test_client_rejects_socket_path_substitution_between_connect_checks(
         original.close()
         replacement.close()
         socket_path.unlink(missing_ok=True)
+        socket_path.parent.rmdir()
+
+
+def test_client_closes_pinned_parent_when_socket_identity_is_invalid() -> None:
+    client_module = _client_module()
+    socket_path = _short_socket_path()
+    before = _open_descriptor_count()
+    try:
+        for _ in range(32):
+            with pytest.raises(
+                client_module.GitHubEffectClientError,
+                match="github_effect_service_identity_invalid",
+            ):
+                client_module._pin_socket_path(socket_path, os.getuid())
+        assert _open_descriptor_count() == before
+    finally:
         socket_path.parent.rmdir()
 
 

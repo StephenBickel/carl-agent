@@ -11,9 +11,11 @@ import dataclasses
 import hashlib
 import os
 import re
+import select
 import socket
 import stat
 import struct
+import time
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from datetime import UTC, datetime
@@ -39,6 +41,7 @@ from carl_bench.unix_socket_security import (
 _SOCKET_PATH = Path("/run/carl/github-effect.sock")
 _ALLOWED_CLIENT_UID = 0
 _CONNECTION_TIMEOUT_SECONDS = 2.0
+_ACTIVATION_PROBE_TIMEOUT_SECONDS = 1.0
 
 
 def _protected_graphql_documents() -> object:
@@ -338,7 +341,43 @@ def _activation_descriptor_from_environment(
         or environment.get("LISTEN_FDNAMES") != "github-effect"
     ):
         raise RuntimeError("github_effect_service_activation_invalid")
+    try:
+        inherited = _inheritable_descriptors()
+    except OSError as error:
+        raise RuntimeError("github_effect_service_activation_invalid") from error
+    if not os.get_inheritable(descriptor_fd) or inherited != {descriptor_fd}:
+        raise RuntimeError("github_effect_service_activation_invalid")
     return descriptor_fd
+
+
+def _inheritable_descriptors() -> set[int]:
+    """Enumerate open inheritable descriptors without rejecting CLOEXEC runtime files."""
+    descriptor_names: list[str] | None = None
+    for root in ("/proc/self/fd", "/dev/fd"):
+        try:
+            descriptor_names = os.listdir(root)
+        except OSError:
+            continue
+        break
+    if descriptor_names is None:
+        try:
+            maximum = int(os.sysconf("SC_OPEN_MAX"))
+        except (AttributeError, OSError, TypeError, ValueError) as error:
+            raise OSError("cannot enumerate descriptors") from error
+        candidates = range(3, maximum)
+    else:
+        candidates = (int(name) for name in descriptor_names if name.isdecimal())
+
+    inherited: set[int] = set()
+    for descriptor in candidates:
+        if descriptor < 3:
+            continue
+        try:
+            if os.get_inheritable(descriptor):
+                inherited.add(descriptor)
+        except OSError:
+            continue
+    return inherited
 
 
 def _descriptor_identity(descriptor: int, *, expected_uid: int) -> tuple[int, int, int, int]:
@@ -351,30 +390,53 @@ def _descriptor_identity(descriptor: int, *, expected_uid: int) -> tuple[int, in
     return details.st_dev, details.st_ino, details.st_mode, details.st_uid
 
 
-def _listener_is_accepting(listener: socket.socket) -> bool:
-    """Check listening state, including AF_UNIX platforms without SO_ACCEPTCONN."""
+def _peer_pid(connection: socket.socket) -> int | None:
+    if hasattr(socket, "SO_PEERCRED"):
+        credentials = connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
+        return struct.unpack("3i", credentials)[0]
+    if hasattr(socket, "LOCAL_PEERCRED"):
+        option = getattr(socket, "LOCAL_PEERPID", 2)
+        credentials = connection.getsockopt(0, option, 4)
+        return struct.unpack("i", credentials)[0]
+    return None
+
+
+def _prove_listener_occupies_path(
+    listener: socket.socket, socket_path: Path
+) -> list[socket.socket]:
+    """Connect through the protected path and prove that this listener accepts it."""
+    queued: list[socket.socket] = []
+    deadline = time.monotonic() + _ACTIVATION_PROBE_TIMEOUT_SECONDS
     try:
-        return listener.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN) == 1
-    except OSError:
-        previous_timeout = listener.gettimeout()
-        listener.setblocking(False)
-        try:
-            connection, _ = listener.accept()
-        except BlockingIOError:
-            return True
-        except OSError:
-            return False
-        else:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+            probe.settimeout(_ACTIVATION_PROBE_TIMEOUT_SECONDS)
+            try:
+                probe.connect(os.fspath(socket_path))
+            except OSError as error:
+                raise RuntimeError("github_effect_service_listener_invalid") from error
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not select.select([listener], [], [], remaining)[0]:
+                    raise RuntimeError("github_effect_service_socket_identity_invalid")
+                connection, _ = listener.accept()
+                if _peer_pid(connection) == os.getpid():
+                    connection.close()
+                    return queued
+                queued.append(connection)
+    except (OSError, TimeoutError) as error:
+        for connection in queued:
             connection.close()
-            return False
-        finally:
-            listener.settimeout(previous_timeout)
+        raise RuntimeError("github_effect_service_socket_identity_invalid") from error
+    except Exception:
+        for connection in queued:
+            connection.close()
+        raise
 
 
 @contextmanager
 def _validated_activated_listener(
     *, listener_fd: int, socket_path: Path, expected_uid: int
-) -> Iterator[socket.socket]:
+) -> Iterator[tuple[socket.socket, list[socket.socket]]]:
     """Duplicate and validate a supervisor-owned listening Unix socket."""
     descriptor_before = _descriptor_identity(listener_fd, expected_uid=expected_uid)
     try:
@@ -392,15 +454,19 @@ def _validated_activated_listener(
             if (
                 listener.family != socket.AF_UNIX
                 or listener.getsockopt(socket.SOL_SOCKET, socket.SO_TYPE) != socket.SOCK_STREAM
-                or not _listener_is_accepting(listener)
                 or listener.getsockname() != os.fspath(socket_path)
             ):
                 raise RuntimeError("github_effect_service_listener_invalid")
+            queued = _prove_listener_occupies_path(listener, socket_path)
             descriptor_after = _descriptor_identity(listener_fd, expected_uid=expected_uid)
             path_after = socket_identity_at(parent_fd, socket_path.name, expected_uid=expected_uid)
             if descriptor_after != descriptor_before or path_after != path_before:
                 raise RuntimeError("github_effect_service_socket_identity_invalid")
-            yield listener
+            try:
+                yield listener, queued
+            finally:
+                for connection in queued:
+                    connection.close()
         finally:
             listener.close()
     except ProtectedSocketPathError as error:
@@ -435,11 +501,15 @@ def _serve_activated_listener(
         listener_fd=listener_fd,
         socket_path=socket_path,
         expected_uid=service_uid,
-    ) as listener:
+    ) as activated:
+        listener, queued = activated
         if on_ready is not None:
             on_ready()
         while True:
-            connection, _ = listener.accept()
+            if queued:
+                connection = queued.pop(0)
+            else:
+                connection, _ = listener.accept()
             with connection:
                 connection.settimeout(float(connection_timeout_seconds))
                 peer_uid = _peer_uid(connection)
