@@ -14,8 +14,10 @@ from carl_bench.canonical import canonical_json_bytes
 from carl_bench.report import summarize_run
 from carl_bench.run_attestation import (
     RunAttestationError,
+    attest_bound_payload,
     attest_run,
     verify_attested_scorecard,
+    verify_bound_payload_attestation,
 )
 
 KEY = bytes(range(32))
@@ -147,3 +149,34 @@ def test_attested_run_rejects_unknown_key_and_even_valid_mac_for_inconsistent_ev
             expected_role="baseline",
             expected_subject_commit=experiment_manifest().parent_commit,
         )
+
+
+def test_bound_payload_attestation_is_exact_and_domain_separated() -> None:
+    payload = canonical_json_bytes({"request_digest": "a" * 64, "schema_version": 1})
+    key_id, signature = attest_bound_payload(
+        payload,
+        purpose="protected-live-pair",
+        key=KEY,
+    )
+
+    assert verify_bound_payload_attestation(
+        payload,
+        purpose="protected-live-pair",
+        key=KEY,
+        expected_key_id=key_id,
+        signature=signature,
+    )
+    assert not verify_bound_payload_attestation(
+        payload + b" ",
+        purpose="protected-live-pair",
+        key=KEY,
+        expected_key_id=key_id,
+        signature=signature,
+    )
+    assert not verify_bound_payload_attestation(
+        payload,
+        purpose="other-purpose",
+        key=KEY,
+        expected_key_id=key_id,
+        signature=signature,
+    )

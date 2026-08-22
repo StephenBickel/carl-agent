@@ -294,9 +294,10 @@ class CloudHarnessResult:
     eligible: bool = False
     disposition: str = "insufficient_evidence"
     reasons: tuple[str, ...] = (_LIVE_GATE_REASON,)
+    live_evaluation_identity: object | None = None
 
     def to_canonical_dict(self) -> dict[str, Any]:
-        return {
+        value = {
             "candidate": self.candidate.to_canonical_dict(),
             "contract_disposition": self.contract_disposition,
             "contract_eligible": self.contract_eligible,
@@ -311,6 +312,13 @@ class CloudHarnessResult:
             "reasons": list(self.reasons),
             "schema_version": 1,
         }
+        if self.live_evaluation_identity is not None:
+            from carl_bench.live_capability import LiveEvaluationIdentity
+
+            if not isinstance(self.live_evaluation_identity, LiveEvaluationIdentity):
+                raise CloudHarnessError("live_evaluation_identity_invalid")
+            value["live_evaluation_identity"] = self.live_evaluation_identity.to_canonical_dict()
+        return value
 
 
 def _parse_contracts(
@@ -689,6 +697,7 @@ def evaluate_carl_pair(
     mode: str,
     parent_identity: tuple[int, int] | None = None,
     candidate_identity: tuple[int, int] | None = None,
+    live_evaluation_identity: object | None = None,
 ) -> CloudHarnessResult:
     """Run protected probes against exact binaries and emit bounded canonical evidence."""
     if not _COMMIT_RE.fullmatch(parent_commit) or not _COMMIT_RE.fullmatch(candidate_commit):
@@ -711,6 +720,21 @@ def evaluate_carl_pair(
         metric_pack_path=Path(metric_pack_path),
         policy_path=Path(policy_path),
     )
+    if live_evaluation_identity is not None:
+        from carl_bench.live_capability import LiveEvaluationIdentity
+
+        if (
+            not isinstance(live_evaluation_identity, LiveEvaluationIdentity)
+            or live_evaluation_identity.parent_commit != parent_commit
+            or live_evaluation_identity.candidate_commit != candidate_commit
+            or live_evaluation_identity.experiment_digest != immutable_inputs["experiment"]
+            or live_evaluation_identity.task_set_digest != immutable_inputs["task_set"]
+            or live_evaluation_identity.metric_pack_digest != immutable_inputs["metric_pack"]
+            or live_evaluation_identity.policy_digest != immutable_inputs["policy"]
+            or live_evaluation_identity.task_order != tuple(probe.probe_id for probe in probes)
+            or live_evaluation_identity.attempts != attempts
+        ):
+            raise CloudHarnessError("live_evaluation_identity_mismatch")
     output_limit = policy["maximum_probe_output_bytes"]
     parent = _subject(
         parent_binary,
@@ -767,6 +791,7 @@ def evaluate_carl_pair(
         contract_eligible=not reasons,
         contract_disposition="improvement" if not reasons else "rejected",
         contract_reasons=tuple(reasons),
+        live_evaluation_identity=live_evaluation_identity,
     )
     if len(canonical_json_bytes(result.to_canonical_dict())) > policy["maximum_payload_bytes"]:
         raise CloudHarnessError("evidence_payload_too_large")

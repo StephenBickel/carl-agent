@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from carl_bench.adapters.carl_acp import CarlAcpAdapter
+from carl_bench.adapters.carl_acp import BoundedModelGatewayCapability, CarlAcpAdapter
 from carl_bench.adapters.codex_cli import CodexCliAdapter
 from carl_bench.adapters.scripted import ScriptedAdapter
 from carl_bench.models import AgentRequest, OutcomeStatus
@@ -174,6 +174,51 @@ async def test_carl_acp_completes_v2_without_retaining_provider_text(
         "default",
     ]
     assert "private provider output" not in repr(outcome)
+
+
+@pytest.mark.asyncio
+async def test_carl_acp_live_gateway_capability_omits_provider_policy_from_subject_argv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-never-pass-to-subject-123456")
+    workspace = tmp_path / "acp-live"
+    workspace.mkdir(mode=0o700)
+    (workspace / "acp-mode.txt").write_text("environment", encoding="utf-8")
+    data_dir = tmp_path / "data-live"
+    data_dir.mkdir(mode=0o700)
+    capability = BoundedModelGatewayCapability(
+        endpoint="http://127.0.0.1:43117/v1/evaluate",
+        token="pair-task-token-1234567890",
+        pair_request_digest="a" * 64,
+        subject="candidate",
+        task_id="carl/test",
+        attempt=1,
+    )
+    adapter = CarlAcpAdapter(
+        executable=FAKE_CARL,
+        codex_executable=Path(sys.executable).resolve(),
+        data_dir=data_dir,
+        model="gpt-protected",
+        effort="xhigh",
+        gateway_capability=capability,
+    )
+    agent_request = AgentRequest(
+        trial_id="trial-live",
+        task_id="carl/test",
+        instruction="Complete the protected fixture task.",
+        workspace=os.fspath(workspace),
+        timeout_sec=3,
+        seed=7,
+    )
+
+    outcome = await adapter.run(agent_request)
+
+    assert outcome.status is OutcomeStatus.PASSED
+    assert json.loads((workspace / "acp-argv.json").read_text(encoding="utf-8")) == [
+        "acp",
+        "--permission-mode",
+        "default",
+    ]
 
 
 @pytest.mark.asyncio

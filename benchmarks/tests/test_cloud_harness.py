@@ -9,6 +9,7 @@ import pytest
 
 import carl_bench.cloud_harness as cloud_harness
 from carl_bench.cloud_harness import CloudHarnessError, evaluate_carl_pair
+from carl_bench.live_capability import LiveEvaluationIdentity
 
 PARENT = "1" * 40
 CANDIDATE = "2" * 40
@@ -220,6 +221,53 @@ def test_trusted_harness_executes_exact_carl_binaries_and_owns_scoring(tmp_path:
     assert payload["immutable_inputs"] == {
         kind: hashlib.sha256(path.read_bytes()).hexdigest() for kind, path in objects.items()
     }
+
+
+def test_deterministic_harness_binds_the_exact_live_pair_identity(tmp_path: Path) -> None:
+    objects = _objects(tmp_path)
+    immutable = {
+        kind: hashlib.sha256(path.read_bytes()).hexdigest() for kind, path in objects.items()
+    }
+    pair_identity = LiveEvaluationIdentity.create(
+        repository="StephenBickel/carl-agent",
+        parent_commit=PARENT,
+        parent_tree="3" * 40,
+        candidate_commit=CANDIDATE,
+        candidate_tree="4" * 40,
+        experiment_digest=immutable["experiment"],
+        workflow_revision="5" * 40,
+        workflow_digest="6" * 64,
+        task_set_digest=immutable["task_set"],
+        metric_pack_digest=immutable["metric_pack"],
+        policy_digest=immutable["policy"],
+        model_policy_digest="7" * 64,
+        grader_digest="8" * 64,
+        environment_digest="9" * 64,
+        model="gpt-5.2",
+        reasoning_policy="medium/no-summary",
+        tool_protocol_revision="acp-v2/bounded-openai-v1",
+        task_order=("help", "memory-help", "version"),
+        seeds=(41000, 41001, 41002),
+        attempts=3,
+    )
+
+    result = evaluate_carl_pair(
+        parent_binary=_subject(tmp_path / "parent-carl", version_ok=False),
+        candidate_binary=_subject(tmp_path / "candidate-carl", version_ok=True),
+        parent_commit=PARENT,
+        candidate_commit=CANDIDATE,
+        experiment_path=objects["experiment"],
+        task_set_path=objects["task_set"],
+        metric_pack_path=objects["metric_pack"],
+        policy_path=objects["policy"],
+        mode="improvement",
+        live_evaluation_identity=pair_identity,
+    )
+
+    assert result.live_evaluation_identity == pair_identity
+    assert result.to_canonical_dict()["live_evaluation_identity"] == (
+        pair_identity.to_canonical_dict()
+    )
 
 
 def test_protected_harness_rejects_shared_or_harness_subject_uid(tmp_path: Path) -> None:

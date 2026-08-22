@@ -13,6 +13,7 @@ from carl_bench.models import RunManifest, Scorecard
 from carl_bench.report import summarize_run
 
 _DOMAIN = b"carl-bench/run-attestation/v1\x00"
+_BOUND_PAYLOAD_DOMAIN = b"carl-bench/bound-payload-attestation/v1\x00"
 _POLICY_VERSION = "phase3-benchmark-attestation-v1"
 _DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 _COMMIT_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
@@ -39,6 +40,44 @@ def _key_id(key: bytes) -> str:
 def _validate_key(key: bytes) -> None:
     if not isinstance(key, bytes) or not 32 <= len(key) <= 64:
         raise RunAttestationError("attestation_key_invalid")
+
+
+def attest_bound_payload(payload: bytes, *, purpose: str, key: bytes) -> tuple[str, str]:
+    """Return the pinned key identity and domain-separated MAC for exact canonical bytes."""
+    _validate_key(key)
+    if (
+        not isinstance(payload, bytes)
+        or not payload
+        or len(payload) > 8_388_608
+        or not isinstance(purpose, str)
+        or not _ID_RE.fullmatch(purpose)
+    ):
+        raise RunAttestationError("attestation_payload_invalid")
+    message = _BOUND_PAYLOAD_DOMAIN + purpose.encode("utf-8") + b"\x00" + payload
+    return _key_id(key), hmac.new(key, message, hashlib.sha256).hexdigest()
+
+
+def verify_bound_payload_attestation(
+    payload: bytes,
+    *,
+    purpose: str,
+    key: bytes,
+    expected_key_id: str,
+    signature: str,
+) -> bool:
+    """Verify one exact payload without accepting caller-selected signing domains."""
+    if (
+        not isinstance(expected_key_id, str)
+        or not _DIGEST_RE.fullmatch(expected_key_id)
+        or not isinstance(signature, str)
+        or not _DIGEST_RE.fullmatch(signature)
+    ):
+        return False
+    try:
+        key_id, expected = attest_bound_payload(payload, purpose=purpose, key=key)
+    except RunAttestationError:
+        return False
+    return hmac.compare_digest(expected_key_id, key_id) and hmac.compare_digest(signature, expected)
 
 
 def _task_identity_values(task_identities: tuple[dict[str, str], ...]) -> list[dict[str, str]]:
