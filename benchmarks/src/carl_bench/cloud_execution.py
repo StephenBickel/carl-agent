@@ -281,15 +281,11 @@ class CloudRunRequest:
         return f"{self.dispatch_key}-attempt-{attempt}"
 
     def to_canonical_dict(self) -> dict[str, Any]:
-        return _codec_output(
-            {name: getattr(self, name) for name in self.__dataclass_fields__}
-        )
+        return _codec_output({name: getattr(self, name) for name in self.__dataclass_fields__})
 
     @classmethod
     def from_canonical_dict(cls, value: object) -> CloudRunRequest:
-        decoded = _codec_fields(
-            value, frozenset(cls.__dataclass_fields__), "cloud_request_invalid"
-        )
+        decoded = _codec_fields(value, frozenset(cls.__dataclass_fields__), "cloud_request_invalid")
         try:
             return cls(**decoded)
         except TypeError as error:
@@ -321,9 +317,7 @@ class CloudArtifact:
             _digest("cloud_downloaded_artifact_digest", self.downloaded_digest)
 
     def to_canonical_dict(self) -> dict[str, Any]:
-        return _codec_output(
-            {name: getattr(self, name) for name in self.__dataclass_fields__}
-        )
+        return _codec_output({name: getattr(self, name) for name in self.__dataclass_fields__})
 
     @classmethod
     def from_canonical_dict(cls, value: object) -> CloudArtifact:
@@ -397,9 +391,7 @@ class CommissioningReceipt:
             raise CloudExecutionError("invalid_cloud_commissioning_artifact_name")
 
     def to_canonical_dict(self) -> dict[str, Any]:
-        return _codec_output(
-            {name: getattr(self, name) for name in self.__dataclass_fields__}
-        )
+        return _codec_output({name: getattr(self, name) for name in self.__dataclass_fields__})
 
     @classmethod
     def from_canonical_dict(cls, value: object) -> CommissioningReceipt:
@@ -506,9 +498,7 @@ class CompletedRunObservation:
         _utc("cloud_completed_run_observed_at", self.observed_at)
 
     def to_canonical_dict(self) -> dict[str, Any]:
-        return _codec_output(
-            {name: getattr(self, name) for name in self.__dataclass_fields__}
-        )
+        return _codec_output({name: getattr(self, name) for name in self.__dataclass_fields__})
 
     @classmethod
     def from_canonical_dict(cls, value: object) -> CompletedRunObservation:
@@ -575,9 +565,7 @@ class SignedCompletedRunObservation:
                 signature_base64=decoded["signature_base64"],
             )
         except TypeError as error:
-            raise CloudExecutionError(
-                "signed_cloud_completed_run_observation_invalid"
-            ) from error
+            raise CloudExecutionError("signed_cloud_completed_run_observation_invalid") from error
         if result.observation_digest != result.observation.digest:
             raise CloudExecutionError("cloud_completed_run_observation_digest_mismatch")
         return result
@@ -654,9 +642,7 @@ class CloudRunSnapshot:
     artifacts: tuple[CloudArtifact, ...] = ()
     artifacts_expires_at: str | None = None
     commissioning_receipt: CommissioningReceipt | SignedCommissioningReceipt | None = None
-    completed_run_observation: (
-        CompletedRunObservation | SignedCompletedRunObservation | None
-    ) = None
+    completed_run_observation: CompletedRunObservation | SignedCompletedRunObservation | None = None
     local_fallback_command: str | None = None
 
     def __post_init__(self) -> None:
@@ -972,10 +958,7 @@ class CloudRunDecision:
                         )
                     ):
                         raise ValueError
-                elif (
-                    self.head_sha is None
-                    or self.conclusion not in _INFRASTRUCTURE_CONCLUSIONS
-                ):
+                elif self.head_sha is None or self.conclusion not in _INFRASTRUCTURE_CONCLUSIONS:
                     raise ValueError
         except CloudExecutionError as error:
             raise CloudExecutionError("cloud_decision_invalid") from error
@@ -983,9 +966,7 @@ class CloudRunDecision:
             raise CloudExecutionError("cloud_decision_invalid") from error
 
     def to_canonical_dict(self) -> dict[str, Any]:
-        return _codec_output(
-            {name: getattr(self, name) for name in self.__dataclass_fields__}
-        )
+        return _codec_output({name: getattr(self, name) for name in self.__dataclass_fields__})
 
     @classmethod
     def from_canonical_dict(cls, value: object) -> CloudRunDecision:
@@ -1040,16 +1021,13 @@ class CloudRetryState:
             or len(self.prior_run_ids) != self.attempt - 1
         ):
             raise CloudExecutionError("invalid_cloud_prior_runs")
-        if (
-            not isinstance(self.prior_observation_digests, tuple)
-            or len(self.prior_observation_digests) != len(self.prior_run_ids)
-        ):
+        if not isinstance(self.prior_observation_digests, tuple) or len(
+            self.prior_observation_digests
+        ) != len(self.prior_run_ids):
             raise CloudExecutionError("invalid_cloud_prior_observations")
         for digest in self.prior_observation_digests:
             _digest("cloud_prior_observation_digest", digest)
-        if len(set(self.prior_observation_digests)) != len(
-            self.prior_observation_digests
-        ):
+        if len(set(self.prior_observation_digests)) != len(self.prior_observation_digests):
             raise CloudExecutionError("invalid_cloud_prior_observations")
         if self.retry_not_before is not None:
             _utc("cloud_retry_not_before", self.retry_not_before)
@@ -1098,9 +1076,7 @@ class CloudRetryState:
             raise CloudExecutionError("cloud_retry_state_invalid")
         prior_run_ids = value["prior_run_ids"]
         prior_observation_digests = value["prior_observation_digests"]
-        if not isinstance(prior_run_ids, list) or not isinstance(
-            prior_observation_digests, list
-        ):
+        if not isinstance(prior_run_ids, list) or not isinstance(prior_observation_digests, list):
             raise CloudExecutionError("cloud_retry_state_invalid")
         try:
             return cls(
@@ -1287,15 +1263,13 @@ class CloudRetryStateStore:
             or len(replacement.prior_run_ids) != len(expected.prior_run_ids) + 1
             or replacement.prior_run_ids[-1] != retry_decision.run_id
             or retry_decision.run_id in expected.prior_run_ids
-            or replacement.prior_observation_digests[:-1]
-            != expected.prior_observation_digests
+            or replacement.prior_observation_digests[:-1] != expected.prior_observation_digests
             or len(replacement.prior_observation_digests)
             != len(expected.prior_observation_digests) + 1
             or retry_decision.completed_run_observation_digest is None
             or replacement.prior_observation_digests[-1]
             != retry_decision.completed_run_observation_digest
-            or retry_decision.completed_run_observation_digest
-            in expected.prior_observation_digests
+            or retry_decision.completed_run_observation_digest in expected.prior_observation_digests
         ):
             raise CloudExecutionError("cloud_retry_transition_invalid")
         with self._locked():
@@ -1379,9 +1353,7 @@ def _retry_decision(
         return _decision("blocked", "cloud_retry_budget_exhausted", request, snapshot)
     observed = _utc("cloud_observed_at", snapshot.observed_at)
     delay_minutes = 5 * snapshot.attempt
-    retry_at = (observed + timedelta(minutes=delay_minutes)).isoformat().replace(
-        "+00:00", "Z"
-    )
+    retry_at = (observed + timedelta(minutes=delay_minutes)).isoformat().replace("+00:00", "Z")
     return _decision(
         "schedule_retry",
         reason,
@@ -1664,9 +1636,8 @@ def reconcile_cloud_run(
     """Choose one restart-safe control-plane action without executing local work."""
     if not isinstance(request, CloudRunRequest) or not isinstance(snapshot, CloudRunSnapshot):
         raise CloudExecutionError("invalid_cloud_reconciliation")
-    if (
-        snapshot.local_fallback_command is not None
-        and _HEAVY_LOCAL_RE.search(snapshot.local_fallback_command)
+    if snapshot.local_fallback_command is not None and _HEAVY_LOCAL_RE.search(
+        snapshot.local_fallback_command
     ):
         return _decision("blocked", "local_heavy_fallback_forbidden", request, snapshot)
     if snapshot.attempt_key is not None and snapshot.attempt_key != request.attempt_key(
