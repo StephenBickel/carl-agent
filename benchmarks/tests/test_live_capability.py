@@ -960,6 +960,8 @@ def test_protected_authority_rejects_live_pair_without_signed_execution_receipts
         ("timeout_seconds", 31),
         ("executable_inode", 99_999),
         ("executable_digest", digest("drifted-executable")),
+        ("process_id", 63_099),
+        ("cgroup_observation_digest", digest("drifted-cgroup-observation")),
     ),
 )
 def test_evaluator_rejects_validly_signed_execution_actuals_drifted_from_commissioning(
@@ -1035,6 +1037,21 @@ def test_evaluator_rejects_validly_signed_execution_actuals_drifted_from_commiss
             "worker_uid": 62_001,
         }
     )
+
+    class CommissionedObservations:
+        def expected_actuals(self, **identity: object) -> tuple[int, str] | None:
+            if identity != {
+                "pair_request_digest": pair.identity.request_digest,
+                "task_id": trial.task.task_id,
+                "attempt": trial.attempt,
+                "subject": "parent",
+            }:
+                return None
+            return (
+                exact_fields["process_id"],
+                exact_fields["cgroup_observation_digest"],
+            )
+
     commissioning = LiveExecutionCommissioningPolicy._for_testing(
         checkout_root=checkout_root,
         executable_relative_path="carl",
@@ -1042,6 +1059,7 @@ def test_evaluator_rejects_validly_signed_execution_actuals_drifted_from_commiss
         timeout_seconds=30,
         workers=((62_001, 62_001), (62_002, 62_002)),
         cgroup_unit="carl-live-gateway.service",
+        observations=CommissionedObservations(),
     )
 
     class Isolation:

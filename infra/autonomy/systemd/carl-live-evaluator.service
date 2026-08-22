@@ -1,6 +1,7 @@
 [Unit]
 Description=Carl protected live evidence evaluator
-Requires=carl-live-evaluator.socket
+After=carl-live-gateway.service
+Requires=carl-live-evaluator.socket carl-live-gateway.service
 
 [Service]
 Type=simple
@@ -18,7 +19,7 @@ ProtectHome=yes
 ProtectKernelModules=yes
 ProtectKernelTunables=yes
 ProtectSystem=strict
-ReadOnlyPaths=/srv/carl/checkouts
+ReadOnlyPaths=/srv/carl/checkouts /var/lib/carl/live-gateway/state.sqlite3
 RestrictAddressFamilies=AF_UNIX
 UMask=0077
 

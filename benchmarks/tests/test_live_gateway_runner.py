@@ -678,6 +678,157 @@ def test_runner_exact_request_replays_same_durable_execution_bundle_after_restar
     assert replay_scope.process_id == -1
 
 
+@pytest.mark.skipif(os.name == "nt", reason="requires POSIX worker execution")
+def test_runner_resumes_completed_provider_result_after_preseal_crash_without_redispatch(
+    tmp_path: Path,
+) -> None:
+    from carl_bench.live_gateway_store import (
+        LiveGatewayStateError,
+        SQLiteLiveGatewayCommissioningReader,
+        SQLiteLiveGatewayStateStore,
+    )
+    from carl_bench.live_runner_ipc import ProtectedLiveRunnerRequest
+
+    class CountingGateway(_Gateway):
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def evaluate(self, request: OpenAIModelRequest) -> ProtectedOpenAIModelResult:
+            self.calls += 1
+            return super().evaluate(request)
+
+    class CrashBeforeSealState:
+        def __init__(self, delegate: object) -> None:
+            self._delegate = delegate
+            self.bundle: dict[str, object] | None = None
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(self._delegate, name)
+
+        def seal_result_bundle(self, *args: object, **kwargs: object) -> object:
+            del args
+            bundle = kwargs["bundle"]
+            assert type(bundle) is dict
+            self.bundle = bundle
+            raise RuntimeError("crash-before-seal")
+
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(2)
+    port = listener.getsockname()[1]
+    endpoint = f"http://127.0.0.1:{port}/v1/evaluate"
+    executable, parent_commit, parent_tree = _checkout(tmp_path / "parent", port)
+    identity, policy, task = _case(
+        endpoint=endpoint,
+        parent_commit=parent_commit,
+        parent_tree=parent_tree,
+    )
+    state_path = tmp_path / "gateway.sqlite3"
+    gateway = CountingGateway()
+    durable_state = SQLiteLiveGatewayStateStore._for_testing(state_path)
+    crash_state = CrashBeforeSealState(durable_state)
+    first_server = ProtectedModelGatewayServer._for_testing(
+        gateway=gateway,
+        endpoint=endpoint,
+        token_source=lambda: "runner-owned-token-1234567890",
+        state=crash_state,
+    )
+    first_scope = _FakeIsolationScope()
+    first_runner = ProtectedLiveGatewayRunner._for_testing(
+        server=first_server,
+        workers=((os.geteuid(), os.getegid()), (os.geteuid() + 1, os.getegid() + 1)),
+        isolation=_FakeIsolation(first_scope),
+        execution_key=b"E" * 32,
+    )
+    thread = threading.Thread(
+        target=_serve_loopback_listener,
+        kwargs={
+            "listener_fd": listener.fileno(),
+            "server": first_server,
+            "maximum_connections": 1,
+        },
+        daemon=True,
+    )
+    thread.start()
+    try:
+        with pytest.raises(RuntimeError, match="crash-before-seal"):
+            first_runner.execute_worker(
+                identity=identity,
+                policy=policy,
+                task=task,
+                subject="parent",
+                attempt=1,
+                checkout=tmp_path / "parent",
+                executable=executable,
+                timeout_seconds=5,
+            )
+    finally:
+        thread.join(3)
+        listener.close()
+
+    assert crash_state.bundle is not None
+    with pytest.raises(LiveGatewayStateError, match="live_gateway_bundle_conflict"):
+        durable_state.seal_result_bundle(
+            hashlib.sha256(b"runner-owned-token-1234567890").hexdigest(),
+            runner_request_digest=_digest("different-runner-request"),
+            bundle=crash_state.bundle,
+        )
+
+    commissioned = SQLiteLiveGatewayCommissioningReader._for_testing(state_path).expected_actuals(
+        pair_request_digest=identity.request_digest,
+        task_id=task.task_id,
+        attempt=1,
+        subject="parent",
+    )
+    assert commissioned == (first_scope.process_id, first_scope.attestation_digest)
+
+    replay_scope = _FakeIsolationScope()
+    restarted = ProtectedLiveGatewayRunner._for_testing(
+        server=ProtectedModelGatewayServer._for_testing(
+            gateway=gateway,
+            endpoint=endpoint,
+            token_source=lambda: "must-not-be-issued-1234567890",
+            state=SQLiteLiveGatewayStateStore._for_testing(state_path),
+        ),
+        workers=((os.geteuid(), os.getegid()), (os.geteuid() + 1, os.getegid() + 1)),
+        isolation=_FakeIsolation(replay_scope),
+        execution_key=b"E" * 32,
+    )
+
+    resumed = restarted.execute_worker(
+        identity=identity,
+        policy=policy,
+        task=task,
+        subject="parent",
+        attempt=1,
+        checkout=tmp_path / "parent",
+        executable=executable,
+        timeout_seconds=5,
+    )
+
+    assert resumed.model_result.output_text == "runner output"
+    assert verify_execution_receipt(resumed.execution_receipt, key=b"E" * 32) is True
+    runner_request_digest = ProtectedLiveRunnerRequest.create(
+        identity=identity,
+        policy=policy,
+        task=task,
+        subject="parent",
+        attempt=1,
+        checkout=tmp_path / "parent",
+        executable=executable,
+        timeout_seconds=5,
+    ).digest
+    assert (
+        restarted.gateway_server.seal_resumed_execution_bundle(
+            runner_request_digest,
+            bundle=resumed,
+        )
+        == resumed
+    )
+    assert gateway.calls == 1
+    assert replay_scope.process_id == -1
+
+
 @pytest.mark.skipif(os.name == "nt", reason="requires POSIX process-group semantics")
 def test_runner_reaps_candidate_background_process_tree(
     tmp_path: Path,
@@ -1082,3 +1233,61 @@ def test_gateway_listener_thread_failure_is_fatal_to_service(
         monitor.check()
 
     assert isinstance(raised.value.__cause__, RuntimeError)
+
+
+def test_runner_listener_failure_interrupts_an_inflight_worker_promptly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from carl_bench import live_runner_service
+
+    server_connection, client_connection = socket.socketpair()
+    entered = threading.Event()
+    release = threading.Event()
+    errors: list[BaseException] = []
+
+    class OneConnectionListener:
+        def settimeout(self, timeout: float) -> None:
+            assert timeout <= 0.5
+
+        def accept(self) -> tuple[socket.socket, object]:
+            return server_connection, None
+
+    def blocking_connection(connection: socket.socket, *, runner: object) -> None:
+        del connection, runner
+        entered.set()
+        release.wait(5)
+
+    def health_check() -> None:
+        if entered.is_set():
+            raise RuntimeError("gateway-listener-died-inflight")
+
+    monkeypatch.setattr(live_runner_service, "_serve_connection", blocking_connection)
+
+    def serve() -> None:
+        try:
+            live_runner_service._serve_runner_listener(
+                listener=OneConnectionListener(),  # type: ignore[arg-type]
+                allowed_client_uid=os.geteuid(),
+                runner=object(),
+                maximum_connections=1,
+                health_check=health_check,
+            )
+        except BaseException as error:
+            errors.append(error)
+
+    thread = threading.Thread(target=serve, daemon=True)
+    started_at = time.monotonic()
+    thread.start()
+    try:
+        assert entered.wait(1)
+        thread.join(1)
+        assert thread.is_alive() is False
+        assert time.monotonic() - started_at < 1.5
+        assert len(errors) == 1
+        assert str(errors[0]) == "gateway-listener-died-inflight"
+    finally:
+        release.set()
+        thread.join(3)
+        client_connection.close()
+        with suppress(OSError):
+            server_connection.close()

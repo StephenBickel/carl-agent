@@ -31,6 +31,7 @@ class LiveExecutionCommissioningPolicy:
         "_cgroup_unit",
         "_checkout_root",
         "_executable_relative_path",
+        "_observations",
         "_timeout_seconds",
         "_workers",
     )
@@ -45,9 +46,15 @@ class LiveExecutionCommissioningPolicy:
     def from_protected_process(
         cls, *, workers: tuple[tuple[int, int], tuple[int, int]]
     ) -> LiveExecutionCommissioningPolicy:
+        from carl_bench.live_gateway_store import (
+            LiveGatewayStateError,
+            SQLiteLiveGatewayCommissioningReader,
+        )
+
         try:
             details = _PROTECTED_CHECKOUT_ROOT.lstat()
-        except OSError as error:
+            observations = SQLiteLiveGatewayCommissioningReader.from_protected_process()
+        except (OSError, LiveGatewayStateError) as error:
             raise LiveExecutionCommissioningError(
                 "live_execution_commissioning_not_available"
             ) from error
@@ -65,6 +72,7 @@ class LiveExecutionCommissioningPolicy:
             timeout_seconds=_TIMEOUT_SECONDS,
             workers=workers,
             cgroup_unit=_CGROUP_UNIT,
+            observations=observations,
         )
 
     @classmethod
@@ -77,6 +85,7 @@ class LiveExecutionCommissioningPolicy:
         timeout_seconds: int,
         workers: tuple[tuple[int, int], tuple[int, int]],
         cgroup_unit: str,
+        observations: object,
     ) -> LiveExecutionCommissioningPolicy:
         return cls._construct(
             checkout_root=checkout_root,
@@ -85,6 +94,7 @@ class LiveExecutionCommissioningPolicy:
             timeout_seconds=timeout_seconds,
             workers=workers,
             cgroup_unit=cgroup_unit,
+            observations=observations,
         )
 
     @classmethod
@@ -97,6 +107,7 @@ class LiveExecutionCommissioningPolicy:
         timeout_seconds: int,
         workers: tuple[tuple[int, int], tuple[int, int]],
         cgroup_unit: str,
+        observations: object,
     ) -> LiveExecutionCommissioningPolicy:
         relative = Path(executable_relative_path)
         if (
@@ -119,6 +130,7 @@ class LiveExecutionCommissioningPolicy:
                 for value in worker
             )
             or cgroup_unit != "carl-live-gateway.service"
+            or not callable(getattr(observations, "expected_actuals", None))
         ):
             raise LiveExecutionCommissioningError(
                 "live_execution_commissioning_configuration_invalid"
@@ -130,6 +142,7 @@ class LiveExecutionCommissioningPolicy:
         value._timeout_seconds = timeout_seconds
         value._workers = workers
         value._cgroup_unit = cgroup_unit
+        value._observations = observations
         return value
 
     @property
@@ -148,6 +161,20 @@ class LiveExecutionCommissioningPolicy:
             or receipt.timeout_seconds != self._timeout_seconds
             or (receipt.worker_uid, receipt.worker_gid) != worker
             or receipt.cgroup_unit != self._cgroup_unit
+        ):
+            return False
+        try:
+            expected_dynamic_actuals = self._observations.expected_actuals(
+                pair_request_digest=receipt.pair_request_digest,
+                task_id=receipt.task_id,
+                attempt=receipt.attempt,
+                subject=receipt.subject,
+            )
+        except Exception:
+            return False
+        if expected_dynamic_actuals != (
+            receipt.process_id,
+            receipt.cgroup_observation_digest,
         ):
             return False
         try:

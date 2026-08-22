@@ -359,6 +359,29 @@ class ProtectedLiveGatewayRunner:
             if not verify_execution_receipt(replayed.execution_receipt, key=self._execution_key):
                 raise LiveGatewayAuthorityError("live_gateway_bundle_invalid")
             return replayed
+        resumable = self._server.resume_completed_execution(runner_request_digest)
+        if resumable is not None:
+            model_result, stored_context = resumable
+            receipt_context = dict(stored_context)
+            if type(receipt_context.get("argv")) is list:
+                receipt_context["argv"] = tuple(receipt_context["argv"])
+            bundle = ProtectedLiveExecutionResult(
+                model_result=model_result,
+                execution_receipt=sign_execution_receipt(
+                    fields={
+                        **receipt_context,
+                        "model_result_digest": model_result_digest(model_result),
+                        "model_request_digest": model_result.request_digest,
+                        "model_output_digest": model_result.output_digest,
+                        "response_id": model_result.response_id,
+                    },
+                    key=self._execution_key,
+                ),
+            )
+            return self._server.seal_resumed_execution_bundle(
+                runner_request_digest,
+                bundle=bundle,
+            )
         expected_commit = (
             identity.parent_commit if subject == "parent" else identity.candidate_commit
         )
@@ -475,52 +498,16 @@ class ProtectedLiveGatewayRunner:
                 checkout_digest=pinned.checkout_digest,
                 isolation_digest=isolation_scope.attestation_digest,
             )
-            observation = ProtectedExecutionObservation._mint(
-                identity=identity,
-                policy=policy,
-                task=task,
-                actual=actual,
-            )
-            self._server._issue_observed_capability(
-                identity=observation.identity,
-                policy=observation.policy,
-                task=observation.task,
-                actual=observation.actual,
-                prepared=prepared,
-            )
-            capability_issued = True
-            os.write(write_descriptor, b"1")
-            os.close(write_descriptor)
-            write_descriptor = -1
-            try:
-                return_code = process.wait(timeout=timeout_seconds)
-            except subprocess.TimeoutExpired as error:
-                self._terminate_process_tree(process)
-                self._server.record_infrastructure_invalid(prepared.token, "runner_timeout")
-                execution_invalidated = True
-                raise LiveGatewayAuthorityError("live_worker_timeout") from error
-            if return_code != 0:
-                self._server.record_infrastructure_invalid(prepared.token, "runner_exit_nonzero")
-                execution_invalidated = True
-                raise LiveGatewayAuthorityError("live_worker_exit_nonzero")
-            try:
-                self._revalidate_checkout(pinned)
-            except LiveGatewayAuthorityError:
-                invalidate_execution("runner_execution_changed")
-                raise
-            cleanup_attempted = True
-            try:
-                isolation_scope.cleanup_and_verify_empty()
-            except LiveWorkerIsolationError as error:
-                invalidate_execution("runner_isolation_cleanup_failed")
-                raise LiveGatewayAuthorityError(error.code) from error
-            model_result = self._server.peek_completed_result(prepared)
             try:
                 isolation_observation = isolation_scope.receipt_observation()
             except Exception as error:
-                invalidate_execution("runner_isolation_observation_invalid")
                 raise LiveGatewayAuthorityError("live_worker_isolation_state_invalid") from error
-            fields = {
+            if (
+                type(isolation_observation) is not dict
+                or isolation_observation.get("cgroup_observation_digest") != actual.isolation_digest
+            ):
+                raise LiveGatewayAuthorityError("live_worker_isolation_state_invalid")
+            receipt_context = {
                 "argv": (os.fspath(executable), *arguments),
                 "timeout_seconds": timeout_seconds,
                 "repository": identity.repository,
@@ -555,6 +542,59 @@ class ProtectedLiveGatewayRunner:
                 "checkout_inode": pinned.root_identity[1],
                 "checkout_digest": pinned.checkout_digest,
                 **isolation_observation,
+            }
+            observation = ProtectedExecutionObservation._mint(
+                identity=identity,
+                policy=policy,
+                task=task,
+                actual=actual,
+            )
+            self._server._issue_observed_capability(
+                identity=observation.identity,
+                policy=observation.policy,
+                task=observation.task,
+                actual=observation.actual,
+                prepared=prepared,
+                runner_request_digest=runner_request_digest,
+                runner_context=receipt_context,
+            )
+            capability_issued = True
+            os.write(write_descriptor, b"1")
+            os.close(write_descriptor)
+            write_descriptor = -1
+            try:
+                return_code = process.wait(timeout=timeout_seconds)
+            except subprocess.TimeoutExpired as error:
+                self._terminate_process_tree(process)
+                self._server.record_infrastructure_invalid(prepared.token, "runner_timeout")
+                execution_invalidated = True
+                raise LiveGatewayAuthorityError("live_worker_timeout") from error
+            if return_code != 0:
+                self._server.record_infrastructure_invalid(prepared.token, "runner_exit_nonzero")
+                execution_invalidated = True
+                raise LiveGatewayAuthorityError("live_worker_exit_nonzero")
+            try:
+                self._revalidate_checkout(pinned)
+            except LiveGatewayAuthorityError:
+                invalidate_execution("runner_execution_changed")
+                raise
+            cleanup_attempted = True
+            try:
+                isolation_scope.cleanup_and_verify_empty()
+            except LiveWorkerIsolationError as error:
+                invalidate_execution("runner_isolation_cleanup_failed")
+                raise LiveGatewayAuthorityError(error.code) from error
+            model_result = self._server.peek_completed_result(prepared)
+            try:
+                completed_isolation_observation = isolation_scope.receipt_observation()
+            except Exception as error:
+                invalidate_execution("runner_isolation_observation_invalid")
+                raise LiveGatewayAuthorityError("live_worker_isolation_state_invalid") from error
+            if completed_isolation_observation != isolation_observation:
+                invalidate_execution("runner_isolation_observation_changed")
+                raise LiveGatewayAuthorityError("live_worker_isolation_state_invalid")
+            fields = {
+                **receipt_context,
                 "model_result_digest": model_result_digest(model_result),
                 "model_request_digest": model_result.request_digest,
                 "model_output_digest": model_result.output_digest,

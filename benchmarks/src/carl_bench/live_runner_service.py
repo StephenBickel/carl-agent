@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import socket
 import struct
+import threading
 from collections.abc import Callable
 
 from carl_bench.canonical import canonical_json_bytes
@@ -99,5 +100,32 @@ def _serve_runner_listener(
             if _peer_uid(connection) != allowed_client_uid:
                 continue
             connection.settimeout(30)
-            _serve_connection(connection, runner=runner)
+            if health_check is None:
+                _serve_connection(connection, runner=runner)
+            else:
+                completed = threading.Event()
+                errors: list[BaseException] = []
+
+                def serve(
+                    active_connection: socket.socket = connection,
+                    active_errors: list[BaseException] = errors,
+                    active_completed: threading.Event = completed,
+                ) -> None:
+                    try:
+                        _serve_connection(active_connection, runner=runner)
+                    except BaseException as error:
+                        active_errors.append(error)
+                    finally:
+                        active_completed.set()
+
+                worker = threading.Thread(
+                    target=serve,
+                    daemon=True,
+                    name="carl-live-runner-connection",
+                )
+                worker.start()
+                while not completed.wait(0.05):
+                    health_check()
+                if errors:
+                    raise errors[0]
             served += 1

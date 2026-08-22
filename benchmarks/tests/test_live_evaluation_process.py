@@ -276,6 +276,11 @@ def test_live_evaluator_systemd_contract_commissions_deterministic_cgroup_isolat
 
     assert service.read(root / "carl-live-evaluator.service")
     assert socket_unit.read(root / "carl-live-evaluator.socket")
+    assert service["Unit"] == {
+        "Description": "Carl protected live evidence evaluator",
+        "After": "carl-live-gateway.service",
+        "Requires": "carl-live-evaluator.socket carl-live-gateway.service",
+    }
     assert service["Service"] == {
         "Type": "simple",
         "ExecStart": "/opt/carl/venv/bin/carl-live-evaluation-service",
@@ -292,7 +297,7 @@ def test_live_evaluator_systemd_contract_commissions_deterministic_cgroup_isolat
         "ProtectKernelModules": "yes",
         "ProtectKernelTunables": "yes",
         "ProtectSystem": "strict",
-        "ReadOnlyPaths": "/srv/carl/checkouts",
+        "ReadOnlyPaths": "/srv/carl/checkouts /var/lib/carl/live-gateway/state.sqlite3",
         "RestrictAddressFamilies": "AF_UNIX",
         "UMask": "0077",
     }

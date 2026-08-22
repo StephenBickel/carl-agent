@@ -19,7 +19,10 @@ from carl_bench.live_capability import (
     LivePairPolicy,
     LiveTaskIdentity,
 )
-from carl_bench.live_execution_receipt import ProtectedLiveExecutionResult
+from carl_bench.live_execution_receipt import (
+    ProtectedExecutionReceipt,
+    ProtectedLiveExecutionResult,
+)
 from carl_bench.live_gateway_store import LiveGatewayStateError, SQLiteLiveGatewayStateStore
 from carl_bench.openai_gateway import (
     OpenAIGatewayError,
@@ -180,8 +183,16 @@ class _GatewayState(Protocol):
 
     def load_sealed_bundle(self, runner_request_digest: str) -> dict[str, Any] | None: ...
 
+    def load_resumable_result(
+        self, runner_request_digest: str
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]] | None: ...
+
     def seal_result_bundle(
         self, token_digest: str, *, runner_request_digest: str, bundle: dict[str, Any]
+    ) -> dict[str, Any]: ...
+
+    def seal_resumed_result_bundle(
+        self, runner_request_digest: str, *, bundle: dict[str, Any]
     ) -> dict[str, Any]: ...
 
     def record_infrastructure_invalid(self, token_digest: str, code: str) -> None: ...
@@ -324,7 +335,21 @@ class _MemoryGatewayState:
     def reserve_grant(self, **kwargs: object) -> None:
         token = kwargs["token_digest"]
         issue = kwargs["issue_key"]
-        if token in self.rows or issue in self.issues:
+        runner_request_digest = kwargs.get("runner_request_digest")
+        runner_context = kwargs.get("runner_context")
+        if (runner_request_digest is None) != (runner_context is None):
+            raise LiveGatewayStateError("live_gateway_runner_binding_invalid")
+        if (
+            token in self.rows
+            or issue in self.issues
+            or (
+                runner_request_digest is not None
+                and any(
+                    row["runner_request_digest"] == runner_request_digest
+                    for row in self.rows.values()
+                )
+            )
+        ):
             raise LiveGatewayStateError("live_gateway_grant_conflict")
         self.issues.add(issue)
         self.rows[token] = {
@@ -339,7 +364,8 @@ class _MemoryGatewayState:
             "collected": False,
             "infrastructure_code": None,
             "provider_request_digest": None,
-            "runner_request_digest": None,
+            "runner_request_digest": kwargs.get("runner_request_digest"),
+            "runner_context": kwargs.get("runner_context"),
             "sealed_bundle": None,
         }
 
@@ -431,8 +457,25 @@ class _MemoryGatewayState:
         for row in self.rows.values():
             if row["runner_request_digest"] == runner_request_digest:
                 if row["sealed_bundle"] is None:
-                    raise LiveGatewayStateError("live_gateway_bundle_invalid")
+                    return None
                 return row["sealed_bundle"]
+        return None
+
+    def load_resumable_result(
+        self, runner_request_digest: str
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]] | None:
+        for row in self.rows.values():
+            if row["runner_request_digest"] != runner_request_digest:
+                continue
+            if row["sealed_bundle"] is not None:
+                return None
+            if (
+                row["claim_state"] != "completed"
+                or row["result"] is None
+                or type(row["runner_context"]) is not dict
+            ):
+                raise LiveGatewayStateError("live_gateway_execution_resume_unavailable")
+            return row["grant"], row["result"], row["runner_context"]
         return None
 
     def seal_result_bundle(
@@ -456,9 +499,10 @@ class _MemoryGatewayState:
             row["collected"]
             or row["claim_state"] != "completed"
             or row["result"] is None
+            or row["runner_request_digest"] not in {None, runner_request_digest}
             or bundle.get("model_result") != row["result"]
             or any(
-                existing["runner_request_digest"] == runner_request_digest
+                existing is not row and existing["runner_request_digest"] == runner_request_digest
                 for existing in self.rows.values()
             )
         ):
@@ -467,6 +511,21 @@ class _MemoryGatewayState:
         row["sealed_bundle"] = bundle
         row["collected"] = True
         return bundle
+
+    def seal_resumed_result_bundle(
+        self,
+        runner_request_digest: str,
+        *,
+        bundle: dict[str, Any],
+    ) -> dict[str, Any]:
+        for token_digest, row in self.rows.items():
+            if row["runner_request_digest"] == runner_request_digest:
+                return self.seal_result_bundle(
+                    token_digest,
+                    runner_request_digest=runner_request_digest,
+                    bundle=bundle,
+                )
+        raise LiveGatewayStateError("live_gateway_execution_resume_unavailable")
 
     def record_infrastructure_invalid(self, token_digest: str, code: str) -> None:
         row = self.rows.get(token_digest)
@@ -823,6 +882,8 @@ class ProtectedModelGatewayServer:
         task: LiveTaskIdentity,
         actual: ActualLiveExecution,
         prepared: BoundedModelGatewayCapability | None = None,
+        runner_request_digest: str | None = None,
+        runner_context: dict[str, Any] | None = None,
     ) -> BoundedModelGatewayCapability:
         if (
             not isinstance(identity, LiveEvaluationIdentity)
@@ -832,8 +893,12 @@ class ProtectedModelGatewayServer:
             or task.task_id not in identity.task_order
             or task.grader_digest != identity.grader_digest
             or identity.attempts > policy.maximum_pair_retries + 1
+            or (runner_request_digest is None) != (runner_context is None)
+            or (runner_context is not None and type(runner_context) is not dict)
         ):
             raise LiveGatewayAuthorityError("live_execution_binding_mismatch")
+        if runner_request_digest is not None:
+            _digest(runner_request_digest, "live_gateway_runner_binding_invalid")
         try:
             protected_policy = self._gateway.protected_execution_policy()
         except Exception as error:
@@ -909,6 +974,8 @@ class ProtectedModelGatewayServer:
                 attempt=actual.attempt,
                 subject=actual.subject,
                 grant=_grant_document(grant),
+                runner_request_digest=runner_request_digest,
+                runner_context=runner_context,
             )
         except LiveGatewayStateError as error:
             code = (
@@ -1125,6 +1192,106 @@ class ProtectedModelGatewayServer:
         if not verified:
             raise LiveGatewayAuthorityError("live_gateway_bundle_invalid")
         return bundle
+
+    def resume_completed_execution(
+        self, runner_request_digest: str
+    ) -> tuple[ProtectedOpenAIModelResult, dict[str, Any]] | None:
+        _digest(runner_request_digest, "live_gateway_bundle_invalid")
+        try:
+            resumed = self._state.load_resumable_result(runner_request_digest)
+        except LiveGatewayStateError as error:
+            raise LiveGatewayAuthorityError(error.code) from error
+        if resumed is None:
+            return None
+        grant_document, result_document, context = resumed
+        try:
+            grant = _grant_from_document(grant_document)
+            result = _result_from_document(result_document)
+            verified = self._gateway.verify_protected_result(result)
+        except Exception as error:
+            raise LiveGatewayAuthorityError("live_gateway_bundle_invalid") from error
+        expected_context_fields = set(ProtectedExecutionReceipt.__dataclass_fields__) - {
+            "schema_version",
+            "model_result_digest",
+            "model_request_digest",
+            "model_output_digest",
+            "response_id",
+            "key_id",
+            "signature",
+        }
+        actual = grant.actual
+        expected_binding = {
+            "attempt": actual.attempt,
+            "checkout_digest": actual.checkout_digest,
+            "cgroup_observation_digest": actual.isolation_digest,
+            "environment_digest": actual.environment_digest,
+            "executable_digest": actual.executable_digest,
+            "execution_context_digest": actual.execution_context_digest,
+            "grader_digest": actual.grader_digest,
+            "input_digest": actual.input_digest,
+            "input_size": actual.input_size,
+            "live_policy_digest": actual.live_policy_digest,
+            "model": actual.model,
+            "model_policy_digest": grant.identity.model_policy_digest,
+            "pair_request_digest": actual.pair_request_digest,
+            "process_id": actual.process_id,
+            "reasoning_policy": actual.reasoning_policy,
+            "repository": actual.repository,
+            "seed": actual.seed,
+            "subject": actual.subject,
+            "subject_commit": actual.subject_commit,
+            "subject_tree": actual.subject_tree,
+            "task_digest": actual.task_digest,
+            "task_id": actual.task_id,
+            "task_role": actual.task_role,
+            "worker_gid": actual.worker_gid,
+            "worker_uid": actual.worker_uid,
+        }
+        expected_request = grant.identity.model_request_digest(
+            subject=actual.subject,
+            task=grant.task,
+            policy=grant.policy,
+            seed=actual.seed,
+            attempt=actual.attempt,
+        )
+        if (
+            not verified
+            or result.request_digest != expected_request
+            or set(context) != expected_context_fields
+            or any(context.get(name) != value for name, value in expected_binding.items())
+        ):
+            raise LiveGatewayAuthorityError("live_gateway_runner_binding_invalid")
+        return result, context
+
+    def seal_resumed_execution_bundle(
+        self,
+        runner_request_digest: str,
+        *,
+        bundle: ProtectedLiveExecutionResult,
+    ) -> ProtectedLiveExecutionResult:
+        if not isinstance(bundle, ProtectedLiveExecutionResult):
+            raise LiveGatewayAuthorityError("live_gateway_bundle_invalid")
+        resumed = self.resume_completed_execution(runner_request_digest)
+        if resumed is None:
+            replayed = self.replay_sealed_execution_bundle(runner_request_digest)
+            if replayed != bundle:
+                raise LiveGatewayAuthorityError("live_gateway_bundle_invalid")
+            return replayed
+        result, _ = resumed
+        if bundle.model_result != result:
+            raise LiveGatewayAuthorityError("live_gateway_bundle_conflict")
+        try:
+            sealed = self._state.seal_resumed_result_bundle(
+                runner_request_digest,
+                bundle=bundle.to_canonical_dict(),
+            )
+            recovered = ProtectedLiveExecutionResult.from_canonical_dict(sealed)
+        except (LiveGatewayStateError, ValueError) as error:
+            code = getattr(error, "code", "live_gateway_bundle_invalid")
+            raise LiveGatewayAuthorityError(code) from error
+        if recovered != bundle:
+            raise LiveGatewayAuthorityError("live_gateway_bundle_conflict")
+        return recovered
 
     def seal_execution_bundle(
         self,
