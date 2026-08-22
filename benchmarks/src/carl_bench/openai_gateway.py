@@ -9,7 +9,9 @@ import re
 import ssl
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -36,14 +38,12 @@ _REQUEST_FIELDS = frozenset(
         "task_id",
     }
 )
-_RESPONSE_FIELDS = frozenset(
+_RESPONSE_REQUIRED_FIELDS = frozenset(
     {"error", "id", "incomplete_details", "metadata", "model", "output", "status", "usage"}
 )
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$")
 _REPOSITORY_RE = re.compile(r"^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$")
 _API_KEY_RE = re.compile(r"^sk-[A-Za-z0-9_-]{16,508}$")
-_RESPONSE_ID_RE = re.compile(r"^resp_[0-9a-f]{16,64}$")
-_MESSAGE_ID_RE = re.compile(r"^msg_[0-9a-f]{16,64}$")
 _DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 _MAX_REQUEST_BYTES = 131_072
 _MAX_INPUT_BYTES = 65_536
@@ -52,6 +52,7 @@ _MAX_OUTPUT_BYTES = 65_536
 _MAX_TOKENS = 1_000_000
 _HTTP_TIMEOUT_SECONDS = 30.0
 _OVERALL_TIMEOUT_SECONDS = 30.0
+_CLEANUP_TIMEOUT_SECONDS = 5.0
 _POLL_INTERVAL_SECONDS = 1.0
 _MAX_POLLS = 4
 
@@ -227,6 +228,16 @@ class OpenAIModelResult:
     output_text: str
 
 
+@dataclass(frozen=True, slots=True)
+class ProtectedOpenAIModelResult(OpenAIModelResult):
+    """Result produced only by the fixed protected-environment gateway path."""
+
+
+@dataclass(frozen=True, slots=True)
+class SyntheticOpenAIModelResult(OpenAIModelResult):
+    """Untrusted result produced by an injected transport."""
+
+
 class _UrllibResponsesTransport:
     __slots__ = ("__context",)
 
@@ -274,7 +285,7 @@ class _UrllibResponsesTransport:
 class OpenAIModelGateway:
     """Controller-only model boundary with fixed provider policy and transport authority."""
 
-    __slots__ = ("__api_key", "__monotonic", "__sleep", "__transport")
+    __slots__ = ("__api_key", "__monotonic", "__protected", "__sleep", "__transport")
 
     def __new__(cls, *args: object, **kwargs: object) -> OpenAIModelGateway:
         del cls, args, kwargs
@@ -290,13 +301,25 @@ class OpenAIModelGateway:
         return key
 
     @classmethod
-    def _construct(
+    def from_protected_environment(cls) -> OpenAIModelGateway:
+        """Construct the fixed production transport from controller-owned environment state."""
+        gateway = object.__new__(cls)
+        gateway.__api_key = cls._read_controller_key()
+        gateway.__transport = _UrllibResponsesTransport()
+        gateway.__monotonic = time.monotonic
+        gateway.__sleep = time.sleep
+        gateway.__protected = True
+        return gateway
+
+    @classmethod
+    def _for_testing(
         cls,
         *,
         transport: _ResponsesTransport,
-        monotonic: Callable[[], float],
-        sleep: Callable[[float], None],
+        monotonic: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> OpenAIModelGateway:
+        """Construct an explicitly synthetic gateway for bounded offline tests."""
         if (
             not callable(getattr(transport, "send", None))
             or not callable(monotonic)
@@ -308,32 +331,14 @@ class OpenAIModelGateway:
         gateway.__transport = transport
         gateway.__monotonic = monotonic
         gateway.__sleep = sleep
+        gateway.__protected = False
         return gateway
-
-    @classmethod
-    def from_protected_environment(cls) -> OpenAIModelGateway:
-        """Construct the fixed production transport from controller-owned environment state."""
-        return cls._construct(
-            transport=_UrllibResponsesTransport(),
-            monotonic=time.monotonic,
-            sleep=time.sleep,
-        )
-
-    @classmethod
-    def _for_testing(
-        cls,
-        *,
-        transport: _ResponsesTransport,
-        monotonic: Callable[[], float] = time.monotonic,
-        sleep: Callable[[float], None] = time.sleep,
-    ) -> OpenAIModelGateway:
-        """Inject only bounded I/O and time; protected request policy remains fixed."""
-        return cls._construct(transport=transport, monotonic=monotonic, sleep=sleep)
 
     def evaluate(self, request: OpenAIModelRequest) -> OpenAIModelResult:
         if not isinstance(request, OpenAIModelRequest):
             raise OpenAIGatewayError("openai_request_invalid")
         started = self._now()
+        deadline = started + _OVERALL_TIMEOUT_SECONDS
         metadata = self._metadata(request)
         request_body = canonical_json_bytes(
             {
@@ -359,43 +364,64 @@ class OpenAIModelGateway:
         headers = {
             "Authorization": f"Bearer {self.__api_key}",
             "Content-Type": "application/json",
-            "Idempotency-Key": f"carl-openai-{request.request_digest}",
         }
-        initial = self._create_response(headers=headers, body=request_body)
+        initial = self._create_response(headers=headers, body=request_body, deadline=deadline)
         observed = self._validate_observation(initial, request, expected_response_id=None)
         response_id = observed["id"]
+        if self._now() >= deadline:
+            if observed["status"] in {"queued", "in_progress"}:
+                self._cancel_and_reconcile(response_id, request, deadline)
+            raise OpenAIGatewayError("openai_response_timeout")
         if observed["status"] not in {"queued", "in_progress"}:
-            return self._terminal_result(observed, request, started)
+            return self._terminal_result(observed, request, started, deadline)
 
         polls = 0
         while polls < _MAX_POLLS:
-            if self._now() - started > _OVERALL_TIMEOUT_SECONDS:
-                self._cancel_and_reconcile(response_id, request)
+            remaining = deadline - self._now()
+            if remaining <= 0:
+                self._cancel_and_reconcile(response_id, request, deadline)
                 raise OpenAIGatewayError("openai_response_timeout")
-            self.__sleep(_POLL_INTERVAL_SECONDS)
+            self.__sleep(min(_POLL_INTERVAL_SECONDS, remaining))
+            if self._now() >= deadline:
+                self._cancel_and_reconcile(response_id, request, deadline)
+                raise OpenAIGatewayError("openai_response_timeout")
             polls += 1
             response = self._send(
                 method="GET",
-                path=f"/v1/responses/{response_id}",
+                path=self._response_path(response_id),
                 headers=self._read_headers(),
                 body=None,
+                deadline=deadline,
             )
             observed = self._validate_observation(
                 response, request, expected_response_id=response_id
             )
+            if self._now() >= deadline:
+                if observed["status"] in {"queued", "in_progress"}:
+                    self._cancel_and_reconcile(response_id, request, deadline)
+                raise OpenAIGatewayError("openai_response_timeout")
             if observed["status"] not in {"queued", "in_progress"}:
-                return self._terminal_result(observed, request, started)
-        self._cancel_and_reconcile(response_id, request)
+                return self._terminal_result(observed, request, started, deadline)
+        self._cancel_and_reconcile(response_id, request, deadline)
         raise OpenAIGatewayError("openai_response_timeout")
 
-    def _create_response(self, *, headers: dict[str, str], body: bytes) -> OpenAIHTTPResponse:
+    def _create_response(
+        self, *, headers: dict[str, str], body: bytes, deadline: float
+    ) -> OpenAIHTTPResponse:
+        ambiguous = False
         try:
-            return self._send(method="POST", path="/v1/responses", headers=headers, body=body)
+            response = self._send(
+                method="POST",
+                path="/v1/responses",
+                headers=headers,
+                body=body,
+                deadline=deadline,
+            )
         except OpenAITransportAmbiguous:
-            try:
-                return self._send(method="POST", path="/v1/responses", headers=headers, body=body)
-            except Exception:
-                raise OpenAIGatewayError("openai_response_ambiguous") from None
+            ambiguous = True
+        if ambiguous:
+            raise OpenAIGatewayError("openai_create_ambiguous") from None
+        return response
 
     def _send(
         self,
@@ -404,19 +430,31 @@ class OpenAIModelGateway:
         path: str,
         headers: dict[str, str],
         body: bytes | None,
+        deadline: float,
     ) -> OpenAIHTTPResponse:
+        remaining = deadline - self._now()
+        if remaining <= 0:
+            raise OpenAIGatewayError("openai_response_timeout")
+        request_headers = dict(headers)
+        request_headers["X-Client-Request-Id"] = f"carl-{uuid.uuid4().hex}"
+        ambiguous = False
+        unavailable = False
         try:
             response = self.__transport.send(
                 method=method,
                 path=path,
-                headers=headers,
+                headers=request_headers,
                 body=body,
-                timeout_seconds=_HTTP_TIMEOUT_SECONDS,
+                timeout_seconds=min(_HTTP_TIMEOUT_SECONDS, remaining),
                 max_response_bytes=_MAX_RESPONSE_BYTES,
             )
         except OpenAITransportAmbiguous:
-            raise
+            ambiguous = True
         except Exception:
+            unavailable = True
+        if ambiguous:
+            raise OpenAITransportAmbiguous("openai_transport_ambiguous") from None
+        if unavailable:
             raise OpenAIGatewayError("openai_provider_unavailable") from None
         if not isinstance(response, OpenAIHTTPResponse):
             raise OpenAIGatewayError("openai_provider_unavailable")
@@ -430,34 +468,55 @@ class OpenAIModelGateway:
             raise OpenAIGatewayError("openai_response_malformed")
         return response
 
-    def _cancel_and_reconcile(self, response_id: str, request: OpenAIModelRequest) -> None:
-        path = f"/v1/responses/{response_id}/cancel"
+    def _cancel_and_reconcile(
+        self, response_id: str, request: OpenAIModelRequest, overall_deadline: float
+    ) -> None:
+        cleanup_deadline = min(
+            overall_deadline + _CLEANUP_TIMEOUT_SECONDS,
+            self._now() + _CLEANUP_TIMEOUT_SECONDS,
+        )
+        path = f"{self._response_path(response_id)}/cancel"
         headers = self._cancel_headers(request, response_id)
         ambiguous = False
         try:
-            cancelled = self._send(method="POST", path=path, headers=headers, body=b"{}")
+            cancelled = self._send(
+                method="POST",
+                path=path,
+                headers=headers,
+                body=b"{}",
+                deadline=cleanup_deadline,
+            )
             self._validate_observation(cancelled, request, expected_response_id=response_id)
         except OpenAITransportAmbiguous:
             ambiguous = True
         except OpenAIGatewayError:
             pass
-        reconciled_status = self._reconcile_cancel(response_id, request)
+        reconciled_status = self._reconcile_cancel(response_id, request, cleanup_deadline)
         if not ambiguous or reconciled_status not in {"queued", "in_progress"}:
             return
         try:
-            replayed = self._send(method="POST", path=path, headers=headers, body=b"{}")
+            replayed = self._send(
+                method="POST",
+                path=path,
+                headers=headers,
+                body=b"{}",
+                deadline=cleanup_deadline,
+            )
             self._validate_observation(replayed, request, expected_response_id=response_id)
         except (OpenAIGatewayError, OpenAITransportAmbiguous):
             pass
-        self._reconcile_cancel(response_id, request)
+        self._reconcile_cancel(response_id, request, cleanup_deadline)
 
-    def _reconcile_cancel(self, response_id: str, request: OpenAIModelRequest) -> str | None:
+    def _reconcile_cancel(
+        self, response_id: str, request: OpenAIModelRequest, deadline: float
+    ) -> str | None:
         try:
             reconciled = self._send(
                 method="GET",
-                path=f"/v1/responses/{response_id}",
+                path=self._response_path(response_id),
                 headers=self._read_headers(),
                 body=None,
+                deadline=deadline,
             )
             value = self._validate_observation(
                 reconciled, request, expected_response_id=response_id
@@ -475,17 +534,34 @@ class OpenAIModelGateway:
         expected_response_id: str | None,
     ) -> dict[str, Any]:
         value = _decode_json_object(response.body, request=False)
-        if set(value) != _RESPONSE_FIELDS:
+        if not _RESPONSE_REQUIRED_FIELDS.issubset(value) or len(value) > 64:
             raise OpenAIGatewayError("openai_response_malformed")
         response_id = value["id"]
-        if not isinstance(response_id, str) or _RESPONSE_ID_RE.fullmatch(response_id) is None:
-            raise OpenAIGatewayError("openai_response_identity_invalid")
+        self._bounded_provider_id(response_id, "openai_response_identity_invalid")
         if expected_response_id is not None and response_id != expected_response_id:
             raise OpenAIGatewayError("openai_response_identity_mismatch")
         if value["model"] != _MODEL:
             raise OpenAIGatewayError("openai_response_model_mismatch")
         if value["metadata"] != self._metadata(request):
             raise OpenAIGatewayError("openai_response_metadata_mismatch")
+        if value.get("object") != "response":
+            raise OpenAIGatewayError("openai_response_malformed")
+        if value.get("instructions") != _INSTRUCTIONS:
+            raise OpenAIGatewayError("openai_response_malformed")
+        if value.get("max_output_tokens") != 4096:
+            raise OpenAIGatewayError("openai_response_malformed")
+        if value.get("store") is not True or value.get("tools") != []:
+            raise OpenAIGatewayError("openai_response_malformed")
+        if value.get("tool_choice") != "none":
+            raise OpenAIGatewayError("openai_response_malformed")
+        reasoning = value.get("reasoning")
+        if (
+            type(reasoning) is not dict
+            or len(reasoning) > 8
+            or reasoning.get("effort") != "medium"
+            or reasoning.get("summary") is not None
+        ):
+            raise OpenAIGatewayError("openai_response_malformed")
         status = value["status"]
         if status not in {
             "queued",
@@ -504,7 +580,11 @@ class OpenAIModelGateway:
         return value
 
     def _terminal_result(
-        self, value: dict[str, Any], request: OpenAIModelRequest, started: float
+        self,
+        value: dict[str, Any],
+        request: OpenAIModelRequest,
+        started: float,
+        deadline: float,
     ) -> OpenAIModelResult:
         status = value["status"]
         failure_codes = {
@@ -523,11 +603,15 @@ class OpenAIModelGateway:
             raise OpenAIGatewayError("openai_response_malformed")
         output_text = self._parse_output(value["output"])
         usage = self._parse_usage(value["usage"])
-        elapsed = self._now() - started
-        if not 0 <= elapsed <= _OVERALL_TIMEOUT_SECONDS + _HTTP_TIMEOUT_SECONDS:
+        finished = self._now()
+        elapsed = finished - started
+        if elapsed < 0:
             raise OpenAIGatewayError("openai_clock_invalid")
+        if finished > deadline:
+            raise OpenAIGatewayError("openai_response_timeout")
         output_bytes = output_text.encode("utf-8")
-        return OpenAIModelResult(
+        result_type = ProtectedOpenAIModelResult if self.__protected else SyntheticOpenAIModelResult
+        return result_type(
             response_id=value["id"],
             model=value["model"],
             status=status,
@@ -543,22 +627,20 @@ class OpenAIModelGateway:
         if type(value) is not list or len(value) != 1:
             raise OpenAIGatewayError("openai_response_output_invalid")
         message = value[0]
-        if type(message) is not dict or set(message) != {
-            "content",
-            "id",
-            "role",
-            "status",
-            "type",
-        }:
+        required_message_fields = {"content", "id", "role", "status", "type"}
+        if (
+            type(message) is not dict
+            or not required_message_fields.issubset(message)
+            or len(message) > 16
+        ):
             raise OpenAIGatewayError("openai_response_output_invalid")
         if (
             message["type"] != "message"
             or message["role"] != "assistant"
             or message["status"] != "completed"
-            or not isinstance(message["id"], str)
-            or _MESSAGE_ID_RE.fullmatch(message["id"]) is None
         ):
             raise OpenAIGatewayError("openai_response_output_invalid")
+        OpenAIModelGateway._bounded_provider_id(message["id"], "openai_response_output_invalid")
         content = message["content"]
         if type(content) is not list or len(content) != 1:
             raise OpenAIGatewayError("openai_response_output_invalid")
@@ -567,13 +649,13 @@ class OpenAIModelGateway:
             raise OpenAIGatewayError("openai_response_output_invalid")
         if item.get("type") == "refusal":
             raise OpenAIGatewayError("openai_response_refused")
-        if set(item) != {"annotations", "logprobs", "text", "type"}:
+        if not {"annotations", "text", "type"}.issubset(item) or len(item) > 16:
             raise OpenAIGatewayError("openai_response_output_invalid")
         text = item["text"]
         if (
             item["type"] != "output_text"
             or item["annotations"] != []
-            or item["logprobs"] != []
+            or ("logprobs" in item and item["logprobs"] != [])
             or not isinstance(text, str)
             or not text
             or "\x00" in text
@@ -589,23 +671,34 @@ class OpenAIModelGateway:
 
     @staticmethod
     def _parse_usage(value: object) -> OpenAIUsage:
-        if type(value) is not dict or set(value) != {
+        required_fields = {
             "input_tokens",
             "input_tokens_details",
             "output_tokens",
             "output_tokens_details",
             "total_tokens",
-        }:
+        }
+        if type(value) is not dict or not required_fields.issubset(value) or len(value) > 16:
             raise OpenAIGatewayError("openai_response_usage_invalid")
         input_details = value["input_tokens_details"]
         output_details = value["output_tokens_details"]
-        if type(input_details) is not dict or set(input_details) != {"cached_tokens"}:
+        if (
+            type(input_details) is not dict
+            or "cached_tokens" not in input_details
+            or len(input_details) > 16
+        ):
             raise OpenAIGatewayError("openai_response_usage_invalid")
-        if type(output_details) is not dict or set(output_details) != {"reasoning_tokens"}:
+        if (
+            type(output_details) is not dict
+            or "reasoning_tokens" not in output_details
+            or len(output_details) > 16
+        ):
             raise OpenAIGatewayError("openai_response_usage_invalid")
+        cache_write_tokens = input_details.get("cache_write_tokens", 0)
         numbers = (
             value["input_tokens"],
             input_details["cached_tokens"],
+            cache_write_tokens,
             value["output_tokens"],
             output_details["reasoning_tokens"],
             value["total_tokens"],
@@ -617,9 +710,17 @@ class OpenAIModelGateway:
             for number in numbers
         ):
             raise OpenAIGatewayError("openai_response_usage_invalid")
-        input_tokens, cached_tokens, output_tokens, reasoning_tokens, total_tokens = numbers
+        (
+            input_tokens,
+            cached_tokens,
+            cache_write_tokens,
+            output_tokens,
+            reasoning_tokens,
+            total_tokens,
+        ) = numbers
         if (
             cached_tokens > input_tokens
+            or cache_write_tokens > input_tokens
             or reasoning_tokens > output_tokens
             or total_tokens != input_tokens + output_tokens
         ):
@@ -651,11 +752,31 @@ class OpenAIModelGateway:
         return {"Authorization": f"Bearer {self.__api_key}"}
 
     def _cancel_headers(self, request: OpenAIModelRequest, response_id: str) -> dict[str, str]:
+        del request, response_id
         return {
             "Authorization": f"Bearer {self.__api_key}",
             "Content-Type": "application/json",
-            "Idempotency-Key": (f"carl-openai-cancel-{request.request_digest}-{response_id}"),
         }
+
+    @staticmethod
+    def _bounded_provider_id(value: object, code: str) -> str:
+        if not isinstance(value, str) or not value:
+            raise OpenAIGatewayError(code)
+        try:
+            encoded = value.encode("utf-8")
+        except UnicodeError:
+            raise OpenAIGatewayError(code) from None
+        if len(encoded) > 512 or any(
+            ord(character) < 32 or ord(character) == 127 for character in value
+        ):
+            raise OpenAIGatewayError(code)
+        return value
+
+    @classmethod
+    def _response_path(cls, response_id: object) -> str:
+        bounded = cls._bounded_provider_id(response_id, "openai_response_identity_invalid")
+        quoted = urllib.parse.quote(bounded, safe="").replace(".", "%2E")
+        return f"/v1/responses/{quoted}"
 
     def _now(self) -> float:
         try:

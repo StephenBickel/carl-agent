@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import traceback
 from dataclasses import replace
 
 import pytest
 
+import carl_bench.openai_gateway as openai_gateway
 from carl_bench.openai_gateway import (
     OpenAIGatewayError,
     OpenAIHTTPResponse,
@@ -113,13 +115,28 @@ def _response_document(
             }
         ]
     return {
+        "completed_at": 1_741_486_165 if status == "completed" else None,
+        "created_at": 1_741_486_164,
         "error": error,
         "id": response_id,
         "incomplete_details": incomplete_details,
+        "instructions": INSTRUCTIONS,
+        "max_output_tokens": 4096,
         "metadata": metadata or _metadata(),
         "model": model,
+        "object": "response",
         "output": output,
+        "parallel_tool_calls": True,
+        "previous_response_id": None,
+        "reasoning": {"effort": "medium", "summary": None},
         "status": status,
+        "store": True,
+        "temperature": 1.0,
+        "text": {"format": {"type": "text"}},
+        "tool_choice": "none",
+        "tools": [],
+        "top_p": 1.0,
+        "truncation": "disabled",
         "usage": {
             "input_tokens": 12,
             "input_tokens_details": {"cached_tokens": 3},
@@ -127,6 +144,66 @@ def _response_document(
             "output_tokens_details": {"reasoning_tokens": 2},
             "total_tokens": 19,
         },
+    }
+
+
+def _documented_response(
+    *,
+    status: str = "completed",
+    response_id: str = "response.future/opaque?id=1",
+    output: list[object] | None = None,
+) -> dict[str, object]:
+    """A bounded fixture shaped like the official create/retrieve examples."""
+    if output is None:
+        output = [
+            {
+                "id": "message.future/opaque?id=1",
+                "type": "message",
+                "status": "completed",
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": "café",
+                        "annotations": [],
+                        "future_content_property": None,
+                    }
+                ],
+                "future_message_property": None,
+            }
+        ]
+    return {
+        "id": response_id,
+        "object": "response",
+        "created_at": 1_741_486_164,
+        "status": status,
+        "completed_at": 1_741_486_165 if status == "completed" else None,
+        "error": None,
+        "incomplete_details": None,
+        "instructions": INSTRUCTIONS,
+        "max_output_tokens": 4096,
+        "model": MODEL,
+        "output": output,
+        "parallel_tool_calls": True,
+        "previous_response_id": None,
+        "reasoning": {"effort": "medium", "summary": None},
+        "store": True,
+        "temperature": 1.0,
+        "text": {"format": {"type": "text"}},
+        "tool_choice": "none",
+        "tools": [],
+        "top_p": 1.0,
+        "truncation": "disabled",
+        "usage": {
+            "input_tokens": 12,
+            "input_tokens_details": {"cached_tokens": 3, "cache_write_tokens": 0},
+            "output_tokens": 7,
+            "output_tokens_details": {"reasoning_tokens": 2},
+            "total_tokens": 19,
+        },
+        "user": None,
+        "metadata": _metadata(),
+        "future_top_level_property": {"revision": 2},
     }
 
 
@@ -169,14 +246,48 @@ class FakeTransport:
 
 class Clock:
     def __init__(self, values: list[float] | None = None) -> None:
-        self.values = iter(values or [100.0, 100.125])
+        self.values = list(values or [100.0, 100.0, 100.125])
+        self.index = 0
         self.sleeps: list[float] = []
 
     def monotonic(self) -> float:
-        return next(self.values)
+        value = self.values[min(self.index, len(self.values) - 1)]
+        self.index += 1
+        return value
 
     def sleep(self, seconds: float) -> None:
         self.sleeps.append(seconds)
+
+
+class AdvancingClock:
+    def __init__(self) -> None:
+        self.value = 0.0
+        self.sleeps: list[float] = []
+
+    def monotonic(self) -> float:
+        return self.value
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.value += seconds
+
+
+class AdvancingTransport(FakeTransport):
+    def __init__(
+        self,
+        outcomes: list[OpenAIHTTPResponse | Exception],
+        durations: list[float],
+        clock: AdvancingClock,
+    ) -> None:
+        super().__init__(outcomes)
+        self.durations = list(durations)
+        self.clock = clock
+
+    def send(self, **kwargs: object) -> OpenAIHTTPResponse:
+        try:
+            return super().send(**kwargs)  # type: ignore[arg-type]
+        finally:
+            self.clock.value += self.durations.pop(0)
 
 
 def _gateway(
@@ -217,6 +328,10 @@ def test_exact_protected_responses_request_and_recorded_attestation(
     result = gateway.evaluate(_request())
 
     digest = _expected_digest()
+    client_request_id = transport.calls[0]["headers"]["X-Client-Request-Id"]  # type: ignore[index]
+    assert isinstance(client_request_id, str)
+    assert client_request_id.startswith("carl-")
+    assert len(client_request_id) <= 512
     assert transport.calls == [
         {
             "body": _canonical(
@@ -245,7 +360,7 @@ def test_exact_protected_responses_request_and_recorded_attestation(
             "headers": {
                 "Authorization": f"Bearer {API_KEY}",
                 "Content-Type": "application/json",
-                "Idempotency-Key": f"carl-openai-{digest}",
+                "X-Client-Request-Id": client_request_id,
             },
             "max_response_bytes": 1_048_576,
             "method": "POST",
@@ -349,9 +464,11 @@ def test_timeout_cancels_once_and_reconciles_exact_response(
 ) -> None:
     active = _response_document(status="in_progress", output=[])
     cancelled = _response_document(status="cancelled", output=[])
-    clock = Clock([0.0, 31.0, 31.1])
-    transport = FakeTransport(
-        [_http_response(active), _http_response(cancelled), _http_response(cancelled)]
+    clock = AdvancingClock()
+    transport = AdvancingTransport(
+        [_http_response(active), _http_response(cancelled), _http_response(cancelled)],
+        [30.0, 0.0, 0.0],
+        clock,
     )
 
     with pytest.raises(OpenAIGatewayError, match="^openai_response_timeout$"):
@@ -364,11 +481,9 @@ def test_timeout_cancels_once_and_reconciles_exact_response(
     ]
     cancel_call = transport.calls[1]
     assert cancel_call["body"] == b"{}"
-    assert cancel_call["headers"] == {
-        "Authorization": f"Bearer {API_KEY}",
-        "Content-Type": "application/json",
-        "Idempotency-Key": (f"carl-openai-cancel-{_expected_digest()}-resp_0123456789abcdef"),
-    }
+    assert cancel_call["headers"]["Authorization"] == f"Bearer {API_KEY}"  # type: ignore[index]
+    assert cancel_call["headers"]["Content-Type"] == "application/json"  # type: ignore[index]
+    assert "Idempotency-Key" not in cancel_call["headers"]  # type: ignore[operator]
 
 
 def test_ambiguous_cancel_reconciles_before_one_exact_replay(
@@ -376,15 +491,17 @@ def test_ambiguous_cancel_reconciles_before_one_exact_replay(
 ) -> None:
     active = _http_response(_response_document(status="in_progress", output=[]))
     cancelled = _http_response(_response_document(status="cancelled", output=[]))
-    clock = Clock([0.0, 31.0])
-    transport = FakeTransport(
+    clock = AdvancingClock()
+    transport = AdvancingTransport(
         [
             active,
             OpenAITransportAmbiguous("raw provider detail"),
             active,
             cancelled,
             cancelled,
-        ]
+        ],
+        [30.0, 0.0, 0.0, 0.0, 0.0],
+        clock,
     )
 
     with pytest.raises(OpenAIGatewayError, match="^openai_response_timeout$"):
@@ -397,20 +514,24 @@ def test_ambiguous_cancel_reconciles_before_one_exact_replay(
         ("POST", "/v1/responses/resp_0123456789abcdef/cancel"),
         ("GET", "/v1/responses/resp_0123456789abcdef"),
     ]
-    assert transport.calls[3] == transport.calls[1]
+    assert transport.calls[3]["method"] == transport.calls[1]["method"]
+    assert transport.calls[3]["path"] == transport.calls[1]["path"]
+    assert transport.calls[3]["body"] == transport.calls[1]["body"]
+    assert (
+        transport.calls[3]["headers"]["X-Client-Request-Id"]  # type: ignore[index]
+        != transport.calls[1]["headers"]["X-Client-Request-Id"]  # type: ignore[index]
+    )
 
 
-def test_ambiguous_create_replays_only_exact_idempotent_request(
+def test_ambiguous_create_stops_before_a_second_chargeable_post(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    recovered = _http_response(_response_document())
-    transport = FakeTransport([OpenAITransportAmbiguous("raw token secret"), recovered])
+    transport = FakeTransport([OpenAITransportAmbiguous("raw token secret")])
 
-    result = _gateway(monkeypatch, transport).evaluate(_request())
+    with pytest.raises(OpenAIGatewayError, match="^openai_create_ambiguous$"):
+        _gateway(monkeypatch, transport).evaluate(_request())
 
-    assert result.status == "completed"
-    assert len(transport.calls) == 2
-    assert transport.calls[1] == transport.calls[0]
+    assert len(transport.calls) == 1
 
 
 @pytest.mark.parametrize("http_status", (400, 401, 403, 404, 409, 429, 500, 503))
@@ -453,7 +574,7 @@ def test_clear_provider_failures_are_redacted_and_never_selectively_retried(
         ),
         ({"status": "expired", "output": []}, "openai_response_expired"),
         ({"model": "candidate-model"}, "openai_response_model_mismatch"),
-        ({"response_id": "resp_cross_request"}, "openai_response_identity_invalid"),
+        ({"response_id": ""}, "openai_response_identity_invalid"),
     ),
 )
 def test_terminal_failure_and_identity_states_fail_closed(
@@ -575,3 +696,94 @@ def test_transport_is_private_test_only_and_cannot_override_policy(
     request = _request()
     with pytest.raises(TypeError):
         replace(request, model="candidate-model")  # type: ignore[call-arg]
+
+
+def test_documented_response_shape_additions_and_opaque_ids_are_accepted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport = FakeTransport([_http_response(_documented_response())])
+
+    result = _gateway(monkeypatch, transport).evaluate(_request())
+
+    assert result.response_id == "response.future/opaque?id=1"
+    assert result.output_text == "café"
+    assert result.usage.cached_input_tokens == 3
+
+
+def test_ambiguous_create_is_not_replayed_and_scrubs_provider_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret = f"Authorization: Bearer {API_KEY}; prompt=hidden reasoning"
+    transport = FakeTransport([OpenAITransportAmbiguous(secret)])
+
+    with pytest.raises(OpenAIGatewayError, match="^openai_create_ambiguous$") as failure:
+        _gateway(monkeypatch, transport).evaluate(_request())
+
+    assert len(transport.calls) == 1
+    headers = transport.calls[0]["headers"]
+    assert isinstance(headers, dict)
+    assert "Idempotency-Key" not in headers
+    assert isinstance(headers.get("X-Client-Request-Id"), str)
+    assert failure.value.__cause__ is None
+    assert failure.value.__context__ is None
+    rendered = "".join(traceback.format_exception(failure.value))
+    assert API_KEY not in rendered
+    assert "hidden reasoning" not in rendered
+
+
+def test_one_deadline_bounds_create_poll_cancel_and_reconciliation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = AdvancingClock()
+    active = _http_response(
+        _documented_response(
+            status="in_progress",
+            response_id="resp_deadline/opaque",
+            output=[],
+        )
+    )
+    cancelled = _http_response(
+        _documented_response(
+            status="cancelled",
+            response_id="resp_deadline/opaque",
+            output=[],
+        )
+    )
+    transport = AdvancingTransport(
+        [active, active, cancelled, cancelled],
+        [20.0, 9.0, 3.0, 1.0],
+        clock,
+    )
+
+    with pytest.raises(OpenAIGatewayError, match="^openai_response_timeout$"):
+        _gateway(monkeypatch, transport, clock).evaluate(_request())
+
+    assert [(call["method"], call["path"]) for call in transport.calls] == [
+        ("POST", "/v1/responses"),
+        ("GET", "/v1/responses/resp_deadline%2Fopaque"),
+        ("POST", "/v1/responses/resp_deadline%2Fopaque/cancel"),
+        ("GET", "/v1/responses/resp_deadline%2Fopaque"),
+    ]
+    assert [call["timeout_seconds"] for call in transport.calls] == pytest.approx(
+        [30.0, 9.0, 5.0, 2.0]
+    )
+    assert clock.value <= 35.0
+
+
+def test_injected_transport_can_only_return_synthetic_provenance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert hasattr(openai_gateway, "SyntheticOpenAIModelResult")
+    assert hasattr(openai_gateway, "ProtectedOpenAIModelResult")
+    synthetic_type = openai_gateway.SyntheticOpenAIModelResult
+    protected_type = openai_gateway.ProtectedOpenAIModelResult
+
+    result = _gateway(
+        monkeypatch,
+        FakeTransport([_http_response(_documented_response())]),
+    ).evaluate(_request())
+
+    assert type(result) is synthetic_type
+    assert not isinstance(result, protected_type)
+    protected_gateway = OpenAIModelGateway.from_protected_environment()
+    assert type(protected_gateway) is OpenAIModelGateway
