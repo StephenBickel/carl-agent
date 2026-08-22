@@ -27,6 +27,7 @@ from carl_bench.live_capability import (
     LiveEvaluationIdentity,
     LivePairPolicy,
     LiveTaskIdentity,
+    LiveTrialEvidence,
     ProtectedLivePair,
 )
 from carl_bench.openai_gateway import (
@@ -43,6 +44,7 @@ _REASON = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,255}$")
 _DETERMINISTIC = "protected_deterministic_pair"
 _LIVE = "protected_live_pair"
 _RESULT_PURPOSE = "protected-combined-capability"
+_GRADER_PURPOSE = "protected-live-grader-outcome"
 _MAX_BYTES = 8_388_608
 _LIFETIME = timedelta(hours=6)
 
@@ -168,6 +170,10 @@ class ProtectedArchiveReader(Protocol):
     def read_exact(self, object_key: str, version_id: str) -> ProtectedArchiveVersion: ...
 
 
+class ProtectedLiveGrader(Protocol):
+    def grade(self, *, identity: object, task: object, result: object) -> int: ...
+
+
 @dataclass(frozen=True, slots=True, init=False)
 class DeterministicRunLease:
     request_digest: str
@@ -291,8 +297,11 @@ class ProtectedLiveEvaluationAuthority:
         "_det_key",
         "_deterministic_runs",
         "_gateway",
+        "_grader",
+        "_grader_key",
         "_live_key",
         "_result_key",
+        "_worker_identities",
     )
 
     def __new__(cls, *args: object, **kwargs: object) -> ProtectedLiveEvaluationAuthority:
@@ -312,10 +321,29 @@ class ProtectedLiveEvaluationAuthority:
             raise LiveEvaluationAuthorityError("live_authority_key_invalid")
         return key
 
+    @staticmethod
+    def _environment_worker_identity(prefix: str) -> tuple[int, int]:
+        uid_text = os.environ.get(f"CARL_{prefix}_WORKER_UID")
+        gid_text = os.environ.get(f"CARL_{prefix}_WORKER_GID")
+        if (
+            not isinstance(uid_text, str)
+            or not isinstance(gid_text, str)
+            or not uid_text.isdecimal()
+            or not gid_text.isdecimal()
+            or str(int(uid_text)) != uid_text
+            or str(int(gid_text)) != gid_text
+        ):
+            raise LiveEvaluationAuthorityError("live_worker_identity_missing")
+        uid, gid = int(uid_text), int(gid_text)
+        if not 1 <= uid <= 2_147_483_647 or not 1 <= gid <= 2_147_483_647:
+            raise LiveEvaluationAuthorityError("live_worker_identity_invalid")
+        return uid, gid
+
     @classmethod
     def from_protected_process(cls) -> ProtectedLiveEvaluationAuthority:
         """Construct every production dependency from fixed protected-process policy."""
         from carl_bench.live_archive_client import ProtectedArchiveSocketReader
+        from carl_bench.live_grader import ProtectedGraderBundle
 
         try:
             gateway = OpenAIModelGateway.from_protected_environment()
@@ -326,13 +354,25 @@ class ProtectedLiveEvaluationAuthority:
             }:
                 raise LiveEvaluationAuthorityError("live_acp_credential_missing") from error
             raise LiveEvaluationAuthorityError("live_gateway_unavailable") from error
+        worker_identities = (
+            cls._environment_worker_identity("PARENT"),
+            cls._environment_worker_identity("CANDIDATE"),
+        )
+        if worker_identities[0] == worker_identities[1] or os.geteuid() in {
+            worker_identities[0][0],
+            worker_identities[1][0],
+        }:
+            raise LiveEvaluationAuthorityError("live_worker_identity_invalid")
         return cls._construct(
             archive=ProtectedArchiveSocketReader.from_protected_environment(),
             gateway=gateway,
+            grader=ProtectedGraderBundle.from_protected_process(),
             clock=lambda: datetime.now(UTC),
             deterministic_key=cls._environment_key("CARL_DETERMINISTIC_ATTESTATION_KEY_B64"),
             live_key=cls._environment_key("CARL_LIVE_ATTESTATION_KEY_B64"),
             result_key=cls._environment_key("CARL_COMBINED_EVIDENCE_KEY_B64"),
+            grader_key=cls._environment_key("CARL_GRADER_ATTESTATION_KEY_B64"),
+            worker_identities=worker_identities,
         )
 
     @classmethod
@@ -341,10 +381,13 @@ class ProtectedLiveEvaluationAuthority:
         *,
         archive: ProtectedArchiveReader,
         gateway: object,
+        grader: object | None = None,
         clock: Callable[[], datetime],
         deterministic_key: bytes,
         live_key: bytes,
         result_key: bytes,
+        grader_key: bytes | None = None,
+        worker_identities: tuple[tuple[int, int], tuple[int, int]] | None = None,
     ) -> ProtectedLiveEvaluationAuthority:
         if (
             not callable(getattr(archive, "read_exact", None))
@@ -356,10 +399,13 @@ class ProtectedLiveEvaluationAuthority:
         return cls._construct(
             archive=archive,
             gateway=gateway,
+            grader=grader,
             clock=clock,
             deterministic_key=deterministic_key,
             live_key=live_key,
             result_key=result_key,
+            grader_key=grader_key,
+            worker_identities=worker_identities,
         )
 
     @classmethod
@@ -368,23 +414,38 @@ class ProtectedLiveEvaluationAuthority:
         *,
         archive: ProtectedArchiveReader,
         gateway: object,
+        grader: object | None,
         clock: Callable[[], datetime],
         deterministic_key: bytes,
         live_key: bytes,
         result_key: bytes,
+        grader_key: bytes | None,
+        worker_identities: tuple[tuple[int, int], tuple[int, int]] | None,
     ) -> ProtectedLiveEvaluationAuthority:
+        if (grader is None) != (grader_key is None) or (
+            grader is not None and not callable(getattr(grader, "grade", None))
+        ):
+            raise LiveEvaluationAuthorityError("live_authority_grader_invalid")
         for key in (deterministic_key, live_key, result_key):
             try:
                 attest_bound_payload(b"key-check", purpose="key-check", key=key)
             except ValueError as error:
                 raise LiveEvaluationAuthorityError("live_authority_key_invalid") from error
+        if grader_key is not None:
+            try:
+                attest_bound_payload(b"key-check", purpose="key-check", key=grader_key)
+            except ValueError as error:
+                raise LiveEvaluationAuthorityError("live_authority_key_invalid") from error
         value = object.__new__(cls)
         value._archive = archive
         value._gateway = gateway
+        value._grader = grader
+        value._grader_key = grader_key
         value._clock = clock
         value._det_key = deterministic_key
         value._live_key = live_key
         value._result_key = result_key
+        value._worker_identities = worker_identities
         value._deterministic_runs: dict[str, _DeterministicRunState] = {}
         return value
 
@@ -669,6 +730,12 @@ class ProtectedLiveEvaluationAuthority:
             metric_pack_path=metric_pack_path,
             policy_path=policy_path,
             mode="improvement",
+            parent_identity=(
+                self._worker_identities[0] if self._worker_identities is not None else None
+            ),
+            candidate_identity=(
+                self._worker_identities[1] if self._worker_identities is not None else None
+            ),
             live_evaluation_identity=run.identity,
         )
         after = {
@@ -791,6 +858,83 @@ class ProtectedLiveEvaluationAuthority:
             kind=_DETERMINISTIC, payload=payload, key=self._det_key, now=self._now()
         )
 
+    def _grader_receipt(
+        self,
+        *,
+        pair: ProtectedLivePair,
+        trial: LiveTrialEvidence,
+        model_result_digest: str,
+    ) -> dict[str, Any]:
+        if self._grader is None or self._grader_key is None:
+            raise LiveEvaluationAuthorityError("live_grader_receipt_invalid")
+        if trial.status == "valid":
+            if type(trial.model_result) is not ProtectedOpenAIModelResult:
+                raise LiveEvaluationAuthorityError("live_grader_receipt_invalid")
+            try:
+                protected_score = self._grader.grade(
+                    identity=pair.identity,
+                    task=trial.task,
+                    result=trial.model_result,
+                )
+            except Exception as error:
+                raise LiveEvaluationAuthorityError("live_grader_receipt_invalid") from error
+            if (
+                isinstance(protected_score, bool)
+                or not isinstance(protected_score, int)
+                or not 0 <= protected_score <= 10_000
+                or protected_score != trial.score_basis_points
+            ):
+                raise LiveEvaluationAuthorityError("live_grader_receipt_invalid")
+            model_request_digest: str | None = trial.model_result.request_digest
+            model_output_digest: str | None = trial.model_result.output_digest
+        else:
+            protected_score = 0
+            model_request_digest = None
+            model_output_digest = None
+        unsigned = {
+            "attempt": trial.attempt,
+            "attempt_identity": trial.attempt_identity,
+            "domain": "carl.protected-live-grader-outcome.v1",
+            "evaluation_request_digest": pair.identity.request_digest,
+            "execution_context_digest": pair.identity.execution_context_digest(
+                subject=trial.subject,
+                task=trial.task,
+                policy=pair.policy,
+                seed=trial.seed,
+                attempt=trial.attempt,
+            ),
+            "infrastructure_code": trial.infrastructure_code,
+            "live_policy_digest": hashlib.sha256(
+                canonical_json_bytes(pair.policy.to_canonical_dict())
+            ).hexdigest(),
+            "model_output_digest": model_output_digest,
+            "model_request_digest": model_request_digest,
+            "model_result_digest": model_result_digest,
+            "schema_version": 1,
+            "score_basis_points": protected_score,
+            "seed": trial.seed,
+            "status": trial.status,
+            "subject": trial.subject,
+            "subject_commit": trial.subject_commit,
+            "subject_tree": (
+                pair.identity.parent_tree
+                if trial.subject == "parent"
+                else pair.identity.candidate_tree
+            ),
+            "task": trial.task.to_canonical_dict(),
+            "workflow_digest": pair.identity.workflow_digest,
+            "workflow_revision": pair.identity.workflow_revision,
+        }
+        try:
+            key_id, signature = attest_bound_payload(
+                canonical_json_bytes(unsigned),
+                purpose=_GRADER_PURPOSE,
+                key=self._grader_key,
+            )
+        except ValueError as error:
+            raise LiveEvaluationAuthorityError("live_grader_receipt_invalid") from error
+        return {**unsigned, "key_id": key_id, "signature": signature}
+
     def seal_live_pair(self, pair: ProtectedLivePair) -> bytes:
         if not isinstance(pair, ProtectedLivePair):
             raise LiveEvaluationAuthorityError("live_evidence_invalid")
@@ -809,6 +953,7 @@ class ProtectedLiveEvaluationAuthority:
             raise LiveEvaluationAuthorityError("live_evidence_mutated")
         contexts: list[str] = []
         results: list[str] = []
+        grader_receipts: list[dict[str, Any]] = []
         for subject, trials in (
             ("parent", pair.parent_trials),
             ("candidate", pair.candidate_trials),
@@ -826,18 +971,25 @@ class ProtectedLiveEvaluationAuthority:
                 if trial.status == "valid":
                     if type(trial.model_result) is not ProtectedOpenAIModelResult:
                         raise LiveEvaluationAuthorityError("live_model_provenance_invalid")
-                    results.append(_model_digest(trial.model_result))
+                    model_result_digest = _model_digest(trial.model_result)
                 else:
-                    results.append(
-                        hashlib.sha256(
-                            canonical_json_bytes(
-                                {"code": trial.infrastructure_code, "status": trial.status}
-                            )
-                        ).hexdigest()
+                    model_result_digest = hashlib.sha256(
+                        canonical_json_bytes(
+                            {"code": trial.infrastructure_code, "status": trial.status}
+                        )
+                    ).hexdigest()
+                results.append(model_result_digest)
+                grader_receipts.append(
+                    self._grader_receipt(
+                        pair=pair,
+                        trial=trial,
+                        model_result_digest=model_result_digest,
                     )
+                )
         payload = {
             "eligible": pair.eligible,
             "execution_context_digests": contexts,
+            "grader_receipts": grader_receipts,
             "identity": pair.identity.to_canonical_dict(),
             "inconclusive": pair.inconclusive,
             "live_pair_digest": pair.digest,
@@ -1000,6 +1152,7 @@ class ProtectedLiveEvaluationAuthority:
         if set(value) != {
             "eligible",
             "execution_context_digests",
+            "grader_receipts",
             "identity",
             "inconclusive",
             "live_pair_digest",
@@ -1065,6 +1218,128 @@ class ProtectedLiveEvaluationAuthority:
             for task in tasks
             for attempt, seed in enumerate(identity.seeds, start=1)
         ]
+        grader_receipts = value["grader_receipts"]
+        if (
+            type(grader_receipts) is not list
+            or len(grader_receipts) != expected_count
+            or self._grader_key is None
+        ):
+            raise LiveEvaluationAuthorityError("live_grader_receipt_invalid")
+        expected_rows = [
+            (subject, task, attempt, seed)
+            for subject in ("parent", "candidate")
+            for task in tasks
+            for attempt, seed in enumerate(identity.seeds, start=1)
+        ]
+        scores: dict[tuple[str, str], list[int]] = {
+            (subject, task.task_id): [] for subject in ("parent", "candidate") for task in tasks
+        }
+        receipt_fields = {
+            "attempt",
+            "attempt_identity",
+            "domain",
+            "evaluation_request_digest",
+            "execution_context_digest",
+            "infrastructure_code",
+            "key_id",
+            "live_policy_digest",
+            "model_output_digest",
+            "model_request_digest",
+            "model_result_digest",
+            "schema_version",
+            "score_basis_points",
+            "seed",
+            "signature",
+            "status",
+            "subject",
+            "subject_commit",
+            "subject_tree",
+            "task",
+            "workflow_digest",
+            "workflow_revision",
+        }
+        policy_digest = hashlib.sha256(canonical_json_bytes(policy.to_canonical_dict())).hexdigest()
+        for index, (receipt, expected_row) in enumerate(
+            zip(grader_receipts, expected_rows, strict=True)
+        ):
+            subject, task, attempt, seed = expected_row
+            if type(receipt) is not dict or set(receipt) != receipt_fields:
+                raise LiveEvaluationAuthorityError("live_grader_receipt_invalid")
+            unsigned = {
+                key: item for key, item in receipt.items() if key not in {"key_id", "signature"}
+            }
+            if not verify_bound_payload_attestation(
+                canonical_json_bytes(unsigned),
+                purpose=_GRADER_PURPOSE,
+                key=self._grader_key,
+                expected_key_id=receipt["key_id"],
+                signature=receipt["signature"],
+            ):
+                raise LiveEvaluationAuthorityError("live_grader_receipt_invalid")
+            expected_commit = (
+                identity.parent_commit if subject == "parent" else identity.candidate_commit
+            )
+            expected_tree = identity.parent_tree if subject == "parent" else identity.candidate_tree
+            expected_request = identity.model_request_digest(
+                subject=subject,
+                task=task,
+                policy=policy,
+                seed=seed,
+                attempt=attempt,
+            )
+            score = receipt["score_basis_points"]
+            status = receipt["status"]
+            if (
+                receipt["domain"] != "carl.protected-live-grader-outcome.v1"
+                or receipt["schema_version"] != 1
+                or receipt["evaluation_request_digest"] != identity.request_digest
+                or receipt["execution_context_digest"] != expected_contexts[index]
+                or receipt["live_policy_digest"] != policy_digest
+                or receipt["model_result_digest"] != results[index]
+                or receipt["subject"] != subject
+                or receipt["subject_commit"] != expected_commit
+                or receipt["subject_tree"] != expected_tree
+                or receipt["task"] != task.to_canonical_dict()
+                or receipt["attempt"] != attempt
+                or receipt["seed"] != seed
+                or receipt["workflow_digest"] != identity.workflow_digest
+                or receipt["workflow_revision"] != identity.workflow_revision
+                or not isinstance(receipt["attempt_identity"], str)
+                or _DIGEST.fullmatch(receipt["attempt_identity"]) is None
+                or isinstance(score, bool)
+                or not isinstance(score, int)
+                or not 0 <= score <= 10_000
+            ):
+                raise LiveEvaluationAuthorityError("live_grader_receipt_invalid")
+            if status == "valid":
+                if (
+                    receipt["infrastructure_code"] is not None
+                    or receipt["model_request_digest"] != expected_request
+                    or not isinstance(receipt["model_output_digest"], str)
+                    or _DIGEST.fullmatch(receipt["model_output_digest"]) is None
+                ):
+                    raise LiveEvaluationAuthorityError("live_grader_receipt_invalid")
+            elif status == "infrastructure_invalid":
+                if (
+                    not isinstance(receipt["infrastructure_code"], str)
+                    or receipt["model_request_digest"] is not None
+                    or receipt["model_output_digest"] is not None
+                    or score != 0
+                ):
+                    raise LiveEvaluationAuthorityError("live_grader_receipt_invalid")
+            else:
+                raise LiveEvaluationAuthorityError("live_grader_receipt_invalid")
+            scores[(subject, task.task_id)].append(score)
+        protected_deltas = tuple(
+            (
+                task.task_id,
+                sum(scores[("candidate", task.task_id)]) // identity.attempts
+                - sum(scores[("parent", task.task_id)]) // identity.attempts,
+            )
+            for task in tasks
+        )
+        if protected_deltas != deltas:
+            raise LiveEvaluationAuthorityError("live_grader_receipt_invalid")
         try:
             gateway_policy = self._gateway.protected_execution_policy()
         except Exception as error:

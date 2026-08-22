@@ -259,6 +259,42 @@ def test_trusted_harness_executes_exact_carl_binaries_and_owns_scoring(tmp_path:
     }
 
 
+@pytest.mark.skipif(os.name == "nt", reason="requires POSIX subject process semantics")
+def test_subject_binary_cannot_read_protected_evaluator_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Removing the explicit child environment must expose the protected test credential."""
+    subject = tmp_path / "credential-probe"
+    subject.write_text(
+        "#!/bin/sh\n"
+        "set -eu\n"
+        "printf '%s\\n' \"${OPENAI_API_KEY-unset}\"\n"
+        "printf '%s\\n' \"${CARL_OPENAI_PROVENANCE_KEY_B64-unset}\"\n"
+        "env | LC_ALL=C sort\n",
+        encoding="utf-8",
+    )
+    subject.chmod(0o755)
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-protected-secret-visible-to-candidate")
+    monkeypatch.setenv("CARL_OPENAI_PROVENANCE_KEY_B64", "protected-provenance-secret")
+
+    exit_code, stdout, stderr, timed_out, overflow = cloud_harness._bounded_process(
+        subject,
+        (),
+        timeout_seconds=2,
+        output_limit=16_384,
+        subject_identity=None,
+    )
+
+    assert exit_code == 0
+    assert stderr == b""
+    assert timed_out is False
+    assert overflow is False
+    assert b"sk-protected-secret-visible-to-candidate" not in stdout
+    assert b"protected-provenance-secret" not in stdout
+    assert b"OPENAI_API_KEY=" not in stdout
+    assert b"CARL_OPENAI_PROVENANCE_KEY_B64=" not in stdout
+
+
 def test_deterministic_harness_binds_the_exact_live_pair_identity(tmp_path: Path) -> None:
     objects = _objects(tmp_path)
     immutable = {

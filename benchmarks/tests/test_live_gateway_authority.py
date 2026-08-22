@@ -5,7 +5,7 @@ import json
 import multiprocessing
 import os
 import socket
-from dataclasses import replace
+from inspect import signature
 
 import pytest
 
@@ -22,6 +22,7 @@ from carl_bench.live_gateway_authority import (
 )
 from carl_bench.live_gateway_http import _serve_loopback_listener
 from carl_bench.openai_gateway import (
+    OpenAIGatewayError,
     OpenAIModelRequest,
     OpenAIModelResult,
     OpenAIUsage,
@@ -192,14 +193,74 @@ def test_server_rejects_any_actual_execution_binding_mutation(field: str, value:
     )
 
     with pytest.raises(LiveGatewayAuthorityError, match="live_execution_binding_mismatch"):
-        server.issue_capability(
+        server.issue_observed_capability_for_testing(
             identity=identity,
             policy=policy,
             task=task,
             subject="candidate",
             attempt=1,
-            actual=replace(_actual(identity, policy, task), **{field: value}),
+            observed_overrides={field: value},
         )
+
+
+def test_gateway_capability_cannot_be_issued_from_caller_declared_execution() -> None:
+    """The protected runner, not a caller-supplied dataclass, must own process observation."""
+    assert "actual" not in signature(ProtectedModelGatewayServer.issue_capability).parameters
+    with pytest.raises(LiveGatewayAuthorityError, match="live_execution_observation_protected"):
+        _actual(_identity(), _policy(), _task())
+
+
+def test_gateway_result_lifecycle_survives_server_restart(tmp_path) -> None:
+    """Removing the durable store must lose the completed result after reconstruction."""
+    from carl_bench.live_gateway_store import SQLiteLiveGatewayStateStore
+
+    identity = _identity()
+    policy = _policy()
+    task = _task()
+    store = SQLiteLiveGatewayStateStore._for_testing(tmp_path / "gateway.sqlite3")
+    first = ProtectedModelGatewayServer._for_testing(
+        gateway=_PinnedGateway(),
+        endpoint="http://127.0.0.1:43117/v1/evaluate",
+        token_source=lambda: "pair-task-token-1234567890",
+        state=store,
+    )
+    capability = first.issue_observed_capability_for_testing(
+        identity=identity,
+        policy=policy,
+        task=task,
+        subject="candidate",
+        attempt=1,
+    )
+    evaluated = first.evaluate(capability.token, "held-out prompt")
+
+    restarted = ProtectedModelGatewayServer._for_testing(
+        gateway=_PinnedGateway(),
+        endpoint="http://127.0.0.1:43117/v1/evaluate",
+        token_source=lambda: "unused-restart-token-1234567890",
+        state=SQLiteLiveGatewayStateStore._for_testing(tmp_path / "gateway.sqlite3"),
+    )
+
+    assert restarted.take_completed_result(capability) == evaluated
+    with pytest.raises(LiveGatewayAuthorityError, match="live_gateway_result_consumed"):
+        restarted.take_completed_result(capability)
+
+
+def test_protected_gateway_runner_has_supervised_entrypoint_and_owns_process_execution() -> None:
+    from importlib.metadata import entry_points
+
+    from carl_bench.live_gateway_runner import ProtectedLiveGatewayRunner
+
+    assert "actual" not in signature(ProtectedModelGatewayServer.issue_capability).parameters
+    assert (
+        "process_launcher"
+        not in signature(ProtectedLiveGatewayRunner.from_protected_process).parameters
+    )
+    entry = next(
+        item
+        for item in entry_points(group="console_scripts")
+        if item.name == "carl-live-gateway-service"
+    )
+    assert entry.load().__module__ == "carl_bench.live_gateway_service"
 
 
 def test_server_consumes_exact_capability_once_and_owns_model_request() -> None:
@@ -213,13 +274,12 @@ def test_server_consumes_exact_capability_once_and_owns_model_request() -> None:
         endpoint="http://127.0.0.1:43117/v1/evaluate",
         token_source=lambda: next(tokens),
     )
-    capability = server.issue_capability(
+    capability = server.issue_observed_capability_for_testing(
         identity=identity,
         policy=policy,
         task=task,
         subject="candidate",
         attempt=1,
-        actual=_actual(identity, policy, task),
     )
 
     result = server.evaluate(capability.token, "held-out prompt")
@@ -227,21 +287,20 @@ def test_server_consumes_exact_capability_once_and_owns_model_request() -> None:
     assert type(result) is ProtectedOpenAIModelResult
     assert len(gateway.requests) == 1
     request = gateway.requests[0]
-    assert (
-        request.execution_context_digest == _actual(identity, policy, task).execution_context_digest
+    assert request.execution_context_digest == identity.execution_context_digest(
+        subject="candidate", task=task, policy=policy, seed=41, attempt=1
     )
     assert request.request_digest == identity.model_request_digest(
         subject="candidate", task=task, policy=policy, seed=41, attempt=1
     )
     with pytest.raises(LiveGatewayAuthorityError, match="live_gateway_capability_consumed"):
         server.evaluate(capability.token, "held-out prompt")
-    parent_capability = server.issue_capability(
+    parent_capability = server.issue_observed_capability_for_testing(
         identity=identity,
         policy=policy,
         task=task,
         subject="parent",
         attempt=1,
-        actual=_actual(identity, policy, task, subject="parent"),
     )
     with pytest.raises(LiveGatewayAuthorityError, match="live_gateway_input_mismatch"):
         server.evaluate(parent_capability.token, "changed prompt")
@@ -256,13 +315,12 @@ def test_protected_evaluator_collects_authenticated_result_once_by_exact_capabil
         endpoint="http://127.0.0.1:43117/v1/evaluate",
         token_source=lambda: "pair-task-token-1234567890",
     )
-    capability = server.issue_capability(
+    capability = server.issue_observed_capability_for_testing(
         identity=identity,
         policy=policy,
         task=task,
         subject="candidate",
         attempt=1,
-        actual=_actual(identity, policy, task),
     )
     evaluated = server.evaluate(capability.token, "held-out prompt")
 
@@ -289,43 +347,67 @@ def test_retry_capability_requires_exact_pair_scoped_infrastructure_failure() ->
         endpoint="http://127.0.0.1:43117/v1/evaluate",
         token_source=lambda: next(tokens),
     )
-    parent = server.issue_capability(
+    parent = server.issue_observed_capability_for_testing(
         identity=identity,
         policy=policy,
         task=task,
         subject="parent",
         attempt=1,
-        actual=_actual(identity, policy, task, subject="parent"),
     )
-    candidate = server.issue_capability(
+    candidate = server.issue_observed_capability_for_testing(
         identity=identity,
         policy=policy,
         task=task,
         subject="candidate",
         attempt=1,
-        actual=_actual(identity, policy, task),
     )
 
     with pytest.raises(LiveGatewayAuthorityError, match="live_retry_not_authorized"):
-        server.issue_capability(
+        server.issue_observed_capability_for_testing(
             identity=identity,
             policy=policy,
             task=task,
             subject="candidate",
             attempt=2,
-            actual=_actual(identity, policy, task, attempt=2),
         )
     server.record_infrastructure_invalid(parent.token, "runner_internal_error")
     server.record_infrastructure_invalid(candidate.token, "runner_internal_error")
-    retry = server.issue_capability(
+    retry = server.issue_observed_capability_for_testing(
         identity=identity,
         policy=policy,
         task=task,
         subject="candidate",
         attempt=2,
-        actual=_actual(identity, policy, task, attempt=2),
     )
     assert retry.attempt == 2
+
+
+def test_consumed_failed_model_call_can_be_durably_classified_for_pair_retry() -> None:
+    class FailingGateway(_PinnedGateway):
+        def evaluate(self, request: OpenAIModelRequest) -> ProtectedOpenAIModelResult:
+            del request
+            raise OpenAIGatewayError("openai_timeout")
+
+    identity = _identity()
+    policy = _policy()
+    task = _task()
+    server = ProtectedModelGatewayServer._for_testing(
+        gateway=FailingGateway(),
+        endpoint="http://127.0.0.1:43117/v1/evaluate",
+        token_source=lambda: "failed-model-token-1234567890",
+    )
+    capability = server.issue_observed_capability_for_testing(
+        identity=identity,
+        policy=policy,
+        task=task,
+        subject="parent",
+        attempt=1,
+    )
+
+    with pytest.raises(LiveGatewayAuthorityError, match="openai_timeout"):
+        server.evaluate(capability.token, "held-out prompt")
+
+    server.record_infrastructure_invalid(capability.token, "openai_timeout")
 
 
 def test_gateway_authority_rejects_synthetic_model_result() -> None:
@@ -347,13 +429,12 @@ def test_gateway_authority_rejects_synthetic_model_result() -> None:
         endpoint="http://127.0.0.1:43117/v1/evaluate",
         token_source=lambda: "pair-task-token-1234567890",
     )
-    capability = server.issue_capability(
+    capability = server.issue_observed_capability_for_testing(
         identity=identity,
         policy=policy,
         task=task,
         subject="candidate",
         attempt=1,
-        actual=_actual(identity, policy, task),
     )
 
     with pytest.raises(LiveGatewayAuthorityError, match="live_model_provenance_invalid"):
@@ -413,13 +494,12 @@ def test_separate_http_process_consumes_opaque_capability_once_without_provenanc
         endpoint=f"http://127.0.0.1:{port}/v1/evaluate",
         token_source=lambda: "pair-task-token-1234567890",
     )
-    capability = server.issue_capability(
+    capability = server.issue_observed_capability_for_testing(
         identity=identity,
         policy=policy,
         task=task,
         subject="candidate",
         attempt=1,
-        actual=_actual(identity, policy, task),
     )
     context = multiprocessing.get_context("fork")
     ready = context.Event()

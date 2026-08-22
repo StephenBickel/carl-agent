@@ -183,6 +183,36 @@ def test_protected_service_constructs_its_pinned_archive_gateway_clock_and_keys(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from carl_bench.live_evaluation_service import _load_protected_authority
+    from carl_bench.live_grader import ProtectedGraderBundle
+
+    class Grader:
+        def grade(self, **kwargs: object) -> int:
+            del kwargs
+            return 0
+
+    monkeypatch.setattr(ProtectedGraderBundle, "from_protected_process", lambda: Grader())
+
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-1234567890123456")
+    for name, key in (
+        ("CARL_OPENAI_PROVENANCE_KEY_B64", b"P" * 32),
+        ("CARL_DETERMINISTIC_ATTESTATION_KEY_B64", b"D" * 32),
+        ("CARL_LIVE_ATTESTATION_KEY_B64", b"L" * 32),
+        ("CARL_COMBINED_EVIDENCE_KEY_B64", b"R" * 32),
+        ("CARL_GRADER_ATTESTATION_KEY_B64", b"G" * 32),
+    ):
+        monkeypatch.setenv(name, base64.b64encode(key).decode("ascii"))
+    monkeypatch.setenv("CARL_PARENT_WORKER_UID", "62001")
+    monkeypatch.setenv("CARL_PARENT_WORKER_GID", "62001")
+    monkeypatch.setenv("CARL_CANDIDATE_WORKER_UID", "62002")
+    monkeypatch.setenv("CARL_CANDIDATE_WORKER_GID", "62002")
+
+    assert type(_load_protected_authority()) is ProtectedLiveEvaluationAuthority
+
+
+def test_protected_service_requires_distinct_unprivileged_worker_identities(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from carl_bench.live_evaluation_service import _load_protected_authority
 
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test-1234567890123456")
     for name, key in (
@@ -192,8 +222,16 @@ def test_protected_service_constructs_its_pinned_archive_gateway_clock_and_keys(
         ("CARL_COMBINED_EVIDENCE_KEY_B64", b"R" * 32),
     ):
         monkeypatch.setenv(name, base64.b64encode(key).decode("ascii"))
+    for name in (
+        "CARL_PARENT_WORKER_UID",
+        "CARL_PARENT_WORKER_GID",
+        "CARL_CANDIDATE_WORKER_UID",
+        "CARL_CANDIDATE_WORKER_GID",
+    ):
+        monkeypatch.delenv(name, raising=False)
 
-    assert type(_load_protected_authority()) is ProtectedLiveEvaluationAuthority
+    with pytest.raises(LiveEvaluationAuthorityError, match="live_worker_identity_missing"):
+        _load_protected_authority()
 
 
 @pytest.mark.skipif(os.name == "nt", reason="requires Unix peer credentials")

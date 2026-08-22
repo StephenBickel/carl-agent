@@ -516,11 +516,17 @@ def _bounded_process(
     output_limit: int,
     subject_identity: tuple[int, int] | None,
 ) -> tuple[int | None, bytes, bytes, bool, bool]:
+    subject_environment = {
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PATH": os.defpath,
+    }
     demote = None
     if subject_identity is not None:
         uid, gid = subject_identity
 
         def demote() -> None:
+            os.umask(0o077)
             os.setgroups([])
             os.setgid(gid)
             os.setuid(uid)
@@ -532,6 +538,7 @@ def _bounded_process(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             close_fds=True,
+            env=subject_environment,
             start_new_session=True,
             preexec_fn=demote,
         )

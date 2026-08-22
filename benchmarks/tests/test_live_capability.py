@@ -5,6 +5,7 @@ import hashlib
 import json
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from typing import ClassVar
 
 import pytest
 
@@ -787,6 +788,20 @@ class _ProtectedArchive:
         return self.objects[(object_key, version_id)]
 
 
+class _ProtectedFixtureGrader:
+    _scores: ClassVar[dict[str, dict[str, int]]] = {
+        "parent": {"affected": 4_000, "guard": 10_000, "held": 5_000},
+        "candidate": {"affected": 8_000, "guard": 10_000, "held": 7_000},
+    }
+
+    def grade(self, *, identity: object, task: object, result: object) -> int:
+        assert identity == globals()["identity"]()
+        marker = result.response_id.removeprefix("resp-")
+        subject, task_id, _attempt = marker.rsplit("-", 2)
+        assert task.task_id == task_id
+        return self._scores[subject][task_id]
+
+
 def _protected_authority(
     archive: _ProtectedArchive,
     gateway: OpenAIModelGateway,
@@ -797,10 +812,12 @@ def _protected_authority(
     return ProtectedLiveEvaluationAuthority._for_testing(
         archive=archive,
         gateway=gateway,
+        grader=_ProtectedFixtureGrader(),
         clock=lambda: NOW,
         deterministic_key=deterministic_key,
         live_key=live_key,
         result_key=bytes(reversed(range(32))),
+        grader_key=b"G" * 32,
     )
 
 
@@ -841,6 +858,29 @@ def test_protected_authority_reads_exact_versions_and_is_the_only_eligible_join(
     encoded = canonical_json_bytes(receipt.to_canonical_dict())
     assert b"bounded fixture output" not in encoded
     assert b"OPENAI_API_KEY" not in encoded
+
+
+def test_protected_authority_rejects_caller_selected_scores_with_genuine_model_results(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A valid model result must not authenticate a separately mutated score."""
+    pair, gateway = protected_pair(monkeypatch)
+    candidate_trials = tuple(
+        replace(trial, score_basis_points=10_000) if trial.task.task_id == "affected" else trial
+        for trial in pair.candidate_trials
+    )
+    forged = ProtectedLivePair.create(
+        identity=pair.identity,
+        policy=pair.policy,
+        tasks=pair.tasks,
+        parent_trials=pair.parent_trials,
+        candidate_trials=candidate_trials,
+        gateway=gateway,
+    )
+    authority = _protected_authority(_ProtectedArchive(), gateway)
+
+    with pytest.raises(LiveEvaluationAuthorityError, match="live_grader_receipt_invalid"):
+        authority.seal_live_pair(forged)
 
 
 def test_protected_authority_never_overrides_deterministic_regression(
