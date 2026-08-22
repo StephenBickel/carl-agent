@@ -9,6 +9,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from carl_bench.canonical import canonical_json_bytes
+from carl_bench.cloud_harness import CloudHarnessResult, SubjectResult
 from carl_bench.evidence_archive import ArchivedEvidence, ArchiveIdentity
 from carl_bench.live_capability import (
     DeterministicPairEvidence,
@@ -40,6 +41,18 @@ def digest(label: str) -> str:
     return hashlib.sha256(label.encode()).hexdigest()
 
 
+def model_policy_digest() -> str:
+    return hashlib.sha256(
+        canonical_json_bytes(
+            {
+                "model": "gpt-5.2",
+                "policy_revision": "openai-responses-policy-2026-08-20.1",
+                "reasoning_policy": "medium/no-summary",
+            }
+        )
+    ).hexdigest()
+
+
 def identity() -> LiveEvaluationIdentity:
     return LiveEvaluationIdentity.create(
         repository="StephenBickel/carl-agent",
@@ -53,7 +66,7 @@ def identity() -> LiveEvaluationIdentity:
         task_set_digest=digest("task-set"),
         metric_pack_digest=digest("metric-pack"),
         policy_digest=digest("policy"),
-        model_policy_digest=digest("model-policy"),
+        model_policy_digest=model_policy_digest(),
         grader_digest=digest("grader"),
         environment_digest=digest("environment"),
         model="gpt-5.2",
@@ -70,6 +83,9 @@ def policy() -> LivePairPolicy:
         maximum_pair_retries=1,
         maximum_total_cost_microdollars=50_000,
         maximum_trial_latency_ms=30_000,
+        input_cost_microdollars_per_million_tokens=5_000_000,
+        cached_input_cost_microdollars_per_million_tokens=1_000_000,
+        output_cost_microdollars_per_million_tokens=10_000_000,
         minimum_aggregate_gain_basis_points=500,
         minimum_held_out_gain_basis_points=1,
         require_affected_improvement=True,
@@ -115,13 +131,19 @@ def protected_gateway(monkeypatch: pytest.MonkeyPatch) -> OpenAIModelGateway:
     return OpenAIModelGateway.from_protected_environment()
 
 
-def model_result(request_digest: str, marker: str) -> ProtectedOpenAIModelResult:
+def model_result(
+    request_digest: str,
+    marker: str,
+    *,
+    usage: OpenAIUsage | None = None,
+    latency_ms: int = 100,
+) -> ProtectedOpenAIModelResult:
     fields = {
         "response_id": f"resp-{marker}",
         "model": "gpt-5.2",
         "status": "completed",
-        "usage": OpenAIUsage(10, 0, 5, 1, 15),
-        "latency_ms": 100,
+        "usage": usage or OpenAIUsage(10, 0, 5, 1, 15),
+        "latency_ms": latency_ms,
         "request_digest": request_digest,
         "output_digest": digest(f"output-{marker}"),
         "output_text": "bounded fixture output",
@@ -142,9 +164,11 @@ def trials(
     pair_identity: LiveEvaluationIdentity,
     *,
     subject: str,
+    pair_policy: LivePairPolicy | None = None,
     infrastructure_invalid: set[tuple[str, int]] | None = None,
 ) -> tuple[LiveTrialEvidence, ...]:
     invalid = infrastructure_invalid or set()
+    live_policy = pair_policy or policy()
     scores = {
         "parent": {"affected": 4_000, "guard": 10_000, "held": 5_000},
         "candidate": {"affected": 8_000, "guard": 10_000, "held": 7_000},
@@ -154,9 +178,8 @@ def trials(
         for attempt, seed in enumerate(pair_identity.seeds, start=1):
             request_digest = pair_identity.model_request_digest(
                 subject=subject,
-                task_id=task.task_id,
-                task_input_digest=task.input_digest,
-                input_size=task.input_size,
+                task=task,
+                policy=live_policy,
                 seed=seed,
                 attempt=attempt,
             )
@@ -172,8 +195,8 @@ def trials(
                     attempt_identity=digest(f"{task.task_id}:{attempt}"),
                     status=status,
                     score_basis_points=0 if status != "valid" else scores[subject][task.task_id],
-                    cost_microdollars=100,
-                    latency_ms=100,
+                    cost_microdollars=0 if status != "valid" else 100,
+                    latency_ms=0 if status != "valid" else 100,
                     model_result=(
                         None
                         if status != "valid"
@@ -189,14 +212,15 @@ def trials(
 
 def protected_pair(monkeypatch: pytest.MonkeyPatch) -> tuple[ProtectedLivePair, OpenAIModelGateway]:
     pair_identity = identity()
+    live_policy = policy()
     gateway = protected_gateway(monkeypatch)
     return (
         ProtectedLivePair.create(
             identity=pair_identity,
-            policy=policy(),
+            policy=live_policy,
             tasks=tasks(),
-            parent_trials=trials(pair_identity, subject="parent"),
-            candidate_trials=trials(pair_identity, subject="candidate"),
+            parent_trials=trials(pair_identity, subject="parent", pair_policy=live_policy),
+            candidate_trials=trials(pair_identity, subject="candidate", pair_policy=live_policy),
             gateway=gateway,
         ),
         gateway,
@@ -239,12 +263,33 @@ def attested(monkeypatch: pytest.MonkeyPatch):
 def deterministic_evidence(
     pair_identity: LiveEvaluationIdentity, *, eligible: bool = True
 ) -> DeterministicPairEvidence:
-    return DeterministicPairEvidence(
-        identity=pair_identity,
+    source = CloudHarnessResult(
+        mode="improvement",
+        immutable_inputs={
+            "experiment": pair_identity.experiment_digest,
+            "metric_pack": pair_identity.metric_pack_digest,
+            "policy": pair_identity.policy_digest,
+            "task_set": pair_identity.task_set_digest,
+        },
+        parent=SubjectResult(
+            commit=pair_identity.parent_commit,
+            binary_digest=digest("parent-binary"),
+            score_basis_points=4_000,
+            observations=(),
+        ),
+        candidate=SubjectResult(
+            commit=pair_identity.candidate_commit,
+            binary_digest=digest("candidate-binary"),
+            score_basis_points=8_000 if eligible else 3_000,
+            observations=(),
+        ),
+        gain_basis_points=4_000 if eligible else -1_000,
         contract_eligible=eligible,
+        contract_disposition="improvement" if eligible else "rejected",
         contract_reasons=() if eligible else ("deterministic_contract_regression",),
-        evidence_digest=digest("deterministic-evidence"),
+        live_evaluation_identity=pair_identity,
     )
+    return DeterministicPairEvidence.from_cloud_harness(source)
 
 
 def test_pair_identity_is_exact_immutable_and_subject_checkouts_are_isolated() -> None:
@@ -279,6 +324,96 @@ def test_pair_requires_identical_protected_conditions_and_exact_trial_population
             policy=policy(),
             tasks=tasks(),
             parent_trials=trials(pair_identity, subject="parent"),
+            candidate_trials=tuple(candidate),
+            gateway=gateway,
+        )
+
+
+@pytest.mark.parametrize(
+    "commitment",
+    (
+        "model",
+        "reasoning_policy",
+        "live_policy",
+        "task_role",
+        "environment",
+        "checkout_tree",
+    ),
+)
+def test_authenticated_execution_rejects_unexecuted_commitment_mutations(
+    monkeypatch: pytest.MonkeyPatch, commitment: str
+) -> None:
+    pair, gateway = protected_pair(monkeypatch)
+    mutated_identity = pair.identity
+    mutated_policy = pair.policy
+    mutated_tasks = pair.tasks
+    if commitment == "model":
+        mutated_identity = replace(mutated_identity, model="gpt-5.1", request_digest="")
+    elif commitment == "reasoning_policy":
+        mutated_identity = replace(
+            mutated_identity,
+            reasoning_policy="high/no-summary",
+            request_digest="",
+        )
+    elif commitment == "live_policy":
+        mutated_policy = replace(mutated_policy, maximum_trial_latency_ms=30_001)
+    elif commitment == "task_role":
+        mutated_tasks = tuple(
+            replace(task, role="held_out" if task.role == "guard" else "guard")
+            if task.role in {"guard", "held_out"}
+            else task
+            for task in mutated_tasks
+        )
+    elif commitment == "environment":
+        mutated_identity = replace(
+            mutated_identity,
+            environment_digest=digest("other-environment"),
+            request_digest="",
+        )
+    else:
+        mutated_identity = replace(
+            mutated_identity,
+            parent_tree="a" * 40,
+            request_digest="",
+        )
+
+    tasks_by_id = {task.task_id: task for task in mutated_tasks}
+
+    def rebind(trial: LiveTrialEvidence) -> LiveTrialEvidence:
+        return replace(
+            trial,
+            pair_request_digest=mutated_identity.request_digest,
+            task=tasks_by_id[trial.task.task_id],
+        )
+
+    with pytest.raises(LiveCapabilityError, match="live_execution_binding_mismatch"):
+        ProtectedLivePair.create(
+            identity=mutated_identity,
+            policy=mutated_policy,
+            tasks=mutated_tasks,
+            parent_trials=tuple(rebind(trial) for trial in pair.parent_trials),
+            candidate_trials=tuple(rebind(trial) for trial in pair.candidate_trials),
+            gateway=gateway,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (("cost_microdollars", 1), ("latency_ms", 1)),
+)
+def test_authenticated_model_result_owns_resource_accounting(
+    monkeypatch: pytest.MonkeyPatch, field: str, value: int
+) -> None:
+    pair, gateway = protected_pair(monkeypatch)
+    candidate = list(pair.candidate_trials)
+    candidate[0] = replace(candidate[0], **{field: value})
+
+    with pytest.raises(LiveCapabilityError, match="live_resource_accounting_mismatch"):
+        ProtectedLivePair.create(
+            identity=pair.identity,
+            policy=pair.policy,
+            tasks=pair.tasks,
+            parent_trials=pair.parent_trials,
             candidate_trials=tuple(candidate),
             gateway=gateway,
         )
@@ -336,7 +471,20 @@ def test_task_regressions_transfer_cost_latency_and_aggregate_gain_are_enforced(
     assert regressed.eligible is False
     assert "guard_task_regression" in regressed.reasons
 
-    expensive = tuple(replace(item, cost_microdollars=50_000) for item in pair.candidate_trials)
+    expensive_usage = OpenAIUsage(0, 0, 1_000, 0, 1_000)
+    expensive = tuple(
+        replace(
+            item,
+            cost_microdollars=10_000,
+            model_result=model_result(
+                item.model_result.request_digest,
+                f"expensive-{item.task.task_id}-{item.attempt}",
+                usage=expensive_usage,
+            ),
+        )
+        for item in pair.candidate_trials
+        if isinstance(item.model_result, ProtectedOpenAIModelResult)
+    )
     bounded = ProtectedLivePair.create(
         identity=pair.identity,
         policy=pair.policy,
@@ -436,16 +584,12 @@ def test_combiner_rejects_untrusted_or_identity_mismatched_live_evidence(
     elif mutation == "wrong_key":
         key = bytes(range(1, 33))
     elif mutation == "cross_run":
-        deterministic = replace(
-            deterministic,
-            identity=replace(
-                pair.identity, workflow_digest=digest("other-workflow"), request_digest=""
-            ),
+        deterministic = deterministic_evidence(
+            replace(pair.identity, workflow_digest=digest("other-workflow"), request_digest="")
         )
     else:
-        deterministic = replace(
-            deterministic,
-            identity=replace(pair.identity, candidate_commit="9" * 40, request_digest=""),
+        deterministic = deterministic_evidence(
+            replace(pair.identity, candidate_commit="9" * 40, request_digest="")
         )
 
     with pytest.raises(LiveCapabilityError):
@@ -501,14 +645,25 @@ def test_exact_attested_pair_combines_with_deterministic_identity(
     assert b"OPENAI_API_KEY" not in encoded
 
 
+def test_direct_deterministic_evidence_cannot_claim_an_arbitrary_digest() -> None:
+    with pytest.raises(LiveCapabilityError, match="deterministic_evidence_invalid"):
+        DeterministicPairEvidence(
+            identity=identity(),
+            contract_eligible=True,
+            contract_reasons=(),
+            evidence_digest=digest("attacker-selected-evidence"),
+        )
+
+
 def test_missing_live_evidence_preserves_stable_disposition(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("CARL_OPENAI_PROVENANCE_KEY_B64", raising=False)
     result = combine_paired_evidence(
         deterministic_evidence=deterministic_evidence(identity()),
         live_evidence=None,
         key=KEY,
-        gateway=protected_gateway(monkeypatch),
         now=NOW,
     )
 

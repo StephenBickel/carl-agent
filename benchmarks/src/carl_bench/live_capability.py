@@ -13,6 +13,7 @@ from carl_bench.evidence_archive import ArchivedEvidence
 from carl_bench.openai_gateway import (
     OpenAIGatewayError,
     OpenAIModelGateway,
+    OpenAIUsage,
     ProtectedOpenAIModelResult,
 )
 from carl_bench.run_attestation import attest_bound_payload, verify_bound_payload_attestation
@@ -23,6 +24,7 @@ _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,255}$")
 _REPOSITORY_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _PAIR_ATTESTATION_PURPOSE = "protected-live-pair"
 _OPENAI_POLICY_REVISION = "openai-responses-policy-2026-08-20.1"
+_TOOL_PROTOCOL_REVISION = "acp-v2/bounded-openai-v1"
 _LIVE_GATE_REASON = "live_acp_credential_missing"
 
 
@@ -178,36 +180,74 @@ class LiveEvaluationIdentity:
             value["request_digest"] = self.request_digest
         return value
 
-    def model_request_digest(
+    def execution_context_digest(
         self,
         *,
         subject: str,
-        task_id: str,
-        task_input_digest: str,
-        input_size: int = 32,
+        task: LiveTaskIdentity,
+        policy: LivePairPolicy,
         seed: int,
         attempt: int,
     ) -> str:
         gateway_subject = "baseline" if subject == "parent" else subject
         if gateway_subject not in {"baseline", "candidate"}:
             raise LiveCapabilityError("live_subject_invalid")
-        _identifier(task_id, "live_task_identity_invalid")
-        _digest(task_input_digest, "live_input_identity_invalid")
-        _bounded_int(input_size, minimum=1, maximum=65_536, code="live_input_identity_invalid")
+        if not isinstance(task, LiveTaskIdentity) or not isinstance(policy, LivePairPolicy):
+            raise LiveCapabilityError("live_execution_binding_invalid")
+        return hashlib.sha256(
+            canonical_json_bytes(
+                {
+                    "attempt": attempt,
+                    "domain": "carl.protected-live-execution-context.v1",
+                    "evaluation_identity": self.to_canonical_dict(),
+                    "live_policy": policy.to_canonical_dict(),
+                    "schema_version": 1,
+                    "seed": seed,
+                    "subject": gateway_subject,
+                    "subject_commit": (
+                        self.parent_commit if subject == "parent" else self.candidate_commit
+                    ),
+                    "subject_tree": (
+                        self.parent_tree if subject == "parent" else self.candidate_tree
+                    ),
+                    "task": task.to_canonical_dict(),
+                }
+            )
+        ).hexdigest()
+
+    def model_request_digest(
+        self,
+        *,
+        subject: str,
+        task: LiveTaskIdentity,
+        policy: LivePairPolicy,
+        seed: int,
+        attempt: int,
+    ) -> str:
+        gateway_subject = "baseline" if subject == "parent" else subject
+        if gateway_subject not in {"baseline", "candidate"}:
+            raise LiveCapabilityError("live_subject_invalid")
         return hashlib.sha256(
             canonical_json_bytes(
                 {
                     "attempt": attempt,
                     "domain": "carl.openai.responses.request.v1",
+                    "execution_context_digest": self.execution_context_digest(
+                        subject=subject,
+                        task=task,
+                        policy=policy,
+                        seed=seed,
+                        attempt=attempt,
+                    ),
                     "experiment_id": self.experiment_digest,
-                    "input_sha256": task_input_digest,
-                    "input_size": input_size,
+                    "input_sha256": task.input_digest,
+                    "input_size": task.input_size,
                     "policy_revision": _OPENAI_POLICY_REVISION,
                     "repository": self.repository,
                     "schema_version": 1,
                     "seed": seed,
                     "subject": gateway_subject,
-                    "task_id": task_id,
+                    "task_id": task.task_id,
                 }
             )
         ).hexdigest()
@@ -246,6 +286,9 @@ class LivePairPolicy:
     maximum_pair_retries: int
     maximum_total_cost_microdollars: int
     maximum_trial_latency_ms: int
+    input_cost_microdollars_per_million_tokens: int
+    cached_input_cost_microdollars_per_million_tokens: int
+    output_cost_microdollars_per_million_tokens: int
     minimum_aggregate_gain_basis_points: int
     minimum_held_out_gain_basis_points: int
     require_affected_improvement: bool
@@ -270,6 +313,17 @@ class LivePairPolicy:
             maximum=3_600_000,
             code="live_policy_invalid",
         )
+        for value in (
+            self.input_cost_microdollars_per_million_tokens,
+            self.cached_input_cost_microdollars_per_million_tokens,
+            self.output_cost_microdollars_per_million_tokens,
+        ):
+            _bounded_int(
+                value,
+                minimum=0,
+                maximum=1_000_000_000,
+                code="live_policy_invalid",
+            )
         for value in (
             self.minimum_aggregate_gain_basis_points,
             self.minimum_held_out_gain_basis_points,
@@ -332,6 +386,8 @@ class LiveTrialEvidence:
                 or _ID_RE.fullmatch(self.infrastructure_code) is None
                 or self.model_result is not None
                 or self.score_basis_points != 0
+                or self.cost_microdollars != 0
+                or self.latency_ms != 0
             ):
                 raise LiveCapabilityError("live_trial_invalid")
         else:
@@ -394,6 +450,39 @@ def _task_scores(
     }
 
 
+def _authenticated_cost_microdollars(
+    result: ProtectedOpenAIModelResult,
+    policy: LivePairPolicy,
+) -> int:
+    usage = result.usage
+    if not isinstance(usage, OpenAIUsage):
+        raise LiveCapabilityError("live_resource_accounting_invalid")
+    values = (
+        usage.input_tokens,
+        usage.cached_input_tokens,
+        usage.output_tokens,
+        usage.reasoning_output_tokens,
+        usage.total_tokens,
+    )
+    if (
+        any(
+            isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 1_000_000
+            for value in values
+        )
+        or usage.cached_input_tokens > usage.input_tokens
+        or usage.reasoning_output_tokens > usage.output_tokens
+        or usage.total_tokens != usage.input_tokens + usage.output_tokens
+    ):
+        raise LiveCapabilityError("live_resource_accounting_invalid")
+    uncached_input_tokens = usage.input_tokens - usage.cached_input_tokens
+    numerator = (
+        uncached_input_tokens * policy.input_cost_microdollars_per_million_tokens
+        + usage.cached_input_tokens * policy.cached_input_cost_microdollars_per_million_tokens
+        + usage.output_tokens * policy.output_cost_microdollars_per_million_tokens
+    )
+    return (numerator + 999_999) // 1_000_000
+
+
 @dataclass(frozen=True, slots=True)
 class ProtectedLivePair:
     identity: LiveEvaluationIdentity
@@ -434,6 +523,18 @@ class ProtectedLivePair:
             raise LiveCapabilityError("live_task_identity_mismatch")
         if identity.attempts > policy.maximum_pair_retries + 1:
             raise LiveCapabilityError("live_retry_policy_invalid")
+        try:
+            protected_policy = gateway.protected_execution_policy()
+        except OpenAIGatewayError as error:
+            raise LiveCapabilityError("live_execution_binding_mismatch") from error
+        protected_policy_digest = hashlib.sha256(canonical_json_bytes(protected_policy)).hexdigest()
+        if (
+            identity.model != protected_policy["model"]
+            or identity.reasoning_policy != protected_policy["reasoning_policy"]
+            or identity.model_policy_digest != protected_policy_digest
+            or identity.tool_protocol_revision != _TOOL_PROTOCOL_REVISION
+        ):
+            raise LiveCapabilityError("live_execution_binding_mismatch")
         expected = _expected_population(identity, tasks)
         for subject, values, commit in (
             ("parent", parent_trials, identity.parent_commit),
@@ -463,23 +564,27 @@ class ProtectedLivePair:
                     continue
                 expected_request = identity.model_request_digest(
                     subject=subject,
-                    task_id=item.task.task_id,
-                    task_input_digest=item.task.input_digest,
-                    input_size=item.task.input_size,
+                    task=item.task,
+                    policy=policy,
                     seed=item.seed,
                     attempt=item.attempt,
                 )
-                if (
-                    type(item.model_result) is not ProtectedOpenAIModelResult
-                    or item.model_result.request_digest != expected_request
-                ):
+                if type(item.model_result) is not ProtectedOpenAIModelResult:
                     raise LiveCapabilityError("live_model_provenance_invalid")
+                if item.model_result.request_digest != expected_request:
+                    raise LiveCapabilityError("live_execution_binding_mismatch")
                 try:
                     verified = gateway.verify_protected_result(item.model_result)
                 except OpenAIGatewayError:
                     verified = False
                 if not verified:
                     raise LiveCapabilityError("live_model_provenance_invalid")
+                expected_cost = _authenticated_cost_microdollars(item.model_result, policy)
+                if (
+                    item.latency_ms != item.model_result.latency_ms
+                    or item.cost_microdollars != expected_cost
+                ):
+                    raise LiveCapabilityError("live_resource_accounting_mismatch")
         for parent, candidate in zip(parent_trials, candidate_trials, strict=True):
             if parent.attempt_identity != candidate.attempt_identity:
                 raise LiveCapabilityError("live_attempt_identity_mismatch")
@@ -501,13 +606,21 @@ class ProtectedLivePair:
             if next(task.role for task in tasks if task.task_id == task_id) == "held_out"
         )
         held_gain = sum(held) // len(held)
-        total_cost = sum(item.cost_microdollars for item in (*parent_trials, *candidate_trials))
+        valid_trials = tuple(
+            item for item in (*parent_trials, *candidate_trials) if item.status == "valid"
+        )
+        total_cost = sum(
+            _authenticated_cost_microdollars(item.model_result, policy)
+            for item in valid_trials
+            if isinstance(item.model_result, ProtectedOpenAIModelResult)
+        )
         reasons: set[str] = set()
         if invalid:
             reasons.add("pair_infrastructure_invalid")
         if any(
-            item.latency_ms > policy.maximum_trial_latency_ms
-            for item in (*parent_trials, *candidate_trials)
+            item.model_result.latency_ms > policy.maximum_trial_latency_ms
+            for item in valid_trials
+            if isinstance(item.model_result, ProtectedOpenAIModelResult)
         ):
             reasons.add("live_latency_limit_exceeded")
         if total_cost > policy.maximum_total_cost_microdollars:
@@ -774,46 +887,89 @@ class CombinedCapabilityEvidence:
         }
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, init=False)
 class DeterministicPairEvidence:
     identity: LiveEvaluationIdentity
     contract_eligible: bool
     contract_reasons: tuple[str, ...]
     evidence_digest: str
+    _source_result: object
+    _source_payload: bytes
 
-    def __post_init__(self) -> None:
-        if not isinstance(self.identity, LiveEvaluationIdentity):
-            raise LiveCapabilityError("deterministic_evidence_invalid")
-        if type(self.contract_eligible) is not bool:
-            raise LiveCapabilityError("deterministic_evidence_invalid")
-        if (
-            not isinstance(self.contract_reasons, tuple)
-            or any(
-                not isinstance(reason, str) or _ID_RE.fullmatch(reason) is None
-                for reason in self.contract_reasons
-            )
-            or tuple(sorted(set(self.contract_reasons))) != self.contract_reasons
-            or self.contract_eligible == bool(self.contract_reasons)
-        ):
-            raise LiveCapabilityError("deterministic_evidence_invalid")
-        _digest(self.evidence_digest, "deterministic_evidence_invalid")
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise LiveCapabilityError("deterministic_evidence_invalid")
 
-    @classmethod
-    def from_cloud_harness(cls, result: object) -> DeterministicPairEvidence:
-        from carl_bench.cloud_harness import CloudHarnessResult
+    @staticmethod
+    def _derive(result: object) -> tuple[LiveEvaluationIdentity, bool, tuple[str, ...], bytes]:
+        from carl_bench.cloud_harness import CloudHarnessResult, SubjectResult
 
         if not isinstance(result, CloudHarnessResult) or not isinstance(
             result.live_evaluation_identity, LiveEvaluationIdentity
         ):
             raise LiveCapabilityError("deterministic_evidence_invalid")
-        return cls(
-            identity=result.live_evaluation_identity,
-            contract_eligible=result.contract_eligible,
-            contract_reasons=tuple(sorted(result.contract_reasons)),
-            evidence_digest=hashlib.sha256(
-                canonical_json_bytes(result.to_canonical_dict())
-            ).hexdigest(),
-        )
+        identity = result.live_evaluation_identity
+        reasons = tuple(sorted(result.contract_reasons))
+        if (
+            not isinstance(result.parent, SubjectResult)
+            or not isinstance(result.candidate, SubjectResult)
+            or result.mode != "improvement"
+            or result.parent.commit != identity.parent_commit
+            or result.candidate.commit != identity.candidate_commit
+            or result.gain_basis_points
+            != result.candidate.score_basis_points - result.parent.score_basis_points
+            or result.immutable_inputs
+            != {
+                "experiment": identity.experiment_digest,
+                "metric_pack": identity.metric_pack_digest,
+                "policy": identity.policy_digest,
+                "task_set": identity.task_set_digest,
+            }
+            or type(result.contract_eligible) is not bool
+            or not isinstance(result.contract_reasons, tuple)
+            or any(
+                not isinstance(reason, str) or _ID_RE.fullmatch(reason) is None
+                for reason in result.contract_reasons
+            )
+            or tuple(sorted(set(result.contract_reasons))) != reasons
+            or result.contract_eligible == bool(reasons)
+            or result.contract_disposition
+            != ("improvement" if result.contract_eligible else "rejected")
+            or result.eligible is not False
+            or result.disposition != "insufficient_evidence"
+            or result.reasons != (_LIVE_GATE_REASON,)
+        ):
+            raise LiveCapabilityError("deterministic_evidence_invalid")
+        try:
+            payload = canonical_json_bytes(result.to_canonical_dict())
+        except (TypeError, ValueError) as error:
+            raise LiveCapabilityError("deterministic_evidence_invalid") from error
+        if not payload or len(payload) > 1_048_576:
+            raise LiveCapabilityError("deterministic_evidence_invalid")
+        return identity, result.contract_eligible, reasons, payload
+
+    @classmethod
+    def from_cloud_harness(cls, result: object) -> DeterministicPairEvidence:
+        identity, eligible, reasons, payload = cls._derive(result)
+        value = object.__new__(cls)
+        object.__setattr__(value, "identity", identity)
+        object.__setattr__(value, "contract_eligible", eligible)
+        object.__setattr__(value, "contract_reasons", reasons)
+        object.__setattr__(value, "evidence_digest", hashlib.sha256(payload).hexdigest())
+        object.__setattr__(value, "_source_result", result)
+        object.__setattr__(value, "_source_payload", payload)
+        return value
+
+    def verify_source(self) -> None:
+        identity, eligible, reasons, payload = self._derive(self._source_result)
+        if (
+            payload != self._source_payload
+            or identity != self.identity
+            or eligible is not self.contract_eligible
+            or reasons != self.contract_reasons
+            or hashlib.sha256(payload).hexdigest() != self.evidence_digest
+        ):
+            raise LiveCapabilityError("deterministic_evidence_invalid")
 
 
 def combine_paired_evidence(
@@ -821,12 +977,26 @@ def combine_paired_evidence(
     deterministic_evidence: DeterministicPairEvidence,
     live_evidence: AttestedLivePair | None,
     key: bytes,
-    gateway: OpenAIModelGateway,
+    gateway: OpenAIModelGateway | None = None,
     now: datetime,
 ) -> CombinedCapabilityEvidence:
     if not isinstance(deterministic_evidence, DeterministicPairEvidence):
         raise LiveCapabilityError("deterministic_evidence_invalid")
+    deterministic_evidence.verify_source()
     identity = deterministic_evidence.identity
+    if gateway is None:
+        try:
+            gateway = OpenAIModelGateway.from_protected_environment()
+        except OpenAIGatewayError as error:
+            if error.code == "openai_credentials_missing" and live_evidence is None:
+                return CombinedCapabilityEvidence(
+                    identity=identity,
+                    eligible=False,
+                    disposition="insufficient_evidence",
+                    reasons=(_LIVE_GATE_REASON,),
+                    live_pair_digest=None,
+                )
+            raise LiveCapabilityError("live_gateway_unavailable") from error
     if live_evidence is None:
         return CombinedCapabilityEvidence(
             identity=identity,

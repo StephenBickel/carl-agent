@@ -32,6 +32,7 @@ _REQUEST_DOMAIN = "carl.openai.responses.request.v1"
 _REQUEST_FIELDS = frozenset(
     {
         "attempt",
+        "execution_context_digest",
         "experiment_id",
         "input",
         "repository",
@@ -136,6 +137,7 @@ def _request_binding(value: OpenAIModelRequest) -> dict[str, object]:
     return {
         "attempt": value.attempt,
         "domain": _REQUEST_DOMAIN,
+        "execution_context_digest": value.execution_context_digest,
         "experiment_id": value.experiment_id,
         "input_sha256": hashlib.sha256(input_bytes).hexdigest(),
         "input_size": len(input_bytes),
@@ -160,6 +162,7 @@ class OpenAIModelRequest:
     seed: int
     attempt: int
     input: str
+    execution_context_digest: str
     request_digest: str = ""
 
     def __post_init__(self) -> None:
@@ -172,6 +175,11 @@ class OpenAIModelRequest:
             raise OpenAIGatewayError("openai_request_invalid")
         _bounded_identifier(self.experiment_id)
         _bounded_identifier(self.task_id)
+        if (
+            not isinstance(self.execution_context_digest, str)
+            or _DIGEST_RE.fullmatch(self.execution_context_digest) is None
+        ):
+            raise OpenAIGatewayError("openai_request_invalid")
         if self.subject not in {"baseline", "candidate"}:
             raise OpenAIGatewayError("openai_request_invalid")
         if (
@@ -657,6 +665,16 @@ class OpenAIModelGateway:
             return SyntheticOpenAIModelResult(**result_fields)
         else:
             raise OpenAIGatewayError("openai_gateway_construction_invalid")
+
+    def protected_execution_policy(self) -> dict[str, str]:
+        """Return the exact fixed policy enforced by the protected gateway implementation."""
+        if type(self) is not OpenAIModelGateway:
+            raise OpenAIGatewayError("openai_gateway_construction_invalid")
+        return {
+            "model": _MODEL,
+            "policy_revision": _POLICY_REVISION,
+            "reasoning_policy": "medium/no-summary",
+        }
 
     @staticmethod
     def _result_provenance_payload(value: dict[str, Any]) -> bytes:
