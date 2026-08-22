@@ -409,11 +409,72 @@ class CommissioningReceipt:
 
 
 @dataclass(frozen=True, slots=True)
+class ProtectedReceiptBinding:
+    """Durable protected-signer/archive context carried with a commissioning receipt."""
+
+    schema_version: int
+    algorithm: str
+    purpose: str
+    domain: str
+    repository: str
+    signer_request_digest: str
+    archive_object_key: str
+    archive_version_id: str
+    archive_digest: str
+    archive_checksum_sha256: str
+    archive_record_digest: str
+    retention_mode: str
+    retain_until: str
+    occurred_at: str
+
+    def __post_init__(self) -> None:
+        if isinstance(self.schema_version, bool) or self.schema_version != 1:
+            raise CloudExecutionError("cloud_protected_receipt_binding_invalid")
+        if self.algorithm != "ED25519_SHA_512":
+            raise CloudExecutionError("cloud_protected_receipt_binding_invalid")
+        if self.purpose != "commissioning-receipt":
+            raise CloudExecutionError("cloud_protected_receipt_binding_invalid")
+        if self.domain != "carl-autonomy/cloud-evidence/v1":
+            raise CloudExecutionError("cloud_protected_receipt_binding_invalid")
+        if not isinstance(self.repository, str) or not _REPOSITORY_RE.fullmatch(self.repository):
+            raise CloudExecutionError("cloud_protected_receipt_binding_invalid")
+        for name in (
+            "signer_request_digest",
+            "archive_digest",
+            "archive_checksum_sha256",
+            "archive_record_digest",
+        ):
+            _digest(f"cloud_protected_{name}", getattr(self, name))
+        for name in ("archive_object_key", "archive_version_id"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value or len(value.encode("utf-8")) > 512:
+                raise CloudExecutionError("cloud_protected_receipt_binding_invalid")
+        if self.retention_mode != "COMPLIANCE":
+            raise CloudExecutionError("cloud_protected_receipt_binding_invalid")
+        _utc("cloud_protected_retain_until", self.retain_until)
+        _utc("cloud_protected_occurred_at", self.occurred_at)
+
+    def to_canonical_dict(self) -> dict[str, Any]:
+        return _codec_output({name: getattr(self, name) for name in self.__dataclass_fields__})
+
+    @classmethod
+    def from_canonical_dict(cls, value: object) -> ProtectedReceiptBinding:
+        decoded = _codec_fields(
+            value, frozenset(cls.__dataclass_fields__), "cloud_protected_receipt_binding_invalid"
+        )
+        try:
+            return cls(**decoded)
+        except TypeError as error:
+            raise CloudExecutionError("cloud_protected_receipt_binding_invalid") from error
+
+
+@dataclass(frozen=True, slots=True)
 class SignedCommissioningReceipt:
     receipt: CommissioningReceipt
     receipt_digest: str
     key_id: str
     signature_base64: str
+    protected_binding: ProtectedReceiptBinding | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.receipt, CommissioningReceipt):
@@ -427,6 +488,16 @@ class SignedCommissioningReceipt:
             raise CloudExecutionError("invalid_cloud_commissioning_signature") from error
         if len(signature) != 64:
             raise CloudExecutionError("invalid_cloud_commissioning_signature")
+        if self.protected_binding is not None:
+            if not isinstance(self.protected_binding, ProtectedReceiptBinding):
+                raise CloudExecutionError("cloud_protected_receipt_binding_invalid")
+            if (
+                self.protected_binding.repository != self.receipt.repository
+                or self.protected_binding.archive_digest != self.receipt.artifact_digest
+                or self.protected_binding.archive_checksum_sha256 != self.receipt.artifact_digest
+                or self.protected_binding.occurred_at != self.receipt.observed_at
+            ):
+                raise CloudExecutionError("cloud_protected_receipt_binding_invalid")
 
     @property
     def signature(self) -> bytes:
@@ -439,6 +510,11 @@ class SignedCommissioningReceipt:
                 "receipt_digest": self.receipt_digest,
                 "key_id": self.key_id,
                 "signature_base64": self.signature_base64,
+                "protected_binding": (
+                    self.protected_binding.to_canonical_dict()
+                    if self.protected_binding is not None
+                    else None
+                ),
             }
         )
 
@@ -450,12 +526,19 @@ class SignedCommissioningReceipt:
             "signed_cloud_commissioning_receipt_invalid",
         )
         receipt = CommissioningReceipt.from_canonical_dict(decoded["receipt"])
+        binding_value = decoded["protected_binding"]
+        binding = (
+            None
+            if binding_value is None
+            else ProtectedReceiptBinding.from_canonical_dict(binding_value)
+        )
         try:
             result = cls(
                 receipt=receipt,
                 receipt_digest=decoded["receipt_digest"],
                 key_id=decoded["key_id"],
                 signature_base64=decoded["signature_base64"],
+                protected_binding=binding,
             )
         except TypeError as error:
             raise CloudExecutionError("signed_cloud_commissioning_receipt_invalid") from error
@@ -1550,9 +1633,18 @@ def _commissioning_failure(
         return "cloud_commissioning_signature_invalid"
     if len(signature) != 64:
         return "cloud_commissioning_signature_invalid"
+    if envelope.protected_binding is None:
+        signed_payload = envelope.receipt.to_canonical_dict()
+        claimed_digest = envelope.receipt_digest
+    else:
+        signed_payload = {
+            "protected_binding": envelope.protected_binding.to_canonical_dict(),
+            "receipt": envelope.receipt.to_canonical_dict(),
+        }
+        claimed_digest = hashlib.sha256(canonical_json_bytes(signed_payload)).hexdigest()
     signature_failure = _signed_payload_failure(
-        payload=envelope.receipt.to_canonical_dict(),
-        claimed_digest=envelope.receipt_digest,
+        payload=signed_payload,
+        claimed_digest=claimed_digest,
         key_id=envelope.key_id,
         signature=signature,
         trusted_key=trusted_receipt_key,
