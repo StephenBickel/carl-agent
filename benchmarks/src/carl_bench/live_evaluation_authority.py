@@ -358,7 +358,7 @@ class ProtectedLiveEvaluationAuthority:
             cls._environment_worker_identity("PARENT"),
             cls._environment_worker_identity("CANDIDATE"),
         )
-        if worker_identities[0] == worker_identities[1] or os.geteuid() in {
+        if worker_identities[0][0] == worker_identities[1][0] or os.geteuid() in {
             worker_identities[0][0],
             worker_identities[1][0],
         }:
@@ -422,6 +422,8 @@ class ProtectedLiveEvaluationAuthority:
         grader_key: bytes | None,
         worker_identities: tuple[tuple[int, int], tuple[int, int]] | None,
     ) -> ProtectedLiveEvaluationAuthority:
+        if worker_identities is not None and worker_identities[0][0] == worker_identities[1][0]:
+            raise LiveEvaluationAuthorityError("live_worker_identity_invalid")
         if (grader is None) != (grader_key is None) or (
             grader is not None and not callable(getattr(grader, "grade", None))
         ):

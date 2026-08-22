@@ -494,18 +494,137 @@ def _parse_contracts(
 
 
 def _terminate(process: subprocess.Popen[bytes]) -> None:
-    if process.poll() is not None:
-        return
     try:
         if os.name == "posix":
             os.killpg(process.pid, signal.SIGKILL)
-        else:
+        elif process.poll() is None:
             process.kill()
     except ProcessLookupError:
         pass
     except OSError:
-        with contextlib.suppress(ProcessLookupError):
+        with contextlib.suppress(ProcessLookupError), contextlib.suppress(OSError):
             process.kill()
+    if process.poll() is None:
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            process.wait(timeout=1)
+
+
+def _process_group_empty(process_group_id: int) -> bool:
+    if os.name != "posix":  # pragma: no cover - protected harness is POSIX
+        return True
+    try:
+        os.killpg(process_group_id, 0)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        pass
+    try:
+        observed = subprocess.run(
+            ("ps", "-axo", "pgid=,stat="),
+            check=False,
+            capture_output=True,
+            env={"LANG": "C", "LC_ALL": "C", "PATH": os.defpath},
+            text=True,
+            timeout=2,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if observed.returncode != 0 or observed.stderr:
+        return False
+    for line in observed.stdout.splitlines():
+        fields = line.split()
+        if (
+            len(fields) == 2
+            and fields[0] == str(process_group_id)
+            and not fields[1].startswith("Z")
+        ):
+            return False
+    return True
+
+
+def _cleanup_process_group(process: subprocess.Popen[bytes]) -> None:
+    _terminate(process)
+    deadline = time.monotonic() + 2
+    while not _process_group_empty(process.pid) and time.monotonic() < deadline:
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(process.pid, signal.SIGKILL)
+        time.sleep(0.01)
+    if not _process_group_empty(process.pid):
+        raise CloudHarnessError("subject_process_cleanup_failed")
+
+
+def _collect_bounded_process(
+    process: subprocess.Popen[bytes], *, timeout_seconds: int, output_limit: int
+) -> tuple[int | None, bytes, bytes, bool, bool]:
+    assert process.stdout is not None and process.stderr is not None
+    selector = selectors.DefaultSelector()
+    streams = {process.stdout: bytearray(), process.stderr: bytearray()}
+    try:
+        for stream in streams:
+            os.set_blocking(stream.fileno(), False)
+            selector.register(stream, selectors.EVENT_READ)
+        deadline = time.monotonic() + timeout_seconds
+        timed_out = False
+        overflow = False
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                _terminate(process)
+            events = selector.select(max(0.0, min(remaining, 0.1)) if not timed_out else 0.1)
+            for key, _ in events:
+                stream = key.fileobj
+                try:
+                    chunk = os.read(stream.fileno(), 16 * 1024)
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    selector.unregister(stream)
+                    continue
+                target = streams[stream]
+                available = max(
+                    0,
+                    output_limit - sum(len(value) for value in streams.values()),
+                )
+                target.extend(chunk[:available])
+                if len(chunk) > available:
+                    overflow = True
+                    _terminate(process)
+            if process.poll() is not None and not events:
+                for stream in tuple(streams):
+                    try:
+                        chunk = os.read(stream.fileno(), 16 * 1024)
+                    except BlockingIOError:
+                        continue
+                    if not chunk:
+                        with contextlib.suppress(KeyError):
+                            selector.unregister(stream)
+                        continue
+                    target = streams[stream]
+                    available = max(
+                        0,
+                        output_limit - sum(len(value) for value in streams.values()),
+                    )
+                    target.extend(chunk[:available])
+                    if len(chunk) > available:
+                        overflow = True
+            if timed_out or overflow:
+                _terminate(process)
+        try:
+            exit_code = process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            _terminate(process)
+            exit_code = process.wait(timeout=1)
+        return (
+            exit_code,
+            bytes(streams[process.stdout]),
+            bytes(streams[process.stderr]),
+            timed_out,
+            overflow,
+        )
+    finally:
+        with contextlib.suppress(Exception):
+            selector.close()
 
 
 def _bounded_process(
@@ -544,65 +663,18 @@ def _bounded_process(
         )
     except (OSError, subprocess.SubprocessError) as error:
         raise CloudHarnessError("subject_binary_execution_failed") from error
-    assert process.stdout is not None and process.stderr is not None
-    selector = selectors.DefaultSelector()
-    streams = {process.stdout: bytearray(), process.stderr: bytearray()}
-    for stream in streams:
-        os.set_blocking(stream.fileno(), False)
-        selector.register(stream, selectors.EVENT_READ)
-    deadline = time.monotonic() + timeout_seconds
-    timed_out = False
-    overflow = False
-    while selector.get_map():
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            timed_out = True
-            _terminate(process)
-        events = selector.select(max(0.0, min(remaining, 0.1)) if not timed_out else 0.1)
-        for key, _ in events:
-            stream = key.fileobj
-            try:
-                chunk = os.read(stream.fileno(), 16 * 1024)
-            except BlockingIOError:
-                continue
-            if not chunk:
-                selector.unregister(stream)
-                continue
-            target = streams[stream]
-            available = max(0, output_limit - sum(len(value) for value in streams.values()))
-            target.extend(chunk[:available])
-            if len(chunk) > available:
-                overflow = True
-                _terminate(process)
-        if process.poll() is not None and not events:
-            for stream in tuple(streams):
-                try:
-                    chunk = os.read(stream.fileno(), 16 * 1024)
-                except BlockingIOError:
-                    continue
-                if not chunk:
-                    with contextlib.suppress(KeyError):
-                        selector.unregister(stream)
-                    continue
-                target = streams[stream]
-                available = max(0, output_limit - sum(len(value) for value in streams.values()))
-                target.extend(chunk[:available])
-                if len(chunk) > available:
-                    overflow = True
-        if timed_out or overflow:
-            _terminate(process)
     try:
-        exit_code = process.wait(timeout=1)
-    except subprocess.TimeoutExpired:
-        _terminate(process)
-        exit_code = process.wait(timeout=1)
-    return (
-        exit_code,
-        bytes(streams[process.stdout]),
-        bytes(streams[process.stderr]),
-        timed_out,
-        overflow,
-    )
+        return _collect_bounded_process(
+            process,
+            timeout_seconds=timeout_seconds,
+            output_limit=output_limit,
+        )
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except Exception as error:
+        raise CloudHarnessError("subject_process_collection_failed") from error
+    finally:
+        _cleanup_process_group(process)
 
 
 def _observe(
@@ -729,7 +801,7 @@ def evaluate_carl_pair(
     if (parent_identity is None) != (candidate_identity is None):
         raise CloudHarnessError("subject_identity_invalid")
     if parent_identity is not None and (
-        parent_identity == candidate_identity
+        parent_identity[0] == candidate_identity[0]
         or os.geteuid() in {parent_identity[0], candidate_identity[0]}
     ):
         raise CloudHarnessError("subject_identity_not_isolated")

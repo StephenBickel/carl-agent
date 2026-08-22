@@ -1,0 +1,11 @@
+[Unit]
+Description=Carl protected live model gateway socket
+
+[Socket]
+FileDescriptorName=live-gateway
+ListenStream=127.0.0.1:43117
+NoDelay=true
+Service=carl-live-gateway.service
+
+[Install]
+WantedBy=sockets.target

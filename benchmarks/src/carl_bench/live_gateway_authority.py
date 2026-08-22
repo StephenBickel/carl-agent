@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 import secrets
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any, Protocol
 
 from carl_bench.adapters.carl_acp import BoundedModelGatewayCapability
@@ -28,6 +31,10 @@ _DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 _OBJECT_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,255}$")
 _ENDPOINT = "http://127.0.0.1:43117/v1/evaluate"
+_CLAIM_LEASE_SECONDS = 60
+_BOOT_ID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+)
 
 
 class LiveGatewayAuthorityError(ValueError):
@@ -77,6 +84,7 @@ class ActualLiveExecution:
     worker_gid: int
     executable_digest: str
     checkout_digest: str
+    isolation_digest: str
 
     def __init__(self, *args: object, **kwargs: object) -> None:
         del args, kwargs
@@ -130,6 +138,7 @@ class ActualLiveExecution:
             self.execution_context_digest,
             self.executable_digest,
             self.checkout_digest,
+            self.isolation_digest,
         ):
             _digest(value, "live_execution_context_invalid")
         for value in (self.task_id, self.model, self.reasoning_policy):
@@ -150,17 +159,23 @@ class _PinnedGateway(Protocol):
 class _GatewayState(Protocol):
     def reserve_grant(self, **kwargs: object) -> None: ...
 
-    def load_grant(self, token_digest: str, *, consume: bool = False) -> dict[str, Any]: ...
+    def load_grant(self, token_digest: str) -> dict[str, Any]: ...
 
-    def complete_result(self, token_digest: str, result: dict[str, Any]) -> None: ...
+    def claim_grant(self, token_digest: str, **kwargs: object) -> dict[str, Any]: ...
+
+    def complete_result(self, token_digest: str, claim_id: str, result: dict[str, Any]) -> None: ...
 
     def take_result(self, token_digest: str) -> tuple[dict[str, Any], dict[str, Any]]: ...
 
     def record_infrastructure_invalid(self, token_digest: str, code: str) -> None: ...
 
+    def invalidate_execution(self, token_digest: str, code: str) -> None: ...
+
     def retry_codes(
         self, pair_request_digest: str, task_id: str, attempt: int
     ) -> dict[str, str]: ...
+
+    def reconcile_abandoned_claims(self, **kwargs: object) -> tuple[str, ...]: ...
 
 
 @dataclass(slots=True)
@@ -297,25 +312,53 @@ class _MemoryGatewayState:
         self.issues.add(issue)
         self.rows[token] = {
             "grant": kwargs["grant"],
-            "consumed": False,
+            "claim_state": "ready",
+            "claim_id": None,
+            "claim_boot_id": None,
+            "claim_pid": None,
+            "claim_process_start": None,
+            "claim_expires_at": None,
             "result": None,
             "collected": False,
             "infrastructure_code": None,
         }
 
-    def load_grant(self, token_digest: str, *, consume: bool = False) -> dict[str, Any]:
+    def load_grant(self, token_digest: str) -> dict[str, Any]:
         row = self.rows.get(token_digest)
         if row is None:
             raise LiveGatewayStateError("live_gateway_capability_invalid")
-        if consume:
-            if row["consumed"]:
-                raise LiveGatewayStateError("live_gateway_capability_consumed")
-            row["consumed"] = True
         return row["grant"]
 
-    def complete_result(self, token_digest: str, result: dict[str, Any]) -> None:
+    def claim_grant(self, token_digest: str, **kwargs: object) -> dict[str, Any]:
+        row = self.rows.get(token_digest)
+        if row is None:
+            raise LiveGatewayStateError("live_gateway_capability_invalid")
+        if row["claim_state"] == "in_progress":
+            raise LiveGatewayStateError("live_gateway_capability_in_progress")
+        if row["claim_state"] != "ready":
+            raise LiveGatewayStateError("live_gateway_capability_consumed")
+        row["claim_state"] = "in_progress"
+        for name in (
+            "claim_id",
+            "boot_id",
+            "process_id",
+            "process_start",
+            "expires_at",
+        ):
+            target = {
+                "boot_id": "claim_boot_id",
+                "process_id": "claim_pid",
+                "process_start": "claim_process_start",
+            }.get(name, name)
+            row[target] = kwargs[name]
+        return row["grant"]
+
+    def complete_result(self, token_digest: str, claim_id: str, result: dict[str, Any]) -> None:
         row = self.rows[token_digest]
+        if row["claim_state"] != "in_progress" or row["claim_id"] != claim_id:
+            raise LiveGatewayStateError("live_gateway_capability_invalid")
         row["result"] = result
+        row["claim_state"] = "completed"
 
     def take_result(self, token_digest: str) -> tuple[dict[str, Any], dict[str, Any]]:
         row = self.rows.get(token_digest)
@@ -334,7 +377,15 @@ class _MemoryGatewayState:
             raise LiveGatewayStateError("live_gateway_capability_invalid")
         if row["result"] is not None or row["infrastructure_code"] not in {None, code}:
             raise LiveGatewayStateError("live_infrastructure_result_conflict")
-        row["consumed"] = True
+        row["claim_state"] = "invalid"
+        row["infrastructure_code"] = code
+
+    def invalidate_execution(self, token_digest: str, code: str) -> None:
+        row = self.rows.get(token_digest)
+        if row is None or row["collected"] or row["infrastructure_code"] not in {None, code}:
+            raise LiveGatewayStateError("live_infrastructure_result_conflict")
+        row["result"] = None
+        row["claim_state"] = "invalid"
         row["infrastructure_code"] = code
 
     def retry_codes(self, pair_request_digest: str, task_id: str, attempt: int) -> dict[str, str]:
@@ -351,13 +402,36 @@ class _MemoryGatewayState:
                 result[actual["subject"]] = row["infrastructure_code"]
         return result
 
+    def reconcile_abandoned_claims(self, **kwargs: object) -> tuple[str, ...]:
+        reconciled: list[str] = []
+        observed_at = kwargs["observed_at"]
+        current_boot_id = kwargs["current_boot_id"]
+        process_identity = kwargs["process_identity"]
+        for token_digest, row in self.rows.items():
+            if row["claim_state"] != "in_progress" or row["claim_expires_at"] > observed_at:
+                continue
+            alive = (
+                process_identity(row["claim_pid"])
+                if row["claim_boot_id"] == current_boot_id
+                else None
+            )
+            if alive == row["claim_process_start"]:
+                continue
+            row["claim_state"] = "invalid"
+            row["infrastructure_code"] = "gateway_claim_abandoned"
+            reconciled.append(token_digest)
+        return tuple(sorted(reconciled))
+
 
 class ProtectedModelGatewayServer:
     """Service-owned registry that turns opaque one-use tokens into fixed model calls."""
 
     __slots__ = (
+        "_claim_holder",
+        "_clock",
         "_endpoint",
         "_gateway",
+        "_process_identity",
         "_state",
         "_token_source",
     )
@@ -378,12 +452,49 @@ class ProtectedModelGatewayServer:
             }:
                 raise LiveGatewayAuthorityError("live_acp_credential_missing") from error
             raise LiveGatewayAuthorityError("live_gateway_unavailable") from error
+        boot_id, process_id, process_start = cls._protected_claim_holder()
         return cls._construct(
             gateway=gateway,
             endpoint=_ENDPOINT,
             token_source=lambda: secrets.token_urlsafe(32),
             state=SQLiteLiveGatewayStateStore.from_protected_process(),
+            clock=lambda: datetime.now(UTC),
+            claim_holder=(boot_id, process_id, process_start),
+            process_identity=cls._process_start,
         )
+
+    @staticmethod
+    def _process_start(process_id: int) -> str | None:
+        try:
+            payload = Path(f"/proc/{process_id}/stat").read_bytes()
+        except OSError:
+            return None
+        if not 0 < len(payload) <= 16_384:
+            return None
+        closing = payload.rfind(b")")
+        if closing < 0:
+            return None
+        fields = payload[closing + 1 :].split()
+        if len(fields) < 20:
+            return None
+        start = fields[19]
+        try:
+            decoded = start.decode("ascii")
+        except UnicodeError:
+            return None
+        return decoded if decoded.isdecimal() else None
+
+    @classmethod
+    def _protected_claim_holder(cls) -> tuple[str, int, str]:
+        try:
+            boot_id = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip()
+        except OSError as error:
+            raise LiveGatewayAuthorityError("live_gateway_claim_observer_unavailable") from error
+        process_id = os.getpid()
+        process_start = cls._process_start(process_id)
+        if _BOOT_ID_RE.fullmatch(boot_id) is None or process_start is None:
+            raise LiveGatewayAuthorityError("live_gateway_claim_observer_unavailable")
+        return boot_id, process_id, process_start
 
     @classmethod
     def _for_testing(
@@ -393,6 +504,9 @@ class ProtectedModelGatewayServer:
         endpoint: str,
         token_source: Callable[[], str],
         state: _GatewayState | None = None,
+        clock: Callable[[], datetime] | None = None,
+        claim_holder: tuple[str, int, str] | None = None,
+        process_identity: Callable[[int], str | None] | None = None,
     ) -> ProtectedModelGatewayServer:
         if (
             not callable(getattr(gateway, "protected_execution_policy", None))
@@ -406,6 +520,17 @@ class ProtectedModelGatewayServer:
             endpoint=endpoint,
             token_source=token_source,
             state=state if state is not None else _MemoryGatewayState(),
+            clock=clock if clock is not None else (lambda: datetime.now(UTC)),
+            claim_holder=(
+                claim_holder
+                if claim_holder is not None
+                else ("11111111-1111-4111-8111-111111111111", 1, "test-process-1")
+            ),
+            process_identity=(
+                process_identity
+                if process_identity is not None
+                else (lambda process_id: "test-process-1" if process_id == 1 else None)
+            ),
         )
 
     @classmethod
@@ -416,6 +541,9 @@ class ProtectedModelGatewayServer:
         endpoint: str,
         token_source: Callable[[], str],
         state: _GatewayState,
+        clock: Callable[[], datetime],
+        claim_holder: tuple[str, int, str],
+        process_identity: Callable[[int], str | None],
     ) -> ProtectedModelGatewayServer:
         try:
             BoundedModelGatewayCapability(
@@ -433,7 +561,43 @@ class ProtectedModelGatewayServer:
         value._endpoint = endpoint
         value._token_source = token_source
         value._state = state
+        if (
+            not callable(clock)
+            or not callable(process_identity)
+            or not isinstance(claim_holder, tuple)
+            or len(claim_holder) != 3
+            or not isinstance(claim_holder[0], str)
+            or _BOOT_ID_RE.fullmatch(claim_holder[0]) is None
+            or isinstance(claim_holder[1], bool)
+            or not isinstance(claim_holder[1], int)
+            or claim_holder[1] <= 0
+            or not isinstance(claim_holder[2], str)
+            or not claim_holder[2]
+        ):
+            raise LiveGatewayAuthorityError("live_gateway_claim_observer_invalid")
+        value._clock = clock
+        value._claim_holder = claim_holder
+        value._process_identity = process_identity
+        try:
+            value._state.reconcile_abandoned_claims(
+                observed_at=value._now_epoch(),
+                current_boot_id=claim_holder[0],
+                process_identity=process_identity,
+            )
+        except LiveGatewayStateError as error:
+            raise LiveGatewayAuthorityError(error.code) from error
         return value
+
+    def _now_epoch(self) -> int:
+        observed = self._clock()
+        if (
+            not isinstance(observed, datetime)
+            or observed.tzinfo is None
+            or observed.utcoffset() is None
+            or observed.utcoffset().total_seconds() != 0
+        ):
+            raise LiveGatewayAuthorityError("live_gateway_clock_invalid")
+        return int(observed.timestamp())
 
     @staticmethod
     def _expected_actual(
@@ -448,6 +612,7 @@ class ProtectedModelGatewayServer:
         worker_gid: int = 1,
         executable_digest: str | None = None,
         checkout_digest: str | None = None,
+        isolation_digest: str | None = None,
     ) -> ActualLiveExecution:
         if subject not in {"parent", "candidate"}:
             raise LiveGatewayAuthorityError("live_execution_binding_mismatch")
@@ -492,6 +657,7 @@ class ProtectedModelGatewayServer:
             worker_gid=worker_gid,
             executable_digest=executable_digest or hashlib.sha256(b"test-executable").hexdigest(),
             checkout_digest=checkout_digest or hashlib.sha256(b"test-checkout").hexdigest(),
+            isolation_digest=isolation_digest or hashlib.sha256(b"test-isolation").hexdigest(),
         )
 
     def issue_capability(
@@ -580,6 +746,7 @@ class ProtectedModelGatewayServer:
             worker_gid=actual.worker_gid,
             executable_digest=actual.executable_digest,
             checkout_digest=actual.checkout_digest,
+            isolation_digest=actual.isolation_digest,
         )
         if actual != expected:
             raise LiveGatewayAuthorityError("live_execution_binding_mismatch")
@@ -659,19 +826,17 @@ class ProtectedModelGatewayServer:
         except (TypeError, ValueError) as error:
             raise LiveGatewayAuthorityError("live_gateway_token_invalid") from error
 
-    def _grant(self, token: object, *, consume: bool = False) -> _Grant:
+    def _grant(self, token: object) -> _Grant:
         if not isinstance(token, str):
             raise LiveGatewayAuthorityError("live_gateway_capability_invalid")
         try:
-            value = self._state.load_grant(
-                hashlib.sha256(token.encode()).hexdigest(), consume=consume
-            )
+            value = self._state.load_grant(hashlib.sha256(token.encode()).hexdigest())
             return _grant_from_document(value)
         except LiveGatewayStateError as error:
             raise LiveGatewayAuthorityError(error.code) from error
 
     def evaluate(self, token: str, input_text: str) -> ProtectedOpenAIModelResult:
-        grant = self._grant(token, consume=True)
+        grant = self._grant(token)
         if not isinstance(input_text, str):
             raise LiveGatewayAuthorityError("live_gateway_input_mismatch")
         try:
@@ -703,6 +868,32 @@ class ProtectedModelGatewayServer:
         )
         if request.request_digest != expected_digest:
             raise LiveGatewayAuthorityError("live_execution_binding_mismatch")
+        claim_id = hashlib.sha256(
+            canonical_json_bytes(
+                {
+                    "domain": "carl.live-gateway-provider-claim.v1",
+                    "request_digest": request.request_digest,
+                    "token_digest": grant.token_digest,
+                }
+            )
+        ).hexdigest()
+        started_at = self._now_epoch()
+        try:
+            claimed = _grant_from_document(
+                self._state.claim_grant(
+                    grant.token_digest,
+                    claim_id=claim_id,
+                    boot_id=self._claim_holder[0],
+                    process_id=self._claim_holder[1],
+                    process_start=self._claim_holder[2],
+                    started_at=started_at,
+                    expires_at=started_at + _CLAIM_LEASE_SECONDS,
+                )
+            )
+        except LiveGatewayStateError as error:
+            raise LiveGatewayAuthorityError(error.code) from error
+        if claimed != grant:
+            raise LiveGatewayAuthorityError("live_gateway_grant_invalid")
         try:
             result = self._gateway.evaluate(request)
             verified = self._gateway.verify_protected_result(result)
@@ -713,7 +904,11 @@ class ProtectedModelGatewayServer:
         if type(result) is not ProtectedOpenAIModelResult or not verified:
             raise LiveGatewayAuthorityError("live_model_provenance_invalid")
         try:
-            self._state.complete_result(grant.token_digest, _result_document(result))
+            self._state.complete_result(
+                grant.token_digest,
+                claim_id,
+                _result_document(result),
+            )
         except LiveGatewayStateError as error:
             raise LiveGatewayAuthorityError(error.code) from error
         return result
@@ -752,5 +947,14 @@ class ProtectedModelGatewayServer:
             raise LiveGatewayAuthorityError("live_infrastructure_code_invalid")
         try:
             self._state.record_infrastructure_invalid(grant.token_digest, code)
+        except LiveGatewayStateError as error:
+            raise LiveGatewayAuthorityError(error.code) from error
+
+    def invalidate_execution(self, token: str, code: str) -> None:
+        grant = self._grant(token)
+        if not isinstance(code, str) or _ID_RE.fullmatch(code) is None:
+            raise LiveGatewayAuthorityError("live_infrastructure_code_invalid")
+        try:
+            self._state.invalidate_execution(grant.token_digest, code)
         except LiveGatewayStateError as error:
             raise LiveGatewayAuthorityError(error.code) from error

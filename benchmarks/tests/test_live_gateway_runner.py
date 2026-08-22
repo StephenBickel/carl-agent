@@ -7,15 +7,22 @@ import socket
 import subprocess
 import threading
 import time
+from configparser import ConfigParser
+from contextlib import suppress
 from pathlib import Path
 
 import pytest
 
+from carl_bench.adapters.carl_acp import BoundedModelGatewayCapability
 from carl_bench.canonical import canonical_json_bytes
 from carl_bench.live_capability import LiveEvaluationIdentity, LivePairPolicy, LiveTaskIdentity
-from carl_bench.live_gateway_authority import ProtectedModelGatewayServer
+from carl_bench.live_gateway_authority import (
+    LiveGatewayAuthorityError,
+    ProtectedModelGatewayServer,
+)
 from carl_bench.live_gateway_http import _serve_loopback_listener
 from carl_bench.live_gateway_runner import ProtectedLiveGatewayRunner
+from carl_bench.live_worker_isolation import CgroupV2WorkerIsolation, LiveWorkerIsolationError
 from carl_bench.openai_gateway import (
     OpenAIModelRequest,
     OpenAIUsage,
@@ -52,7 +59,14 @@ class _Gateway:
         return type(result) is ProtectedOpenAIModelResult
 
 
-def _checkout(root: Path, port: int, *, fork_background: bool = False) -> tuple[Path, str, str]:
+def _checkout(
+    root: Path,
+    port: int,
+    *,
+    fork_background: bool = False,
+    escape_session: bool = False,
+    mutate_checkout: bool = False,
+) -> tuple[Path, str, str]:
     root.mkdir()
     executable = root / "subject"
     executable.write_text(
@@ -65,6 +79,18 @@ def _checkout(root: Path, port: int, *, fork_background: bool = False) -> tuple[
             "    time.sleep(60)\n"
             "    raise SystemExit(0)\n"
             if fork_background
+            else ""
+        )
+        + (
+            "child = os.fork()\n"
+            "if child == 0:\n"
+            "    os.setsid()\n"
+            "    os.close(1)\n"
+            "    os.close(2)\n"
+            "    open(sys.argv[1], 'w', encoding='utf-8').write(str(os.getpid()))\n"
+            "    time.sleep(60)\n"
+            "    raise SystemExit(0)\n"
+            if escape_session
             else ""
         )
         + "assert 'OPENAI_API_KEY' not in os.environ\n"
@@ -86,7 +112,12 @@ def _checkout(root: Path, port: int, *, fork_background: bool = False) -> tuple[
         "        chunk = connection.recv(65536)\n"
         "        if not chunk: break\n"
         "        response += chunk\n"
-        "assert response.startswith(b'HTTP/1.1 200 OK')\n",
+        "assert response.startswith(b'HTTP/1.1 200 OK')\n"
+        + (
+            "open('post-run-mutation', 'w', encoding='utf-8').write('dirty')\n"
+            if mutate_checkout
+            else ""
+        ),
         encoding="utf-8",
     )
     executable.chmod(0o755)
@@ -117,7 +148,315 @@ def _process_exists(process_id: int) -> bool:
         os.kill(process_id, 0)
     except ProcessLookupError:
         return False
-    return True
+    status = subprocess.run(
+        ("ps", "-o", "stat=", "-p", str(process_id)),
+        check=False,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    return bool(status) and not status.startswith("Z")
+
+
+class _FakeIsolationScope:
+    def __init__(
+        self,
+        *,
+        observed_identity: tuple[int, int] | None = None,
+        escaped_pid_path: Path | None = None,
+        fail_cleanup: bool = False,
+    ) -> None:
+        self._observed_identity = observed_identity
+        self._escaped_pid_path = escaped_pid_path
+        self._fail_cleanup = fail_cleanup
+        self.process_id = -1
+        self.cleaned = False
+        self.attestation_digest = _digest("fake-cgroup-v2-scope")
+
+    def attach_and_observe(
+        self, process_id: int, *, expected_uid: int, expected_gid: int
+    ) -> tuple[int, int]:
+        self.process_id = process_id
+        return self._observed_identity or (expected_uid, expected_gid)
+
+    def cleanup_and_verify_empty(self) -> None:
+        if self.process_id > 0:
+            with suppress(ProcessLookupError, PermissionError):
+                os.killpg(self.process_id, signal.SIGKILL)
+        if self._escaped_pid_path is not None:
+            deadline = time.monotonic() + 2
+            while not self._escaped_pid_path.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            if self._escaped_pid_path.exists():
+                escaped = int(self._escaped_pid_path.read_text(encoding="utf-8"))
+                with suppress(ProcessLookupError):
+                    os.kill(escaped, signal.SIGKILL)
+                while _process_exists(escaped) and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                if _process_exists(escaped):
+                    raise LiveWorkerIsolationError("live_worker_isolation_not_empty")
+        if self._fail_cleanup:
+            raise LiveWorkerIsolationError("live_worker_isolation_not_empty")
+        self.cleaned = True
+
+
+class _FakeIsolation:
+    def __init__(self, scope: _FakeIsolationScope | None = None) -> None:
+        self.scope = scope or _FakeIsolationScope()
+
+    def begin(self, execution_digest: str) -> _FakeIsolationScope:
+        assert len(execution_digest) == 64
+        return self.scope
+
+
+def _case(
+    *, endpoint: str, parent_commit: str, parent_tree: str
+) -> tuple[LiveEvaluationIdentity, LivePairPolicy, LiveTaskIdentity]:
+    policy_document = _Gateway().protected_execution_policy()
+    identity = LiveEvaluationIdentity.create(
+        repository="StephenBickel/carl-agent",
+        parent_commit=parent_commit,
+        parent_tree=parent_tree,
+        candidate_commit="2" * 40,
+        candidate_tree="3" * 40,
+        experiment_digest=_digest("experiment"),
+        workflow_revision="4" * 40,
+        workflow_digest=_digest("workflow"),
+        task_set_digest=_digest("task-set"),
+        metric_pack_digest=_digest("metric-pack"),
+        policy_digest=_digest("policy"),
+        model_policy_digest=hashlib.sha256(canonical_json_bytes(policy_document)).hexdigest(),
+        grader_digest=_digest("grader"),
+        environment_digest=ProtectedLiveGatewayRunner.environment_digest(endpoint),
+        model="gpt-5.2",
+        reasoning_policy="medium/no-summary",
+        tool_protocol_revision="acp-v2/bounded-openai-v1",
+        task_order=("held",),
+        seeds=(41,),
+        attempts=1,
+    )
+    policy = LivePairPolicy(0, 50_000, 30_000, 5_000_000, 1_000_000, 10_000_000, 0, 0, False, False)
+    task = LiveTaskIdentity(
+        task_id="held",
+        task_digest=_digest("held-task"),
+        input_digest=hashlib.sha256(b"held-out prompt").hexdigest(),
+        input_size=len(b"held-out prompt"),
+        grader_digest=_digest("grader"),
+        role="held_out",
+    )
+    return identity, policy, task
+
+
+def test_runner_rejects_same_uid_with_different_gids() -> None:
+    server = ProtectedModelGatewayServer._for_testing(
+        gateway=_Gateway(),
+        endpoint="http://127.0.0.1:43117/v1/evaluate",
+        token_source=lambda: "runner-owned-token-1234567890",
+    )
+
+    with pytest.raises(
+        LiveGatewayAuthorityError,
+        match="live_gateway_runner_configuration_invalid",
+    ):
+        ProtectedLiveGatewayRunner._for_testing(
+            server=server,
+            workers=((62_001, 62_001), (62_001, 62_002)),
+            isolation=_FakeIsolation(),
+        )
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires POSIX executable replacement")
+def test_runner_rejects_checkout_replacement_after_observation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(2)
+    port = listener.getsockname()[1]
+    endpoint = f"http://127.0.0.1:{port}/v1/evaluate"
+    executable, parent_commit, parent_tree = _checkout(tmp_path / "parent", port)
+    identity, policy, task = _case(
+        endpoint=endpoint,
+        parent_commit=parent_commit,
+        parent_tree=parent_tree,
+    )
+    marker = tmp_path / "replacement-executed"
+    replacement = tmp_path / "replacement"
+    replacement.write_text(
+        executable.read_text(encoding="utf-8").replace(
+            "assert 'OPENAI_API_KEY' not in os.environ",
+            f"open({os.fspath(marker)!r}, 'w', encoding='utf-8').write('executed')\n"
+            "assert 'OPENAI_API_KEY' not in os.environ",
+        ),
+        encoding="utf-8",
+    )
+    replacement.chmod(0o755)
+    server = ProtectedModelGatewayServer._for_testing(
+        gateway=_Gateway(),
+        endpoint=endpoint,
+        token_source=lambda: "runner-owned-token-1234567890",
+    )
+    scope = _FakeIsolationScope()
+    runner = ProtectedLiveGatewayRunner._for_testing(
+        server=server,
+        workers=((os.geteuid(), os.getegid()), (os.geteuid() + 1, os.getegid() + 1)),
+        isolation=_FakeIsolation(scope),
+    )
+    original = ProtectedLiveGatewayRunner._observe_checkout
+
+    def replace_after_observation(cls: type[ProtectedLiveGatewayRunner], **kwargs: object):
+        del cls
+        observed = original(**kwargs)
+        os.replace(replacement, executable)
+        return observed
+
+    monkeypatch.setattr(
+        ProtectedLiveGatewayRunner,
+        "_observe_checkout",
+        classmethod(replace_after_observation),
+    )
+    thread = threading.Thread(
+        target=_serve_loopback_listener,
+        kwargs={"listener_fd": listener.fileno(), "server": server, "maximum_connections": 1},
+        daemon=True,
+    )
+    thread.start()
+    try:
+        with pytest.raises(LiveGatewayAuthorityError, match="live_worker_checkout_changed"):
+            runner.execute_worker(
+                identity=identity,
+                policy=policy,
+                task=task,
+                subject="parent",
+                attempt=1,
+                checkout=tmp_path / "parent",
+                executable=executable,
+                timeout_seconds=5,
+            )
+    finally:
+        thread.join(3)
+        listener.close()
+    assert marker.exists() is False
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires POSIX checkout mutation")
+def test_runner_invalidates_completed_result_when_checkout_changes_during_execution(
+    tmp_path: Path,
+) -> None:
+    from carl_bench.live_gateway_store import SQLiteLiveGatewayStateStore
+
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(2)
+    port = listener.getsockname()[1]
+    endpoint = f"http://127.0.0.1:{port}/v1/evaluate"
+    executable, parent_commit, parent_tree = _checkout(
+        tmp_path / "parent", port, mutate_checkout=True
+    )
+    identity, policy, task = _case(
+        endpoint=endpoint,
+        parent_commit=parent_commit,
+        parent_tree=parent_tree,
+    )
+    token = "runner-owned-token-1234567890"
+    store = SQLiteLiveGatewayStateStore._for_testing(tmp_path / "gateway.sqlite3")
+    server = ProtectedModelGatewayServer._for_testing(
+        gateway=_Gateway(),
+        endpoint=endpoint,
+        token_source=lambda: token,
+        state=store,
+    )
+    runner = ProtectedLiveGatewayRunner._for_testing(
+        server=server,
+        workers=((os.geteuid(), os.getegid()), (os.geteuid() + 1, os.getegid() + 1)),
+        isolation=_FakeIsolation(),
+    )
+    thread = threading.Thread(
+        target=_serve_loopback_listener,
+        kwargs={"listener_fd": listener.fileno(), "server": server, "maximum_connections": 1},
+        daemon=True,
+    )
+    thread.start()
+    try:
+        with pytest.raises(LiveGatewayAuthorityError, match="live_worker_checkout_changed"):
+            runner.execute_worker(
+                identity=identity,
+                policy=policy,
+                task=task,
+                subject="parent",
+                attempt=1,
+                checkout=tmp_path / "parent",
+                executable=executable,
+                timeout_seconds=5,
+            )
+        capability = BoundedModelGatewayCapability(
+            endpoint=endpoint,
+            token=token,
+            pair_request_digest=identity.request_digest,
+            subject="parent",
+            task_id=task.task_id,
+            attempt=1,
+        )
+        with pytest.raises(LiveGatewayAuthorityError, match="live_gateway_result_unavailable"):
+            server.take_completed_result(capability)
+        assert store.retry_codes(identity.request_digest, task.task_id, 1) == {
+            "parent": "runner_execution_changed"
+        }
+    finally:
+        thread.join(3)
+        listener.close()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires POSIX worker execution")
+def test_runner_invalidates_result_when_isolation_cannot_verify_empty(tmp_path: Path) -> None:
+    from carl_bench.live_gateway_store import SQLiteLiveGatewayStateStore
+
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(2)
+    port = listener.getsockname()[1]
+    endpoint = f"http://127.0.0.1:{port}/v1/evaluate"
+    executable, parent_commit, parent_tree = _checkout(tmp_path / "parent", port)
+    identity, policy, task = _case(
+        endpoint=endpoint,
+        parent_commit=parent_commit,
+        parent_tree=parent_tree,
+    )
+    store = SQLiteLiveGatewayStateStore._for_testing(tmp_path / "gateway.sqlite3")
+    server = ProtectedModelGatewayServer._for_testing(
+        gateway=_Gateway(),
+        endpoint=endpoint,
+        token_source=lambda: "runner-owned-token-1234567890",
+        state=store,
+    )
+    runner = ProtectedLiveGatewayRunner._for_testing(
+        server=server,
+        workers=((os.geteuid(), os.getegid()), (os.geteuid() + 1, os.getegid() + 1)),
+        isolation=_FakeIsolation(_FakeIsolationScope(fail_cleanup=True)),
+    )
+    thread = threading.Thread(
+        target=_serve_loopback_listener,
+        kwargs={"listener_fd": listener.fileno(), "server": server, "maximum_connections": 1},
+        daemon=True,
+    )
+    thread.start()
+    try:
+        with pytest.raises(LiveGatewayAuthorityError, match="live_worker_isolation_not_empty"):
+            runner.execute_worker(
+                identity=identity,
+                policy=policy,
+                task=task,
+                subject="parent",
+                attempt=1,
+                checkout=tmp_path / "parent",
+                executable=executable,
+                timeout_seconds=5,
+            )
+        assert store.retry_codes(identity.request_digest, task.task_id, 1) == {
+            "parent": "runner_isolation_cleanup_failed"
+        }
+    finally:
+        thread.join(3)
+        listener.close()
 
 
 @pytest.mark.skipif(os.name == "nt", reason="requires POSIX exec and descriptor semantics")
@@ -167,9 +506,11 @@ def test_runner_owns_launch_observation_capability_and_cross_process_result(
         endpoint=endpoint,
         token_source=lambda: "runner-owned-token-1234567890",
     )
+    scope = _FakeIsolationScope()
     runner = ProtectedLiveGatewayRunner._for_testing(
         server=server,
         workers=((os.geteuid(), os.getegid()), (os.geteuid() + 1, os.getegid() + 1)),
+        isolation=_FakeIsolation(scope),
     )
     monkeypatch.setenv("OPENAI_API_KEY", "sk-protected-secret-visible-to-candidate")
     monkeypatch.setenv("CARL_OPENAI_PROVENANCE_KEY_B64", "protected-provenance-secret")
@@ -196,6 +537,9 @@ def test_runner_owns_launch_observation_capability_and_cross_process_result(
 
     assert type(result) is ProtectedOpenAIModelResult
     assert result.output_text == "runner output"
+    assert server._grant("runner-owned-token-1234567890").actual.isolation_digest == (
+        scope.attestation_digest
+    )
     assert thread.is_alive() is False
 
 
@@ -251,6 +595,7 @@ def test_runner_reaps_candidate_background_process_tree(
     runner = ProtectedLiveGatewayRunner._for_testing(
         server=server,
         workers=((os.geteuid(), os.getegid()), (os.geteuid() + 1, os.getegid() + 1)),
+        isolation=_FakeIsolation(),
     )
     pid_path = tmp_path / "background.pid"
     thread = threading.Thread(
@@ -282,3 +627,148 @@ def test_runner_reaps_candidate_background_process_tree(
             os.kill(child_pid, signal.SIGKILL)
         thread.join(3)
         listener.close()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires POSIX setsid semantics")
+def test_runner_cgroup_isolation_reaps_setsid_escape(tmp_path: Path) -> None:
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(2)
+    port = listener.getsockname()[1]
+    endpoint = f"http://127.0.0.1:{port}/v1/evaluate"
+    escaped_pid_path = tmp_path / "escaped.pid"
+    executable, parent_commit, parent_tree = _checkout(
+        tmp_path / "parent", port, escape_session=True
+    )
+    identity, policy, task = _case(
+        endpoint=endpoint,
+        parent_commit=parent_commit,
+        parent_tree=parent_tree,
+    )
+    scope = _FakeIsolationScope(escaped_pid_path=escaped_pid_path)
+    server = ProtectedModelGatewayServer._for_testing(
+        gateway=_Gateway(),
+        endpoint=endpoint,
+        token_source=lambda: "runner-owned-token-1234567890",
+    )
+    runner = ProtectedLiveGatewayRunner._for_testing(
+        server=server,
+        workers=((os.geteuid(), os.getegid()), (os.geteuid() + 1, os.getegid() + 1)),
+        isolation=_FakeIsolation(scope),
+    )
+    thread = threading.Thread(
+        target=_serve_loopback_listener,
+        kwargs={"listener_fd": listener.fileno(), "server": server, "maximum_connections": 1},
+        daemon=True,
+    )
+    thread.start()
+    try:
+        result = runner.execute_worker(
+            identity=identity,
+            policy=policy,
+            task=task,
+            subject="parent",
+            attempt=1,
+            checkout=tmp_path / "parent",
+            executable=executable,
+            arguments=(os.fspath(escaped_pid_path),),
+            timeout_seconds=5,
+        )
+        escaped_pid = int(escaped_pid_path.read_text(encoding="utf-8"))
+        assert type(result) is ProtectedOpenAIModelResult
+        assert scope.cleaned is True
+        assert _process_exists(escaped_pid) is False
+    finally:
+        if escaped_pid_path.exists():
+            escaped_pid = int(escaped_pid_path.read_text(encoding="utf-8"))
+            if _process_exists(escaped_pid):
+                os.kill(escaped_pid, signal.SIGKILL)
+        thread.join(3)
+        listener.close()
+
+
+def test_runner_rejects_runtime_worker_identity_mismatch(tmp_path: Path) -> None:
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    port = listener.getsockname()[1]
+    endpoint = f"http://127.0.0.1:{port}/v1/evaluate"
+    executable, parent_commit, parent_tree = _checkout(tmp_path / "parent", port)
+    identity, policy, task = _case(
+        endpoint=endpoint,
+        parent_commit=parent_commit,
+        parent_tree=parent_tree,
+    )
+    expected = (os.geteuid(), os.getegid())
+    server = ProtectedModelGatewayServer._for_testing(
+        gateway=_Gateway(),
+        endpoint=endpoint,
+        token_source=lambda: "runner-owned-token-1234567890",
+    )
+    runner = ProtectedLiveGatewayRunner._for_testing(
+        server=server,
+        workers=(expected, (os.geteuid() + 1, os.getegid() + 1)),
+        isolation=_FakeIsolation(
+            _FakeIsolationScope(observed_identity=(expected[0] + 10, expected[1]))
+        ),
+    )
+    try:
+        with pytest.raises(LiveGatewayAuthorityError, match="live_worker_identity_mismatch"):
+            runner.execute_worker(
+                identity=identity,
+                policy=policy,
+                task=task,
+                subject="parent",
+                attempt=1,
+                checkout=tmp_path / "parent",
+                executable=executable,
+                timeout_seconds=5,
+            )
+    finally:
+        listener.close()
+
+
+def test_production_cgroup_isolation_fails_closed_outside_commissioned_service() -> None:
+    with pytest.raises(LiveWorkerIsolationError, match="live_worker_isolation_not_commissioned"):
+        CgroupV2WorkerIsolation.from_protected_process()
+
+
+def test_live_gateway_systemd_contract_commissions_delegated_cgroup_v2() -> None:
+    systemd_root = Path(__file__).parents[2] / "infra/autonomy/systemd"
+    service = ConfigParser(interpolation=None, strict=True)
+    service.optionxform = str
+    socket_unit = ConfigParser(interpolation=None, strict=True)
+    socket_unit.optionxform = str
+
+    assert service.read(systemd_root / "carl-live-gateway.service")
+    assert socket_unit.read(systemd_root / "carl-live-gateway.socket")
+    assert service["Service"] == {
+        "Type": "simple",
+        "ExecStart": "/opt/carl/venv/bin/carl-live-gateway-service",
+        "EnvironmentFile": "/etc/carl/live-gateway.env",
+        "User": "root",
+        "Group": "root",
+        "Delegate": "pids",
+        "TasksMax": "256",
+        "NoNewPrivileges": "yes",
+        "PrivateDevices": "yes",
+        "PrivateTmp": "yes",
+        "ProtectControlGroups": "no",
+        "ProtectHome": "yes",
+        "ProtectKernelModules": "yes",
+        "ProtectKernelTunables": "yes",
+        "ProtectSystem": "strict",
+        "ReadOnlyPaths": "/srv/carl/checkouts",
+        "RestrictAddressFamilies": "AF_UNIX AF_INET AF_INET6",
+        "RuntimeDirectory": "carl-live-gateway",
+        "RuntimeDirectoryMode": "0700",
+        "StateDirectory": "carl/live-gateway",
+        "StateDirectoryMode": "0700",
+        "UMask": "0077",
+    }
+    assert socket_unit["Socket"] == {
+        "FileDescriptorName": "live-gateway",
+        "ListenStream": "127.0.0.1:43117",
+        "NoDelay": "true",
+        "Service": "carl-live-gateway.service",
+    }

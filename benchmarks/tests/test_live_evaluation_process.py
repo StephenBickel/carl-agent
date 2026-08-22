@@ -233,6 +233,13 @@ def test_protected_service_requires_distinct_unprivileged_worker_identities(
     with pytest.raises(LiveEvaluationAuthorityError, match="live_worker_identity_missing"):
         _load_protected_authority()
 
+    monkeypatch.setenv("CARL_PARENT_WORKER_UID", "62001")
+    monkeypatch.setenv("CARL_PARENT_WORKER_GID", "62001")
+    monkeypatch.setenv("CARL_CANDIDATE_WORKER_UID", "62001")
+    monkeypatch.setenv("CARL_CANDIDATE_WORKER_GID", "62002")
+    with pytest.raises(LiveEvaluationAuthorityError, match="live_worker_identity_invalid"):
+        _load_protected_authority()
+
 
 @pytest.mark.skipif(os.name == "nt", reason="requires Unix peer credentials")
 def test_archive_reader_uses_exact_credential_free_protected_storage_read() -> None:

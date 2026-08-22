@@ -4,7 +4,9 @@ import hashlib
 import json
 import os
 import shutil
+import signal
 import subprocess
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -182,6 +184,20 @@ def _git_subject(path: Path, *, version_ok: bool) -> tuple[Path, str, str]:
         text=True,
     ).stdout.strip()
     return binary, commit, tree
+
+
+def _process_exists(process_id: int) -> bool:
+    try:
+        os.kill(process_id, 0)
+    except ProcessLookupError:
+        return False
+    status = subprocess.run(
+        ("ps", "-o", "stat=", "-p", str(process_id)),
+        check=False,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    return bool(status) and not status.startswith("Z")
 
 
 def test_contract_hash_and_parser_share_one_held_file_description(
@@ -482,6 +498,117 @@ def test_protected_harness_rejects_shared_or_harness_subject_uid(tmp_path: Path)
             parent_identity=harness_identity,
             candidate_identity=harness_identity,
         )
+
+
+def test_protected_harness_rejects_same_uid_with_different_gids(tmp_path: Path) -> None:
+    objects = _objects(tmp_path)
+    parent = _subject(tmp_path / "parent-carl", version_ok=False)
+    candidate = _subject(tmp_path / "candidate-carl", version_ok=True)
+    shared_uid = os.geteuid() + 10_000
+
+    with pytest.raises(CloudHarnessError, match="subject_identity_not_isolated"):
+        evaluate_carl_pair(
+            parent_binary=parent,
+            candidate_binary=candidate,
+            parent_commit=PARENT,
+            candidate_commit=CANDIDATE,
+            experiment_path=objects["experiment"],
+            task_set_path=objects["task_set"],
+            metric_pack_path=objects["metric_pack"],
+            policy_path=objects["policy"],
+            mode="improvement",
+            parent_identity=(shared_uid, os.getegid() + 10_000),
+            candidate_identity=(shared_uid, os.getegid() + 10_001),
+        )
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires POSIX fork and process groups")
+def test_bounded_process_reaps_descendants_after_normal_leader_exit(tmp_path: Path) -> None:
+    pid_path = tmp_path / "descendant.pid"
+    executable = tmp_path / "forking-subject"
+    executable.write_text(
+        "#!/usr/bin/python3\n"
+        "import os, sys, time\n"
+        "child = os.fork()\n"
+        "if child == 0:\n"
+        "    os.close(1)\n"
+        "    os.close(2)\n"
+        "    open(sys.argv[1], 'w', encoding='utf-8').write(str(os.getpid()))\n"
+        "    time.sleep(60)\n"
+        "    raise SystemExit(0)\n"
+        "raise SystemExit(0)\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+    child_pid = -1
+    try:
+        result = cloud_harness._bounded_process(
+            executable,
+            (os.fspath(pid_path),),
+            timeout_seconds=2,
+            output_limit=4_096,
+            subject_identity=None,
+        )
+        deadline = time.monotonic() + 2
+        while not pid_path.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        child_pid = int(pid_path.read_text(encoding="utf-8"))
+        while _process_exists(child_pid) and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        assert result[0] == 0
+        assert _process_exists(child_pid) is False
+    finally:
+        if child_pid > 0 and _process_exists(child_pid):
+            os.kill(child_pid, signal.SIGKILL)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires POSIX process groups")
+def test_bounded_process_reaps_subject_when_collection_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pid_path = tmp_path / "subject.pid"
+    executable = tmp_path / "sleeping-subject"
+    executable.write_text(
+        "#!/usr/bin/python3\n"
+        "import os, sys, time\n"
+        "open(sys.argv[1], 'w', encoding='utf-8').write(str(os.getpid()))\n"
+        "time.sleep(60)\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+
+    class FailingSelector:
+        def register(self, *args: object) -> None:
+            del args
+            deadline = time.monotonic() + 1
+            while not pid_path.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            raise RuntimeError("selector failed")
+
+    monkeypatch.setattr(cloud_harness.selectors, "DefaultSelector", FailingSelector)
+    process_id = -1
+    try:
+        with pytest.raises(CloudHarnessError, match="subject_process_collection_failed"):
+            cloud_harness._bounded_process(
+                executable,
+                (os.fspath(pid_path),),
+                timeout_seconds=2,
+                output_limit=4_096,
+                subject_identity=None,
+            )
+        deadline = time.monotonic() + 2
+        while not pid_path.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        process_id = int(pid_path.read_text(encoding="utf-8"))
+        while _process_exists(process_id) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert _process_exists(process_id) is False
+    finally:
+        if process_id < 0 and pid_path.exists():
+            process_id = int(pid_path.read_text(encoding="utf-8"))
+        if process_id > 0 and _process_exists(process_id):
+            os.kill(process_id, signal.SIGKILL)
 
 
 def test_equal_or_worse_candidate_is_never_eligible(tmp_path: Path) -> None:

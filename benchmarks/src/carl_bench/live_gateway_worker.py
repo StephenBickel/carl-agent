@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import stat
 import sys
 from contextlib import suppress
 
@@ -27,7 +28,20 @@ def main() -> int:
         return 70
     endpoint = os.environ.get("CARL_MODEL_GATEWAY_ENDPOINT")
     token = os.environ.get("CARL_MODEL_GATEWAY_TOKEN")
-    if not endpoint or not token:
+    raw_executable_descriptor = os.environ.get("CARL_PINNED_EXECUTABLE_FD")
+    if (
+        not endpoint
+        or not token
+        or not isinstance(raw_executable_descriptor, str)
+        or not raw_executable_descriptor.isdecimal()
+    ):
+        return 70
+    executable_descriptor = int(raw_executable_descriptor)
+    try:
+        executable_details = os.fstat(executable_descriptor)
+    except OSError:
+        return 70
+    if executable_descriptor < 3 or not stat.S_ISREG(executable_details.st_mode):
         return 70
     environment = {
         "CARL_MODEL_GATEWAY_ENDPOINT": endpoint,
@@ -37,7 +51,12 @@ def main() -> int:
         "PATH": os.defpath,
     }
     try:
-        os.execve(sys.argv[1], sys.argv[1:], environment)
+        execution_path = (
+            f"/proc/self/fd/{executable_descriptor}"
+            if sys.platform.startswith("linux")
+            else sys.argv[1]
+        )
+        os.execve(execution_path, sys.argv[1:], environment)
     except OSError:
         return 70
 
