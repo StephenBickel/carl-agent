@@ -1129,7 +1129,7 @@ def test_cgroup_cleanup_fails_closed_when_scope_remains_populated(
     assert removed == []
 
 
-def test_live_gateway_systemd_contract_commissions_runner_ipc_and_delegated_cgroup_v2() -> None:
+def test_live_gateway_systemd_contract_commissions_runner_ipc_and_restarts_fatal_exit() -> None:
     systemd_root = Path(__file__).parents[2] / "infra/autonomy/systemd"
     service = ConfigParser(interpolation=None, strict=True)
     service.optionxform = str
@@ -1141,10 +1141,19 @@ def test_live_gateway_systemd_contract_commissions_runner_ipc_and_delegated_cgro
     assert service.read(systemd_root / "carl-live-gateway.service")
     assert socket_unit.read(systemd_root / "carl-live-gateway.socket")
     assert runner_socket.read(systemd_root / "carl-live-runner.socket")
-    assert service["Unit"]["Requires"] == ("carl-live-gateway.socket carl-live-runner.socket")
+    assert service["Unit"] == {
+        "Description": "Carl protected live model gateway",
+        "After": "network-online.target",
+        "Wants": "network-online.target",
+        "Requires": "carl-live-gateway.socket carl-live-runner.socket",
+        "StartLimitIntervalSec": "300",
+        "StartLimitBurst": "5",
+    }
     assert service["Service"] == {
         "Type": "simple",
         "ExecStart": "/opt/carl/venv/bin/carl-live-gateway-service",
+        "Restart": "on-failure",
+        "RestartSec": "5s",
         "EnvironmentFile": "/etc/carl/live-gateway.env",
         "User": "root",
         "Group": "root",
