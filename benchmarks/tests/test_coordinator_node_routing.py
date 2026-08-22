@@ -302,6 +302,35 @@ def test_uncommissioned_family_persists_one_stable_selected_node_freeze() -> Non
     assert state.consequences == ["frozen"]
 
 
+def test_first_publish_input_socket_failure_freezes_once_then_is_durably_idle() -> None:
+    state = RestartableState("publish_input")
+    state.current = replace(
+        state.current,
+        command=claimed_command_for(node("publish_input")),
+    )
+
+    class MissingInput:
+        def execute(self, decision, *, observed_at):
+            assert decision.node == "publish_input"
+            assert observed_at == NOW
+            raise cloud_coordinator.ProtectedEffectUnavailable("input_service_uncommissioned")
+
+    first = _restart(state, MissingInput()).advance("coordinate")
+    repeated = _restart(state, MissingInput()).advance("coordinate")
+
+    assert (first.action, first.reason, first.consequential) == (
+        "frozen",
+        "input_service_uncommissioned",
+        True,
+    )
+    assert (repeated.action, repeated.reason, repeated.consequential) == (
+        "idle",
+        "no_applicable_node",
+        False,
+    )
+    assert state.consequences == ["frozen"]
+
+
 def test_typed_node_effect_codec_binds_exact_family_and_command_identity() -> None:
     effects = importlib.import_module("carl_bench.coordinator_effects")
     selected = node("observe_builder")
@@ -524,5 +553,49 @@ def test_fixed_router_does_not_prepare_an_uncommissioned_external_family() -> No
     with pytest.raises(
         cloud_coordinator.ProtectedEffectUnavailable,
         match="archive_service_uncommissioned",
+    ):
+        router.execute(decision, observed_at=NOW)
+
+
+def test_fixed_router_maps_an_unavailable_typed_socket_to_a_durable_freeze() -> None:
+    from carl_bench.coordinator_effect_client import CoordinatorEffectClientError
+
+    selected = node("publish_input")
+    decision = cloud_coordinator.choose_next_action(
+        snapshot(
+            selected,
+            current_lease=lease(),
+            command=claimed_command_for(selected),
+        )
+    )
+
+    class Backend:
+        def prepare_coordinator_effect(self, actual, *, expected_family, observed_at):
+            from carl_bench.coordinator_effects import (
+                CoordinatorNodeEffectRequest,
+                PreparedCoordinatorEffect,
+            )
+
+            assert actual == decision
+            request = CoordinatorNodeEffectRequest.from_decision(decision)
+            return PreparedCoordinatorEffect(expected_family, request)
+
+    class MissingInputService:
+        def publish(self, request):
+            del request
+            raise CoordinatorEffectClientError("input_service_unavailable")
+
+    router = coordinator_service._ProtectedCoordinatorEffectRouter._for_testing(
+        backend=Backend(),
+        github=None,
+        input_publisher=MissingInputService(),
+        observer=None,
+        archive=None,
+        evaluator=None,
+    )
+
+    with pytest.raises(
+        cloud_coordinator.ProtectedEffectUnavailable,
+        match="input_service_uncommissioned",
     ):
         router.execute(decision, observed_at=NOW)

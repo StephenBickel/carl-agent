@@ -1,0 +1,14 @@
+[Unit]
+Description=Carl protected archive effect socket
+
+[Socket]
+FileDescriptorName=archive-effect
+ListenStream=/run/carl/archive-effect.sock
+DirectoryMode=0700
+SocketMode=0600
+SocketUser=root
+SocketGroup=root
+RemoveOnStop=false
+
+[Install]
+WantedBy=sockets.target

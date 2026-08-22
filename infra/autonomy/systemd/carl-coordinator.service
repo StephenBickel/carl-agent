@@ -1,7 +1,7 @@
 [Unit]
 Description=Carl protected autonomy coordinator
-Requires=carl-coordinator.socket
-After=network-online.target
+Requires=carl-coordinator.socket carl-archive-effect.socket carl-evaluator-effect.socket carl-input-effect.socket carl-observer-effect.socket
+After=network-online.target carl-archive-effect.socket carl-evaluator-effect.socket carl-input-effect.socket carl-observer-effect.socket
 Wants=network-online.target
 StartLimitIntervalSec=300
 StartLimitBurst=5
@@ -24,6 +24,7 @@ ProtectSystem=strict
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
+ReadOnlyPaths=/etc/carl/coordinator-effects-policy.json
 RestrictSUIDSGID=true
 LockPersonality=true
 MemoryDenyWriteExecute=true

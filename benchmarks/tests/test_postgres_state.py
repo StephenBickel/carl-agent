@@ -541,12 +541,14 @@ def test_sql_applies_every_consequential_coordinator_action_or_fails_closed() ->
         "release_lease",
         "create_command",
         "claim_command",
-        "complete_command_and_append_event",
+        "terminal_command",
         "create_supervisor_trigger",
     ):
         assert f"carl_autonomy.{durable_operation}" in body
     assert "coordinator_action_not_supported" in body
-    assert "_service_uncommissioned" in body
+    assert "coordinator_freeze_reason_valid" in body
+    assert "coordinator_completion_receipts" in body
+    assert "coordinator_freeze_occurrences" in body
 
 
 def test_sql_derives_named_production_receipts_from_exact_durable_identities() -> None:

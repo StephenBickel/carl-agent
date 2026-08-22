@@ -33,6 +33,7 @@ from test_experiment import (
 
 from carl_bench.candidate import DraftPullRequest, ReviewAttestation, ReviewPacket
 from carl_bench.canonical import canonical_json_bytes
+from carl_bench.cloud_coordinator import CloudCoordinatorDecision
 from carl_bench.cloud_state import (
     AuthorityCapability,
     ClaimReconciliation,
@@ -108,6 +109,32 @@ def _canonical(value: dict[str, Any]) -> str:
     return canonical_json_bytes(value).decode("utf-8")
 
 
+COORDINATOR_NODE_KINDS = (
+    "create_revert",
+    "observe_revert",
+    "publish_input",
+    "register_hypothesis",
+    "request_builder",
+    "dispatch_builder",
+    "observe_builder",
+    "archive_builder",
+    "ingest_builder",
+    "publish_experimental",
+    "dispatch_validation",
+    "observe_validation",
+    "archive_validation",
+    "ingest_validation",
+    "record_disposition",
+    "create_promotion_pr",
+    "observe_required_checks",
+    "enable_auto_merge",
+    "schedule_soak",
+    "observe_soak",
+    "accept_soak",
+    "trigger_supervisor",
+)
+
+
 @pytest.fixture(scope="module")
 def postgres() -> object:
     import psycopg
@@ -165,6 +192,388 @@ def _append_event(connection: object, event: ExperimentEvent) -> dict[str, Any]:
         "SELECT * FROM carl_autonomy.append_event(%s, %s, %s, %s)",
         (_canonical(event.to_canonical_dict()), event.digest, event.payload_json, NOW),
     ).fetchone()
+
+
+@pytest.mark.parametrize("node_kind", COORDINATOR_NODE_KINDS)
+def test_protected_sql_completes_every_node_with_an_exact_authority_bound_receipt(
+    postgres: object, node_kind: str
+) -> None:
+    manifest = sample_manifest()
+    with _as_role(postgres, "carl_builder") as builder:
+        _register_manifest(builder, manifest)
+    with _as_role(postgres, "carl_coordinator") as coordinator:
+        coordinator.execute(
+            "SELECT * FROM carl_autonomy.enqueue_pending_coordinator_graph(%s)", (NOW,)
+        ).fetchone()
+    with postgres.connect(  # type: ignore[attr-defined]
+        POSTGRES_DSN, autocommit=True, row_factory=dict_row
+    ) as admin:
+        runtime = admin.execute(
+            "SELECT snapshot_json FROM carl_autonomy.coordinator_runtime WHERE experiment_id=%s",
+            (manifest.experiment_id,),
+        ).fetchone()
+        graph = json.loads(runtime["snapshot_json"])
+        selected = next(item for item in graph["nodes"] if item["kind"] == node_kind)
+        graph["nodes"] = [
+            {
+                **item,
+                "status": "ready" if item["kind"] == node_kind else "complete",
+            }
+            for item in graph["nodes"]
+        ]
+        snapshot_text = _canonical(graph)
+        admin.execute(
+            "UPDATE carl_autonomy.coordinator_runtime SET snapshot_json=%s, "
+            "snapshot_digest=%s WHERE experiment_id=%s",
+            (
+                snapshot_text,
+                hashlib.sha256(snapshot_text.encode()).hexdigest(),
+                manifest.experiment_id,
+            ),
+        )
+
+    command = CloudCommand.create(
+        command_key=selected["command_key"],
+        authority=selected["authority"],
+        operation=selected["operation"],
+        request_digest=selected["request_digest"],
+        occurred_at=selected["occurred_at"],
+        expected_revision=graph["revision"],
+        attempt=selected["attempt"],
+        max_attempts=selected["max_attempts"],
+    )
+    claim = CommandClaim(
+        command_key=command.command_key,
+        claim_id=f"claim:{node_kind}",
+        authority=command.authority,
+        expected_revision=0,
+        claimed_at=NOW,
+        expires_at="2026-08-20T12:15:00Z",
+    )
+    with _as_role(postgres, f"carl_{command.authority}") as authority:
+        authority.execute(
+            "SELECT * FROM carl_autonomy.create_command(%s,%s)",
+            (_canonical(command.to_canonical_dict()), NOW),
+        ).fetchone()
+        authority.execute(
+            "SELECT * FROM carl_autonomy.claim_command(%s,%s)",
+            (_canonical(claim.to_canonical_dict()), NOW),
+        ).fetchone()
+
+    result_digest = hashlib.sha256(f"result:{node_kind}".encode()).hexdigest()
+    with postgres.connect(  # type: ignore[attr-defined]
+        POSTGRES_DSN, autocommit=True, row_factory=dict_row
+    ) as admin:
+        event_row = admin.execute(
+            "SELECT * FROM carl_autonomy.build_coordinator_completion_event("
+            "%s,%s,%s,%s,%s,%s,%s,%s)",
+            (
+                manifest.experiment_id,
+                node_kind,
+                selected["attempt"],
+                command.command_key,
+                command.effect_key,
+                command.request_digest,
+                result_digest,
+                NOW,
+            ),
+        ).fetchone()
+        admin.execute(
+            "UPDATE carl_autonomy.coordinator_runtime SET completion_event_json=%s, "
+            "completion_event_digest=%s, status='effect_observed' WHERE experiment_id=%s",
+            (
+                event_row["event_json"],
+                event_row["event_digest"],
+                manifest.experiment_id,
+            ),
+        )
+
+    event = json.loads(event_row["event_json"])
+    assert event == {
+        "authority": event_row["event_authority"],
+        "domain": "carl.coordinator-node-completion.v1",
+        "event_type": "coordinator_node_completed",
+        "experiment_id": manifest.experiment_id,
+        "occurred_at": NOW,
+        "payload": {
+            "command_key": command.command_key,
+            "effect_key": command.effect_key,
+            "node_kind": node_kind,
+            "request_digest": command.request_digest,
+            "result_digest": result_digest,
+        },
+        "schema_version": 1,
+        "stage_attempt_id": event["stage_attempt_id"],
+    }
+    assert event["authority"] in {
+        "builder",
+        "coordinator",
+        "observer",
+        "promoter",
+        "soak",
+        "supervisor",
+        "validator",
+    }
+    assert event["stage_attempt_id"].startswith("coordinator-completion-")
+    assert event_row["event_digest"] == hashlib.sha256(event_row["event_json"].encode()).hexdigest()
+
+    identity_payload = {
+        "action": "complete_command",
+        "command_key": command.command_key,
+        "effect_key": command.effect_key,
+        "experiment_id": manifest.experiment_id,
+        "node_id": selected["node_id"],
+        "reason": "observed_effect_completion_required",
+        "revision": graph["revision"],
+    }
+    decision = CloudCoordinatorDecision(
+        schema_version=1,
+        action="complete_command",
+        reason="observed_effect_completion_required",
+        identity=hashlib.sha256(canonical_json_bytes(identity_payload)).hexdigest(),
+        experiment_id=manifest.experiment_id,
+        revision=graph["revision"],
+        node=node_kind,
+        command=command,
+        effect_key=command.effect_key,
+        result_digest=result_digest,
+        consequential=True,
+        remote_effect=False,
+        event=None,
+    )
+    with _as_role(postgres, "carl_coordinator") as coordinator:
+        completed = coordinator.execute(
+            "SELECT * FROM carl_autonomy.apply_coordinator_decision(%s,%s)",
+            (_canonical(decision.to_canonical_dict()), NOW),
+        ).fetchone()
+    with postgres.connect(  # type: ignore[attr-defined]
+        POSTGRES_DSN, autocommit=True, row_factory=dict_row
+    ) as admin:
+        receipt = admin.execute(
+            "SELECT * FROM carl_autonomy.coordinator_completion_receipts WHERE effect_key=%s",
+            (command.effect_key,),
+        ).fetchone()
+        command_row = admin.execute(
+            "SELECT status, result_digest FROM carl_autonomy.commands WHERE command_key=%s",
+            (command.command_key,),
+        ).fetchone()
+        final_runtime = admin.execute(
+            "SELECT revision, snapshot_json, completion_event_json, "
+            "completion_event_digest FROM carl_autonomy.coordinator_runtime "
+            "WHERE experiment_id=%s",
+            (manifest.experiment_id,),
+        ).fetchone()
+
+    completed_node = next(
+        item
+        for item in json.loads(final_runtime["snapshot_json"])["nodes"]
+        if item["kind"] == node_kind
+    )
+    assert completed["applied"] is True
+    assert command_row == {"status": "completed", "result_digest": result_digest}
+    assert receipt["authority"] == selected["authority"]
+    assert receipt["event_digest"] == event_row["event_digest"]
+    assert receipt["event_json"] == event_row["event_json"]
+    assert receipt["request_digest"] == selected["request_digest"]
+    assert receipt["result_digest"] == result_digest
+    assert final_runtime["revision"] == graph["revision"] + 1
+    assert final_runtime["completion_event_json"] is None
+    assert final_runtime["completion_event_digest"] is None
+    assert completed_node["status"] == "complete"
+
+
+def test_completion_receipt_builder_rejects_unknown_nodes_and_arbitrary_authority(
+    postgres: object,
+) -> None:
+    with (
+        postgres.connect(  # type: ignore[attr-defined]
+            POSTGRES_DSN, autocommit=True, row_factory=dict_row
+        ) as admin,
+        pytest.raises(psycopg.Error, match="coordinator_completion_identity_invalid"),
+    ):
+        admin.execute(
+            "SELECT * FROM carl_autonomy.build_coordinator_completion_event("
+            "%s,%s,%s,%s,%s,%s,%s,%s)",
+            (
+                "experiment-1",
+                "attacker_selected_node",
+                1,
+                "experiment-1:attacker:attempt:1",
+                f"cloud-effect-{'a' * 64}",
+                "b" * 64,
+                "c" * 64,
+                NOW,
+            ),
+        ).fetchone()
+
+
+def test_receipt_freeze_is_durable_idempotent_and_recoverable_with_changed_evidence(
+    postgres: object,
+) -> None:
+    manifest = sample_manifest()
+    with _as_role(postgres, "carl_builder") as builder:
+        _register_manifest(builder, manifest)
+    with _as_role(postgres, "carl_coordinator") as coordinator:
+        coordinator.execute(
+            "SELECT * FROM carl_autonomy.enqueue_pending_coordinator_graph(%s)", (NOW,)
+        ).fetchone()
+    with postgres.connect(  # type: ignore[attr-defined]
+        POSTGRES_DSN, autocommit=True, row_factory=dict_row
+    ) as admin:
+        row = admin.execute(
+            "SELECT snapshot_json FROM carl_autonomy.coordinator_runtime WHERE experiment_id=%s",
+            (manifest.experiment_id,),
+        ).fetchone()
+        snapshot_value = json.loads(row["snapshot_json"])
+        selected = next(
+            item for item in snapshot_value["nodes"] if item["kind"] == "create_promotion_pr"
+        )
+        snapshot_value["nodes"] = [
+            {
+                **item,
+                "status": "ready" if item["kind"] == "create_promotion_pr" else "complete",
+            }
+            for item in snapshot_value["nodes"]
+        ]
+        snapshot_value["revision"] = 7
+        snapshot_text = _canonical(snapshot_value)
+        admin.execute(
+            "UPDATE carl_autonomy.coordinator_runtime SET snapshot_json=%s, "
+            "snapshot_digest=%s, revision=7, status='ready', effect_family=NULL, "
+            "effect_request_json=NULL, effect_request_digest=NULL WHERE experiment_id=%s",
+            (
+                snapshot_text,
+                hashlib.sha256(snapshot_text.encode()).hexdigest(),
+                manifest.experiment_id,
+            ),
+        )
+    identity_payload = {
+        "action": "frozen",
+        "experiment_id": manifest.experiment_id,
+        "node_id": selected["node_id"],
+        "reason": "protected_production_receipts_required",
+        "revision": 7,
+    }
+    frozen = CloudCoordinatorDecision(
+        schema_version=1,
+        action="frozen",
+        reason="protected_production_receipts_required",
+        identity=hashlib.sha256(canonical_json_bytes(identity_payload)).hexdigest(),
+        experiment_id=manifest.experiment_id,
+        revision=7,
+        node="create_promotion_pr",
+        command=None,
+        effect_key=None,
+        result_digest=None,
+        consequential=True,
+        remote_effect=False,
+        event=None,
+    )
+    frozen_text = _canonical(frozen.to_canonical_dict())
+    with _as_role(postgres, "carl_coordinator") as coordinator:
+        first = coordinator.execute(
+            "SELECT * FROM carl_autonomy.apply_coordinator_decision(%s,%s)",
+            (frozen_text, NOW),
+        ).fetchone()
+        replay = coordinator.execute(
+            "SELECT * FROM carl_autonomy.apply_coordinator_decision(%s,%s)",
+            (frozen_text, NOW),
+        ).fetchone()
+        idle = coordinator.execute(
+            "SELECT * FROM carl_autonomy.load_coordinator_snapshot(%s,%s)",
+            ("commission-live", NOW),
+        ).fetchone()
+    with postgres.connect(  # type: ignore[attr-defined]
+        POSTGRES_DSN, autocommit=True, row_factory=dict_row
+    ) as admin:
+        durable = admin.execute(
+            "SELECT status, freeze_reason, freeze_fingerprint, freeze_occurrence_key, "
+            "freeze_attempt FROM carl_autonomy.coordinator_runtime WHERE experiment_id=%s",
+            (manifest.experiment_id,),
+        ).fetchone()
+        occurrence = admin.execute(
+            "SELECT node_kind, reason, attempt, runtime_revision, decision_json, "
+            "recovered_at, recovery_fingerprint FROM "
+            "carl_autonomy.coordinator_freeze_occurrences WHERE experiment_id=%s",
+            (manifest.experiment_id,),
+        ).fetchone()
+
+    assert first["applied"] is True
+    assert replay["applied"] is False
+    assert idle == {"snapshot_json": None, "production_receipts_json": None}
+    assert durable["status"] == "frozen"
+    assert durable["freeze_reason"] == "protected_production_receipts_required"
+    assert durable["freeze_attempt"] == 1
+    assert durable["freeze_occurrence_key"].startswith("coordinator-freeze/")
+    assert durable["freeze_fingerprint"] == durable["freeze_occurrence_key"].split("/")[1]
+    assert occurrence == {
+        "node_kind": "create_promotion_pr",
+        "reason": "protected_production_receipts_required",
+        "attempt": 1,
+        "runtime_revision": 7,
+        "decision_json": frozen_text,
+        "recovered_at": None,
+        "recovery_fingerprint": None,
+    }
+
+    evidence = EvidenceObject(
+        digest="d" * 64,
+        object_key=f"evidence/{'d' * 64}",
+        object_version="repair-v2",
+        producer="observer",
+        request_digest=selected["request_digest"],
+        media_type="application/vnd.carl.repair-receipt+json",
+        retained_until="2027-08-22T12:00:00Z",
+    )
+    with _as_role(postgres, "carl_observer") as observer:
+        observer.execute(
+            "SELECT * FROM carl_autonomy.register_evidence(%s,%s)",
+            (_canonical(evidence.to_canonical_dict()), NOW),
+        ).fetchone()
+    recovery = {
+        "domain": "carl.coordinator.recovery.v1",
+        "evidence_digest": evidence.digest,
+        "expected_revision": 7,
+        "experiment_id": manifest.experiment_id,
+        "node_id": selected["node_id"],
+        "node_kind": selected["kind"],
+        "repair_fingerprint": evidence.digest,
+        "requested_at": NOW,
+        "schema_version": 1,
+    }
+    with _as_role(postgres, "carl_supervisor") as supervisor:
+        repaired = supervisor.execute(
+            "SELECT * FROM carl_autonomy.reactivate_coordinator_node(%s,%s)",
+            (_canonical(recovery), NOW),
+        ).fetchone()
+    with postgres.connect(  # type: ignore[attr-defined]
+        POSTGRES_DSN, autocommit=True, row_factory=dict_row
+    ) as admin:
+        recovered = admin.execute(
+            "SELECT status, freeze_reason, freeze_fingerprint, freeze_occurrence_key, "
+            "freeze_attempt FROM carl_autonomy.coordinator_runtime WHERE experiment_id=%s",
+            (manifest.experiment_id,),
+        ).fetchone()
+        recovered_occurrence = admin.execute(
+            "SELECT recovered_at, recovery_evidence_digest, recovery_fingerprint FROM "
+            "carl_autonomy.coordinator_freeze_occurrences WHERE experiment_id=%s",
+            (manifest.experiment_id,),
+        ).fetchone()
+
+    assert repaired["applied"] is True
+    assert repaired["attempt"] == 2
+    assert recovered == {
+        "status": "ready",
+        "freeze_reason": None,
+        "freeze_fingerprint": None,
+        "freeze_occurrence_key": None,
+        "freeze_attempt": None,
+    }
+    assert recovered_occurrence == {
+        "recovered_at": datetime(2026, 8, 20, 12, tzinfo=UTC),
+        "recovery_evidence_digest": evidence.digest,
+        "recovery_fingerprint": evidence.digest,
+    }
 
 
 def _retry_payload(*, attempt: int, scheduled_at: str, changed_action: str) -> dict[str, Any]:
@@ -572,7 +981,7 @@ def test_all_22_enqueued_nodes_persist_and_claim_under_exact_postgres_authority(
     assert count == 22
 
 
-def test_non_github_effect_occurrence_is_durable_before_service_execution(
+def test_non_github_effect_is_fenced_then_constructs_receipt_after_verified_result(
     postgres: object,
 ) -> None:
     from carl_bench.cloud_coordinator import (
@@ -672,6 +1081,48 @@ def test_non_github_effect_occurrence_is_durable_before_service_execution(
         hashlib.sha256(first["request_json"].encode("utf-8")).hexdigest(),
     )
 
+    from carl_bench.coordinator_effects import (
+        CoordinatorNodeEffectRequest,
+        CoordinatorNodeEffectResponse,
+    )
+
+    request = CoordinatorNodeEffectRequest.from_canonical_dict(json.loads(first["request_json"]))
+    response = CoordinatorNodeEffectResponse.completed(
+        request=request,
+        result_digest="e" * 64,
+        observed_at=NOW,
+    )
+    with _as_role(postgres, "carl_coordinator") as coordinator:
+        completed = coordinator.execute(
+            "SELECT * FROM carl_autonomy.complete_coordinator_effect(%s,%s,%s)",
+            (decision_json, _canonical(response.to_canonical_dict()), NOW),
+        ).fetchone()
+    with postgres.connect(  # type: ignore[attr-defined]
+        POSTGRES_DSN, autocommit=True, row_factory=dict_row
+    ) as admin:
+        receipt = admin.execute(
+            "SELECT completion_event_json, completion_event_digest, effect_response_json, "
+            "status FROM carl_autonomy.coordinator_runtime WHERE experiment_id=%s",
+            (manifest.experiment_id,),
+        ).fetchone()
+
+    event = json.loads(receipt["completion_event_json"])
+    assert completed["applied"] is True
+    assert receipt["status"] == "effect_observed"
+    assert json.loads(receipt["effect_response_json"]) == response.to_canonical_dict()
+    assert (
+        receipt["completion_event_digest"]
+        == hashlib.sha256(receipt["completion_event_json"].encode()).hexdigest()
+    )
+    assert event["authority"] == "validator"
+    assert event["payload"] == {
+        "command_key": command.command_key,
+        "effect_key": command.effect_key,
+        "node_kind": "publish_input",
+        "request_digest": command.request_digest,
+        "result_digest": "e" * 64,
+    }
+
 
 def test_frozen_node_reactivates_only_with_changed_retained_repair_evidence(
     postgres: object,
@@ -707,11 +1158,53 @@ def test_frozen_node_reactivates_only_with_changed_retained_repair_evidence(
         "revision": 7,
         "schema_version": 1,
     }
+    freeze_fingerprint = hashlib.sha256(
+        canonical_json_bytes(
+            {
+                "attempt": selected["attempt"],
+                "experiment_id": manifest.experiment_id,
+                "node_id": selected["node_id"],
+                "node_kind": selected["kind"],
+                "reason": frozen["reason"],
+                "request_digest": selected["request_digest"],
+                "revision": 7,
+            }
+        )
+    ).hexdigest()
     with postgres.connect(POSTGRES_DSN, autocommit=True) as admin:  # type: ignore[attr-defined]
         admin.execute(
             "UPDATE carl_autonomy.coordinator_runtime SET status='frozen', revision=7, "
-            "decision_json=%s, decision_identity=%s WHERE experiment_id=%s",
-            (_canonical(frozen), frozen["identity"], manifest.experiment_id),
+            "decision_json=%s, decision_identity=%s, freeze_reason=%s, "
+            "freeze_fingerprint=%s, freeze_occurrence_key=%s, freeze_attempt=%s "
+            "WHERE experiment_id=%s",
+            (
+                _canonical(frozen),
+                frozen["identity"],
+                frozen["reason"],
+                freeze_fingerprint,
+                f"coordinator-freeze/{freeze_fingerprint}",
+                selected["attempt"],
+                manifest.experiment_id,
+            ),
+        )
+        admin.execute(
+            "INSERT INTO carl_autonomy.coordinator_freeze_occurrences("
+            "occurrence_key, freeze_fingerprint, experiment_id, node_id, node_kind, "
+            "attempt, reason, request_digest, runtime_revision, decision_identity, "
+            "decision_json, frozen_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,7,%s,%s,%s)",
+            (
+                f"coordinator-freeze/{freeze_fingerprint}",
+                freeze_fingerprint,
+                manifest.experiment_id,
+                selected["node_id"],
+                selected["kind"],
+                selected["attempt"],
+                frozen["reason"],
+                selected["request_digest"],
+                frozen["identity"],
+                _canonical(frozen),
+                NOW,
+            ),
         )
     evidence = EvidenceObject(
         digest="c" * 64,
@@ -802,18 +1295,27 @@ def test_coordinator_state_backend_has_procedure_access_without_raw_table_access
             "has_table_privilege('carl_state_backend', "
             "'carl_autonomy.coordinator_effect_occurrences', "
             "'SELECT,INSERT,UPDATE,DELETE') AS occurrence_raw, "
+            "has_table_privilege('carl_state_backend', "
+            "'carl_autonomy.coordinator_completion_receipts', "
+            "'SELECT,INSERT,UPDATE,DELETE') AS completion_raw, "
+            "has_table_privilege('carl_state_backend', "
+            "'carl_autonomy.coordinator_freeze_occurrences', "
+            "'SELECT,INSERT,UPDATE,DELETE') AS freeze_raw, "
             "has_function_privilege('carl_state_backend', "
             "'carl_autonomy.enqueue_pending_coordinator_graph(timestamptz)', "
             "'EXECUTE') AS protected_enqueue, "
             "has_function_privilege('carl_state_backend', "
             "'carl_autonomy.reactivate_coordinator_node(text,timestamptz)', "
             "'EXECUTE') AS protected_recovery, "
+            "has_function_privilege('carl_state_backend', "
+            "'carl_autonomy.build_coordinator_completion_event(text,text,integer,text,text,"
+            "text,text,timestamptz)', 'EXECUTE') AS raw_completion_builder, "
             "has_function_privilege('carl_autonomy_workflow', "
             "'carl_autonomy.enqueue_coordinator_graph(text,timestamptz)', "
             "'EXECUTE') AS workflow_raw_enqueue"
         ).fetchone()
 
-    assert privileges == (False, False, True, True, False)
+    assert privileges == (False, False, False, False, True, True, False, False)
 
 
 def _state_event(

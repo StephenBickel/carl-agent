@@ -22,6 +22,10 @@ from carl_bench.cloud_coordinator import (
     _selected_node,
     effect_family_for_node,
 )
+from carl_bench.coordinator_effect_client import (
+    CoordinatorEffectClientError,
+    load_protected_coordinator_effect_clients,
+)
 from carl_bench.coordinator_effects import (
     CoordinatorNodeEffectResponse,
     PreparedCoordinatorEffect,
@@ -388,15 +392,22 @@ class _ProtectedCoordinatorEffectRouter:
 
     @classmethod
     def _for_protected_service(
-        cls, *, backend: object, github: object
+        cls,
+        *,
+        backend: object,
+        github: object,
+        input_publisher: object,
+        observer: object,
+        archive: object,
+        evaluator: object,
     ) -> _ProtectedCoordinatorEffectRouter:
         return cls(
             backend=backend,
             github=github,
-            input_publisher=None,
-            observer=None,
-            archive=None,
-            evaluator=None,
+            input_publisher=input_publisher,
+            observer=observer,
+            archive=archive,
+            evaluator=evaluator,
             _testing=True,
         )
 
@@ -432,7 +443,10 @@ class _ProtectedCoordinatorEffectRouter:
         )
         if not isinstance(prepared, PreparedCoordinatorEffect) or prepared.family != family:
             raise CloudCoordinatorError("coordinator_prepared_effect_invalid")
-        response = method(prepared.request)
+        try:
+            response = method(prepared.request)
+        except CoordinatorEffectClientError as error:
+            raise ProtectedEffectUnavailable(f"{family}_service_uncommissioned") from error
         if not isinstance(response, CoordinatorNodeEffectResponse):
             raise CloudCoordinatorError("coordinator_effect_response_invalid")
         return self.__backend.complete_coordinator_effect(  # type: ignore[attr-defined,no-any-return]
@@ -445,10 +459,16 @@ def _build_protected_controller() -> ProtectedCoordinatorExecutor:
     backend = PostgresStateBackend.from_protected_environment()
     github = GitHubEffectSocketClient.from_protected_environment()
     archive = ProtectedArchiveSocketReader.from_protected_environment()
+    effect_clients = load_protected_coordinator_effect_clients()
     return ProtectedCoordinatorExecutor._for_protected_service(
         state=_PostgresCoordinatorState(backend, archive),
         effects=_ProtectedCoordinatorEffectRouter._for_protected_service(
-            backend=backend, github=github
+            backend=backend,
+            github=github,
+            input_publisher=effect_clients.input_publisher,
+            observer=effect_clients.observer,
+            archive=effect_clients.archive,
+            evaluator=effect_clients.evaluator,
         ),
         clock=_trusted_clock,
     )

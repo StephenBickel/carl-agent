@@ -271,14 +271,93 @@ def test_production_controller_owns_fixed_state_and_effect_clients(monkeypatch) 
             constructed.append("archive")
             return object()
 
+    class EffectClients:
+        input_publisher = object()
+        observer = object()
+        archive = object()
+        evaluator = object()
+
+    def load_effect_clients():
+        constructed.append("effects")
+        return EffectClients()
+
     monkeypatch.setattr(coordinator_service, "PostgresStateBackend", Backend)
     monkeypatch.setattr(coordinator_service, "GitHubEffectSocketClient", GitHubClient)
     monkeypatch.setattr(coordinator_service, "ProtectedArchiveSocketReader", ArchiveReader)
+    monkeypatch.setattr(
+        coordinator_service,
+        "load_protected_coordinator_effect_clients",
+        load_effect_clients,
+    )
 
     controller = coordinator_service._build_protected_controller()
 
     assert isinstance(controller, ProtectedCoordinatorExecutor)
-    assert constructed == ["postgres", "github", "archive"]
+    assert constructed == ["postgres", "github", "archive", "effects"]
+
+
+def test_protected_receipt_failure_is_persisted_once_then_returns_durable_idle() -> None:
+    class State:
+        def __init__(self) -> None:
+            self.current = snapshot(
+                node("create_promotion_pr"),
+                current_lease=lease(),
+            )
+            self.applied: list[object] = []
+
+        def reconstruct(self, command: str, *, observed_at: datetime):
+            assert command == "commission-live"
+            assert observed_at == datetime(2026, 8, 22, 12, tzinfo=UTC)
+            return self.current
+
+        def apply(self, decision, *, observed_at: datetime):
+            assert observed_at == datetime(2026, 8, 22, 12, tzinfo=UTC)
+            self.applied.append(decision)
+            self.current = None
+            return decision
+
+    state = State()
+    controller = ProtectedCoordinatorExecutor._for_testing(
+        state=state,
+        effects=NoEffects(),
+        clock=lambda: datetime(2026, 8, 22, 12, tzinfo=UTC),
+    )
+
+    first = controller.advance("commission-live")
+    second = controller.advance("commission-live")
+
+    assert first.action == "frozen"
+    assert first.reason == "protected_production_receipts_required"
+    assert len(state.applied) == 1
+    assert second.action == "idle"
+    assert second.reason == "no_applicable_node"
+
+
+def test_systemd_commissions_every_fixed_effect_socket_before_coordinator_start() -> None:
+    root = Path(__file__).parents[2] / "infra/autonomy/systemd"
+    policy = Path(__file__).parents[2] / "infra/autonomy/policies/coordinator-effects-policy.json"
+    service = (root / "carl-coordinator.service").read_text(encoding="utf-8")
+    units = {
+        "archive": "carl-archive-effect.socket",
+        "evaluator": "carl-evaluator-effect.socket",
+        "input": "carl-input-effect.socket",
+        "observer": "carl-observer-effect.socket",
+    }
+
+    for family, unit_name in units.items():
+        assert unit_name in service
+        unit = (root / unit_name).read_text(encoding="utf-8")
+        assert f"FileDescriptorName={family}-effect" in unit
+        assert f"ListenStream=/run/carl/{family}-effect.sock" in unit
+        assert "SocketMode=0600" in unit
+
+    assert "ReadOnlyPaths=/etc/carl/coordinator-effects-policy.json" in service
+    assert json.loads(policy.read_text(encoding="utf-8")) == {
+        "domain": "carl.coordinator-effect-policy.v1",
+        "required_families": ["archive", "evaluator", "input", "observer"],
+        "schema_version": 1,
+        "service_uid": 0,
+    }
 
 
 def test_production_receipts_are_bound_to_an_independent_exact_archive_read() -> None:

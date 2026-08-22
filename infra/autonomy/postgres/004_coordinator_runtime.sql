@@ -29,6 +29,10 @@ CREATE TABLE carl_autonomy.coordinator_runtime (
     graph_request_digest character(64),
     graph_occurrence_key varchar(192),
     repair_fingerprint character(64),
+    freeze_reason varchar(128),
+    freeze_fingerprint character(64),
+    freeze_occurrence_key varchar(96),
+    freeze_attempt smallint,
     status varchar(24) NOT NULL DEFAULT 'ready' CHECK (
         status IN ('ready', 'effect_prepared', 'effect_observed', 'complete', 'frozen')
     ),
@@ -65,6 +69,16 @@ CREATE TABLE carl_autonomy.coordinator_runtime (
     ),
     CHECK (graph_request_digest IS NULL OR graph_request_digest ~ '^[0-9a-f]{64}$'),
     CHECK (repair_fingerprint IS NULL OR repair_fingerprint ~ '^[0-9a-f]{64}$'),
+    CHECK (
+        (freeze_reason IS NULL AND freeze_fingerprint IS NULL
+            AND freeze_occurrence_key IS NULL AND freeze_attempt IS NULL)
+        OR (
+            freeze_reason IS NOT NULL
+            AND freeze_fingerprint ~ '^[0-9a-f]{64}$'
+            AND freeze_occurrence_key = 'coordinator-freeze/' || freeze_fingerprint
+            AND freeze_attempt BETWEEN 1 AND 3
+        )
+    ),
     UNIQUE (graph_occurrence_key)
 );
 
@@ -97,6 +111,63 @@ CREATE TABLE carl_autonomy.coordinator_effect_occurrences (
 );
 
 REVOKE ALL ON carl_autonomy.coordinator_effect_occurrences
+FROM PUBLIC, carl_autonomy_workflow;
+
+CREATE TABLE carl_autonomy.coordinator_completion_receipts (
+    event_digest character(64) PRIMARY KEY CHECK (event_digest ~ '^[0-9a-f]{64}$'),
+    experiment_id varchar(128) NOT NULL
+        REFERENCES carl_autonomy.coordinator_runtime(experiment_id),
+    node_kind varchar(32) NOT NULL,
+    authority varchar(32) NOT NULL CHECK (
+        authority IN (
+            'builder', 'validator', 'promoter', 'soak', 'supervisor',
+            'coordinator', 'observer'
+        )
+    ),
+    command_key varchar(192) NOT NULL,
+    effect_key varchar(192) NOT NULL UNIQUE,
+    request_digest character(64) NOT NULL CHECK (request_digest ~ '^[0-9a-f]{64}$'),
+    result_digest character(64) NOT NULL CHECK (result_digest ~ '^[0-9a-f]{64}$'),
+    event_json text NOT NULL CHECK (octet_length(event_json) BETWEEN 2 AND 32768),
+    occurred_at timestamptz NOT NULL,
+    recorded_at timestamptz NOT NULL
+);
+
+REVOKE ALL ON carl_autonomy.coordinator_completion_receipts
+FROM PUBLIC, carl_autonomy_workflow;
+
+CREATE TABLE carl_autonomy.coordinator_freeze_occurrences (
+    occurrence_key varchar(96) PRIMARY KEY,
+    freeze_fingerprint character(64) NOT NULL UNIQUE
+        CHECK (freeze_fingerprint ~ '^[0-9a-f]{64}$'),
+    experiment_id varchar(128) NOT NULL
+        REFERENCES carl_autonomy.coordinator_runtime(experiment_id),
+    node_id varchar(192) NOT NULL,
+    node_kind varchar(32) NOT NULL,
+    attempt smallint NOT NULL CHECK (attempt BETWEEN 1 AND 3),
+    reason varchar(128) NOT NULL,
+    request_digest character(64) NOT NULL CHECK (request_digest ~ '^[0-9a-f]{64}$'),
+    runtime_revision integer NOT NULL CHECK (runtime_revision BETWEEN 0 AND 2147483647),
+    decision_identity character(64) NOT NULL CHECK (decision_identity ~ '^[0-9a-f]{64}$'),
+    decision_json text NOT NULL CHECK (octet_length(decision_json) BETWEEN 2 AND 32768),
+    frozen_at timestamptz NOT NULL,
+    recovery_evidence_digest character(64),
+    recovery_fingerprint character(64),
+    recovered_at timestamptz,
+    CHECK (occurrence_key = 'coordinator-freeze/' || freeze_fingerprint),
+    CHECK (node_id = experiment_id || ':' || node_kind),
+    CHECK (
+        (recovery_evidence_digest IS NULL AND recovery_fingerprint IS NULL
+            AND recovered_at IS NULL)
+        OR (
+            recovery_evidence_digest ~ '^[0-9a-f]{64}$'
+            AND recovery_fingerprint ~ '^[0-9a-f]{64}$'
+            AND recovered_at IS NOT NULL
+        )
+    )
+);
+
+REVOKE ALL ON carl_autonomy.coordinator_freeze_occurrences
 FROM PUBLIC, carl_autonomy_workflow;
 
 CREATE OR REPLACE FUNCTION carl_autonomy.coordinator_timestamp(p_value timestamptz)
@@ -275,6 +346,111 @@ AS $$
         WHEN 'trigger_supervisor' THEN 'claim_trigger'
         ELSE NULL
     END
+$$;
+
+CREATE OR REPLACE FUNCTION carl_autonomy.coordinator_freeze_reason_valid(
+    p_kind text,
+    p_reason text
+)
+RETURNS boolean
+LANGUAGE sql
+IMMUTABLE
+STRICT
+SECURITY INVOKER
+SET search_path = pg_catalog, carl_autonomy
+AS $$
+    SELECT CASE
+        WHEN carl_autonomy.coordinator_node_priority(p_kind) IS NULL THEN false
+        WHEN p_reason = carl_autonomy.coordinator_effect_family(p_kind)
+                || '_service_uncommissioned' THEN true
+        WHEN p_kind IN (
+            'create_promotion_pr', 'observe_required_checks', 'enable_auto_merge',
+            'schedule_soak', 'observe_soak', 'accept_soak', 'create_revert',
+            'observe_revert'
+        ) AND p_reason IN (
+            'protected_production_receipts_required',
+            'production_experiment_identity_mismatch',
+            'production_node_identity_mismatch',
+            'production_request_identity_mismatch',
+            'protected_verification_stale',
+            'protected_archive_retention_expired',
+            'merge_bound_soak_required'
+        ) THEN true
+        WHEN p_reason IN (
+            'failure_command_mismatch', 'command_identity_conflict',
+            'completed_command_node_not_advanced', 'claimed_command_identity_missing',
+            'effect_identity_conflict'
+        ) THEN true
+        ELSE false
+    END
+$$;
+
+CREATE OR REPLACE FUNCTION carl_autonomy.build_coordinator_completion_event(
+    p_experiment_id text,
+    p_node_kind text,
+    p_attempt integer,
+    p_command_key text,
+    p_effect_key text,
+    p_request_digest text,
+    p_result_digest text,
+    p_occurred_at timestamptz
+)
+RETURNS TABLE(event_authority text, event_json text, event_digest text)
+LANGUAGE plpgsql
+IMMUTABLE
+SECURITY DEFINER
+SET search_path = pg_catalog, carl_autonomy
+AS $$
+DECLARE
+    authority_value text;
+    stage_attempt_value text;
+    event_value text;
+BEGIN
+    authority_value := carl_autonomy.coordinator_node_authority(p_node_kind);
+    IF authority_value IS NULL
+        OR p_experiment_id !~ '^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$'
+        OR p_attempt NOT BETWEEN 1 AND 3
+        OR p_command_key <> p_experiment_id || ':' || p_node_kind
+            || ':attempt:' || p_attempt::text
+        OR p_effect_key !~ '^cloud-effect-[0-9a-f]{64}$'
+        OR p_request_digest !~ '^[0-9a-f]{64}$'
+        OR p_result_digest !~ '^[0-9a-f]{64}$'
+    THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '22023', MESSAGE = 'coordinator_completion_identity_invalid';
+    END IF;
+    stage_attempt_value := 'coordinator-completion-' || substr(
+        carl_autonomy.sha256_text(carl_autonomy.canonical_jsonb(jsonb_build_object(
+            'attempt', p_attempt,
+            'command_key', p_command_key,
+            'effect_key', p_effect_key,
+            'experiment_id', p_experiment_id,
+            'node_kind', p_node_kind,
+            'request_digest', p_request_digest,
+            'result_digest', p_result_digest
+        ))),
+        1,
+        64
+    );
+    event_value := carl_autonomy.canonical_jsonb(jsonb_build_object(
+        'authority', authority_value,
+        'domain', 'carl.coordinator-node-completion.v1',
+        'event_type', 'coordinator_node_completed',
+        'experiment_id', p_experiment_id,
+        'occurred_at', carl_autonomy.coordinator_timestamp(p_occurred_at),
+        'payload', jsonb_build_object(
+            'command_key', p_command_key,
+            'effect_key', p_effect_key,
+            'node_kind', p_node_kind,
+            'request_digest', p_request_digest,
+            'result_digest', p_result_digest
+        ),
+        'schema_version', 1,
+        'stage_attempt_id', stage_attempt_value
+    ));
+    RETURN QUERY SELECT authority_value, event_value,
+        carl_autonomy.sha256_text(event_value);
+END;
 $$;
 
 CREATE OR REPLACE FUNCTION carl_autonomy.coordinator_node_event_authority(
@@ -650,6 +826,12 @@ BEGIN
         OR (selected_node->>'attempt')::integer >= (selected_node->>'max_attempts')::integer
         OR runtime.decision_json IS NULL
         OR runtime.decision_identity IS NULL
+        OR runtime.freeze_reason IS NULL
+        OR runtime.freeze_fingerprint IS NULL
+        OR runtime.freeze_occurrence_key
+            IS DISTINCT FROM 'coordinator-freeze/' || runtime.freeze_fingerprint
+        OR runtime.freeze_attempt IS DISTINCT FROM (selected_node->>'attempt')::integer
+        OR recovery_value->>'repair_fingerprint' = runtime.freeze_fingerprint
     THEN
         RAISE EXCEPTION USING
             ERRCODE = '40001', MESSAGE = 'coordinator_recovery_cas_mismatch';
@@ -660,7 +842,10 @@ BEGIN
     next_effect_family := carl_autonomy.coordinator_effect_family(selected_node->>'kind');
     IF decision_value->>'action' <> 'frozen'
         OR decision_value->>'node' <> selected_node->>'kind'
-        OR decision_value->>'reason' <> next_effect_family || '_service_uncommissioned'
+        OR decision_value->>'reason' IS DISTINCT FROM runtime.freeze_reason
+        OR NOT carl_autonomy.coordinator_freeze_reason_valid(
+            selected_node->>'kind', runtime.freeze_reason
+        )
     THEN
         RAISE EXCEPTION USING
             ERRCODE = '55000', MESSAGE = 'coordinator_recovery_freeze_mismatch';
@@ -753,6 +938,28 @@ BEGIN
         ))
         ELSE NULL
     END;
+    UPDATE carl_autonomy.coordinator_freeze_occurrences AS occurrence
+    SET recovery_evidence_digest = recovery_value->>'evidence_digest',
+        recovery_fingerprint = recovery_value->>'repair_fingerprint',
+        recovered_at = p_observed_at
+    WHERE occurrence.occurrence_key = runtime.freeze_occurrence_key
+        AND occurrence.freeze_fingerprint = runtime.freeze_fingerprint
+        AND occurrence.experiment_id = runtime.experiment_id
+        AND occurrence.node_id = selected_node->>'node_id'
+        AND occurrence.node_kind = selected_node->>'kind'
+        AND occurrence.attempt = (selected_node->>'attempt')::integer
+        AND occurrence.reason = runtime.freeze_reason
+        AND occurrence.request_digest = selected_node->>'request_digest'
+        AND occurrence.runtime_revision = runtime.revision
+        AND occurrence.decision_identity = runtime.decision_identity
+        AND occurrence.decision_json = runtime.decision_json
+        AND occurrence.recovery_evidence_digest IS NULL
+        AND occurrence.recovery_fingerprint IS NULL
+        AND occurrence.recovered_at IS NULL;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '55000', MESSAGE = 'coordinator_freeze_occurrence_missing';
+    END IF;
     UPDATE carl_autonomy.coordinator_runtime AS item
     SET snapshot_json = carl_autonomy.canonical_jsonb(snapshot_value),
         snapshot_digest = carl_autonomy.sha256_text(
@@ -770,6 +977,10 @@ BEGIN
         decision_identity = NULL,
         decision_json = NULL,
         repair_fingerprint = recovery_value->>'repair_fingerprint',
+        freeze_reason = NULL,
+        freeze_fingerprint = NULL,
+        freeze_occurrence_key = NULL,
+        freeze_attempt = NULL,
         revision = next_revision,
         status = 'ready',
         updated_at = p_observed_at
@@ -1419,6 +1630,10 @@ DECLARE
     lease_result record;
     completion_result record;
     trigger_result record;
+    freeze_fingerprint_value text;
+    expected_completion record;
+    existing_completion carl_autonomy.coordinator_completion_receipts%ROWTYPE;
+    existing_freeze carl_autonomy.coordinator_freeze_occurrences%ROWTYPE;
 BEGIN
     PERFORM carl_autonomy.require_role(ARRAY['carl_coordinator']);
     decision_value := carl_autonomy.parse_object(
@@ -1701,9 +1916,22 @@ BEGIN
             event_value := carl_autonomy.parse_object(
                 runtime.completion_event_json, 'coordinator_completion_event_invalid'
             );
+            SELECT * INTO expected_completion
+            FROM carl_autonomy.build_coordinator_completion_event(
+                runtime.experiment_id,
+                ready_node->>'kind',
+                (ready_node->>'attempt')::integer,
+                command_state.command_key,
+                command_state.effect_key,
+                command_state.request_digest,
+                decision_value->>'result_digest',
+                (event_value->>'occurred_at')::timestamptz
+            );
             IF event_value->>'experiment_id' <> runtime.experiment_id
                 OR (event_value->>'occurred_at')::timestamptz > p_observed_at
                 OR (event_value->>'occurred_at')::timestamptz < command_state.occurred_at
+                OR runtime.completion_event_json <> expected_completion.event_json
+                OR runtime.completion_event_digest <> expected_completion.event_digest
             THEN
                 RAISE EXCEPTION USING
                     ERRCODE = '55000', MESSAGE = 'coordinator_completion_event_mismatch';
@@ -1718,28 +1946,46 @@ BEGIN
                 'result_digest', decision_value->>'result_digest',
                 'status', 'completed'
             ));
-            PERFORM set_config('carl_autonomy.authority', command_state.authority, true);
-            IF command_state.authority IN ('observer', 'supervisor') THEN
-                PERFORM set_config('carl_autonomy.authority', 'coordinator', true);
-                SELECT * INTO completion_result
-                FROM carl_autonomy.complete_coordinator_node_event(
-                    transition_value,
-                    runtime.completion_event_json,
-                    runtime.completion_event_digest,
-                    carl_autonomy.canonical_jsonb(event_value->'payload'),
-                    ready_node->>'kind',
-                    p_observed_at
-                );
-            ELSE
-                SELECT * INTO completion_result
-                FROM carl_autonomy.complete_command_and_append_event(
-                    transition_value,
-                    runtime.completion_event_json,
-                    runtime.completion_event_digest,
-                    carl_autonomy.canonical_jsonb(event_value->'payload'),
-                    p_observed_at
-                );
+            INSERT INTO carl_autonomy.coordinator_completion_receipts(
+                event_digest, experiment_id, node_kind, authority, command_key,
+                effect_key, request_digest, result_digest, event_json, occurred_at,
+                recorded_at
+            ) VALUES (
+                expected_completion.event_digest,
+                runtime.experiment_id,
+                ready_node->>'kind',
+                expected_completion.event_authority,
+                command_state.command_key,
+                command_state.effect_key,
+                command_state.request_digest,
+                decision_value->>'result_digest',
+                expected_completion.event_json,
+                (event_value->>'occurred_at')::timestamptz,
+                p_observed_at
+            ) ON CONFLICT (event_digest) DO NOTHING;
+            SELECT receipt.* INTO existing_completion
+            FROM carl_autonomy.coordinator_completion_receipts AS receipt
+            WHERE receipt.effect_key = command_state.effect_key
+            FOR UPDATE;
+            IF NOT FOUND
+                OR existing_completion.event_digest
+                    <> expected_completion.event_digest::character(64)
+                OR existing_completion.experiment_id <> runtime.experiment_id
+                OR existing_completion.node_kind <> ready_node->>'kind'
+                OR existing_completion.authority <> expected_completion.event_authority
+                OR existing_completion.command_key <> command_state.command_key
+                OR existing_completion.request_digest <> command_state.request_digest
+                OR existing_completion.result_digest <> decision_value->>'result_digest'
+                OR existing_completion.event_json <> expected_completion.event_json
+            THEN
+                RAISE EXCEPTION USING
+                    ERRCODE = '23505', MESSAGE = 'coordinator_completion_receipt_conflict';
             END IF;
+            PERFORM set_config('carl_autonomy.authority', command_state.authority, true);
+            SELECT * INTO completion_result
+            FROM carl_autonomy.terminal_command(
+                transition_value, 'completed', p_observed_at
+            );
             nodes_value := (
                 SELECT jsonb_agg(
                     CASE WHEN node->>'node_id' = ready_node->>'node_id'
@@ -1785,12 +2031,63 @@ BEGIN
             next_status := 'frozen';
         WHEN 'frozen' THEN
             IF ready_node IS NULL
-                OR decision_value->>'reason' IS DISTINCT FROM
-                    carl_autonomy.coordinator_effect_family(ready_node->>'kind')
-                        || '_service_uncommissioned'
+                OR NOT carl_autonomy.coordinator_freeze_reason_valid(
+                    ready_node->>'kind', decision_value->>'reason'
+                )
             THEN
                 RAISE EXCEPTION USING
                     ERRCODE = '55000', MESSAGE = 'coordinator_freeze_reason_invalid';
+            END IF;
+            freeze_fingerprint_value := carl_autonomy.sha256_text(
+                carl_autonomy.canonical_jsonb(jsonb_build_object(
+                    'attempt', (ready_node->>'attempt')::integer,
+                    'experiment_id', runtime.experiment_id,
+                    'node_id', ready_node->>'node_id',
+                    'node_kind', ready_node->>'kind',
+                    'reason', decision_value->>'reason',
+                    'request_digest', ready_node->>'request_digest',
+                    'revision', runtime.revision
+                ))
+            );
+            INSERT INTO carl_autonomy.coordinator_freeze_occurrences(
+                occurrence_key, freeze_fingerprint, experiment_id, node_id, node_kind,
+                attempt, reason, request_digest, runtime_revision, decision_identity,
+                decision_json, frozen_at
+            ) VALUES (
+                'coordinator-freeze/' || freeze_fingerprint_value,
+                freeze_fingerprint_value,
+                runtime.experiment_id,
+                ready_node->>'node_id',
+                ready_node->>'kind',
+                (ready_node->>'attempt')::integer,
+                decision_value->>'reason',
+                ready_node->>'request_digest',
+                runtime.revision,
+                decision_value->>'identity',
+                p_decision_json,
+                p_observed_at
+            ) ON CONFLICT (occurrence_key) DO NOTHING;
+            SELECT occurrence.* INTO existing_freeze
+            FROM carl_autonomy.coordinator_freeze_occurrences AS occurrence
+            WHERE occurrence.occurrence_key
+                = 'coordinator-freeze/' || freeze_fingerprint_value
+            FOR UPDATE;
+            IF NOT FOUND
+                OR existing_freeze.freeze_fingerprint
+                    <> freeze_fingerprint_value::character(64)
+                OR existing_freeze.experiment_id <> runtime.experiment_id
+                OR existing_freeze.node_id <> ready_node->>'node_id'
+                OR existing_freeze.node_kind <> ready_node->>'kind'
+                OR existing_freeze.attempt <> (ready_node->>'attempt')::integer
+                OR existing_freeze.reason <> decision_value->>'reason'
+                OR existing_freeze.request_digest <> ready_node->>'request_digest'
+                OR existing_freeze.runtime_revision <> runtime.revision
+                OR existing_freeze.decision_identity <> decision_value->>'identity'
+                OR existing_freeze.decision_json <> p_decision_json
+                OR existing_freeze.recovered_at IS NOT NULL
+            THEN
+                RAISE EXCEPTION USING
+                    ERRCODE = '23505', MESSAGE = 'coordinator_freeze_occurrence_conflict';
             END IF;
             next_status := 'frozen';
         ELSE
@@ -1840,6 +2137,24 @@ BEGIN
         effect_response_json = CASE
             WHEN decision_value->>'action' IN ('persist_command', 'retry_rework') THEN NULL
             ELSE item.effect_response_json
+        END,
+        freeze_reason = CASE
+            WHEN decision_value->>'action' = 'frozen' THEN decision_value->>'reason'
+            ELSE item.freeze_reason
+        END,
+        freeze_fingerprint = CASE
+            WHEN decision_value->>'action' = 'frozen' THEN freeze_fingerprint_value
+            ELSE item.freeze_fingerprint
+        END,
+        freeze_occurrence_key = CASE
+            WHEN decision_value->>'action' = 'frozen'
+                THEN 'coordinator-freeze/' || freeze_fingerprint_value
+            ELSE item.freeze_occurrence_key
+        END,
+        freeze_attempt = CASE
+            WHEN decision_value->>'action' = 'frozen'
+                THEN (ready_node->>'attempt')::integer
+            ELSE item.freeze_attempt
         END,
         updated_at = p_observed_at
     WHERE item.experiment_id = runtime.experiment_id;
@@ -2030,6 +2345,8 @@ DECLARE
     occurrence_state carl_autonomy.coordinator_effect_occurrences%ROWTYPE;
     transition_value text;
     failure_result record;
+    completion_event record;
+    completion_result_digest text;
 BEGIN
     PERFORM carl_autonomy.require_role(ARRAY['carl_coordinator']);
     decision_value := carl_autonomy.parse_object(
@@ -2216,8 +2533,34 @@ BEGIN
     ) THEN
         RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'coordinator_effect_response_mismatch';
     END IF;
+    IF response_value->>'status' = 'completed' THEN
+        completion_result_digest := CASE
+            WHEN runtime.effect_family = 'github' THEN effect_state.result_digest::text
+            ELSE response_value->>'result_digest'
+        END;
+        SELECT * INTO completion_event
+        FROM carl_autonomy.build_coordinator_completion_event(
+            runtime.experiment_id,
+            decision_value->>'node',
+            (decision_value->'command'->>'attempt')::integer,
+            command_state.command_key,
+            command_state.effect_key,
+            command_state.request_digest,
+            completion_result_digest,
+            p_observed_at
+        );
+    END IF;
     UPDATE carl_autonomy.coordinator_runtime AS item
-    SET effect_response_json = p_response_json, status = 'effect_observed',
+    SET effect_response_json = p_response_json,
+        completion_event_json = CASE
+            WHEN response_value->>'status' = 'completed' THEN completion_event.event_json
+            ELSE NULL
+        END,
+        completion_event_digest = CASE
+            WHEN response_value->>'status' = 'completed' THEN completion_event.event_digest
+            ELSE NULL
+        END,
+        status = 'effect_observed',
         updated_at = p_observed_at
     WHERE item.experiment_id = runtime.experiment_id;
     RETURN QUERY SELECT true, p_decision_json;
@@ -2244,6 +2587,8 @@ DECLARE
     occurrence_state carl_autonomy.coordinator_effect_occurrences%ROWTYPE;
     trigger_value text;
     trigger_result record;
+    completion_event record;
+    local_result_digest text;
 BEGIN
     PERFORM carl_autonomy.require_role(ARRAY['carl_coordinator']);
     decision_value := carl_autonomy.parse_object(
@@ -2276,10 +2621,6 @@ BEGIN
         OR runtime.effect_request_digest IS NULL
         OR carl_autonomy.sha256_text(runtime.effect_request_json)
             IS DISTINCT FROM runtime.effect_request_digest
-        OR runtime.completion_event_json IS NULL
-        OR runtime.completion_event_digest IS NULL
-        OR carl_autonomy.sha256_text(runtime.completion_event_json)
-            <> runtime.completion_event_digest
         OR runtime.effect_response_json IS NOT NULL
     THEN
         RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'coordinator_local_effect_invalid';
@@ -2382,12 +2723,33 @@ BEGIN
         SELECT * INTO trigger_result
         FROM carl_autonomy.create_supervisor_trigger(trigger_value, p_observed_at);
     END IF;
+    local_result_digest := carl_autonomy.sha256_text(
+        carl_autonomy.canonical_jsonb(jsonb_build_object(
+            'command_key', command_state.command_key,
+            'effect_key', command_state.effect_key,
+            'family', runtime.effect_family,
+            'node_kind', ready_node->>'kind',
+            'request_digest', command_state.request_digest,
+            'status', 'completed'
+        ))
+    );
+    SELECT * INTO completion_event
+    FROM carl_autonomy.build_coordinator_completion_event(
+        runtime.experiment_id,
+        ready_node->>'kind',
+        (ready_node->>'attempt')::integer,
+        command_state.command_key,
+        command_state.effect_key,
+        command_state.request_digest,
+        local_result_digest,
+        p_observed_at
+    );
     response_value := jsonb_build_object(
         'domain', 'carl.coordinator-node-effect.response.v1',
         'error_code', NULL,
         'observed_at', carl_autonomy.coordinator_timestamp(p_observed_at),
         'request_digest', runtime.effect_request_digest,
-        'result_digest', runtime.completion_event_digest,
+        'result_digest', local_result_digest,
         'retry_not_before', NULL,
         'schema_version', 1,
         'status', 'completed'
@@ -2404,6 +2766,8 @@ BEGIN
     SET decision_identity = decision_value->>'identity',
         decision_json = p_decision_json,
         effect_response_json = carl_autonomy.canonical_jsonb(response_value),
+        completion_event_json = completion_event.event_json,
+        completion_event_digest = completion_event.event_digest,
         status = 'effect_observed',
         updated_at = p_observed_at
     WHERE item.experiment_id = runtime.experiment_id;
@@ -2417,6 +2781,10 @@ REVOKE ALL ON FUNCTION
     carl_autonomy.coordinator_command_state(text),
     carl_autonomy.coordinator_node_authority(text),
     carl_autonomy.coordinator_node_operation(text),
+    carl_autonomy.coordinator_freeze_reason_valid(text, text),
+    carl_autonomy.build_coordinator_completion_event(
+        text, text, integer, text, text, text, text, timestamptz
+    ),
     carl_autonomy.coordinator_node_event_authority(text, text),
     carl_autonomy.coordinator_command_allows_node(text, text),
     carl_autonomy.enqueue_coordinator_graph(text, timestamptz),

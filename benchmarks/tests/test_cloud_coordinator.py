@@ -247,7 +247,20 @@ def test_pending_command_identity_conflict_freezes_before_effect() -> None:
     decision = choose_next_action(snapshot(selected, current_lease=lease(), command=conflicting))
     assert decision.action == "frozen"
     assert decision.reason == "command_identity_conflict"
-    assert decision.consequential is False
+    assert decision.consequential is True
+
+
+def test_orphaned_command_routes_to_durable_supervisor_instead_of_an_unpersistable_freeze() -> None:
+    decision = choose_next_action(
+        snapshot(
+            current_lease=lease(),
+            command=claimed_command_for(node("dispatch_builder")),
+        )
+    )
+
+    assert decision.action == "trigger_supervisor"
+    assert decision.reason == "command_node_missing"
+    assert decision.consequential is True
 
 
 @pytest.mark.parametrize(
@@ -468,7 +481,7 @@ def test_production_nodes_fail_closed_without_service_minted_authorization(kind:
     )
     assert decision.action == "frozen"
     assert decision.reason == "protected_production_receipts_required"
-    assert decision.consequential is False
+    assert decision.consequential is True
 
 
 def test_idle_has_stable_identity_and_no_event_or_effect() -> None:

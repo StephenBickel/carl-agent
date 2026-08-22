@@ -932,6 +932,8 @@ def _decision(
     consequential: bool = False,
     remote_effect: bool = False,
 ) -> CloudCoordinatorDecision:
+    if action == "frozen":
+        consequential = True
     identity_payload = {
         "action": action,
         "experiment_id": snapshot.experiment_id,
@@ -1100,7 +1102,12 @@ def choose_next_action(snapshot: CoordinatorSnapshot) -> CloudCoordinatorDecisio
     selected = _selected_node(snapshot)
     if selected is None:
         if snapshot.command is not None:
-            return _decision(snapshot, "frozen", "command_node_missing")
+            return _decision(
+                snapshot,
+                "trigger_supervisor",
+                "command_node_missing",
+                consequential=True,
+            )
         return _decision(snapshot, "idle", "no_ready_node")
 
     blocker = _production_blocker(snapshot, selected)

@@ -1,0 +1,14 @@
+[Unit]
+Description=Carl protected observer effect socket
+
+[Socket]
+FileDescriptorName=observer-effect
+ListenStream=/run/carl/observer-effect.sock
+DirectoryMode=0700
+SocketMode=0600
+SocketUser=root
+SocketGroup=root
+RemoveOnStop=false
+
+[Install]
+WantedBy=sockets.target
