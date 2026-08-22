@@ -15,6 +15,7 @@ dependencies = [
 [project.scripts]
 carl-bench = "carl_bench.cli:main"
 carl-coordinator-service = "carl_bench.coordinator_service:main"
+carl-coordinator-effect-service = "carl_bench.coordinator_effect_service:main"
 carl-github-effect-service = "carl_bench.github_effect_service:main"
 carl-live-evaluation-service = "carl_bench.live_evaluation_service:main"
 carl-live-gateway-service = "carl_bench.live_gateway_service:main"

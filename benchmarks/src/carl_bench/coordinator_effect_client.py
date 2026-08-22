@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import pwd
 import socket
 import stat
 import struct
@@ -143,6 +144,7 @@ def _validate_peer(connection: socket.socket, expected_uid: int) -> None:
 class CoordinatorEffectSocketClient:
     family: EffectFamily
     _socket_path: Path
+    _expected_socket_uid: int
     _expected_peer_uid: int
     _timeout_seconds: float
 
@@ -154,11 +156,16 @@ class CoordinatorEffectSocketClient:
         socket_path: Path,
         expected_peer_uid: int,
         timeout_seconds: float,
+        expected_socket_uid: int | None = None,
     ) -> CoordinatorEffectSocketClient:
+        socket_uid = expected_peer_uid if expected_socket_uid is None else expected_socket_uid
         if (
             family not in _EXTERNAL_FAMILIES
             or not isinstance(socket_path, Path)
             or not socket_path.is_absolute()
+            or isinstance(socket_uid, bool)
+            or not isinstance(socket_uid, int)
+            or socket_uid < 0
             or isinstance(expected_peer_uid, bool)
             or not isinstance(expected_peer_uid, int)
             or expected_peer_uid < 0
@@ -168,7 +175,11 @@ class CoordinatorEffectSocketClient:
         ):
             raise CoordinatorEffectClientError("coordinator_effect_client_configuration_invalid")
         return cls(
-            cast(EffectFamily, family), socket_path, expected_peer_uid, float(timeout_seconds)
+            cast(EffectFamily, family),
+            socket_path,
+            socket_uid,
+            expected_peer_uid,
+            float(timeout_seconds),
         )
 
     def _execute(self, request: CoordinatorNodeEffectRequest) -> CoordinatorNodeEffectResponse:
@@ -177,16 +188,20 @@ class CoordinatorEffectSocketClient:
         payload = encode_effect_request_bytes(request)
         parent_fd: int | None = None
         try:
-            parent_fd = open_pinned_parent(self._socket_path, expected_uid=self._expected_peer_uid)
+            parent_fd = open_pinned_parent(
+                self._socket_path, expected_uid=self._expected_socket_uid
+            )
             before = socket_identity_at(
-                parent_fd, self._socket_path.name, expected_uid=self._expected_peer_uid
+                parent_fd, self._socket_path.name, expected_uid=self._expected_socket_uid
             )
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
                 connection.settimeout(self._timeout_seconds)
                 connection.connect(os.fspath(self._socket_path))
                 _validate_peer(connection, self._expected_peer_uid)
                 after = socket_identity_at(
-                    parent_fd, self._socket_path.name, expected_uid=self._expected_peer_uid
+                    parent_fd,
+                    self._socket_path.name,
+                    expected_uid=self._expected_socket_uid,
                 )
                 if after != before:
                     raise CoordinatorEffectClientError(
@@ -275,6 +290,7 @@ def load_protected_coordinator_effect_clients(
     *,
     _testing_policy_path: Path | None = None,
     _testing_expected_owner_uid: int | None = None,
+    _testing_service_uids: Mapping[str, int] | None = None,
     _testing_socket_paths: Mapping[str, Path] | None = None,
 ) -> ProtectedCoordinatorEffectClients:
     testing = _testing_policy_path is not None
@@ -286,15 +302,23 @@ def load_protected_coordinator_effect_clients(
         or isinstance(expected_owner_uid, bool)
         or not isinstance(expected_owner_uid, int)
         or expected_owner_uid < 0
-        or (_testing_socket_paths is not None and not testing)
+        or (
+            (_testing_socket_paths is not None or _testing_service_uids is not None) and not testing
+        )
     ):
         raise CoordinatorEffectClientError("coordinator_effect_policy_invalid")
     value = _read_policy(policy_path, expected_owner_uid=expected_owner_uid)
+    service_users = {
+        "archive": "carl-autonomy-archive",
+        "evaluator": "carl-autonomy-evaluator",
+        "input": "carl-autonomy-input",
+        "observer": "carl-autonomy-observer",
+    }
     expected = {
         "domain": "carl.coordinator-effect-policy.v1",
         "required_families": ["archive", "evaluator", "input", "observer"],
         "schema_version": 1,
-        "service_uid": expected_owner_uid,
+        "service_users": service_users,
     }
     if value != expected:
         raise CoordinatorEffectClientError("coordinator_effect_policy_invalid")
@@ -303,12 +327,28 @@ def load_protected_coordinator_effect_clients(
     )
     if set(paths) != _EXTERNAL_FAMILIES:
         raise CoordinatorEffectClientError("coordinator_effect_policy_invalid")
+    if _testing_service_uids is None:
+        try:
+            service_uids = {
+                family: pwd.getpwnam(user_name).pw_uid
+                for family, user_name in service_users.items()
+            }
+        except KeyError as error:
+            raise CoordinatorEffectClientError("coordinator_effect_policy_invalid") from error
+    else:
+        service_uids = dict(_testing_service_uids)
+    if set(service_uids) != _EXTERNAL_FAMILIES or any(
+        isinstance(uid, bool) or not isinstance(uid, int) or uid < 0
+        for uid in service_uids.values()
+    ):
+        raise CoordinatorEffectClientError("coordinator_effect_policy_invalid")
 
     def client(family: str) -> CoordinatorEffectSocketClient:
         return CoordinatorEffectSocketClient._for_testing(
             family=family,
             socket_path=paths[family],
-            expected_peer_uid=expected_owner_uid,
+            expected_socket_uid=expected_owner_uid,
+            expected_peer_uid=service_uids[family],
             timeout_seconds=_SOCKET_TIMEOUT_SECONDS,
         )
 

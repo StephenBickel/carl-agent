@@ -2,6 +2,7 @@
 Description=Carl protected evaluator effect socket
 
 [Socket]
+Service=carl-evaluator-effect.service
 FileDescriptorName=evaluator-effect
 ListenStream=/run/carl/evaluator-effect.sock
 DirectoryMode=0700

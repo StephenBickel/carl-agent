@@ -18,6 +18,7 @@ from carl_bench import coordinator_service
 from carl_bench.canonical import canonical_json_bytes
 from carl_bench.cloud_coordinator import (
     CloudCoordinatorError,
+    EffectObservation,
     ProtectedCoordinatorExecutor,
     choose_next_action,
 )
@@ -249,6 +250,10 @@ def test_protected_coordinator_has_a_zero_argument_packaged_entrypoint() -> None
     )
     assert set(signature(coordinator_service.main).parameters) == set()
 
+    assert project["project"]["scripts"]["carl-coordinator-effect-service"] == (
+        "carl_bench.coordinator_effect_service:main"
+    )
+
 
 def test_production_controller_owns_fixed_state_and_effect_clients(monkeypatch) -> None:
     constructed: list[str] = []
@@ -333,6 +338,140 @@ def test_protected_receipt_failure_is_persisted_once_then_returns_durable_idle()
     assert second.reason == "no_applicable_node"
 
 
+@pytest.mark.parametrize(
+    "receipt_error",
+    (
+        "coordinator_completion_receipt_required",
+        "coordinator_completion_event_mismatch",
+        "coordinator_completion_receipt_conflict",
+    ),
+)
+def test_authoritative_completion_failure_freezes_once_and_replay_is_already_frozen(
+    receipt_error: str,
+) -> None:
+    selected = node("archive_builder")
+
+    class State:
+        def __init__(self) -> None:
+            self.current = snapshot(
+                selected,
+                current_lease=lease(),
+                command=claimed_command_for(selected),
+                effect=EffectObservation(
+                    effect_key=selected.effect_key,
+                    status="applied",
+                    result_digest="a" * 64,
+                    observed_at=NOW_TEXT,
+                ),
+            )
+            self.completion_attempts = 0
+            self.freeze_mutations = 0
+            self.effect_mutations = 0
+            self.frozen = False
+
+        def reconstruct(self, command: str, *, observed_at: datetime):
+            assert command == "coordinate"
+            assert observed_at == datetime(2026, 8, 22, 12, tzinfo=UTC)
+            return None if self.frozen else self.current
+
+        def frozen_status(self, command: str, *, observed_at: datetime) -> bool:
+            assert command == "coordinate"
+            assert observed_at == datetime(2026, 8, 22, 12, tzinfo=UTC)
+            return self.frozen
+
+        def apply(self, decision, *, observed_at: datetime):
+            assert observed_at == datetime(2026, 8, 22, 12, tzinfo=UTC)
+            if decision.action == "complete_command":
+                self.completion_attempts += 1
+                raise PostgresStateError(receipt_error)
+            if decision.action == "frozen":
+                self.freeze_mutations += 1
+                self.frozen = True
+                return decision
+            raise AssertionError(decision.action)
+
+    state = State()
+    controller = ProtectedCoordinatorExecutor._for_testing(
+        state=state,
+        effects=NoEffects(),
+        clock=lambda: datetime(2026, 8, 22, 12, tzinfo=UTC),
+    )
+
+    first = controller.advance("coordinate")
+    replay = controller.advance("coordinate")
+
+    assert (first.action, first.reason, first.consequential) == (
+        "frozen",
+        "authoritative_completion_receipt_invalid",
+        True,
+    )
+    assert (replay.action, replay.reason, replay.consequential) == (
+        "idle",
+        "already_frozen",
+        False,
+    )
+    assert state.completion_attempts == 1
+    assert state.effect_mutations == 0
+    assert state.freeze_mutations == 1
+
+
+def test_authoritative_effect_receipt_failure_uses_the_same_durable_freeze_path() -> None:
+    selected = node("archive_builder")
+
+    class State:
+        def __init__(self) -> None:
+            self.frozen = False
+            self.freeze_mutations = 0
+            self.current = snapshot(
+                selected,
+                current_lease=lease(),
+                command=claimed_command_for(selected),
+            )
+
+        def reconstruct(self, command: str, *, observed_at: datetime):
+            del command, observed_at
+            return None if self.frozen else self.current
+
+        def frozen_status(self, command: str, *, observed_at: datetime) -> bool:
+            del command, observed_at
+            return self.frozen
+
+        def apply(self, decision, *, observed_at: datetime):
+            del observed_at
+            assert decision.action == "frozen"
+            self.frozen = True
+            self.freeze_mutations += 1
+            return decision
+
+    class MissingReceipt:
+        def __init__(self) -> None:
+            self.attempts = 0
+
+        def execute(self, decision, *, observed_at):
+            del decision, observed_at
+            self.attempts += 1
+            raise PostgresStateError("coordinator_effect_receipt_missing")
+
+    state = State()
+    effects = MissingReceipt()
+    controller = ProtectedCoordinatorExecutor._for_testing(
+        state=state,
+        effects=effects,
+        clock=lambda: datetime(2026, 8, 22, 12, tzinfo=UTC),
+    )
+
+    first = controller.advance("coordinate")
+    replay = controller.advance("coordinate")
+
+    assert (first.action, first.reason) == (
+        "frozen",
+        "authoritative_completion_receipt_invalid",
+    )
+    assert (replay.action, replay.reason) == ("idle", "already_frozen")
+    assert effects.attempts == 1
+    assert state.freeze_mutations == 1
+
+
 def test_systemd_commissions_every_fixed_effect_socket_before_coordinator_start() -> None:
     root = Path(__file__).parents[2] / "infra/autonomy/systemd"
     policy = Path(__file__).parents[2] / "infra/autonomy/policies/coordinator-effects-policy.json"
@@ -350,13 +489,32 @@ def test_systemd_commissions_every_fixed_effect_socket_before_coordinator_start(
         assert f"FileDescriptorName={family}-effect" in unit
         assert f"ListenStream=/run/carl/{family}-effect.sock" in unit
         assert "SocketMode=0600" in unit
+        assert "SocketUser=root" in unit
+        assert "SocketGroup=root" in unit
+        responder = (root / unit_name.replace(".socket", ".service")).read_text(encoding="utf-8")
+        assert f"User=carl-autonomy-{family}" in responder
+        assert f"Group=carl-autonomy-{family}" in responder
+        assert f"EnvironmentFile=/etc/carl/{family}-effect.env" in responder
+        assert (
+            "ExecStart=/opt/carl-autonomy/venv/bin/python3 -I "
+            "-m carl_bench.coordinator_effect_service" in responder
+        )
+        assert "NoNewPrivileges=true" in responder
+        assert "ProtectSystem=strict" in responder
+        assert "UnsetEnvironment=PYTHONPATH PYTHONHOME PYTHONSTARTUP PYTHONUSERBASE" in responder
+        assert f"Service=carl-{family}-effect.service" in unit
 
     assert "ReadOnlyPaths=/etc/carl/coordinator-effects-policy.json" in service
     assert json.loads(policy.read_text(encoding="utf-8")) == {
         "domain": "carl.coordinator-effect-policy.v1",
         "required_families": ["archive", "evaluator", "input", "observer"],
         "schema_version": 1,
-        "service_uid": 0,
+        "service_users": {
+            "archive": "carl-autonomy-archive",
+            "evaluator": "carl-autonomy-evaluator",
+            "input": "carl-autonomy-input",
+            "observer": "carl-autonomy-observer",
+        },
     }
 
 

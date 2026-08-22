@@ -1,0 +1,29 @@
+[Unit]
+Description=Carl protected evaluator coordinator effect responder
+Requires=carl-evaluator-effect.socket
+
+[Service]
+Type=simple
+User=carl-autonomy-evaluator
+Group=carl-autonomy-evaluator
+EnvironmentFile=/etc/carl/evaluator-effect.env
+Environment=PYTHONNOUSERSITE=1
+UnsetEnvironment=PYTHONPATH PYTHONHOME PYTHONSTARTUP PYTHONUSERBASE
+ExecStart=/opt/carl-autonomy/venv/bin/python3 -I -m carl_bench.coordinator_effect_service
+Restart=on-failure
+RestartSec=5s
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

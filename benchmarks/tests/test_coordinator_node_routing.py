@@ -1,8 +1,13 @@
 from __future__ import annotations
 
 import importlib
+import multiprocessing
+import os
+import socket
+import tempfile
 from dataclasses import replace
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 from test_cloud_coordinator import claimed_command_for, lease, node, snapshot
@@ -211,6 +216,32 @@ class RestartableEffects:
         return self.router.execute(decision, observed_at=observed_at)
 
 
+class _ProcessAuthority:
+    def __init__(self, family: str) -> None:
+        self.family = family
+
+    def execute(self, request):
+        effects = importlib.import_module("carl_bench.coordinator_effects")
+        assert request.family == self.family
+        return effects.CoordinatorNodeEffectResponse.completed(
+            request=request,
+            result_digest=RESULT_DIGEST,
+            observed_at="2026-08-22T12:00:00Z",
+        )
+
+
+def _serve_process_effect(listener: socket.socket, family: str, ready, stop) -> None:
+    service = importlib.import_module("carl_bench.coordinator_effect_service")
+    ready.set()
+    service._serve_activated_listener(
+        listener,
+        family=family,
+        authority=_ProcessAuthority(family),
+        allowed_client_uid=os.getuid(),
+        stop=stop,
+    )
+
+
 def _restart(state: RestartableState, effects: object) -> ProtectedCoordinatorExecutor:
     return ProtectedCoordinatorExecutor._for_testing(
         state=state,
@@ -279,6 +310,83 @@ def test_every_node_survives_restart_and_reaches_exact_completion(kind: str) -> 
         ]
 
 
+def test_all_22_nodes_complete_through_real_routers_and_activated_effect_processes() -> None:
+    from carl_bench.coordinator_effect_client import CoordinatorEffectSocketClient
+
+    with tempfile.TemporaryDirectory(prefix="carl-all-node-router-", dir="/private/tmp") as path:
+        root = Path(path)
+        context = multiprocessing.get_context("spawn")
+        services: dict[str, tuple[socket.socket, object, object, Path]] = {}
+        for family in ("archive", "evaluator", "input", "observer"):
+            socket_path = root / f"{family}.sock"
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            listener.bind(os.fspath(socket_path))
+            os.chmod(socket_path, 0o600)
+            ready = context.Event()
+            stop = context.Event()
+            process = context.Process(
+                target=_serve_process_effect,
+                args=(listener, family, ready, stop),
+            )
+            process.start()
+            services[family] = (listener, process, stop, socket_path)
+            assert ready.wait(5)
+        clients = {
+            family: CoordinatorEffectSocketClient._for_testing(
+                family=family,
+                socket_path=service[3],
+                expected_peer_uid=os.getuid(),
+                timeout_seconds=1,
+            )
+            for family, service in services.items()
+        }
+        try:
+            completed: list[str] = []
+            for kind in EXPECTED_EFFECT_FAMILIES:
+                state = RestartableState(kind)
+                backend = RestartableBackend(state)
+                router = coordinator_service._ProtectedCoordinatorEffectRouter._for_testing(
+                    backend=backend,
+                    github=object(),
+                    input_publisher=clients["input"],
+                    observer=clients["observer"],
+                    archive=clients["archive"],
+                    evaluator=clients["evaluator"],
+                )
+
+                class RoutedEffects:
+                    def __init__(self, selected_router) -> None:
+                        self.router = selected_router
+
+                    def execute(self, decision, *, observed_at):
+                        return self.router.execute(decision, observed_at=observed_at)
+
+                routed_effects = RoutedEffects(router)
+
+                for expected_action in (
+                    "persist_command",
+                    "claim_command",
+                    "execute_effect",
+                    "complete_command",
+                    "idle",
+                ):
+                    assert _restart(state, routed_effects).advance("coordinate").action == (
+                        expected_action
+                    )
+                completed.append(kind)
+            assert completed == list(EXPECTED_EFFECT_FAMILIES)
+            assert all(service[1].is_alive() for service in services.values())
+        finally:
+            for listener, process, stop, _ in services.values():
+                stop.set()
+                process.join(5)
+                listener.close()
+                if process.is_alive():
+                    process.kill()
+                    process.join(2)
+        assert all(service[1].exitcode == 0 for service in services.values())
+
+
 def test_uncommissioned_family_persists_one_stable_selected_node_freeze() -> None:
     state = RestartableState("archive_builder")
     state.current = replace(
@@ -299,6 +407,56 @@ def test_uncommissioned_family_persists_one_stable_selected_node_freeze() -> Non
     assert decision.reason == "archive_service_uncommissioned"
     assert decision.consequential is True
     assert restarted.action == "idle"
+    assert state.consequences == ["frozen"]
+
+
+def test_responder_uncommissioned_receipt_freezes_instead_of_entering_retry_rework() -> None:
+    effects = importlib.import_module("carl_bench.coordinator_effects")
+    state = RestartableState("archive_builder")
+    state.current = replace(
+        state.current,
+        command=claimed_command_for(node("archive_builder")),
+    )
+
+    class Backend:
+        def prepare_coordinator_effect(self, decision, *, expected_family, observed_at):
+            assert expected_family == "archive"
+            assert observed_at == NOW
+            return effects.PreparedCoordinatorEffect(
+                "archive", effects.CoordinatorNodeEffectRequest.from_decision(decision)
+            )
+
+        def complete_coordinator_effect(self, *args, **kwargs):  # pragma: no cover
+            del args, kwargs
+            raise AssertionError("uncommissioned response must not become experiment failure")
+
+    class Archive:
+        def archive(self, request):
+            return effects.CoordinatorNodeEffectResponse(
+                schema_version=1,
+                domain=effects.RESPONSE_DOMAIN,
+                status="rejected",
+                request_digest=request.digest,
+                observed_at="2026-08-22T12:00:00Z",
+                result_digest=None,
+                retry_not_before=None,
+                error_code="archive_service_uncommissioned",
+            )
+
+    router = coordinator_service._ProtectedCoordinatorEffectRouter._for_testing(
+        backend=Backend(),
+        github=None,
+        input_publisher=None,
+        observer=None,
+        archive=Archive(),
+        evaluator=None,
+    )
+
+    first = _restart(state, router).advance("coordinate")
+    replay = _restart(state, router).advance("coordinate")
+
+    assert (first.action, first.reason) == ("frozen", "archive_service_uncommissioned")
+    assert (replay.action, replay.reason) == ("idle", "no_applicable_node")
     assert state.consequences == ["frozen"]
 
 

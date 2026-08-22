@@ -146,6 +146,8 @@ CREATE TABLE carl_autonomy.coordinator_freeze_occurrences (
     node_kind varchar(32) NOT NULL,
     attempt smallint NOT NULL CHECK (attempt BETWEEN 1 AND 3),
     reason varchar(128) NOT NULL,
+    command_key varchar(192) NOT NULL,
+    effect_key varchar(192) NOT NULL,
     request_digest character(64) NOT NULL CHECK (request_digest ~ '^[0-9a-f]{64}$'),
     runtime_revision integer NOT NULL CHECK (runtime_revision BETWEEN 0 AND 2147483647),
     decision_identity character(64) NOT NULL CHECK (decision_identity ~ '^[0-9a-f]{64}$'),
@@ -156,6 +158,8 @@ CREATE TABLE carl_autonomy.coordinator_freeze_occurrences (
     recovered_at timestamptz,
     CHECK (occurrence_key = 'coordinator-freeze/' || freeze_fingerprint),
     CHECK (node_id = experiment_id || ':' || node_kind),
+    CHECK (command_key = experiment_id || ':' || node_kind || ':attempt:' || attempt::text),
+    CHECK (effect_key ~ '^cloud-effect-[0-9a-f]{64}$'),
     CHECK (
         (recovery_evidence_digest IS NULL AND recovery_fingerprint IS NULL
             AND recovered_at IS NULL)
@@ -169,6 +173,54 @@ CREATE TABLE carl_autonomy.coordinator_freeze_occurrences (
 
 REVOKE ALL ON carl_autonomy.coordinator_freeze_occurrences
 FROM PUBLIC, carl_autonomy_workflow;
+
+CREATE TABLE carl_autonomy.coordinator_recovery_receipts (
+    evidence_digest character(64) PRIMARY KEY CHECK (evidence_digest ~ '^[0-9a-f]{64}$'),
+    occurrence_key varchar(96) NOT NULL UNIQUE,
+    freeze_fingerprint character(64) NOT NULL CHECK (freeze_fingerprint ~ '^[0-9a-f]{64}$'),
+    experiment_id varchar(128) NOT NULL
+        REFERENCES carl_autonomy.coordinator_runtime(experiment_id),
+    node_id varchar(192) NOT NULL,
+    node_kind varchar(32) NOT NULL,
+    attempt smallint NOT NULL CHECK (attempt BETWEEN 1 AND 3),
+    reason varchar(128) NOT NULL,
+    command_key varchar(192) NOT NULL,
+    effect_key varchar(192) NOT NULL,
+    request_digest character(64) NOT NULL CHECK (request_digest ~ '^[0-9a-f]{64}$'),
+    runtime_revision integer NOT NULL CHECK (runtime_revision BETWEEN 0 AND 2147483646),
+    decision_identity character(64) NOT NULL CHECK (decision_identity ~ '^[0-9a-f]{64}$'),
+    changed_action_digest character(64) NOT NULL
+        CHECK (changed_action_digest ~ '^[0-9a-f]{64}$'),
+    repair_fingerprint character(64) NOT NULL CHECK (repair_fingerprint ~ '^[0-9a-f]{64}$'),
+    archive_object_key varchar(256) NOT NULL,
+    archive_version_id varchar(256) NOT NULL,
+    archive_checksum_sha256 character(64) NOT NULL
+        CHECK (archive_checksum_sha256 ~ '^[0-9a-f]{64}$'),
+    archive_byte_length integer NOT NULL CHECK (archive_byte_length BETWEEN 2 AND 32768),
+    retention_mode varchar(16) NOT NULL CHECK (retention_mode = 'COMPLIANCE'),
+    retained_until timestamptz NOT NULL,
+    archive_created_at timestamptz NOT NULL,
+    verified_at timestamptz NOT NULL,
+    receipt_json text NOT NULL CHECK (octet_length(receipt_json) BETWEEN 2 AND 65536),
+    registered_at timestamptz NOT NULL,
+    CHECK (occurrence_key = 'coordinator-freeze/' || freeze_fingerprint),
+    CHECK (node_id = experiment_id || ':' || node_kind),
+    CHECK (command_key = experiment_id || ':' || node_kind || ':attempt:' || attempt::text),
+    CHECK (effect_key ~ '^cloud-effect-[0-9a-f]{64}$'),
+    CHECK (
+        archive_object_key = 'carl-evidence/v1/sha256/'
+            || substr(evidence_digest, 1, 2) || '/' || evidence_digest
+    ),
+    CHECK (archive_checksum_sha256 = evidence_digest),
+    CHECK (retained_until > verified_at AND archive_created_at <= verified_at)
+);
+
+REVOKE ALL ON carl_autonomy.coordinator_recovery_receipts
+FROM PUBLIC, carl_autonomy_workflow;
+
+CREATE TRIGGER coordinator_recovery_receipts_immutable
+BEFORE UPDATE OR DELETE ON carl_autonomy.coordinator_recovery_receipts
+FOR EACH ROW EXECUTE FUNCTION carl_autonomy.reject_immutable_mutation();
 
 CREATE OR REPLACE FUNCTION carl_autonomy.coordinator_timestamp(p_value timestamptz)
 RETURNS text
@@ -379,7 +431,7 @@ AS $$
         WHEN p_reason IN (
             'failure_command_mismatch', 'command_identity_conflict',
             'completed_command_node_not_advanced', 'claimed_command_identity_missing',
-            'effect_identity_conflict'
+            'effect_identity_conflict', 'authoritative_completion_receipt_invalid'
         ) THEN true
         ELSE false
     END
@@ -744,6 +796,198 @@ BEGIN
 END;
 $$;
 
+CREATE OR REPLACE FUNCTION carl_autonomy.register_coordinator_recovery_receipt(
+    p_receipt_json text,
+    p_observed_at timestamptz
+)
+RETURNS TABLE(applied boolean)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, carl_autonomy
+AS $$
+DECLARE
+    receipt_value jsonb;
+    artifact_value jsonb;
+    artifact_json text;
+    identity_value text;
+    evidence_digest_value text;
+    existing carl_autonomy.coordinator_recovery_receipts%ROWTYPE;
+    occurrence carl_autonomy.coordinator_freeze_occurrences%ROWTYPE;
+BEGIN
+    IF CASE
+        WHEN current_setting('role', true) IS NULL
+            OR current_setting('role', true) = 'none' THEN session_user::text
+        ELSE current_setting('role', true)
+    END <> 'carl_archive_backend'
+    THEN
+        RAISE EXCEPTION USING ERRCODE = '42501', MESSAGE = 'database_role_denied';
+    END IF;
+    receipt_value := carl_autonomy.parse_object(
+        p_receipt_json, 'coordinator_recovery_archive_invalid'
+    );
+    artifact_value := receipt_value->'artifact';
+    IF carl_autonomy.canonical_jsonb(receipt_value) <> p_receipt_json
+        OR jsonb_object_length(receipt_value) <> 12
+        OR NOT receipt_value ?& ARRAY[
+            'archive_byte_length', 'archive_checksum_sha256', 'archive_created_at',
+            'archive_object_key', 'archive_version_id', 'artifact', 'domain',
+            'evidence_digest', 'retained_until', 'retention_mode', 'schema_version',
+            'verified_at'
+        ]
+        OR receipt_value->'schema_version' IS DISTINCT FROM '1'::jsonb
+        OR receipt_value->>'domain'
+            <> 'carl.coordinator-recovery-archive-receipt.v1'
+        OR jsonb_typeof(artifact_value) <> 'object'
+        OR jsonb_object_length(artifact_value) <> 17
+        OR NOT artifact_value ?& ARRAY[
+            'attempt', 'changed_action_digest', 'command_key', 'decision_identity',
+            'domain', 'effect_key', 'experiment_id', 'freeze_fingerprint', 'node_id',
+            'node_kind', 'occurrence_key', 'reason', 'repair_fingerprint', 'repaired_at',
+            'request_digest', 'runtime_revision', 'schema_version'
+        ]
+        OR artifact_value->'schema_version' IS DISTINCT FROM '1'::jsonb
+        OR artifact_value->>'domain' <> 'carl.coordinator-recovery-artifact.v1'
+        OR artifact_value->>'experiment_id'
+            !~ '^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$'
+        OR carl_autonomy.coordinator_node_priority(artifact_value->>'node_kind') IS NULL
+        OR artifact_value->>'node_id'
+            <> artifact_value->>'experiment_id' || ':' || artifact_value->>'node_kind'
+        OR jsonb_typeof(artifact_value->'attempt') <> 'number'
+        OR (artifact_value->>'attempt')::integer NOT BETWEEN 1 AND 3
+        OR artifact_value->>'command_key'
+            <> artifact_value->>'experiment_id' || ':' || artifact_value->>'node_kind'
+                || ':attempt:' || artifact_value->>'attempt'
+        OR artifact_value->>'effect_key' !~ '^cloud-effect-[0-9a-f]{64}$'
+        OR artifact_value->>'occurrence_key'
+            <> 'coordinator-freeze/' || artifact_value->>'freeze_fingerprint'
+        OR NOT carl_autonomy.coordinator_freeze_reason_valid(
+            artifact_value->>'node_kind', artifact_value->>'reason'
+        )
+        OR jsonb_typeof(artifact_value->'runtime_revision') <> 'number'
+        OR (artifact_value->>'runtime_revision')::integer NOT BETWEEN 0 AND 2147483646
+        OR NOT carl_autonomy.canonical_utc_text_valid(artifact_value->>'repaired_at')
+        OR NOT carl_autonomy.canonical_utc_text_valid(receipt_value->>'archive_created_at')
+        OR NOT carl_autonomy.canonical_utc_text_valid(receipt_value->>'retained_until')
+        OR NOT carl_autonomy.canonical_utc_text_valid(receipt_value->>'verified_at')
+        OR (receipt_value->>'verified_at')::timestamptz <> p_observed_at
+        OR (artifact_value->>'repaired_at')::timestamptz
+            > (receipt_value->>'archive_created_at')::timestamptz
+        OR (receipt_value->>'archive_created_at')::timestamptz > p_observed_at
+        OR (receipt_value->>'retained_until')::timestamptz <= p_observed_at
+        OR receipt_value->>'retention_mode' <> 'COMPLIANCE'
+        OR receipt_value->>'archive_version_id'
+            !~ '^[A-Za-z0-9][A-Za-z0-9._:/+=-]{0,255}$'
+        OR jsonb_typeof(receipt_value->'archive_byte_length') <> 'number'
+    THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '22023', MESSAGE = 'coordinator_recovery_archive_invalid';
+    END IF;
+    FOREACH evidence_digest_value IN ARRAY ARRAY[
+        artifact_value->>'changed_action_digest',
+        artifact_value->>'decision_identity',
+        artifact_value->>'freeze_fingerprint',
+        artifact_value->>'repair_fingerprint',
+        artifact_value->>'request_digest',
+        receipt_value->>'archive_checksum_sha256',
+        receipt_value->>'evidence_digest'
+    ]
+    LOOP
+        IF evidence_digest_value !~ '^[0-9a-f]{64}$'
+            OR evidence_digest_value = repeat('0', 64)
+        THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '22023', MESSAGE = 'coordinator_recovery_archive_invalid';
+        END IF;
+    END LOOP;
+    artifact_json := carl_autonomy.canonical_jsonb(artifact_value);
+    evidence_digest_value := carl_autonomy.sha256_text(artifact_json);
+    identity_value := carl_autonomy.canonical_jsonb(jsonb_build_object(
+        'attempt', (artifact_value->>'attempt')::integer,
+        'changed_action_digest', artifact_value->>'changed_action_digest',
+        'command_key', artifact_value->>'command_key',
+        'decision_identity', artifact_value->>'decision_identity',
+        'effect_key', artifact_value->>'effect_key',
+        'experiment_id', artifact_value->>'experiment_id',
+        'freeze_fingerprint', artifact_value->>'freeze_fingerprint',
+        'node_id', artifact_value->>'node_id',
+        'node_kind', artifact_value->>'node_kind',
+        'occurrence_key', artifact_value->>'occurrence_key',
+        'reason', artifact_value->>'reason',
+        'request_digest', artifact_value->>'request_digest',
+        'runtime_revision', (artifact_value->>'runtime_revision')::integer
+    ));
+    IF receipt_value->>'evidence_digest' <> evidence_digest_value
+        OR receipt_value->>'archive_checksum_sha256' <> evidence_digest_value
+        OR receipt_value->>'archive_object_key'
+            <> 'carl-evidence/v1/sha256/' || substr(evidence_digest_value, 1, 2)
+                || '/' || evidence_digest_value
+        OR (receipt_value->>'archive_byte_length')::integer <> octet_length(artifact_json)
+        OR artifact_value->>'repair_fingerprint'
+            <> carl_autonomy.sha256_text(identity_value)
+    THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '22023', MESSAGE = 'coordinator_recovery_archive_invalid';
+    END IF;
+    SELECT item.* INTO occurrence
+    FROM carl_autonomy.coordinator_freeze_occurrences AS item
+    WHERE item.occurrence_key = artifact_value->>'occurrence_key'
+    FOR SHARE;
+    IF NOT FOUND
+        OR occurrence.freeze_fingerprint <> artifact_value->>'freeze_fingerprint'
+        OR occurrence.experiment_id <> artifact_value->>'experiment_id'
+        OR occurrence.node_id <> artifact_value->>'node_id'
+        OR occurrence.node_kind <> artifact_value->>'node_kind'
+        OR occurrence.attempt <> (artifact_value->>'attempt')::integer
+        OR occurrence.reason <> artifact_value->>'reason'
+        OR occurrence.command_key <> artifact_value->>'command_key'
+        OR occurrence.effect_key <> artifact_value->>'effect_key'
+        OR occurrence.request_digest <> artifact_value->>'request_digest'
+        OR occurrence.runtime_revision <> (artifact_value->>'runtime_revision')::integer
+        OR occurrence.decision_identity <> artifact_value->>'decision_identity'
+        OR occurrence.recovered_at IS NOT NULL
+    THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '55000', MESSAGE = 'coordinator_recovery_freeze_mismatch';
+    END IF;
+    PERFORM pg_advisory_xact_lock(hashtextextended(evidence_digest_value, 41));
+    SELECT item.* INTO existing
+    FROM carl_autonomy.coordinator_recovery_receipts AS item
+    WHERE item.evidence_digest = evidence_digest_value;
+    IF FOUND THEN
+        IF existing.receipt_json = p_receipt_json THEN
+            RETURN QUERY SELECT false;
+            RETURN;
+        END IF;
+        RAISE EXCEPTION USING
+            ERRCODE = '23505', MESSAGE = 'coordinator_recovery_receipt_conflict';
+    END IF;
+    INSERT INTO carl_autonomy.coordinator_recovery_receipts(
+        evidence_digest, occurrence_key, freeze_fingerprint, experiment_id, node_id,
+        node_kind, attempt, reason, command_key, effect_key, request_digest,
+        runtime_revision, decision_identity, changed_action_digest, repair_fingerprint,
+        archive_object_key, archive_version_id, archive_checksum_sha256,
+        archive_byte_length, retention_mode, retained_until, archive_created_at,
+        verified_at, receipt_json, registered_at
+    ) VALUES (
+        evidence_digest_value, artifact_value->>'occurrence_key',
+        artifact_value->>'freeze_fingerprint', artifact_value->>'experiment_id',
+        artifact_value->>'node_id', artifact_value->>'node_kind',
+        (artifact_value->>'attempt')::integer, artifact_value->>'reason',
+        artifact_value->>'command_key', artifact_value->>'effect_key',
+        artifact_value->>'request_digest',
+        (artifact_value->>'runtime_revision')::integer,
+        artifact_value->>'decision_identity', artifact_value->>'changed_action_digest',
+        artifact_value->>'repair_fingerprint', receipt_value->>'archive_object_key',
+        receipt_value->>'archive_version_id', receipt_value->>'archive_checksum_sha256',
+        (receipt_value->>'archive_byte_length')::integer, receipt_value->>'retention_mode',
+        (receipt_value->>'retained_until')::timestamptz,
+        (receipt_value->>'archive_created_at')::timestamptz,
+        (receipt_value->>'verified_at')::timestamptz, p_receipt_json, p_observed_at
+    );
+    RETURN QUERY SELECT true;
+END;
+$$;
+
 CREATE OR REPLACE FUNCTION carl_autonomy.reactivate_coordinator_node(
     p_recovery_json text,
     p_observed_at timestamptz
@@ -761,7 +1005,7 @@ DECLARE
     selected_node jsonb;
     repaired_node jsonb;
     repaired_nodes jsonb;
-    evidence_state carl_autonomy.evidence_objects%ROWTYPE;
+    recovery_receipt carl_autonomy.coordinator_recovery_receipts%ROWTYPE;
     next_attempt integer;
     next_revision integer;
     next_request_digest text;
@@ -850,20 +1094,35 @@ BEGIN
         RAISE EXCEPTION USING
             ERRCODE = '55000', MESSAGE = 'coordinator_recovery_freeze_mismatch';
     END IF;
-    SELECT evidence.* INTO evidence_state
-    FROM carl_autonomy.evidence_objects AS evidence
-    WHERE evidence.digest = recovery_value->>'evidence_digest'
+    SELECT receipt.* INTO recovery_receipt
+    FROM carl_autonomy.coordinator_recovery_receipts AS receipt
+    WHERE receipt.evidence_digest = recovery_value->>'evidence_digest'
     FOR SHARE;
     IF NOT FOUND
-        OR evidence_state.digest <> recovery_value->>'repair_fingerprint'
-        OR evidence_state.request_digest <> selected_node->>'request_digest'
-        OR evidence_state.producer <> 'observer'
-        OR evidence_state.media_type NOT IN (
-            'application/vnd.carl.dependency-commissioning+json',
-            'application/vnd.carl.repair-receipt+json'
-        )
-        OR evidence_state.recorded_at > p_observed_at
-        OR evidence_state.retained_until <= p_observed_at
+        OR recovery_receipt.repair_fingerprint <> recovery_value->>'repair_fingerprint'
+        OR recovery_receipt.occurrence_key <> runtime.freeze_occurrence_key
+        OR recovery_receipt.freeze_fingerprint <> runtime.freeze_fingerprint
+        OR recovery_receipt.experiment_id <> runtime.experiment_id
+        OR recovery_receipt.node_id <> selected_node->>'node_id'
+        OR recovery_receipt.node_kind <> selected_node->>'kind'
+        OR recovery_receipt.attempt <> (selected_node->>'attempt')::integer
+        OR recovery_receipt.reason <> runtime.freeze_reason
+        OR recovery_receipt.command_key <> selected_node->>'command_key'
+        OR recovery_receipt.effect_key <> selected_node->>'effect_key'
+        OR recovery_receipt.request_digest <> selected_node->>'request_digest'
+        OR recovery_receipt.runtime_revision <> runtime.revision
+        OR recovery_receipt.decision_identity <> runtime.decision_identity
+        OR recovery_receipt.archive_checksum_sha256
+            <> recovery_receipt.evidence_digest
+        OR recovery_receipt.archive_object_key
+            <> 'carl-evidence/v1/sha256/'
+                || substr(recovery_receipt.evidence_digest, 1, 2)
+                || '/' || recovery_receipt.evidence_digest
+        OR recovery_receipt.retention_mode <> 'COMPLIANCE'
+        OR recovery_receipt.registered_at > p_observed_at
+        OR recovery_receipt.archive_created_at > recovery_receipt.verified_at
+        OR recovery_receipt.verified_at > p_observed_at
+        OR recovery_receipt.retained_until <= p_observed_at
     THEN
         RAISE EXCEPTION USING
             ERRCODE = '55000', MESSAGE = 'coordinator_recovery_evidence_invalid';
@@ -949,6 +1208,8 @@ BEGIN
         AND occurrence.node_kind = selected_node->>'kind'
         AND occurrence.attempt = (selected_node->>'attempt')::integer
         AND occurrence.reason = runtime.freeze_reason
+        AND occurrence.command_key = selected_node->>'command_key'
+        AND occurrence.effect_key = selected_node->>'effect_key'
         AND occurrence.request_digest = selected_node->>'request_digest'
         AND occurrence.runtime_revision = runtime.revision
         AND occurrence.decision_identity = runtime.decision_identity
@@ -986,6 +1247,39 @@ BEGIN
         updated_at = p_observed_at
     WHERE item.experiment_id = runtime.experiment_id;
     RETURN QUERY SELECT true, next_attempt, next_request_digest, next_revision;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION carl_autonomy.coordinator_frozen_status(p_command_name text)
+RETURNS TABLE(already_frozen boolean)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, carl_autonomy
+AS $$
+BEGIN
+    PERFORM carl_autonomy.require_role(ARRAY['carl_coordinator']);
+    RETURN QUERY SELECT EXISTS (
+        SELECT 1
+        FROM carl_autonomy.coordinator_runtime AS runtime
+        CROSS JOIN LATERAL (
+            SELECT node
+            FROM jsonb_array_elements(
+                carl_autonomy.parse_object(
+                    runtime.snapshot_json, 'coordinator_snapshot_json_invalid'
+                )->'nodes'
+            ) AS active(node)
+            WHERE node->>'status' IN ('ready', 'failed')
+            ORDER BY carl_autonomy.coordinator_node_priority(node->>'kind'), node->>'node_id'
+            LIMIT 1
+        ) AS selected_node
+        WHERE runtime.status = 'frozen'
+            AND runtime.freeze_occurrence_key IS NOT NULL
+            AND runtime.freeze_fingerprint IS NOT NULL
+            AND runtime.freeze_reason IS NOT NULL
+            AND carl_autonomy.coordinator_command_allows_node(
+                p_command_name, selected_node.node->>'kind'
+            )
+    );
 END;
 $$;
 
@@ -2051,8 +2345,8 @@ BEGIN
             );
             INSERT INTO carl_autonomy.coordinator_freeze_occurrences(
                 occurrence_key, freeze_fingerprint, experiment_id, node_id, node_kind,
-                attempt, reason, request_digest, runtime_revision, decision_identity,
-                decision_json, frozen_at
+                attempt, reason, command_key, effect_key, request_digest, runtime_revision,
+                decision_identity, decision_json, frozen_at
             ) VALUES (
                 'coordinator-freeze/' || freeze_fingerprint_value,
                 freeze_fingerprint_value,
@@ -2061,6 +2355,8 @@ BEGIN
                 ready_node->>'kind',
                 (ready_node->>'attempt')::integer,
                 decision_value->>'reason',
+                ready_node->>'command_key',
+                ready_node->>'effect_key',
                 ready_node->>'request_digest',
                 runtime.revision,
                 decision_value->>'identity',
@@ -2080,6 +2376,8 @@ BEGIN
                 OR existing_freeze.node_kind <> ready_node->>'kind'
                 OR existing_freeze.attempt <> (ready_node->>'attempt')::integer
                 OR existing_freeze.reason <> decision_value->>'reason'
+                OR existing_freeze.command_key <> ready_node->>'command_key'
+                OR existing_freeze.effect_key <> ready_node->>'effect_key'
                 OR existing_freeze.request_digest <> ready_node->>'request_digest'
                 OR existing_freeze.runtime_revision <> runtime.revision
                 OR existing_freeze.decision_identity <> decision_value->>'identity'
@@ -2789,11 +3087,13 @@ REVOKE ALL ON FUNCTION
     carl_autonomy.coordinator_command_allows_node(text, text),
     carl_autonomy.enqueue_coordinator_graph(text, timestamptz),
     carl_autonomy.enqueue_pending_coordinator_graph(timestamptz),
+    carl_autonomy.register_coordinator_recovery_receipt(text, timestamptz),
     carl_autonomy.reactivate_coordinator_node(text, timestamptz),
     carl_autonomy.complete_coordinator_node_event(
         text, text, text, text, text, timestamptz
     ),
     carl_autonomy.renew_coordinator_lease(text, text, integer, timestamptz),
+    carl_autonomy.coordinator_frozen_status(text),
     carl_autonomy.load_coordinator_snapshot(text, timestamptz),
     carl_autonomy.apply_coordinator_decision(text, timestamptz),
     carl_autonomy.prepare_coordinator_effect(text, timestamptz),
@@ -2803,12 +3103,17 @@ REVOKE ALL ON FUNCTION
 FROM PUBLIC, carl_autonomy_workflow;
 
 GRANT EXECUTE ON FUNCTION
+    carl_autonomy.register_coordinator_recovery_receipt(text, timestamptz)
+TO carl_archive_backend;
+
+GRANT EXECUTE ON FUNCTION
     carl_autonomy.coordinator_node_event_authority(text, text),
     carl_autonomy.enqueue_pending_coordinator_graph(timestamptz),
     carl_autonomy.reactivate_coordinator_node(text, timestamptz),
     carl_autonomy.complete_coordinator_node_event(
         text, text, text, text, text, timestamptz
     ),
+    carl_autonomy.coordinator_frozen_status(text),
     carl_autonomy.load_coordinator_snapshot(text, timestamptz),
     carl_autonomy.apply_coordinator_decision(text, timestamptz),
     carl_autonomy.prepare_coordinator_effect(text, timestamptz),

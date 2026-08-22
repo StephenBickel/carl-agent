@@ -329,6 +329,11 @@ class _PostgresCoordinatorState:
             observed_at=observed_at
         )
 
+    def frozen_status(self, command: str, *, observed_at: datetime) -> bool:
+        return self.__backend.coordinator_frozen_status(  # type: ignore[attr-defined,no-any-return]
+            command, observed_at=observed_at
+        )
+
     def apply(
         self, decision: CloudCoordinatorDecision, *, observed_at: datetime
     ) -> CloudCoordinatorDecision:
@@ -449,6 +454,11 @@ class _ProtectedCoordinatorEffectRouter:
             raise ProtectedEffectUnavailable(f"{family}_service_uncommissioned") from error
         if not isinstance(response, CoordinatorNodeEffectResponse):
             raise CloudCoordinatorError("coordinator_effect_response_invalid")
+        if (
+            response.status == "rejected"
+            and response.error_code == f"{family}_service_uncommissioned"
+        ):
+            raise ProtectedEffectUnavailable(response.error_code)
         return self.__backend.complete_coordinator_effect(  # type: ignore[attr-defined,no-any-return]
             decision, response, observed_at=observed_at
         )

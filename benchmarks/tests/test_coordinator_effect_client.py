@@ -62,6 +62,34 @@ def _serve_one(listener: socket.socket, family: str, ready: object) -> None:
         connection.sendall(struct.pack(">I", len(payload)) + payload)
 
 
+class _EffectAuthority:
+    def __init__(self, family: str) -> None:
+        self.family = family
+
+    def execute(self, request: CoordinatorNodeEffectRequest) -> CoordinatorNodeEffectResponse:
+        assert request.family == self.family
+        return CoordinatorNodeEffectResponse.completed(
+            request=request,
+            result_digest=RESULT_DIGEST,
+            observed_at=NOW,
+        )
+
+
+def _serve_activated_effect(
+    listener: socket.socket, family: str, ready: object, stop: object
+) -> None:
+    from carl_bench.coordinator_effect_service import _serve_activated_listener
+
+    ready.set()
+    _serve_activated_listener(
+        listener,
+        family=family,
+        authority=_EffectAuthority(family),
+        allowed_client_uid=os.getuid(),
+        stop=stop,
+    )
+
+
 @pytest.mark.parametrize(
     ("family", "method_name"),
     (
@@ -107,6 +135,118 @@ def test_each_fixed_effect_family_round_trips_over_a_credential_free_socket(
                 process.join(2)
 
 
+@pytest.mark.parametrize(
+    ("family", "method_name"),
+    (
+        ("archive", "archive"),
+        ("evaluator", "evaluate"),
+        ("input", "publish"),
+        ("observer", "observe"),
+    ),
+)
+def test_each_packaged_protected_effect_service_responds_on_its_activated_socket(
+    family: str, method_name: str
+) -> None:
+    from carl_bench.coordinator_effect_client import CoordinatorEffectSocketClient
+
+    with tempfile.TemporaryDirectory(prefix="carl-ces-", dir="/private/tmp") as directory:
+        socket_path = Path(directory) / f"{family}.sock"
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(os.fspath(socket_path))
+        os.chmod(socket_path, 0o600)
+        context = multiprocessing.get_context("spawn")
+        ready = context.Event()
+        stop = context.Event()
+        process = context.Process(
+            target=_serve_activated_effect,
+            args=(listener, family, ready, stop),
+        )
+        process.start()
+        try:
+            assert ready.wait(5)
+            client = CoordinatorEffectSocketClient._for_testing(
+                family=family,
+                socket_path=socket_path,
+                expected_peer_uid=os.getuid(),
+                timeout_seconds=1,
+            )
+
+            response = getattr(client, method_name)(_request(family))
+
+            assert response.status == "completed"
+            assert response.result_digest == RESULT_DIGEST
+        finally:
+            stop.set()
+            process.join(5)
+            listener.close()
+            if process.is_alive():
+                process.kill()
+                process.join(2)
+        assert process.exitcode == 0
+
+
+def test_all_four_effect_services_are_distinct_long_lived_responders() -> None:
+    from carl_bench.coordinator_effect_client import CoordinatorEffectSocketClient
+
+    with tempfile.TemporaryDirectory(prefix="carl-ces-all-", dir="/private/tmp") as directory:
+        root = Path(directory)
+        context = multiprocessing.get_context("spawn")
+        services: list[tuple[socket.socket, object, object, object, Path]] = []
+        for family in ("archive", "evaluator", "input", "observer"):
+            socket_path = root / f"{family}.sock"
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            listener.bind(os.fspath(socket_path))
+            os.chmod(socket_path, 0o600)
+            ready = context.Event()
+            stop = context.Event()
+            process = context.Process(
+                target=_serve_activated_effect,
+                args=(listener, family, ready, stop),
+            )
+            process.start()
+            services.append((listener, process, ready, stop, socket_path))
+        try:
+            assert all(ready.wait(5) for _, _, ready, _, _ in services)
+            for family, method_name, service in zip(
+                ("archive", "evaluator", "input", "observer"),
+                ("archive", "evaluate", "publish", "observe"),
+                services,
+                strict=True,
+            ):
+                client = CoordinatorEffectSocketClient._for_testing(
+                    family=family,
+                    socket_path=service[4],
+                    expected_peer_uid=os.getuid(),
+                    timeout_seconds=1,
+                )
+                for _ in range(2):
+                    assert getattr(client, method_name)(_request(family)).status == "completed"
+                assert service[1].is_alive()
+                assert service[1].pid is not None
+            assert len({service[1].pid for service in services}) == 4
+        finally:
+            for listener, process, _, stop, _ in services:
+                stop.set()
+                process.join(5)
+                listener.close()
+                if process.is_alive():
+                    process.kill()
+                    process.join(2)
+        assert all(process.exitcode == 0 for _, process, _, _, _ in services)
+
+
+@pytest.mark.parametrize("family", ("archive", "evaluator", "input", "observer"))
+def test_protected_responder_names_the_exact_uncommissioned_family(family: str) -> None:
+    from carl_bench.coordinator_effect_service import _ProtectedEffectAuthority
+
+    response = _ProtectedEffectAuthority.from_protected_environment(family).execute(
+        _request(family)
+    )
+
+    assert response.status == "rejected"
+    assert response.error_code == f"{family}_service_uncommissioned"
+
+
 def test_protected_policy_loader_commissions_all_fixed_families_without_endpoints(
     tmp_path: Path,
 ) -> None:
@@ -122,7 +262,12 @@ def test_protected_policy_loader_commissions_all_fixed_families_without_endpoint
                 "domain": "carl.coordinator-effect-policy.v1",
                 "required_families": ["archive", "evaluator", "input", "observer"],
                 "schema_version": 1,
-                "service_uid": os.getuid(),
+                "service_users": {
+                    "archive": "carl-autonomy-archive",
+                    "evaluator": "carl-autonomy-evaluator",
+                    "input": "carl-autonomy-input",
+                    "observer": "carl-autonomy-observer",
+                },
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -135,6 +280,7 @@ def test_protected_policy_loader_commissions_all_fixed_families_without_endpoint
     clients = load_protected_coordinator_effect_clients(
         _testing_policy_path=policy,
         _testing_expected_owner_uid=os.getuid(),
+        _testing_service_uids={family: os.getuid() + 1 for family in PROTECTED_EFFECT_SOCKET_PATHS},
         _testing_socket_paths={
             family: tmp_path / path.name for family, path in PROTECTED_EFFECT_SOCKET_PATHS.items()
         },
@@ -144,6 +290,14 @@ def test_protected_policy_loader_commissions_all_fixed_families_without_endpoint
     assert clients.observer.family == "observer"
     assert clients.archive.family == "archive"
     assert clients.evaluator.family == "evaluator"
+    for client in (
+        clients.input_publisher,
+        clients.observer,
+        clients.archive,
+        clients.evaluator,
+    ):
+        assert client._expected_socket_uid == os.getuid()
+        assert client._expected_peer_uid == os.getuid() + 1
     assert "socket" not in policy.read_text(encoding="utf-8")
 
 
@@ -160,7 +314,11 @@ def test_protected_policy_rejects_missing_family_or_caller_selected_endpoint(
         "domain": "carl.coordinator-effect-policy.v1",
         "required_families": ["archive", "evaluator", "input"],
         "schema_version": 1,
-        "service_uid": os.getuid(),
+        "service_users": {
+            "archive": "carl-autonomy-archive",
+            "evaluator": "carl-autonomy-evaluator",
+            "input": "carl-autonomy-input",
+        },
     }
     for document in (base, {**base, "socket_path": "/tmp/attacker.sock"}):
         policy.write_text(
@@ -171,4 +329,10 @@ def test_protected_policy_rejects_missing_family_or_caller_selected_endpoint(
             load_protected_coordinator_effect_clients(
                 _testing_policy_path=policy,
                 _testing_expected_owner_uid=os.getuid(),
+                _testing_service_uids={
+                    "archive": os.getuid(),
+                    "evaluator": os.getuid(),
+                    "input": os.getuid(),
+                    "observer": os.getuid(),
+                },
             )

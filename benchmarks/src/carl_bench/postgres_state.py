@@ -61,7 +61,25 @@ _PROTECTED_STATE_CONFIG_DIR = Path("/etc/carl")
 _PROTECTED_STATE_CONFIG_NAME = "postgres-state-policy.json"
 _PROTECTED_STATE_DSN_ENV = "CARL_AUTONOMY_POSTGRES_DSN"
 _WORKFLOW_AUTHORITIES = frozenset(
-    {"builder", "coordinator", "observer", "promoter", "soak", "supervisor", "validator"}
+    {
+        "builder",
+        "coordinator",
+        "observer",
+        "promoter",
+        "soak",
+        "supervisor",
+        "validator",
+    }
+)
+_AUTHORITATIVE_RECEIPT_FAILURES = frozenset(
+    {
+        "coordinator_completion_event_invalid",
+        "coordinator_completion_event_mismatch",
+        "coordinator_completion_receipt_conflict",
+        "coordinator_completion_receipt_required",
+        "coordinator_effect_occurrence_missing",
+        "coordinator_effect_receipt_missing",
+    }
 )
 _EVENT_AUTHORITIES = {
     EventType.ROLE_RECORDED: "builder",
@@ -409,7 +427,10 @@ class PostgresStateBackend(StateBackend):
                 if isinstance(error, PostgresStateError):
                     raise
                 raise PostgresStateError("postgres_domain_result_invalid") from error
-            raise PostgresStateError("postgres_mutation_failed") from error
+            primary = getattr(getattr(error, "diag", None), "message_primary", None)
+            if primary in _AUTHORITATIVE_RECEIPT_FAILURES:
+                raise PostgresStateError(primary) from None
+            raise PostgresStateError("postgres_mutation_failed") from None
         finally:
             connection.close()
 
@@ -1164,6 +1185,38 @@ class PostgresStateBackend(StateBackend):
                 "coordinator",
                 "SELECT * FROM carl_autonomy.enqueue_pending_coordinator_graph(%s)",
                 (observed_at,),
+                decode,
+            ),
+        )
+
+    def coordinator_frozen_status(self, command: str, *, observed_at: datetime) -> bool:
+        """Report whether the exact command queue is durably stopped at a frozen node."""
+        if (
+            command
+            not in {
+                "request",
+                "coordinate",
+                "observe",
+                "ingest",
+                "publish-input",
+                "health",
+                "commission-live",
+            }
+            or not isinstance(observed_at, datetime)
+            or observed_at.tzinfo != UTC
+        ):
+            raise PostgresStateError("coordinator_reconstruction_invalid")
+
+        def decode(row: dict[str, Any]) -> bool:
+            value = _strict_row(row, frozenset({"already_frozen"}))
+            return _strict_bool(value["already_frozen"])
+
+        return cast(
+            bool,
+            self._mutation(
+                "coordinator",
+                "SELECT * FROM carl_autonomy.coordinator_frozen_status(%s)",
+                (command,),
                 decode,
             ),
         )

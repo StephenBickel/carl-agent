@@ -1024,6 +1024,7 @@ class FakeDatabase:
             "mark_effect_retry_scheduled",
             "mark_effect_completed",
             "load_coordinator_snapshot",
+            "coordinator_frozen_status",
             "enqueue_pending_coordinator_graph",
             "reactivate_coordinator_node",
             "apply_coordinator_decision",
@@ -2543,6 +2544,79 @@ def test_postgres_coordinator_prepares_and_completes_exact_typed_family() -> Non
 
 
 @pytest.mark.parametrize(
+    "message",
+    (
+        "coordinator_completion_receipt_required",
+        "coordinator_completion_event_mismatch",
+        "coordinator_completion_receipt_conflict",
+        "coordinator_effect_receipt_missing",
+    ),
+)
+def test_postgres_preserves_only_allowlisted_authoritative_receipt_failures(message: str) -> None:
+    selected = coordinator_node("observe_builder")
+    decision = choose_next_action(
+        coordinator_snapshot(
+            selected,
+            current_lease=coordinator_lease(),
+            command=coordinator_claimed_command(selected),
+        )
+    )
+    request = CoordinatorNodeEffectRequest.from_decision(decision)
+    response = CoordinatorNodeEffectResponse.completed(
+        request=request,
+        result_digest=DIGEST_B,
+        observed_at="2026-08-20T12:00:00Z",
+    )
+
+    class Diagnostic:
+        message_primary = message
+
+    class DatabaseReceiptError(RuntimeError):
+        diag = Diagnostic()
+
+    database = FakeDatabase()
+    database.failure = DatabaseReceiptError("private database detail")
+
+    with pytest.raises(PostgresStateError, match=message) as failure:
+        _backend(database).complete_coordinator_effect(decision, response, observed_at=NOW)
+
+    assert str(failure.value) == message
+    assert failure.value.__cause__ is None
+
+
+def test_postgres_scrubs_nonallowlisted_database_errors() -> None:
+    selected = coordinator_node("observe_builder")
+    decision = choose_next_action(
+        coordinator_snapshot(
+            selected,
+            current_lease=coordinator_lease(),
+            command=coordinator_claimed_command(selected),
+        )
+    )
+    request = CoordinatorNodeEffectRequest.from_decision(decision)
+    response = CoordinatorNodeEffectResponse.completed(
+        request=request,
+        result_digest=DIGEST_B,
+        observed_at="2026-08-20T12:00:00Z",
+    )
+
+    class Diagnostic:
+        message_primary = "private_database_secret"
+
+    class DatabaseFailure(RuntimeError):
+        diag = Diagnostic()
+
+    database = FakeDatabase()
+    database.failure = DatabaseFailure("provider payload")
+
+    with pytest.raises(PostgresStateError, match="postgres_mutation_failed") as failure:
+        _backend(database).complete_coordinator_effect(decision, response, observed_at=NOW)
+
+    assert str(failure.value) == "postgres_mutation_failed"
+    assert failure.value.__cause__ is None
+
+
+@pytest.mark.parametrize(
     ("kind", "family"),
     [("register_hypothesis", "state"), ("trigger_supervisor", "supervisor")],
 )
@@ -2582,6 +2656,17 @@ def test_postgres_coordinator_empty_queue_is_not_a_failure_or_mutation() -> None
     result = _backend(database).reconstruct_coordinator_snapshot("observe", observed_at=NOW)
 
     assert result is None
+    assert database.transactions_started == 1
+    assert database.transactions_committed == 1
+
+
+def test_postgres_coordinator_reads_one_durable_frozen_status_without_mutation() -> None:
+    database = FakeDatabase()
+    database.responses["coordinator_frozen_status"] = [{"already_frozen": True}]
+
+    result = _backend(database).coordinator_frozen_status("coordinate", observed_at=NOW)
+
+    assert result is True
     assert database.transactions_started == 1
     assert database.transactions_committed == 1
 

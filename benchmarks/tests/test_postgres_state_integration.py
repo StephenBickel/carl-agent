@@ -152,7 +152,8 @@ def clean_state(postgres: object) -> None:
     assert POSTGRES_DSN is not None
     with postgres.connect(POSTGRES_DSN, autocommit=True) as connection:  # type: ignore[attr-defined]
         connection.execute(
-            "TRUNCATE carl_autonomy.coordinator_runtime, "
+            "TRUNCATE carl_autonomy.coordinator_recovery_receipts, "
+            "carl_autonomy.coordinator_runtime, "
             "carl_autonomy.experiment_events, "
             "carl_autonomy.experiment_manifests, carl_autonomy.commands, "
             "carl_autonomy.leases, carl_autonomy.supervisor_triggers, "
@@ -171,7 +172,11 @@ def _as_role(postgres: object, role: str):
     with postgres.connect(  # type: ignore[attr-defined]
         POSTGRES_DSN, autocommit=True, row_factory=dict_row
     ) as connection:
-        connection.execute(sql.SQL("SET ROLE {}").format(sql.Identifier("carl_state_backend")))
+        database_role = "carl_archive_backend" if role == "carl_archive" else "carl_state_backend"
+        connection.execute(sql.SQL("SET ROLE {}").format(sql.Identifier(database_role)))
+        if role == "carl_archive":
+            yield connection
+            return
         connection.execute(
             "SELECT set_config('carl_autonomy.authority', %s, false)",
             (role.removeprefix("carl_"),),
@@ -192,6 +197,62 @@ def _append_event(connection: object, event: ExperimentEvent) -> dict[str, Any]:
         "SELECT * FROM carl_autonomy.append_event(%s, %s, %s, %s)",
         (_canonical(event.to_canonical_dict()), event.digest, event.payload_json, NOW),
     ).fetchone()
+
+
+def _recovery_archive_receipt(
+    *,
+    selected: dict[str, Any],
+    experiment_id: str,
+    freeze_fingerprint: str,
+    reason: str,
+    decision_identity: str,
+    runtime_revision: int,
+) -> tuple[dict[str, Any], str, str]:
+    artifact_identity = {
+        "attempt": selected["attempt"],
+        "changed_action_digest": "d" * 64,
+        "command_key": selected["command_key"],
+        "decision_identity": decision_identity,
+        "effect_key": selected["effect_key"],
+        "experiment_id": experiment_id,
+        "freeze_fingerprint": freeze_fingerprint,
+        "node_id": selected["node_id"],
+        "node_kind": selected["kind"],
+        "occurrence_key": f"coordinator-freeze/{freeze_fingerprint}",
+        "reason": reason,
+        "request_digest": selected["request_digest"],
+        "runtime_revision": runtime_revision,
+    }
+    repair_fingerprint = hashlib.sha256(canonical_json_bytes(artifact_identity)).hexdigest()
+    artifact = {
+        **artifact_identity,
+        "domain": "carl.coordinator-recovery-artifact.v1",
+        "repair_fingerprint": repair_fingerprint,
+        "repaired_at": NOW,
+        "schema_version": 1,
+    }
+    artifact_json = _canonical(artifact)
+    evidence_digest = hashlib.sha256(artifact_json.encode()).hexdigest()
+    return (
+        {
+            "archive_byte_length": len(artifact_json.encode()),
+            "archive_checksum_sha256": evidence_digest,
+            "archive_created_at": NOW,
+            "archive_object_key": (
+                f"carl-evidence/v1/sha256/{evidence_digest[:2]}/{evidence_digest}"
+            ),
+            "archive_version_id": "recovery-v1",
+            "artifact": artifact,
+            "domain": "carl.coordinator-recovery-archive-receipt.v1",
+            "evidence_digest": evidence_digest,
+            "retained_until": "2027-08-22T12:00:00Z",
+            "retention_mode": "COMPLIANCE",
+            "schema_version": 1,
+            "verified_at": NOW,
+        },
+        evidence_digest,
+        repair_fingerprint,
+    )
 
 
 @pytest.mark.parametrize("node_kind", COORDINATOR_NODE_KINDS)
@@ -541,6 +602,31 @@ def test_receipt_freeze_is_durable_idempotent_and_recoverable_with_changed_evide
         "requested_at": NOW,
         "schema_version": 1,
     }
+    with (
+        _as_role(postgres, "carl_supervisor") as supervisor,
+        pytest.raises(psycopg.Error, match="coordinator_recovery_evidence_invalid"),
+    ):
+        supervisor.execute(
+            "SELECT * FROM carl_autonomy.reactivate_coordinator_node(%s,%s)",
+            (_canonical(recovery), NOW),
+        ).fetchone()
+    archive_receipt, evidence_digest, repair_fingerprint = _recovery_archive_receipt(
+        selected=selected,
+        experiment_id=manifest.experiment_id,
+        freeze_fingerprint=durable["freeze_fingerprint"],
+        reason=frozen.reason,
+        decision_identity=frozen.identity,
+        runtime_revision=7,
+    )
+    with _as_role(postgres, "carl_archive") as archive:
+        archive.execute(
+            "SELECT * FROM carl_autonomy.register_coordinator_recovery_receipt(%s,%s)",
+            (_canonical(archive_receipt), NOW),
+        ).fetchone()
+    recovery.update(
+        evidence_digest=evidence_digest,
+        repair_fingerprint=repair_fingerprint,
+    )
     with _as_role(postgres, "carl_supervisor") as supervisor:
         repaired = supervisor.execute(
             "SELECT * FROM carl_autonomy.reactivate_coordinator_node(%s,%s)",
@@ -571,8 +657,8 @@ def test_receipt_freeze_is_durable_idempotent_and_recoverable_with_changed_evide
     }
     assert recovered_occurrence == {
         "recovered_at": datetime(2026, 8, 20, 12, tzinfo=UTC),
-        "recovery_evidence_digest": evidence.digest,
-        "recovery_fingerprint": evidence.digest,
+        "recovery_evidence_digest": evidence_digest,
+        "recovery_fingerprint": repair_fingerprint,
     }
 
 
@@ -1190,8 +1276,9 @@ def test_frozen_node_reactivates_only_with_changed_retained_repair_evidence(
         admin.execute(
             "INSERT INTO carl_autonomy.coordinator_freeze_occurrences("
             "occurrence_key, freeze_fingerprint, experiment_id, node_id, node_kind, "
-            "attempt, reason, request_digest, runtime_revision, decision_identity, "
-            "decision_json, frozen_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,7,%s,%s,%s)",
+            "attempt, reason, command_key, effect_key, request_digest, runtime_revision, "
+            "decision_identity, decision_json, frozen_at) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,7,%s,%s,%s)",
             (
                 f"coordinator-freeze/{freeze_fingerprint}",
                 freeze_fingerprint,
@@ -1200,6 +1287,8 @@ def test_frozen_node_reactivates_only_with_changed_retained_repair_evidence(
                 selected["kind"],
                 selected["attempt"],
                 frozen["reason"],
+                selected["command_key"],
+                selected["effect_key"],
                 selected["request_digest"],
                 frozen["identity"],
                 _canonical(frozen),
@@ -1239,6 +1328,73 @@ def test_frozen_node_reactivates_only_with_changed_retained_repair_evidence(
             "SELECT * FROM carl_autonomy.register_evidence(%s, %s)",
             (_canonical(evidence.to_canonical_dict()), NOW),
         ).fetchone()
+    with (
+        _as_role(postgres, "carl_supervisor") as supervisor,
+        pytest.raises(psycopg.Error, match="coordinator_recovery_evidence_invalid"),
+    ):
+        supervisor.execute(
+            "SELECT * FROM carl_autonomy.reactivate_coordinator_node(%s, %s)",
+            (_canonical(recovery), NOW),
+        ).fetchone()
+
+    artifact_identity = {
+        "attempt": selected["attempt"],
+        "changed_action_digest": "d" * 64,
+        "command_key": selected["command_key"],
+        "decision_identity": frozen["identity"],
+        "effect_key": selected["effect_key"],
+        "experiment_id": manifest.experiment_id,
+        "freeze_fingerprint": freeze_fingerprint,
+        "node_id": selected["node_id"],
+        "node_kind": selected["kind"],
+        "occurrence_key": f"coordinator-freeze/{freeze_fingerprint}",
+        "reason": frozen["reason"],
+        "request_digest": selected["request_digest"],
+        "runtime_revision": 7,
+    }
+    repair_fingerprint = hashlib.sha256(canonical_json_bytes(artifact_identity)).hexdigest()
+    artifact = {
+        **artifact_identity,
+        "domain": "carl.coordinator-recovery-artifact.v1",
+        "repair_fingerprint": repair_fingerprint,
+        "repaired_at": NOW,
+        "schema_version": 1,
+    }
+    artifact_json = _canonical(artifact)
+    evidence_digest = hashlib.sha256(artifact_json.encode()).hexdigest()
+    archive_receipt = {
+        "archive_byte_length": len(artifact_json.encode()),
+        "archive_checksum_sha256": evidence_digest,
+        "archive_created_at": NOW,
+        "archive_object_key": (f"carl-evidence/v1/sha256/{evidence_digest[:2]}/{evidence_digest}"),
+        "archive_version_id": "recovery-v1",
+        "artifact": artifact,
+        "domain": "carl.coordinator-recovery-archive-receipt.v1",
+        "evidence_digest": evidence_digest,
+        "retained_until": "2027-08-22T12:00:00Z",
+        "retention_mode": "COMPLIANCE",
+        "schema_version": 1,
+        "verified_at": NOW,
+    }
+    forged_receipt = {**archive_receipt, "archive_checksum_sha256": "0" * 64}
+    with (
+        _as_role(postgres, "carl_archive") as archive,
+        pytest.raises(psycopg.Error, match="coordinator_recovery_archive_invalid"),
+    ):
+        archive.execute(
+            "SELECT * FROM carl_autonomy.register_coordinator_recovery_receipt(%s, %s)",
+            (_canonical(forged_receipt), NOW),
+        ).fetchone()
+    with _as_role(postgres, "carl_archive") as archive:
+        registered = archive.execute(
+            "SELECT * FROM carl_autonomy.register_coordinator_recovery_receipt(%s, %s)",
+            (_canonical(archive_receipt), NOW),
+        ).fetchone()
+
+    recovery.update(
+        evidence_digest=evidence_digest,
+        repair_fingerprint=repair_fingerprint,
+    )
     with _as_role(postgres, "carl_supervisor") as supervisor:
         repaired = supervisor.execute(
             "SELECT * FROM carl_autonomy.reactivate_coordinator_node(%s, %s)",
@@ -1249,6 +1405,7 @@ def test_frozen_node_reactivates_only_with_changed_retained_repair_evidence(
             (_canonical(recovery), NOW),
         ).fetchone()
 
+    assert registered["applied"] is True
     assert repaired["applied"] is True
     assert replay["applied"] is False
     assert repaired["attempt"] == 2
@@ -1283,7 +1440,7 @@ def test_exact_observer_and_supervisor_node_completion_authority_is_node_bound(
     assert denied["authority"] is None
 
 
-def test_coordinator_state_backend_has_procedure_access_without_raw_table_access(
+def test_coordinator_and_archive_backends_have_separated_procedure_only_access(
     postgres: object,
 ) -> None:
     with postgres.connect(POSTGRES_DSN, autocommit=True) as admin:  # type: ignore[attr-defined]
@@ -1312,10 +1469,35 @@ def test_coordinator_state_backend_has_procedure_access_without_raw_table_access
             "text,text,timestamptz)', 'EXECUTE') AS raw_completion_builder, "
             "has_function_privilege('carl_autonomy_workflow', "
             "'carl_autonomy.enqueue_coordinator_graph(text,timestamptz)', "
-            "'EXECUTE') AS workflow_raw_enqueue"
+            "'EXECUTE') AS workflow_raw_enqueue, "
+            "has_table_privilege('carl_archive_backend', "
+            "'carl_autonomy.coordinator_recovery_receipts', "
+            "'SELECT,INSERT,UPDATE,DELETE') AS archive_recovery_raw, "
+            "has_function_privilege('carl_archive_backend', "
+            "'carl_autonomy.register_coordinator_recovery_receipt(text,timestamptz)', "
+            "'EXECUTE') AS archive_registration, "
+            "has_function_privilege('carl_state_backend', "
+            "'carl_autonomy.register_coordinator_recovery_receipt(text,timestamptz)', "
+            "'EXECUTE') AS state_registration, "
+            "has_function_privilege('carl_archive_backend', "
+            "'carl_autonomy.reactivate_coordinator_node(text,timestamptz)', "
+            "'EXECUTE') AS archive_reactivation"
         ).fetchone()
 
-    assert privileges == (False, False, False, False, True, True, False, False)
+    assert privileges == (
+        False,
+        False,
+        False,
+        False,
+        True,
+        True,
+        False,
+        False,
+        False,
+        True,
+        False,
+        False,
+    )
 
 
 def _state_event(

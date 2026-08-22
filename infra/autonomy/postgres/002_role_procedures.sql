@@ -8,6 +8,9 @@ BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'carl_autonomy_workflow') THEN
         CREATE ROLE carl_autonomy_workflow NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT;
     END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'carl_archive_backend') THEN
+        CREATE ROLE carl_archive_backend NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT;
+    END IF;
 END;
 $$;
 
@@ -34,6 +37,7 @@ END;
 $$;
 
 GRANT USAGE ON SCHEMA carl_autonomy TO carl_state_backend;
+GRANT USAGE ON SCHEMA carl_autonomy TO carl_archive_backend;
 REVOKE ALL ON SCHEMA carl_autonomy FROM carl_autonomy_workflow;
 REVOKE ALL ON ALL TABLES IN SCHEMA carl_autonomy FROM carl_autonomy_workflow;
 REVOKE ALL ON ALL SEQUENCES IN SCHEMA carl_autonomy FROM carl_autonomy_workflow;
