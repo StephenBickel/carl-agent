@@ -15,7 +15,11 @@ CREATE TABLE carl_autonomy.coordinator_runtime (
     production_receipts_digest character(64),
     completion_event_json text,
     completion_event_digest character(64),
-    effect_family varchar(24) CHECK (effect_family IN ('github')),
+    effect_family varchar(24) CHECK (
+        effect_family IN (
+            'archive', 'evaluator', 'github', 'input', 'observer', 'state', 'supervisor'
+        )
+    ),
     effect_request_json text,
     effect_request_digest character(64),
     decision_identity character(64),
@@ -126,6 +130,41 @@ AS $$
     WHERE c.command_key = p_command_key
 $$;
 
+CREATE OR REPLACE FUNCTION carl_autonomy.coordinator_effect_family(p_kind text)
+RETURNS text
+LANGUAGE sql
+IMMUTABLE
+STRICT
+SECURITY INVOKER
+SET search_path = pg_catalog, carl_autonomy
+AS $$
+    SELECT CASE p_kind
+        WHEN 'create_revert' THEN 'github'
+        WHEN 'observe_revert' THEN 'observer'
+        WHEN 'publish_input' THEN 'input'
+        WHEN 'register_hypothesis' THEN 'state'
+        WHEN 'request_builder' THEN 'state'
+        WHEN 'dispatch_builder' THEN 'github'
+        WHEN 'observe_builder' THEN 'observer'
+        WHEN 'archive_builder' THEN 'archive'
+        WHEN 'ingest_builder' THEN 'state'
+        WHEN 'publish_experimental' THEN 'github'
+        WHEN 'dispatch_validation' THEN 'github'
+        WHEN 'observe_validation' THEN 'observer'
+        WHEN 'archive_validation' THEN 'archive'
+        WHEN 'ingest_validation' THEN 'evaluator'
+        WHEN 'record_disposition' THEN 'state'
+        WHEN 'create_promotion_pr' THEN 'github'
+        WHEN 'observe_required_checks' THEN 'github'
+        WHEN 'enable_auto_merge' THEN 'github'
+        WHEN 'schedule_soak' THEN 'state'
+        WHEN 'observe_soak' THEN 'observer'
+        WHEN 'accept_soak' THEN 'state'
+        WHEN 'trigger_supervisor' THEN 'supervisor'
+        ELSE NULL
+    END
+$$;
+
 CREATE OR REPLACE FUNCTION carl_autonomy.load_coordinator_snapshot(
     p_command_name text,
     p_observed_at timestamptz
@@ -145,6 +184,7 @@ DECLARE
     command_state carl_autonomy.commands%ROWTYPE;
     lease_state carl_autonomy.leases%ROWTYPE;
     effect_state carl_autonomy.effect_attempts%ROWTYPE;
+    response_value jsonb;
     guard_state carl_autonomy.experiment_projection_guards%ROWTYPE;
     archive_state carl_autonomy.evidence_objects%ROWTYPE;
     checks_state carl_autonomy.evidence_objects%ROWTYPE;
@@ -265,6 +305,39 @@ BEGIN
                 ELSE NULL
             END;
         END IF;
+    END IF;
+    IF effect_value IS NULL
+        AND selected.effect_family IS NOT NULL
+        AND selected.effect_family <> 'github'
+        AND selected.effect_response_json IS NOT NULL
+    THEN
+        response_value := carl_autonomy.parse_object(
+            selected.effect_response_json, 'coordinator_effect_response_json_invalid'
+        );
+        effect_value := CASE response_value->>'status'
+            WHEN 'retry_scheduled' THEN jsonb_build_object(
+                'effect_key', command_state.effect_key,
+                'observed_at', response_value->>'observed_at',
+                'result_digest', NULL,
+                'retry_not_before', response_value->>'retry_not_before',
+                'status', 'retry_scheduled'
+            )
+            WHEN 'uncertain' THEN jsonb_build_object(
+                'effect_key', command_state.effect_key,
+                'observed_at', response_value->>'observed_at',
+                'result_digest', NULL,
+                'retry_not_before', NULL,
+                'status', 'uncertain'
+            )
+            WHEN 'completed' THEN jsonb_build_object(
+                'effect_key', command_state.effect_key,
+                'observed_at', response_value->>'observed_at',
+                'result_digest', response_value->>'result_digest',
+                'retry_not_before', NULL,
+                'status', 'applied'
+            )
+            ELSE NULL
+        END;
     END IF;
     snapshot_value := jsonb_set(
         snapshot_value, '{command}', COALESCE(command_value, 'null'::jsonb), false
@@ -877,6 +950,11 @@ BEGIN
             snapshot_value := jsonb_set(
                 snapshot_value, '{revision}', to_jsonb(next_revision), false
             );
+            next_status := CASE WHEN EXISTS (
+                SELECT 1
+                FROM jsonb_array_elements(nodes_value) AS remaining(node)
+                WHERE remaining.node->>'status' IN ('ready', 'failed')
+            ) THEN 'ready' ELSE 'complete' END;
         WHEN 'trigger_supervisor' THEN
             trigger_value := carl_autonomy.canonical_jsonb(jsonb_build_object(
                 'attempt_history', jsonb_build_array(),
@@ -898,6 +976,16 @@ BEGIN
             PERFORM set_config('carl_autonomy.authority', 'coordinator', true);
             SELECT * INTO trigger_result
             FROM carl_autonomy.create_supervisor_trigger(trigger_value, p_observed_at);
+            next_status := 'frozen';
+        WHEN 'frozen' THEN
+            IF ready_node IS NULL
+                OR decision_value->>'reason' IS DISTINCT FROM
+                    carl_autonomy.coordinator_effect_family(ready_node->>'kind')
+                        || '_service_uncommissioned'
+            THEN
+                RAISE EXCEPTION USING
+                    ERRCODE = '55000', MESSAGE = 'coordinator_freeze_reason_invalid';
+            END IF;
             next_status := 'frozen';
         ELSE
             RAISE EXCEPTION USING ERRCODE = '0A000', MESSAGE = 'coordinator_action_not_supported';
@@ -939,7 +1027,7 @@ BEGIN
     decision_value := carl_autonomy.parse_object(
         p_decision_json, 'coordinator_decision_json_invalid'
     );
-    IF decision_value->>'remote_effect' <> 'true'
+    IF decision_value->>'remote_effect' IS DISTINCT FROM 'true'
         OR decision_value->>'action' NOT IN ('execute_effect', 'reconcile_effect')
     THEN
         RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'coordinator_effect_invalid';
@@ -949,13 +1037,12 @@ BEGIN
     WHERE item.experiment_id = decision_value->>'experiment_id'
         AND item.revision = (decision_value->>'revision')::integer
     FOR UPDATE SKIP LOCKED;
-    IF NOT FOUND OR runtime.effect_family <> 'github'
-        OR runtime.effect_request_json IS NULL
+    IF NOT FOUND OR runtime.effect_family IS NULL OR runtime.effect_request_json IS NULL
     THEN
         RAISE EXCEPTION USING ERRCODE = 'P0002', MESSAGE = 'coordinator_effect_not_found';
     END IF;
     IF carl_autonomy.sha256_text(runtime.effect_request_json)
-        <> runtime.effect_request_digest
+        IS DISTINCT FROM runtime.effect_request_digest
     THEN
         RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'coordinator_effect_digest_mismatch';
     END IF;
@@ -975,26 +1062,65 @@ BEGIN
     WHERE command.command_key = request_value->>'command_key';
     IF NOT FOUND OR command_state.status <> 'claimed'
         OR command_state.claim_expires_at <= p_observed_at
-        OR decision_value->>'node' <> ready_node->>'kind'
-        OR request_value->>'command_key' <> decision_value->'command'->>'command_key'
-        OR request_value->>'effect_key' <> decision_value->>'effect_key'
-        OR request_value->>'occurred_at' <> decision_value->'command'->>'occurred_at'
-        OR request_value->>'effect_key' <> command_state.effect_key
+        OR decision_value->>'node' IS DISTINCT FROM ready_node->>'kind'
+        OR runtime.effect_family
+            IS DISTINCT FROM carl_autonomy.coordinator_effect_family(ready_node->>'kind')
+        OR runtime.effect_family IN ('state', 'supervisor')
+        OR request_value->>'command_key'
+            IS DISTINCT FROM decision_value->'command'->>'command_key'
+        OR request_value->>'effect_key' IS DISTINCT FROM decision_value->>'effect_key'
+        OR request_value->>'occurred_at'
+            IS DISTINCT FROM decision_value->'command'->>'occurred_at'
+        OR request_value->>'effect_key' IS DISTINCT FROM command_state.effect_key
         OR carl_autonomy.canonical_jsonb(decision_value->'command')
             <> command_state.command_json
-        OR CASE ready_node->>'kind'
-            WHEN 'dispatch_builder' THEN request_value->>'operation' <> 'dispatch_workflow'
-            WHEN 'dispatch_validation' THEN request_value->>'operation' <> 'dispatch_workflow'
-            WHEN 'publish_experimental' THEN
-                request_value->>'operation' <> 'create_experimental_ref'
-            WHEN 'create_promotion_pr' THEN
-                request_value->>'operation' <> 'create_pull_request'
-            WHEN 'observe_required_checks' THEN
-                request_value->>'operation' <> 'observe_required_checks'
-            WHEN 'enable_auto_merge' THEN
-                request_value->>'operation' <> 'enable_pull_request_auto_merge'
-            WHEN 'create_revert' THEN request_value->>'operation' <> 'create_revert_ref'
-            ELSE true
+        OR CASE
+            WHEN runtime.effect_family = 'github' THEN CASE ready_node->>'kind'
+                WHEN 'dispatch_builder' THEN
+                    request_value->>'operation' IS DISTINCT FROM 'dispatch_workflow'
+                WHEN 'dispatch_validation' THEN
+                    request_value->>'operation' IS DISTINCT FROM 'dispatch_workflow'
+                WHEN 'publish_experimental' THEN
+                    request_value->>'operation' IS DISTINCT FROM 'create_experimental_ref'
+                WHEN 'create_promotion_pr' THEN
+                    request_value->>'operation' IS DISTINCT FROM 'create_pull_request'
+                WHEN 'observe_required_checks' THEN
+                    request_value->>'operation' IS DISTINCT FROM 'observe_required_checks'
+                WHEN 'enable_auto_merge' THEN
+                    request_value->>'operation'
+                        IS DISTINCT FROM 'enable_pull_request_auto_merge'
+                WHEN 'create_revert' THEN
+                    request_value->>'operation' IS DISTINCT FROM 'create_revert_ref'
+                ELSE true
+            END
+            ELSE jsonb_object_length(request_value) <> 8
+                OR NOT request_value ?& ARRAY[
+                    'schema_version', 'domain', 'family', 'node_kind', 'command_key',
+                    'effect_key', 'request_digest', 'occurred_at'
+                ]
+                OR request_value->'schema_version' IS DISTINCT FROM '1'::jsonb
+                OR jsonb_typeof(request_value->'domain') <> 'string'
+                OR request_value->>'domain'
+                    IS DISTINCT FROM 'carl.coordinator-node-effect.request.v1'
+                OR jsonb_typeof(request_value->'family') <> 'string'
+                OR request_value->>'family' IS DISTINCT FROM runtime.effect_family
+                OR jsonb_typeof(request_value->'node_kind') <> 'string'
+                OR request_value->>'node_kind' IS DISTINCT FROM ready_node->>'kind'
+                OR jsonb_typeof(request_value->'command_key') <> 'string'
+                OR request_value->>'command_key'
+                    IS DISTINCT FROM command_state.command_key
+                OR jsonb_typeof(request_value->'effect_key') <> 'string'
+                OR request_value->>'effect_key' IS DISTINCT FROM command_state.effect_key
+                OR jsonb_typeof(request_value->'request_digest') <> 'string'
+                OR request_value->>'request_digest'
+                    IS DISTINCT FROM command_state.request_digest
+                OR request_value->>'request_digest' !~ '^[0-9a-f]{64}$'
+                OR jsonb_typeof(request_value->'occurred_at') <> 'string'
+                OR request_value->>'occurred_at'
+                    IS DISTINCT FROM command_state.occurred_at_text
+                OR NOT carl_autonomy.canonical_utc_text_valid(
+                    request_value->>'occurred_at'
+                )
         END
     THEN
         RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'coordinator_effect_identity_mismatch';
@@ -1040,7 +1166,7 @@ BEGIN
         AND item.decision_json = p_decision_json
     FOR UPDATE SKIP LOCKED;
     IF NOT FOUND OR runtime.status NOT IN ('effect_prepared', 'effect_observed')
-        OR response_value->>'request_digest' <> runtime.effect_request_digest
+        OR response_value->>'request_digest' IS DISTINCT FROM runtime.effect_request_digest
     THEN
         RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'coordinator_effect_response_mismatch';
     END IF;
@@ -1063,21 +1189,82 @@ BEGIN
     SELECT attempt.* INTO effect_state
     FROM carl_autonomy.effect_attempts AS attempt
     WHERE attempt.effect_key = command_state.effect_key;
-    IF response_value->>'status' = 'completed' AND (
-        NOT FOUND OR effect_state.attempt_state <> 'completed'
-        OR effect_state.result_digest IS NULL
-    ) THEN
-        RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'coordinator_effect_receipt_missing';
-    ELSIF response_value->>'status' = 'uncertain' AND (
-        NOT FOUND OR effect_state.attempt_state <> 'uncertain'
-    ) THEN
-        RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'coordinator_effect_receipt_missing';
-    ELSIF response_value->>'status' = 'retry_scheduled' AND (
-        NOT FOUND OR effect_state.attempt_state <> 'retry_scheduled'
-        OR effect_state.not_before_text <> response_value->>'retry_not_before'
-    ) THEN
-        RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'coordinator_effect_receipt_missing';
-    ELSIF response_value->>'status' = 'rejected' THEN
+    IF runtime.effect_family = 'github' THEN
+        IF response_value->>'status' = 'completed' AND (
+            NOT FOUND OR effect_state.attempt_state <> 'completed'
+            OR effect_state.result_digest IS NULL
+        ) THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '55000', MESSAGE = 'coordinator_effect_receipt_missing';
+        ELSIF response_value->>'status' = 'uncertain' AND (
+            NOT FOUND OR effect_state.attempt_state <> 'uncertain'
+        ) THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '55000', MESSAGE = 'coordinator_effect_receipt_missing';
+        ELSIF response_value->>'status' = 'retry_scheduled' AND (
+            NOT FOUND OR effect_state.attempt_state <> 'retry_scheduled'
+            OR effect_state.not_before_text <> response_value->>'retry_not_before'
+        ) THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '55000', MESSAGE = 'coordinator_effect_receipt_missing';
+        END IF;
+    ELSIF runtime.effect_family NOT IN ('archive', 'evaluator', 'input', 'observer')
+        OR jsonb_object_length(response_value) <> 8
+        OR NOT response_value ?& ARRAY[
+            'schema_version', 'domain', 'status', 'request_digest', 'observed_at',
+            'result_digest', 'retry_not_before', 'error_code'
+        ]
+        OR response_value->'schema_version' IS DISTINCT FROM '1'::jsonb
+        OR jsonb_typeof(response_value->'domain') <> 'string'
+        OR response_value->>'domain'
+            IS DISTINCT FROM 'carl.coordinator-node-effect.response.v1'
+        OR jsonb_typeof(response_value->'status') <> 'string'
+        OR jsonb_typeof(response_value->'request_digest') <> 'string'
+        OR response_value->>'request_digest'
+            IS DISTINCT FROM runtime.effect_request_digest
+        OR response_value->>'request_digest' !~ '^[0-9a-f]{64}$'
+        OR CASE
+            WHEN jsonb_typeof(response_value->'observed_at') <> 'string' THEN true
+            WHEN NOT carl_autonomy.canonical_utc_text_valid(
+                response_value->>'observed_at'
+            ) THEN true
+            ELSE (response_value->>'observed_at')::timestamptz
+                    < command_state.occurred_at
+                OR (response_value->>'observed_at')::timestamptz
+                    > p_observed_at + interval '30 seconds'
+        END
+        OR CASE response_value->>'status'
+            WHEN 'completed' THEN
+                jsonb_typeof(response_value->'result_digest') <> 'string'
+                OR response_value->>'result_digest' !~ '^[0-9a-f]{64}$'
+                OR response_value->'retry_not_before' IS DISTINCT FROM 'null'::jsonb
+                OR response_value->'error_code' IS DISTINCT FROM 'null'::jsonb
+            WHEN 'rejected' THEN response_value->'result_digest' IS DISTINCT FROM 'null'::jsonb
+                OR response_value->'retry_not_before' IS DISTINCT FROM 'null'::jsonb
+                OR jsonb_typeof(response_value->'error_code') <> 'string'
+                OR response_value->>'error_code' !~ '^[a-z][a-z0-9_]{0,63}$'
+            WHEN 'retry_scheduled' THEN
+                response_value->'result_digest' IS DISTINCT FROM 'null'::jsonb
+                OR response_value->'error_code' IS DISTINCT FROM 'null'::jsonb
+                OR CASE
+                    WHEN jsonb_typeof(response_value->'retry_not_before') <> 'string'
+                        THEN true
+                    WHEN NOT carl_autonomy.canonical_utc_text_valid(
+                        response_value->>'retry_not_before'
+                    ) THEN true
+                    ELSE (response_value->>'retry_not_before')::timestamptz < p_observed_at
+                END
+            WHEN 'uncertain' THEN
+                response_value->'result_digest' IS DISTINCT FROM 'null'::jsonb
+                OR response_value->'retry_not_before' IS DISTINCT FROM 'null'::jsonb
+                OR response_value->'error_code' IS DISTINCT FROM 'null'::jsonb
+            ELSE true
+        END
+    THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '55000', MESSAGE = 'coordinator_effect_response_mismatch';
+    END IF;
+    IF response_value->>'status' = 'rejected' THEN
         transition_value := carl_autonomy.canonical_jsonb(jsonb_build_object(
             'authority', command_state.authority,
             'claim_id', command_state.claim_id,
@@ -1105,6 +1292,151 @@ BEGIN
 END;
 $$;
 
+CREATE OR REPLACE FUNCTION carl_autonomy.execute_coordinator_local_effect(
+    p_decision_json text,
+    p_observed_at timestamptz
+)
+RETURNS TABLE(applied boolean, decision_json text)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, carl_autonomy
+AS $$
+DECLARE
+    decision_value jsonb;
+    runtime carl_autonomy.coordinator_runtime%ROWTYPE;
+    snapshot_value jsonb;
+    ready_node jsonb;
+    request_value jsonb;
+    response_value jsonb;
+    command_state carl_autonomy.commands%ROWTYPE;
+    trigger_value text;
+    trigger_result record;
+BEGIN
+    PERFORM carl_autonomy.require_role(ARRAY['carl_coordinator']);
+    decision_value := carl_autonomy.parse_object(
+        p_decision_json, 'coordinator_decision_json_invalid'
+    );
+    IF decision_value->>'action' <> 'execute_effect'
+        OR decision_value->>'remote_effect' <> 'false'
+        OR decision_value->'command' IS NULL
+        OR decision_value->'command' = 'null'::jsonb
+    THEN
+        RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'coordinator_effect_invalid';
+    END IF;
+    SELECT item.* INTO runtime
+    FROM carl_autonomy.coordinator_runtime AS item
+    WHERE item.experiment_id = decision_value->>'experiment_id'
+        AND item.revision = (decision_value->>'revision')::integer
+    FOR UPDATE SKIP LOCKED;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION USING ERRCODE = '40001', MESSAGE = 'coordinator_decision_cas_mismatch';
+    END IF;
+    IF runtime.decision_identity = decision_value->>'identity'
+        AND runtime.decision_json = p_decision_json
+        AND runtime.effect_response_json IS NOT NULL
+    THEN
+        RETURN QUERY SELECT false, runtime.decision_json;
+        RETURN;
+    END IF;
+    IF runtime.effect_family NOT IN ('state', 'supervisor')
+        OR runtime.effect_request_json IS NULL
+        OR runtime.effect_request_digest IS NULL
+        OR carl_autonomy.sha256_text(runtime.effect_request_json)
+            IS DISTINCT FROM runtime.effect_request_digest
+        OR runtime.completion_event_json IS NULL
+        OR runtime.completion_event_digest IS NULL
+        OR carl_autonomy.sha256_text(runtime.completion_event_json)
+            <> runtime.completion_event_digest
+        OR runtime.effect_response_json IS NOT NULL
+    THEN
+        RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'coordinator_local_effect_invalid';
+    END IF;
+    snapshot_value := carl_autonomy.parse_object(
+        runtime.snapshot_json, 'coordinator_snapshot_json_invalid'
+    );
+    SELECT node INTO ready_node
+    FROM jsonb_array_elements(snapshot_value->'nodes') AS node
+    WHERE node->>'status' IN ('ready', 'failed')
+    ORDER BY carl_autonomy.coordinator_node_priority(node->>'kind'), node->>'node_id'
+    LIMIT 1;
+    request_value := carl_autonomy.parse_object(
+        runtime.effect_request_json, 'coordinator_effect_request_json_invalid'
+    );
+    SELECT command.* INTO command_state
+    FROM carl_autonomy.commands AS command
+    WHERE command.command_key = decision_value->'command'->>'command_key'
+    FOR UPDATE;
+    IF NOT FOUND OR command_state.status <> 'claimed'
+        OR command_state.claim_expires_at <= p_observed_at
+        OR runtime.effect_family
+            IS DISTINCT FROM carl_autonomy.coordinator_effect_family(ready_node->>'kind')
+        OR decision_value->>'node' IS DISTINCT FROM ready_node->>'kind'
+        OR decision_value->>'effect_key' IS DISTINCT FROM command_state.effect_key
+        OR carl_autonomy.canonical_jsonb(decision_value->'command')
+            <> command_state.command_json
+        OR jsonb_object_length(request_value) <> 8
+        OR NOT request_value ?& ARRAY[
+            'schema_version', 'domain', 'family', 'node_kind', 'command_key',
+            'effect_key', 'request_digest', 'occurred_at'
+        ]
+        OR request_value->'schema_version' IS DISTINCT FROM '1'::jsonb
+        OR jsonb_typeof(request_value->'domain') <> 'string'
+        OR request_value->>'domain'
+            IS DISTINCT FROM 'carl.coordinator-node-effect.request.v1'
+        OR jsonb_typeof(request_value->'family') <> 'string'
+        OR request_value->>'family' IS DISTINCT FROM runtime.effect_family
+        OR jsonb_typeof(request_value->'node_kind') <> 'string'
+        OR request_value->>'node_kind' IS DISTINCT FROM ready_node->>'kind'
+        OR jsonb_typeof(request_value->'command_key') <> 'string'
+        OR request_value->>'command_key' IS DISTINCT FROM command_state.command_key
+        OR jsonb_typeof(request_value->'effect_key') <> 'string'
+        OR request_value->>'effect_key' IS DISTINCT FROM command_state.effect_key
+        OR jsonb_typeof(request_value->'request_digest') <> 'string'
+        OR request_value->>'request_digest' IS DISTINCT FROM command_state.request_digest
+        OR request_value->>'request_digest' !~ '^[0-9a-f]{64}$'
+        OR jsonb_typeof(request_value->'occurred_at') <> 'string'
+        OR request_value->>'occurred_at' IS DISTINCT FROM command_state.occurred_at_text
+        OR NOT carl_autonomy.canonical_utc_text_valid(request_value->>'occurred_at')
+    THEN
+        RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'coordinator_effect_identity_mismatch';
+    END IF;
+    IF runtime.effect_family = 'supervisor' THEN
+        trigger_value := carl_autonomy.canonical_jsonb(jsonb_build_object(
+            'attempt_history', jsonb_build_array(),
+            'created_at', carl_autonomy.coordinator_timestamp(p_observed_at),
+            'evidence_digest', command_state.request_digest,
+            'next_safe_node_key', ready_node->>'node_id',
+            'schema_version', 1,
+            'trigger_id', 'coordinator-trigger-' || substr(
+                decision_value->>'identity', 1, 48
+            ),
+            'unsafe_boundary', 'node_recovery_required'
+        ));
+        PERFORM set_config('carl_autonomy.authority', 'coordinator', true);
+        SELECT * INTO trigger_result
+        FROM carl_autonomy.create_supervisor_trigger(trigger_value, p_observed_at);
+    END IF;
+    response_value := jsonb_build_object(
+        'domain', 'carl.coordinator-node-effect.response.v1',
+        'error_code', NULL,
+        'observed_at', carl_autonomy.coordinator_timestamp(p_observed_at),
+        'request_digest', runtime.effect_request_digest,
+        'result_digest', runtime.completion_event_digest,
+        'retry_not_before', NULL,
+        'schema_version', 1,
+        'status', 'completed'
+    );
+    UPDATE carl_autonomy.coordinator_runtime AS item
+    SET decision_identity = decision_value->>'identity',
+        decision_json = p_decision_json,
+        effect_response_json = carl_autonomy.canonical_jsonb(response_value),
+        status = 'effect_observed',
+        updated_at = p_observed_at
+    WHERE item.experiment_id = runtime.experiment_id;
+    RETURN QUERY SELECT true, p_decision_json;
+END;
+$$;
+
 REVOKE ALL ON FUNCTION
     carl_autonomy.coordinator_timestamp(timestamptz),
     carl_autonomy.coordinator_node_priority(text),
@@ -1113,14 +1445,17 @@ REVOKE ALL ON FUNCTION
     carl_autonomy.load_coordinator_snapshot(text, timestamptz),
     carl_autonomy.apply_coordinator_decision(text, timestamptz),
     carl_autonomy.prepare_coordinator_effect(text, timestamptz),
-    carl_autonomy.complete_coordinator_effect(text, text, timestamptz)
+    carl_autonomy.complete_coordinator_effect(text, text, timestamptz),
+    carl_autonomy.execute_coordinator_local_effect(text, timestamptz),
+    carl_autonomy.coordinator_effect_family(text)
 FROM PUBLIC, carl_autonomy_workflow;
 
 GRANT EXECUTE ON FUNCTION
     carl_autonomy.load_coordinator_snapshot(text, timestamptz),
     carl_autonomy.apply_coordinator_decision(text, timestamptz),
     carl_autonomy.prepare_coordinator_effect(text, timestamptz),
-    carl_autonomy.complete_coordinator_effect(text, text, timestamptz)
+    carl_autonomy.complete_coordinator_effect(text, text, timestamptz),
+    carl_autonomy.execute_coordinator_local_effect(text, timestamptz)
 TO carl_state_backend;
 
 COMMIT;

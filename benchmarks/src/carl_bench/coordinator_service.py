@@ -17,8 +17,14 @@ from carl_bench.cloud_coordinator import (
     CloudCoordinatorError,
     CoordinatorSnapshot,
     ProtectedCoordinatorExecutor,
+    ProtectedEffectUnavailable,
     ProtectedProductionAuthorization,
     _selected_node,
+    effect_family_for_node,
+)
+from carl_bench.coordinator_effects import (
+    CoordinatorNodeEffectResponse,
+    PreparedCoordinatorEffect,
 )
 from carl_bench.coordinator_ipc import (
     COORDINATOR_RESPONSE_DOMAIN,
@@ -325,19 +331,105 @@ class _PostgresCoordinatorState:
 class _ProtectedCoordinatorEffectRouter:
     """Fixed effect family router; requests are resolved from durable state, never IPC input."""
 
-    __slots__ = ("__backend", "__github")
+    __slots__ = (
+        "__archive",
+        "__backend",
+        "__evaluator",
+        "__github",
+        "__input_publisher",
+        "__observer",
+    )
 
-    def __init__(self, backend: object, github: object) -> None:
+    def __init__(
+        self,
+        *,
+        backend: object,
+        github: object | None,
+        input_publisher: object | None,
+        observer: object | None,
+        archive: object | None,
+        evaluator: object | None,
+        _testing: bool,
+    ) -> None:
+        if not _testing:
+            raise CloudCoordinatorError("coordinator_effect_router_construction_invalid")
         self.__backend = backend
         self.__github = github
+        self.__input_publisher = input_publisher
+        self.__observer = observer
+        self.__archive = archive
+        self.__evaluator = evaluator
+
+    @classmethod
+    def _for_testing(
+        cls,
+        *,
+        backend: object,
+        github: object | None,
+        input_publisher: object | None,
+        observer: object | None,
+        archive: object | None,
+        evaluator: object | None,
+    ) -> _ProtectedCoordinatorEffectRouter:
+        return cls(
+            backend=backend,
+            github=github,
+            input_publisher=input_publisher,
+            observer=observer,
+            archive=archive,
+            evaluator=evaluator,
+            _testing=True,
+        )
+
+    @classmethod
+    def _for_protected_service(
+        cls, *, backend: object, github: object
+    ) -> _ProtectedCoordinatorEffectRouter:
+        return cls(
+            backend=backend,
+            github=github,
+            input_publisher=None,
+            observer=None,
+            archive=None,
+            evaluator=None,
+            _testing=True,
+        )
 
     def execute(
         self, decision: CloudCoordinatorDecision, *, observed_at: datetime
     ) -> CloudCoordinatorDecision:
-        return self.__backend.execute_coordinator_effect(  # type: ignore[attr-defined,no-any-return]
-            decision,
-            github=self.__github,
-            observed_at=observed_at,
+        if decision.node is None:
+            raise CloudCoordinatorError("coordinator_effect_node_missing")
+        family = effect_family_for_node(decision.node)
+        if family in {"state", "supervisor"}:
+            return self.__backend.execute_local_coordinator_effect(  # type: ignore[attr-defined,no-any-return]
+                decision, family=family, observed_at=observed_at
+            )
+        if family == "github":
+            if self.__github is None:
+                raise ProtectedEffectUnavailable("github_service_uncommissioned")
+            return self.__backend.execute_github_coordinator_effect(  # type: ignore[attr-defined,no-any-return]
+                decision, github=self.__github, observed_at=observed_at
+            )
+        service, method_name = {
+            "input": (self.__input_publisher, "publish"),
+            "observer": (self.__observer, "observe"),
+            "archive": (self.__archive, "archive"),
+            "evaluator": (self.__evaluator, "evaluate"),
+        }[family]
+        method = None if service is None else getattr(service, method_name, None)
+        if not callable(method):
+            raise ProtectedEffectUnavailable(f"{family}_service_uncommissioned")
+        prepared = self.__backend.prepare_coordinator_effect(  # type: ignore[attr-defined]
+            decision, expected_family=family, observed_at=observed_at
+        )
+        if not isinstance(prepared, PreparedCoordinatorEffect) or prepared.family != family:
+            raise CloudCoordinatorError("coordinator_prepared_effect_invalid")
+        response = method(prepared.request)
+        if not isinstance(response, CoordinatorNodeEffectResponse):
+            raise CloudCoordinatorError("coordinator_effect_response_invalid")
+        return self.__backend.complete_coordinator_effect(  # type: ignore[attr-defined,no-any-return]
+            decision, response, observed_at=observed_at
         )
 
 
@@ -348,7 +440,9 @@ def _build_protected_controller() -> ProtectedCoordinatorExecutor:
     archive = ProtectedArchiveSocketReader.from_protected_environment()
     return ProtectedCoordinatorExecutor._for_protected_service(
         state=_PostgresCoordinatorState(backend, archive),
-        effects=_ProtectedCoordinatorEffectRouter(backend, github),
+        effects=_ProtectedCoordinatorEffectRouter._for_protected_service(
+            backend=backend, github=github
+        ),
         clock=_trusted_clock,
     )
 

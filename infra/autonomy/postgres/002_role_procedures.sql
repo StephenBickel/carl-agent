@@ -937,6 +937,8 @@ BEGIN
             NOT guard.promotion_recorded
             OR guard.qualifying_healthy_soak_at IS NULL
             OR guard.qualifying_healthy_soak_at > p_occurred_at
+            OR guard.soak_failure_recorded
+            OR guard.soak_failure_digest IS NOT NULL
         ) THEN
             RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'soak_healthy_observation_required';
         END IF;

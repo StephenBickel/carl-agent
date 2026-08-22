@@ -1172,7 +1172,7 @@ class PostgresStateBackend(StateBackend):
             lambda row: self._decode_coordinator_decision(row, expected=decision),
         )
 
-    def execute_coordinator_effect(
+    def execute_github_coordinator_effect(
         self,
         decision: object,
         *,
@@ -1237,5 +1237,141 @@ class PostgresStateBackend(StateBackend):
                 _canonical_text(response.to_canonical_dict()),
                 observed_at,
             ),
+            lambda row: self._decode_coordinator_decision(row, expected=decision),
+        )
+
+    def execute_coordinator_effect(
+        self,
+        decision: object,
+        *,
+        github: object,
+        observed_at: datetime,
+    ) -> object:
+        """Compatibility alias for the fixed GitHub family executor."""
+        return self.execute_github_coordinator_effect(
+            decision, github=github, observed_at=observed_at
+        )
+
+    def prepare_coordinator_effect(
+        self,
+        decision: object,
+        *,
+        expected_family: object,
+        observed_at: datetime,
+    ) -> object:
+        """Prepare one exact non-GitHub protected effect without executing it."""
+        from carl_bench.cloud_coordinator import (
+            CloudCoordinatorDecision,
+            effect_family_for_node,
+        )
+        from carl_bench.coordinator_effects import (
+            CoordinatorNodeEffectRequest,
+            PreparedCoordinatorEffect,
+        )
+
+        if (
+            not isinstance(decision, CloudCoordinatorDecision)
+            or not decision.consequential
+            or not decision.remote_effect
+            or decision.node is None
+            or decision.command is None
+            or expected_family not in {"archive", "evaluator", "input", "observer"}
+            or effect_family_for_node(decision.node) != expected_family
+            or not isinstance(observed_at, datetime)
+            or observed_at.tzinfo != UTC
+        ):
+            raise PostgresStateError("coordinator_effect_invalid")
+
+        def decode(row: dict[str, Any]) -> object:
+            value = _strict_row(row, frozenset({"effect_family", "request_json"}))
+            if value["effect_family"] != expected_family:
+                raise PostgresStateError("coordinator_effect_family_invalid")
+            try:
+                request = CoordinatorNodeEffectRequest.from_canonical_dict(
+                    _strict_json_object(
+                        value["request_json"], code="coordinator_effect_request_json_invalid"
+                    )
+                )
+            except Exception as error:
+                raise PostgresStateError("coordinator_effect_request_invalid") from error
+            if (
+                request.family != expected_family
+                or request.node_kind != decision.node
+                or request.command_key != decision.command.command_key
+                or request.effect_key != decision.command.effect_key
+                or request.request_digest != decision.command.request_digest
+                or request.occurred_at != decision.command.occurred_at
+            ):
+                raise PostgresStateError("coordinator_effect_identity_mismatch")
+            return PreparedCoordinatorEffect(expected_family, request)
+
+        return self._mutation(
+            "coordinator",
+            "SELECT * FROM carl_autonomy.prepare_coordinator_effect(%s, %s)",
+            (_canonical_text(decision.to_canonical_dict()), observed_at),
+            decode,
+        )
+
+    def complete_coordinator_effect(
+        self,
+        decision: object,
+        response: object,
+        *,
+        observed_at: datetime,
+    ) -> object:
+        """Persist one exact typed non-GitHub response after protected execution."""
+        from carl_bench.cloud_coordinator import CloudCoordinatorDecision
+        from carl_bench.coordinator_effects import CoordinatorNodeEffectResponse
+
+        if (
+            not isinstance(decision, CloudCoordinatorDecision)
+            or not decision.consequential
+            or not decision.remote_effect
+            or not isinstance(response, CoordinatorNodeEffectResponse)
+            or not isinstance(observed_at, datetime)
+            or observed_at.tzinfo != UTC
+        ):
+            raise PostgresStateError("coordinator_effect_invalid")
+        return self._mutation(
+            "coordinator",
+            "SELECT * FROM carl_autonomy.complete_coordinator_effect(%s, %s, %s)",
+            (
+                _canonical_text(decision.to_canonical_dict()),
+                _canonical_text(response.to_canonical_dict()),
+                observed_at,
+            ),
+            lambda row: self._decode_coordinator_decision(row, expected=decision),
+        )
+
+    def execute_local_coordinator_effect(
+        self,
+        decision: object,
+        *,
+        family: object,
+        observed_at: datetime,
+    ) -> object:
+        """Advance one state/supervisor node in one protected PostgreSQL transaction."""
+        from carl_bench.cloud_coordinator import (
+            CloudCoordinatorDecision,
+            effect_family_for_node,
+        )
+
+        if (
+            not isinstance(decision, CloudCoordinatorDecision)
+            or not decision.consequential
+            or decision.remote_effect
+            or decision.action != "execute_effect"
+            or decision.node is None
+            or decision.command is None
+            or family not in {"state", "supervisor"}
+            or effect_family_for_node(decision.node) != family
+            or not isinstance(observed_at, datetime)
+            or observed_at.tzinfo != UTC
+        ):
+            raise PostgresStateError("coordinator_effect_invalid")
+        return self._mutation(
+            "coordinator",
+            "SELECT * FROM carl_autonomy.execute_coordinator_local_effect(%s, %s)",
+            (_canonical_text(decision.to_canonical_dict()), observed_at),
             lambda row: self._decode_coordinator_decision(row, expected=decision),
         )

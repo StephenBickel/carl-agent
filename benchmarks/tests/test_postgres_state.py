@@ -29,7 +29,7 @@ from test_experiment import manifest as sample_manifest
 from test_experiment import sealed_candidate
 
 from carl_bench.canonical import canonical_json_bytes
-from carl_bench.cloud_coordinator import choose_next_action
+from carl_bench.cloud_coordinator import EFFECT_FAMILY_BY_NODE, choose_next_action
 from carl_bench.cloud_execution import CloudRunRequest
 from carl_bench.cloud_state import (
     AuthorityCapability,
@@ -44,6 +44,11 @@ from carl_bench.cloud_state import (
     LeaseRelease,
     StateTransition,
     TrustedAuthorityKey,
+)
+from carl_bench.coordinator_effects import (
+    CoordinatorNodeEffectRequest,
+    CoordinatorNodeEffectResponse,
+    PreparedCoordinatorEffect,
 )
 from carl_bench.experiment import EventType, ExperimentEvent
 from carl_bench.github_cloud import GitHubEffectAttempt, workflow_dispatch_binding
@@ -204,6 +209,69 @@ def test_sql_exposes_exact_coordinator_reconstruction_and_effect_fences() -> Non
     assert "carl_state_backend" in COORDINATOR_RUNTIME_SQL
 
 
+def test_coordinator_sql_strictly_validates_typed_effect_documents() -> None:
+    prepare = re.search(
+        r"FUNCTION\s+carl_autonomy\.prepare_coordinator_effect\b.*?"
+        r"AS\s+\$\$(?P<body>.*?)\$\$;",
+        COORDINATOR_RUNTIME_SQL,
+        re.IGNORECASE | re.DOTALL,
+    )
+    complete = re.search(
+        r"FUNCTION\s+carl_autonomy\.complete_coordinator_effect\b.*?"
+        r"AS\s+\$\$(?P<body>.*?)\$\$;",
+        COORDINATOR_RUNTIME_SQL,
+        re.IGNORECASE | re.DOTALL,
+    )
+    local = re.search(
+        r"FUNCTION\s+carl_autonomy\.execute_coordinator_local_effect\b.*?"
+        r"AS\s+\$\$(?P<body>.*?)\$\$;",
+        COORDINATOR_RUNTIME_SQL,
+        re.IGNORECASE | re.DOTALL,
+    )
+    assert prepare is not None
+    assert complete is not None
+    assert local is not None
+    prepare_body = prepare.group("body")
+    complete_body = complete.group("body")
+    local_body = local.group("body")
+    for field in (
+        "family",
+        "node_kind",
+        "command_key",
+        "effect_key",
+        "request_digest",
+        "occurred_at",
+    ):
+        assert re.search(rf"request_value->>'{field}'\s+IS\s+DISTINCT\s+FROM", prepare_body)
+        assert re.search(rf"request_value->>'{field}'\s+IS\s+DISTINCT\s+FROM", local_body)
+    for field in ("request_digest",):
+        assert re.search(rf"response_value->>'{field}'\s+IS\s+DISTINCT\s+FROM", complete_body)
+    assert re.search(
+        r"canonical_utc_text_valid\(\s*response_value->>'observed_at'\s*\)",
+        complete_body,
+    )
+    assert "command_state.occurred_at" in complete_body
+    assert "p_observed_at + interval '30 seconds'" in complete_body
+    assert "jsonb_typeof(response_value->'result_digest') <> 'string'" in complete_body
+    assert "jsonb_typeof(response_value->'retry_not_before') <> 'string'" in complete_body
+    assert re.search(
+        r"canonical_utc_text_valid\(\s*response_value->>'retry_not_before'\s*\)",
+        complete_body,
+    )
+
+
+def test_coordinator_sql_effect_family_table_matches_every_python_node() -> None:
+    routing = re.search(
+        r"FUNCTION\s+carl_autonomy\.coordinator_effect_family\b.*?"
+        r"AS\s+\$\$(?P<body>.*?)\$\$;",
+        COORDINATOR_RUNTIME_SQL,
+        re.IGNORECASE | re.DOTALL,
+    )
+    assert routing is not None
+    sql_routes = dict(re.findall(r"WHEN\s+'([^']+)'\s+THEN\s+'([^']+)'", routing.group("body")))
+    assert sql_routes == dict(EFFECT_FAMILY_BY_NODE)
+
+
 def test_coordinator_migration_is_mandatory_in_integration_and_ci() -> None:
     assert "004_coordinator_runtime.sql" in POSTGRES_INTEGRATION_SOURCE
     assert "--file infra/autonomy/postgres/004_coordinator_runtime.sql" in BENCHMARK_WORKFLOW
@@ -340,6 +408,28 @@ def test_coordinator_sql_accepts_only_healthy_soak_without_later_hard_failure() 
     )
 
 
+def test_acceptance_append_transaction_rechecks_failure_absence() -> None:
+    validation = re.search(
+        r"FUNCTION\s+carl_autonomy\.validate_and_advance_event\b.*?"
+        r"AS\s+\$\$(?P<body>.*?)\$\$;",
+        ROLE_PROCEDURES_SQL,
+        re.IGNORECASE | re.DOTALL,
+    )
+    assert validation is not None
+    accepted_guard = re.search(
+        r"IF\s+target_state\s*=\s*'accepted'\s+AND\s*\((?P<predicate>.*?)\)\s*THEN",
+        validation.group("body"),
+        re.IGNORECASE | re.DOTALL,
+    )
+
+    assert accepted_guard is not None
+    predicate = accepted_guard.group("predicate")
+    assert "guard.promotion_recorded" in predicate
+    assert "guard.qualifying_healthy_soak_at IS NULL" in predicate
+    assert "guard.soak_failure_recorded" in predicate
+    assert "guard.soak_failure_digest IS NOT NULL" in predicate
+
+
 def test_sql_reconstructs_mutable_coordinator_truth_from_protected_tables() -> None:
     load = re.search(
         r"FUNCTION\s+carl_autonomy\.load_coordinator_snapshot\b.*?"
@@ -388,6 +478,7 @@ def test_sql_applies_every_consequential_coordinator_action_or_fails_closed() ->
         "complete_command",
         "retry_rework",
         "trigger_supervisor",
+        "frozen",
     ):
         assert re.search(rf"WHEN[^\n]*'{action}'", body)
     for durable_operation in (
@@ -402,6 +493,7 @@ def test_sql_applies_every_consequential_coordinator_action_or_fails_closed() ->
     ):
         assert f"carl_autonomy.{durable_operation}" in body
     assert "coordinator_action_not_supported" in body
+    assert "_service_uncommissioned" in body
 
 
 def test_sql_derives_named_production_receipts_from_exact_durable_identities() -> None:
@@ -880,6 +972,7 @@ class FakeDatabase:
             "apply_coordinator_decision",
             "prepare_coordinator_effect",
             "complete_coordinator_effect",
+            "execute_coordinator_local_effect",
             "complete_command",
             "fail_command",
             "reconcile_expired_claim",
@@ -2334,7 +2427,7 @@ def test_postgres_coordinator_operations_decode_exact_durable_results() -> None:
             assert actual == request
             return response
 
-    completed = backend.execute_coordinator_effect(
+    completed = backend.execute_github_coordinator_effect(
         remote_decision, github=Client(), observed_at=NOW
     )
 
@@ -2344,6 +2437,83 @@ def test_postgres_coordinator_operations_decode_exact_durable_results() -> None:
     assert completed == remote_decision
     assert database.transactions_started == 4
     assert database.transactions_committed == 4
+
+
+def test_postgres_coordinator_prepares_and_completes_exact_typed_family() -> None:
+    observed_at = datetime(2026, 8, 22, 12, tzinfo=UTC)
+    selected = coordinator_node("observe_builder")
+    decision = choose_next_action(
+        coordinator_snapshot(
+            selected,
+            current_lease=coordinator_lease(),
+            command=coordinator_claimed_command(selected),
+        )
+    )
+    request = CoordinatorNodeEffectRequest.from_decision(decision)
+    response = CoordinatorNodeEffectResponse.completed(
+        request=request,
+        result_digest=DIGEST_B,
+        observed_at="2026-08-22T12:00:00Z",
+    )
+    database = FakeDatabase()
+    database.responses.update(
+        {
+            "prepare_coordinator_effect": [
+                {
+                    "effect_family": "observer",
+                    "request_json": _canonical(request.to_canonical_dict()),
+                }
+            ],
+            "complete_coordinator_effect": [
+                {
+                    "applied": True,
+                    "decision_json": _canonical(decision.to_canonical_dict()),
+                }
+            ],
+        }
+    )
+    backend = _backend(database)
+
+    prepared = backend.prepare_coordinator_effect(
+        decision, expected_family="observer", observed_at=observed_at
+    )
+    completed = backend.complete_coordinator_effect(decision, response, observed_at=observed_at)
+
+    assert prepared == PreparedCoordinatorEffect("observer", request)
+    assert completed == decision
+    assert database.transactions_started == 2
+    assert database.transactions_committed == 2
+
+
+@pytest.mark.parametrize(
+    ("kind", "family"),
+    [("register_hypothesis", "state"), ("trigger_supervisor", "supervisor")],
+)
+def test_postgres_coordinator_executes_local_family_atomically(kind: str, family: str) -> None:
+    observed_at = datetime(2026, 8, 22, 12, tzinfo=UTC)
+    selected = coordinator_node(kind)
+    decision = choose_next_action(
+        coordinator_snapshot(
+            selected,
+            current_lease=coordinator_lease(),
+            command=coordinator_claimed_command(selected),
+        )
+    )
+    database = FakeDatabase()
+    database.responses["execute_coordinator_local_effect"] = [
+        {
+            "applied": True,
+            "decision_json": _canonical(decision.to_canonical_dict()),
+        }
+    ]
+
+    completed = _backend(database).execute_local_coordinator_effect(
+        decision, family=family, observed_at=observed_at
+    )
+
+    assert completed == decision
+    assert database.transactions_started == 1
+    assert database.transactions_committed == 1
 
 
 def test_postgres_coordinator_empty_queue_is_not_a_failure_or_mutation() -> None:

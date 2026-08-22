@@ -10,6 +10,7 @@ import hashlib
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from types import MappingProxyType
 from typing import Any, Literal, Protocol
 
 from carl_bench.canonical import CanonicalizationError, canonical_json_bytes
@@ -47,7 +48,7 @@ CoordinatorAction = Literal[
     "frozen",
 ]
 
-_NODE_ORDER = (
+NODE_ORDER = (
     "create_revert",
     "observe_revert",
     "publish_input",
@@ -71,7 +72,37 @@ _NODE_ORDER = (
     "accept_soak",
     "trigger_supervisor",
 )
+_NODE_ORDER = NODE_ORDER
 _NODE_PRIORITY = {name: index for index, name in enumerate(_NODE_ORDER)}
+EffectFamily = Literal["archive", "evaluator", "github", "input", "observer", "state", "supervisor"]
+EFFECT_FAMILY_BY_NODE = MappingProxyType(
+    {
+        "create_revert": "github",
+        "observe_revert": "observer",
+        "publish_input": "input",
+        "register_hypothesis": "state",
+        "request_builder": "state",
+        "dispatch_builder": "github",
+        "observe_builder": "observer",
+        "archive_builder": "archive",
+        "ingest_builder": "state",
+        "publish_experimental": "github",
+        "dispatch_validation": "github",
+        "observe_validation": "observer",
+        "archive_validation": "archive",
+        "ingest_validation": "evaluator",
+        "record_disposition": "state",
+        "create_promotion_pr": "github",
+        "observe_required_checks": "github",
+        "enable_auto_merge": "github",
+        "schedule_soak": "state",
+        "observe_soak": "observer",
+        "accept_soak": "state",
+        "trigger_supervisor": "supervisor",
+    }
+)
+if tuple(EFFECT_FAMILY_BY_NODE) != NODE_ORDER:  # pragma: no cover - import-time invariant
+    raise RuntimeError("coordinator_effect_family_table_invalid")
 _PRODUCTION_NODES = frozenset(
     {
         "create_promotion_pr",
@@ -161,6 +192,27 @@ class CloudCoordinatorError(ValueError):
     def __init__(self, code: str) -> None:
         self.code = code
         super().__init__(code)
+
+
+class ProtectedEffectUnavailable(CloudCoordinatorError):
+    """One fixed protected service is not commissioned for the selected node."""
+
+    def __init__(self, code: str) -> None:
+        if (
+            not isinstance(code, str)
+            or not code.endswith("_service_uncommissioned")
+            or _FAILURE.fullmatch(code) is None
+        ):
+            raise CloudCoordinatorError("protected_effect_unavailable_invalid")
+        super().__init__(code)
+
+
+def effect_family_for_node(kind: str) -> EffectFamily:
+    """Return the fixed protected effect family for one exact graph node."""
+    try:
+        return EFFECT_FAMILY_BY_NODE[kind]  # type: ignore[return-value]
+    except (KeyError, TypeError) as error:
+        raise CloudCoordinatorError("coordinator_effect_family_invalid") from error
 
 
 def _timestamp(value: object, code: str) -> datetime:
@@ -1169,7 +1221,7 @@ def choose_next_action(snapshot: CoordinatorSnapshot) -> CloudCoordinatorDecisio
             command=state.command,
             effect_key=state.command.effect_key,
             consequential=True,
-            remote_effect=True,
+            remote_effect=effect_family_for_node(selected.kind) not in {"state", "supervisor"},
         )
     if effect is not None and effect.status == "uncertain":
         return _decision(
@@ -1180,7 +1232,7 @@ def choose_next_action(snapshot: CoordinatorSnapshot) -> CloudCoordinatorDecisio
             command=state.command,
             effect_key=state.command.effect_key,
             consequential=True,
-            remote_effect=True,
+            remote_effect=effect_family_for_node(selected.kind) not in {"state", "supervisor"},
         )
     if effect is not None and effect.status == "applied":
         return _decision(
@@ -1201,7 +1253,7 @@ def choose_next_action(snapshot: CoordinatorSnapshot) -> CloudCoordinatorDecisio
         command=state.command,
         effect_key=state.command.effect_key,
         consequential=True,
-        remote_effect=True,
+        remote_effect=effect_family_for_node(selected.kind) not in {"state", "supervisor"},
     )
 
 
@@ -1284,8 +1336,21 @@ class ProtectedCoordinatorExecutor:
             return _decision(snapshot, "idle", "no_applicable_node")
         if not decision.consequential:
             return decision
-        if decision.remote_effect:
-            applied = self.__effects.execute(decision, observed_at=observed_at)
+        if decision.action in {"execute_effect", "reconcile_effect"}:
+            try:
+                applied = self.__effects.execute(decision, observed_at=observed_at)
+            except ProtectedEffectUnavailable as error:
+                frozen = _decision(
+                    snapshot,
+                    "frozen",
+                    error.code,
+                    node=_selected_node(snapshot),
+                    consequential=True,
+                )
+                applied = self.__state.apply(frozen, observed_at=observed_at)
+                if applied != frozen:
+                    raise CloudCoordinatorError("coordinator_applied_identity_mismatch") from error
+                return frozen
         else:
             applied = self.__state.apply(decision, observed_at=observed_at)
         if applied != decision:

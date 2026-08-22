@@ -406,6 +406,73 @@ def test_coordinator_runtime_rejects_a_later_unhealthy_soak_atomically(
         ).fetchone()
 
 
+def test_acceptance_append_rechecks_a_concurrent_production_worse_commit(
+    postgres: object,
+) -> None:
+    manifest = sample_manifest()
+    history = _full_event_history()
+    accepted_index = next(
+        index for index, event in enumerate(history) if event.stage_attempt_id == "parity-accepted"
+    )
+    with _as_role(postgres, "carl_builder") as builder:
+        _register_manifest(builder, manifest)
+    for event in history[:accepted_index]:
+        with _as_role(postgres, f"carl_{_event_authority(event)}") as connection:
+            _append_event(connection, event)
+
+    production_worse = ExperimentEvent.create(
+        experiment_id=manifest.experiment_id,
+        stage_attempt_id="acceptance-race-production-worse",
+        event_type=EventType.SOAK_OBSERVED,
+        occurred_at="2026-08-11T12:02:30Z",
+        payload={
+            "evidence_digest": "9" * 64,
+            "healthy": False,
+            "merge_commit": "d" * 40,
+            "observed_at": "2026-08-11T12:02:30Z",
+        },
+    )
+    accepted = history[accepted_index]
+
+    with (
+        _as_role(postgres, "carl_soak") as acceptance_connection,
+        _as_role(postgres, "carl_soak") as failure_connection,
+    ):
+        acceptance_connection.execute("BEGIN")
+        acceptance_connection.execute(
+            "SELECT lifecycle_state FROM carl_autonomy.experiment_projection_guards "
+            "WHERE experiment_id = %s",
+            (manifest.experiment_id,),
+        ).fetchone()
+        failure_connection.execute("BEGIN")
+        _append_event(failure_connection, production_worse)
+        failure_connection.execute("COMMIT")
+        with pytest.raises(psycopg.Error, match="soak_healthy_observation_required"):
+            _append_event(acceptance_connection, accepted)
+        acceptance_connection.execute("ROLLBACK")
+
+
+def test_postgres_effect_family_routing_is_exhaustive_and_matches_python(
+    postgres: object,
+) -> None:
+    from psycopg.rows import dict_row
+
+    from carl_bench.cloud_coordinator import EFFECT_FAMILY_BY_NODE
+
+    assert POSTGRES_DSN is not None
+    with postgres.connect(  # type: ignore[attr-defined]
+        POSTGRES_DSN, autocommit=True, row_factory=dict_row
+    ) as admin:
+        rows = admin.execute(
+            "SELECT node_kind, carl_autonomy.coordinator_effect_family(node_kind) AS family "
+            "FROM unnest(%s::text[]) WITH ORDINALITY AS nodes(node_kind, ordinal) "
+            "ORDER BY ordinal",
+            (list(EFFECT_FAMILY_BY_NODE),),
+        ).fetchall()
+
+    assert {row["node_kind"]: row["family"] for row in rows} == dict(EFFECT_FAMILY_BY_NODE)
+
+
 def _state_event(
     *,
     attempt: str,
@@ -690,32 +757,6 @@ def _full_event_history() -> tuple[ExperimentEvent, ...]:
             ),
             ExperimentEvent.create(
                 experiment_id=manifest.experiment_id,
-                stage_attempt_id="parity-soak-failed",
-                event_type=EventType.SOAK_OBSERVED,
-                occurred_at="2026-08-11T12:01:00Z",
-                payload={
-                    "evidence_digest": "f" * 64,
-                    "healthy": False,
-                    "merge_commit": "d" * 40,
-                    "observed_at": "2026-08-11T12:01:00Z",
-                },
-            ),
-            ExperimentEvent.create(
-                experiment_id=manifest.experiment_id,
-                stage_attempt_id="parity-revert",
-                event_type=EventType.REVERT_RECORDED,
-                occurred_at="2026-08-11T12:01:30Z",
-                payload={
-                    "hard_failure_digest": "f" * 64,
-                    "merge_commit": "d" * 40,
-                    "restored_tree": "1" * 40,
-                    "revert_candidate_commit": "2" * 40,
-                    "revert_merge_commit": "3" * 40,
-                    "revert_pull_request_number": 18,
-                },
-            ),
-            ExperimentEvent.create(
-                experiment_id=manifest.experiment_id,
                 stage_attempt_id="parity-soak-healthy",
                 event_type=EventType.SOAK_OBSERVED,
                 occurred_at="2026-08-11T12:02:00Z",
@@ -736,9 +777,35 @@ def _full_event_history() -> tuple[ExperimentEvent, ...]:
             ),
             ExperimentEvent.create(
                 experiment_id=manifest.experiment_id,
+                stage_attempt_id="parity-soak-failed",
+                event_type=EventType.SOAK_OBSERVED,
+                occurred_at="2026-08-11T12:04:00Z",
+                payload={
+                    "evidence_digest": "f" * 64,
+                    "healthy": False,
+                    "merge_commit": "d" * 40,
+                    "observed_at": "2026-08-11T12:04:00Z",
+                },
+            ),
+            ExperimentEvent.create(
+                experiment_id=manifest.experiment_id,
+                stage_attempt_id="parity-revert",
+                event_type=EventType.REVERT_RECORDED,
+                occurred_at="2026-08-11T12:04:30Z",
+                payload={
+                    "hard_failure_digest": "f" * 64,
+                    "merge_commit": "d" * 40,
+                    "restored_tree": "1" * 40,
+                    "revert_candidate_commit": "2" * 40,
+                    "revert_merge_commit": "3" * 40,
+                    "revert_pull_request_number": 18,
+                },
+            ),
+            ExperimentEvent.create(
+                experiment_id=manifest.experiment_id,
                 stage_attempt_id="parity-lease-release",
                 event_type=EventType.LEASE_RELEASED,
-                occurred_at="2026-08-11T12:04:00Z",
+                occurred_at="2026-08-11T12:05:00Z",
                 payload={"lease_stage_attempt_id": "parity-soak-lease"},
             ),
         )
