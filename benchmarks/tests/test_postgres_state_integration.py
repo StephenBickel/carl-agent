@@ -17,6 +17,8 @@ import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from postgres_event_policy import EVENT_PAYLOAD_KEY_SETS, INVALID_EVENT_PAYLOAD_TYPES
+from test_cloud_coordinator import node as coordinator_node
+from test_cloud_coordinator import snapshot as coordinator_snapshot
 from test_experiment import (
     candidate_artifact,
     paired_evidence,
@@ -172,6 +174,236 @@ def _retry_payload(*, attempt: int, scheduled_at: str, changed_action: str) -> d
         "failure_class": "infrastructure",
         "scheduled_at": scheduled_at,
     }
+
+
+def _insert_coordinator_receipt_fixture(
+    connection: object, *, node_kind: str, include_soak: bool = False
+) -> tuple[str, str]:
+    experiment_id = "experiment-1"
+    request_digest = "9" * 64
+    archive_receipt_digest = "a" * 64
+    experimental_receipt_digest = "b" * 64
+    live_receipt_digest = "c" * 64
+    disposition_receipt_digest = "d" * 64
+    checks_receipt_digest = "e" * 64
+    protection_receipt_digest = "f" * 64
+    archive_digest = "1" * 64
+    candidate_commit = "2" * 40
+    candidate_tree = "3" * 40
+    merge_commit = "4" * 40
+    merge_tree = "5" * 40
+    retained_until = "2027-08-22T12:00:00Z"
+    manifest_digest = "6" * 64
+    connection.execute(  # type: ignore[attr-defined]
+        "INSERT INTO carl_autonomy.experiment_manifests("
+        "experiment_id, manifest_json, manifest_digest, registered_at, registered_at_text, "
+        "recorded_at) VALUES (%s, %s, %s, %s, %s, %s)",
+        (experiment_id, "{}", manifest_digest, NOW, NOW, NOW),
+    )
+    connection.execute(  # type: ignore[attr-defined]
+        "INSERT INTO carl_autonomy.experiment_projection_guards("
+        "experiment_id, manifest_digest, manifest_parent_commit, manifest_registered_at, "
+        "manifest_deterministic_checks, experimental_branch, "
+        "experimental_candidate_packet_digest, experimental_commit, experimental_tree, "
+        "protected_validation_receipt_digest, paired_evidence_digest, paired_decision, "
+        "promotion_merge_commit, promotion_merge_tree, promotion_merged_at, updated_at) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+        (
+            experiment_id,
+            manifest_digest,
+            "7" * 40,
+            NOW,
+            ["benchmark-contracts"],
+            f"experimental/{experiment_id}",
+            experimental_receipt_digest,
+            candidate_commit,
+            candidate_tree,
+            live_receipt_digest,
+            disposition_receipt_digest,
+            "improvement",
+            merge_commit if include_soak else None,
+            merge_tree if include_soak else None,
+            "2026-08-21T12:00:00Z" if include_soak else None,
+            NOW,
+        ),
+    )
+    for digest, version in (
+        (archive_receipt_digest, "archive-v1"),
+        (checks_receipt_digest, "checks-v1"),
+        (protection_receipt_digest, "protection-v1"),
+    ):
+        evidence = {
+            "digest": digest,
+            "media_type": "application/json",
+            "object_key": f"evidence/{digest}",
+            "object_version": version,
+            "producer": "observer",
+            "request_digest": request_digest,
+            "retained_until": retained_until,
+        }
+        connection.execute(  # type: ignore[attr-defined]
+            "INSERT INTO carl_autonomy.evidence_objects("
+            "digest, object_key, object_version, producer, request_digest, media_type, "
+            "retained_until, retained_until_text, evidence_json, recorded_at) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            (
+                digest,
+                evidence["object_key"],
+                version,
+                "observer",
+                request_digest,
+                "application/json",
+                retained_until,
+                retained_until,
+                _canonical(evidence),
+                "2026-08-22T12:00:00Z",
+            ),
+        )
+    selected = coordinator_node(node_kind, request_digest=request_digest)
+    snapshot_json = _canonical(coordinator_snapshot(selected).to_canonical_dict())
+    receipts: dict[str, object] = {
+        "archive_digest": archive_digest,
+        "archive_object_key": f"carl-evidence/v1/sha256/{archive_digest[:2]}/{archive_digest}",
+        "archive_receipt_digest": archive_receipt_digest,
+        "archive_retain_until": retained_until,
+        "archive_version_id": "archive-v1",
+        "branch_protection_receipt_digest": protection_receipt_digest,
+        "candidate_commit": candidate_commit,
+        "candidate_tree": candidate_tree,
+        "experiment_id": experiment_id,
+        "experimental_receipt_digest": experimental_receipt_digest,
+        "experimental_ref": f"refs/heads/experimental/{experiment_id}",
+        "hard_failure_digest": None,
+        "independent_disposition_receipt_digest": disposition_receipt_digest,
+        "live_provenance_receipt_digest": live_receipt_digest,
+        "merge_commit": merge_commit if include_soak else None,
+        "merge_tree": merge_tree if include_soak else None,
+        "merged_at": "2026-08-21T12:00:00Z" if include_soak else None,
+        "node_kind": node_kind,
+        "pull_request_base": "main",
+        "pull_request_head": candidate_commit,
+        "pull_request_number": 42,
+        "repository": "StephenBickel/carl-agent",
+        "request_digest": request_digest,
+        "required_checks_receipt_digest": checks_receipt_digest,
+        "revert_candidate_commit": None,
+        "soak_observation_digest": "8" * 64 if include_soak else None,
+        "soak_observed_at": "2026-08-22T12:00:00Z" if include_soak else None,
+        "verified_at": None,
+    }
+    receipts_json = _canonical(receipts)
+    connection.execute(  # type: ignore[attr-defined]
+        "INSERT INTO carl_autonomy.coordinator_runtime("
+        "experiment_id, command_name, snapshot_json, snapshot_digest, "
+        "production_receipts_json, production_receipts_digest, status, revision, updated_at) "
+        "VALUES (%s, 'commission-live', %s, %s, %s, %s, 'ready', 7, %s)",
+        (
+            experiment_id,
+            snapshot_json,
+            hashlib.sha256(snapshot_json.encode()).hexdigest(),
+            receipts_json,
+            hashlib.sha256(receipts_json.encode()).hexdigest(),
+            NOW,
+        ),
+    )
+    if include_soak:
+        payload = {
+            "evidence_digest": "8" * 64,
+            "healthy": True,
+            "merge_commit": merge_commit,
+            "observed_at": "2026-08-22T12:00:00Z",
+        }
+        connection.execute(  # type: ignore[attr-defined]
+            "INSERT INTO carl_autonomy.experiment_events("
+            "experiment_id, ordinal, schema_version, stage_attempt_id, event_type, occurred_at, "
+            "occurred_at_text, payload_json, event_json, event_digest, previous_chain_digest, "
+            "chain_digest, authority, trusted_authority, provenance_json, appended_at) "
+            "VALUES (%s, 1, 1, 'soak-healthy', 'soak_observed', %s, %s, %s, '{}', %s, %s, "
+            "%s, 'soak', true, '{}', %s)",
+            (
+                experiment_id,
+                "2026-08-22T12:00:00Z",
+                "2026-08-22T12:00:00Z",
+                _canonical(payload),
+                "8" * 64,
+                "0" * 64,
+                "8" * 64,
+                "2026-08-22T12:00:00Z",
+            ),
+        )
+    return checks_receipt_digest, protection_receipt_digest
+
+
+def test_coordinator_runtime_returns_exact_protected_check_object_bindings(
+    postgres: object,
+) -> None:
+    from psycopg.rows import dict_row
+
+    assert POSTGRES_DSN is not None
+    with postgres.connect(POSTGRES_DSN, autocommit=True, row_factory=dict_row) as admin:  # type: ignore[attr-defined]
+        checks_digest, protection_digest = _insert_coordinator_receipt_fixture(
+            admin, node_kind="enable_auto_merge"
+        )
+    with _as_role(postgres, "carl_coordinator") as coordinator:
+        row = coordinator.execute(
+            "SELECT * FROM carl_autonomy.load_coordinator_snapshot(%s, %s)",
+            ("commission-live", "2026-08-22T12:00:00Z"),
+        ).fetchone()
+
+    receipts = json.loads(row["production_receipts_json"])
+    assert receipts["required_checks_object_key"] == f"evidence/{checks_digest}"
+    assert receipts["required_checks_object_version"] == "checks-v1"
+    assert receipts["branch_protection_object_key"] == f"evidence/{protection_digest}"
+    assert receipts["branch_protection_object_version"] == "protection-v1"
+
+
+def test_coordinator_runtime_rejects_a_later_unhealthy_soak_atomically(
+    postgres: object,
+) -> None:
+    from psycopg.rows import dict_row
+
+    assert POSTGRES_DSN is not None
+    with postgres.connect(POSTGRES_DSN, autocommit=True, row_factory=dict_row) as admin:  # type: ignore[attr-defined]
+        _insert_coordinator_receipt_fixture(admin, node_kind="accept_soak", include_soak=True)
+    with _as_role(postgres, "carl_coordinator") as coordinator:
+        healthy = coordinator.execute(
+            "SELECT * FROM carl_autonomy.load_coordinator_snapshot(%s, %s)",
+            ("commission-live", "2026-08-22T12:00:00Z"),
+        ).fetchone()
+    assert healthy["production_receipts_json"] is not None
+
+    failure_payload = {
+        "evidence_digest": "9" * 64,
+        "healthy": False,
+        "merge_commit": "4" * 40,
+        "observed_at": "2026-08-22T12:30:00Z",
+    }
+    with postgres.connect(POSTGRES_DSN, autocommit=True, row_factory=dict_row) as admin:  # type: ignore[attr-defined]
+        admin.execute(
+            "INSERT INTO carl_autonomy.experiment_events("
+            "experiment_id, ordinal, schema_version, stage_attempt_id, event_type, occurred_at, "
+            "occurred_at_text, payload_json, event_json, event_digest, previous_chain_digest, "
+            "chain_digest, authority, trusted_authority, provenance_json, appended_at) "
+            "VALUES ('experiment-1', 2, 1, 'soak-hard-failure', 'soak_observed', %s, %s, %s, "
+            "'{}', %s, %s, %s, 'soak', true, '{}', %s)",
+            (
+                "2026-08-22T12:30:00Z",
+                "2026-08-22T12:30:00Z",
+                _canonical(failure_payload),
+                "9" * 64,
+                "8" * 64,
+                "9" * 64,
+                "2026-08-22T12:30:00Z",
+            ),
+        )
+    with (
+        _as_role(postgres, "carl_coordinator") as coordinator,
+        pytest.raises(psycopg.Error, match="coordinator_production_receipt_mismatch"),
+    ):
+        coordinator.execute(
+            "SELECT * FROM carl_autonomy.load_coordinator_snapshot(%s, %s)",
+            ("commission-live", "2026-08-22T13:00:00Z"),
+        ).fetchone()
 
 
 def _state_event(

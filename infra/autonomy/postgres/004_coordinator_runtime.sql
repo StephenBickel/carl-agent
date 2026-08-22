@@ -147,6 +147,8 @@ DECLARE
     effect_state carl_autonomy.effect_attempts%ROWTYPE;
     guard_state carl_autonomy.experiment_projection_guards%ROWTYPE;
     archive_state carl_autonomy.evidence_objects%ROWTYPE;
+    checks_state carl_autonomy.evidence_objects%ROWTYPE;
+    protection_state carl_autonomy.evidence_objects%ROWTYPE;
     dead_holder_digest text;
 BEGIN
     PERFORM carl_autonomy.require_role(ARRAY['carl_coordinator']);
@@ -314,7 +316,17 @@ BEGIN
         SELECT evidence.* INTO archive_state
         FROM carl_autonomy.evidence_objects AS evidence
         WHERE evidence.digest = receipt_value->>'archive_receipt_digest';
-        IF NOT FOUND
+        IF receipt_value->>'required_checks_receipt_digest' IS NOT NULL THEN
+            SELECT evidence.* INTO checks_state
+            FROM carl_autonomy.evidence_objects AS evidence
+            WHERE evidence.digest = receipt_value->>'required_checks_receipt_digest';
+        END IF;
+        IF receipt_value->>'branch_protection_receipt_digest' IS NOT NULL THEN
+            SELECT evidence.* INTO protection_state
+            FROM carl_autonomy.evidence_objects AS evidence
+            WHERE evidence.digest = receipt_value->>'branch_protection_receipt_digest';
+        END IF;
+        IF archive_state.digest IS NULL
             OR receipt_value->>'experiment_id' <> selected.experiment_id
             OR receipt_value->>'node_kind' <> ready_node->>'kind'
             OR receipt_value->>'request_digest' <> ready_node->>'request_digest'
@@ -355,20 +367,62 @@ BEGIN
             )
             OR (
                 receipt_value->>'required_checks_receipt_digest' IS NOT NULL
-                AND NOT EXISTS (
-                    SELECT 1 FROM carl_autonomy.evidence_objects AS checks
-                    WHERE checks.digest = receipt_value->>'required_checks_receipt_digest'
-                        AND checks.request_digest = ready_node->>'request_digest'
-                        AND checks.retained_until > p_observed_at
+                AND (
+                    checks_state.digest IS NULL
+                    OR checks_state.request_digest <> ready_node->>'request_digest'
+                    OR checks_state.retained_until <= p_observed_at
+                    OR checks_state.recorded_at > p_observed_at
+                    OR checks_state.recorded_at < p_observed_at - interval '15 minutes'
+                    OR carl_autonomy.parse_object(
+                        checks_state.evidence_json,
+                        'coordinator_required_checks_evidence_invalid'
+                    )->>'digest' <> receipt_value->>'required_checks_receipt_digest'
+                    OR carl_autonomy.parse_object(
+                        checks_state.evidence_json,
+                        'coordinator_required_checks_evidence_invalid'
+                    )->>'object_key' <> checks_state.object_key
+                    OR carl_autonomy.parse_object(
+                        checks_state.evidence_json,
+                        'coordinator_required_checks_evidence_invalid'
+                    )->>'object_version' <> checks_state.object_version
+                    OR carl_autonomy.parse_object(
+                        checks_state.evidence_json,
+                        'coordinator_required_checks_evidence_invalid'
+                    )->>'request_digest' <> checks_state.request_digest
+                    OR carl_autonomy.parse_object(
+                        checks_state.evidence_json,
+                        'coordinator_required_checks_evidence_invalid'
+                    )->>'retained_until' <> checks_state.retained_until_text
                 )
             )
             OR (
                 receipt_value->>'branch_protection_receipt_digest' IS NOT NULL
-                AND NOT EXISTS (
-                    SELECT 1 FROM carl_autonomy.evidence_objects AS protection
-                    WHERE protection.digest = receipt_value->>'branch_protection_receipt_digest'
-                        AND protection.request_digest = ready_node->>'request_digest'
-                        AND protection.retained_until > p_observed_at
+                AND (
+                    protection_state.digest IS NULL
+                    OR protection_state.request_digest <> ready_node->>'request_digest'
+                    OR protection_state.retained_until <= p_observed_at
+                    OR protection_state.recorded_at > p_observed_at
+                    OR protection_state.recorded_at < p_observed_at - interval '15 minutes'
+                    OR carl_autonomy.parse_object(
+                        protection_state.evidence_json,
+                        'coordinator_branch_protection_evidence_invalid'
+                    )->>'digest' <> receipt_value->>'branch_protection_receipt_digest'
+                    OR carl_autonomy.parse_object(
+                        protection_state.evidence_json,
+                        'coordinator_branch_protection_evidence_invalid'
+                    )->>'object_key' <> protection_state.object_key
+                    OR carl_autonomy.parse_object(
+                        protection_state.evidence_json,
+                        'coordinator_branch_protection_evidence_invalid'
+                    )->>'object_version' <> protection_state.object_version
+                    OR carl_autonomy.parse_object(
+                        protection_state.evidence_json,
+                        'coordinator_branch_protection_evidence_invalid'
+                    )->>'request_digest' <> protection_state.request_digest
+                    OR carl_autonomy.parse_object(
+                        protection_state.evidence_json,
+                        'coordinator_branch_protection_evidence_invalid'
+                    )->>'retained_until' <> protection_state.retained_until_text
                 )
             )
             OR (
@@ -393,6 +447,24 @@ BEGIN
                         AND soak.payload_json::jsonb->>'merge_commit'
                             = receipt_value->>'merge_commit'
                         AND soak.occurred_at_text = receipt_value->>'soak_observed_at'
+                        AND soak.payload_json::jsonb->'healthy' = 'true'::jsonb
+                        AND soak.occurred_at >= guard_state.promotion_merged_at
+                            + interval '24 hours'
+                        AND p_observed_at >= guard_state.promotion_merged_at
+                            + interval '24 hours'
+                        AND guard_state.soak_failure_digest IS NULL
+                        AND NOT EXISTS (
+                            SELECT 1
+                            FROM carl_autonomy.experiment_events AS hard_failure
+                            WHERE hard_failure.experiment_id = selected.experiment_id
+                                AND hard_failure.event_type = 'soak_observed'
+                                AND hard_failure.payload_json::jsonb->>'merge_commit'
+                                    = receipt_value->>'merge_commit'
+                                AND hard_failure.payload_json::jsonb->'healthy'
+                                    = 'false'::jsonb
+                                AND hard_failure.occurred_at >= soak.occurred_at
+                                AND hard_failure.occurred_at <= p_observed_at
+                        )
                 )
             )
             OR (
@@ -414,6 +486,20 @@ BEGIN
         THEN
             RAISE EXCEPTION USING
                 ERRCODE = '55000', MESSAGE = 'coordinator_production_receipt_mismatch';
+        END IF;
+        IF receipt_value->>'required_checks_receipt_digest' IS NOT NULL THEN
+            receipt_value := receipt_value || jsonb_build_object(
+                'required_checks_object_key', checks_state.object_key,
+                'required_checks_object_version', checks_state.object_version,
+                'required_checks_recorded_at',
+                    carl_autonomy.coordinator_timestamp(checks_state.recorded_at),
+                'required_checks_retain_until', checks_state.retained_until_text,
+                'branch_protection_object_key', protection_state.object_key,
+                'branch_protection_object_version', protection_state.object_version,
+                'branch_protection_recorded_at',
+                    carl_autonomy.coordinator_timestamp(protection_state.recorded_at),
+                'branch_protection_retain_until', protection_state.retained_until_text
+            );
         END IF;
     END IF;
     RETURN QUERY SELECT

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
+import subprocess
+import sys
 import tomllib
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -12,6 +15,7 @@ import pytest
 from test_cloud_coordinator import claimed_command_for, lease, node, snapshot
 
 from carl_bench import coordinator_service
+from carl_bench.canonical import canonical_json_bytes
 from carl_bench.cloud_coordinator import (
     CloudCoordinatorError,
     ProtectedCoordinatorExecutor,
@@ -20,6 +24,7 @@ from carl_bench.cloud_coordinator import (
 from carl_bench.cloud_state import create_command_state
 from carl_bench.coordinator_ipc import CoordinatorServiceRequest
 from carl_bench.coordinator_service import coordinator_response
+from carl_bench.github_promotion import APPROVED_REQUIRED_CHECKS
 from carl_bench.live_evaluation_authority import ProtectedArchiveVersion
 from carl_bench.postgres_state import PostgresStateError
 
@@ -444,3 +449,206 @@ def test_service_rejects_revert_without_exact_hard_failure_identity() -> None:
             receipts,
             observed_at=datetime(2026, 8, 22, 12, tzinfo=UTC),
         )
+
+
+def _promotion_receipt_payloads(
+    *, check_conclusion: str = "success", protection_override: dict[str, object] | None = None
+) -> tuple[bytes, bytes]:
+    checks = canonical_json_bytes(
+        {
+            "checks": [
+                {"app_id": 15368, "conclusion": check_conclusion, "name": name}
+                for name in APPROVED_REQUIRED_CHECKS
+            ],
+            "head_sha": "2" * 40,
+            "kind": "github_required_checks",
+            "observed_at": NOW_TEXT,
+            "pull_request_number": 42,
+            "repository": "StephenBickel/carl-agent",
+            "schema_version": 1,
+        }
+    )
+    protection = {
+        "allow_auto_merge": True,
+        "allow_deletions": False,
+        "allow_force_pushes": False,
+        "allow_merge_commit": False,
+        "allow_rebase_merge": False,
+        "allow_squash_merge": True,
+        "branch": "main",
+        "delete_branch_on_merge": True,
+        "enforce_admins": True,
+        "head_sha": "2" * 40,
+        "kind": "github_branch_protection",
+        "observed_at": NOW_TEXT,
+        "pull_request_number": 42,
+        "repository": "StephenBickel/carl-agent",
+        "required_checks": [{"app_id": 15368, "name": name} for name in APPROVED_REQUIRED_CHECKS],
+        "required_conversation_resolution": True,
+        "required_linear_history": True,
+        "required_status_checks_strict": True,
+        "schema_version": 1,
+    }
+    protection.update(protection_override or {})
+    return checks, canonical_json_bytes(protection)
+
+
+def _receipt_bound_state(
+    *, checks: bytes, protection: bytes
+) -> coordinator_service._PostgresCoordinatorState:
+    archive_payload = b"protected production evidence"
+    archive_digest = hashlib.sha256(archive_payload).hexdigest()
+    checks_digest = hashlib.sha256(checks).hexdigest()
+    protection_digest = hashlib.sha256(protection).hexdigest()
+    receipts = durable_production_receipts("enable_auto_merge")
+    receipts.update(
+        {
+            "archive_digest": archive_digest,
+            "archive_object_key": f"carl-evidence/v1/sha256/{archive_digest[:2]}/{archive_digest}",
+            "archive_version_id": "archive-v1",
+            "required_checks_receipt_digest": checks_digest,
+            "branch_protection_receipt_digest": protection_digest,
+            "required_checks_object_key": f"evidence/{checks_digest}",
+            "required_checks_object_version": "checks-v1",
+            "required_checks_recorded_at": NOW_TEXT,
+            "required_checks_retain_until": "2026-09-22T12:00:00Z",
+            "branch_protection_object_key": f"evidence/{protection_digest}",
+            "branch_protection_object_version": "protection-v1",
+            "branch_protection_recorded_at": NOW_TEXT,
+            "branch_protection_retain_until": "2026-09-22T12:00:00Z",
+        }
+    )
+    durable_snapshot = snapshot(node("enable_auto_merge"), current_lease=lease())
+
+    class Backend:
+        def reconstruct_coordinator_snapshot(self, command, *, observed_at):
+            assert command == "commission-live"
+            return durable_snapshot, receipts
+
+    versions = {
+        receipts["archive_object_key"]: (archive_payload, "archive-v1"),
+        receipts["required_checks_object_key"]: (checks, "checks-v1"),
+        receipts["branch_protection_object_key"]: (protection, "protection-v1"),
+    }
+
+    class Archive:
+        def read_exact(self, object_key, version_id):
+            payload, expected_version = versions[object_key]
+            assert version_id == expected_version
+            return ProtectedArchiveVersion(
+                object_key=object_key,
+                version_id=version_id,
+                payload=payload,
+                checksum_sha256=hashlib.sha256(payload).hexdigest(),
+                byte_length=len(payload),
+                retention_mode="COMPLIANCE",
+                retain_until="2026-09-22T12:00:00Z",
+                created_at="2026-08-22T11:00:00Z",
+            )
+
+    return coordinator_service._PostgresCoordinatorState(Backend(), Archive())
+
+
+def test_enable_auto_merge_reads_and_verifies_exact_protected_payloads() -> None:
+    checks, protection = _promotion_receipt_payloads()
+
+    rebuilt = _receipt_bound_state(checks=checks, protection=protection).reconstruct(
+        "commission-live", observed_at=datetime(2026, 8, 22, 12, tzinfo=UTC)
+    )
+
+    assert rebuilt is not None
+    assert rebuilt.production_authorization is not None
+    assert rebuilt.production_authorization.node_kind == "enable_auto_merge"
+
+
+@pytest.mark.parametrize(
+    ("check_conclusion", "protection_override"),
+    (
+        ("failure", None),
+        ("success", {"enforce_admins": False}),
+        ("success", {"allow_force_pushes": True}),
+        ("success", {"head_sha": "9" * 40}),
+        ("success", {"repository": "attacker/fork"}),
+    ),
+)
+def test_enable_auto_merge_rejects_failed_checks_or_protection_drift(
+    check_conclusion: str, protection_override: dict[str, object] | None
+) -> None:
+    checks, protection = _promotion_receipt_payloads(
+        check_conclusion=check_conclusion, protection_override=protection_override
+    )
+
+    with pytest.raises(CloudCoordinatorError, match="protected_promotion_receipt_mismatch"):
+        _receipt_bound_state(checks=checks, protection=protection).reconstruct(
+            "commission-live", observed_at=datetime(2026, 8, 22, 12, tzinfo=UTC)
+        )
+
+
+@pytest.mark.parametrize(
+    ("path", "replacement"),
+    (
+        (("repository",), "attacker/fork"),
+        (("pull_request_number",), 43),
+        (("head_sha",), "9" * 40),
+        (("checks", 0, "name"), "Quality-copy"),
+        (("checks", 0, "app_id"), 1),
+    ),
+)
+def test_enable_auto_merge_rejects_each_mutated_check_identity(
+    path: tuple[str | int, ...], replacement: object
+) -> None:
+    checks_payload, protection = _promotion_receipt_payloads()
+    checks = json.loads(checks_payload)
+    target = checks
+    for key in path[:-1]:
+        target = target[key]
+    target[path[-1]] = replacement
+
+    with pytest.raises(CloudCoordinatorError, match="protected_promotion_receipt_mismatch"):
+        _receipt_bound_state(
+            checks=canonical_json_bytes(checks), protection=protection
+        ).reconstruct("commission-live", observed_at=datetime(2026, 8, 22, 12, tzinfo=UTC))
+
+
+def test_supervised_entrypoint_ignores_malicious_pythonpath_in_a_separate_process(
+    tmp_path: Path,
+) -> None:
+    unit_path = Path(__file__).parents[2] / "infra/autonomy/systemd/carl-coordinator.service"
+    unit = unit_path.read_text(encoding="utf-8")
+    assert (
+        "ExecStart=/opt/carl-autonomy/venv/bin/python3 -I -m carl_bench.coordinator_service" in unit
+    )
+    assert "UnsetEnvironment=PYTHONPATH PYTHONHOME PYTHONSTARTUP PYTHONUSERBASE" in unit
+    assert "Environment=PYTHONNOUSERSITE=1" in unit
+
+    malicious = tmp_path / "malicious"
+    package = malicious / "carl_bench"
+    package.mkdir(parents=True)
+    marker = tmp_path / "replacement-imported"
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "coordinator_service.py").write_text(
+        f"from pathlib import Path\nPath({str(marker)!r}).write_text('owned')\n",
+        encoding="utf-8",
+    )
+    source_root = Path(__file__).parents[1] / "src"
+    environment = dict(os.environ)
+    environment["PYTHONPATH"] = str(malicious)
+    probe = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            (
+                f"import sys; sys.path.insert(0, {str(source_root)!r}); "
+                "import carl_bench.coordinator_service as service; print(service.__file__)"
+            ),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+    assert probe.returncode == 0, probe.stderr
+    assert str(source_root / "carl_bench/coordinator_service.py") in probe.stdout
+    assert not marker.exists()

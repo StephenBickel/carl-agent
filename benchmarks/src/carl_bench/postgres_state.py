@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import json
 import os
@@ -315,13 +317,26 @@ class PostgresStateBackend(StateBackend):
             value = decoded[name]
             if type(value) is not dict or set(value) != {
                 "key_id",
-                "public_key_pem",
+                "public_key_pem_b64",
                 "purpose",
             }:
                 raise PostgresStateError("postgres_protected_configuration_invalid")
+            encoded = value["public_key_pem_b64"]
+            if type(encoded) is not str or not 1 <= len(encoded) <= 8_192:
+                raise PostgresStateError("postgres_protected_configuration_invalid")
             try:
-                return TrustedAuthorityKey(**value)
-            except (CloudStateError, TypeError) as error:
+                public_key_pem = base64.b64decode(encoded, validate=True)
+                if (
+                    not 1 <= len(public_key_pem) <= 4_096
+                    or base64.b64encode(public_key_pem).decode("ascii") != encoded
+                ):
+                    raise PostgresStateError("postgres_protected_configuration_invalid")
+                return TrustedAuthorityKey(
+                    key_id=value["key_id"],
+                    purpose=value["purpose"],
+                    public_key_pem=public_key_pem,
+                )
+            except (binascii.Error, CloudStateError, TypeError) as error:
                 raise PostgresStateError("postgres_protected_configuration_invalid") from error
 
         dsn = os.environ.get(_PROTECTED_STATE_DSN_ENV)

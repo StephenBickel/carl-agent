@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import socket
 import struct
@@ -10,6 +11,7 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
+from carl_bench.canonical import CanonicalizationError, canonical_json_bytes
 from carl_bench.cloud_coordinator import (
     CloudCoordinatorDecision,
     CloudCoordinatorError,
@@ -35,6 +37,7 @@ from carl_bench.github_effect_service import (
     _peer_uid,
     _validated_activated_listener,
 )
+from carl_bench.github_promotion import APPROVED_REQUIRED_CHECKS
 from carl_bench.live_archive_client import ProtectedArchiveSocketReader
 from carl_bench.live_evaluation_authority import ProtectedArchiveVersion
 from carl_bench.postgres_state import PostgresStateBackend, PostgresStateError
@@ -42,6 +45,18 @@ from carl_bench.postgres_state import PostgresStateBackend, PostgresStateError
 _SOCKET_PATH = Path("/run/carl/coordinator.sock")
 _ALLOWED_CLIENT_UID = 0
 _CONNECTION_TIMEOUT_SECONDS = 2.0
+_PROMOTION_RECEIPT_BINDINGS = frozenset(
+    {
+        "branch_protection_object_key",
+        "branch_protection_object_version",
+        "branch_protection_recorded_at",
+        "branch_protection_retain_until",
+        "required_checks_object_key",
+        "required_checks_object_version",
+        "required_checks_recorded_at",
+        "required_checks_retain_until",
+    }
+)
 
 
 def _trusted_clock() -> datetime:
@@ -129,6 +144,150 @@ class _PostgresCoordinatorState:
         ):
             raise CloudCoordinatorError("protected_archive_receipt_mismatch")
 
+    def _read_promotion_receipt(
+        self,
+        receipt_row: dict[str, object],
+        *,
+        prefix: str,
+        digest_field: str,
+        observed_at: datetime,
+    ) -> bytes:
+        object_key = receipt_row.get(f"{prefix}_object_key")
+        object_version = receipt_row.get(f"{prefix}_object_version")
+        recorded_at = receipt_row.get(f"{prefix}_recorded_at")
+        retain_until = receipt_row.get(f"{prefix}_retain_until")
+        digest = receipt_row.get(digest_field)
+        if (
+            not isinstance(object_key, str)
+            or not isinstance(object_version, str)
+            or not isinstance(recorded_at, str)
+            or not isinstance(retain_until, str)
+            or not isinstance(digest, str)
+            or object_key != f"evidence/{digest}"
+        ):
+            raise CloudCoordinatorError("protected_promotion_receipt_mismatch")
+        try:
+            archive = self.__archive.read_exact(object_key, object_version)  # type: ignore[attr-defined]
+            recorded = datetime.fromisoformat(recorded_at.removesuffix("Z") + "+00:00")
+            retained = datetime.fromisoformat(retain_until.removesuffix("Z") + "+00:00")
+            created = datetime.fromisoformat(archive.created_at.removesuffix("Z") + "+00:00")
+        except Exception:
+            raise CloudCoordinatorError("protected_promotion_receipt_mismatch") from None
+        payload = archive.payload if isinstance(archive, ProtectedArchiveVersion) else None
+        if (
+            not isinstance(archive, ProtectedArchiveVersion)
+            or type(payload) is not bytes
+            or archive.object_key != object_key
+            or archive.version_id != object_version
+            or archive.checksum_sha256 != digest
+            or hashlib.sha256(payload).hexdigest() != digest
+            or isinstance(archive.byte_length, bool)
+            or archive.byte_length != len(payload)
+            or not 2 <= len(payload) <= 16_384
+            or archive.retention_mode != "COMPLIANCE"
+            or archive.retain_until != retain_until
+            or recorded.tzinfo != UTC
+            or retained.tzinfo != UTC
+            or created.tzinfo != UTC
+            or not recorded_at.endswith("Z")
+            or not retain_until.endswith("Z")
+            or not archive.created_at.endswith("Z")
+            or recorded.isoformat().replace("+00:00", "Z") != recorded_at
+            or recorded > observed_at
+            or (observed_at - recorded).total_seconds() > 15 * 60
+            or retained <= observed_at
+            or created > observed_at
+        ):
+            raise CloudCoordinatorError("protected_promotion_receipt_mismatch")
+        return payload
+
+    @staticmethod
+    def _strict_receipt_payload(payload: bytes) -> dict[str, object]:
+        def reject_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
+            result: dict[str, object] = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError
+                result[key] = value
+            return result
+
+        try:
+            decoded = json.loads(payload, object_pairs_hook=reject_duplicates)
+            if type(decoded) is not dict or canonical_json_bytes(decoded) != payload:
+                raise ValueError
+        except (CanonicalizationError, UnicodeError, ValueError, json.JSONDecodeError) as error:
+            raise CloudCoordinatorError("protected_promotion_receipt_mismatch") from error
+        return decoded
+
+    def _verify_promotion_receipts(
+        self, receipt_row: dict[str, object], *, observed_at: datetime
+    ) -> dict[str, object]:
+        transient = set(receipt_row) & _PROMOTION_RECEIPT_BINDINGS
+        requires_checks = receipt_row.get("required_checks_receipt_digest") is not None
+        if not requires_checks:
+            if transient:
+                raise CloudCoordinatorError("protected_promotion_receipt_mismatch")
+            return receipt_row
+        if transient != _PROMOTION_RECEIPT_BINDINGS:
+            raise CloudCoordinatorError("protected_promotion_receipt_mismatch")
+        repository = receipt_row.get("repository")
+        pull_request_number = receipt_row.get("pull_request_number")
+        head_sha = receipt_row.get("pull_request_head")
+        checks = self._strict_receipt_payload(
+            self._read_promotion_receipt(
+                receipt_row,
+                prefix="required_checks",
+                digest_field="required_checks_receipt_digest",
+                observed_at=observed_at,
+            )
+        )
+        expected_checks = {
+            "checks": [
+                {"app_id": 15368, "conclusion": "success", "name": name}
+                for name in APPROVED_REQUIRED_CHECKS
+            ],
+            "head_sha": head_sha,
+            "kind": "github_required_checks",
+            "observed_at": receipt_row.get("required_checks_recorded_at"),
+            "pull_request_number": pull_request_number,
+            "repository": repository,
+            "schema_version": 1,
+        }
+        protection = self._strict_receipt_payload(
+            self._read_promotion_receipt(
+                receipt_row,
+                prefix="branch_protection",
+                digest_field="branch_protection_receipt_digest",
+                observed_at=observed_at,
+            )
+        )
+        expected_protection = {
+            "allow_auto_merge": True,
+            "allow_deletions": False,
+            "allow_force_pushes": False,
+            "allow_merge_commit": False,
+            "allow_rebase_merge": False,
+            "allow_squash_merge": True,
+            "branch": "main",
+            "delete_branch_on_merge": True,
+            "enforce_admins": True,
+            "head_sha": head_sha,
+            "kind": "github_branch_protection",
+            "observed_at": receipt_row.get("branch_protection_recorded_at"),
+            "pull_request_number": pull_request_number,
+            "repository": repository,
+            "required_checks": [
+                {"app_id": 15368, "name": name} for name in APPROVED_REQUIRED_CHECKS
+            ],
+            "required_conversation_resolution": True,
+            "required_linear_history": True,
+            "required_status_checks_strict": True,
+            "schema_version": 1,
+        }
+        if checks != expected_checks or protection != expected_protection:
+            raise CloudCoordinatorError("protected_promotion_receipt_mismatch")
+        return {key: value for key, value in receipt_row.items() if key not in transient}
+
     def reconstruct(self, command: str, *, observed_at: datetime) -> CoordinatorSnapshot | None:
         reconstructed = self.__backend.reconstruct_coordinator_snapshot(  # type: ignore[attr-defined]
             command, observed_at=observed_at
@@ -149,7 +308,10 @@ class _PostgresCoordinatorState:
         if selected is None:
             raise CloudCoordinatorError("protected_authorization_receipts_invalid")
         self._verify_archive_receipt(receipt_row, observed_at=observed_at)
-        authorization = _authorization_from_durable_receipts(receipt_row, observed_at=observed_at)
+        verified_receipts = self._verify_promotion_receipts(receipt_row, observed_at=observed_at)
+        authorization = _authorization_from_durable_receipts(
+            verified_receipts, observed_at=observed_at
+        )
         return replace(snapshot, production_authorization=authorization)
 
     def apply(

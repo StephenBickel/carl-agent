@@ -209,6 +209,137 @@ def test_coordinator_migration_is_mandatory_in_integration_and_ci() -> None:
     assert "--file infra/autonomy/postgres/004_coordinator_runtime.sql" in BENCHMARK_WORKFLOW
 
 
+def test_protected_policy_decodes_canonical_bounded_base64_public_keys(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from carl_bench import postgres_state
+
+    policy_dir = tmp_path / "etc-carl"
+    policy_dir.mkdir(mode=0o700)
+    policy = {
+        "authority_key": {
+            "key_id": AUTHORITY_KEY.key_id,
+            "public_key_pem_b64": base64.b64encode(AUTHORITY_KEY.public_key_pem).decode("ascii"),
+            "purpose": AUTHORITY_KEY.purpose,
+        },
+        "database_role": "carl_state_backend",
+        "dead_holder_key": {
+            "key_id": LIVENESS_KEY.key_id,
+            "public_key_pem_b64": base64.b64encode(LIVENESS_KEY.public_key_pem).decode("ascii"),
+            "purpose": LIVENESS_KEY.purpose,
+        },
+        "schema_version": 1,
+    }
+    policy_path = policy_dir / "postgres-state-policy.json"
+    policy_path.write_bytes(canonical_json_bytes(policy))
+    policy_path.chmod(0o600)
+    monkeypatch.setattr(postgres_state, "_PROTECTED_STATE_CONFIG_DIR", policy_dir)
+    monkeypatch.setenv("CARL_AUTONOMY_POSTGRES_DSN", "postgresql://protected.invalid/carl")
+
+    backend = PostgresStateBackend.from_protected_environment()
+
+    assert backend.verifier._authority_key == AUTHORITY_KEY
+    assert backend.verifier._dead_holder_key == LIVENESS_KEY
+
+
+@pytest.mark.parametrize(
+    "encoded_key",
+    (
+        "QUJD\n",
+        "A" * 8_193,
+        "not+canonical=base64===",
+    ),
+)
+def test_protected_policy_rejects_noncanonical_or_oversized_base64_keys(
+    encoded_key: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from carl_bench import postgres_state
+
+    policy_dir = tmp_path / "etc-carl"
+    policy_dir.mkdir(mode=0o700)
+    policy = {
+        "authority_key": {
+            "key_id": AUTHORITY_KEY.key_id,
+            "public_key_pem_b64": encoded_key,
+            "purpose": AUTHORITY_KEY.purpose,
+        },
+        "database_role": "carl_state_backend",
+        "dead_holder_key": {
+            "key_id": LIVENESS_KEY.key_id,
+            "public_key_pem_b64": base64.b64encode(LIVENESS_KEY.public_key_pem).decode("ascii"),
+            "purpose": LIVENESS_KEY.purpose,
+        },
+        "schema_version": 1,
+    }
+    policy_path = policy_dir / "postgres-state-policy.json"
+    policy_path.write_bytes(canonical_json_bytes(policy))
+    policy_path.chmod(0o600)
+    monkeypatch.setattr(postgres_state, "_PROTECTED_STATE_CONFIG_DIR", policy_dir)
+    monkeypatch.setenv("CARL_AUTONOMY_POSTGRES_DSN", "postgresql://protected.invalid/carl")
+
+    with pytest.raises(PostgresStateError, match="postgres_protected_configuration_invalid"):
+        PostgresStateBackend.from_protected_environment()
+
+
+def test_coordinator_sql_requires_semantic_check_and_protection_objects() -> None:
+    load = re.search(
+        r"FUNCTION\s+carl_autonomy\.load_coordinator_snapshot\b.*?"
+        r"AS\s+\$\$(?P<body>.*?)\$\$;",
+        COORDINATOR_RUNTIME_SQL,
+        re.IGNORECASE | re.DOTALL,
+    )
+    assert load is not None
+    body = load.group("body")
+    for binding in (
+        "required_checks_object_key",
+        "required_checks_object_version",
+        "required_checks_recorded_at",
+        "required_checks_retain_until",
+        "branch_protection_object_key",
+        "branch_protection_object_version",
+        "branch_protection_recorded_at",
+        "branch_protection_retain_until",
+    ):
+        assert binding in body
+    assert "checks_state.evidence_json" in body
+    assert "protection_state.evidence_json" in body
+    assert "archive_state.digest IS NULL" in body
+    assert re.search(
+        r"checks_state\.recorded_at\s*<\s*p_observed_at\s*-\s*interval\s*'15 minutes'",
+        body,
+        re.IGNORECASE,
+    )
+    assert re.search(
+        r"protection_state\.recorded_at\s*<\s*p_observed_at\s*-\s*interval\s*'15 minutes'",
+        body,
+        re.IGNORECASE,
+    )
+
+
+def test_coordinator_sql_accepts_only_healthy_soak_without_later_hard_failure() -> None:
+    load = re.search(
+        r"FUNCTION\s+carl_autonomy\.load_coordinator_snapshot\b.*?"
+        r"AS\s+\$\$(?P<body>.*?)\$\$;",
+        COORDINATOR_RUNTIME_SQL,
+        re.IGNORECASE | re.DOTALL,
+    )
+    assert load is not None
+    body = load.group("body")
+    assert re.search(
+        r"soak\.payload_json::jsonb->'healthy'\s*=\s*'true'::jsonb", body, re.IGNORECASE
+    )
+    assert re.search(
+        r"NOT\s+EXISTS\s*\(.*?hard_failure.*?occurred_at\s*>=\s*soak\.occurred_at",
+        body,
+        re.IGNORECASE | re.DOTALL,
+    )
+    assert re.search(
+        r"p_observed_at\s*>=\s*guard_state\.promotion_merged_at\s*\+\s*interval\s*'24 hours'",
+        body,
+        re.IGNORECASE,
+    )
+
+
 def test_sql_reconstructs_mutable_coordinator_truth_from_protected_tables() -> None:
     load = re.search(
         r"FUNCTION\s+carl_autonomy\.load_coordinator_snapshot\b.*?"
