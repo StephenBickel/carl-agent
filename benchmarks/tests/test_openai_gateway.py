@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import base64
 import hashlib
+import hmac
 import json
 import traceback
 from dataclasses import replace
@@ -17,6 +19,8 @@ from carl_bench.openai_gateway import (
 )
 
 API_KEY = "sk-test-controller-credential-1234567890"
+PROVENANCE_KEY = b"carl-openai-provenance-test-key!"
+PROVENANCE_KEY_B64 = base64.b64encode(PROVENANCE_KEY).decode("ascii")
 REPOSITORY = "StephenBickel/carl-agent"
 POLICY_REVISION = "openai-responses-policy-2026-08-20.1"
 MODEL = "gpt-5.2"
@@ -317,6 +321,14 @@ def test_protected_construction_reads_only_controller_api_key_and_redacts_errors
         with pytest.raises(OpenAIGatewayError, match="^openai_credentials_invalid$") as invalid:
             OpenAIModelGateway._for_testing(transport=FakeTransport([]))
         assert API_KEY not in str(invalid.value)
+
+    monkeypatch.setenv("OPENAI_API_KEY", API_KEY)
+    monkeypatch.delenv("CARL_OPENAI_PROVENANCE_KEY_B64", raising=False)
+    with pytest.raises(OpenAIGatewayError, match="^openai_provenance_key_missing$"):
+        OpenAIModelGateway.from_protected_environment()
+    monkeypatch.setenv("CARL_OPENAI_PROVENANCE_KEY_B64", "not-canonical-base64")
+    with pytest.raises(OpenAIGatewayError, match="^openai_provenance_key_invalid$"):
+        OpenAIModelGateway.from_protected_environment()
 
 
 def test_exact_protected_responses_request_and_recorded_attestation(
@@ -795,6 +807,7 @@ def test_injected_transport_can_only_return_synthetic_provenance(
     assert type(second) is synthetic_type
     with pytest.raises(OpenAIGatewayError, match="^openai_gateway_construction_invalid$"):
         result_gateway.verify_protected_result(second)
+    monkeypatch.setenv("CARL_OPENAI_PROVENANCE_KEY_B64", PROVENANCE_KEY_B64)
     protected_gateway = OpenAIModelGateway.from_protected_environment()
     assert type(protected_gateway) is OpenAIModelGateway
     forged = protected_type(
@@ -809,3 +822,15 @@ def test_injected_transport_can_only_return_synthetic_provenance(
         provenance_tag="0" * 64,
     )
     assert protected_gateway.verify_protected_result(forged) is False
+    exposed_key_tag = hmac.new(
+        API_KEY.encode("utf-8"),
+        protected_gateway._result_provenance_payload(
+            {
+                name: getattr(forged, name)
+                for name in openai_gateway.OpenAIModelResult.__dataclass_fields__
+            }
+        ),
+        hashlib.sha256,
+    ).hexdigest()
+    forged_with_transport_secret = replace(forged, provenance_tag=exposed_key_tag)
+    assert protected_gateway.verify_protected_result(forged_with_transport_secret) is False

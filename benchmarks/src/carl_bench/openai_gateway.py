@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import hmac
 import json
@@ -45,6 +47,7 @@ _RESPONSE_REQUIRED_FIELDS = frozenset(
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$")
 _REPOSITORY_RE = re.compile(r"^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$")
 _API_KEY_RE = re.compile(r"^sk-[A-Za-z0-9_-]{16,508}$")
+_PROVENANCE_KEY_ENV = "CARL_OPENAI_PROVENANCE_KEY_B64"
 _DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 _MAX_REQUEST_BYTES = 131_072
 _MAX_INPUT_BYTES = 65_536
@@ -288,7 +291,13 @@ class _UrllibResponsesTransport:
 class OpenAIModelGateway:
     """Controller-only model boundary with fixed provider policy and transport authority."""
 
-    __slots__ = ("__api_key", "__monotonic", "__sleep", "__transport")
+    __slots__ = (
+        "__api_key",
+        "__monotonic",
+        "__provenance_key",
+        "__sleep",
+        "__transport",
+    )
 
     def __new__(cls, *args: object, **kwargs: object) -> OpenAIModelGateway:
         del cls, args, kwargs
@@ -303,6 +312,19 @@ class OpenAIModelGateway:
             raise OpenAIGatewayError("openai_credentials_invalid")
         return key
 
+    @staticmethod
+    def _read_provenance_key() -> bytes:
+        encoded = os.environ.get(_PROVENANCE_KEY_ENV)
+        if not isinstance(encoded, str):
+            raise OpenAIGatewayError("openai_provenance_key_missing")
+        try:
+            key = base64.b64decode(encoded, validate=True)
+        except (ValueError, binascii.Error):
+            raise OpenAIGatewayError("openai_provenance_key_invalid") from None
+        if len(key) != 32 or base64.b64encode(key).decode("ascii") != encoded:
+            raise OpenAIGatewayError("openai_provenance_key_invalid")
+        return key
+
     @classmethod
     def from_protected_environment(cls) -> OpenAIModelGateway:
         """Construct the fixed production transport from controller-owned environment state."""
@@ -310,6 +332,7 @@ class OpenAIModelGateway:
             raise OpenAIGatewayError("openai_gateway_construction_invalid")
         gateway = object.__new__(cls)
         gateway.__api_key = cls._read_controller_key()
+        gateway.__provenance_key = cls._read_provenance_key()
         gateway.__transport = _UrllibResponsesTransport()
         gateway.__monotonic = time.monotonic
         gateway.__sleep = time.sleep
@@ -625,7 +648,7 @@ class OpenAIModelGateway:
         }
         if type(self) is OpenAIModelGateway:
             provenance_tag = hmac.new(
-                self.__api_key.encode("utf-8"),
+                self.__provenance_key,
                 self._result_provenance_payload(result_fields),
                 hashlib.sha256,
             ).hexdigest()
@@ -655,7 +678,7 @@ class OpenAIModelGateway:
             return False
         fields = {name: getattr(result, name) for name in OpenAIModelResult.__dataclass_fields__}
         expected = hmac.new(
-            self.__api_key.encode("utf-8"),
+            self.__provenance_key,
             self._result_provenance_payload(fields),
             hashlib.sha256,
         ).hexdigest()
