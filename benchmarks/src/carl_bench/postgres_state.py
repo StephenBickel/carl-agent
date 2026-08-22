@@ -1362,6 +1362,7 @@ class PostgresStateBackend(StateBackend):
         archive_reader: object,
         receipt_registrar: object,
         observed_at: datetime,
+        trusted_keyring: object,
     ) -> dict[str, object]:
         """Read, verify, register, and reactivate through the production authority chain."""
         from carl_bench.coordinator_recovery_archive import (
@@ -1376,6 +1377,7 @@ class PostgresStateBackend(StateBackend):
             receipt_registrar=receipt_registrar,  # type: ignore[arg-type]
             state=self,
             observed_at=observed_at,
+            trusted_keyring=trusted_keyring,  # type: ignore[arg-type]
         )
 
     def reactivate_coordinator_node_from_protected_archive(
@@ -1387,6 +1389,9 @@ class PostgresStateBackend(StateBackend):
         observed_at: datetime,
     ) -> dict[str, object]:
         """Closed production constructor: no caller-selected archive or database seams."""
+        from carl_bench.coordinator_recovery_archive import (
+            load_protected_coordinator_recovery_keyring,
+        )
         from carl_bench.live_archive_client import ProtectedArchiveSocketReader
 
         return self.reactivate_coordinator_node(
@@ -1398,6 +1403,7 @@ class PostgresStateBackend(StateBackend):
                 PostgresCoordinatorRecoveryReceiptRegistrar.from_protected_environment()
             ),
             observed_at=observed_at,
+            trusted_keyring=load_protected_coordinator_recovery_keyring(),
         )
 
     @staticmethod

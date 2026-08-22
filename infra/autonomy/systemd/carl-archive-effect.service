@@ -10,6 +10,7 @@ User=carl-autonomy-archive
 Group=carl-autonomy-archive
 EnvironmentFile=/etc/carl/archive-effect.env
 InaccessiblePaths=/etc/carl/coordinator.env /etc/carl/github-effect.env /etc/carl/evaluator-effect.env /etc/carl/input-effect.env /etc/carl/observer-effect.env
+ReadOnlyPaths=/etc/carl/coordinator-recovery-signing-key.pem
 Environment=PYTHONNOUSERSITE=1
 UnsetEnvironment=PYTHONPATH PYTHONHOME PYTHONSTARTUP PYTHONUSERBASE
 ExecStart=/opt/carl-autonomy/venv/bin/python3 -I -m carl_bench.coordinator_effect_service

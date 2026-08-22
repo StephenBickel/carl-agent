@@ -273,6 +273,27 @@ def test_coordinator_sql_strictly_validates_typed_effect_documents() -> None:
     )
 
 
+def test_concurrent_effect_completion_serializes_instead_of_treating_contention_as_evidence() -> (
+    None
+):
+    complete = re.search(
+        r"FUNCTION\s+carl_autonomy\.complete_coordinator_effect_unchecked\b.*?"
+        r"AS\s+\$\$(?P<body>.*?)\$\$;",
+        COORDINATOR_RUNTIME_SQL,
+        re.IGNORECASE | re.DOTALL,
+    )
+
+    assert complete is not None
+    runtime_lock = re.search(
+        r"SELECT\s+item\.\*\s+INTO\s+runtime.*?WHERE\s+item\.experiment_id.*?"
+        r"(?P<lock>FOR\s+UPDATE(?:\s+SKIP\s+LOCKED)?)",
+        complete.group("body"),
+        re.IGNORECASE | re.DOTALL,
+    )
+    assert runtime_lock is not None
+    assert re.fullmatch(r"FOR\s+UPDATE", runtime_lock.group("lock"), re.IGNORECASE)
+
+
 def test_coordinator_sql_binds_each_selected_node_and_fences_every_non_github_family() -> None:
     apply = re.search(
         r"FUNCTION\s+carl_autonomy\.apply_coordinator_decision_unchecked\b.*?"
@@ -2753,6 +2774,54 @@ def test_sql_guards_receipt_rejection_and_freeze_in_one_database_transaction() -
     assert "RETURN QUERY SELECT * FROM carl_autonomy.freeze_coordinator_receipt_failure(" in body
 
 
+def test_recovery_registration_persists_and_hashes_the_verified_signed_envelope() -> None:
+    registration = re.search(
+        r"FUNCTION\s+carl_autonomy\.register_coordinator_recovery_receipt\b.*?"
+        r"AS\s+\$\$(?P<body>.*?)\$\$;",
+        COORDINATOR_RUNTIME_SQL,
+        re.IGNORECASE | re.DOTALL,
+    )
+
+    assert registration is not None
+    body = registration.group("body")
+    for field in (
+        "signed_envelope",
+        "signature_algorithm",
+        "signature_base64",
+        "signature_expires_at",
+        "signature_issued_at",
+        "signature_key_id",
+    ):
+        assert field in body
+    assert "carl.coordinator-recovery-signed-envelope.v1" in body
+    assert "coordinator_node_recovery" in body
+    assert re.search(
+        r"evidence_digest_value\s*:=\s*carl_autonomy\.sha256_text\(envelope_json\)",
+        body,
+        re.IGNORECASE,
+    )
+    assert re.search(
+        r"signed_envelope_value->'artifact'\s+IS\s+DISTINCT\s+FROM\s+artifact_value",
+        body,
+        re.IGNORECASE,
+    )
+
+
+def test_exact_recovery_receipt_replay_is_resolved_before_recovered_freeze_rejection() -> None:
+    registration = re.search(
+        r"FUNCTION\s+carl_autonomy\.register_coordinator_recovery_receipt\b.*?"
+        r"AS\s+\$\$(?P<body>.*?)\$\$;",
+        COORDINATOR_RUNTIME_SQL,
+        re.IGNORECASE | re.DOTALL,
+    )
+
+    assert registration is not None
+    body = registration.group("body")
+    existing_receipt = body.index("FROM carl_autonomy.coordinator_recovery_receipts AS item")
+    freeze_lookup = body.index("FROM carl_autonomy.coordinator_freeze_occurrences AS item")
+    assert existing_receipt < freeze_lookup
+
+
 def test_postgres_scrubs_nonallowlisted_database_errors() -> None:
     selected = coordinator_node("observe_builder")
     decision = choose_next_action(
@@ -2857,6 +2926,8 @@ def test_postgres_coordinator_enqueue_empty_manifest_queue_is_idempotent() -> No
 
 
 def test_postgres_coordinator_recovery_uses_verified_archive_then_supervisor_cas() -> None:
+    from test_coordinator_recovery_archive import _signed_envelope, _trusted_keyring
+
     identity = {
         "attempt": 1,
         "changed_action_digest": "d" * 64,
@@ -2873,14 +2944,19 @@ def test_postgres_coordinator_recovery_uses_verified_archive_then_supervisor_cas
         "runtime_revision": 7,
     }
     repair_fingerprint = hashlib.sha256(canonical_json_bytes(identity)).hexdigest()
+    artifact = {
+        **identity,
+        "domain": "carl.coordinator-recovery-artifact.v1",
+        "repair_fingerprint": repair_fingerprint,
+        "repaired_at": NOW_TEXT,
+        "schema_version": 1,
+    }
     payload = canonical_json_bytes(
-        {
-            **identity,
-            "domain": "carl.coordinator-recovery-artifact.v1",
-            "repair_fingerprint": repair_fingerprint,
-            "repaired_at": NOW_TEXT,
-            "schema_version": 1,
-        }
+        _signed_envelope(
+            artifact,
+            issued_at=NOW_TEXT,
+            expires_at="2026-08-20T13:00:00Z",
+        )
     )
     evidence_digest = hashlib.sha256(payload).hexdigest()
     archive = ProtectedArchiveVersion(
@@ -2940,6 +3016,7 @@ def test_postgres_coordinator_recovery_uses_verified_archive_then_supervisor_cas
         archive_reader=Reader(),
         receipt_registrar=registrar,
         observed_at=NOW,
+        trusted_keyring=_trusted_keyring(),
     )
 
     assert result == {
@@ -2958,3 +3035,64 @@ def test_postgres_coordinator_recovery_uses_verified_archive_then_supervisor_cas
         if "set_config('carl_autonomy.authority'" in query
     )
     assert registrar.receipts == 1
+
+
+def test_closed_protected_recovery_loads_public_keyring_before_archive_reactivation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from test_coordinator_recovery_archive import _trusted_keyring
+
+    from carl_bench import coordinator_recovery_archive, live_archive_client
+    from carl_bench.postgres_state import PostgresCoordinatorRecoveryReceiptRegistrar
+
+    keyring = _trusted_keyring()
+    reader = object()
+    registrar = object()
+    captured: list[dict[str, object]] = []
+
+    monkeypatch.setattr(
+        coordinator_recovery_archive,
+        "load_protected_coordinator_recovery_keyring",
+        lambda: keyring,
+    )
+    monkeypatch.setattr(
+        live_archive_client.ProtectedArchiveSocketReader,
+        "from_protected_environment",
+        staticmethod(lambda: reader),
+    )
+    monkeypatch.setattr(
+        PostgresCoordinatorRecoveryReceiptRegistrar,
+        "from_protected_environment",
+        staticmethod(lambda: registrar),
+    )
+
+    def capture(self: object, recovery: object, **kwargs: object) -> dict[str, object]:
+        del self, recovery
+        captured.append(kwargs)
+        return {
+            "applied": True,
+            "attempt": 2,
+            "request_digest": "c" * 64,
+            "revision": 8,
+        }
+
+    monkeypatch.setattr(PostgresStateBackend, "reactivate_coordinator_node", capture)
+
+    result = _backend(FakeDatabase()).reactivate_coordinator_node_from_protected_archive(
+        object(),
+        object_key="carl-evidence/v1/sha256/aa/" + "a" * 64,
+        version_id="recovery-v1",
+        observed_at=NOW,
+    )
+
+    assert result["applied"] is True
+    assert captured == [
+        {
+            "object_key": "carl-evidence/v1/sha256/aa/" + "a" * 64,
+            "version_id": "recovery-v1",
+            "archive_reader": reader,
+            "receipt_registrar": registrar,
+            "observed_at": NOW,
+            "trusted_keyring": keyring,
+        }
+    ]

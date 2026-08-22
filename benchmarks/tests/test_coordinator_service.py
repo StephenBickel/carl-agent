@@ -518,17 +518,30 @@ def test_systemd_commissions_every_fixed_effect_socket_before_coordinator_start(
             if other != family:
                 assert f"/etc/carl/{other}-effect.env" in inaccessible
         assert "/etc/carl/github-effect.env" in inaccessible
+        if family == "archive":
+            assert "ReadOnlyPaths=/etc/carl/coordinator-recovery-signing-key.pem" in responder
+        else:
+            assert "/etc/carl/coordinator-recovery-signing-key.pem" in inaccessible
         assert f"Service=carl-{family}-effect.service" in unit
 
     assert "User=carl-autonomy-coordinator" in service
     assert "Group=carl-autonomy-coordinator" in service
     assert "User=root" not in service
     assert "ReadOnlyPaths=/etc/carl/coordinator-effects-policy.json" in service
-    assert (
-        "InaccessiblePaths=/etc/carl/github-effect.env /etc/carl/archive-effect.env "
-        "/etc/carl/evaluator-effect.env "
-        "/etc/carl/input-effect.env /etc/carl/observer-effect.env" in service
+    assert "/etc/carl/coordinator-recovery-keyring.json" in service
+    assert "/etc/carl/coordinator-recovery-signing-key.pem" in service
+    coordinator_inaccessible = next(
+        line for line in service.splitlines() if line.startswith("InaccessiblePaths=")
     )
+    for protected_secret in (
+        "/etc/carl/github-effect.env",
+        "/etc/carl/archive-effect.env",
+        "/etc/carl/evaluator-effect.env",
+        "/etc/carl/input-effect.env",
+        "/etc/carl/observer-effect.env",
+        "/etc/carl/coordinator-recovery-signing-key.pem",
+    ):
+        assert protected_secret in coordinator_inaccessible
     assert "DirectoryMode=0711" in coordinator_socket
     assert "carl-github-effect.socket" in service
     github_socket = (root / "carl-github-effect.socket").read_text(encoding="utf-8")
@@ -543,6 +556,9 @@ def test_systemd_commissions_every_fixed_effect_socket_before_coordinator_start(
     assert "Group=root" in github_service
     assert "EnvironmentFile=/etc/carl/github-effect.env" in github_service
     assert "InaccessiblePaths=/etc/carl/coordinator.env" in github_service
+    assert "/etc/carl/coordinator-recovery-signing-key.pem" in next(
+        line for line in github_service.splitlines() if line.startswith("InaccessiblePaths=")
+    )
     assert json.loads(policy.read_text(encoding="utf-8")) == {
         "coordinator_user": "carl-autonomy-coordinator",
         "domain": "carl.coordinator-effect-policy.v1",

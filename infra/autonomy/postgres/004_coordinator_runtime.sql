@@ -192,6 +192,13 @@ CREATE TABLE carl_autonomy.coordinator_recovery_receipts (
     changed_action_digest character(64) NOT NULL
         CHECK (changed_action_digest ~ '^[0-9a-f]{64}$'),
     repair_fingerprint character(64) NOT NULL CHECK (repair_fingerprint ~ '^[0-9a-f]{64}$'),
+    signature_key_id varchar(128) NOT NULL
+        CHECK (signature_key_id ~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$'),
+    signature_algorithm varchar(16) NOT NULL CHECK (signature_algorithm = 'Ed25519'),
+    signature_base64 character(88) NOT NULL
+        CHECK (signature_base64 ~ '^[A-Za-z0-9+/]{86}==$'),
+    signature_issued_at timestamptz NOT NULL,
+    signature_expires_at timestamptz NOT NULL,
     archive_object_key varchar(256) NOT NULL,
     archive_version_id varchar(256) NOT NULL,
     archive_checksum_sha256 character(64) NOT NULL
@@ -212,7 +219,12 @@ CREATE TABLE carl_autonomy.coordinator_recovery_receipts (
             || substr(evidence_digest, 1, 2) || '/' || evidence_digest
     ),
     CHECK (archive_checksum_sha256 = evidence_digest),
-    CHECK (retained_until > verified_at AND archive_created_at <= verified_at)
+    CHECK (
+        signature_issued_at <= archive_created_at
+        AND archive_created_at <= verified_at
+        AND verified_at < signature_expires_at
+        AND signature_expires_at <= retained_until
+    )
 );
 
 REVOKE ALL ON carl_autonomy.coordinator_recovery_receipts
@@ -808,7 +820,10 @@ AS $$
 DECLARE
     receipt_value jsonb;
     artifact_value jsonb;
+    signed_envelope_value jsonb;
+    binding_value jsonb;
     artifact_json text;
+    envelope_json text;
     identity_value text;
     evidence_digest_value text;
     existing carl_autonomy.coordinator_recovery_receipts%ROWTYPE;
@@ -826,17 +841,42 @@ BEGIN
         p_receipt_json, 'coordinator_recovery_archive_invalid'
     );
     artifact_value := receipt_value->'artifact';
+    signed_envelope_value := receipt_value->'signed_envelope';
+    binding_value := signed_envelope_value->'binding';
     IF carl_autonomy.canonical_jsonb(receipt_value) <> p_receipt_json
-        OR jsonb_object_length(receipt_value) <> 12
+        OR jsonb_object_length(receipt_value) <> 18
         OR NOT receipt_value ?& ARRAY[
             'archive_byte_length', 'archive_checksum_sha256', 'archive_created_at',
             'archive_object_key', 'archive_version_id', 'artifact', 'domain',
             'evidence_digest', 'retained_until', 'retention_mode', 'schema_version',
-            'verified_at'
+            'signed_envelope', 'signature_algorithm', 'signature_base64',
+            'signature_expires_at', 'signature_issued_at', 'signature_key_id', 'verified_at'
         ]
         OR receipt_value->'schema_version' IS DISTINCT FROM '1'::jsonb
         OR receipt_value->>'domain'
             <> 'carl.coordinator-recovery-archive-receipt.v1'
+        OR jsonb_typeof(signed_envelope_value) <> 'object'
+        OR jsonb_object_length(signed_envelope_value) <> 10
+        OR NOT signed_envelope_value ?& ARRAY[
+            'algorithm', 'artifact', 'binding', 'domain', 'expires_at', 'issued_at',
+            'key_id', 'purpose', 'schema_version', 'signature_base64'
+        ]
+        OR signed_envelope_value->'schema_version' IS DISTINCT FROM '1'::jsonb
+        OR signed_envelope_value->>'domain'
+            <> 'carl.coordinator-recovery-signed-envelope.v1'
+        OR signed_envelope_value->>'purpose' <> 'coordinator_node_recovery'
+        OR signed_envelope_value->>'algorithm' <> 'Ed25519'
+        OR signed_envelope_value->>'key_id'
+            !~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$'
+        OR signed_envelope_value->>'signature_base64'
+            !~ '^[A-Za-z0-9+/]{86}==$'
+        OR signed_envelope_value->'artifact' IS DISTINCT FROM artifact_value
+        OR jsonb_typeof(binding_value) <> 'object'
+        OR jsonb_object_length(binding_value) <> 7
+        OR NOT binding_value ?& ARRAY[
+            'command_key', 'effect_key', 'freeze_fingerprint', 'occurrence_key',
+            'reason', 'repair_fingerprint', 'request_digest'
+        ]
         OR jsonb_typeof(artifact_value) <> 'object'
         OR jsonb_object_length(artifact_value) <> 17
         OR NOT artifact_value ?& ARRAY[
@@ -868,11 +908,38 @@ BEGIN
         OR NOT carl_autonomy.canonical_utc_text_valid(artifact_value->>'repaired_at')
         OR NOT carl_autonomy.canonical_utc_text_valid(receipt_value->>'archive_created_at')
         OR NOT carl_autonomy.canonical_utc_text_valid(receipt_value->>'retained_until')
+        OR NOT carl_autonomy.canonical_utc_text_valid(
+            signed_envelope_value->>'issued_at'
+        )
+        OR NOT carl_autonomy.canonical_utc_text_valid(
+            signed_envelope_value->>'expires_at'
+        )
+        OR NOT carl_autonomy.canonical_utc_text_valid(
+            receipt_value->>'signature_issued_at'
+        )
+        OR NOT carl_autonomy.canonical_utc_text_valid(
+            receipt_value->>'signature_expires_at'
+        )
         OR NOT carl_autonomy.canonical_utc_text_valid(receipt_value->>'verified_at')
         OR (receipt_value->>'verified_at')::timestamptz <> p_observed_at
-        OR (artifact_value->>'repaired_at')::timestamptz
+        OR receipt_value->>'signature_algorithm'
+            IS DISTINCT FROM signed_envelope_value->>'algorithm'
+        OR receipt_value->>'signature_key_id'
+            IS DISTINCT FROM signed_envelope_value->>'key_id'
+        OR receipt_value->>'signature_base64'
+            IS DISTINCT FROM signed_envelope_value->>'signature_base64'
+        OR receipt_value->>'signature_issued_at'
+            IS DISTINCT FROM signed_envelope_value->>'issued_at'
+        OR receipt_value->>'signature_expires_at'
+            IS DISTINCT FROM signed_envelope_value->>'expires_at'
+        OR (signed_envelope_value->>'issued_at')::timestamptz
             > (receipt_value->>'archive_created_at')::timestamptz
+        OR (artifact_value->>'repaired_at')::timestamptz
+            > (signed_envelope_value->>'issued_at')::timestamptz
         OR (receipt_value->>'archive_created_at')::timestamptz > p_observed_at
+        OR (signed_envelope_value->>'expires_at')::timestamptz <= p_observed_at
+        OR (signed_envelope_value->>'expires_at')::timestamptz
+            > (receipt_value->>'retained_until')::timestamptz
         OR (receipt_value->>'retained_until')::timestamptz <= p_observed_at
         OR receipt_value->>'retention_mode' <> 'COMPLIANCE'
         OR receipt_value->>'archive_version_id'
@@ -900,7 +967,8 @@ BEGIN
         END IF;
     END LOOP;
     artifact_json := carl_autonomy.canonical_jsonb(artifact_value);
-    evidence_digest_value := carl_autonomy.sha256_text(artifact_json);
+    envelope_json := carl_autonomy.canonical_jsonb(signed_envelope_value);
+    evidence_digest_value := carl_autonomy.sha256_text(envelope_json);
     identity_value := carl_autonomy.canonical_jsonb(jsonb_build_object(
         'attempt', (artifact_value->>'attempt')::integer,
         'changed_action_digest', artifact_value->>'changed_action_digest',
@@ -921,12 +989,31 @@ BEGIN
         OR receipt_value->>'archive_object_key'
             <> 'carl-evidence/v1/sha256/' || substr(evidence_digest_value, 1, 2)
                 || '/' || evidence_digest_value
-        OR (receipt_value->>'archive_byte_length')::integer <> octet_length(artifact_json)
+        OR (receipt_value->>'archive_byte_length')::integer <> octet_length(envelope_json)
         OR artifact_value->>'repair_fingerprint'
             <> carl_autonomy.sha256_text(identity_value)
+        OR binding_value->>'command_key' <> artifact_value->>'command_key'
+        OR binding_value->>'effect_key' <> artifact_value->>'effect_key'
+        OR binding_value->>'freeze_fingerprint' <> artifact_value->>'freeze_fingerprint'
+        OR binding_value->>'occurrence_key' <> artifact_value->>'occurrence_key'
+        OR binding_value->>'reason' <> artifact_value->>'reason'
+        OR binding_value->>'repair_fingerprint' <> artifact_value->>'repair_fingerprint'
+        OR binding_value->>'request_digest' <> artifact_value->>'request_digest'
     THEN
         RAISE EXCEPTION USING
             ERRCODE = '22023', MESSAGE = 'coordinator_recovery_archive_invalid';
+    END IF;
+    PERFORM pg_advisory_xact_lock(hashtextextended(evidence_digest_value, 41));
+    SELECT item.* INTO existing
+    FROM carl_autonomy.coordinator_recovery_receipts AS item
+    WHERE item.evidence_digest = evidence_digest_value;
+    IF FOUND THEN
+        IF existing.receipt_json = p_receipt_json THEN
+            RETURN QUERY SELECT false;
+            RETURN;
+        END IF;
+        RAISE EXCEPTION USING
+            ERRCODE = '23505', MESSAGE = 'coordinator_recovery_receipt_conflict';
     END IF;
     SELECT item.* INTO occurrence
     FROM carl_autonomy.coordinator_freeze_occurrences AS item
@@ -949,22 +1036,12 @@ BEGIN
         RAISE EXCEPTION USING
             ERRCODE = '55000', MESSAGE = 'coordinator_recovery_freeze_mismatch';
     END IF;
-    PERFORM pg_advisory_xact_lock(hashtextextended(evidence_digest_value, 41));
-    SELECT item.* INTO existing
-    FROM carl_autonomy.coordinator_recovery_receipts AS item
-    WHERE item.evidence_digest = evidence_digest_value;
-    IF FOUND THEN
-        IF existing.receipt_json = p_receipt_json THEN
-            RETURN QUERY SELECT false;
-            RETURN;
-        END IF;
-        RAISE EXCEPTION USING
-            ERRCODE = '23505', MESSAGE = 'coordinator_recovery_receipt_conflict';
-    END IF;
     INSERT INTO carl_autonomy.coordinator_recovery_receipts(
         evidence_digest, occurrence_key, freeze_fingerprint, experiment_id, node_id,
         node_kind, attempt, reason, command_key, effect_key, request_digest,
         runtime_revision, decision_identity, changed_action_digest, repair_fingerprint,
+        signature_key_id, signature_algorithm, signature_base64,
+        signature_issued_at, signature_expires_at,
         archive_object_key, archive_version_id, archive_checksum_sha256,
         archive_byte_length, retention_mode, retained_until, archive_created_at,
         verified_at, receipt_json, registered_at
@@ -977,7 +1054,11 @@ BEGIN
         artifact_value->>'request_digest',
         (artifact_value->>'runtime_revision')::integer,
         artifact_value->>'decision_identity', artifact_value->>'changed_action_digest',
-        artifact_value->>'repair_fingerprint', receipt_value->>'archive_object_key',
+        artifact_value->>'repair_fingerprint', receipt_value->>'signature_key_id',
+        receipt_value->>'signature_algorithm', receipt_value->>'signature_base64',
+        (receipt_value->>'signature_issued_at')::timestamptz,
+        (receipt_value->>'signature_expires_at')::timestamptz,
+        receipt_value->>'archive_object_key',
         receipt_value->>'archive_version_id', receipt_value->>'archive_checksum_sha256',
         (receipt_value->>'archive_byte_length')::integer, receipt_value->>'retention_mode',
         (receipt_value->>'retained_until')::timestamptz,
@@ -1118,6 +1199,10 @@ BEGIN
             <> 'carl-evidence/v1/sha256/'
                 || substr(recovery_receipt.evidence_digest, 1, 2)
                 || '/' || recovery_receipt.evidence_digest
+        OR recovery_receipt.signature_algorithm <> 'Ed25519'
+        OR recovery_receipt.signature_issued_at > recovery_receipt.archive_created_at
+        OR recovery_receipt.signature_expires_at <= p_observed_at
+        OR recovery_receipt.signature_expires_at > recovery_receipt.retained_until
         OR recovery_receipt.retention_mode <> 'COMPLIANCE'
         OR recovery_receipt.registered_at > p_observed_at
         OR recovery_receipt.archive_created_at > recovery_receipt.verified_at
@@ -2658,7 +2743,7 @@ BEGIN
     WHERE item.experiment_id = decision_value->>'experiment_id'
         AND item.decision_identity = decision_value->>'identity'
         AND item.decision_json = p_decision_json
-    FOR UPDATE SKIP LOCKED;
+    FOR UPDATE;
     IF NOT FOUND OR runtime.status NOT IN ('effect_prepared', 'effect_observed')
         OR response_value->>'request_digest' IS DISTINCT FROM runtime.effect_request_digest
     THEN
