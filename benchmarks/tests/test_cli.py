@@ -9,6 +9,11 @@ from pathlib import Path
 import pytest
 
 from carl_bench import cli
+from carl_bench.coordinator_client import CoordinatorClientError
+from carl_bench.coordinator_ipc import (
+    COORDINATOR_RESPONSE_DOMAIN,
+    CoordinatorServiceResponse,
+)
 
 TASK_ROOT = Path(__file__).parents[1] / "tasks" / "dev"
 
@@ -81,18 +86,51 @@ def test_cloud_command_emits_one_canonical_json_result_without_prose(
         "reason": "no_ready_node",
         "schema_version": 1,
     }
-    monkeypatch.setattr(cli, "run_protected_cloud_command", lambda command: expected)
+    observed = []
+
+    class Client:
+        def execute(self, request):
+            observed.append(request)
+            return CoordinatorServiceResponse(
+                schema_version=1,
+                domain=COORDINATOR_RESPONSE_DOMAIN,
+                status="completed",
+                request_digest=request.digest,
+                result=expected,
+                error_code=None,
+            )
+
+    monkeypatch.setattr(
+        cli.CoordinatorSocketClient,
+        "from_protected_environment",
+        classmethod(lambda cls: Client()),
+    )
 
     assert cli.main(["cloud", "coordinate"]) == 0
     captured = capsys.readouterr()
     assert captured.err == ""
     assert captured.out == json.dumps(expected, separators=(",", ":"), sort_keys=True) + "\n"
+    assert len(observed) == 1
+    assert observed[0].to_canonical_dict() == {
+        "command": "coordinate",
+        "domain": "carl.coordinator.ipc.request.v1",
+        "schema_version": 1,
+    }
 
 
 def test_missing_cloud_configuration_freezes_only_the_requested_node(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    monkeypatch.delenv("CARL_AUTONOMY_POSTGRES_DSN", raising=False)
+    class MissingClient:
+        def execute(self, request):
+            del request
+            raise CoordinatorClientError("coordinator_service_unavailable")
+
+    monkeypatch.setattr(
+        cli.CoordinatorSocketClient,
+        "from_protected_environment",
+        classmethod(lambda cls: MissingClient()),
+    )
     result = cli.main(["cloud", "observe"])
     captured = capsys.readouterr()
     value = json.loads(captured.out)
@@ -104,6 +142,59 @@ def test_missing_cloud_configuration_freezes_only_the_requested_node(
     assert value["node"] == "observe"
     assert len(value["identity"]) == 64
     assert "dsn" not in captured.out.casefold()
+
+
+def test_cloud_cli_ignores_caller_snapshot_clock_authority_and_evidence(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv(
+        "CARL_CLOUD_COMMAND_INPUT_B64",
+        "caller-selected-snapshot-with-production-evidence",
+    )
+    observed = []
+
+    class Client:
+        def execute(self, request):
+            observed.append(request.to_canonical_dict())
+            result = {
+                "action": "idle",
+                "command": None,
+                "consequential": False,
+                "effect_key": None,
+                "event": None,
+                "experiment_id": "experiment-1",
+                "identity": "1" * 64,
+                "node": None,
+                "reason": "no_ready_node",
+                "remote_effect": False,
+                "result_digest": None,
+                "revision": 7,
+                "schema_version": 1,
+            }
+            return CoordinatorServiceResponse(
+                1,
+                COORDINATOR_RESPONSE_DOMAIN,
+                "completed",
+                request.digest,
+                result,
+                None,
+            )
+
+    monkeypatch.setattr(
+        cli.CoordinatorSocketClient,
+        "from_protected_environment",
+        classmethod(lambda cls: Client()),
+    )
+
+    assert cli.main(["cloud", "coordinate"]) == 0
+    assert json.loads(capsys.readouterr().out)["action"] == "idle"
+    assert observed == [
+        {
+            "command": "coordinate",
+            "domain": "carl.coordinator.ipc.request.v1",
+            "schema_version": 1,
+        }
+    ]
 
 
 def test_scripted_run_writes_only_sanitized_scorecard(tmp_path: Path) -> None:

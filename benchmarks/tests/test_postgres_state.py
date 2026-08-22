@@ -21,10 +21,16 @@ from postgres_event_policy import (
     EVENT_STRING_FIELDS,
     INVALID_EVENT_PAYLOAD_TYPES,
 )
+from test_cloud_coordinator import claimed_command_for as coordinator_claimed_command
+from test_cloud_coordinator import lease as coordinator_lease
+from test_cloud_coordinator import node as coordinator_node
+from test_cloud_coordinator import snapshot as coordinator_snapshot
 from test_experiment import manifest as sample_manifest
 from test_experiment import sealed_candidate
 
 from carl_bench.canonical import canonical_json_bytes
+from carl_bench.cloud_coordinator import choose_next_action
+from carl_bench.cloud_execution import CloudRunRequest
 from carl_bench.cloud_state import (
     AuthorityCapability,
     ClaimReconciliation,
@@ -40,7 +46,13 @@ from carl_bench.cloud_state import (
     TrustedAuthorityKey,
 )
 from carl_bench.experiment import EventType, ExperimentEvent
-from carl_bench.github_cloud import GitHubEffectAttempt
+from carl_bench.github_cloud import GitHubEffectAttempt, workflow_dispatch_binding
+from carl_bench.github_effect_ipc import (
+    REQUEST_DOMAIN,
+    RESPONSE_DOMAIN,
+    GitHubEffectRequest,
+    GitHubEffectResponse,
+)
 from carl_bench.postgres_state import (
     MAX_STATE_REVISION,
     PostgresStateBackend,
@@ -76,6 +88,20 @@ GITHUB_EFFECT_FENCES_SQL = (
     if GITHUB_EFFECT_FENCES_PATH.exists()
     else ""
 )
+COORDINATOR_RUNTIME_PATH = (
+    Path(__file__).parents[2] / "infra/autonomy/postgres/004_coordinator_runtime.sql"
+)
+COORDINATOR_RUNTIME_SQL = (
+    COORDINATOR_RUNTIME_PATH.read_text(encoding="utf-8")
+    if COORDINATOR_RUNTIME_PATH.exists()
+    else ""
+)
+POSTGRES_INTEGRATION_SOURCE = (
+    Path(__file__).with_name("test_postgres_state_integration.py").read_text(encoding="utf-8")
+)
+BENCHMARK_WORKFLOW = (
+    Path(__file__).parents[2] / ".github/workflows/benchmark-contracts.yml"
+).read_text(encoding="utf-8")
 HISTORICAL_EFFECT_FENCE_FIXTURE = (
     Path(__file__).parents[2]
     / "benchmarks/tests/fixtures/postgres-4aa2ab5-github-effect-fences.sql"
@@ -157,6 +183,128 @@ def test_sql_persists_exact_effect_fence_before_network_and_reuses_it_on_restart
     assert "claim_json" in body
     assert "INSERT INTO carl_autonomy.effect_attempts" in body
     assert "effect_attempt_conflict" in body
+
+
+def test_sql_exposes_exact_coordinator_reconstruction_and_effect_fences() -> None:
+    assert COORDINATOR_RUNTIME_PATH.is_file()
+    for function_name in (
+        "load_coordinator_snapshot",
+        "apply_coordinator_decision",
+        "prepare_coordinator_effect",
+        "complete_coordinator_effect",
+    ):
+        assert re.search(
+            rf"FUNCTION\s+carl_autonomy\.{function_name}\b",
+            COORDINATOR_RUNTIME_SQL,
+            re.IGNORECASE,
+        )
+    assert "FOR UPDATE SKIP LOCKED" in COORDINATOR_RUNTIME_SQL
+    assert "decision_identity" in COORDINATOR_RUNTIME_SQL
+    assert "request_digest" in COORDINATOR_RUNTIME_SQL
+    assert "carl_state_backend" in COORDINATOR_RUNTIME_SQL
+
+
+def test_coordinator_migration_is_mandatory_in_integration_and_ci() -> None:
+    assert "004_coordinator_runtime.sql" in POSTGRES_INTEGRATION_SOURCE
+    assert "--file infra/autonomy/postgres/004_coordinator_runtime.sql" in BENCHMARK_WORKFLOW
+
+
+def test_sql_reconstructs_mutable_coordinator_truth_from_protected_tables() -> None:
+    load = re.search(
+        r"FUNCTION\s+carl_autonomy\.load_coordinator_snapshot\b.*?"
+        r"AS\s+\$\$(?P<body>.*?)\$\$;",
+        COORDINATOR_RUNTIME_SQL,
+        re.IGNORECASE | re.DOTALL,
+    )
+    assert load is not None
+    body = load.group("body")
+    for durable_source in (
+        "carl_autonomy.commands",
+        "carl_autonomy.leases",
+        "carl_autonomy.effect_attempts",
+        "carl_autonomy.experiment_projection_guards",
+        "carl_autonomy.evidence_objects",
+    ):
+        assert durable_source in body
+    for caller_selected_field in (
+        "'{command}'",
+        "'{effect}'",
+        "'{lease}'",
+        "'{observed_at}'",
+        "'{production_authorization}'",
+    ):
+        assert caller_selected_field in body
+    assert "coordinator_snapshot_mutable_input_forbidden" in body
+    assert "coordinator_node_priority" in body
+
+
+def test_sql_applies_every_consequential_coordinator_action_or_fails_closed() -> None:
+    apply = re.search(
+        r"FUNCTION\s+carl_autonomy\.apply_coordinator_decision\b.*?"
+        r"AS\s+\$\$(?P<body>.*?)\$\$;",
+        COORDINATOR_RUNTIME_SQL,
+        re.IGNORECASE | re.DOTALL,
+    )
+    assert apply is not None
+    body = apply.group("body")
+    for action in (
+        "acquire_lease",
+        "renew_lease",
+        "reconcile_lease",
+        "release_lease",
+        "persist_command",
+        "claim_command",
+        "complete_command",
+        "retry_rework",
+        "trigger_supervisor",
+    ):
+        assert re.search(rf"WHEN[^\n]*'{action}'", body)
+    for durable_operation in (
+        "acquire_lease",
+        "renew_coordinator_lease",
+        "reconcile_lease",
+        "release_lease",
+        "create_command",
+        "claim_command",
+        "complete_command_and_append_event",
+        "create_supervisor_trigger",
+    ):
+        assert f"carl_autonomy.{durable_operation}" in body
+    assert "coordinator_action_not_supported" in body
+
+
+def test_sql_derives_named_production_receipts_from_exact_durable_identities() -> None:
+    load = re.search(
+        r"FUNCTION\s+carl_autonomy\.load_coordinator_snapshot\b.*?"
+        r"AS\s+\$\$(?P<body>.*?)\$\$;",
+        COORDINATOR_RUNTIME_SQL,
+        re.IGNORECASE | re.DOTALL,
+    )
+    assert load is not None
+    body = load.group("body")
+    for identity in (
+        "archive_receipt_digest",
+        "experimental_receipt_digest",
+        "live_provenance_receipt_digest",
+        "independent_disposition_receipt_digest",
+        "required_checks_receipt_digest",
+        "branch_protection_receipt_digest",
+        "pull_request_number",
+        "pull_request_head",
+        "pull_request_base",
+        "hard_failure_digest",
+        "revert_candidate_commit",
+    ):
+        assert identity in body
+    assert "coordinator_production_receipt_mismatch" in body
+    assert "coordinator_production_receipt_digest_mismatch" in body
+    assert "production_receipts_digest" in COORDINATOR_RUNTIME_SQL
+    assert re.search(
+        r"jsonb_set\s*\(\s*receipt_value\s*,\s*'\{verified_at\}'",
+        body,
+        re.IGNORECASE | re.DOTALL,
+    )
+    assert "p_observed_at" in body
 
 
 def test_sql_effect_fence_can_rearm_only_after_a_durable_rate_limit_deadline() -> None:
@@ -597,6 +745,10 @@ class FakeDatabase:
             "mark_effect_uncertain",
             "mark_effect_retry_scheduled",
             "mark_effect_completed",
+            "load_coordinator_snapshot",
+            "apply_coordinator_decision",
+            "prepare_coordinator_effect",
+            "complete_coordinator_effect",
             "complete_command",
             "fail_command",
             "reconcile_expired_claim",
@@ -1932,3 +2084,145 @@ def test_latest_health_snapshot_rejects_extra_columns() -> None:
 
     with pytest.raises(PostgresStateError, match="postgres_result_shape_invalid"):
         _backend(database).health_snapshot()
+
+
+def _coordinator_state():
+    return replace(
+        coordinator_snapshot(
+            coordinator_node(),
+            current_lease=coordinator_lease(),
+        ),
+        observed_at=NOW_TEXT,
+    )
+
+
+def _github_effect_request() -> tuple[object, GitHubEffectRequest]:
+    run = CloudRunRequest.create(
+        repository="StephenBickel/carl-agent",
+        workflow_file="autonomous-improvement.yml",
+        workflow_revision="3" * 40,
+        workflow_blob_digest="e" * 64,
+        parent_commit="4" * 40,
+        candidate_commit="2" * 40,
+        experiment_digest="a" * 64,
+        task_set_digest="b" * 64,
+        metric_pack_digest="c" * 64,
+        policy_digest="d" * 64,
+    )
+    binding = workflow_dispatch_binding(run, attempt=1)
+    selected = coordinator_node(
+        command_key=binding.command_key,
+        request_digest=binding.request_digest,
+    )
+    remote_state = replace(
+        _coordinator_state(),
+        nodes=(selected,),
+        command=coordinator_claimed_command(selected),
+    )
+    decision = choose_next_action(remote_state)
+    assert decision.command is not None
+    request = GitHubEffectRequest.from_canonical_dict(
+        {
+            "command_key": binding.command_key,
+            "domain": REQUEST_DOMAIN,
+            "effect_key": decision.command.effect_key,
+            "occurred_at": decision.command.occurred_at,
+            "operation": "dispatch_workflow",
+            "parameters": {
+                name: getattr(run, name)
+                for name in (
+                    "candidate_commit",
+                    "experiment_digest",
+                    "metric_pack_digest",
+                    "parent_commit",
+                    "policy_digest",
+                    "repository",
+                    "task_set_digest",
+                    "workflow_blob_digest",
+                    "workflow_file",
+                    "workflow_revision",
+                )
+            },
+            "request_key": binding.request_key,
+            "schema_version": 1,
+        }
+    )
+    return decision, request
+
+
+def test_postgres_coordinator_operations_decode_exact_durable_results() -> None:
+    database = FakeDatabase()
+    state = _coordinator_state()
+    decision = choose_next_action(state)
+    remote_decision, request = _github_effect_request()
+    response = GitHubEffectResponse(
+        schema_version=1,
+        domain=RESPONSE_DOMAIN,
+        status="rejected",
+        request_digest=request.digest,
+        observed_at=NOW_TEXT,
+        result=None,
+        retry_not_before=None,
+        error_code="github_command_not_found",
+    )
+    database.responses.update(
+        {
+            "load_coordinator_snapshot": [
+                {
+                    "production_receipts_json": None,
+                    "snapshot_json": _canonical(state.to_canonical_dict()),
+                }
+            ],
+            "apply_coordinator_decision": [
+                {
+                    "applied": True,
+                    "decision_json": _canonical(decision.to_canonical_dict()),
+                }
+            ],
+            "prepare_coordinator_effect": [
+                {
+                    "effect_family": "github",
+                    "request_json": _canonical(request.to_canonical_dict()),
+                }
+            ],
+            "complete_coordinator_effect": [
+                {
+                    "applied": True,
+                    "decision_json": _canonical(remote_decision.to_canonical_dict()),
+                }
+            ],
+        }
+    )
+    backend = _backend(database)
+
+    rebuilt, receipts = backend.reconstruct_coordinator_snapshot("coordinate", observed_at=NOW)
+    applied = backend.apply_coordinator_decision(decision, observed_at=NOW)
+
+    class Client:
+        def execute(self, actual):
+            assert actual == request
+            return response
+
+    completed = backend.execute_coordinator_effect(
+        remote_decision, github=Client(), observed_at=NOW
+    )
+
+    assert rebuilt == state
+    assert receipts is None
+    assert applied == decision
+    assert completed == remote_decision
+    assert database.transactions_started == 4
+    assert database.transactions_committed == 4
+
+
+def test_postgres_coordinator_empty_queue_is_not_a_failure_or_mutation() -> None:
+    database = FakeDatabase()
+    database.responses["load_coordinator_snapshot"] = [
+        {"production_receipts_json": None, "snapshot_json": None}
+    ]
+
+    result = _backend(database).reconstruct_coordinator_snapshot("observe", observed_at=NOW)
+
+    assert result is None
+    assert database.transactions_started == 1
+    assert database.transactions_committed == 1

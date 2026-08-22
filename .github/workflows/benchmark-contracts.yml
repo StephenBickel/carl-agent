@@ -60,6 +60,8 @@ jobs:
             --file infra/autonomy/postgres/002_role_procedures.sql
           psql --set ON_ERROR_STOP=1 --dbname "$CARL_POSTGRES_TEST_DSN" \
             --file infra/autonomy/postgres/003_github_effect_fences.sql
+          psql --set ON_ERROR_STOP=1 --dbname "$CARL_POSTGRES_TEST_DSN" \
+            --file infra/autonomy/postgres/004_coordinator_runtime.sql
       - name: Test PostgreSQL state integration
         run: >-
           uv run --offline --project benchmarks --locked pytest -q

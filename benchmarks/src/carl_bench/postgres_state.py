@@ -1061,3 +1061,166 @@ class PostgresStateBackend(StateBackend):
                         raise PostgresStateError("health_snapshot_invalid") from error
         finally:
             connection.close()
+
+    def reconstruct_coordinator_snapshot(
+        self, command: str, *, observed_at: datetime
+    ) -> tuple[object, dict[str, Any] | None] | None:
+        """Load one service-selected snapshot and its separately protected receipt row."""
+        from carl_bench.cloud_coordinator import reconstruct_snapshot
+
+        if (
+            command
+            not in {
+                "request",
+                "coordinate",
+                "observe",
+                "ingest",
+                "publish-input",
+                "health",
+                "commission-live",
+            }
+            or not isinstance(observed_at, datetime)
+            or observed_at.tzinfo != UTC
+        ):
+            raise PostgresStateError("coordinator_reconstruction_invalid")
+
+        def decode(row: dict[str, Any]) -> tuple[object, dict[str, Any] | None] | None:
+            value = _strict_row(
+                row,
+                frozenset({"production_receipts_json", "snapshot_json"}),
+            )
+            if value["snapshot_json"] is None:
+                if value["production_receipts_json"] is not None:
+                    raise PostgresStateError("coordinator_empty_queue_receipts_invalid")
+                return None
+            snapshot_value = _strict_json_object(
+                value["snapshot_json"], code="coordinator_snapshot_json_invalid"
+            )
+            receipts_text = value["production_receipts_json"]
+            receipts = (
+                None
+                if receipts_text is None
+                else _strict_json_object(
+                    receipts_text,
+                    code="coordinator_production_receipts_json_invalid",
+                )
+            )
+            try:
+                return reconstruct_snapshot(snapshot_value), receipts
+            except Exception as error:
+                raise PostgresStateError("coordinator_snapshot_invalid") from error
+
+        return cast(
+            tuple[object, dict[str, Any] | None] | None,
+            self._mutation(
+                "coordinator",
+                "SELECT * FROM carl_autonomy.load_coordinator_snapshot(%s, %s)",
+                (command, observed_at),
+                decode,
+            ),
+        )
+
+    @staticmethod
+    def _decode_coordinator_decision(row: dict[str, Any], *, expected: object) -> object:
+        from carl_bench.cloud_coordinator import CloudCoordinatorDecision
+
+        value = _strict_row(row, frozenset({"applied", "decision_json"}))
+        _strict_bool(value["applied"])
+        try:
+            decision = CloudCoordinatorDecision.from_canonical_dict(
+                _strict_json_object(
+                    value["decision_json"], code="coordinator_decision_json_invalid"
+                )
+            )
+        except Exception as error:
+            raise PostgresStateError("coordinator_decision_invalid") from error
+        if decision != expected:
+            raise PostgresStateError("coordinator_decision_identity_mismatch")
+        return decision
+
+    def apply_coordinator_decision(self, decision: object, *, observed_at: datetime) -> object:
+        """Apply or replay exactly one non-remote coordinator decision transactionally."""
+        from carl_bench.cloud_coordinator import CloudCoordinatorDecision
+
+        if (
+            not isinstance(decision, CloudCoordinatorDecision)
+            or not decision.consequential
+            or decision.remote_effect
+            or not isinstance(observed_at, datetime)
+            or observed_at.tzinfo != UTC
+        ):
+            raise PostgresStateError("coordinator_decision_invalid")
+        return self._mutation(
+            "coordinator",
+            "SELECT * FROM carl_autonomy.apply_coordinator_decision(%s, %s)",
+            (_canonical_text(decision.to_canonical_dict()), observed_at),
+            lambda row: self._decode_coordinator_decision(row, expected=decision),
+        )
+
+    def execute_coordinator_effect(
+        self,
+        decision: object,
+        *,
+        github: object,
+        observed_at: datetime,
+    ) -> object:
+        """Resolve, execute, and durably fence one exact protected GitHub effect."""
+        from carl_bench.cloud_coordinator import CloudCoordinatorDecision
+        from carl_bench.github_effect_ipc import GitHubEffectRequest, GitHubEffectResponse
+
+        if (
+            not isinstance(decision, CloudCoordinatorDecision)
+            or not decision.consequential
+            or not decision.remote_effect
+            or decision.command is None
+            or not isinstance(observed_at, datetime)
+            or observed_at.tzinfo != UTC
+            or not callable(getattr(github, "execute", None))
+        ):
+            raise PostgresStateError("coordinator_effect_invalid")
+
+        def prepare(row: dict[str, Any]) -> GitHubEffectRequest:
+            value = _strict_row(row, frozenset({"effect_family", "request_json"}))
+            if value["effect_family"] != "github":
+                raise PostgresStateError("coordinator_effect_family_invalid")
+            try:
+                request = GitHubEffectRequest.from_canonical_dict(
+                    _strict_json_object(
+                        value["request_json"], code="coordinator_effect_request_json_invalid"
+                    )
+                )
+            except Exception as error:
+                raise PostgresStateError("coordinator_effect_request_invalid") from error
+            if (
+                request.command_key != decision.command.command_key
+                or request.effect_key != decision.command.effect_key
+                or request.occurred_at != decision.command.occurred_at
+            ):
+                raise PostgresStateError("coordinator_effect_identity_mismatch")
+            return request
+
+        request = self._mutation(
+            "coordinator",
+            "SELECT * FROM carl_autonomy.prepare_coordinator_effect(%s, %s)",
+            (_canonical_text(decision.to_canonical_dict()), observed_at),
+            prepare,
+        )
+        try:
+            response = github.execute(request)
+        except Exception as error:
+            raise PostgresStateError("coordinator_effect_unavailable") from error
+        if (
+            not isinstance(response, GitHubEffectResponse)
+            or response.request_digest != request.digest
+        ):
+            raise PostgresStateError("coordinator_effect_response_invalid")
+        return self._mutation(
+            "coordinator",
+            "SELECT * FROM carl_autonomy.complete_coordinator_effect(%s, %s, %s)",
+            (
+                _canonical_text(decision.to_canonical_dict()),
+                _canonical_text(response.to_canonical_dict()),
+                observed_at,
+            ),
+            lambda row: self._decode_coordinator_decision(row, expected=decision),
+        )

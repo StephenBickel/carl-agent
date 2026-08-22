@@ -67,10 +67,17 @@ BASE_MIGRATIONS = (
 GITHUB_EFFECT_FENCES_MIGRATION = (
     REPOSITORY_ROOT / "infra/autonomy/postgres/003_github_effect_fences.sql"
 )
+COORDINATOR_RUNTIME_MIGRATION = (
+    REPOSITORY_ROOT / "infra/autonomy/postgres/004_coordinator_runtime.sql"
+)
 HISTORICAL_EFFECT_FENCE_FIXTURE = (
     REPOSITORY_ROOT / "benchmarks/tests/fixtures/postgres-4aa2ab5-github-effect-fences.sql"
 )
-MIGRATIONS = (*BASE_MIGRATIONS, GITHUB_EFFECT_FENCES_MIGRATION)
+MIGRATIONS = (
+    *BASE_MIGRATIONS,
+    GITHUB_EFFECT_FENCES_MIGRATION,
+    COORDINATOR_RUNTIME_MIGRATION,
+)
 NOW = "2026-08-20T12:00:00Z"
 DIGEST_A = "a" * 64
 DIGEST_B = "b" * 64
@@ -115,7 +122,8 @@ def clean_state(postgres: object) -> None:
     assert POSTGRES_DSN is not None
     with postgres.connect(POSTGRES_DSN, autocommit=True) as connection:  # type: ignore[attr-defined]
         connection.execute(
-            "TRUNCATE carl_autonomy.experiment_events, "
+            "TRUNCATE carl_autonomy.coordinator_runtime, "
+            "carl_autonomy.experiment_events, "
             "carl_autonomy.experiment_manifests, carl_autonomy.commands, "
             "carl_autonomy.leases, carl_autonomy.supervisor_triggers, "
             "carl_autonomy.evidence_objects, carl_autonomy.monitor_snapshots, "

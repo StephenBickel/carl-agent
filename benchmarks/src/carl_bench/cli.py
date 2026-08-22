@@ -38,7 +38,9 @@ from carl_bench.candidate_evidence import (
 )
 from carl_bench.candidate_git import CandidateGitManager, TrustedCheckRegistry
 from carl_bench.canonical import canonical_json_bytes
-from carl_bench.cloud_coordinator import run_protected_cloud_command
+from carl_bench.cloud_coordinator import protected_cloud_failure
+from carl_bench.coordinator_client import CoordinatorClientError, CoordinatorSocketClient
+from carl_bench.coordinator_ipc import CoordinatorServiceRequest
 from carl_bench.experiment import (
     EventType,
     ExperimentEvent,
@@ -1392,7 +1394,17 @@ def _validate_command(args: argparse.Namespace) -> int:
 
 
 def _cloud_command(args: argparse.Namespace) -> int:
-    value = run_protected_cloud_command(args.cloud_command)
+    request = CoordinatorServiceRequest.create(args.cloud_command)
+    try:
+        response = CoordinatorSocketClient.from_protected_environment().execute(request)
+    except CoordinatorClientError:
+        value = protected_cloud_failure(args.cloud_command, "cloud_configuration_unavailable")
+    else:
+        value = (
+            response.result
+            if response.status == "completed" and response.result is not None
+            else protected_cloud_failure(args.cloud_command, "cloud_request_rejected")
+        )
     sys.stdout.write(canonical_json_bytes(value).decode("utf-8") + "\n")
     return 2 if value.get("action") == "frozen" else 0
 

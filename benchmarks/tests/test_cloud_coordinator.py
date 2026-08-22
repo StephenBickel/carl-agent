@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-import base64
 import hashlib
 from dataclasses import replace
 
 import pytest
 
+from carl_bench import cloud_coordinator
 from carl_bench.canonical import canonical_json_bytes
 from carl_bench.cloud_coordinator import (
     CloudCoordinatorDecision,
@@ -15,10 +15,9 @@ from carl_bench.cloud_coordinator import (
     CoordinatorSnapshot,
     EffectObservation,
     ImmutableInputBinding,
-    ProductionEvidence,
+    ProtectedProductionAuthorization,
     choose_next_action,
     reconstruct_snapshot,
-    run_protected_cloud_command,
 )
 from carl_bench.cloud_state import (
     CloudCommand,
@@ -32,6 +31,31 @@ NOW = "2026-08-22T12:00:00Z"
 LATER = "2026-08-22T12:30:00Z"
 DIGEST = "1" * 64
 
+NODE_BINDINGS = {
+    "create_revert": ("promoter", "github_effect"),
+    "observe_revert": ("observer", "observe"),
+    "publish_input": ("validator", "register_evidence"),
+    "register_hypothesis": ("builder", "register_manifest"),
+    "request_builder": ("coordinator", "schedule"),
+    "dispatch_builder": ("coordinator", "dispatch"),
+    "observe_builder": ("observer", "observe"),
+    "archive_builder": ("observer", "register_evidence"),
+    "ingest_builder": ("coordinator", "record_success"),
+    "publish_experimental": ("builder", "publish_experimental"),
+    "dispatch_validation": ("coordinator", "dispatch"),
+    "observe_validation": ("observer", "observe"),
+    "archive_validation": ("validator", "register_evidence"),
+    "ingest_validation": ("coordinator", "record_success"),
+    "record_disposition": ("validator", "append_disposition"),
+    "create_promotion_pr": ("promoter", "github_effect"),
+    "observe_required_checks": ("observer", "observe"),
+    "enable_auto_merge": ("promoter", "github_effect"),
+    "schedule_soak": ("coordinator", "schedule"),
+    "observe_soak": ("soak", "production_observation"),
+    "accept_soak": ("soak", "record_soak"),
+    "trigger_supervisor": ("supervisor", "claim_trigger"),
+}
+
 
 def node(
     kind: str = "dispatch_builder",
@@ -39,13 +63,18 @@ def node(
     status: str = "ready",
     attempt: int = 1,
     request_digest: str = DIGEST,
+    command_key: str | None = None,
 ) -> CoordinatorNode:
+    authority, operation = NODE_BINDINGS[kind]
     return CoordinatorNode(
         node_id=f"experiment-1:{kind}",
         kind=kind,
         status=status,
-        authority="coordinator",
-        operation="dispatch",
+        authority=authority,
+        operation=operation,
+        command_key=(
+            f"experiment-1:{kind}:attempt:{attempt}" if command_key is None else command_key
+        ),
         request_digest=request_digest,
         occurred_at=NOW,
         attempt=attempt,
@@ -79,7 +108,7 @@ def snapshot(
     command: CommandState | None = None,
     effect: EffectObservation | None = None,
     failure: CoordinatorFailure | None = None,
-    production_evidence: ProductionEvidence | None = None,
+    production_authorization: ProtectedProductionAuthorization | None = None,
     dead_holder_observation_digest: str | None = None,
 ) -> CoordinatorSnapshot:
     return CoordinatorSnapshot(
@@ -93,7 +122,7 @@ def snapshot(
         command=command,
         effect=effect,
         failure=failure,
-        production_evidence=production_evidence,
+        production_authorization=production_authorization,
         immutable_inputs=(),
         dead_holder_observation_digest=dead_holder_observation_digest,
     )
@@ -202,6 +231,16 @@ def test_command_is_persisted_before_effect_and_reuses_original_timestamp() -> N
     assert second.command.occurred_at == NOW
 
 
+def test_node_preserves_exact_effect_binding_command_key() -> None:
+    exact = f"cloud-run-{'7' * 64}-attempt-1"
+    selected = node(command_key=exact, request_digest="7" * 64)
+
+    decision = choose_next_action(snapshot(selected, current_lease=lease()))
+
+    assert decision.command is not None
+    assert decision.command.command_key == exact
+
+
 def test_pending_command_identity_conflict_freezes_before_effect() -> None:
     selected = node()
     conflicting = command_for(replace(selected, request_digest="2" * 64))
@@ -221,35 +260,17 @@ def test_pending_command_identity_conflict_freezes_before_effect() -> None:
         ("publish_experimental", "execute_effect"),
         ("dispatch_validation", "execute_effect"),
         ("record_disposition", "execute_effect"),
-        ("create_promotion_pr", "execute_effect"),
-        ("schedule_soak", "execute_effect"),
-        ("observe_soak", "execute_effect"),
-        ("accept_soak", "execute_effect"),
-        ("create_revert", "execute_effect"),
         ("trigger_supervisor", "execute_effect"),
     ],
 )
 def test_claimed_nodes_expose_exactly_one_effect(kind: str, expected_action: str) -> None:
     selected = node(kind)
     claimed = claimed_command_for(selected)
-    evidence = (
-        protected_evidence()
-        if kind
-        in {
-            "create_promotion_pr",
-            "schedule_soak",
-            "observe_soak",
-            "accept_soak",
-            "create_revert",
-        }
-        else None
-    )
     decision = choose_next_action(
         snapshot(
             selected,
             current_lease=lease(),
             command=claimed,
-            production_evidence=evidence,
         )
     )
     assert decision.action == expected_action
@@ -271,6 +292,37 @@ def test_lost_response_reconciles_effect_instead_of_reexecuting() -> None:
     )
     assert decision.action == "reconcile_effect"
     assert decision.reason == "effect_response_lost"
+
+
+def test_rate_limited_effect_waits_idly_then_reconciles_without_reexecution() -> None:
+    selected = node()
+    claimed = claimed_command_for(selected)
+    waiting = EffectObservation(
+        effect_key=selected.effect_key,
+        status="retry_scheduled",
+        result_digest=None,
+        observed_at=NOW,
+        retry_not_before="2026-08-22T12:10:00Z",
+    )
+
+    before = choose_next_action(
+        replace(
+            snapshot(selected, current_lease=lease(), command=claimed, effect=waiting),
+            observed_at="2026-08-22T12:05:00Z",
+        )
+    )
+    after = choose_next_action(
+        replace(
+            snapshot(selected, current_lease=lease(), command=claimed, effect=waiting),
+            observed_at="2026-08-22T12:10:00Z",
+        )
+    )
+
+    assert before.action == "idle"
+    assert before.reason == "effect_retry_not_ready"
+    assert before.consequential is False
+    assert after.action == "reconcile_effect"
+    assert after.reason == "effect_retry_ready"
 
 
 def test_applied_effect_is_completed_without_a_second_remote_effect() -> None:
@@ -343,6 +395,7 @@ def test_retry_requires_changed_rework_and_preserves_attempt_identity() -> None:
         failed_command_key=selected.command_key,
         changed_action="use_fresh_runner",
         prior_changed_actions=(),
+        next_command_key="experiment-1:dispatch_builder:attempt:2",
         next_request_digest="5" * 64,
     )
     decision = choose_next_action(snapshot(selected, current_lease=lease(), failure=failure))
@@ -359,72 +412,63 @@ def test_retry_requires_changed_rework_and_preserves_attempt_identity() -> None:
     assert escalated.reason == "unchanged_retry_forbidden"
 
 
-def protected_evidence(**changes: object) -> ProductionEvidence:
-    values: dict[str, object] = {
-        "protected_archive_receipt": True,
+def production_authorization_values(
+    node_kind: str = "create_promotion_pr", **changes: object
+) -> dict[str, object]:
+    values = {
+        "experiment_id": "experiment-1",
+        "node_kind": node_kind,
+        "request_digest": DIGEST,
+        "repository": "StephenBickel/carl-agent",
+        "candidate_commit": "2" * 40,
+        "candidate_tree": "3" * 40,
+        "experimental_ref": "refs/heads/experimental/experiment-1",
+        "archive_object_key": f"carl-evidence/v1/sha256/{DIGEST[:2]}/{DIGEST}",
+        "archive_version_id": "version-1",
+        "archive_digest": DIGEST,
         "verified_at": NOW,
         "archive_retain_until": "2026-09-22T12:00:00Z",
-        "protected_live_model_provenance": True,
-        "independent_disposition": True,
-        "required_checks_passed": True,
-        "branch_protection_current": True,
-        "merge_bound_soak": True,
-        "synthetic": False,
+        "source_receipt_digests": ("2" * 64, "3" * 64, "4" * 64, "5" * 64),
+        "merge_commit": "4" * 40,
+        "merge_tree": "5" * 40,
+        "merged_at": "2026-08-21T12:00:00Z",
+        "soak_observation_digest": "6" * 64,
+        "soak_observed_at": NOW,
     }
     values.update(changes)
-    return ProductionEvidence(**values)
+    return values
+
+
+def test_production_authorization_cannot_be_constructed_by_ordinary_code() -> None:
+    with pytest.raises(CloudCoordinatorError, match="protected_authorization_construction_invalid"):
+        ProtectedProductionAuthorization(**production_authorization_values())
 
 
 @pytest.mark.parametrize(
-    ("changes", "reason"),
-    [
-        ({"protected_archive_receipt": False}, "protected_archive_receipt_required"),
-        ({"verified_at": "2026-08-22T11:30:00Z"}, "protected_verification_stale"),
-        ({"protected_live_model_provenance": False}, "protected_live_model_required"),
-        ({"independent_disposition": False}, "independent_disposition_required"),
-        ({"required_checks_passed": False}, "required_checks_incomplete"),
-        ({"branch_protection_current": False}, "branch_protection_drift"),
-        ({"synthetic": True}, "synthetic_evidence_forbidden"),
-    ],
+    "kind",
+    sorted(
+        {
+            "create_promotion_pr",
+            "observe_required_checks",
+            "enable_auto_merge",
+            "schedule_soak",
+            "observe_soak",
+            "accept_soak",
+            "create_revert",
+            "observe_revert",
+        }
+    ),
 )
-def test_production_promotion_fails_closed_on_each_missing_gate(
-    changes: dict[str, object], reason: str
-) -> None:
+def test_production_nodes_fail_closed_without_service_minted_authorization(kind: str) -> None:
     decision = choose_next_action(
         snapshot(
-            node("create_promotion_pr"),
+            node(kind),
             current_lease=lease(),
-            production_evidence=protected_evidence(**changes),
         )
     )
     assert decision.action == "frozen"
-    assert decision.reason == reason
+    assert decision.reason == "protected_production_receipts_required"
     assert decision.consequential is False
-
-
-def test_soak_acceptance_requires_merge_bound_observation() -> None:
-    decision = choose_next_action(
-        snapshot(
-            node("accept_soak"),
-            current_lease=lease(),
-            production_evidence=protected_evidence(merge_bound_soak=False),
-        )
-    )
-    assert decision.action == "frozen"
-    assert decision.reason == "merge_bound_soak_required"
-
-
-def test_hard_regression_prioritizes_exact_revert_over_other_ready_work() -> None:
-    decision = choose_next_action(
-        snapshot(
-            node("register_hypothesis"),
-            node("create_revert"),
-            current_lease=lease(),
-            production_evidence=protected_evidence(),
-        )
-    )
-    assert decision.node == "create_revert"
-    assert decision.action == "persist_command"
 
 
 def test_idle_has_stable_identity_and_no_event_or_effect() -> None:
@@ -464,68 +508,54 @@ def test_decision_codec_rejects_secret_shaped_or_private_payloads() -> None:
         )
 
 
-def test_protected_command_reconstructs_canonical_environment_snapshot(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    state = snapshot(node(), current_lease=lease())
-    envelope = {
-        "command": "coordinate",
-        "schema_version": 1,
-        "snapshot": state.to_canonical_dict(),
-    }
-    monkeypatch.setenv(
-        "CARL_CLOUD_COMMAND_INPUT_B64",
-        base64.b64encode(canonical_json_bytes(envelope)).decode("ascii"),
+def test_pure_coordinator_exposes_no_environment_snapshot_execution_path() -> None:
+    assert not hasattr(cloud_coordinator, "run_protected_cloud_command")
+
+
+def test_node_kind_rejects_caller_selected_authority_and_operation() -> None:
+    with pytest.raises(CloudCoordinatorError, match="coordinator_node_binding_invalid"):
+        CoordinatorNode(
+            node_id="experiment-1:create_promotion_pr",
+            kind="create_promotion_pr",
+            status="ready",
+            authority="builder",
+            operation="publish_experimental",
+            command_key="github-pr-experiment-1",
+            request_digest=DIGEST,
+            occurred_at=NOW,
+            attempt=1,
+            max_attempts=3,
+        )
+
+
+def test_retry_rework_rejects_an_unchanged_request_digest() -> None:
+    selected = node(status="failed")
+    unchanged = CoordinatorFailure(
+        failure_code="infrastructure_failure",
+        failed_command_key=selected.command_key,
+        changed_action="retry_with_fresh_runner",
+        prior_changed_actions=(),
+        next_command_key=selected.command_key,
+        next_request_digest=selected.request_digest,
     )
 
-    result = run_protected_cloud_command("coordinate")
+    decision = choose_next_action(snapshot(selected, current_lease=lease(), failure=unchanged))
 
-    assert result["action"] == "persist_command"
-    assert result["node"] == "dispatch_builder"
-    assert result["command"]["occurred_at"] == NOW
-
-
-def test_protected_command_rejects_cross_command_and_noncanonical_input(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    state = snapshot(node("observe_builder"), current_lease=lease())
-    envelope = {
-        "command": "ingest",
-        "schema_version": 1,
-        "snapshot": state.to_canonical_dict(),
-    }
-    monkeypatch.setenv(
-        "CARL_CLOUD_COMMAND_INPUT_B64",
-        base64.b64encode(canonical_json_bytes(envelope)).decode("ascii"),
-    )
-    mismatch = run_protected_cloud_command("observe")
-    assert mismatch["action"] == "frozen"
-    assert mismatch["reason"] == "cloud_command_input_mismatch"
-
-    monkeypatch.setenv(
-        "CARL_CLOUD_COMMAND_INPUT_B64",
-        base64.b64encode(b'{"schema_version":1, "command":"observe"}').decode("ascii"),
-    )
-    malformed = run_protected_cloud_command("observe")
-    assert malformed["action"] == "frozen"
-    assert malformed["reason"] == "cloud_command_input_invalid"
+    assert decision.action == "trigger_supervisor"
+    assert decision.reason == "unchanged_retry_forbidden"
 
 
-def test_worker_command_cannot_advance_a_different_node(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    state = snapshot(node("dispatch_builder"), current_lease=lease())
-    envelope = {
-        "command": "observe",
-        "schema_version": 1,
-        "snapshot": state.to_canonical_dict(),
-    }
-    monkeypatch.setenv(
-        "CARL_CLOUD_COMMAND_INPUT_B64",
-        base64.b64encode(canonical_json_bytes(envelope)).decode("ascii"),
-    )
+def test_snapshot_schema_version_rejects_boolean_true() -> None:
+    value = snapshot(current_lease=lease()).to_canonical_dict()
+    value["schema_version"] = True
 
-    result = run_protected_cloud_command("observe")
+    with pytest.raises(CloudCoordinatorError, match="coordinator_snapshot_schema_invalid"):
+        reconstruct_snapshot(value)
 
-    assert result["action"] == "frozen"
-    assert result["reason"] == "cloud_command_node_mismatch"
+
+def test_decision_schema_version_rejects_boolean_true() -> None:
+    value = choose_next_action(snapshot(current_lease=lease())).to_canonical_dict()
+    value["schema_version"] = True
+
+    with pytest.raises(CloudCoordinatorError, match="cloud_decision_invalid"):
+        CloudCoordinatorDecision.from_canonical_dict(value)

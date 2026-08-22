@@ -6,15 +6,11 @@ does not own provider clients, credentials, model policy, or local execution fal
 
 from __future__ import annotations
 
-import base64
-import binascii
 import hashlib
-import json
-import os
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 
 from carl_bench.canonical import CanonicalizationError, canonical_json_bytes
 from carl_bench.cloud_state import CloudCommand, CloudLease, CloudStateError, CommandState
@@ -34,7 +30,7 @@ _PUBLIC_FORBIDDEN = re.compile(
 )
 
 NodeStatus = Literal["waiting", "ready", "complete", "failed"]
-EffectStatus = Literal["none", "uncertain", "applied"]
+EffectStatus = Literal["none", "retry_scheduled", "uncertain", "applied"]
 CoordinatorAction = Literal[
     "idle",
     "acquire_lease",
@@ -88,6 +84,20 @@ _PRODUCTION_NODES = frozenset(
         "observe_revert",
     }
 )
+_PULL_REQUEST_RECEIPT_NODES = _PRODUCTION_NODES - {
+    "create_promotion_pr",
+    "create_revert",
+}
+_CHECK_RECEIPT_NODES = _PRODUCTION_NODES - {
+    "create_promotion_pr",
+    "observe_required_checks",
+    "create_revert",
+}
+_MERGE_RECEIPT_NODES = frozenset(
+    {"schedule_soak", "observe_soak", "accept_soak", "create_revert", "observe_revert"}
+)
+_SOAK_RECEIPT_NODES = frozenset({"accept_soak", "create_revert", "observe_revert"})
+_REVERT_RECEIPT_NODES = frozenset({"create_revert", "observe_revert"})
 _CLOUD_COMMANDS = frozenset(
     {"request", "coordinate", "observe", "ingest", "publish-input", "health", "commission-live"}
 )
@@ -119,7 +129,30 @@ _COMMAND_NODES: dict[str, frozenset[str]] = {
         }
     ),
 }
-_CLOUD_INPUT_ENV = "CARL_CLOUD_COMMAND_INPUT_B64"
+_NODE_BINDINGS: dict[str, tuple[str, str]] = {
+    "create_revert": ("promoter", "github_effect"),
+    "observe_revert": ("observer", "observe"),
+    "publish_input": ("validator", "register_evidence"),
+    "register_hypothesis": ("builder", "register_manifest"),
+    "request_builder": ("coordinator", "schedule"),
+    "dispatch_builder": ("coordinator", "dispatch"),
+    "observe_builder": ("observer", "observe"),
+    "archive_builder": ("observer", "register_evidence"),
+    "ingest_builder": ("coordinator", "record_success"),
+    "publish_experimental": ("builder", "publish_experimental"),
+    "dispatch_validation": ("coordinator", "dispatch"),
+    "observe_validation": ("observer", "observe"),
+    "archive_validation": ("validator", "register_evidence"),
+    "ingest_validation": ("coordinator", "record_success"),
+    "record_disposition": ("validator", "append_disposition"),
+    "create_promotion_pr": ("promoter", "github_effect"),
+    "observe_required_checks": ("observer", "observe"),
+    "enable_auto_merge": ("promoter", "github_effect"),
+    "schedule_soak": ("coordinator", "schedule"),
+    "observe_soak": ("soak", "production_observation"),
+    "accept_soak": ("soak", "record_soak"),
+    "trigger_supervisor": ("supervisor", "claim_trigger"),
+}
 
 
 class CloudCoordinatorError(ValueError):
@@ -222,6 +255,7 @@ class CoordinatorNode:
     status: NodeStatus
     authority: str
     operation: str
+    command_key: str
     request_digest: str
     occurred_at: str
     attempt: int
@@ -233,16 +267,15 @@ class CoordinatorNode:
             raise CloudCoordinatorError("coordinator_node_kind_invalid")
         if self.status not in {"waiting", "ready", "complete", "failed"}:
             raise CloudCoordinatorError("coordinator_node_status_invalid")
+        if (self.authority, self.operation) != _NODE_BINDINGS[self.kind]:
+            raise CloudCoordinatorError("coordinator_node_binding_invalid")
+        _identifier(self.command_key, "coordinator_node_command_key_invalid")
         _digest(self.request_digest, "coordinator_node_request_digest_invalid")
         _timestamp(self.occurred_at, "coordinator_node_occurred_at_invalid")
         try:
             self.command(expected_revision=0)
         except CloudStateError as error:
             raise CloudCoordinatorError("coordinator_node_command_invalid") from error
-
-    @property
-    def command_key(self) -> str:
-        return f"{self.node_id}:attempt:{self.attempt}"
 
     @property
     def effect_key(self) -> str:
@@ -254,11 +287,15 @@ class CoordinatorNode:
         expected_revision: int,
         request_digest: str | None = None,
         attempt: int | None = None,
+        command_key: str | None = None,
     ) -> CloudCommand:
         selected_attempt = self.attempt if attempt is None else attempt
         selected_digest = self.request_digest if request_digest is None else request_digest
+        selected_key = self.command_key if command_key is None else command_key
+        if command_key is None and selected_attempt != self.attempt:
+            raise CloudStateError("retry_command_key_required")
         return CloudCommand.create(
-            command_key=f"{self.node_id}:attempt:{selected_attempt}",
+            command_key=selected_key,
             authority=self.authority,
             operation=self.operation,
             request_digest=selected_digest,
@@ -290,16 +327,23 @@ class EffectObservation:
     status: EffectStatus
     result_digest: str | None
     observed_at: str
+    retry_not_before: str | None = None
 
     def __post_init__(self) -> None:
         _identifier(self.effect_key, "effect_observation_key_invalid")
-        if self.status not in {"none", "uncertain", "applied"}:
+        if self.status not in {"none", "retry_scheduled", "uncertain", "applied"}:
             raise CloudCoordinatorError("effect_observation_status_invalid")
         _timestamp(self.observed_at, "effect_observation_time_invalid")
         if self.status == "applied":
             _digest(self.result_digest, "effect_observation_result_invalid")
         elif self.result_digest is not None:
             raise CloudCoordinatorError("effect_observation_result_unexpected")
+        if self.status == "retry_scheduled":
+            retry_at = _timestamp(self.retry_not_before, "effect_observation_retry_time_invalid")
+            if retry_at < _timestamp(self.observed_at, "effect_observation_time_invalid"):
+                raise CloudCoordinatorError("effect_observation_retry_time_invalid")
+        elif self.retry_not_before is not None:
+            raise CloudCoordinatorError("effect_observation_retry_time_unexpected")
 
     def to_canonical_dict(self) -> dict[str, Any]:
         return {name: getattr(self, name) for name in self.__dataclass_fields__}
@@ -321,6 +365,7 @@ class CoordinatorFailure:
     failed_command_key: str
     changed_action: str
     prior_changed_actions: tuple[str, ...]
+    next_command_key: str
     next_request_digest: str
 
     def __post_init__(self) -> None:
@@ -338,6 +383,7 @@ class CoordinatorFailure:
             or len(set(self.prior_changed_actions)) != len(self.prior_changed_actions)
         ):
             raise CloudCoordinatorError("coordinator_failure_history_invalid")
+        _identifier(self.next_command_key, "coordinator_failure_command_key_invalid")
         _digest(self.next_request_digest, "coordinator_failure_request_digest_invalid")
 
     def to_canonical_dict(self) -> dict[str, Any]:
@@ -345,6 +391,7 @@ class CoordinatorFailure:
             "changed_action": self.changed_action,
             "failed_command_key": self.failed_command_key,
             "failure_code": self.failure_code,
+            "next_command_key": self.next_command_key,
             "next_request_digest": self.next_request_digest,
             "prior_changed_actions": list(self.prior_changed_actions),
         }
@@ -363,54 +410,190 @@ class CoordinatorFailure:
                 failed_command_key=decoded["failed_command_key"],
                 changed_action=decoded["changed_action"],
                 prior_changed_actions=tuple(history),
+                next_command_key=decoded["next_command_key"],
                 next_request_digest=decoded["next_request_digest"],
             )
         except (KeyError, TypeError) as error:
             raise CloudCoordinatorError("coordinator_failure_invalid") from error
 
 
-@dataclass(frozen=True, slots=True)
-class ProductionEvidence:
-    protected_archive_receipt: bool
-    verified_at: str
+@dataclass(frozen=True, slots=True, init=False)
+class ProtectedProductionAuthorization:
+    """Exact protected-service result for one production node and request.
+
+    This value is never accepted by a wire codec.  It can only enter a coordinator snapshot through
+    the isolated service's independently verified durable reconstruction.
+    """
+
+    experiment_id: str
+    node_kind: str
+    request_digest: str
+    repository: str
+    candidate_commit: str
+    candidate_tree: str
+    experimental_ref: str
+    archive_object_key: str
+    archive_version_id: str
+    archive_digest: str
+    archive_receipt_digest: str
+    experimental_receipt_digest: str
+    live_provenance_receipt_digest: str
+    independent_disposition_receipt_digest: str
     archive_retain_until: str
-    protected_live_model_provenance: bool
-    independent_disposition: bool
-    required_checks_passed: bool
-    branch_protection_current: bool
-    merge_bound_soak: bool
-    synthetic: bool
+    verified_at: str
+    pull_request_number: int | None = None
+    pull_request_head: str | None = None
+    pull_request_base: str | None = None
+    required_checks_receipt_digest: str | None = None
+    branch_protection_receipt_digest: str | None = None
+    merge_commit: str | None = None
+    merge_tree: str | None = None
+    merged_at: str | None = None
+    soak_observation_digest: str | None = None
+    soak_observed_at: str | None = None
+    hard_failure_digest: str | None = None
+    revert_candidate_commit: str | None = None
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise CloudCoordinatorError("protected_authorization_construction_invalid")
 
     def __post_init__(self) -> None:
-        for name in (
-            "protected_archive_receipt",
-            "protected_live_model_provenance",
-            "independent_disposition",
-            "required_checks_passed",
-            "branch_protection_current",
-            "merge_bound_soak",
-            "synthetic",
+        _identifier(self.experiment_id, "protected_authorization_identity_invalid")
+        if self.node_kind not in _PRODUCTION_NODES:
+            raise CloudCoordinatorError("protected_authorization_node_invalid")
+        _digest(self.request_digest, "protected_authorization_identity_invalid")
+        if (
+            not isinstance(self.repository, str)
+            or re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", self.repository) is None
+            or not isinstance(self.candidate_commit, str)
+            or re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", self.candidate_commit) is None
+            or not isinstance(self.candidate_tree, str)
+            or re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", self.candidate_tree) is None
+            or not isinstance(self.experimental_ref, str)
+            or self.experimental_ref != f"refs/heads/experimental/{self.experiment_id}"
+            or not isinstance(self.archive_object_key, str)
+            or self.archive_object_key
+            != f"carl-evidence/v1/sha256/{self.archive_digest[:2]}/{self.archive_digest}"
+            or not isinstance(self.archive_version_id, str)
+            or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/+=-]{0,255}", self.archive_version_id)
+            is None
         ):
-            if type(getattr(self, name)) is not bool:
-                raise CloudCoordinatorError("production_evidence_invalid")
-        _timestamp(self.verified_at, "production_evidence_verified_at_invalid")
-        if _timestamp(
-            self.archive_retain_until, "production_evidence_retention_invalid"
-        ) <= _timestamp(self.verified_at, "production_evidence_verified_at_invalid"):
-            raise CloudCoordinatorError("production_evidence_retention_invalid")
-
-    def to_canonical_dict(self) -> dict[str, Any]:
-        return {name: getattr(self, name) for name in self.__dataclass_fields__}
-
-    @classmethod
-    def from_canonical_dict(cls, value: object) -> ProductionEvidence:
-        decoded = _strict_fields(
-            value, frozenset(cls.__dataclass_fields__), "production_evidence_invalid"
+            raise CloudCoordinatorError("protected_authorization_identity_invalid")
+        _digest(self.archive_digest, "protected_authorization_archive_invalid")
+        verified = _timestamp(self.verified_at, "protected_authorization_time_invalid")
+        retained = _timestamp(
+            self.archive_retain_until, "protected_authorization_retention_invalid"
         )
-        try:
-            return cls(**decoded)
-        except TypeError as error:
-            raise CloudCoordinatorError("production_evidence_invalid") from error
+        if retained <= verified:
+            raise CloudCoordinatorError("protected_authorization_retention_invalid")
+        common_receipts = (
+            self.archive_receipt_digest,
+            self.experimental_receipt_digest,
+            self.live_provenance_receipt_digest,
+            self.independent_disposition_receipt_digest,
+        )
+        for digest in common_receipts:
+            _digest(digest, "protected_authorization_receipts_invalid")
+        if len(set(common_receipts)) != len(common_receipts):
+            raise CloudCoordinatorError("protected_authorization_receipts_invalid")
+        pull_request_values = (
+            self.pull_request_number,
+            self.pull_request_head,
+            self.pull_request_base,
+        )
+        requires_pull_request = self.node_kind in _PULL_REQUEST_RECEIPT_NODES
+        has_any_pull_request = any(value is not None for value in pull_request_values)
+        has_all_pull_request = all(value is not None for value in pull_request_values)
+        if (
+            has_any_pull_request != has_all_pull_request
+            or requires_pull_request != has_all_pull_request
+        ):
+            raise CloudCoordinatorError("protected_authorization_pull_request_invalid")
+        if requires_pull_request:
+            if (
+                isinstance(self.pull_request_number, bool)
+                or not isinstance(self.pull_request_number, int)
+                or self.pull_request_number <= 0
+                or not isinstance(self.pull_request_head, str)
+                or re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", self.pull_request_head) is None
+                or self.pull_request_base != "main"
+            ):
+                raise CloudCoordinatorError("protected_authorization_pull_request_invalid")
+            if (
+                self.node_kind not in _REVERT_RECEIPT_NODES
+                and self.pull_request_head != self.candidate_commit
+            ):
+                raise CloudCoordinatorError("protected_authorization_pull_request_invalid")
+        check_values = (
+            self.required_checks_receipt_digest,
+            self.branch_protection_receipt_digest,
+        )
+        requires_checks = self.node_kind in _CHECK_RECEIPT_NODES
+        has_any_checks = any(value is not None for value in check_values)
+        has_all_checks = all(value is not None for value in check_values)
+        if has_any_checks != has_all_checks or requires_checks != has_all_checks:
+            raise CloudCoordinatorError("protected_authorization_checks_invalid")
+        if requires_checks:
+            for digest in check_values:
+                _digest(digest, "protected_authorization_checks_invalid")
+            if len(set((*common_receipts, *check_values))) != 6:
+                raise CloudCoordinatorError("protected_authorization_checks_invalid")
+        merge_values = (self.merge_commit, self.merge_tree, self.merged_at)
+        requires_merge = self.node_kind in _MERGE_RECEIPT_NODES
+        has_any_merge = any(value is not None for value in merge_values)
+        has_all_merge = all(value is not None for value in merge_values)
+        if has_any_merge != has_all_merge or requires_merge != has_all_merge:
+            raise CloudCoordinatorError("protected_authorization_merge_invalid")
+        if self.merge_commit is not None:
+            for value in (self.merge_commit, self.merge_tree):
+                if (
+                    not isinstance(value, str)
+                    or re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", value) is None
+                ):
+                    raise CloudCoordinatorError("protected_authorization_merge_invalid")
+            _timestamp(self.merged_at, "protected_authorization_merge_invalid")
+        soak_values = (self.soak_observation_digest, self.soak_observed_at)
+        requires_soak = self.node_kind in _SOAK_RECEIPT_NODES
+        has_any_soak = any(value is not None for value in soak_values)
+        has_all_soak = all(value is not None for value in soak_values)
+        if has_any_soak != has_all_soak or requires_soak != has_all_soak:
+            raise CloudCoordinatorError("protected_authorization_soak_invalid")
+        if self.soak_observation_digest is not None:
+            _digest(self.soak_observation_digest, "protected_authorization_soak_invalid")
+            _timestamp(self.soak_observed_at, "protected_authorization_soak_invalid")
+            if self.merge_commit is None:
+                raise CloudCoordinatorError("protected_authorization_soak_invalid")
+        revert_values = (self.hard_failure_digest, self.revert_candidate_commit)
+        requires_revert = self.node_kind in _REVERT_RECEIPT_NODES
+        has_any_revert = any(value is not None for value in revert_values)
+        has_all_revert = all(value is not None for value in revert_values)
+        if has_any_revert != has_all_revert or requires_revert != has_all_revert:
+            raise CloudCoordinatorError("protected_authorization_revert_invalid")
+        if requires_revert:
+            _digest(self.hard_failure_digest, "protected_authorization_revert_invalid")
+            if (
+                not isinstance(self.revert_candidate_commit, str)
+                or re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", self.revert_candidate_commit) is None
+                or (
+                    self.node_kind == "observe_revert"
+                    and self.pull_request_head != self.revert_candidate_commit
+                )
+            ):
+                raise CloudCoordinatorError("protected_authorization_revert_invalid")
+
+    @property
+    def digest(self) -> str:
+        return hashlib.sha256(
+            canonical_json_bytes(
+                {
+                    name: list(value) if isinstance(value, tuple) else value
+                    for name, value in (
+                        (field, getattr(self, field)) for field in self.__dataclass_fields__
+                    )
+                }
+            )
+        ).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
@@ -425,12 +608,12 @@ class CoordinatorSnapshot:
     command: CommandState | None
     effect: EffectObservation | None
     failure: CoordinatorFailure | None
-    production_evidence: ProductionEvidence | None
+    production_authorization: ProtectedProductionAuthorization | None
     immutable_inputs: tuple[ImmutableInputBinding, ...]
     dead_holder_observation_digest: str | None
 
     def __post_init__(self) -> None:
-        if self.schema_version != 1:
+        if isinstance(self.schema_version, bool) or self.schema_version != 1:
             raise CloudCoordinatorError("coordinator_snapshot_schema_invalid")
         _identifier(self.experiment_id, "coordinator_experiment_id_invalid")
         _identifier(self.coordinator_id, "coordinator_id_invalid")
@@ -458,10 +641,10 @@ class CoordinatorSnapshot:
             raise CloudCoordinatorError("coordinator_effect_invalid")
         if self.failure is not None and not isinstance(self.failure, CoordinatorFailure):
             raise CloudCoordinatorError("coordinator_failure_invalid")
-        if self.production_evidence is not None and not isinstance(
-            self.production_evidence, ProductionEvidence
+        if self.production_authorization is not None and not isinstance(
+            self.production_authorization, ProtectedProductionAuthorization
         ):
-            raise CloudCoordinatorError("production_evidence_invalid")
+            raise CloudCoordinatorError("protected_authorization_invalid")
         if not isinstance(self.immutable_inputs, tuple) or any(
             not isinstance(item, ImmutableInputBinding) for item in self.immutable_inputs
         ):
@@ -492,14 +675,18 @@ class CoordinatorSnapshot:
             "lease": None if self.lease is None else self.lease.to_canonical_dict(),
             "nodes": [item.to_canonical_dict() for item in self.nodes],
             "observed_at": self.observed_at,
-            "production_evidence": (
+            "production_authorization": (
                 None
-                if self.production_evidence is None
-                else self.production_evidence.to_canonical_dict()
+                if self.production_authorization is None
+                else {"authorization_digest": self.production_authorization.digest}
             ),
             "revision": self.revision,
             "schema_version": self.schema_version,
         }
+
+
+def _raise_caller_authorization_forbidden() -> None:
+    raise CloudCoordinatorError("protected_authorization_caller_forbidden")
 
 
 def reconstruct_snapshot(value: object) -> CoordinatorSnapshot:
@@ -544,10 +731,10 @@ def reconstruct_snapshot(value: object) -> CoordinatorSnapshot:
                 if decoded["failure"] is None
                 else CoordinatorFailure.from_canonical_dict(decoded["failure"])
             ),
-            production_evidence=(
+            production_authorization=(
                 None
-                if decoded["production_evidence"] is None
-                else ProductionEvidence.from_canonical_dict(decoded["production_evidence"])
+                if decoded["production_authorization"] is None
+                else (_raise_caller_authorization_forbidden())
             ),
             immutable_inputs=tuple(
                 ImmutableInputBinding.from_canonical_dict(item) for item in inputs
@@ -577,21 +764,26 @@ class CloudCoordinatorDecision:
     event: None
 
     def __post_init__(self) -> None:
-        if self.schema_version != 1 or self.action not in {
-            "idle",
-            "acquire_lease",
-            "renew_lease",
-            "reconcile_lease",
-            "release_lease",
-            "persist_command",
-            "claim_command",
-            "execute_effect",
-            "reconcile_effect",
-            "complete_command",
-            "retry_rework",
-            "trigger_supervisor",
-            "frozen",
-        }:
+        if (
+            isinstance(self.schema_version, bool)
+            or self.schema_version != 1
+            or self.action
+            not in {
+                "idle",
+                "acquire_lease",
+                "renew_lease",
+                "reconcile_lease",
+                "release_lease",
+                "persist_command",
+                "claim_command",
+                "execute_effect",
+                "reconcile_effect",
+                "complete_command",
+                "retry_rework",
+                "trigger_supervisor",
+                "frozen",
+            }
+        ):
             raise CloudCoordinatorError("cloud_decision_invalid")
         if (
             not isinstance(self.reason, str)
@@ -717,6 +909,36 @@ def _decision(
     )
 
 
+def _empty_queue_decision(command: str) -> CloudCoordinatorDecision:
+    """Return a stable public idle result without inventing durable experiment state."""
+    reason = "no_applicable_node"
+    identity = hashlib.sha256(
+        canonical_json_bytes(
+            {
+                "action": "idle",
+                "command": command,
+                "reason": reason,
+                "schema_version": 1,
+            }
+        )
+    ).hexdigest()
+    return CloudCoordinatorDecision(
+        schema_version=1,
+        action="idle",
+        reason=reason,
+        identity=identity,
+        experiment_id=f"coordinator-queue:{command}",
+        revision=0,
+        node=None,
+        command=None,
+        effect_key=None,
+        result_digest=None,
+        consequential=False,
+        remote_effect=False,
+        event=None,
+    )
+
+
 def _lease_decision(snapshot: CoordinatorSnapshot) -> CloudCoordinatorDecision | None:
     current = snapshot.lease
     now = _timestamp(snapshot.observed_at, "coordinator_observed_at_invalid")
@@ -764,30 +986,39 @@ def _lease_decision(snapshot: CoordinatorSnapshot) -> CloudCoordinatorDecision |
 def _production_blocker(snapshot: CoordinatorSnapshot, selected: CoordinatorNode) -> str | None:
     if selected.kind not in _PRODUCTION_NODES:
         return None
-    evidence = snapshot.production_evidence
-    if evidence is None:
-        return "protected_evidence_required"
+    authorization = snapshot.production_authorization
+    if authorization is None:
+        return "protected_production_receipts_required"
     now = _timestamp(snapshot.observed_at, "coordinator_observed_at_invalid")
-    verified = _timestamp(evidence.verified_at, "production_evidence_verified_at_invalid")
-    retained = _timestamp(evidence.archive_retain_until, "production_evidence_retention_invalid")
-    if evidence.synthetic:
-        return "synthetic_evidence_forbidden"
-    if not evidence.protected_archive_receipt:
-        return "protected_archive_receipt_required"
+    verified = _timestamp(authorization.verified_at, "protected_authorization_time_invalid")
+    retained = _timestamp(
+        authorization.archive_retain_until, "protected_authorization_retention_invalid"
+    )
+    if authorization.experiment_id != snapshot.experiment_id:
+        return "production_experiment_identity_mismatch"
+    if authorization.node_kind != selected.kind:
+        return "production_node_identity_mismatch"
+    if authorization.request_digest != selected.request_digest:
+        return "production_request_identity_mismatch"
     if verified > now or now - verified > _MAX_PROTECTED_VERIFICATION_AGE:
         return "protected_verification_stale"
     if retained <= now:
         return "protected_archive_retention_expired"
-    if not evidence.protected_live_model_provenance:
-        return "protected_live_model_required"
-    if not evidence.independent_disposition:
-        return "independent_disposition_required"
-    if not evidence.required_checks_passed:
-        return "required_checks_incomplete"
-    if not evidence.branch_protection_current:
-        return "branch_protection_drift"
-    if selected.kind == "accept_soak" and not evidence.merge_bound_soak:
-        return "merge_bound_soak_required"
+    if selected.kind == "accept_soak":
+        if (
+            authorization.merge_commit is None
+            or authorization.merge_tree is None
+            or authorization.merged_at is None
+            or authorization.soak_observation_digest is None
+            or authorization.soak_observed_at is None
+        ):
+            return "merge_bound_soak_required"
+        merged = _timestamp(authorization.merged_at, "protected_authorization_merge_invalid")
+        observed = _timestamp(
+            authorization.soak_observed_at, "protected_authorization_soak_invalid"
+        )
+        if observed - merged < timedelta(hours=24) or observed != verified:
+            return "merge_bound_soak_required"
     return None
 
 
@@ -844,10 +1075,27 @@ def choose_next_action(snapshot: CoordinatorSnapshot) -> CloudCoordinatorDecisio
                 node=selected,
                 consequential=True,
             )
+        if failure.next_request_digest == selected.request_digest:
+            return _decision(
+                snapshot,
+                "trigger_supervisor",
+                "unchanged_retry_forbidden",
+                node=selected,
+                consequential=True,
+            )
+        if failure.next_command_key == selected.command_key:
+            return _decision(
+                snapshot,
+                "trigger_supervisor",
+                "unchanged_retry_forbidden",
+                node=selected,
+                consequential=True,
+            )
         retry = selected.command(
             expected_revision=snapshot.revision,
             request_digest=failure.next_request_digest,
             attempt=selected.attempt + 1,
+            command_key=failure.next_command_key,
         )
         return _decision(
             snapshot,
@@ -908,6 +1156,21 @@ def choose_next_action(snapshot: CoordinatorSnapshot) -> CloudCoordinatorDecisio
     effect = snapshot.effect
     if effect is not None and effect.effect_key != state.command.effect_key:
         return _decision(snapshot, "frozen", "effect_identity_conflict", node=selected)
+    if effect is not None and effect.status == "retry_scheduled":
+        retry_at = _timestamp(effect.retry_not_before, "effect_observation_retry_time_invalid")
+        observed_at = _timestamp(snapshot.observed_at, "coordinator_observed_at_invalid")
+        if observed_at < retry_at:
+            return _decision(snapshot, "idle", "effect_retry_not_ready", node=selected)
+        return _decision(
+            snapshot,
+            "reconcile_effect",
+            "effect_retry_ready",
+            node=selected,
+            command=state.command,
+            effect_key=state.command.effect_key,
+            consequential=True,
+            remote_effect=True,
+        )
     if effect is not None and effect.status == "uncertain":
         return _decision(
             snapshot,
@@ -942,6 +1205,94 @@ def choose_next_action(snapshot: CoordinatorSnapshot) -> CloudCoordinatorDecisio
     )
 
 
+class ProtectedCoordinatorState(Protocol):
+    """Service-only durable state surface; ordinary CLI code cannot construct it."""
+
+    def reconstruct(self, command: str, *, observed_at: datetime) -> CoordinatorSnapshot | None: ...
+
+    def apply(
+        self, decision: CloudCoordinatorDecision, *, observed_at: datetime
+    ) -> CloudCoordinatorDecision: ...
+
+
+class ProtectedCoordinatorEffects(Protocol):
+    """Fixed typed effect router owned by the activated coordinator service."""
+
+    def execute(
+        self, decision: CloudCoordinatorDecision, *, observed_at: datetime
+    ) -> CloudCoordinatorDecision: ...
+
+
+class ProtectedCoordinatorExecutor:
+    """Reconstruct and apply exactly one durable transition or protected remote effect."""
+
+    __slots__ = ("__clock", "__effects", "__state")
+
+    def __init__(
+        self,
+        *,
+        state: ProtectedCoordinatorState,
+        effects: ProtectedCoordinatorEffects,
+        clock: object,
+        _testing: bool,
+    ) -> None:
+        if not _testing or not callable(clock):
+            raise CloudCoordinatorError("coordinator_executor_construction_invalid")
+        self.__state = state
+        self.__effects = effects
+        self.__clock = clock
+
+    @classmethod
+    def _for_testing(
+        cls,
+        *,
+        state: ProtectedCoordinatorState,
+        effects: ProtectedCoordinatorEffects,
+        clock: object,
+    ) -> ProtectedCoordinatorExecutor:
+        return cls(state=state, effects=effects, clock=clock, _testing=True)
+
+    @classmethod
+    def _for_protected_service(
+        cls,
+        *,
+        state: ProtectedCoordinatorState,
+        effects: ProtectedCoordinatorEffects,
+        clock: object,
+    ) -> ProtectedCoordinatorExecutor:
+        return cls(state=state, effects=effects, clock=clock, _testing=True)
+
+    def advance(self, command: str) -> CloudCoordinatorDecision:
+        if command not in _CLOUD_COMMANDS:
+            raise CloudCoordinatorError("cloud_command_invalid")
+        observed_at = self.__clock()
+        if not isinstance(observed_at, datetime) or observed_at.tzinfo != UTC:
+            raise CloudCoordinatorError("coordinator_clock_invalid")
+        snapshot = self.__state.reconstruct(command, observed_at=observed_at)
+        if snapshot is None:
+            return _empty_queue_decision(command)
+        if not isinstance(snapshot, CoordinatorSnapshot):
+            raise CloudCoordinatorError("coordinator_snapshot_invalid")
+        trusted_time = observed_at.isoformat().replace("+00:00", "Z")
+        if snapshot.observed_at != trusted_time:
+            raise CloudCoordinatorError("coordinator_snapshot_clock_mismatch")
+        decision = choose_next_action(snapshot)
+        allowed = _COMMAND_NODES[command]
+        if decision.node is not None and decision.node not in allowed:
+            return _decision(snapshot, "idle", "no_applicable_node")
+        if decision.node is None and command not in {"coordinate", "health"}:
+            return _decision(snapshot, "idle", "no_applicable_node")
+        if not decision.consequential:
+            return decision
+        if decision.remote_effect:
+            applied = self.__effects.execute(decision, observed_at=observed_at)
+        else:
+            applied = self.__state.apply(decision, observed_at=observed_at)
+        if applied != decision:
+            raise CloudCoordinatorError("coordinator_applied_identity_mismatch")
+        return decision
+
+
 def protected_cloud_failure(command: str, reason: str) -> dict[str, object]:
     """Return one public-safe frozen node result without configuration details."""
     if (
@@ -969,82 +1320,3 @@ def protected_cloud_failure(command: str, reason: str) -> dict[str, object]:
     }
     _canonical_size(value, maximum=MAX_CLOUD_RESULT_BYTES, code="cloud_result_too_large")
     return value
-
-
-def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    value: dict[str, Any] = {}
-    for key, item in pairs:
-        if key in value:
-            raise CloudCoordinatorError("cloud_command_input_invalid")
-        value[key] = item
-    return value
-
-
-def _protected_command_snapshot(command: str) -> CoordinatorSnapshot | None:
-    encoded = os.environ.get(_CLOUD_INPUT_ENV)
-    if encoded is None:
-        return None
-    if not isinstance(encoded, str) or not 1 <= len(encoded) <= 1_500_000:
-        raise CloudCoordinatorError("cloud_command_input_invalid")
-    try:
-        payload = base64.b64decode(encoded, validate=True)
-    except (ValueError, binascii.Error) as error:
-        raise CloudCoordinatorError("cloud_command_input_invalid") from error
-    if base64.b64encode(payload).decode("ascii") != encoded or not payload:
-        raise CloudCoordinatorError("cloud_command_input_invalid")
-    if len(payload) > MAX_COORDINATOR_SNAPSHOT_BYTES:
-        raise CloudCoordinatorError("cloud_command_input_invalid")
-    try:
-        value = json.loads(payload.decode("utf-8"), object_pairs_hook=_reject_duplicate_keys)
-    except (
-        CloudCoordinatorError,
-        UnicodeError,
-        json.JSONDecodeError,
-        RecursionError,
-    ) as error:
-        raise CloudCoordinatorError("cloud_command_input_invalid") from error
-    if type(value) is not dict or canonical_json_bytes(value) != payload:
-        raise CloudCoordinatorError("cloud_command_input_invalid")
-    decoded = _strict_fields(
-        value,
-        frozenset({"command", "schema_version", "snapshot"}),
-        "cloud_command_input_invalid",
-    )
-    if decoded["schema_version"] != 1:
-        raise CloudCoordinatorError("cloud_command_input_invalid")
-    if decoded["command"] != command:
-        raise CloudCoordinatorError("cloud_command_input_mismatch")
-    return reconstruct_snapshot(decoded["snapshot"])
-
-
-def run_protected_cloud_command(command: str) -> dict[str, object]:
-    """Reconstruct one protected snapshot and emit exactly one safe-node decision.
-
-    No caller-selected endpoint, model, tool, command, credential, or evidence path is accepted.
-    The cloud workflow supplies one bounded canonical environment envelope reconstructed from the
-    durable state service.  Missing or invalid input freezes only this node and never falls back to
-    local heavy execution.
-    """
-    if command not in _CLOUD_COMMANDS:
-        raise CloudCoordinatorError("cloud_command_invalid")
-    try:
-        snapshot = _protected_command_snapshot(command)
-        if snapshot is None:
-            return protected_cloud_failure(command, "cloud_configuration_unavailable")
-        decision = choose_next_action(snapshot)
-        if decision.node is not None and decision.node not in _COMMAND_NODES[command]:
-            return protected_cloud_failure(command, "cloud_command_node_mismatch")
-        if decision.node is None and command not in {"coordinate", "health"}:
-            return protected_cloud_failure(command, "cloud_command_node_mismatch")
-        return decision.to_canonical_dict()
-    except CloudCoordinatorError as error:
-        reason = (
-            error.code
-            if error.code
-            in {
-                "cloud_command_input_invalid",
-                "cloud_command_input_mismatch",
-            }
-            else "cloud_command_input_invalid"
-        )
-        return protected_cloud_failure(command, reason)
