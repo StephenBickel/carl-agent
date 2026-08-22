@@ -1,16 +1,9 @@
-BEGIN;
+-- Exact GitHub effect-object fixture extracted from the production state at 4aa2ab5.
+-- Source commit: 4aa2ab57779beecf61137bc6f994a82a5fb797c3
+-- 001 SHA-256: af8ee07b184fd0183b6810ce9e7f8946ce7e23736c02e7a39e2cada3dbcbf202
+-- 002 SHA-256: dffbd010b6d4d1c5bd6dbcdbcc5d35e4b33cf99557c3af35a246573192e668d1
 
-DO $migration$
-DECLARE
-    column_signature text;
-    table_owner text;
-    primary_count integer;
-    unique_count integer;
-    foreign_count integer;
-    check_count integer;
-BEGIN
-IF to_regclass('carl_autonomy.effect_attempts') IS NULL THEN
-EXECUTE $ddl$CREATE TABLE carl_autonomy.effect_attempts (
+CREATE TABLE carl_autonomy.effect_attempts (
     effect_key varchar(192) PRIMARY KEY REFERENCES carl_autonomy.commands(effect_key),
     command_key varchar(192) NOT NULL UNIQUE REFERENCES carl_autonomy.commands(command_key),
     claim_id varchar(192) NOT NULL,
@@ -58,70 +51,7 @@ EXECUTE $ddl$CREATE TABLE carl_autonomy.effect_attempts (
         (attempt_state IN ('prepared', 'retry_scheduled', 'uncertain') AND result_digest IS NULL)
         OR (attempt_state = 'completed' AND result_digest IS NOT NULL)
     )
-)$ddl$;
-ELSE
-    SELECT string_agg(
-        column_name || ':' || data_type || ':' || is_nullable,
-        '|' ORDER BY ordinal_position
-    ) INTO column_signature
-    FROM information_schema.columns
-    WHERE table_schema = 'carl_autonomy' AND table_name = 'effect_attempts';
-    IF column_signature <> 'effect_key:character varying:NO|command_key:character varying:NO|claim_id:character varying:NO|command_revision:integer:NO|claim_expected_revision:integer:NO|authority:character varying:NO|operation:character varying:NO|action:character varying:NO|endpoint_id:character varying:NO|method:character varying:NO|payload_digest:character:NO|command_request_digest:character:NO|repository:character varying:NO|target_identity:character varying:NO|request_key:character varying:NO|attempt_key:character varying:NO|command_occurred_at:timestamp with time zone:NO|command_occurred_at_text:character varying:NO|claim_expires_at:timestamp with time zone:NO|claim_expires_at_text:character varying:NO|attempt_state:character varying:NO|not_before:timestamp with time zone:NO|not_before_text:character varying:NO|attempt_json:text:NO|result_digest:character:YES|observed_at:timestamp with time zone:NO|observed_at_text:character varying:NO|created_at:timestamp with time zone:NO|updated_at:timestamp with time zone:NO'
-    THEN
-        RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'effect_fence_schema_invalid';
-    END IF;
-    SELECT pg_catalog.pg_get_userbyid(c.relowner),
-        count(*) FILTER (WHERE constraint_type = 'PRIMARY KEY'),
-        count(*) FILTER (WHERE constraint_type = 'UNIQUE'),
-        count(*) FILTER (WHERE constraint_type = 'FOREIGN KEY'),
-        count(*) FILTER (WHERE constraint_type = 'CHECK')
-    INTO table_owner, primary_count, unique_count, foreign_count, check_count
-    FROM pg_catalog.pg_class AS c
-    JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace
-    CROSS JOIN information_schema.table_constraints AS tc
-    WHERE n.nspname = 'carl_autonomy' AND c.relname = 'effect_attempts'
-        AND tc.table_schema = n.nspname AND tc.table_name = c.relname
-    GROUP BY c.relowner;
-    IF table_owner <> CURRENT_USER OR primary_count <> 1 OR unique_count <> 1
-        OR foreign_count <> 2 OR check_count <> 15
-    THEN
-        RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'effect_fence_schema_invalid';
-    END IF;
-END IF;
-END;
-$migration$;
-
-CREATE INDEX IF NOT EXISTS effect_attempts_reconciliation
-    ON carl_autonomy.effect_attempts(attempt_state, not_before, effect_key)
-    WHERE attempt_state IN ('retry_scheduled', 'uncertain');
-
-DO $migration$
-DECLARE
-    key_columns text[];
-    predicate text;
-    valid boolean;
-    unique_index boolean;
-BEGIN
-    SELECT array_agg(a.attname ORDER BY k.ordinality),
-        pg_catalog.pg_get_expr(i.indpred, i.indrelid), i.indisvalid, i.indisunique
-    INTO key_columns, predicate, valid, unique_index
-    FROM pg_catalog.pg_index AS i
-    JOIN pg_catalog.pg_class AS idx ON idx.oid = i.indexrelid
-    JOIN pg_catalog.pg_class AS tab ON tab.oid = i.indrelid
-    JOIN pg_catalog.pg_namespace AS n ON n.oid = tab.relnamespace
-    JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS k(attnum, ordinality) ON true
-    JOIN pg_catalog.pg_attribute AS a ON a.attrelid = tab.oid AND a.attnum = k.attnum
-    WHERE n.nspname = 'carl_autonomy' AND tab.relname = 'effect_attempts'
-        AND idx.relname = 'effect_attempts_reconciliation'
-    GROUP BY i.indpred, i.indrelid, i.indisvalid, i.indisunique;
-    IF key_columns <> ARRAY['attempt_state', 'not_before', 'effect_key']
-        OR predicate IS NULL OR position('retry_scheduled' IN predicate) = 0
-        OR position('uncertain' IN predicate) = 0 OR NOT valid OR unique_index
-    THEN
-        RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'effect_fence_schema_invalid';
-    END IF;
-END;
-$migration$;
+);
 
 CREATE OR REPLACE FUNCTION carl_autonomy.resolve_claimed_command(
     p_command_key text,
@@ -297,20 +227,6 @@ BEGIN
             AND existing.attempt_key = value->>'attempt_key'
             AND existing.command_occurred_at_text = command_occurred_text
         THEN
-            IF existing.attempt_state = 'uncertain' THEN
-                UPDATE carl_autonomy.effect_attempts AS e
-                SET claim_id = claim_key,
-                    command_revision = command_revision_value,
-                    claim_expected_revision = claim_revision_value,
-                    claim_expires_at = claim_expires_time,
-                    claim_expires_at_text = claim_expires_text,
-                    observed_at = p_observed_at,
-                    observed_at_text = observed_text,
-                    updated_at = p_observed_at
-                WHERE e.effect_key = effect_key_value;
-                RETURN QUERY SELECT false;
-                RETURN;
-            END IF;
             IF existing.attempt_state = 'retry_scheduled'
                 AND p_observed_at >= existing.not_before
             THEN
@@ -471,15 +387,8 @@ BEGIN
 END;
 $$;
 
-DROP FUNCTION IF EXISTS carl_autonomy.mark_effect_completed(text, text, text, timestamptz);
-
 CREATE OR REPLACE FUNCTION carl_autonomy.mark_effect_completed(
     p_effect_key text,
-    p_command_key text,
-    p_claim_id text,
-    p_command_revision integer,
-    p_claim_expected_revision integer,
-    p_claim_expires_at_text text,
     p_result_digest text,
     p_observed_at_text text,
     p_observed_at timestamptz
@@ -492,8 +401,6 @@ AS $$
 DECLARE
     caller text;
     caller_authority text;
-    claim_value jsonb;
-    current_state carl_autonomy.commands%ROWTYPE;
     current_attempt carl_autonomy.effect_attempts%ROWTYPE;
 BEGIN
     caller := carl_autonomy.require_role(ARRAY[
@@ -501,24 +408,9 @@ BEGIN
         'carl_supervisor', 'carl_coordinator', 'carl_observer'
     ]);
     caller_authority := carl_autonomy.role_authority(caller);
-    IF p_result_digest !~ '^[0-9a-f]{64}$'
-        OR NOT carl_autonomy.canonical_utc_text_valid(p_claim_expires_at_text)
-        OR NOT carl_autonomy.canonical_utc_text_valid(p_observed_at_text)
-        OR p_observed_at_text::timestamptz <> p_observed_at
-    THEN
+    IF p_result_digest !~ '^[0-9a-f]{64}$' THEN
         RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'effect_result_invalid';
     END IF;
-    SELECT c.* INTO current_state
-    FROM carl_autonomy.commands AS c
-    WHERE c.command_key = p_command_key
-    FOR UPDATE;
-    IF NOT FOUND THEN
-        RAISE EXCEPTION USING ERRCODE = 'P0002', MESSAGE = 'command_not_found';
-    END IF;
-    IF current_state.command_json IS NULL OR current_state.claim_json IS NULL THEN
-        RAISE EXCEPTION USING ERRCODE = '42501', MESSAGE = 'effect_attempt_transition_denied';
-    END IF;
-    claim_value := carl_autonomy.parse_object(current_state.claim_json, 'claim_json_invalid');
     SELECT e.* INTO current_attempt
     FROM carl_autonomy.effect_attempts AS e
     WHERE e.effect_key = p_effect_key
@@ -526,23 +418,9 @@ BEGIN
     IF NOT FOUND THEN
         RAISE EXCEPTION USING ERRCODE = 'P0002', MESSAGE = 'effect_attempt_not_found';
     END IF;
-    IF current_state.status <> 'claimed'
-        OR current_state.command_key <> p_command_key
-        OR current_state.effect_key <> p_effect_key
-        OR current_state.authority <> caller_authority
-        OR current_state.revision <> p_command_revision
-        OR current_state.claim_id <> p_claim_id
-        OR current_state.claim_expires_at_text <> p_claim_expires_at_text
-        OR current_state.claim_expires_at <= p_observed_at
-        OR (claim_value->>'expected_revision')::integer <> p_claim_expected_revision
-        OR claim_value->>'claim_id' <> p_claim_id
-        OR claim_value->>'authority' <> caller_authority
-        OR current_attempt.authority <> caller_authority
-        OR current_attempt.command_key <> p_command_key
-        OR current_attempt.claim_id <> p_claim_id
-        OR current_attempt.command_revision <> p_command_revision
-        OR current_attempt.claim_expected_revision <> p_claim_expected_revision
-        OR current_attempt.claim_expires_at_text <> p_claim_expires_at_text
+    IF current_attempt.authority <> caller_authority
+        OR NOT carl_autonomy.canonical_utc_text_valid(p_observed_at_text)
+        OR p_observed_at_text::timestamptz <> p_observed_at
         OR p_observed_at < current_attempt.observed_at
     THEN
         RAISE EXCEPTION USING ERRCODE = '42501', MESSAGE = 'effect_attempt_transition_denied';
@@ -563,35 +441,13 @@ BEGIN
 END;
 $$;
 
-ALTER TABLE carl_autonomy.effect_attempts OWNER TO CURRENT_USER;
-ALTER FUNCTION carl_autonomy.resolve_claimed_command(text, timestamptz) OWNER TO CURRENT_USER;
-ALTER FUNCTION carl_autonomy.prepare_effect_attempt(text, timestamptz) OWNER TO CURRENT_USER;
-ALTER FUNCTION carl_autonomy.mark_effect_retry_scheduled(text, text, text, timestamptz)
-    OWNER TO CURRENT_USER;
-ALTER FUNCTION carl_autonomy.mark_effect_uncertain(text, text, text, timestamptz)
-    OWNER TO CURRENT_USER;
-ALTER FUNCTION carl_autonomy.mark_effect_completed(
-    text, text, text, integer, integer, text, text, text, timestamptz
-)
-    OWNER TO CURRENT_USER;
+REVOKE ALL ON ALL TABLES IN SCHEMA carl_autonomy FROM PUBLIC, carl_autonomy_workflow;
+REVOKE ALL ON ALL SEQUENCES IN SCHEMA carl_autonomy FROM PUBLIC, carl_autonomy_workflow;
+REVOKE ALL ON ALL FUNCTIONS IN SCHEMA carl_autonomy FROM PUBLIC, carl_autonomy_workflow;
 
-REVOKE ALL ON TABLE carl_autonomy.effect_attempts
-    FROM PUBLIC, carl_autonomy_workflow, carl_state_backend;
-REVOKE ALL ON FUNCTION carl_autonomy.resolve_claimed_command(text, timestamptz),
-    carl_autonomy.prepare_effect_attempt(text, timestamptz),
-    carl_autonomy.mark_effect_retry_scheduled(text, text, text, timestamptz),
-    carl_autonomy.mark_effect_uncertain(text, text, text, timestamptz),
-    carl_autonomy.mark_effect_completed(
-        text, text, text, integer, integer, text, text, text, timestamptz
-    )
-    FROM PUBLIC, carl_autonomy_workflow;
 GRANT EXECUTE ON FUNCTION carl_autonomy.resolve_claimed_command(text, timestamptz),
     carl_autonomy.prepare_effect_attempt(text, timestamptz),
     carl_autonomy.mark_effect_retry_scheduled(text, text, text, timestamptz),
     carl_autonomy.mark_effect_uncertain(text, text, text, timestamptz),
-    carl_autonomy.mark_effect_completed(
-        text, text, text, integer, integer, text, text, text, timestamptz
-    )
+    carl_autonomy.mark_effect_completed(text, text, text, timestamptz)
     TO carl_state_backend;
-
-COMMIT;

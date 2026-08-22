@@ -67,6 +67,9 @@ BASE_MIGRATIONS = (
 GITHUB_EFFECT_FENCES_MIGRATION = (
     REPOSITORY_ROOT / "infra/autonomy/postgres/003_github_effect_fences.sql"
 )
+HISTORICAL_EFFECT_FENCE_FIXTURE = (
+    REPOSITORY_ROOT / "benchmarks/tests/fixtures/postgres-4aa2ab5-github-effect-fences.sql"
+)
 MIGRATIONS = (*BASE_MIGRATIONS, GITHUB_EFFECT_FENCES_MIGRATION)
 NOW = "2026-08-20T12:00:00Z"
 DIGEST_A = "a" * 64
@@ -789,9 +792,15 @@ def test_additive_effect_fence_migration_upgrades_a_populated_001_002_schema(
                 ),
             ).fetchone()
             completed = coordinator.execute(
-                "SELECT * FROM carl_autonomy.mark_effect_completed(%s, %s, %s, %s)",
+                "SELECT * FROM carl_autonomy.mark_effect_completed("
+                "%s, %s, %s, %s, %s, %s, %s, %s, %s)",
                 (
                     attempt.effect_key,
+                    attempt.command_key,
+                    attempt.claim_id,
+                    attempt.command_revision,
+                    attempt.claim_expected_revision,
+                    attempt.claim_expires_at,
                     DIGEST_B,
                     "2026-08-20T12:00:02Z",
                     "2026-08-20T12:00:02Z",
@@ -808,6 +817,162 @@ def test_additive_effect_fence_migration_upgrades_a_populated_001_002_schema(
             for migration in MIGRATIONS:
                 if migration.is_file():
                     admin.execute(migration.read_text(encoding="utf-8"), prepare=False)
+
+
+def test_effect_fence_migration_upgrades_populated_pinned_4aa2ab5_state(
+    postgres: object,
+) -> None:
+    from psycopg.rows import dict_row
+
+    assert POSTGRES_DSN is not None
+    assert HISTORICAL_EFFECT_FENCE_FIXTURE.is_file()
+    with postgres.connect(POSTGRES_DSN, autocommit=True, row_factory=dict_row) as admin:  # type: ignore[attr-defined]
+        admin.execute("DROP SCHEMA IF EXISTS carl_autonomy CASCADE")
+        for migration in BASE_MIGRATIONS:
+            admin.execute(migration.read_text(encoding="utf-8"), prepare=False)
+        admin.execute(
+            HISTORICAL_EFFECT_FENCE_FIXTURE.read_text(encoding="utf-8"),
+            prepare=False,
+        )
+    try:
+        command = _command()
+        claim = _claim()
+        attempt = GitHubEffectAttempt(
+            schema_version=1,
+            effect_key=command.effect_key,
+            command_key=command.command_key,
+            claim_id=claim.claim_id,
+            command_revision=8,
+            claim_expected_revision=claim.expected_revision,
+            action="dispatch_workflow",
+            endpoint_id="workflow_dispatch",
+            method="POST",
+            payload_digest="c" * 64,
+            command_request_digest=command.request_digest,
+            repository="StephenBickel/carl-agent",
+            target_identity="autonomous-improvement.yml@" + "1" * 40,
+            request_key="cloud-run-request-historical-001",
+            attempt_key="cloud-run-request-historical-001-attempt-1",
+            authority=command.authority,
+            operation=command.operation,
+            command_occurred_at=command.occurred_at,
+            claim_expires_at=claim.expires_at,
+            attempt_state="prepared",
+            not_before="2026-08-20T12:00:30Z",
+            observed_at=NOW,
+        )
+        with _as_role(postgres, "carl_coordinator") as coordinator:
+            coordinator.execute(
+                "SELECT * FROM carl_autonomy.create_command(%s, %s)",
+                (_canonical(command.to_canonical_dict()), NOW),
+            ).fetchone()
+            coordinator.execute(
+                "SELECT * FROM carl_autonomy.claim_command(%s, %s)",
+                (_canonical(claim.to_canonical_dict()), NOW),
+            ).fetchone()
+        with postgres.connect(POSTGRES_DSN, autocommit=True, row_factory=dict_row) as admin:  # type: ignore[attr-defined]
+            admin.execute(
+                "INSERT INTO carl_autonomy.effect_attempts("
+                "effect_key,command_key,claim_id,command_revision,claim_expected_revision,"
+                "authority,operation,action,endpoint_id,method,payload_digest,"
+                "command_request_digest,repository,target_identity,request_key,attempt_key,"
+                "command_occurred_at,command_occurred_at_text,claim_expires_at,"
+                "claim_expires_at_text,attempt_state,not_before,not_before_text,attempt_json,"
+                "result_digest,observed_at,observed_at_text,created_at,updated_at) VALUES ("
+                "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,"
+                "%s,%s,%s,%s,%s,%s,%s)",
+                (
+                    attempt.effect_key,
+                    attempt.command_key,
+                    attempt.claim_id,
+                    attempt.command_revision,
+                    attempt.claim_expected_revision,
+                    attempt.authority,
+                    attempt.operation,
+                    attempt.action,
+                    attempt.endpoint_id,
+                    attempt.method,
+                    attempt.payload_digest,
+                    attempt.command_request_digest,
+                    attempt.repository,
+                    attempt.target_identity,
+                    attempt.request_key,
+                    attempt.attempt_key,
+                    attempt.command_occurred_at,
+                    attempt.command_occurred_at,
+                    attempt.claim_expires_at,
+                    attempt.claim_expires_at,
+                    attempt.attempt_state,
+                    attempt.not_before,
+                    attempt.not_before,
+                    _canonical(attempt.to_canonical_dict()),
+                    None,
+                    attempt.observed_at,
+                    attempt.observed_at,
+                    attempt.observed_at,
+                    attempt.observed_at,
+                ),
+            )
+            admin.execute(
+                GITHUB_EFFECT_FENCES_MIGRATION.read_text(encoding="utf-8"),
+                prepare=False,
+            )
+            preserved = admin.execute(
+                "SELECT effect_key, command_key, claim_id, attempt_state, attempt_json "
+                "FROM carl_autonomy.effect_attempts"
+            ).fetchone()
+            contracts = admin.execute(
+                "SELECT pg_catalog.pg_get_userbyid(c.relowner) = current_user AS owner_ok, "
+                "NOT has_table_privilege('carl_state_backend', c.oid, 'SELECT') AS table_denied, "
+                "to_regprocedure('carl_autonomy.mark_effect_completed("
+                "text,text,text,integer,integer,text,text,text,timestamptz)') "
+                "IS NOT NULL AS new_completion, "
+                "to_regprocedure('carl_autonomy.mark_effect_completed("
+                "text,text,text,timestamptz)') IS NULL AS old_removed, "
+                "has_function_privilege('carl_state_backend', "
+                "'carl_autonomy.mark_effect_completed("
+                "text,text,text,integer,integer,text,text,text,timestamptz)', "
+                "'EXECUTE') AS backend_execute "
+                "FROM pg_catalog.pg_class AS c JOIN pg_catalog.pg_namespace AS n "
+                "ON n.oid = c.relnamespace WHERE n.nspname = 'carl_autonomy' "
+                "AND c.relname = 'effect_attempts'"
+            ).fetchone()
+        assert preserved == {
+            "attempt_json": _canonical(attempt.to_canonical_dict()),
+            "attempt_state": "prepared",
+            "claim_id": claim.claim_id,
+            "command_key": command.command_key,
+            "effect_key": command.effect_key,
+        }
+        assert contracts == {
+            "backend_execute": True,
+            "new_completion": True,
+            "old_removed": True,
+            "owner_ok": True,
+            "table_denied": True,
+        }
+    finally:
+        with postgres.connect(POSTGRES_DSN, autocommit=True) as admin:  # type: ignore[attr-defined]
+            admin.execute("DROP SCHEMA IF EXISTS carl_autonomy CASCADE")
+            for migration in MIGRATIONS:
+                admin.execute(migration.read_text(encoding="utf-8"), prepare=False)
+
+
+def test_effect_fence_migration_rejects_incompatible_existing_table(postgres: object) -> None:
+    assert POSTGRES_DSN is not None
+    with postgres.connect(POSTGRES_DSN, autocommit=True) as admin:  # type: ignore[attr-defined]
+        admin.execute("DROP SCHEMA IF EXISTS carl_autonomy CASCADE")
+        for migration in BASE_MIGRATIONS:
+            admin.execute(migration.read_text(encoding="utf-8"), prepare=False)
+        admin.execute("CREATE TABLE carl_autonomy.effect_attempts(effect_key text PRIMARY KEY)")
+        with pytest.raises(Exception, match="effect_fence_schema_invalid"):
+            admin.execute(
+                GITHUB_EFFECT_FENCES_MIGRATION.read_text(encoding="utf-8"),
+                prepare=False,
+            )
+        admin.execute("DROP SCHEMA IF EXISTS carl_autonomy CASCADE")
+        for migration in MIGRATIONS:
+            admin.execute(migration.read_text(encoding="utf-8"), prepare=False)
 
 
 def test_schema_has_all_strict_transactional_state_tables(postgres: object) -> None:
@@ -1954,6 +2119,153 @@ def test_effect_rate_limit_retry_rearms_once_after_persisted_deadline(
     assert reclaimed["revision"] == 10
     assert rearmed["applied"] is True
     assert duplicate["applied"] is False
+
+
+def test_uncertain_effect_completion_requires_replacement_claim_adoption(
+    postgres: object,
+) -> None:
+    command = _command()
+    claim = _claim()
+    dead_holder = _dead_holder(
+        scope_kind="command",
+        scope_key=command.command_key,
+        subject_id=claim.claim_id,
+        revision=8,
+    )
+    _register_observation(postgres, dead_holder)
+    attempt = GitHubEffectAttempt(
+        schema_version=1,
+        effect_key=command.effect_key,
+        command_key=command.command_key,
+        claim_id=claim.claim_id,
+        command_revision=8,
+        claim_expected_revision=claim.expected_revision,
+        action="dispatch_workflow",
+        endpoint_id="workflow_dispatch",
+        method="POST",
+        payload_digest="c" * 64,
+        command_request_digest=command.request_digest,
+        repository="StephenBickel/carl-agent",
+        target_identity="autonomous-improvement.yml@" + "1" * 40,
+        request_key="cloud-run-request-uncertain-001",
+        attempt_key="cloud-run-request-uncertain-001-attempt-1",
+        authority=command.authority,
+        operation=command.operation,
+        command_occurred_at=command.occurred_at,
+        claim_expires_at=claim.expires_at,
+        attempt_state="prepared",
+        not_before="2026-08-20T12:00:30Z",
+        observed_at=NOW,
+    )
+    with _as_role(postgres, "carl_coordinator") as coordinator:
+        coordinator.execute(
+            "SELECT * FROM carl_autonomy.create_command(%s, %s)",
+            (_canonical(command.to_canonical_dict()), NOW),
+        ).fetchone()
+        coordinator.execute(
+            "SELECT * FROM carl_autonomy.claim_command(%s, %s)",
+            (_canonical(claim.to_canonical_dict()), NOW),
+        ).fetchone()
+        coordinator.execute(
+            "SELECT * FROM carl_autonomy.prepare_effect_attempt(%s, %s)",
+            (_canonical(attempt.to_canonical_dict()), NOW),
+        ).fetchone()
+        coordinator.execute(
+            "SELECT * FROM carl_autonomy.mark_effect_uncertain(%s, %s, %s, %s)",
+            (
+                attempt.effect_key,
+                attempt.not_before,
+                "2026-08-20T12:00:01Z",
+                "2026-08-20T12:00:01Z",
+            ),
+        ).fetchone()
+        reconciliation = ClaimReconciliation(
+            command_key=command.command_key,
+            claim_id=claim.claim_id,
+            authority=command.authority,
+            expected_revision=8,
+            next_revision=9,
+            observed_at="2026-08-20T12:02:00Z",
+        )
+        coordinator.execute(
+            "SELECT * FROM carl_autonomy.reconcile_expired_claim(%s, %s, %s)",
+            (
+                _canonical(reconciliation.to_canonical_dict()),
+                dead_holder.digest,
+                reconciliation.observed_at,
+            ),
+        ).fetchone()
+        with pytest.raises(Exception, match="effect_attempt_transition_denied"):
+            coordinator.execute(
+                "SELECT * FROM carl_autonomy.mark_effect_completed(%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                (
+                    attempt.effect_key,
+                    attempt.command_key,
+                    attempt.claim_id,
+                    attempt.command_revision,
+                    attempt.claim_expected_revision,
+                    attempt.claim_expires_at,
+                    DIGEST_B,
+                    "2026-08-20T12:02:00Z",
+                    "2026-08-20T12:02:00Z",
+                ),
+            ).fetchone()
+        replacement_claim = replace(
+            _claim(claim_id="claim-uncertain-replacement", revision=9),
+            claimed_at="2026-08-20T12:02:00Z",
+            expires_at="2026-08-20T12:05:00Z",
+        )
+        reclaimed = coordinator.execute(
+            "SELECT * FROM carl_autonomy.claim_command(%s, %s)",
+            (
+                _canonical(replacement_claim.to_canonical_dict()),
+                replacement_claim.claimed_at,
+            ),
+        ).fetchone()
+        replacement_attempt = replace(
+            attempt,
+            claim_id=replacement_claim.claim_id,
+            command_revision=10,
+            claim_expected_revision=replacement_claim.expected_revision,
+            claim_expires_at=replacement_claim.expires_at,
+            observed_at="2026-08-20T12:02:01Z",
+            not_before="2026-08-20T12:02:31Z",
+        )
+        observation_only = coordinator.execute(
+            "SELECT * FROM carl_autonomy.prepare_effect_attempt(%s, %s)",
+            (
+                _canonical(replacement_attempt.to_canonical_dict()),
+                replacement_attempt.observed_at,
+            ),
+        ).fetchone()
+        completed = coordinator.execute(
+            "SELECT * FROM carl_autonomy.mark_effect_completed(%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+            (
+                replacement_attempt.effect_key,
+                replacement_attempt.command_key,
+                replacement_attempt.claim_id,
+                replacement_attempt.command_revision,
+                replacement_attempt.claim_expected_revision,
+                replacement_attempt.claim_expires_at,
+                DIGEST_B,
+                "2026-08-20T12:02:02Z",
+                "2026-08-20T12:02:02Z",
+            ),
+        ).fetchone()
+        persisted = coordinator.execute(
+            "SELECT attempt_state, claim_id, result_digest "
+            "FROM carl_autonomy.effect_attempts WHERE effect_key = %s",
+            (attempt.effect_key,),
+        ).fetchone()
+
+    assert reclaimed["revision"] == 10
+    assert observation_only["applied"] is False
+    assert completed["applied"] is True
+    assert persisted == {
+        "attempt_state": "completed",
+        "claim_id": replacement_claim.claim_id,
+        "result_digest": DIGEST_B,
+    }
 
 
 def test_lease_trigger_evidence_and_health_contracts(postgres: object) -> None:

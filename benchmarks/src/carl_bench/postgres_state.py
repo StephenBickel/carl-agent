@@ -675,15 +675,31 @@ class PostgresStateBackend(StateBackend):
         self,
         effect_key: str,
         *,
+        command_key: str,
+        claim_id: str,
+        command_revision: int,
+        claim_expected_revision: int,
+        claim_expires_at: str,
         authority: str,
         result_digest: str,
         observed_at: str,
     ) -> None:
         observed = self._effect_timestamp(observed_at)
+        self._effect_timestamp(claim_expires_at)
         self._mutation(
             authority,
-            "SELECT * FROM carl_autonomy.mark_effect_completed(%s, %s, %s, %s)",
-            (effect_key, result_digest, observed_at, observed),
+            "SELECT * FROM carl_autonomy.mark_effect_completed(%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            (
+                effect_key,
+                command_key,
+                claim_id,
+                command_revision,
+                claim_expected_revision,
+                claim_expires_at,
+                result_digest,
+                observed_at,
+                observed,
+            ),
             self._decode_applied,
         )
 

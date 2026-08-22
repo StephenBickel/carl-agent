@@ -33,6 +33,50 @@ _SOCKET_PATH = Path("/run/carl/github-effect.sock")
 _ALLOWED_CLIENT_UID = 0
 
 
+def _protected_graphql_documents() -> object:
+    """Build fixed operations from service-local literals and independent pinned digests."""
+    github = _github_cloud()
+    mark_ready = """mutation MarkPullRequestReadyForReview($pullRequestId: ID!) {
+  markPullRequestReadyForReview(input: {pullRequestId: $pullRequestId}) {
+    pullRequest {
+      id
+      number
+      isDraft
+      baseRefName
+      headRefName
+      headRefOid
+      repository { nameWithOwner }
+    }
+  }
+}"""
+    enable_auto_merge = (
+        "mutation EnablePullRequestAutoMerge($pullRequestId: ID!, "
+        "$expectedHeadOid: GitObjectID!) {\n"
+        "  enablePullRequestAutoMerge(input: {pullRequestId: $pullRequestId, "
+        "expectedHeadOid: $expectedHeadOid, mergeMethod: SQUASH}) {\n"
+        """    pullRequest {
+      id
+      number
+      isDraft
+      baseRefName
+      headRefName
+      headRefOid
+      repository { nameWithOwner }
+      autoMergeRequest { mergeMethod }
+    }
+  }
+}"""
+    )
+    return github._GitHubGraphQLDocuments.from_pinned_documents(
+        mark_ready=mark_ready,
+        enable_auto_merge=enable_auto_merge,
+        expected_mark_ready_digest="49a7c81b57a1cdfb851fbaa6c3dfd374a892ed76c1f56afaf4282e147a62f973",
+        expected_enable_auto_merge_digest=(
+            "6a96f13af464b95dcd16d58fe01b851362c59893e24b842a40592b04765336f4"
+        ),
+    )
+
+
 def _github_cloud():
     # Credential-bearing implementation is imported only by this service process.
     from carl_bench import github_cloud
@@ -293,6 +337,7 @@ def main() -> int:
         state_controller=state_controller,
         workflow_ref=policy.workflow_ref,
         dispatch_actor_login=policy.dispatch_actor_login,
+        graphql_documents=_protected_graphql_documents(),
     )
     _validate_runtime_directory(_SOCKET_PATH.parent)
     if _SOCKET_PATH.exists() or _SOCKET_PATH.is_symlink():

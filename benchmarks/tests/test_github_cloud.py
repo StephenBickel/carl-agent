@@ -60,9 +60,12 @@ _MARK_READY_MUTATION = """mutation MarkPullRequestReadyForReview($pullRequestId:
     }
   }
 }"""
-_ENABLE_AUTO_MERGE_MUTATION = """mutation EnablePullRequestAutoMerge($pullRequestId: ID!) {
-  enablePullRequestAutoMerge(input: {pullRequestId: $pullRequestId, mergeMethod: SQUASH}) {
-    pullRequest {
+_ENABLE_AUTO_MERGE_MUTATION = (
+    "mutation EnablePullRequestAutoMerge($pullRequestId: ID!, "
+    "$expectedHeadOid: GitObjectID!) {\n"
+    "  enablePullRequestAutoMerge(input: {pullRequestId: $pullRequestId, "
+    "expectedHeadOid: $expectedHeadOid, mergeMethod: SQUASH}) {\n"
+    """    pullRequest {
       id
       number
       isDraft
@@ -74,6 +77,7 @@ _ENABLE_AUTO_MERGE_MUTATION = """mutation EnablePullRequestAutoMerge($pullReques
     }
   }
 }"""
+)
 
 
 @dataclass
@@ -165,11 +169,36 @@ class FakeDurableEffectController:
         self,
         effect_key: str,
         *,
+        command_key: str,
+        claim_id: str,
+        command_revision: int,
+        claim_expected_revision: int,
+        claim_expires_at: str,
         authority: str,
         result_digest: str,
         observed_at: str,
     ) -> None:
-        assert self.attempts[effect_key]["authority"] == authority
+        current = self.commands.get(command_key)
+        attempt = self.attempts[effect_key]
+        if (
+            current is None
+            or current.status != "claimed"
+            or current.claim is None
+            or current.command.effect_key != effect_key
+            or current.command.authority != authority
+            or current.revision != command_revision
+            or current.claim.claim_id != claim_id
+            or current.claim.expected_revision != claim_expected_revision
+            or current.claim.expires_at != claim_expires_at
+            or datetime.fromisoformat(claim_expires_at.replace("Z", "+00:00"))
+            <= datetime.fromisoformat(observed_at.replace("Z", "+00:00"))
+            or attempt["command_key"] != command_key
+            or attempt["claim_id"] != claim_id
+            or attempt["command_revision"] != command_revision
+            or attempt["claim_expected_revision"] != claim_expected_revision
+            or attempt["claim_expires_at"] != claim_expires_at
+        ):
+            raise GitHubCloudError("github_effect_claim_not_current")
         self.attempts[effect_key].update(
             attempt_state="completed",
             result_digest=result_digest,
@@ -1944,7 +1973,10 @@ def test_auto_merge_uses_the_closed_typed_squash_github_graphql_mutation() -> No
     assert transport.requests[1].json_body == {
         "operationName": "EnablePullRequestAutoMerge",
         "query": _ENABLE_AUTO_MERGE_MUTATION,
-        "variables": {"pullRequestId": _PULL_REQUEST_NODE_ID},
+        "variables": {
+            "expectedHeadOid": request.head_sha,
+            "pullRequestId": _PULL_REQUEST_NODE_ID,
+        },
     }
     assert [item.method for item in transport.requests] == ["GET", "POST"]
     assert sum(item.method == "POST" for item in transport.requests) == 1
@@ -1960,6 +1992,31 @@ def test_pinned_official_github_schema_supports_only_the_closed_pull_mutations()
     assert "pullRequestId: ID!" in schema
     assert "mergeMethod: PullRequestMergeMethod = MERGE" in schema
     assert "SQUASH" in schema
+
+
+def test_auto_merge_rejects_mutable_multi_operation_document_before_transport(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport = FakeTransport(deque())
+    malicious = (
+        _ENABLE_AUTO_MERGE_MUTATION
+        + "\nmutation DeleteRef($id: ID!) { deleteRef(input: {refId: $id}) { clientMutationId } }"
+    )
+    monkeypatch.setattr(github_cloud, "_ENABLE_AUTO_MERGE_MUTATION", malicious, raising=False)
+
+    with pytest.raises(GitHubCloudError, match="github_graphql_document_invalid"):
+        github_cloud._GitHubGraphQLDocuments.from_pinned_documents(
+            mark_ready=_MARK_READY_MUTATION,
+            enable_auto_merge=malicious,
+            expected_mark_ready_digest=(
+                "49a7c81b57a1cdfb851fbaa6c3dfd374a892ed76c1f56afaf4282e147a62f973"
+            ),
+            expected_enable_auto_merge_digest=(
+                "6a96f13af464b95dcd16d58fe01b851362c59893e24b842a40592b04765336f4"
+            ),
+        )
+
+    assert transport.requests == []
 
 
 @pytest.mark.parametrize("action", ["update", "ready", "auto-merge"])
@@ -2005,6 +2062,12 @@ def test_pull_effect_head_race_is_persisted_uncertain(action: str) -> None:
             gateway.enable_pull_request_auto_merge(state.command.command_key, request)
 
     assert controller.attempts[state.command.effect_key]["attempt_state"] == "uncertain"
+    if action == "auto-merge":
+        assert transport.requests[1].json_body is not None
+        assert transport.requests[1].json_body["variables"] == {
+            "expectedHeadOid": request.head_sha,
+            "pullRequestId": _PULL_REQUEST_NODE_ID,
+        }
 
 
 def _checks_response(*, head_sha: str = _CANDIDATE_COMMIT) -> GitHubHttpResponse:
@@ -3056,6 +3119,19 @@ def test_uncertain_effect_reclaim_after_claim_expiry_is_observation_only(
     assert uncertain.status == "uncertain"
     original_attempt = dict(controller.attempts[original.command.effect_key])
 
+    with pytest.raises(GitHubCloudError, match="github_effect_claim_not_current"):
+        controller.mark_effect_completed(
+            original.command.effect_key,
+            command_key=original.command.command_key,
+            claim_id=original.claim.claim_id,
+            command_revision=original.revision,
+            claim_expected_revision=original.claim.expected_revision,
+            claim_expires_at=original.claim.expires_at,
+            authority=original.command.authority,
+            result_digest="f" * 64,
+            observed_at="2026-08-21T12:06:00Z",
+        )
+
     replacement_claim = CommandClaim(
         command_key=original.command.command_key,
         claim_id="uncertain-replacement-claim",
@@ -3086,6 +3162,9 @@ def test_uncertain_effect_reclaim_after_claim_expiry_is_observation_only(
     assert persisted["claim_expected_revision"] == replacement_claim.expected_revision
     if not remote_visible:
         assert persisted["attempt_state"] == "uncertain"
+        assert persisted["result_digest"] is None
+    else:
+        assert persisted["attempt_state"] == "completed"
 
 
 def test_dispatch_ambiguity_fence_survives_restart_and_delayed_run_visibility() -> None:

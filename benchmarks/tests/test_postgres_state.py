@@ -76,6 +76,10 @@ GITHUB_EFFECT_FENCES_SQL = (
     if GITHUB_EFFECT_FENCES_PATH.exists()
     else ""
 )
+HISTORICAL_EFFECT_FENCE_FIXTURE = (
+    Path(__file__).parents[2]
+    / "benchmarks/tests/fixtures/postgres-4aa2ab5-github-effect-fences.sql"
+)
 EVENT_POLICY_CASES = (
     (EventType.STATE_TRANSITIONED, frozenset({"coordinator", "soak"}), "if"),
     (EventType.ROLE_RECORDED, frozenset({"builder"}), "if"),
@@ -225,6 +229,56 @@ def test_sql_uncertain_fence_reclaim_changes_claim_lineage_without_restoring_mut
         assert assignment in body
     assert "attempt_state = 'prepared'" not in body
     assert "RETURN QUERY SELECT false" in body
+
+
+def test_sql_completion_requires_exact_current_live_claim_and_adopted_fence_lineage() -> None:
+    completed = re.search(
+        r"FUNCTION\s+carl_autonomy\.mark_effect_completed\b.*?"
+        r"AS\s+\$\$(?P<body>.*?)\$\$;",
+        GITHUB_EFFECT_FENCES_SQL,
+        re.IGNORECASE | re.DOTALL,
+    )
+    assert completed is not None
+    body = completed.group("body")
+    for identity in (
+        "p_command_key",
+        "p_claim_id",
+        "p_command_revision",
+        "p_claim_expected_revision",
+        "p_claim_expires_at_text",
+    ):
+        assert identity in body
+    assert "carl_autonomy.commands" in body
+    assert body.count("FOR UPDATE") >= 2
+    assert "current_state.claim_expires_at <= p_observed_at" in body
+    assert "current_attempt.claim_id <> p_claim_id" in body
+    assert "current_attempt.command_revision <> p_command_revision" in body
+
+
+def test_effect_fence_migration_pins_and_validates_both_historical_starting_states() -> None:
+    assert HISTORICAL_EFFECT_FENCE_FIXTURE.is_file()
+    fixture_bytes = HISTORICAL_EFFECT_FENCE_FIXTURE.read_bytes()
+    assert hashlib.sha256(fixture_bytes).hexdigest() == (
+        "31666751b9c7e337b49d4a4316e1e0d67572aed2af879340e0498b99cbdf718a"
+    )
+    fixture = fixture_bytes.decode("utf-8")
+    assert "Source commit: 4aa2ab57779beecf61137bc6f994a82a5fb797c3" in fixture
+    assert (
+        "001 SHA-256: af8ee07b184fd0183b6810ce9e7f8946ce7e23736c02e7a39e2cada3dbcbf202" in fixture
+    )
+    assert (
+        "002 SHA-256: dffbd010b6d4d1c5bd6dbcdbcc5d35e4b33cf99557c3af35a246573192e668d1" in fixture
+    )
+    assert "CREATE TABLE carl_autonomy.effect_attempts" in fixture
+    assert "CREATE OR REPLACE FUNCTION carl_autonomy.mark_effect_completed" in fixture
+    for contract in (
+        "to_regclass('carl_autonomy.effect_attempts')",
+        "effect_fence_schema_invalid",
+        "information_schema.columns",
+        "pg_catalog.pg_get_userbyid",
+        "effect_attempts_reconciliation",
+    ):
+        assert contract in GITHUB_EFFECT_FENCES_SQL
 
 
 def test_shared_event_policy_keys_equal_production_event_type() -> None:
@@ -1192,6 +1246,42 @@ def test_postgres_adapter_persists_effect_rate_limit_retry_deadline() -> None:
         attempt.effect_key,
         "2026-08-20T12:02:00Z",
         "2026-08-20T12:00:01Z",
+    )
+
+
+def test_postgres_adapter_completion_binds_exact_live_claim_identity() -> None:
+    database = FakeDatabase()
+    database.responses["mark_effect_completed"] = [{"applied": True}]
+    backend = _backend(database)
+    attempt = _effect_attempt()
+
+    backend.mark_effect_completed(
+        attempt.effect_key,
+        command_key=attempt.command_key,
+        claim_id=attempt.claim_id,
+        command_revision=attempt.command_revision,
+        claim_expected_revision=attempt.claim_expected_revision,
+        claim_expires_at=attempt.claim_expires_at,
+        authority=attempt.authority,
+        result_digest="d" * 64,
+        observed_at="2026-08-20T12:00:02Z",
+    )
+
+    query, parameters = next(
+        (query, parameters)
+        for query, parameters in database.calls
+        if "carl_autonomy.mark_effect_completed" in query
+    )
+    assert query.startswith("SELECT * FROM")
+    assert parameters[:-1] == (
+        attempt.effect_key,
+        attempt.command_key,
+        attempt.claim_id,
+        attempt.command_revision,
+        attempt.claim_expected_revision,
+        attempt.claim_expires_at,
+        "d" * 64,
+        "2026-08-20T12:00:02Z",
     )
 
 

@@ -44,33 +44,6 @@ _MAX_RESPONSE_BYTES = 262_144
 _MAX_PAGES = 5
 _EFFECT_RECONCILIATION_DELAY = timedelta(seconds=30)
 _GRAPHQL_NODE_ID_RE = re.compile(r"^[A-Za-z0-9_=-]{1,256}$")
-_MARK_READY_MUTATION = """mutation MarkPullRequestReadyForReview($pullRequestId: ID!) {
-  markPullRequestReadyForReview(input: {pullRequestId: $pullRequestId}) {
-    pullRequest {
-      id
-      number
-      isDraft
-      baseRefName
-      headRefName
-      headRefOid
-      repository { nameWithOwner }
-    }
-  }
-}"""
-_ENABLE_AUTO_MERGE_MUTATION = """mutation EnablePullRequestAutoMerge($pullRequestId: ID!) {
-  enablePullRequestAutoMerge(input: {pullRequestId: $pullRequestId, mergeMethod: SQUASH}) {
-    pullRequest {
-      id
-      number
-      isDraft
-      baseRefName
-      headRefName
-      headRefOid
-      repository { nameWithOwner }
-      autoMergeRequest { mergeMethod }
-    }
-  }
-}"""
 
 
 class GitHubCloudError(ValueError):
@@ -151,7 +124,17 @@ class GitHubEffectStateController(Protocol):
     ) -> None: ...
 
     def mark_effect_completed(
-        self, effect_key: str, *, authority: str, result_digest: str, observed_at: str
+        self,
+        effect_key: str,
+        *,
+        command_key: str,
+        claim_id: str,
+        command_revision: int,
+        claim_expected_revision: int,
+        claim_expires_at: str,
+        authority: str,
+        result_digest: str,
+        observed_at: str,
     ) -> None: ...
 
 
@@ -160,6 +143,84 @@ class _ProtectedGitHubPolicy:
     repository: str
     workflow_ref: str
     dispatch_actor_login: str
+
+
+@dataclass(frozen=True, slots=True)
+class _GitHubGraphQLDocuments:
+    """Pinned protected-service operations; callers cannot supply generic GraphQL."""
+
+    mark_ready: str
+    enable_auto_merge: str
+    mark_ready_digest: str
+    enable_auto_merge_digest: str
+
+    @classmethod
+    def from_pinned_documents(
+        cls,
+        *,
+        mark_ready: str,
+        enable_auto_merge: str,
+        expected_mark_ready_digest: str,
+        expected_enable_auto_merge_digest: str,
+    ) -> _GitHubGraphQLDocuments:
+        for document in (mark_ready, enable_auto_merge):
+            if not isinstance(document, str) or not document or len(document.encode()) > 8_192:
+                raise GitHubCloudError("github_graphql_document_invalid")
+        mark_ready_digest = hashlib.sha256(mark_ready.encode()).hexdigest()
+        enable_auto_merge_digest = hashlib.sha256(enable_auto_merge.encode()).hexdigest()
+        if (
+            mark_ready_digest != expected_mark_ready_digest
+            or enable_auto_merge_digest != expected_enable_auto_merge_digest
+        ):
+            raise GitHubCloudError("github_graphql_document_invalid")
+        return cls(
+            mark_ready=mark_ready,
+            enable_auto_merge=enable_auto_merge,
+            mark_ready_digest=mark_ready_digest,
+            enable_auto_merge_digest=enable_auto_merge_digest,
+        )
+
+
+def _testing_graphql_documents() -> _GitHubGraphQLDocuments:
+    mark_ready = """mutation MarkPullRequestReadyForReview($pullRequestId: ID!) {
+  markPullRequestReadyForReview(input: {pullRequestId: $pullRequestId}) {
+    pullRequest {
+      id
+      number
+      isDraft
+      baseRefName
+      headRefName
+      headRefOid
+      repository { nameWithOwner }
+    }
+  }
+}"""
+    enable_auto_merge = (
+        "mutation EnablePullRequestAutoMerge($pullRequestId: ID!, "
+        "$expectedHeadOid: GitObjectID!) {\n"
+        "  enablePullRequestAutoMerge(input: {pullRequestId: $pullRequestId, "
+        "expectedHeadOid: $expectedHeadOid, mergeMethod: SQUASH}) {\n"
+        """    pullRequest {
+      id
+      number
+      isDraft
+      baseRefName
+      headRefName
+      headRefOid
+      repository { nameWithOwner }
+      autoMergeRequest { mergeMethod }
+    }
+  }
+}"""
+    )
+    return _GitHubGraphQLDocuments.from_pinned_documents(
+        mark_ready=mark_ready,
+        enable_auto_merge=enable_auto_merge,
+        expected_mark_ready_digest="49a7c81b57a1cdfb851fbaa6c3dfd374a892ed76c1f56afaf4282e147a62f973",
+        expected_enable_auto_merge_digest=(
+            "6a96f13af464b95dcd16d58fe01b851362c59893e24b842a40592b04765336f4"
+        ),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1346,9 +1407,29 @@ class _RejectingTestStateController:
         raise GitHubCloudError("github_effect_fence_invalid")
 
     def mark_effect_completed(
-        self, effect_key: str, *, authority: str, result_digest: str, observed_at: str
+        self,
+        effect_key: str,
+        *,
+        command_key: str,
+        claim_id: str,
+        command_revision: int,
+        claim_expected_revision: int,
+        claim_expires_at: str,
+        authority: str,
+        result_digest: str,
+        observed_at: str,
     ) -> None:
-        del effect_key, authority, result_digest, observed_at
+        del (
+            effect_key,
+            command_key,
+            claim_id,
+            command_revision,
+            claim_expected_revision,
+            claim_expires_at,
+            authority,
+            result_digest,
+            observed_at,
+        )
         raise GitHubCloudError("github_effect_fence_invalid")
 
 
@@ -1400,10 +1481,25 @@ class _ProtectedStateControllerClient:
         )
 
     def mark_effect_completed(
-        self, effect_key: str, *, authority: str, result_digest: str, observed_at: str
+        self,
+        effect_key: str,
+        *,
+        command_key: str,
+        claim_id: str,
+        command_revision: int,
+        claim_expected_revision: int,
+        claim_expires_at: str,
+        authority: str,
+        result_digest: str,
+        observed_at: str,
     ) -> None:
         self._backend.mark_effect_completed(
             effect_key,
+            command_key=command_key,
+            claim_id=claim_id,
+            command_revision=command_revision,
+            claim_expected_revision=claim_expected_revision,
+            claim_expires_at=claim_expires_at,
             authority=authority,
             result_digest=result_digest,
             observed_at=observed_at,
@@ -1423,6 +1519,7 @@ class _InjectedGitHubCloudGateway:
         state_controller: GitHubEffectStateController,
         workflow_ref: str,
         dispatch_actor_login: str,
+        graphql_documents: _GitHubGraphQLDocuments,
     ) -> None:
         del (
             repository,
@@ -1432,6 +1529,7 @@ class _InjectedGitHubCloudGateway:
             state_controller,
             workflow_ref,
             dispatch_actor_login,
+            graphql_documents,
         )
         raise GitHubCloudError("github_protected_configuration_required")
 
@@ -1446,6 +1544,7 @@ class _InjectedGitHubCloudGateway:
         state_controller: GitHubEffectStateController,
         workflow_ref: str,
         dispatch_actor_login: str,
+        graphql_documents: _GitHubGraphQLDocuments,
     ) -> _InjectedGitHubCloudGateway:
         if not isinstance(repository, str) or _REPOSITORY_RE.fullmatch(repository) is None:
             raise GitHubCloudError("github_repository_invalid")
@@ -1465,6 +1564,7 @@ class _InjectedGitHubCloudGateway:
             or not callable(getattr(state_controller, "mark_effect_uncertain", None))
             or not callable(getattr(state_controller, "mark_effect_retry_scheduled", None))
             or not callable(getattr(state_controller, "mark_effect_completed", None))
+            or not isinstance(graphql_documents, _GitHubGraphQLDocuments)
         ):
             raise GitHubCloudError("github_protected_configuration_invalid")
         gateway = object.__new__(cls)
@@ -1475,6 +1575,7 @@ class _InjectedGitHubCloudGateway:
         gateway._state_controller = state_controller
         gateway._workflow_ref = workflow_ref
         gateway._dispatch_actor_login = dispatch_actor_login
+        gateway._graphql_documents = graphql_documents
         return gateway
 
     @classmethod
@@ -1499,6 +1600,7 @@ class _InjectedGitHubCloudGateway:
             state_controller=state_controller,
             workflow_ref=workflow_ref,
             dispatch_actor_login=dispatch_actor_login,
+            graphql_documents=_testing_graphql_documents(),
         )
 
     def _now(self) -> datetime:
@@ -1594,19 +1696,27 @@ class _InjectedGitHubCloudGateway:
                 or type(body) is not dict
                 or set(body) != {"operationName", "query", "variables"}
                 or type(body["variables"]) is not dict
-                or set(body["variables"]) != {"pullRequestId"}
+                or "pullRequestId" not in body["variables"]
                 or not isinstance(body["variables"]["pullRequestId"], str)
                 or _GRAPHQL_NODE_ID_RE.fullmatch(body["variables"]["pullRequestId"]) is None
             ):
                 raise GitHubCloudError("github_endpoint_not_allowed")
             if (
                 body["operationName"] == "MarkPullRequestReadyForReview"
-                and body["query"] == _MARK_READY_MUTATION
+                and set(body["variables"]) == {"pullRequestId"}
+                and body["query"] == self._graphql_documents.mark_ready
+                and hashlib.sha256(body["query"].encode()).hexdigest()
+                == self._graphql_documents.mark_ready_digest
             ):
                 return "mark_pull_request_ready"
             if (
                 body["operationName"] == "EnablePullRequestAutoMerge"
-                and body["query"] == _ENABLE_AUTO_MERGE_MUTATION
+                and set(body["variables"]) == {"expectedHeadOid", "pullRequestId"}
+                and isinstance(body["variables"]["expectedHeadOid"], str)
+                and _OBJECT_RE.fullmatch(body["variables"]["expectedHeadOid"]) is not None
+                and body["query"] == self._graphql_documents.enable_auto_merge
+                and hashlib.sha256(body["query"].encode()).hexdigest()
+                == self._graphql_documents.enable_auto_merge_digest
             ):
                 return "enable_pull_request_auto_merge"
             raise GitHubCloudError("github_endpoint_not_allowed")
@@ -1956,6 +2066,11 @@ class _InjectedGitHubCloudGateway:
         now = self._now().isoformat().replace("+00:00", "Z")
         self._state_controller.mark_effect_completed(
             authorization.attempt.effect_key,
+            command_key=authorization.attempt.command_key,
+            claim_id=authorization.attempt.claim_id,
+            command_revision=authorization.attempt.command_revision,
+            claim_expected_revision=authorization.attempt.claim_expected_revision,
+            claim_expires_at=authorization.attempt.claim_expires_at,
             authority=authorization.binding.authority,
             result_digest=result_digest,
             observed_at=now,
@@ -2827,7 +2942,7 @@ class _InjectedGitHubCloudGateway:
                 binding,
                 payload={
                     "operationName": "MarkPullRequestReadyForReview",
-                    "query": _MARK_READY_MUTATION,
+                    "query": self._graphql_documents.mark_ready,
                     "variables": {"pullRequestId": observed.node_id},
                 },
             )
@@ -2844,7 +2959,7 @@ class _InjectedGitHubCloudGateway:
             )
         payload = {
             "operationName": "MarkPullRequestReadyForReview",
-            "query": _MARK_READY_MUTATION,
+            "query": self._graphql_documents.mark_ready,
             "variables": {"pullRequestId": observed.node_id},
         }
         authorization = self._prepare_effect_authorization(
@@ -2958,8 +3073,11 @@ class _InjectedGitHubCloudGateway:
                 binding,
                 payload={
                     "operationName": "EnablePullRequestAutoMerge",
-                    "query": _ENABLE_AUTO_MERGE_MUTATION,
-                    "variables": {"pullRequestId": observed.node_id},
+                    "query": self._graphql_documents.enable_auto_merge,
+                    "variables": {
+                        "expectedHeadOid": request.head_sha,
+                        "pullRequestId": observed.node_id,
+                    },
                 },
             )
             self._mark_effect_completed(
@@ -2975,8 +3093,11 @@ class _InjectedGitHubCloudGateway:
             )
         payload = {
             "operationName": "EnablePullRequestAutoMerge",
-            "query": _ENABLE_AUTO_MERGE_MUTATION,
-            "variables": {"pullRequestId": observed.node_id},
+            "query": self._graphql_documents.enable_auto_merge,
+            "variables": {
+                "expectedHeadOid": request.head_sha,
+                "pullRequestId": observed.node_id,
+            },
         }
         authorization = self._prepare_effect_authorization(
             state,
