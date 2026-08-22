@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import subprocess
 from collections import deque
+from contextlib import suppress
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from inspect import getmembers, isfunction, signature
@@ -46,6 +47,34 @@ _CANDIDATE_COMMIT = "2" * 40
 _WORKFLOW_REF = "main"
 _DISPATCH_ACTOR = "carl-autonomy[bot]"
 _REPOSITORY_ROOT = Path(__file__).parents[2]
+_PULL_REQUEST_NODE_ID = "PR_kwDOAutonomy81"
+_MARK_READY_MUTATION = """mutation MarkPullRequestReadyForReview($pullRequestId: ID!) {
+  markPullRequestReadyForReview(input: {pullRequestId: $pullRequestId}) {
+    pullRequest {
+      id
+      number
+      isDraft
+      baseRefName
+      headRefName
+      headRefOid
+      repository { nameWithOwner }
+    }
+  }
+}"""
+_ENABLE_AUTO_MERGE_MUTATION = """mutation EnablePullRequestAutoMerge($pullRequestId: ID!) {
+  enablePullRequestAutoMerge(input: {pullRequestId: $pullRequestId, mergeMethod: SQUASH}) {
+    pullRequest {
+      id
+      number
+      isDraft
+      baseRefName
+      headRefName
+      headRefOid
+      repository { nameWithOwner }
+      autoMergeRequest { mergeMethod }
+    }
+  }
+}"""
 
 
 @dataclass
@@ -110,6 +139,10 @@ class FakeDurableEffectController:
         ):
             self.attempts[effect_key] = dict(document)
             return True
+        if existing["attempt_state"] == "uncertain":
+            existing.update({key: document[key] for key in claim_fields})
+            existing["observed_at"] = document["observed_at"]
+            return False
         if any(existing[key] != document[key] for key in claim_fields):
             raise GitHubCloudError("github_effect_fence_conflict")
         return False
@@ -873,7 +906,7 @@ def test_rate_limit_becomes_a_durable_retry_decision_without_sleeping() -> None:
         pytest.param("checks-get", "GET", id="get-required-checks"),
         pytest.param("dispatch-post", "POST", id="post-workflow-dispatch"),
         pytest.param("pull-patch", "PATCH", id="patch-pull-request"),
-        pytest.param("auto-merge-put", "PUT", id="put-auto-merge"),
+        pytest.param("auto-merge-post", "POST", id="post-auto-merge"),
     ],
 )
 def test_primary_and_secondary_limits_are_normalized_across_public_http_verbs(
@@ -1409,8 +1442,60 @@ def _pull_request_body(
         f'"draft":{str(draft).lower()},'
         f'"head":{{"ref":"{head_branch}","sha":"{head_sha}"}},'
         '"html_url":"https://github.com/StephenBickel/carl-agent/pull/81",'
+        f'"node_id":"{_PULL_REQUEST_NODE_ID}",'
         f'"number":81,"state":"open","title":"{title}"}}'
     ).encode()
+
+
+def _ready_graphql_response(*, head_sha: str = _CANDIDATE_COMMIT) -> GitHubHttpResponse:
+    return _json_response(
+        200,
+        json.dumps(
+            {
+                "data": {
+                    "markPullRequestReadyForReview": {
+                        "pullRequest": {
+                            "baseRefName": "main",
+                            "headRefName": "experimental/exp-001",
+                            "headRefOid": head_sha,
+                            "id": _PULL_REQUEST_NODE_ID,
+                            "isDraft": False,
+                            "number": 81,
+                            "repository": {"nameWithOwner": "StephenBickel/carl-agent"},
+                        }
+                    }
+                }
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode(),
+    )
+
+
+def _auto_merge_graphql_response(*, head_sha: str = _CANDIDATE_COMMIT) -> GitHubHttpResponse:
+    return _json_response(
+        200,
+        json.dumps(
+            {
+                "data": {
+                    "enablePullRequestAutoMerge": {
+                        "pullRequest": {
+                            "autoMergeRequest": {"mergeMethod": "SQUASH"},
+                            "baseRefName": "main",
+                            "headRefName": "experimental/exp-001",
+                            "headRefOid": head_sha,
+                            "id": _PULL_REQUEST_NODE_ID,
+                            "isDraft": False,
+                            "number": 81,
+                            "repository": {"nameWithOwner": "StephenBickel/carl-agent"},
+                        }
+                    }
+                }
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode(),
+    )
 
 
 def _pull_request_list(
@@ -1785,15 +1870,14 @@ def _ready_request() -> PullRequestReadyRequest:
     )
 
 
-def test_mark_ready_reconciles_before_and_after_one_transition() -> None:
+def test_mark_ready_uses_the_closed_typed_github_graphql_mutation() -> None:
     request = _ready_request()
     binding = pull_request_ready_binding("StephenBickel/carl-agent", request)
     transport = FakeTransport(
         deque(
             [
                 _json_response(200, _pull_request_body(draft=True)),
-                GitHubTransportError("github_response_ambiguous", ambiguous=True),
-                _json_response(200, _pull_request_body(draft=False)),
+                _ready_graphql_response(),
             ]
         )
     )
@@ -1810,12 +1894,15 @@ def test_mark_ready_reconciles_before_and_after_one_transition() -> None:
         request,
     )
 
-    assert result.status == "reconciled"
+    assert result.status == "updated"
     assert result.draft is False
-    assert transport.requests[1].path == (
-        "/repos/StephenBickel/carl-agent/pulls/81/ready_for_review"
-    )
-    assert [item.method for item in transport.requests] == ["GET", "POST", "GET"]
+    assert transport.requests[1].path == "/graphql"
+    assert transport.requests[1].json_body == {
+        "operationName": "MarkPullRequestReadyForReview",
+        "query": _MARK_READY_MUTATION,
+        "variables": {"pullRequestId": _PULL_REQUEST_NODE_ID},
+    }
+    assert [item.method for item in transport.requests] == ["GET", "POST"]
     assert sum(item.method == "POST" for item in transport.requests) == 1
 
 
@@ -1828,15 +1915,14 @@ def _auto_merge_request() -> PullRequestAutoMergeRequest:
     )
 
 
-def test_auto_merge_enablement_is_squash_only_and_reconciles_lost_response() -> None:
+def test_auto_merge_uses_the_closed_typed_squash_github_graphql_mutation() -> None:
     request = _auto_merge_request()
     binding = pull_request_auto_merge_binding("StephenBickel/carl-agent", request)
     transport = FakeTransport(
         deque(
             [
                 _json_response(200, _pull_request_body(draft=False)),
-                GitHubTransportError("github_response_ambiguous", ambiguous=True),
-                _json_response(200, _pull_request_body(draft=False, auto_merge=True)),
+                _auto_merge_graphql_response(),
             ]
         )
     )
@@ -1853,12 +1939,28 @@ def test_auto_merge_enablement_is_squash_only_and_reconciles_lost_response() -> 
         request,
     )
 
-    assert result.status == "reconciled"
+    assert result.status == "updated"
     assert result.auto_merge_enabled is True
-    assert transport.requests[1].path == ("/repos/StephenBickel/carl-agent/pulls/81/auto-merge")
-    assert transport.requests[1].json_body == {"merge_method": "squash"}
-    assert [item.method for item in transport.requests] == ["GET", "PUT", "GET"]
-    assert sum(item.method == "PUT" for item in transport.requests) == 1
+    assert transport.requests[1].path == "/graphql"
+    assert transport.requests[1].json_body == {
+        "operationName": "EnablePullRequestAutoMerge",
+        "query": _ENABLE_AUTO_MERGE_MUTATION,
+        "variables": {"pullRequestId": _PULL_REQUEST_NODE_ID},
+    }
+    assert [item.method for item in transport.requests] == ["GET", "POST"]
+    assert sum(item.method == "POST" for item in transport.requests) == 1
+
+
+def test_pinned_official_github_schema_supports_only_the_closed_pull_mutations() -> None:
+    schema = (
+        _REPOSITORY_ROOT / "benchmarks/tests/fixtures/github-graphql-pull-mutations.graphql"
+    ).read_text(encoding="utf-8")
+
+    assert "markPullRequestReadyForReview(input: MarkPullRequestReadyForReviewInput!)" in schema
+    assert "enablePullRequestAutoMerge(input: EnablePullRequestAutoMergeInput!)" in schema
+    assert "pullRequestId: ID!" in schema
+    assert "mergeMethod: PullRequestMergeMethod = MERGE" in schema
+    assert "SQUASH" in schema
 
 
 @pytest.mark.parametrize("action", ["update", "ready", "auto-merge"])
@@ -1879,22 +1981,12 @@ def test_pull_effect_head_race_is_persisted_uncertain(action: str) -> None:
         request = _ready_request()
         binding = pull_request_ready_binding("StephenBickel/carl-agent", request)
         before = _json_response(200, _pull_request_body(draft=True))
-        after = _json_response(
-            200,
-            _pull_request_body(draft=False, head_sha="3" * 40),
-        )
+        after = _ready_graphql_response(head_sha="3" * 40)
     else:
         request = _auto_merge_request()
         binding = pull_request_auto_merge_binding("StephenBickel/carl-agent", request)
         before = _json_response(200, _pull_request_body(draft=False))
-        after = _json_response(
-            200,
-            _pull_request_body(
-                draft=False,
-                auto_merge=True,
-                head_sha="3" * 40,
-            ),
-        )
+        after = _auto_merge_graphql_response(head_sha="3" * 40)
     state = _claimed_effect_command(
         binding,
         authority="promoter",
@@ -2651,6 +2743,20 @@ def test_protected_policy_symlink_is_rejected(tmp_path, monkeypatch: pytest.Monk
         pytest.param("POST", "/graphql", (), {}, id="graphql"),
         pytest.param(
             "POST",
+            "/repos/StephenBickel/carl-agent/pulls/81/ready_for_review",
+            (),
+            {},
+            id="fake-rest-ready",
+        ),
+        pytest.param(
+            "PUT",
+            "/repos/StephenBickel/carl-agent/pulls/81/auto-merge",
+            (),
+            {"merge_method": "squash"},
+            id="fake-rest-auto-merge",
+        ),
+        pytest.param(
+            "POST",
             "/repos/StephenBickel/carl-agent/git/refs",
             (),
             {"ref": "refs/heads/main", "sha": _CANDIDATE_COMMIT},
@@ -2680,7 +2786,7 @@ def test_internal_http_boundary_rejects_non_allowlisted_effects_before_transport
     )
 
     with pytest.raises(GitHubCloudError, match="github_endpoint_not_allowed"):
-        gateway._request(method, path, query=query, body=body)
+        gateway._validate_endpoint(method=method, path=path, query=query, body=body)
 
     assert transport.requests == []
 
@@ -2707,6 +2813,154 @@ def test_production_factory_exposes_no_transport_clock_or_credential_callback(
         GitHubCloudGateway.from_protected_environment(transport=recorder, clock=_clock)
 
     assert recorder.requests == []
+
+
+def test_production_gateway_rejects_post_construction_dependency_and_policy_substitution(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    policy_dir = tmp_path / "protected"
+    policy_dir.mkdir(mode=0o700)
+    policy_path = policy_dir / "github-cloud-policy.json"
+    policy_path.write_bytes(
+        b'{"api_origin":"https://api.github.com",'
+        b'"dispatch_actor_login":"carl-autonomy[bot]",'
+        b'"repository":"StephenBickel/carl-agent","schema_version":1,'
+        b'"workflow_ref":"main"}'
+    )
+    policy_path.chmod(0o600)
+    monkeypatch.setattr(github_cloud, "_PROTECTED_CONFIG_DIR", policy_dir)
+    monkeypatch.setenv("CARL_GITHUB_APP_INSTALLATION_TOKEN", "github_pat_protected_test")
+    state = _claimed_dispatch_command(_request())
+    controller = FakeDurableEffectController(commands={state.command.command_key: state})
+    protected_transport = FakeTransport(
+        deque([_empty_runs(), GitHubHttpResponse(status=204, headers=(), body=b"")])
+    )
+    recorder = FakeTransport(
+        deque([_empty_runs(), GitHubHttpResponse(status=204, headers=(), body=b"")])
+    )
+    monkeypatch.setattr(github_cloud, "_ProtectedGitHubTransport", lambda: protected_transport)
+    monkeypatch.setattr(github_cloud, "_system_clock", _clock)
+    monkeypatch.setattr(github_cloud, "_ProtectedStateControllerClient", lambda: controller)
+    gateway = GitHubCloudGateway.from_protected_environment()
+
+    with suppress(AttributeError, TypeError, GitHubCloudError):
+        object.__setattr__(gateway, "_transport", recorder)
+    gateway.dispatch_workflow(state.command.command_key, _request())
+
+    assert recorder.requests == []
+    assert [request.method for request in protected_transport.requests] == ["GET", "POST"]
+    for attribute, replacement in (
+        ("_state_controller", FakeDurableEffectController(commands={})),
+        ("_clock", lambda: datetime(2030, 1, 1, tzinfo=UTC)),
+        ("_token", "attacker-token"),
+        ("_repository", "attacker/repository"),
+        ("_workflow_ref", "attacker-ref"),
+        ("_dispatch_actor_login", "attacker[bot]"),
+    ):
+        fresh = GitHubCloudGateway.from_protected_environment()
+        with pytest.raises((AttributeError, TypeError, GitHubCloudError)):
+            setattr(fresh, attribute, replacement)
+        with pytest.raises((AttributeError, TypeError, GitHubCloudError)):
+            object.__setattr__(fresh, attribute, replacement)
+        with pytest.raises((AttributeError, TypeError, GitHubCloudError)):
+            object.__delattr__(fresh, attribute)
+
+
+def test_reflected_effect_authority_cannot_forge_a_raw_mutation() -> None:
+    request = _experimental_request()
+    binding = experimental_branch_binding("StephenBickel/carl-agent", request)
+    state = _claimed_effect_command(
+        binding,
+        authority="builder",
+        operation="publish_experimental",
+        claim_id="reflective-forgery-claim",
+    )
+    reflected = vars(github_cloud)
+    authorization_type = reflected.get("_EffectAuthorization")
+    authorization_key = reflected.get("_PRIVATE_EFFECT_AUTHORIZATION_KEY")
+    transport = FakeTransport(deque([_exact_ref()]))
+    gateway = _gateway_with_state(state, transport)
+    raw_request = getattr(gateway, "_request", None)
+    if authorization_type is None or authorization_key is None or raw_request is None:
+        assert not callable(raw_request)
+        assert transport.requests == []
+        return
+    attempt = github_cloud.GitHubEffectAttempt(
+        schema_version=1,
+        effect_key=state.command.effect_key,
+        command_key=state.command.command_key,
+        claim_id=state.claim.claim_id,
+        command_revision=state.revision,
+        claim_expected_revision=state.claim.expected_revision,
+        action=binding.action,
+        endpoint_id=binding.endpoint_id,
+        method=binding.method,
+        payload_digest=binding.payload_digest,
+        command_request_digest=state.command.request_digest,
+        repository=binding.repository,
+        target_identity=binding.target_identity,
+        request_key=binding.request_key,
+        attempt_key=binding.attempt_key,
+        authority=binding.authority,
+        operation=binding.operation,
+        command_occurred_at=state.command.occurred_at,
+        claim_expires_at=state.claim.expires_at,
+        attempt_state="prepared",
+        not_before="2026-08-21T12:00:30Z",
+        observed_at=_NOW,
+    )
+    forged = authorization_type(
+        state=state,
+        binding=binding,
+        attempt=attempt,
+        may_mutate=True,
+        _construction_key=authorization_key,
+    )
+
+    with pytest.raises(GitHubCloudError, match="github_effect_authorization_required"):
+        raw_request(
+            "POST",
+            "/repos/StephenBickel/carl-agent/git/refs",
+            body={"ref": "refs/heads/experimental/exp-001", "sha": _CANDIDATE_COMMIT},
+            authorization=forged,
+        )
+
+    assert transport.requests == []
+
+
+def test_reflected_observation_authority_cannot_forge_a_raw_get() -> None:
+    request = _experimental_request()
+    binding = experimental_branch_binding("StephenBickel/carl-agent", request)
+    state = _claimed_effect_command(
+        binding,
+        authority="builder",
+        operation="publish_experimental",
+        claim_id="reflective-observation-forgery-claim",
+    )
+    reflected = vars(github_cloud)
+    authorization_type = reflected.get("_ObservationAuthorization")
+    authorization_key = reflected.get("_PRIVATE_OBSERVATION_AUTHORIZATION_KEY")
+    transport = FakeTransport(deque([_exact_ref()]))
+    gateway = _gateway_with_state(state, transport)
+    raw_request = getattr(gateway, "_request", None)
+    if authorization_type is None or authorization_key is None or raw_request is None:
+        assert not callable(raw_request)
+        assert transport.requests == []
+        return
+    forged = authorization_type(
+        state=state,
+        binding=binding,
+        _construction_key=authorization_key,
+    )
+
+    with pytest.raises(GitHubCloudError, match="github_observation_authorization_required"):
+        raw_request(
+            "GET",
+            "/repos/StephenBickel/carl-agent/git/ref/heads/experimental/exp-01",
+            authorization=forged,
+        )
+
+    assert transport.requests == []
 
 
 def test_forged_command_state_and_raw_private_request_cannot_reach_mutation_transport() -> None:
@@ -2742,20 +2996,7 @@ def test_forged_command_state_and_raw_private_request_cannot_reach_mutation_tran
 
     with pytest.raises(GitHubCloudError, match="github_command_reference_invalid"):
         gateway.create_or_reconcile_experimental_branch(forged, request)
-    with pytest.raises(GitHubCloudError, match="github_effect_authorization_required"):
-        gateway._request(
-            "POST",
-            "/repos/StephenBickel/carl-agent/git/refs",
-            body={
-                "ref": "refs/heads/experimental/exp-01",
-                "sha": _CANDIDATE_COMMIT,
-            },
-        )
-    with pytest.raises(GitHubCloudError, match="github_observation_authorization_required"):
-        gateway._request(
-            "GET",
-            "/repos/StephenBickel/carl-agent/pulls/81",
-        )
+    assert not callable(getattr(gateway, "_request", None))
 
     assert transport.requests == []
 
@@ -2824,6 +3065,65 @@ def test_ambiguous_effect_fence_survives_gateway_restart_and_prevents_duplicate_
 
     assert reconciled.status == "reconciled"
     assert [item.method for item in visible_transport.requests] == ["GET"]
+
+
+@pytest.mark.parametrize("remote_visible", [False, True], ids=["still-absent", "delayed-visible"])
+def test_uncertain_effect_reclaim_after_claim_expiry_is_observation_only(
+    remote_visible: bool,
+) -> None:
+    request = _experimental_request()
+    binding = experimental_branch_binding("StephenBickel/carl-agent", request)
+    original = _claimed_effect_command(
+        binding,
+        authority="builder",
+        operation="publish_experimental",
+        claim_id="uncertain-original-claim",
+    )
+    controller = FakeDurableEffectController(commands={original.command.command_key: original})
+    first_transport = FakeTransport(
+        deque(
+            [
+                _missing_ref(),
+                GitHubTransportError("connection_lost", ambiguous=True),
+                _missing_ref(),
+            ]
+        )
+    )
+    first = _gateway_with_controller(controller, first_transport)
+    uncertain = first.create_or_reconcile_experimental_branch(original.command.command_key, request)
+    assert uncertain.status == "uncertain"
+    original_attempt = dict(controller.attempts[original.command.effect_key])
+
+    replacement_claim = CommandClaim(
+        command_key=original.command.command_key,
+        claim_id="uncertain-replacement-claim",
+        authority="builder",
+        expected_revision=10,
+        claimed_at="2026-08-21T12:06:01Z",
+        expires_at="2026-08-21T12:16:01Z",
+    )
+    replacement = replace(original, revision=11, claim=replacement_claim)
+    controller.commands[original.command.command_key] = replacement
+    replay_transport = FakeTransport(deque([_exact_ref() if remote_visible else _missing_ref()]))
+
+    def replay_clock() -> datetime:
+        return datetime(2026, 8, 21, 12, 6, 2, tzinfo=UTC)
+
+    replay = _gateway_with_controller(
+        controller,
+        replay_transport,
+        clock=replay_clock,
+    ).create_or_reconcile_experimental_branch(replacement.command.command_key, request)
+
+    assert replay.status == ("reconciled" if remote_visible else "uncertain")
+    assert [item.method for item in replay_transport.requests] == ["GET"]
+    persisted = controller.attempts[original.command.effect_key]
+    assert persisted["command_occurred_at"] == original_attempt["command_occurred_at"]
+    assert persisted["claim_id"] == replacement_claim.claim_id
+    assert persisted["command_revision"] == replacement.revision
+    assert persisted["claim_expected_revision"] == replacement_claim.expected_revision
+    if not remote_visible:
+        assert persisted["attempt_state"] == "uncertain"
 
 
 def test_dispatch_ambiguity_fence_survives_restart_and_delayed_run_visibility() -> None:
@@ -3015,7 +3315,7 @@ def test_auto_merge_ambiguity_fence_survives_restart_and_delayed_visibility() ->
     )
 
     assert first.status == "uncertain"
-    assert [item.method for item in first_transport.requests] == ["GET", "PUT", "GET"]
+    assert [item.method for item in first_transport.requests] == ["GET", "POST", "GET"]
 
     replay_transport = FakeTransport(deque([disabled]))
     replay = _gateway_with_controller(controller, replay_transport).enable_pull_request_auto_merge(

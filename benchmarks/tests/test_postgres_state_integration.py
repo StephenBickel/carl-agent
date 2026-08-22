@@ -60,10 +60,14 @@ pytestmark = pytest.mark.skipif(
 )
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
-MIGRATIONS = (
+BASE_MIGRATIONS = (
     REPOSITORY_ROOT / "infra/autonomy/postgres/001_initial.sql",
     REPOSITORY_ROOT / "infra/autonomy/postgres/002_role_procedures.sql",
 )
+GITHUB_EFFECT_FENCES_MIGRATION = (
+    REPOSITORY_ROOT / "infra/autonomy/postgres/003_github_effect_fences.sql"
+)
+MIGRATIONS = (*BASE_MIGRATIONS, GITHUB_EFFECT_FENCES_MIGRATION)
 NOW = "2026-08-20T12:00:00Z"
 DIGEST_A = "a" * 64
 DIGEST_B = "b" * 64
@@ -640,6 +644,172 @@ def _required_tables(connection: object) -> set[str]:
     return {row["table_name"] for row in rows}
 
 
+def test_additive_effect_fence_migration_upgrades_a_populated_001_002_schema(
+    postgres: object,
+) -> None:
+    from psycopg.rows import dict_row
+
+    assert POSTGRES_DSN is not None
+    assert GITHUB_EFFECT_FENCES_MIGRATION.is_file()
+    with postgres.connect(POSTGRES_DSN, autocommit=True, row_factory=dict_row) as admin:  # type: ignore[attr-defined]
+        admin.execute("DROP SCHEMA IF EXISTS carl_autonomy CASCADE")
+        for migration in BASE_MIGRATIONS:
+            admin.execute(migration.read_text(encoding="utf-8"), prepare=False)
+    try:
+        manifest = sample_manifest()
+        event = _full_event_history()[0]
+        command = _command()
+        lease = CloudLease(
+            lease_key="upgrade-coordinator",
+            holder_id="upgrade-worker-001",
+            authority="coordinator",
+            revision=0,
+            acquired_at=NOW,
+            expires_at="2026-08-20T12:10:00Z",
+        )
+        evidence = EvidenceObject(
+            digest=DIGEST_A,
+            object_key=f"evidence/{DIGEST_A}",
+            object_version="upgrade-version-001",
+            producer="observer",
+            request_digest=DIGEST_B,
+            media_type="application/json",
+            retained_until="2027-08-20T12:00:00Z",
+        )
+        with _as_role(postgres, "carl_builder") as builder:
+            assert _register_manifest(builder, manifest) is True
+        with _as_role(postgres, "carl_coordinator") as coordinator:
+            assert _append_event(coordinator, event)["appended"] is True
+            assert (
+                coordinator.execute(
+                    "SELECT * FROM carl_autonomy.create_command(%s, %s)",
+                    (_canonical(command.to_canonical_dict()), NOW),
+                ).fetchone()["applied"]
+                is True
+            )
+            assert (
+                coordinator.execute(
+                    "SELECT * FROM carl_autonomy.acquire_lease(%s, %s)",
+                    (_canonical(lease.to_canonical_dict()), NOW),
+                ).fetchone()["applied"]
+                is True
+            )
+        with _as_role(postgres, "carl_observer") as observer:
+            assert (
+                observer.execute(
+                    "SELECT * FROM carl_autonomy.register_evidence(%s, %s)",
+                    (_canonical(evidence.to_canonical_dict()), NOW),
+                ).fetchone()["applied"]
+                is True
+            )
+
+        with postgres.connect(POSTGRES_DSN, autocommit=True, row_factory=dict_row) as admin:  # type: ignore[attr-defined]
+            before = admin.execute(
+                "SELECT "
+                "(SELECT count(*) FROM carl_autonomy.experiment_manifests) AS manifests, "
+                "(SELECT count(*) FROM carl_autonomy.experiment_events) AS events, "
+                "(SELECT count(*) FROM carl_autonomy.commands) AS commands, "
+                "(SELECT count(*) FROM carl_autonomy.leases) AS leases, "
+                "(SELECT count(*) FROM carl_autonomy.evidence_objects) AS evidence"
+            ).fetchone()
+            admin.execute(
+                GITHUB_EFFECT_FENCES_MIGRATION.read_text(encoding="utf-8"),
+                prepare=False,
+            )
+            after = admin.execute(
+                "SELECT "
+                "(SELECT count(*) FROM carl_autonomy.experiment_manifests) AS manifests, "
+                "(SELECT count(*) FROM carl_autonomy.experiment_events) AS events, "
+                "(SELECT count(*) FROM carl_autonomy.commands) AS commands, "
+                "(SELECT count(*) FROM carl_autonomy.leases) AS leases, "
+                "(SELECT count(*) FROM carl_autonomy.evidence_objects) AS evidence"
+            ).fetchone()
+            privileges = admin.execute(
+                "SELECT "
+                "has_table_privilege('carl_state_backend', "
+                "'carl_autonomy.effect_attempts', 'INSERT') AS direct_insert, "
+                "has_function_privilege('carl_state_backend', "
+                "'carl_autonomy.prepare_effect_attempt(text,timestamptz)', "
+                "'EXECUTE') AS execute_prepare"
+            ).fetchone()
+        assert (
+            before
+            == after
+            == {
+                "commands": 1,
+                "events": 1,
+                "evidence": 1,
+                "leases": 1,
+                "manifests": 1,
+            }
+        )
+        assert privileges == {"direct_insert": False, "execute_prepare": True}
+
+        claim = _claim()
+        attempt = GitHubEffectAttempt(
+            schema_version=1,
+            effect_key=command.effect_key,
+            command_key=command.command_key,
+            claim_id=claim.claim_id,
+            command_revision=8,
+            claim_expected_revision=claim.expected_revision,
+            action="dispatch_workflow",
+            endpoint_id="workflow_dispatch",
+            method="POST",
+            payload_digest="c" * 64,
+            command_request_digest=command.request_digest,
+            repository="StephenBickel/carl-agent",
+            target_identity="autonomous-improvement.yml@" + "1" * 40,
+            request_key="cloud-run-request-upgrade-001",
+            attempt_key="cloud-run-request-upgrade-001-attempt-1",
+            authority=command.authority,
+            operation=command.operation,
+            command_occurred_at=command.occurred_at,
+            claim_expires_at=claim.expires_at,
+            attempt_state="prepared",
+            not_before="2026-08-20T12:00:30Z",
+            observed_at=NOW,
+        )
+        with _as_role(postgres, "carl_coordinator") as coordinator:
+            coordinator.execute(
+                "SELECT * FROM carl_autonomy.claim_command(%s, %s)",
+                (_canonical(claim.to_canonical_dict()), NOW),
+            ).fetchone()
+            prepared = coordinator.execute(
+                "SELECT * FROM carl_autonomy.prepare_effect_attempt(%s, %s)",
+                (_canonical(attempt.to_canonical_dict()), NOW),
+            ).fetchone()
+            uncertain = coordinator.execute(
+                "SELECT * FROM carl_autonomy.mark_effect_uncertain(%s, %s, %s, %s)",
+                (
+                    attempt.effect_key,
+                    attempt.not_before,
+                    "2026-08-20T12:00:01Z",
+                    "2026-08-20T12:00:01Z",
+                ),
+            ).fetchone()
+            completed = coordinator.execute(
+                "SELECT * FROM carl_autonomy.mark_effect_completed(%s, %s, %s, %s)",
+                (
+                    attempt.effect_key,
+                    DIGEST_B,
+                    "2026-08-20T12:00:02Z",
+                    "2026-08-20T12:00:02Z",
+                ),
+            ).fetchone()
+        assert (prepared["applied"], uncertain["applied"], completed["applied"]) == (
+            True,
+            True,
+            True,
+        )
+    finally:
+        with postgres.connect(POSTGRES_DSN, autocommit=True) as admin:  # type: ignore[attr-defined]
+            admin.execute("DROP SCHEMA IF EXISTS carl_autonomy CASCADE")
+            for migration in MIGRATIONS:
+                if migration.is_file():
+                    admin.execute(migration.read_text(encoding="utf-8"), prepare=False)
+
+
 def test_schema_has_all_strict_transactional_state_tables(postgres: object) -> None:
     from psycopg.rows import dict_row
 
@@ -648,6 +818,7 @@ def test_schema_has_all_strict_transactional_state_tables(postgres: object) -> N
         assert _required_tables(connection) == {
             "commands",
             "dead_holder_observations",
+            "effect_attempts",
             "evidence_objects",
             "experiment_events",
             "experiment_manifests",

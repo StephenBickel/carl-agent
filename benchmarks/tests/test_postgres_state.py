@@ -68,6 +68,14 @@ ROLE_PROCEDURES_SQL = (
 INITIAL_SQL = (Path(__file__).parents[2] / "infra/autonomy/postgres/001_initial.sql").read_text(
     encoding="utf-8"
 )
+GITHUB_EFFECT_FENCES_PATH = (
+    Path(__file__).parents[2] / "infra/autonomy/postgres/003_github_effect_fences.sql"
+)
+GITHUB_EFFECT_FENCES_SQL = (
+    GITHUB_EFFECT_FENCES_PATH.read_text(encoding="utf-8")
+    if GITHUB_EFFECT_FENCES_PATH.exists()
+    else ""
+)
 EVENT_POLICY_CASES = (
     (EventType.STATE_TRANSITIONED, frozenset({"coordinator", "soak"}), "if"),
     (EventType.ROLE_RECORDED, frozenset({"builder"}), "if"),
@@ -93,9 +101,20 @@ EVENT_POLICY_CASES = (
 
 
 def test_sql_persists_exact_effect_fence_before_network_and_reuses_it_on_restart() -> None:
-    assert re.search(
+    assert GITHUB_EFFECT_FENCES_PATH.is_file()
+    assert not re.search(
         r"CREATE\s+TABLE\s+carl_autonomy\.effect_attempts",
         INITIAL_SQL,
+        re.IGNORECASE,
+    )
+    assert not re.search(
+        r"FUNCTION\s+carl_autonomy\.(?:prepare_effect_attempt|mark_effect_uncertain)",
+        ROLE_PROCEDURES_SQL,
+        re.IGNORECASE,
+    )
+    assert re.search(
+        r"CREATE\s+TABLE\s+carl_autonomy\.effect_attempts",
+        GITHUB_EFFECT_FENCES_SQL,
         re.IGNORECASE,
     )
     for column in (
@@ -108,7 +127,7 @@ def test_sql_persists_exact_effect_fence_before_network_and_reuses_it_on_restart
         "not_before",
         "attempt_json",
     ):
-        assert re.search(rf"\b{column}\b", INITIAL_SQL, re.IGNORECASE)
+        assert re.search(rf"\b{column}\b", GITHUB_EFFECT_FENCES_SQL, re.IGNORECASE)
     for function_name in (
         "resolve_claimed_command",
         "prepare_effect_attempt",
@@ -118,13 +137,13 @@ def test_sql_persists_exact_effect_fence_before_network_and_reuses_it_on_restart
     ):
         assert re.search(
             rf"FUNCTION\s+carl_autonomy\.{function_name}\b",
-            ROLE_PROCEDURES_SQL,
+            GITHUB_EFFECT_FENCES_SQL,
             re.IGNORECASE,
         )
     prepare = re.search(
         r"FUNCTION\s+carl_autonomy\.prepare_effect_attempt\b.*?"
         r"AS\s+\$\$(?P<body>.*?)\$\$;",
-        ROLE_PROCEDURES_SQL,
+        GITHUB_EFFECT_FENCES_SQL,
         re.IGNORECASE | re.DOTALL,
     )
     assert prepare is not None
@@ -139,13 +158,13 @@ def test_sql_persists_exact_effect_fence_before_network_and_reuses_it_on_restart
 def test_sql_effect_fence_can_rearm_only_after_a_durable_rate_limit_deadline() -> None:
     assert re.search(
         r"attempt_state\s+IN\s*\([^)]*'retry_scheduled'",
-        INITIAL_SQL,
+        GITHUB_EFFECT_FENCES_SQL,
         re.IGNORECASE | re.DOTALL,
     )
     retry = re.search(
         r"FUNCTION\s+carl_autonomy\.mark_effect_retry_scheduled\b.*?"
         r"AS\s+\$\$(?P<body>.*?)\$\$;",
-        ROLE_PROCEDURES_SQL,
+        GITHUB_EFFECT_FENCES_SQL,
         re.IGNORECASE | re.DOTALL,
     )
     assert retry is not None
@@ -154,7 +173,7 @@ def test_sql_effect_fence_can_rearm_only_after_a_durable_rate_limit_deadline() -
     prepare = re.search(
         r"FUNCTION\s+carl_autonomy\.prepare_effect_attempt\b.*?"
         r"AS\s+\$\$(?P<body>.*?)\$\$;",
-        ROLE_PROCEDURES_SQL,
+        GITHUB_EFFECT_FENCES_SQL,
         re.IGNORECASE | re.DOTALL,
     )
     assert prepare is not None
@@ -179,6 +198,33 @@ def test_sql_effect_fence_can_rearm_only_after_a_durable_rate_limit_deadline() -
         "claim_expires_at_text = claim_expires_text",
     ):
         assert assignment in assignments
+
+
+def test_sql_uncertain_fence_reclaim_changes_claim_lineage_without_restoring_mutation() -> None:
+    prepare = re.search(
+        r"FUNCTION\s+carl_autonomy\.prepare_effect_attempt\b.*?"
+        r"AS\s+\$\$(?P<body>.*?)\$\$;",
+        GITHUB_EFFECT_FENCES_SQL,
+        re.IGNORECASE | re.DOTALL,
+    )
+    assert prepare is not None
+    uncertain = re.search(
+        r"IF\s+existing\.attempt_state\s*=\s*'uncertain'.*?THEN(?P<body>.*?)END\s+IF",
+        prepare.group("body"),
+        re.IGNORECASE | re.DOTALL,
+    )
+    assert uncertain is not None
+    body = uncertain.group("body")
+    for assignment in (
+        "claim_id = claim_key",
+        "command_revision = command_revision_value",
+        "claim_expected_revision = claim_revision_value",
+        "claim_expires_at = claim_expires_time",
+        "claim_expires_at_text = claim_expires_text",
+    ):
+        assert assignment in body
+    assert "attempt_state = 'prepared'" not in body
+    assert "RETURN QUERY SELECT false" in body
 
 
 def test_shared_event_policy_keys_equal_production_event_type() -> None:

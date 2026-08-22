@@ -10,7 +10,7 @@ import stat
 import urllib.error
 import urllib.request
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal, Protocol
@@ -33,12 +33,37 @@ _WORKFLOW_REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$")
 _ACTOR_LOGIN_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,98}[A-Za-z0-9])?(?:\[bot\])?$")
 _DEFAULT_WORKFLOW_REF = "main"
 _DEFAULT_DISPATCH_ACTOR_LOGIN = "carl-autonomy[bot]"
-_PRIVATE_CONSTRUCTION_KEY = object()
-_PRIVATE_EFFECT_AUTHORIZATION_KEY = object()
-_PRIVATE_OBSERVATION_AUTHORIZATION_KEY = object()
 _MAX_RESPONSE_BYTES = 262_144
 _MAX_PAGES = 5
 _EFFECT_RECONCILIATION_DELAY = timedelta(seconds=30)
+_GRAPHQL_NODE_ID_RE = re.compile(r"^[A-Za-z0-9_=-]{1,256}$")
+_MARK_READY_MUTATION = """mutation MarkPullRequestReadyForReview($pullRequestId: ID!) {
+  markPullRequestReadyForReview(input: {pullRequestId: $pullRequestId}) {
+    pullRequest {
+      id
+      number
+      isDraft
+      baseRefName
+      headRefName
+      headRefOid
+      repository { nameWithOwner }
+    }
+  }
+}"""
+_ENABLE_AUTO_MERGE_MUTATION = """mutation EnablePullRequestAutoMerge($pullRequestId: ID!) {
+  enablePullRequestAutoMerge(input: {pullRequestId: $pullRequestId, mergeMethod: SQUASH}) {
+    pullRequest {
+      id
+      number
+      isDraft
+      baseRefName
+      headRefName
+      headRefOid
+      repository { nameWithOwner }
+      autoMergeRequest { mergeMethod }
+    }
+  }
+}"""
 
 
 class GitHubCloudError(ValueError):
@@ -147,18 +172,9 @@ class GitHubCommandBinding:
 
 
 @dataclass(frozen=True, slots=True)
-class _ObservationAuthorization:
+class _BoundObservation:
     state: CommandState
     binding: GitHubCommandBinding
-    _construction_key: object = field(repr=False, compare=False)
-
-    def __post_init__(self) -> None:
-        if (
-            self._construction_key is not _PRIVATE_OBSERVATION_AUTHORIZATION_KEY
-            or not isinstance(self.state, CommandState)
-            or not isinstance(self.binding, GitHubCommandBinding)
-        ):
-            raise GitHubCloudError("github_observation_authorization_invalid")
 
 
 _OBSERVATION_ENDPOINTS_BY_ACTION = {
@@ -245,22 +261,11 @@ class GitHubEffectAttempt:
 
 
 @dataclass(frozen=True, slots=True)
-class _EffectAuthorization:
+class _BoundEffect:
     state: CommandState
     binding: GitHubCommandBinding
     attempt: GitHubEffectAttempt
     may_mutate: bool
-    _construction_key: object = field(repr=False, compare=False)
-
-    def __post_init__(self) -> None:
-        if (
-            self._construction_key is not _PRIVATE_EFFECT_AUTHORIZATION_KEY
-            or not isinstance(self.state, CommandState)
-            or not isinstance(self.binding, GitHubCommandBinding)
-            or not isinstance(self.attempt, GitHubEffectAttempt)
-            or not isinstance(self.may_mutate, bool)
-        ):
-            raise GitHubCloudError("github_effect_authorization_invalid")
 
 
 @dataclass(frozen=True, slots=True)
@@ -408,6 +413,7 @@ class PullRequestEffectSnapshot:
 
 @dataclass(frozen=True, slots=True)
 class _PullRequestObservation:
+    node_id: str
     number: int
     url: str
     state: Literal["open", "closed"]
@@ -934,7 +940,7 @@ def pull_request_auto_merge_binding(
         head_sha=request.head_sha,
         action="auto-merge",
         endpoint_id="enable_pull_request_auto_merge",
-        method="PUT",
+        method="POST",
         payload={"merge_method": request.merge_method},
     )
 
@@ -1397,8 +1403,8 @@ class _ProtectedStateControllerClient:
         )
 
 
-class GitHubCloudGateway:
-    """Narrow GitHub client; production construction is owned by protected provisioning."""
+class _InjectedGitHubCloudGateway:
+    """Credential-injected implementation confined to explicit test construction."""
 
     def __init__(
         self,
@@ -1410,10 +1416,30 @@ class GitHubCloudGateway:
         state_controller: GitHubEffectStateController,
         workflow_ref: str,
         dispatch_actor_login: str,
-        _construction_key: object | None = None,
     ) -> None:
-        if _construction_key is not _PRIVATE_CONSTRUCTION_KEY:
-            raise GitHubCloudError("github_protected_configuration_required")
+        del (
+            repository,
+            token,
+            transport,
+            clock,
+            state_controller,
+            workflow_ref,
+            dispatch_actor_login,
+        )
+        raise GitHubCloudError("github_protected_configuration_required")
+
+    @classmethod
+    def _construct_test_gateway(
+        cls,
+        *,
+        repository: str,
+        token: str,
+        transport: GitHubHttpTransport,
+        clock: Callable[[], datetime],
+        state_controller: GitHubEffectStateController,
+        workflow_ref: str,
+        dispatch_actor_login: str,
+    ) -> _InjectedGitHubCloudGateway:
         if not isinstance(repository, str) or _REPOSITORY_RE.fullmatch(repository) is None:
             raise GitHubCloudError("github_repository_invalid")
         if not isinstance(token, str) or not token or len(token.encode()) > 4_096:
@@ -1434,13 +1460,15 @@ class GitHubCloudGateway:
             or not callable(getattr(state_controller, "mark_effect_completed", None))
         ):
             raise GitHubCloudError("github_protected_configuration_invalid")
-        self._repository = repository
-        self._token = token
-        self._transport = transport
-        self._clock = clock
-        self._state_controller = state_controller
-        self._workflow_ref = workflow_ref
-        self._dispatch_actor_login = dispatch_actor_login
+        gateway = object.__new__(cls)
+        gateway._repository = repository
+        gateway._token = token
+        gateway._transport = transport
+        gateway._clock = clock
+        gateway._state_controller = state_controller
+        gateway._workflow_ref = workflow_ref
+        gateway._dispatch_actor_login = dispatch_actor_login
+        return gateway
 
     @classmethod
     def _for_testing(
@@ -1453,10 +1481,10 @@ class GitHubCloudGateway:
         state_controller: GitHubEffectStateController | None = None,
         workflow_ref: str = _DEFAULT_WORKFLOW_REF,
         dispatch_actor_login: str = _DEFAULT_DISPATCH_ACTOR_LOGIN,
-    ) -> GitHubCloudGateway:
+    ) -> _InjectedGitHubCloudGateway:
         if state_controller is None:
             state_controller = _RejectingTestStateController()
-        return cls(
+        return cls._construct_test_gateway(
             repository=repository,
             token=token,
             transport=transport,
@@ -1464,25 +1492,6 @@ class GitHubCloudGateway:
             state_controller=state_controller,
             workflow_ref=workflow_ref,
             dispatch_actor_login=dispatch_actor_login,
-            _construction_key=_PRIVATE_CONSTRUCTION_KEY,
-        )
-
-    @classmethod
-    def from_protected_environment(cls) -> GitHubCloudGateway:
-        """Load the fixed root-controlled policy and controller-only installation token."""
-        policy = _load_protected_policy()
-        token = os.environ.get(_PROTECTED_TOKEN_ENV)
-        if token is None:
-            raise GitHubCloudError("github_credentials_missing")
-        return cls(
-            repository=policy.repository,
-            token=token,
-            transport=_ProtectedGitHubTransport(),
-            clock=_system_clock,
-            state_controller=_ProtectedStateControllerClient(),
-            workflow_ref=policy.workflow_ref,
-            dispatch_actor_login=policy.dispatch_actor_login,
-            _construction_key=_PRIVATE_CONSTRUCTION_KEY,
         )
 
     def _now(self) -> datetime:
@@ -1491,30 +1500,28 @@ class GitHubCloudGateway:
             raise GitHubCloudError("github_clock_invalid")
         return now
 
-    def _request(
+    def _execute_bound_http(
         self,
         method: Literal["GET", "POST", "PATCH", "PUT"],
         path: str,
         *,
         query: tuple[tuple[str, str], ...] = (),
         body: dict[str, Any] | None = None,
-        authorization: _EffectAuthorization | _ObservationAuthorization | None = None,
+        authorization: _BoundEffect | _BoundObservation | None = None,
     ) -> GitHubHttpResponse:
         endpoint_id = self._validate_endpoint(method=method, path=path, query=query, body=body)
         if method in {"POST", "PATCH", "PUT"}:
             if (
-                not isinstance(authorization, _EffectAuthorization)
-                or authorization._construction_key is not _PRIVATE_EFFECT_AUTHORIZATION_KEY
+                not isinstance(authorization, _BoundEffect)
                 or not authorization.may_mutate
                 or authorization.binding.method != method
                 or authorization.binding.endpoint_id != endpoint_id
                 or hashlib.sha256(canonical_json_bytes(body)).hexdigest()
-                != authorization.binding.payload_digest
+                != authorization.attempt.payload_digest
             ):
                 raise GitHubCloudError("github_effect_authorization_required")
         elif (
-            not isinstance(authorization, _ObservationAuthorization)
-            or authorization._construction_key is not _PRIVATE_OBSERVATION_AUTHORIZATION_KEY
+            not isinstance(authorization, _BoundObservation)
             or endpoint_id
             not in _OBSERVATION_ENDPOINTS_BY_ACTION.get(authorization.binding.action, frozenset())
             or authorization.binding.repository != self._repository
@@ -1542,7 +1549,7 @@ class GitHubCloudGateway:
         try:
             _rate_limit(response, now=self._now())
         except _GitHubRateLimited as limited:
-            if isinstance(authorization, _EffectAuthorization):
+            if isinstance(authorization, _BoundEffect):
                 self._mark_effect_retry_scheduled(
                     authorization, retry_not_before=limited.retry_not_before
                 )
@@ -1573,6 +1580,29 @@ class GitHubCloudGateway:
             raise GitHubCloudError("github_endpoint_not_allowed")
         query_values = dict(query)
         root = f"/repos/{self._repository}"
+        if path == "/graphql":
+            if (
+                method != "POST"
+                or query
+                or type(body) is not dict
+                or set(body) != {"operationName", "query", "variables"}
+                or type(body["variables"]) is not dict
+                or set(body["variables"]) != {"pullRequestId"}
+                or not isinstance(body["variables"]["pullRequestId"], str)
+                or _GRAPHQL_NODE_ID_RE.fullmatch(body["variables"]["pullRequestId"]) is None
+            ):
+                raise GitHubCloudError("github_endpoint_not_allowed")
+            if (
+                body["operationName"] == "MarkPullRequestReadyForReview"
+                and body["query"] == _MARK_READY_MUTATION
+            ):
+                return "mark_pull_request_ready"
+            if (
+                body["operationName"] == "EnablePullRequestAutoMerge"
+                and body["query"] == _ENABLE_AUTO_MERGE_MUTATION
+            ):
+                return "enable_pull_request_auto_merge"
+            raise GitHubCloudError("github_endpoint_not_allowed")
         workflow_match = re.fullmatch(
             re.escape(root)
             + r"/actions/workflows/"
@@ -1727,15 +1757,6 @@ class GitHubCloudGateway:
                 and set(body) == {"body", "title"}
             ):
                 return "update_pull_request"
-            if not query and suffix == "/ready_for_review" and method == "POST" and body == {}:
-                return "mark_pull_request_ready"
-            if (
-                not query
-                and suffix == "/auto-merge"
-                and method == "PUT"
-                and body == {"merge_method": "squash"}
-            ):
-                return "enable_pull_request_auto_merge"
             raise GitHubCloudError("github_endpoint_not_allowed")
 
         checks_match = re.fullmatch(re.escape(root) + r"/commits/[0-9a-f]{40}/check-runs", path)
@@ -1832,7 +1853,9 @@ class GitHubCloudGateway:
         self,
         state: CommandState,
         binding: GitHubCommandBinding,
-    ) -> _EffectAuthorization:
+        *,
+        payload: dict[str, Any] | None = None,
+    ) -> _BoundEffect:
         self._require_effect_command(state, binding)
         assert state.claim is not None  # CommandState and the durable lookup established this.
         observed = self._now()
@@ -1848,7 +1871,11 @@ class GitHubCloudGateway:
             action=binding.action,
             endpoint_id=binding.endpoint_id,
             method=binding.method,
-            payload_digest=binding.payload_digest,
+            payload_digest=(
+                binding.payload_digest
+                if payload is None
+                else hashlib.sha256(canonical_json_bytes(payload)).hexdigest()
+            ),
             command_request_digest=state.command.request_digest,
             repository=binding.repository,
             target_identity=binding.target_identity,
@@ -1865,29 +1892,27 @@ class GitHubCloudGateway:
         may_mutate = self._state_controller.prepare_effect_attempt(attempt)
         if not isinstance(may_mutate, bool):
             raise GitHubCloudError("github_effect_fence_invalid")
-        return _EffectAuthorization(
+        return _BoundEffect(
             state=state,
             binding=binding,
             attempt=attempt,
             may_mutate=may_mutate,
-            _construction_key=_PRIVATE_EFFECT_AUTHORIZATION_KEY,
         )
 
     def _authorize_observations(
         self,
         state: CommandState,
         binding: GitHubCommandBinding,
-    ) -> _ObservationAuthorization:
+    ) -> _BoundObservation:
         self._require_effect_command(state, binding)
         if binding.action not in _OBSERVATION_ENDPOINTS_BY_ACTION:
             raise GitHubCloudError("github_observation_authorization_invalid")
-        return _ObservationAuthorization(
+        return _BoundObservation(
             state=state,
             binding=binding,
-            _construction_key=_PRIVATE_OBSERVATION_AUTHORIZATION_KEY,
         )
 
-    def _mark_effect_uncertain(self, authorization: _EffectAuthorization) -> None:
+    def _mark_effect_uncertain(self, authorization: _BoundEffect) -> None:
         now = self._now().isoformat().replace("+00:00", "Z")
         self._state_controller.mark_effect_uncertain(
             authorization.attempt.effect_key,
@@ -1898,7 +1923,7 @@ class GitHubCloudGateway:
 
     def _mark_effect_retry_scheduled(
         self,
-        authorization: _EffectAuthorization,
+        authorization: _BoundEffect,
         *,
         retry_not_before: str,
     ) -> None:
@@ -1916,7 +1941,7 @@ class GitHubCloudGateway:
 
     def _mark_effect_completed(
         self,
-        authorization: _EffectAuthorization,
+        authorization: _BoundEffect,
         *,
         result_identity: dict[str, Any],
     ) -> None:
@@ -1988,9 +2013,9 @@ class GitHubCloudGateway:
             raise GitHubCloudError("github_ref_response_schema_invalid")
         return sha
 
-    def _read_ref(self, ref: str, *, authorization: _ObservationAuthorization) -> str | None:
+    def _read_ref(self, ref: str, *, authorization: _BoundObservation) -> str | None:
         path = f"/repos/{self._repository}/git/ref/{ref.removeprefix('refs/')}"
-        response = self._request("GET", path, authorization=authorization)
+        response = self._execute_bound_http("GET", path, authorization=authorization)
         _rate_limit(response, now=self._now())
         if response.status == 404:
             decoded = _decode_json(response)
@@ -2002,9 +2027,9 @@ class GitHubCloudGateway:
         return self._parse_git_ref(_decode_json(response), expected_ref=ref)
 
     def _read_git_commit(
-        self, sha: str, *, authorization: _ObservationAuthorization
+        self, sha: str, *, authorization: _BoundObservation
     ) -> _GitCommitObservation:
-        response = self._request(
+        response = self._execute_bound_http(
             "GET",
             f"/repos/{self._repository}/git/commits/{sha}",
             authorization=authorization,
@@ -2047,7 +2072,7 @@ class GitHubCloudGateway:
         branch: str,
         expected_sha: str,
         *,
-        authorization: _ObservationAuthorization,
+        authorization: _BoundObservation,
     ) -> None:
         observed = self._read_ref(f"refs/heads/{branch}", authorization=authorization)
         if observed != expected_sha:
@@ -2057,7 +2082,7 @@ class GitHubCloudGateway:
         self,
         request: RevertBranchRequest,
         *,
-        authorization: _ObservationAuthorization,
+        authorization: _BoundObservation,
     ) -> None:
         merge = self._read_git_commit(request.promotion_merge_commit, authorization=authorization)
         if len(merge.parents) != 2:
@@ -2137,7 +2162,7 @@ class GitHubCloudGateway:
                 commit_sha=request.candidate_commit,
             )
         try:
-            response = self._request(
+            response = self._execute_bound_http(
                 "POST",
                 f"/repos/{self._repository}/git/refs",
                 body={"ref": ref, "sha": request.candidate_commit},
@@ -2217,6 +2242,7 @@ class GitHubCloudGateway:
             "draft",
             "head",
             "html_url",
+            "node_id",
             "number",
             "state",
             "title",
@@ -2237,7 +2263,6 @@ class GitHubCloudGateway:
             "merge_commit_sha",
             "merged_at",
             "milestone",
-            "node_id",
             "patch_url",
             "requested_reviewers",
             "requested_teams",
@@ -2259,6 +2284,7 @@ class GitHubCloudGateway:
         ):
             raise GitHubCloudError("github_pull_response_schema_invalid")
         number = value["number"]
+        node_id = value["node_id"]
         url = value["html_url"]
         title = value["title"]
         body = value["body"]
@@ -2268,6 +2294,8 @@ class GitHubCloudGateway:
             or number <= 0
             or not isinstance(url, str)
             or url != f"https://github.com/{self._repository}/pull/{number}"
+            or not isinstance(node_id, str)
+            or _GRAPHQL_NODE_ID_RE.fullmatch(node_id) is None
             or value["state"] not in {"open", "closed"}
             or not isinstance(value["draft"], bool)
             or not isinstance(base["ref"], str)
@@ -2338,6 +2366,7 @@ class GitHubCloudGateway:
         ):
             raise GitHubCloudError("github_pull_response_schema_invalid")
         return _PullRequestObservation(
+            node_id=node_id,
             number=number,
             url=url,
             state=value["state"],
@@ -2354,7 +2383,7 @@ class GitHubCloudGateway:
         self,
         request: PullRequestCreateRequest | RevertPullRequestRequest,
         *,
-        authorization: _ObservationAuthorization,
+        authorization: _BoundObservation,
     ) -> _PullRequestObservation | None:
         owner = self._repository.split("/", 1)[0]
         path = f"/repos/{self._repository}/pulls"
@@ -2374,7 +2403,9 @@ class GitHubCloudGateway:
                 ("per_page", "100"),
                 ("state", "all"),
             )
-            response = self._request("GET", path, query=query, authorization=authorization)
+            response = self._execute_bound_http(
+                "GET", path, query=query, authorization=authorization
+            )
             _rate_limit(response, now=self._now())
             if response.status != 200:
                 raise GitHubCloudError("github_pull_observation_failed")
@@ -2492,7 +2523,7 @@ class GitHubCloudGateway:
         if not authorization.may_mutate:
             raise GitHubCloudError("github_pull_create_uncertain")
         try:
-            response = self._request(
+            response = self._execute_bound_http(
                 "POST",
                 f"/repos/{self._repository}/pulls",
                 body=payload,
@@ -2558,9 +2589,9 @@ class GitHubCloudGateway:
         return self._pull_snapshot(status="created", state=state, binding=binding, observed=created)
 
     def _get_pull_request(
-        self, number: int, *, authorization: _ObservationAuthorization
+        self, number: int, *, authorization: _BoundObservation
     ) -> _PullRequestObservation:
-        response = self._request(
+        response = self._execute_bound_http(
             "GET",
             f"/repos/{self._repository}/pulls/{number}",
             authorization=authorization,
@@ -2587,6 +2618,61 @@ class GitHubCloudGateway:
             or observed.head_sha != head_sha
         ):
             raise GitHubCloudError("github_pull_request_identity_conflict")
+
+    def _parse_graphql_pull_effect(
+        self,
+        response: GitHubHttpResponse,
+        *,
+        operation: Literal["markPullRequestReadyForReview", "enablePullRequestAutoMerge"],
+        observed: _PullRequestObservation,
+    ) -> _PullRequestObservation:
+        decoded = _decode_json(response)
+        if set(decoded) != {"data"} or type(decoded["data"]) is not dict:
+            raise GitHubCloudError("github_graphql_response_invalid")
+        data = decoded["data"]
+        if set(data) != {operation} or type(data[operation]) is not dict:
+            raise GitHubCloudError("github_graphql_response_invalid")
+        mutation = data[operation]
+        if set(mutation) != {"pullRequest"} or type(mutation["pullRequest"]) is not dict:
+            raise GitHubCloudError("github_graphql_response_invalid")
+        pull = mutation["pullRequest"]
+        expected_fields = {
+            "baseRefName",
+            "headRefName",
+            "headRefOid",
+            "id",
+            "isDraft",
+            "number",
+            "repository",
+        }
+        if operation == "enablePullRequestAutoMerge":
+            expected_fields.add("autoMergeRequest")
+        if (
+            set(pull) != expected_fields
+            or pull["isDraft"] is not False
+            or type(pull["repository"]) is not dict
+        ):
+            raise GitHubCloudError("github_graphql_response_invalid")
+        if (
+            pull["id"] != observed.node_id
+            or pull["number"] != observed.number
+            or pull["baseRefName"] != observed.base_branch
+            or pull["headRefName"] != observed.head_branch
+            or pull["headRefOid"] != observed.head_sha
+            or pull["repository"] != {"nameWithOwner": self._repository}
+        ):
+            raise GitHubCloudError("github_pull_request_identity_conflict")
+        if operation == "enablePullRequestAutoMerge" and pull["autoMergeRequest"] != {
+            "mergeMethod": "SQUASH"
+        }:
+            raise GitHubCloudError("github_graphql_response_invalid")
+        return replace(
+            observed,
+            draft=False,
+            auto_merge_enabled=(
+                observed.auto_merge_enabled or operation == "enablePullRequestAutoMerge"
+            ),
+        )
 
     def update_pull_request(
         self, command_key: str, request: PullRequestUpdateRequest
@@ -2634,7 +2720,7 @@ class GitHubCloudGateway:
                 status="uncertain", state=state, binding=binding, observed=observed
             )
         try:
-            response = self._request(
+            response = self._execute_bound_http(
                 "PATCH",
                 f"/repos/{self._repository}/pulls/{request.number}",
                 body={"body": request.body, "title": request.title},
@@ -2729,7 +2815,15 @@ class GitHubCloudGateway:
             head_sha=request.head_sha,
         )
         if not observed.draft:
-            authorization = self._prepare_effect_authorization(state, binding)
+            authorization = self._prepare_effect_authorization(
+                state,
+                binding,
+                payload={
+                    "operationName": "MarkPullRequestReadyForReview",
+                    "query": _MARK_READY_MUTATION,
+                    "variables": {"pullRequestId": observed.node_id},
+                },
+            )
             self._mark_effect_completed(
                 authorization,
                 result_identity={
@@ -2741,14 +2835,24 @@ class GitHubCloudGateway:
             return self._pull_snapshot(
                 status="reconciled", state=state, binding=binding, observed=observed
             )
-        path = f"/repos/{self._repository}/pulls/{request.number}/ready_for_review"
-        authorization = self._prepare_effect_authorization(state, binding)
+        payload = {
+            "operationName": "MarkPullRequestReadyForReview",
+            "query": _MARK_READY_MUTATION,
+            "variables": {"pullRequestId": observed.node_id},
+        }
+        authorization = self._prepare_effect_authorization(
+            state,
+            binding,
+            payload=payload,
+        )
         if not authorization.may_mutate:
             return self._pull_snapshot(
                 status="uncertain", state=state, binding=binding, observed=observed
             )
         try:
-            response = self._request("POST", path, body={}, authorization=authorization)
+            response = self._execute_bound_http(
+                "POST", "/graphql", body=payload, authorization=authorization
+            )
         except GitHubTransportError as error:
             if not error.ambiguous:
                 self._mark_effect_uncertain(authorization)
@@ -2785,7 +2889,11 @@ class GitHubCloudGateway:
             self._mark_effect_uncertain(authorization)
             raise GitHubCloudError("github_ready_transition_failed")
         try:
-            ready = self._parse_pull_request(_decode_json(response))
+            ready = self._parse_graphql_pull_effect(
+                response,
+                operation="markPullRequestReadyForReview",
+                observed=observed,
+            )
             self._require_pull_target(
                 ready,
                 number=request.number,
@@ -2838,7 +2946,15 @@ class GitHubCloudGateway:
         if observed.draft:
             raise GitHubCloudError("github_pull_request_not_ready")
         if observed.auto_merge_enabled:
-            authorization = self._prepare_effect_authorization(state, binding)
+            authorization = self._prepare_effect_authorization(
+                state,
+                binding,
+                payload={
+                    "operationName": "EnablePullRequestAutoMerge",
+                    "query": _ENABLE_AUTO_MERGE_MUTATION,
+                    "variables": {"pullRequestId": observed.node_id},
+                },
+            )
             self._mark_effect_completed(
                 authorization,
                 result_identity={
@@ -2850,15 +2966,24 @@ class GitHubCloudGateway:
             return self._pull_snapshot(
                 status="reconciled", state=state, binding=binding, observed=observed
             )
-        path = f"/repos/{self._repository}/pulls/{request.number}/auto-merge"
-        payload = {"merge_method": request.merge_method}
-        authorization = self._prepare_effect_authorization(state, binding)
+        payload = {
+            "operationName": "EnablePullRequestAutoMerge",
+            "query": _ENABLE_AUTO_MERGE_MUTATION,
+            "variables": {"pullRequestId": observed.node_id},
+        }
+        authorization = self._prepare_effect_authorization(
+            state,
+            binding,
+            payload=payload,
+        )
         if not authorization.may_mutate:
             return self._pull_snapshot(
                 status="uncertain", state=state, binding=binding, observed=observed
             )
         try:
-            response = self._request("PUT", path, body=payload, authorization=authorization)
+            response = self._execute_bound_http(
+                "POST", "/graphql", body=payload, authorization=authorization
+            )
         except GitHubTransportError as error:
             if not error.ambiguous:
                 self._mark_effect_uncertain(authorization)
@@ -2895,7 +3020,11 @@ class GitHubCloudGateway:
             self._mark_effect_uncertain(authorization)
             raise GitHubCloudError("github_auto_merge_failed")
         try:
-            enabled = self._parse_pull_request(_decode_json(response))
+            enabled = self._parse_graphql_pull_effect(
+                response,
+                operation="enablePullRequestAutoMerge",
+                observed=observed,
+            )
             self._require_pull_target(
                 enabled,
                 number=request.number,
@@ -2937,7 +3066,7 @@ class GitHubCloudGateway:
         request: RequiredChecksRequest,
     ) -> RequiredChecksSnapshot:
         observations = self._authorize_observations(state, binding)
-        response = self._request(
+        response = self._execute_bound_http(
             "GET",
             f"/repos/{self._repository}/commits/{request.head_sha}/check-runs",
             query=(("filter", "latest"), ("per_page", "100")),
@@ -3164,7 +3293,7 @@ class GitHubCloudGateway:
                 commit_sha=request.revert_candidate_commit,
             )
         try:
-            response = self._request(
+            response = self._execute_bound_http(
                 "POST",
                 f"/repos/{self._repository}/git/refs",
                 body={"ref": ref, "sha": request.revert_candidate_commit},
@@ -3280,7 +3409,7 @@ class GitHubCloudGateway:
         if not authorization.may_mutate:
             raise GitHubCloudError("github_revert_pull_create_uncertain")
         try:
-            response = self._request(
+            response = self._execute_bound_http(
                 "POST",
                 f"/repos/{self._repository}/pulls",
                 body=payload,
@@ -3353,7 +3482,7 @@ class GitHubCloudGateway:
         request: CloudRunRequest,
         binding: GitHubCommandBinding,
         *,
-        authorization: _ObservationAuthorization,
+        authorization: _BoundObservation,
         dispatched_at: str,
     ) -> tuple[int, str] | None:
         dispatched = _utc(dispatched_at, "github_command_timestamp_invalid")
@@ -3412,7 +3541,9 @@ class GitHubCloudGateway:
                 *((("page", str(page)),) if page > 1 else ()),
                 ("per_page", "100"),
             )
-            response = self._request("GET", path, query=query, authorization=authorization)
+            response = self._execute_bound_http(
+                "GET", path, query=query, authorization=authorization
+            )
             _rate_limit(response, now=self._now())
             if response.status != 200:
                 raise GitHubCloudError("github_run_discovery_failed")
@@ -3673,7 +3804,7 @@ class GitHubCloudGateway:
                 binding=binding,
             )
         try:
-            response = self._request(
+            response = self._execute_bound_http(
                 "POST",
                 path,
                 body=_dispatch_payload(
@@ -3773,3 +3904,128 @@ class GitHubCloudGateway:
         else:
             self._mark_effect_uncertain(authorization)
             raise GitHubCloudError("github_dispatch_response_invalid")
+
+
+def _run_protected_operation(operation: str, command_key: str, request: object) -> object:
+    """Execute one named high-level operation without returning the credential-bearing service."""
+    allowed = {
+        "create_or_reconcile_experimental_branch",
+        "create_or_reconcile_pull_request",
+        "create_or_reconcile_revert_branch",
+        "create_or_reconcile_revert_pull_request",
+        "dispatch_workflow",
+        "enable_pull_request_auto_merge",
+        "mark_pull_request_ready",
+        "observe_required_checks",
+        "update_pull_request",
+    }
+    if operation not in allowed:
+        raise GitHubCloudError("github_operation_not_allowed")
+    policy = _load_protected_policy()
+    token = os.environ.get(_PROTECTED_TOKEN_ENV)
+    if token is None:
+        raise GitHubCloudError("github_credentials_missing")
+    gateway = _InjectedGitHubCloudGateway._construct_test_gateway(
+        repository=policy.repository,
+        token=token,
+        transport=_ProtectedGitHubTransport(),
+        clock=_system_clock,
+        state_controller=_ProtectedStateControllerClient(),
+        workflow_ref=policy.workflow_ref,
+        dispatch_actor_login=policy.dispatch_actor_login,
+    )
+    high_level_operation = getattr(gateway, operation)
+    return high_level_operation(command_key, request)
+
+
+class GitHubCloudGateway:
+    """Attribute-free production facade; dependencies exist only during a typed operation."""
+
+    __slots__ = ()
+
+    def __new__(cls, *args: object, **kwargs: object) -> GitHubCloudGateway:
+        del cls, args, kwargs
+        raise GitHubCloudError("github_protected_configuration_required")
+
+    @classmethod
+    def _for_testing(
+        cls,
+        *,
+        repository: str,
+        token: str,
+        transport: GitHubHttpTransport,
+        clock: Callable[[], datetime],
+        state_controller: GitHubEffectStateController | None = None,
+        workflow_ref: str = _DEFAULT_WORKFLOW_REF,
+        dispatch_actor_login: str = _DEFAULT_DISPATCH_ACTOR_LOGIN,
+    ) -> _InjectedGitHubCloudGateway:
+        del cls
+        return _InjectedGitHubCloudGateway._for_testing(
+            repository=repository,
+            token=token,
+            transport=transport,
+            clock=clock,
+            state_controller=state_controller,
+            workflow_ref=workflow_ref,
+            dispatch_actor_login=dispatch_actor_login,
+        )
+
+    @classmethod
+    def from_protected_environment(cls) -> GitHubCloudGateway:
+        """Return an attribute-free facade over one fixed protected operation boundary."""
+        _load_protected_policy()
+        token = os.environ.get(_PROTECTED_TOKEN_ENV)
+        if token is None:
+            raise GitHubCloudError("github_credentials_missing")
+        if not token or len(token.encode()) > 4_096:
+            raise GitHubCloudError("github_credentials_invalid")
+        return object.__new__(cls)
+
+    def create_or_reconcile_experimental_branch(
+        self, command_key: str, request: ExperimentalBranchRequest
+    ) -> GitReferenceSnapshot | GitHubRetryDecision:
+        return _run_protected_operation(
+            "create_or_reconcile_experimental_branch", command_key, request
+        )
+
+    def create_or_reconcile_pull_request(
+        self, command_key: str, request: PullRequestCreateRequest
+    ) -> PullRequestEffectSnapshot | GitHubRetryDecision:
+        return _run_protected_operation("create_or_reconcile_pull_request", command_key, request)
+
+    def create_or_reconcile_revert_branch(
+        self, command_key: str, request: RevertBranchRequest
+    ) -> GitReferenceSnapshot | GitHubRetryDecision:
+        return _run_protected_operation("create_or_reconcile_revert_branch", command_key, request)
+
+    def create_or_reconcile_revert_pull_request(
+        self, command_key: str, request: RevertPullRequestRequest
+    ) -> PullRequestEffectSnapshot | GitHubRetryDecision:
+        return _run_protected_operation(
+            "create_or_reconcile_revert_pull_request", command_key, request
+        )
+
+    def dispatch_workflow(
+        self, command_key: str, request: CloudRunRequest
+    ) -> WorkflowDispatchSnapshot | GitHubRetryDecision:
+        return _run_protected_operation("dispatch_workflow", command_key, request)
+
+    def enable_pull_request_auto_merge(
+        self, command_key: str, request: PullRequestAutoMergeRequest
+    ) -> PullRequestEffectSnapshot | GitHubRetryDecision:
+        return _run_protected_operation("enable_pull_request_auto_merge", command_key, request)
+
+    def mark_pull_request_ready(
+        self, command_key: str, request: PullRequestReadyRequest
+    ) -> PullRequestEffectSnapshot | GitHubRetryDecision:
+        return _run_protected_operation("mark_pull_request_ready", command_key, request)
+
+    def observe_required_checks(
+        self, command_key: str, request: RequiredChecksRequest
+    ) -> RequiredChecksSnapshot | GitHubRetryDecision:
+        return _run_protected_operation("observe_required_checks", command_key, request)
+
+    def update_pull_request(
+        self, command_key: str, request: PullRequestUpdateRequest
+    ) -> PullRequestEffectSnapshot | GitHubRetryDecision:
+        return _run_protected_operation("update_pull_request", command_key, request)
