@@ -46,6 +46,7 @@ WORKFLOWS = (
     "autonomous-soak.yml",
 )
 INPUTS = {
+    "attempt_key",
     "experiment_digest",
     "parent_commit",
     "candidate_commit",
@@ -207,9 +208,7 @@ def reconcile_cloud_run(
     return _reconcile_cloud_run(cloud_request, cloud_snapshot, **kwargs)
 
 
-def snapshot(
-    cloud_request: CloudRunRequest | None = None, **changes: object
-) -> CloudRunSnapshot:
+def snapshot(cloud_request: CloudRunRequest | None = None, **changes: object) -> CloudRunSnapshot:
     current = cloud_request or request()
     conclusion = changes.get("conclusion", "success")
     run_id = changes.get("run_id", 42)
@@ -344,9 +343,7 @@ def test_cloud_wire_codecs_reject_invalid_enums_and_boolean_integers() -> None:
 
 def test_cloud_wire_codecs_reject_mismatched_signed_identities() -> None:
     cloud_request = request()
-    signed = sign_completed_run_observation(
-        completed_run_observation(cloud_request), TEST_SIGNER
-    )
+    signed = sign_completed_run_observation(completed_run_observation(cloud_request), TEST_SIGNER)
     encoded = signed.to_canonical_dict()
     encoded["observation_digest"] = "0" * 64
 
@@ -630,12 +627,8 @@ def test_downloaded_artifact_digest_mismatch_fails_closed() -> None:
     "artifacts",
     (
         (),
-        (
-            CloudArtifact(99, "wrong-name", 42, ARTIFACT_DIGEST, ARTIFACT_DIGEST),
-        ),
-        (
-            CloudArtifact(99, "placeholder", 41, ARTIFACT_DIGEST, ARTIFACT_DIGEST),
-        ),
+        (CloudArtifact(99, "wrong-name", 42, ARTIFACT_DIGEST, ARTIFACT_DIGEST),),
+        (CloudArtifact(99, "placeholder", 41, ARTIFACT_DIGEST, ARTIFACT_DIGEST),),
         (
             CloudArtifact(99, "placeholder", 42, ARTIFACT_DIGEST, ARTIFACT_DIGEST),
             CloudArtifact(100, "other", 42, "b" * 64, "b" * 64),
@@ -862,9 +855,7 @@ def test_retry_state_cas_rejects_a_different_stale_transition(tmp_path: Path) ->
     different = replace(first, prior_run_ids=(41,))
 
     with pytest.raises(CloudExecutionError, match="cloud_retry_transition_invalid"):
-        store.compare_and_swap(
-            expected=initial, replacement=different, retry_decision=decision
-        )
+        store.compare_and_swap(expected=initial, replacement=different, retry_decision=decision)
 
 
 def test_retry_cas_rejects_skip_reset_missing_deadline_and_history_attacks(
@@ -961,9 +952,7 @@ def test_retry_cas_rejects_skip_reset_missing_deadline_and_history_attacks(
         retry_not_before=None,
     )
     with pytest.raises(CloudExecutionError, match="cloud_retry_transition_invalid"):
-        store.compare_and_swap(
-            expected=first, replacement=reset, retry_decision=second_decision
-        )
+        store.compare_and_swap(expected=first, replacement=reset, retry_decision=second_decision)
 
     second = CloudRetryState(
         schema_version=2,
@@ -976,9 +965,7 @@ def test_retry_cas_rejects_skip_reset_missing_deadline_and_history_attacks(
         retry_not_before="2026-08-19T12:15:00Z",
     )
     with pytest.raises(CloudExecutionError, match="cloud_retry_transition_invalid"):
-        store.compare_and_swap(
-            expected=first, replacement=second, retry_decision=second_decision
-        )
+        store.compare_and_swap(expected=first, replacement=second, retry_decision=second_decision)
 
 
 @pytest.mark.parametrize(
@@ -1018,9 +1005,7 @@ def test_retry_cas_revalidates_even_a_tampered_state_object(
     object.__setattr__(replacement, field, value)
 
     with pytest.raises(CloudExecutionError, match="cloud_retry_transition_invalid"):
-        store.compare_and_swap(
-            expected=initial, replacement=replacement, retry_decision=decision
-        )
+        store.compare_and_swap(expected=initial, replacement=replacement, retry_decision=decision)
 
 
 def test_advance_retry_requires_completed_prior_run_id() -> None:
@@ -1214,20 +1199,35 @@ def test_completed_run_observation_rejects_unsigned_forged_and_mismatched_facts(
 
     unsigned = cloud_execution.reconcile_cloud_run(
         cloud_request,
-        snapshot(cloud_request, conclusion="timed_out", artifacts=(), artifacts_expires_at=None,
-                 completed_run_observation=raw),
+        snapshot(
+            cloud_request,
+            conclusion="timed_out",
+            artifacts=(),
+            artifacts_expires_at=None,
+            completed_run_observation=raw,
+        ),
         trusted_receipt_key=trusted_key(signer),
     )
     forged = cloud_execution.reconcile_cloud_run(
         cloud_request,
-        snapshot(cloud_request, conclusion="timed_out", artifacts=(), artifacts_expires_at=None,
-                 completed_run_observation=forged_signature),
+        snapshot(
+            cloud_request,
+            conclusion="timed_out",
+            artifacts=(),
+            artifacts_expires_at=None,
+            completed_run_observation=forged_signature,
+        ),
         trusted_receipt_key=trusted_key(signer),
     )
     mismatched = cloud_execution.reconcile_cloud_run(
         cloud_request,
-        snapshot(cloud_request, conclusion="timed_out", artifacts=(), artifacts_expires_at=None,
-                 completed_run_observation=mismatched_revision),
+        snapshot(
+            cloud_request,
+            conclusion="timed_out",
+            artifacts=(),
+            artifacts_expires_at=None,
+            completed_run_observation=mismatched_revision,
+        ),
         trusted_receipt_key=trusted_key(signer),
     )
 
@@ -1291,9 +1291,7 @@ def test_retry_cas_reverifies_signed_observation_and_rejects_manual_decision(
 
 def test_success_requires_exact_remote_commissioning_receipt() -> None:
     cloud_request = request()
-    absent = reconcile_cloud_run(
-        cloud_request, snapshot(cloud_request, commissioning_receipt=None)
-    )
+    absent = reconcile_cloud_run(cloud_request, snapshot(cloud_request, commissioning_receipt=None))
     wrong_run = replace(commissioning_receipt(cloud_request), run_id=41)
     mismatched = reconcile_cloud_run(
         cloud_request,
@@ -1464,6 +1462,7 @@ def test_workflow_dispatch_contract_is_parsed_and_immutable(name: str) -> None:
     inputs = dispatch["inputs"]
     assert isinstance(inputs, dict)
     assert set(inputs) == INPUTS
+    assert workflow["run-name"] == "${{ inputs.attempt_key }}"
     for contract in inputs.values():
         assert isinstance(contract, dict)
         assert contract["required"] is True
@@ -1506,8 +1505,7 @@ def test_workflow_executes_from_exact_protected_revision_path_and_blob(name: str
 
     assert trusted_checkouts
     assert all(
-        step["with"]["ref"] == "${{ inputs.workflow_revision }}"
-        for step in trusted_checkouts
+        step["with"]["ref"] == "${{ inputs.workflow_revision }}" for step in trusted_checkouts
     )
 
     validation = next(
@@ -1517,11 +1515,13 @@ def test_workflow_executes_from_exact_protected_revision_path_and_blob(name: str
     )
     env = validation["env"]
     commands = validation["run"]
+    assert env["ATTEMPT_KEY"] == "${{ inputs.attempt_key }}"
     assert env["RUN_HEAD_SHA"] == "${{ github.sha }}"
     assert env["WORKFLOW_REF"] == "${{ github.workflow_ref }}"
     assert env["WORKFLOW_SHA"] == "${{ github.workflow_sha }}"
     assert env["WORKFLOW_PATH"] == expected_path
     assert "RUN_HEAD_SHA" in commands
+    assert "f\"cloud-run-{os.environ['REQUEST_DIGEST']}-attempt-\"" in commands
     assert "WORKFLOW_REF" in commands
     assert "WORKFLOW_SHA" in commands
     assert "WORKFLOW_PATH" in commands
@@ -1645,26 +1645,20 @@ def test_soak_workflow_runs_merge_bound_health_probes() -> None:
     assert "rev-parse HEAD" in commands
     assert "test --locked" in commands
     assert "pytest -q" in commands
-    topology = "\n".join(
-        step["run"] for step in jobs["commission"]["steps"] if "run" in step
-    )
+    topology = "\n".join(step["run"] for step in jobs["commission"]["steps"] if "run" in step)
     assert "rev-list --parents -n 1" in topology
     assert "${#MERGE_TOPOLOGY[@]}" in topology
     assert "MERGE_TOPOLOGY[1]" in topology
     assert "merge_commit" in json.dumps(jobs["evidence"])
     assert "request_digest" in json.dumps(jobs["evidence"])
-    _assert_bounded_credential_free_artifact(
-        jobs["evidence"], "autonomous-soak-observation"
-    )
+    _assert_bounded_credential_free_artifact(jobs["evidence"], "autonomous-soak-observation")
 
 
 @pytest.mark.parametrize("name", WORKFLOWS)
 def test_commissioning_job_runs_actionlint_on_github_hosted_runner(name: str) -> None:
     jobs = _jobs(_parse_workflow(name))
     commission = jobs["commission"]
-    commands = "\n".join(
-        step["run"] for step in commission["steps"] if "run" in step
-    )
+    commands = "\n".join(step["run"] for step in commission["steps"] if "run" in step)
 
     assert commission["runs-on"] == "ubuntu-latest"
     assert "go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7" in commands

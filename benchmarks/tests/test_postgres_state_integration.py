@@ -45,6 +45,7 @@ from carl_bench.cloud_state import (
     TrustedAuthorityKey,
 )
 from carl_bench.experiment import EventType, ExperimentEvent, ExperimentState
+from carl_bench.github_cloud import GitHubEffectAttempt
 from carl_bench.postgres_state import PostgresStateBackend, PostgresStateConfig, PostgresStateError
 from carl_bench.supervisor_triggers import (
     RecoveryAttempt,
@@ -1665,6 +1666,123 @@ def test_command_persist_replay_skip_locked_retry_and_terminal_revision_chain(
                 "SELECT * FROM carl_autonomy.fail_command(%s, %s)",
                 (_canonical(changed.to_canonical_dict()), "2026-08-20T12:03:00Z"),
             ).fetchone()
+
+
+def test_effect_rate_limit_retry_rearms_once_after_persisted_deadline(
+    postgres: object,
+) -> None:
+    command = _command()
+    claim = _claim()
+    dead_holder = _dead_holder(
+        scope_kind="command",
+        scope_key=command.command_key,
+        subject_id=claim.claim_id,
+        revision=8,
+    )
+    _register_observation(postgres, dead_holder)
+    attempt = GitHubEffectAttempt(
+        schema_version=1,
+        effect_key=command.effect_key,
+        command_key=command.command_key,
+        claim_id=claim.claim_id,
+        command_revision=8,
+        claim_expected_revision=claim.expected_revision,
+        action="dispatch_workflow",
+        endpoint_id="workflow_dispatch",
+        method="POST",
+        payload_digest="c" * 64,
+        command_request_digest=command.request_digest,
+        repository="StephenBickel/carl-agent",
+        target_identity="autonomous-improvement.yml@" + "1" * 40,
+        request_key="cloud-run-request-001",
+        attempt_key="cloud-run-request-001-attempt-1",
+        authority=command.authority,
+        operation=command.operation,
+        command_occurred_at=command.occurred_at,
+        claim_expires_at=claim.expires_at,
+        attempt_state="prepared",
+        not_before="2026-08-20T12:00:30Z",
+        observed_at=NOW,
+    )
+    with _as_role(postgres, "carl_coordinator") as coordinator:
+        coordinator.execute(
+            "SELECT * FROM carl_autonomy.create_command(%s, %s)",
+            (_canonical(command.to_canonical_dict()), NOW),
+        ).fetchone()
+        coordinator.execute(
+            "SELECT * FROM carl_autonomy.claim_command(%s, %s)",
+            (_canonical(claim.to_canonical_dict()), NOW),
+        ).fetchone()
+        prepared = coordinator.execute(
+            "SELECT * FROM carl_autonomy.prepare_effect_attempt(%s, %s)",
+            (_canonical(attempt.to_canonical_dict()), NOW),
+        ).fetchone()
+        scheduled = coordinator.execute(
+            "SELECT * FROM carl_autonomy.mark_effect_retry_scheduled(%s, %s, %s, %s)",
+            (
+                attempt.effect_key,
+                "2026-08-20T12:01:30Z",
+                "2026-08-20T12:00:01Z",
+                "2026-08-20T12:00:01Z",
+            ),
+        ).fetchone()
+        reconciliation = ClaimReconciliation(
+            command_key=command.command_key,
+            claim_id=claim.claim_id,
+            authority=command.authority,
+            expected_revision=8,
+            next_revision=9,
+            observed_at="2026-08-20T12:02:00Z",
+        )
+        coordinator.execute(
+            "SELECT * FROM carl_autonomy.reconcile_expired_claim(%s, %s, %s)",
+            (
+                _canonical(reconciliation.to_canonical_dict()),
+                dead_holder.digest,
+                reconciliation.observed_at,
+            ),
+        ).fetchone()
+        retry_claim = replace(
+            _claim(claim_id="claim-002", revision=9),
+            claimed_at="2026-08-20T12:02:00Z",
+            expires_at="2026-08-20T12:05:00Z",
+        )
+        reclaimed = coordinator.execute(
+            "SELECT * FROM carl_autonomy.claim_command(%s, %s)",
+            (
+                _canonical(retry_claim.to_canonical_dict()),
+                retry_claim.claimed_at,
+            ),
+        ).fetchone()
+        due_attempt = replace(
+            attempt,
+            claim_id=retry_claim.claim_id,
+            command_revision=10,
+            claim_expected_revision=retry_claim.expected_revision,
+            claim_expires_at=retry_claim.expires_at,
+            observed_at="2026-08-20T12:02:01Z",
+            not_before="2026-08-20T12:02:31Z",
+        )
+        rearmed = coordinator.execute(
+            "SELECT * FROM carl_autonomy.prepare_effect_attempt(%s, %s)",
+            (
+                _canonical(due_attempt.to_canonical_dict()),
+                due_attempt.observed_at,
+            ),
+        ).fetchone()
+        duplicate = coordinator.execute(
+            "SELECT * FROM carl_autonomy.prepare_effect_attempt(%s, %s)",
+            (
+                _canonical(due_attempt.to_canonical_dict()),
+                due_attempt.observed_at,
+            ),
+        ).fetchone()
+
+    assert prepared["applied"] is True
+    assert scheduled["applied"] is True
+    assert reclaimed["revision"] == 10
+    assert rearmed["applied"] is True
+    assert duplicate["applied"] is False
 
 
 def test_lease_trigger_evidence_and_health_contracts(postgres: object) -> None:

@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import stat
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any, ClassVar, cast
 
 from carl_bench.autonomy import AutonomyProjection, reduce_autonomy_events
@@ -39,6 +42,7 @@ from carl_bench.experiment import (
     GraphContractError,
     reduce_events,
 )
+from carl_bench.github_cloud import GitHubEffectAttempt
 from carl_bench.ledger import AppendResult
 from carl_bench.supervisor_triggers import (
     StoredSupervisorTrigger,
@@ -51,6 +55,9 @@ from carl_bench.supervisor_triggers import (
 MAX_STATE_REVISION = 2_147_483_647
 _ZERO_DIGEST = "0" * 64
 _DATABASE_ROLE = "carl_state_backend"
+_PROTECTED_STATE_CONFIG_DIR = Path("/etc/carl")
+_PROTECTED_STATE_CONFIG_NAME = "postgres-state-policy.json"
+_PROTECTED_STATE_DSN_ENV = "CARL_AUTONOMY_POSTGRES_DSN"
 _WORKFLOW_AUTHORITIES = frozenset(
     {"builder", "coordinator", "observer", "promoter", "soak", "supervisor", "validator"}
 )
@@ -247,6 +254,87 @@ class PostgresStateBackend(StateBackend):
             connect=config.connect,
         )
         return backend
+
+    @classmethod
+    def from_protected_environment(cls) -> PostgresStateBackend:
+        """Construct the isolated controller backend without caller-supplied seams."""
+        directory_fd = file_fd = -1
+        try:
+            directory_fd = os.open(
+                _PROTECTED_STATE_CONFIG_DIR,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            )
+            directory_stat = os.fstat(directory_fd)
+            if (
+                not stat.S_ISDIR(directory_stat.st_mode)
+                or directory_stat.st_uid not in {0, os.geteuid()}
+                or directory_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            ):
+                raise PostgresStateError("postgres_protected_configuration_invalid")
+            file_fd = os.open(
+                _PROTECTED_STATE_CONFIG_NAME,
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=directory_fd,
+            )
+            file_stat = os.fstat(file_fd)
+            if (
+                not stat.S_ISREG(file_stat.st_mode)
+                or file_stat.st_uid not in {0, os.geteuid()}
+                or file_stat.st_nlink != 1
+                or file_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+                or not 1 <= file_stat.st_size <= 16_384
+            ):
+                raise PostgresStateError("postgres_protected_configuration_invalid")
+            payload = os.read(file_fd, 16_385)
+            if len(payload) != file_stat.st_size:
+                raise PostgresStateError("postgres_protected_configuration_invalid")
+        except PostgresStateError:
+            raise
+        except OSError as error:
+            raise PostgresStateError("postgres_protected_configuration_invalid") from error
+        finally:
+            if file_fd >= 0:
+                os.close(file_fd)
+            if directory_fd >= 0:
+                os.close(directory_fd)
+        try:
+            decoded = json.loads(payload, object_pairs_hook=_reject_duplicate_keys)
+        except (json.JSONDecodeError, UnicodeError, PostgresStateError) as error:
+            raise PostgresStateError("postgres_protected_configuration_invalid") from error
+        if (
+            type(decoded) is not dict
+            or set(decoded)
+            != {"authority_key", "database_role", "dead_holder_key", "schema_version"}
+            or decoded["schema_version"] != 1
+            or decoded["database_role"] != _DATABASE_ROLE
+            or canonical_json_bytes(decoded) != payload
+        ):
+            raise PostgresStateError("postgres_protected_configuration_invalid")
+
+        def trusted_key(name: str) -> TrustedAuthorityKey:
+            value = decoded[name]
+            if type(value) is not dict or set(value) != {
+                "key_id",
+                "public_key_pem",
+                "purpose",
+            }:
+                raise PostgresStateError("postgres_protected_configuration_invalid")
+            try:
+                return TrustedAuthorityKey(**value)
+            except (CloudStateError, TypeError) as error:
+                raise PostgresStateError("postgres_protected_configuration_invalid") from error
+
+        dsn = os.environ.get(_PROTECTED_STATE_DSN_ENV)
+        if dsn is None:
+            raise PostgresStateError("postgres_dsn_missing")
+        return cls.from_config(
+            PostgresStateConfig(
+                dsn=dsn,
+                database_role=_DATABASE_ROLE,
+                authority_key=trusted_key("authority_key"),
+                dead_holder_key=trusted_key("dead_holder_key"),
+            )
+        )
 
     def _runtime_config(self) -> _PostgresRuntime:
         try:
@@ -500,6 +588,103 @@ class PostgresStateBackend(StateBackend):
                 (_canonical_text(claim.to_canonical_dict()), observed_at),
                 self._decode_command,
             ),
+        )
+
+    @staticmethod
+    def _effect_timestamp(value: str) -> datetime:
+        if not isinstance(value, str) or not value.endswith("Z"):
+            raise PostgresStateError("effect_attempt_timestamp_invalid")
+        try:
+            parsed = datetime.fromisoformat(value.removesuffix("Z") + "+00:00")
+        except ValueError as error:
+            raise PostgresStateError("effect_attempt_timestamp_invalid") from error
+        if parsed.tzinfo != UTC or parsed.isoformat().replace("+00:00", "Z") != value:
+            raise PostgresStateError("effect_attempt_timestamp_invalid")
+        return parsed
+
+    def resolve_claimed_command(
+        self,
+        command_key: str,
+        *,
+        authority: str,
+        observed_at: datetime,
+    ) -> CommandState:
+        if authority not in _WORKFLOW_AUTHORITIES or not isinstance(observed_at, datetime):
+            raise PostgresStateError("effect_command_lookup_invalid")
+        mutation = cast(
+            CommandMutation,
+            self._mutation(
+                authority,
+                "SELECT * FROM carl_autonomy.resolve_claimed_command(%s, %s)",
+                (command_key, observed_at),
+                self._decode_command,
+            ),
+        )
+        if mutation.applied:
+            raise PostgresStateError("effect_command_lookup_invalid")
+        return mutation.state
+
+    def prepare_effect_attempt(self, attempt: GitHubEffectAttempt) -> bool:
+        if not isinstance(attempt, GitHubEffectAttempt):
+            raise PostgresStateError("effect_attempt_invalid")
+        observed_at = self._effect_timestamp(attempt.observed_at)
+        return cast(
+            bool,
+            self._mutation(
+                attempt.authority,
+                "SELECT * FROM carl_autonomy.prepare_effect_attempt(%s, %s)",
+                (_canonical_text(attempt.to_canonical_dict()), observed_at),
+                self._decode_applied,
+            ),
+        )
+
+    def mark_effect_uncertain(
+        self,
+        effect_key: str,
+        *,
+        authority: str,
+        not_before: str,
+        observed_at: str,
+    ) -> None:
+        observed = self._effect_timestamp(observed_at)
+        self._mutation(
+            authority,
+            "SELECT * FROM carl_autonomy.mark_effect_uncertain(%s, %s, %s, %s)",
+            (effect_key, not_before, observed_at, observed),
+            self._decode_applied,
+        )
+
+    def mark_effect_retry_scheduled(
+        self,
+        effect_key: str,
+        *,
+        authority: str,
+        retry_not_before: str,
+        observed_at: str,
+    ) -> None:
+        observed = self._effect_timestamp(observed_at)
+        self._effect_timestamp(retry_not_before)
+        self._mutation(
+            authority,
+            "SELECT * FROM carl_autonomy.mark_effect_retry_scheduled(%s, %s, %s, %s)",
+            (effect_key, retry_not_before, observed_at, observed),
+            self._decode_applied,
+        )
+
+    def mark_effect_completed(
+        self,
+        effect_key: str,
+        *,
+        authority: str,
+        result_digest: str,
+        observed_at: str,
+    ) -> None:
+        observed = self._effect_timestamp(observed_at)
+        self._mutation(
+            authority,
+            "SELECT * FROM carl_autonomy.mark_effect_completed(%s, %s, %s, %s)",
+            (effect_key, result_digest, observed_at, observed),
+            self._decode_applied,
         )
 
     def _complete_command(

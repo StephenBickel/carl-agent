@@ -1,8 +1,13 @@
 name: Autonomous soak observation
+run-name: ${{ inputs.attempt_key }}
 
 "on":
   workflow_dispatch:
     inputs:
+      attempt_key:
+        description: Exact durable cloud dispatch attempt key
+        required: true
+        type: string
       experiment_digest:
         description: Immutable experiment manifest SHA-256
         required: true
@@ -73,6 +78,7 @@ jobs:
       - name: Validate request and exact immediate-parent topology
         id: topology
         env:
+          ATTEMPT_KEY: ${{ inputs.attempt_key }}
           CANDIDATE_COMMIT: ${{ inputs.candidate_commit }}
           EXPERIMENT_DIGEST: ${{ inputs.experiment_digest }}
           METRIC_PACK_DIGEST: ${{ inputs.metric_pack_digest }}
@@ -113,6 +119,11 @@ jobs:
               if not digest.fullmatch(os.environ[name]): raise SystemExit(f"invalid {name.lower()}")
           for name in ("PARENT_COMMIT", "CANDIDATE_COMMIT", "WORKFLOW_REVISION"):
               if not commit.fullmatch(os.environ[name]): raise SystemExit(f"invalid {name.lower()}")
+          attempt_prefix = f"cloud-run-{os.environ['REQUEST_DIGEST']}-attempt-"
+          if os.environ["ATTEMPT_KEY"] not in {
+              attempt_prefix + "1", attempt_prefix + "2", attempt_prefix + "3"
+          }:
+              raise SystemExit("attempt_key mismatch")
           payload = {
               "candidate_commit": os.environ["CANDIDATE_COMMIT"],
               "experiment_digest": os.environ["EXPERIMENT_DIGEST"],

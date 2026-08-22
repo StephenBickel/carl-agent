@@ -40,6 +40,7 @@ from carl_bench.cloud_state import (
     TrustedAuthorityKey,
 )
 from carl_bench.experiment import EventType, ExperimentEvent
+from carl_bench.github_cloud import GitHubEffectAttempt
 from carl_bench.postgres_state import (
     MAX_STATE_REVISION,
     PostgresStateBackend,
@@ -89,6 +90,95 @@ EVENT_POLICY_CASES = (
     (EventType.SOAK_OBSERVED, frozenset({"soak"}), "case"),
     (EventType.REVERT_RECORDED, frozenset({"soak"}), "case"),
 )
+
+
+def test_sql_persists_exact_effect_fence_before_network_and_reuses_it_on_restart() -> None:
+    assert re.search(
+        r"CREATE\s+TABLE\s+carl_autonomy\.effect_attempts",
+        INITIAL_SQL,
+        re.IGNORECASE,
+    )
+    for column in (
+        "effect_key",
+        "command_key",
+        "claim_id",
+        "command_revision",
+        "payload_digest",
+        "attempt_state",
+        "not_before",
+        "attempt_json",
+    ):
+        assert re.search(rf"\b{column}\b", INITIAL_SQL, re.IGNORECASE)
+    for function_name in (
+        "resolve_claimed_command",
+        "prepare_effect_attempt",
+        "mark_effect_uncertain",
+        "mark_effect_retry_scheduled",
+        "mark_effect_completed",
+    ):
+        assert re.search(
+            rf"FUNCTION\s+carl_autonomy\.{function_name}\b",
+            ROLE_PROCEDURES_SQL,
+            re.IGNORECASE,
+        )
+    prepare = re.search(
+        r"FUNCTION\s+carl_autonomy\.prepare_effect_attempt\b.*?"
+        r"AS\s+\$\$(?P<body>.*?)\$\$;",
+        ROLE_PROCEDURES_SQL,
+        re.IGNORECASE | re.DOTALL,
+    )
+    assert prepare is not None
+    body = prepare.group("body")
+    assert "FOR UPDATE" in body
+    assert "command_json" in body
+    assert "claim_json" in body
+    assert "INSERT INTO carl_autonomy.effect_attempts" in body
+    assert "effect_attempt_conflict" in body
+
+
+def test_sql_effect_fence_can_rearm_only_after_a_durable_rate_limit_deadline() -> None:
+    assert re.search(
+        r"attempt_state\s+IN\s*\([^)]*'retry_scheduled'",
+        INITIAL_SQL,
+        re.IGNORECASE | re.DOTALL,
+    )
+    retry = re.search(
+        r"FUNCTION\s+carl_autonomy\.mark_effect_retry_scheduled\b.*?"
+        r"AS\s+\$\$(?P<body>.*?)\$\$;",
+        ROLE_PROCEDURES_SQL,
+        re.IGNORECASE | re.DOTALL,
+    )
+    assert retry is not None
+    assert "FOR UPDATE" in retry.group("body")
+    assert "retry_scheduled" in retry.group("body")
+    prepare = re.search(
+        r"FUNCTION\s+carl_autonomy\.prepare_effect_attempt\b.*?"
+        r"AS\s+\$\$(?P<body>.*?)\$\$;",
+        ROLE_PROCEDURES_SQL,
+        re.IGNORECASE | re.DOTALL,
+    )
+    assert prepare is not None
+    assert re.search(
+        r"attempt_state\s*=\s*'retry_scheduled'.*?p_observed_at\s*>=\s*existing\.not_before",
+        prepare.group("body"),
+        re.IGNORECASE | re.DOTALL,
+    )
+    rearm = re.search(
+        r"IF\s+existing\.attempt_state\s*=\s*'retry_scheduled'.*?THEN\s+"
+        r"UPDATE\s+carl_autonomy\.effect_attempts.*?SET(?P<assignments>.*?)WHERE",
+        prepare.group("body"),
+        re.IGNORECASE | re.DOTALL,
+    )
+    assert rearm is not None
+    assignments = rearm.group("assignments")
+    for assignment in (
+        "claim_id = claim_key",
+        "command_revision = command_revision_value",
+        "claim_expected_revision = claim_revision_value",
+        "claim_expires_at = claim_expires_time",
+        "claim_expires_at_text = claim_expires_text",
+    ):
+        assert assignment in assignments
 
 
 def test_shared_event_policy_keys_equal_production_event_type() -> None:
@@ -355,6 +445,11 @@ class FakeDatabase:
             "append_event",
             "create_command",
             "claim_command",
+            "resolve_claimed_command",
+            "prepare_effect_attempt",
+            "mark_effect_uncertain",
+            "mark_effect_retry_scheduled",
+            "mark_effect_completed",
             "complete_command",
             "fail_command",
             "reconcile_expired_claim",
@@ -974,6 +1069,84 @@ def _command_row(
         if transition is None
         else _canonical(transition.to_canonical_dict()),
     }
+
+
+def _effect_attempt() -> GitHubEffectAttempt:
+    command = _command()
+    claim = _claim()
+    return GitHubEffectAttempt(
+        schema_version=1,
+        effect_key=command.effect_key,
+        command_key=command.command_key,
+        claim_id=claim.claim_id,
+        command_revision=8,
+        claim_expected_revision=claim.expected_revision,
+        action="dispatch_workflow",
+        endpoint_id="workflow_dispatch",
+        method="POST",
+        payload_digest="c" * 64,
+        command_request_digest=command.request_digest,
+        repository="StephenBickel/carl-agent",
+        target_identity="autonomous-improvement.yml@" + "1" * 40,
+        request_key="cloud-run-request-001",
+        attempt_key="cloud-run-request-001-attempt-1",
+        authority=command.authority,
+        operation=command.operation,
+        command_occurred_at=command.occurred_at,
+        claim_expires_at=claim.expires_at,
+        attempt_state="prepared",
+        not_before="2026-08-20T12:00:30Z",
+        observed_at=NOW_TEXT,
+    )
+
+
+def test_postgres_adapter_resolves_durable_claim_and_atomically_prepares_effect_fence() -> None:
+    database = FakeDatabase()
+    database.responses["resolve_claimed_command"] = [
+        _command_row(applied=False, status="claimed", revision=8)
+    ]
+    database.responses["prepare_effect_attempt"] = [{"applied": True}]
+    backend = _backend(database)
+    attempt = _effect_attempt()
+
+    state = backend.resolve_claimed_command(
+        attempt.command_key,
+        authority=attempt.authority,
+        observed_at=NOW,
+    )
+    prepared = backend.prepare_effect_attempt(attempt)
+
+    assert state.status == "claimed"
+    assert state.command.effect_key == attempt.effect_key
+    assert prepared is True
+    assert any("carl_autonomy.resolve_claimed_command" in query for query, _ in database.calls)
+    assert any("carl_autonomy.prepare_effect_attempt" in query for query, _ in database.calls)
+
+
+def test_postgres_adapter_persists_effect_rate_limit_retry_deadline() -> None:
+    database = FakeDatabase()
+    database.responses["mark_effect_retry_scheduled"] = [{"applied": True}]
+    backend = _backend(database)
+    attempt = _effect_attempt()
+
+    backend.mark_effect_retry_scheduled(
+        attempt.effect_key,
+        authority=attempt.authority,
+        retry_not_before="2026-08-20T12:02:00Z",
+        observed_at="2026-08-20T12:00:01Z",
+    )
+
+    query, parameters = next(
+        (query, parameters)
+        for query, parameters in database.calls
+        if "carl_autonomy.mark_effect_retry_scheduled" in query
+    )
+    assert query.startswith("SELECT * FROM")
+    assert parameters[:3] == (
+        attempt.effect_key,
+        "2026-08-20T12:02:00Z",
+        "2026-08-20T12:00:01Z",
+    )
 
 
 def _lease(*, revision: int = 0) -> CloudLease:

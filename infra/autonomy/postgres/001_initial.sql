@@ -284,6 +284,56 @@ CREATE INDEX commands_claimable
     ON carl_autonomy.commands(authority, status, revision, command_key)
     WHERE status = 'pending';
 
+CREATE TABLE carl_autonomy.effect_attempts (
+    effect_key varchar(192) PRIMARY KEY REFERENCES carl_autonomy.commands(effect_key),
+    command_key varchar(192) NOT NULL UNIQUE REFERENCES carl_autonomy.commands(command_key),
+    claim_id varchar(192) NOT NULL,
+    command_revision integer NOT NULL CHECK (command_revision BETWEEN 0 AND 2147483647),
+    claim_expected_revision integer NOT NULL CHECK (
+        claim_expected_revision BETWEEN 0 AND 2147483646
+    ),
+    authority varchar(32) NOT NULL CHECK (
+        authority IN ('builder', 'validator', 'promoter', 'soak', 'supervisor', 'coordinator', 'observer')
+    ),
+    operation varchar(64) NOT NULL,
+    action varchar(64) NOT NULL,
+    endpoint_id varchar(64) NOT NULL,
+    method varchar(8) NOT NULL CHECK (method IN ('POST', 'PATCH', 'PUT')),
+    payload_digest character(64) NOT NULL CHECK (payload_digest ~ '^[0-9a-f]{64}$'),
+    command_request_digest character(64) NOT NULL CHECK (
+        command_request_digest ~ '^[0-9a-f]{64}$'
+    ),
+    repository varchar(192) NOT NULL,
+    target_identity varchar(1024) NOT NULL,
+    request_key varchar(192) NOT NULL,
+    attempt_key varchar(192) NOT NULL,
+    command_occurred_at timestamptz NOT NULL,
+    command_occurred_at_text varchar(64) NOT NULL,
+    claim_expires_at timestamptz NOT NULL,
+    claim_expires_at_text varchar(64) NOT NULL,
+    attempt_state varchar(16) NOT NULL CHECK (
+        attempt_state IN ('prepared', 'retry_scheduled', 'uncertain', 'completed')
+    ),
+    not_before timestamptz NOT NULL,
+    not_before_text varchar(64) NOT NULL,
+    attempt_json text NOT NULL CHECK (octet_length(attempt_json) BETWEEN 2 AND 32768),
+    result_digest character(64),
+    observed_at timestamptz NOT NULL,
+    observed_at_text varchar(64) NOT NULL,
+    created_at timestamptz NOT NULL,
+    updated_at timestamptz NOT NULL,
+    CHECK (claim_id ~ '^[A-Za-z0-9][A-Za-z0-9._:/-]{0,191}$'),
+    CHECK (action ~ '^[a-z][a-z0-9_-]{0,63}$'),
+    CHECK (endpoint_id ~ '^[a-z][a-z0-9_]{0,63}$'),
+    CHECK (octet_length(target_identity) BETWEEN 1 AND 1024),
+    CHECK (result_digest IS NULL OR result_digest ~ '^[0-9a-f]{64}$'),
+    CHECK (not_before >= observed_at),
+    CHECK (
+        (attempt_state IN ('prepared', 'retry_scheduled', 'uncertain') AND result_digest IS NULL)
+        OR (attempt_state = 'completed' AND result_digest IS NOT NULL)
+    )
+);
+
 CREATE TABLE carl_autonomy.leases (
     lease_key varchar(192) PRIMARY KEY,
     lease_json text NOT NULL CHECK (octet_length(lease_json) BETWEEN 2 AND 16384),
