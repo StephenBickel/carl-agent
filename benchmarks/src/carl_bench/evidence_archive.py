@@ -178,8 +178,6 @@ class EvidenceArchive:
                 raise EvidenceArchiveError("evidence_archive_unavailable") from None
             if provider is None:
                 raise EvidenceArchiveError("evidence_archive_response_ambiguous") from None
-        except EvidenceArchiveError:
-            raise
         except Exception:
             raise EvidenceArchiveError("evidence_archive_unavailable") from None
         return self._validated_record(

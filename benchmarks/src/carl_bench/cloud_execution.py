@@ -1623,7 +1623,8 @@ def _commissioning_failure(
     artifact: CloudArtifact,
     trusted_receipt_key: TrustedCloudReceiptKey | None,
     *,
-    require_protected_archive: bool = False,
+    require_protected_archive: bool = True,
+    verified_at: str | None = None,
 ) -> str | None:
     envelope = snapshot.commissioning_receipt
     if envelope is None:
@@ -1632,6 +1633,11 @@ def _commissioning_failure(
         return "cloud_commissioning_signature_missing"
     if require_protected_archive and envelope.protected_binding is None:
         return "cloud_commissioning_protected_archive_missing"
+    if (
+        envelope.protected_binding is not None
+        and envelope.receipt_digest != envelope.receipt.digest
+    ):
+        return "cloud_commissioning_receipt_digest_mismatch"
     try:
         signature = envelope.signature
     except (ValueError, binascii.Error):
@@ -1658,12 +1664,14 @@ def _commissioning_failure(
     if signature_failure is not None:
         return signature_failure
     if envelope.protected_binding is not None:
+        if verified_at is None:
+            return "cloud_commissioning_verification_time_missing"
         retention_end = _utc(
             "cloud_commissioning_archive_retain_until",
             envelope.protected_binding.retain_until,
         )
-        snapshot_time = _utc("cloud_commissioning_snapshot_observed_at", snapshot.observed_at)
-        if retention_end <= snapshot_time:
+        verification_time = _utc("cloud_commissioning_verified_at", verified_at)
+        if retention_end <= verification_time:
             return "cloud_commissioning_archive_retention_expired"
     receipt = envelope.receipt
     bindings: tuple[tuple[object, object, str], ...] = (
@@ -1737,13 +1745,15 @@ def reconcile_cloud_run(
     snapshot: CloudRunSnapshot,
     *,
     trusted_receipt_key: TrustedCloudReceiptKey | None = None,
-    require_protected_archive: bool = False,
+    require_protected_archive: bool = True,
+    verified_at: str | None = None,
 ) -> CloudRunDecision:
     """Choose one restart-safe control-plane action without executing local work."""
     if (
         not isinstance(request, CloudRunRequest)
         or not isinstance(snapshot, CloudRunSnapshot)
         or type(require_protected_archive) is not bool
+        or (verified_at is not None and not isinstance(verified_at, str))
     ):
         raise CloudExecutionError("invalid_cloud_reconciliation")
     if snapshot.local_fallback_command is not None and _HEAVY_LOCAL_RE.search(
@@ -1837,6 +1847,7 @@ def reconcile_cloud_run(
         artifact,
         trusted_receipt_key,
         require_protected_archive=require_protected_archive,
+        verified_at=verified_at,
     )
     if commissioning_failure is not None:
         return _decision("blocked", commissioning_failure, request, snapshot)

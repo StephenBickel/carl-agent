@@ -19,6 +19,7 @@ from carl_bench.cloud_execution import (
 )
 from carl_bench.cloud_signer import (
     CloudReceiptSigner,
+    CloudSignerError,
     KmsSignResult,
     ProtectedSigningPolicy,
     SignResponseLost,
@@ -168,6 +169,16 @@ def test_archive_redacts_provider_exception_causes() -> None:
     assert caught.value.__cause__ is None
     assert str(caught.value) == "evidence_archive_unavailable"
 
+    class PublicErrorStore(FakeStore):
+        def create_immutable(self, key, payload, metadata):
+            raise EvidenceArchiveError("secret-token provider-body")
+
+    public_archive = EvidenceArchive._for_testing(store=PublicErrorStore(), clock=lambda: NOW)
+    with pytest.raises(EvidenceArchiveError) as public_caught:
+        public_archive.archive(identity(), ARCHIVE_PAYLOAD)
+    assert str(public_caught.value) == "evidence_archive_unavailable"
+    assert public_caught.value.__cause__ is None
+
 
 class FakeKms:
     def __init__(self, private_key: Ed25519PrivateKey) -> None:
@@ -304,6 +315,18 @@ def test_signer_redacts_raw_kms_exception_causes() -> None:
     assert caught.value.__cause__ is None
     assert str(caught.value) == "cloud_signer_unavailable"
 
+    class PublicErrorKms(FakeKms):
+        def sign_cloud_evidence(self, request):
+            raise CloudSignerError("secret-token provider-body")
+
+    public_signer = CloudReceiptSigner._for_testing(
+        kms=PublicErrorKms(private), policy=signing_policy(private)
+    )
+    with pytest.raises(CloudSignerError) as public_caught:
+        public_signer.sign_commissioning_receipt(receipt(), archive)
+    assert str(public_caught.value) == "cloud_signer_unavailable"
+    assert public_caught.value.__cause__ is None
+
 
 def test_verifier_rejects_mutation_wrong_archive_and_malformed_signature() -> None:
     private = Ed25519PrivateKey.generate()
@@ -345,8 +368,31 @@ def test_cloud_ingestion_rejects_protected_receipt_after_archive_retention() -> 
         conclusion="success",
     )
     assert (
-        cloud_execution._commissioning_failure(None, snapshot, None, trusted)
+        cloud_execution._commissioning_failure(
+            None,
+            snapshot,
+            None,
+            trusted,
+            verified_at="2028-08-22T12:00:00Z",
+        )
         == "cloud_commissioning_archive_retention_expired"
+    )
+    assert (
+        cloud_execution._commissioning_failure(None, snapshot, None, trusted)
+        == "cloud_commissioning_verification_time_missing"
+    )
+
+    tampered_digest = replace(signed, receipt_digest="f" * 64)
+    snapshot.commissioning_receipt = tampered_digest
+    assert (
+        cloud_execution._commissioning_failure(
+            None,
+            snapshot,
+            None,
+            trusted,
+            verified_at="2026-08-22T12:00:01Z",
+        )
+        == "cloud_commissioning_receipt_digest_mismatch"
     )
 
 

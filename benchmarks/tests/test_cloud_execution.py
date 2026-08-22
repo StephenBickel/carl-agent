@@ -205,7 +205,19 @@ def reconcile_cloud_run(
     **kwargs: object,
 ):
     kwargs.setdefault("trusted_receipt_key", TEST_TRUSTED_KEY)
+    kwargs.setdefault("require_protected_archive", False)
     return _reconcile_cloud_run(cloud_request, cloud_snapshot, **kwargs)
+
+
+def test_production_reconciliation_defaults_to_protected_archive_receipts() -> None:
+    cloud_request = request()
+    decision = _reconcile_cloud_run(
+        cloud_request,
+        snapshot(cloud_request),
+        trusted_receipt_key=TEST_TRUSTED_KEY,
+    )
+    assert decision.action == "blocked"
+    assert decision.reason == "cloud_commissioning_protected_archive_missing"
 
 
 def snapshot(cloud_request: CloudRunRequest | None = None, **changes: object) -> CloudRunSnapshot:
@@ -1351,6 +1363,7 @@ def test_valid_canonical_signed_commissioning_receipt_authorizes_exact_run() -> 
         cloud_request,
         snapshot(cloud_request, commissioning_receipt=signed),
         trusted_receipt_key=trusted_key(private_key),
+        require_protected_archive=False,
     )
 
     assert decision.action == "record_success"
@@ -1365,6 +1378,7 @@ def test_signed_commissioning_requires_the_configured_trusted_public_key() -> No
     missing_key = _reconcile_cloud_run(
         cloud_request,
         snapshot(cloud_request, commissioning_receipt=signed),
+        require_protected_archive=False,
     )
     attacker_key = reconcile_cloud_run(
         cloud_request,
