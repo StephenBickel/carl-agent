@@ -18,6 +18,7 @@ carl-coordinator-service = "carl_bench.coordinator_service:main"
 carl-github-effect-service = "carl_bench.github_effect_service:main"
 carl-live-evaluation-service = "carl_bench.live_evaluation_service:main"
 carl-live-gateway-service = "carl_bench.live_gateway_service:main"
+carl-live-runner = "carl_bench.live_runner_client:main"
 
 [dependency-groups]
 dev = [

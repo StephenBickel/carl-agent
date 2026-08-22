@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import os
 import signal
@@ -15,13 +17,17 @@ from pathlib import Path
 
 from carl_bench.canonical import canonical_json_bytes
 from carl_bench.live_capability import LiveEvaluationIdentity, LivePairPolicy, LiveTaskIdentity
+from carl_bench.live_execution_receipt import (
+    ProtectedLiveExecutionResult,
+    model_result_digest,
+    sign_execution_receipt,
+)
 from carl_bench.live_gateway_authority import (
     LiveGatewayAuthorityError,
     ProtectedExecutionObservation,
     ProtectedModelGatewayServer,
 )
 from carl_bench.live_worker_isolation import CgroupV2WorkerIsolation, LiveWorkerIsolationError
-from carl_bench.openai_gateway import ProtectedOpenAIModelResult
 
 _MAX_WORKER_SECONDS = 3_600
 
@@ -42,7 +48,7 @@ class _PinnedCheckout:
 class ProtectedLiveGatewayRunner:
     """Launch exact unprivileged workers and bind their observed process to one capability."""
 
-    __slots__ = ("_isolation", "_server", "_workers")
+    __slots__ = ("_execution_key", "_isolation", "_server", "_workers")
 
     def __new__(cls, *args: object, **kwargs: object) -> ProtectedLiveGatewayRunner:
         del cls, args, kwargs
@@ -74,12 +80,26 @@ class ProtectedLiveGatewayRunner:
             workers[1][0],
         }:
             raise LiveGatewayAuthorityError("live_worker_identity_invalid")
-        isolation = CgroupV2WorkerIsolation.from_protected_process()
+        isolation = CgroupV2WorkerIsolation.from_live_gateway_process()
         return cls._construct(
             server=ProtectedModelGatewayServer.from_protected_process(),
             workers=workers,
             isolation=isolation,
+            execution_key=cls._protected_execution_key(),
         )
+
+    @staticmethod
+    def _protected_execution_key() -> bytes:
+        encoded = os.environ.get("CARL_LIVE_EXECUTION_KEY_B64")
+        if not isinstance(encoded, str):
+            raise LiveGatewayAuthorityError("live_acp_credential_missing")
+        try:
+            key = base64.b64decode(encoded, validate=True)
+        except (ValueError, binascii.Error):
+            raise LiveGatewayAuthorityError("live_execution_receipt_key_invalid") from None
+        if len(key) != 32 or base64.b64encode(key).decode("ascii") != encoded:
+            raise LiveGatewayAuthorityError("live_execution_receipt_key_invalid")
+        return key
 
     @classmethod
     def _for_testing(
@@ -88,8 +108,14 @@ class ProtectedLiveGatewayRunner:
         server: ProtectedModelGatewayServer,
         workers: tuple[tuple[int, int], tuple[int, int]],
         isolation: object,
+        execution_key: bytes = b"E" * 32,
     ) -> ProtectedLiveGatewayRunner:
-        return cls._construct(server=server, workers=workers, isolation=isolation)
+        return cls._construct(
+            server=server,
+            workers=workers,
+            isolation=isolation,
+            execution_key=execution_key,
+        )
 
     @classmethod
     def _construct(
@@ -98,6 +124,7 @@ class ProtectedLiveGatewayRunner:
         server: ProtectedModelGatewayServer,
         workers: tuple[tuple[int, int], tuple[int, int]],
         isolation: object,
+        execution_key: bytes,
     ) -> ProtectedLiveGatewayRunner:
         if (
             not isinstance(server, ProtectedModelGatewayServer)
@@ -105,12 +132,15 @@ class ProtectedLiveGatewayRunner:
             or len(workers) != 2
             or workers[0][0] == workers[1][0]
             or not callable(getattr(isolation, "begin", None))
+            or not isinstance(execution_key, bytes)
+            or len(execution_key) != 32
         ):
             raise LiveGatewayAuthorityError("live_gateway_runner_configuration_invalid")
         value = object.__new__(cls)
         value._server = server
         value._workers = workers
         value._isolation = isolation
+        value._execution_key = execution_key
         return value
 
     @property
@@ -299,7 +329,7 @@ class ProtectedLiveGatewayRunner:
         executable: Path,
         arguments: Sequence[str] = (),
         timeout_seconds: int,
-    ) -> ProtectedOpenAIModelResult:
+    ) -> ProtectedLiveExecutionResult:
         if (
             subject not in {"parent", "candidate"}
             or isinstance(timeout_seconds, bool)
@@ -463,7 +493,59 @@ class ProtectedLiveGatewayRunner:
             except LiveWorkerIsolationError as error:
                 invalidate_execution("runner_isolation_cleanup_failed")
                 raise LiveGatewayAuthorityError(error.code) from error
-            return self._server.take_completed_result(prepared)
+            model_result = self._server.take_completed_result(prepared)
+            try:
+                isolation_observation = isolation_scope.receipt_observation()
+            except Exception as error:
+                invalidate_execution("runner_isolation_observation_invalid")
+                raise LiveGatewayAuthorityError("live_worker_isolation_state_invalid") from error
+            fields = {
+                "argv": (os.fspath(executable), *arguments),
+                "timeout_seconds": timeout_seconds,
+                "repository": identity.repository,
+                "pair_request_digest": identity.request_digest,
+                "subject": subject,
+                "subject_commit": actual.subject_commit,
+                "subject_tree": actual.subject_tree,
+                "task_id": task.task_id,
+                "task_digest": task.task_digest,
+                "input_digest": task.input_digest,
+                "input_size": task.input_size,
+                "grader_digest": task.grader_digest,
+                "task_role": task.role,
+                "seed": actual.seed,
+                "attempt": attempt,
+                "environment_digest": identity.environment_digest,
+                "model": identity.model,
+                "reasoning_policy": identity.reasoning_policy,
+                "model_policy_digest": identity.model_policy_digest,
+                "live_policy_digest": actual.live_policy_digest,
+                "execution_context_digest": actual.execution_context_digest,
+                "process_id": actual.process_id,
+                "worker_uid": actual.worker_uid,
+                "worker_gid": actual.worker_gid,
+                "executable_device": pinned.executable_identity[0],
+                "executable_inode": pinned.executable_identity[1],
+                "executable_size": pinned.executable_identity[2],
+                "executable_mode": pinned.executable_identity[3],
+                "executable_mtime_ns": pinned.executable_identity[4],
+                "executable_digest": pinned.executable_digest,
+                "checkout_device": pinned.root_identity[0],
+                "checkout_inode": pinned.root_identity[1],
+                "checkout_digest": pinned.checkout_digest,
+                **isolation_observation,
+                "model_result_digest": model_result_digest(model_result),
+                "model_request_digest": model_result.request_digest,
+                "model_output_digest": model_result.output_digest,
+                "response_id": model_result.response_id,
+            }
+            return ProtectedLiveExecutionResult(
+                model_result=model_result,
+                execution_receipt=sign_execution_receipt(
+                    fields=fields,
+                    key=self._execution_key,
+                ),
+            )
         except OSError as error:
             if process is not None:
                 self._terminate_process_tree(process)

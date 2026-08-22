@@ -16,13 +16,21 @@ import pytest
 from carl_bench.adapters.carl_acp import BoundedModelGatewayCapability
 from carl_bench.canonical import canonical_json_bytes
 from carl_bench.live_capability import LiveEvaluationIdentity, LivePairPolicy, LiveTaskIdentity
+from carl_bench.live_execution_receipt import (
+    ProtectedLiveExecutionResult,
+    verify_execution_receipt,
+)
 from carl_bench.live_gateway_authority import (
     LiveGatewayAuthorityError,
     ProtectedModelGatewayServer,
 )
 from carl_bench.live_gateway_http import _serve_loopback_listener
 from carl_bench.live_gateway_runner import ProtectedLiveGatewayRunner
-from carl_bench.live_worker_isolation import CgroupV2WorkerIsolation, LiveWorkerIsolationError
+from carl_bench.live_worker_isolation import (
+    CgroupV2WorkerIsolation,
+    CgroupV2WorkerScope,
+    LiveWorkerIsolationError,
+)
 from carl_bench.openai_gateway import (
     OpenAIModelRequest,
     OpenAIUsage,
@@ -197,6 +205,13 @@ class _FakeIsolationScope:
         if self._fail_cleanup:
             raise LiveWorkerIsolationError("live_worker_isolation_not_empty")
         self.cleaned = True
+
+    def receipt_observation(self) -> dict[str, str]:
+        return {
+            "cgroup_observation_digest": self.attestation_digest,
+            "cgroup_path": "/system.slice/carl-live-gateway.service/worker-test",
+            "cgroup_unit": "carl-live-gateway.service",
+        }
 
 
 class _FakeIsolation:
@@ -511,6 +526,7 @@ def test_runner_owns_launch_observation_capability_and_cross_process_result(
         server=server,
         workers=((os.geteuid(), os.getegid()), (os.geteuid() + 1, os.getegid() + 1)),
         isolation=_FakeIsolation(scope),
+        execution_key=b"E" * 32,
     )
     monkeypatch.setenv("OPENAI_API_KEY", "sk-protected-secret-visible-to-candidate")
     monkeypatch.setenv("CARL_OPENAI_PROVENANCE_KEY_B64", "protected-provenance-secret")
@@ -535,8 +551,41 @@ def test_runner_owns_launch_observation_capability_and_cross_process_result(
         thread.join(3)
         listener.close()
 
-    assert type(result) is ProtectedOpenAIModelResult
-    assert result.output_text == "runner output"
+    assert type(result) is ProtectedLiveExecutionResult
+    assert result.model_result.output_text == "runner output"
+    receipt = result.execution_receipt
+    assert verify_execution_receipt(receipt, key=b"E" * 32) is True
+    assert receipt.argv == (os.fspath(executable),)
+    assert receipt.timeout_seconds == 5
+    assert receipt.executable_inode > 0
+    assert receipt.executable_digest == hashlib.sha256(executable.read_bytes()).hexdigest()
+    assert receipt.subject_tree == parent_tree
+    assert receipt.input_size == task.input_size
+    assert (receipt.worker_uid, receipt.worker_gid) == (os.geteuid(), os.getegid())
+    assert receipt.cgroup_unit == "carl-live-gateway.service"
+    assert receipt.cgroup_path.endswith("/worker-test")
+    assert receipt.environment_digest == identity.environment_digest
+    assert receipt.model_policy_digest == identity.model_policy_digest
+    assert (
+        receipt.model_result_digest
+        == hashlib.sha256(
+            canonical_json_bytes(
+                {
+                    "latency_ms": result.model_result.latency_ms,
+                    "model": result.model_result.model,
+                    "output_digest": result.model_result.output_digest,
+                    "provenance_tag": result.model_result.provenance_tag,
+                    "request_digest": result.model_result.request_digest,
+                    "response_id": result.model_result.response_id,
+                    "status": result.model_result.status,
+                    "usage": {
+                        name: getattr(result.model_result.usage, name)
+                        for name in result.model_result.usage.__dataclass_fields__
+                    },
+                }
+            )
+        ).hexdigest()
+    )
     assert server._grant("runner-owned-token-1234567890").actual.isolation_digest == (
         scope.attestation_digest
     )
@@ -675,7 +724,7 @@ def test_runner_cgroup_isolation_reaps_setsid_escape(tmp_path: Path) -> None:
             timeout_seconds=5,
         )
         escaped_pid = int(escaped_pid_path.read_text(encoding="utf-8"))
-        assert type(result) is ProtectedOpenAIModelResult
+        assert type(result) is ProtectedLiveExecutionResult
         assert scope.cleaned is True
         assert _process_exists(escaped_pid) is False
     finally:
@@ -733,15 +782,89 @@ def test_production_cgroup_isolation_fails_closed_outside_commissioned_service()
         CgroupV2WorkerIsolation.from_protected_process()
 
 
-def test_live_gateway_systemd_contract_commissions_delegated_cgroup_v2() -> None:
+def test_cgroup_cleanup_kills_waits_for_verified_emptiness_and_removes_scope(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    scope_path = tmp_path / "worker-test"
+    scope_path.mkdir()
+    scope = CgroupV2WorkerScope(
+        path=scope_path,
+        relative="/system.slice/carl-live-gateway.service/worker-test",
+        unit="carl-live-gateway.service",
+        execution_digest=_digest("execution"),
+    )
+    writes: list[tuple[Path, str, str | None]] = []
+    reads: list[Path] = []
+    removed: list[Path] = []
+    events = iter(("populated 1\n", "populated 0\n"))
+
+    def write_text(path: Path, data: str, encoding: str | None = None) -> int:
+        writes.append((path, data, encoding))
+        return len(data)
+
+    def read_bounded(path: Path, *, maximum_bytes: int = 16_384) -> str:
+        del maximum_bytes
+        reads.append(path)
+        return next(events)
+
+    def rmdir(path: Path) -> None:
+        removed.append(path)
+
+    monkeypatch.setattr(Path, "write_text", write_text)
+    monkeypatch.setattr(Path, "rmdir", rmdir)
+    monkeypatch.setattr("carl_bench.live_worker_isolation._read_bounded", read_bounded)
+    monkeypatch.setattr("carl_bench.live_worker_isolation.time.sleep", lambda seconds: None)
+
+    scope.cleanup_and_verify_empty()
+
+    assert writes == [(scope_path / "cgroup.kill", "1\n", "ascii")]
+    assert reads == [scope_path / "cgroup.events", scope_path / "cgroup.events"]
+    assert removed == [scope_path]
+
+
+def test_cgroup_cleanup_fails_closed_when_scope_remains_populated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    scope_path = tmp_path / "worker-stuck"
+    scope_path.mkdir()
+    scope = CgroupV2WorkerScope(
+        path=scope_path,
+        relative="/system.slice/carl-live-gateway.service/worker-stuck",
+        unit="carl-live-gateway.service",
+        execution_digest=_digest("stuck-execution"),
+    )
+    removed: list[Path] = []
+    observed_times = iter((0.0, 6.0))
+
+    monkeypatch.setattr(Path, "write_text", lambda path, data, encoding=None: len(data))
+    monkeypatch.setattr(Path, "rmdir", lambda path: removed.append(path))
+    monkeypatch.setattr(
+        "carl_bench.live_worker_isolation._read_bounded",
+        lambda path, maximum_bytes=16_384: "populated 1\n",
+    )
+    monkeypatch.setattr(
+        "carl_bench.live_worker_isolation.time.monotonic", lambda: next(observed_times)
+    )
+
+    with pytest.raises(LiveWorkerIsolationError, match="live_worker_isolation_not_empty"):
+        scope.cleanup_and_verify_empty()
+
+    assert removed == []
+
+
+def test_live_gateway_systemd_contract_commissions_runner_ipc_and_delegated_cgroup_v2() -> None:
     systemd_root = Path(__file__).parents[2] / "infra/autonomy/systemd"
     service = ConfigParser(interpolation=None, strict=True)
     service.optionxform = str
     socket_unit = ConfigParser(interpolation=None, strict=True)
     socket_unit.optionxform = str
+    runner_socket = ConfigParser(interpolation=None, strict=True)
+    runner_socket.optionxform = str
 
     assert service.read(systemd_root / "carl-live-gateway.service")
     assert socket_unit.read(systemd_root / "carl-live-gateway.socket")
+    assert runner_socket.read(systemd_root / "carl-live-runner.socket")
+    assert service["Unit"]["Requires"] == ("carl-live-gateway.socket carl-live-runner.socket")
     assert service["Service"] == {
         "Type": "simple",
         "ExecStart": "/opt/carl/venv/bin/carl-live-gateway-service",
@@ -772,3 +895,35 @@ def test_live_gateway_systemd_contract_commissions_delegated_cgroup_v2() -> None
         "NoDelay": "true",
         "Service": "carl-live-gateway.service",
     }
+    assert runner_socket["Socket"] == {
+        "FileDescriptorName": "live-runner",
+        "ListenStream": "/run/carl/live-runner.sock",
+        "SocketGroup": "root",
+        "SocketMode": "0600",
+        "Service": "carl-live-gateway.service",
+    }
+
+
+def test_gateway_service_requires_exact_two_socket_activation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from carl_bench import live_gateway_service
+
+    environment = {
+        "LISTEN_PID": str(os.getpid()),
+        "LISTEN_FDS": "2",
+        "LISTEN_FDNAMES": "live-gateway:live-runner",
+    }
+    monkeypatch.setattr(live_gateway_service.os, "get_inheritable", lambda fd: fd in {3, 4})
+
+    assert live_gateway_service._activation_descriptors(
+        environment=environment,
+        process_id=os.getpid(),
+    ) == (3, 4)
+
+    environment["LISTEN_FDNAMES"] = "live-runner:live-gateway"
+    with pytest.raises(RuntimeError, match="live_gateway_service_activation_invalid"):
+        live_gateway_service._activation_descriptors(
+            environment=environment,
+            process_id=os.getpid(),
+        )

@@ -141,7 +141,9 @@ class SQLiteLiveGatewayStateStore:
                     claim_pid INTEGER,
                     claim_process_start TEXT,
                     claim_started_at INTEGER,
-                    claim_expires_at INTEGER
+                    claim_expires_at INTEGER,
+                    provider_request_digest TEXT,
+                    dispatched_at INTEGER
                 );
                 """
             )
@@ -154,6 +156,8 @@ class SQLiteLiveGatewayStateStore:
                 "claim_process_start": "TEXT",
                 "claim_started_at": "INTEGER",
                 "claim_expires_at": "INTEGER",
+                "provider_request_digest": "TEXT",
+                "dispatched_at": "INTEGER",
             }
             for name, definition in additions.items():
                 if name not in columns:
@@ -173,6 +177,14 @@ class SQLiteLiveGatewayStateStore:
                        ELSE infrastructure_code
                    END
                    WHERE claim_state = 'ready'"""
+            )
+            connection.execute(
+                """UPDATE gateway_grants
+                   SET claim_state = 'dispatch_ambiguous',
+                       infrastructure_code = COALESCE(
+                           infrastructure_code, 'gateway_legacy_dispatch_ambiguous'
+                       )
+                   WHERE claim_state = 'in_progress'"""
             )
         except sqlite3.Error as error:
             raise LiveGatewayStateError("live_gateway_state_unavailable") from error
@@ -257,13 +269,15 @@ class SQLiteLiveGatewayStateStore:
             ).fetchone()
             if row is None:
                 raise LiveGatewayStateError("live_gateway_capability_invalid")
-            if row["claim_state"] == "in_progress":
+            if row["claim_state"] == "dispatch_ambiguous":
+                raise LiveGatewayStateError("live_gateway_dispatch_ambiguous")
+            if row["claim_state"] in {"pre_dispatch", "dispatched"}:
                 raise LiveGatewayStateError("live_gateway_capability_in_progress")
             if row["claim_state"] != "ready":
                 raise LiveGatewayStateError("live_gateway_capability_consumed")
             connection.execute(
                 """UPDATE gateway_grants
-                   SET consumed = 1, claim_state = 'in_progress', claim_id = ?,
+                   SET consumed = 1, claim_state = 'pre_dispatch', claim_id = ?,
                        claim_boot_id = ?, claim_pid = ?, claim_process_start = ?,
                        claim_started_at = ?, claim_expires_at = ?
                    WHERE token_digest = ? AND claim_state = 'ready'""",
@@ -288,24 +302,117 @@ class SQLiteLiveGatewayStateStore:
         finally:
             connection.close()
 
+    def mark_provider_dispatched(
+        self,
+        token_digest: str,
+        claim_id: str,
+        *,
+        request_digest: str,
+        dispatched_at: int,
+    ) -> None:
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            updated = connection.execute(
+                """UPDATE gateway_grants
+                   SET claim_state = 'dispatched', provider_request_digest = ?, dispatched_at = ?
+                   WHERE token_digest = ? AND claim_state = 'pre_dispatch' AND claim_id = ?""",
+                (request_digest, dispatched_at, token_digest, claim_id),
+            )
+            if updated.rowcount != 1:
+                raise LiveGatewayStateError("live_gateway_capability_invalid")
+            connection.commit()
+        except LiveGatewayStateError:
+            connection.rollback()
+            raise
+        except sqlite3.Error as error:
+            connection.rollback()
+            raise LiveGatewayStateError("live_gateway_state_unavailable") from error
+        finally:
+            connection.close()
+
+    def mark_dispatch_ambiguous(
+        self,
+        token_digest: str,
+        claim_id: str,
+        *,
+        code: str,
+    ) -> None:
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            updated = connection.execute(
+                """UPDATE gateway_grants
+                   SET claim_state = 'dispatch_ambiguous', infrastructure_code = ?
+                   WHERE token_digest = ? AND claim_state = 'dispatched' AND claim_id = ?""",
+                (code, token_digest, claim_id),
+            )
+            if updated.rowcount != 1:
+                raise LiveGatewayStateError("live_gateway_capability_invalid")
+            connection.commit()
+        except LiveGatewayStateError:
+            connection.rollback()
+            raise
+        except sqlite3.Error as error:
+            connection.rollback()
+            raise LiveGatewayStateError("live_gateway_state_unavailable") from error
+        finally:
+            connection.close()
+
     def complete_result(self, token_digest: str, claim_id: str, result: dict[str, Any]) -> None:
         payload = _canonical_text(result, "live_gateway_result_invalid")
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
-                """SELECT claim_state, claim_id, result_json FROM gateway_grants
+                """SELECT claim_state, claim_id, result_json, provider_request_digest
+                   FROM gateway_grants
                    WHERE token_digest = ?""",
                 (token_digest,),
             ).fetchone()
-            if row is None or row["claim_state"] != "in_progress" or row["claim_id"] != claim_id:
+            if row is None or row["claim_state"] != "dispatched" or row["claim_id"] != claim_id:
                 raise LiveGatewayStateError("live_gateway_capability_invalid")
+            if result.get("request_digest") != row["provider_request_digest"]:
+                raise LiveGatewayStateError("live_gateway_result_conflict")
             if row["result_json"] not in {None, payload}:
                 raise LiveGatewayStateError("live_gateway_result_conflict")
             connection.execute(
                 """UPDATE gateway_grants
                    SET result_json = ?, claim_state = 'completed'
                    WHERE token_digest = ?""",
+                (payload, token_digest),
+            )
+            connection.commit()
+        except LiveGatewayStateError:
+            connection.rollback()
+            raise
+        except sqlite3.Error as error:
+            connection.rollback()
+            raise LiveGatewayStateError("live_gateway_state_unavailable") from error
+        finally:
+            connection.close()
+
+    def reconcile_dispatched_result(self, token_digest: str, result: dict[str, Any]) -> None:
+        payload = _canonical_text(result, "live_gateway_result_invalid")
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """SELECT claim_state, provider_request_digest, result_json
+                   FROM gateway_grants WHERE token_digest = ?""",
+                (token_digest,),
+            ).fetchone()
+            if row is None or row["claim_state"] != "dispatch_ambiguous":
+                raise LiveGatewayStateError("live_gateway_reconciliation_not_authorized")
+            if (
+                row["result_json"] is not None
+                or result.get("request_digest") != row["provider_request_digest"]
+            ):
+                raise LiveGatewayStateError("live_gateway_result_conflict")
+            connection.execute(
+                """UPDATE gateway_grants
+                   SET result_json = ?, claim_state = 'completed', infrastructure_code = NULL
+                   WHERE token_digest = ? AND claim_state = 'dispatch_ambiguous'""",
                 (payload, token_digest),
             )
             connection.commit()
@@ -362,7 +469,11 @@ class SQLiteLiveGatewayStateStore:
             ).fetchone()
             if row is None:
                 raise LiveGatewayStateError("live_gateway_capability_invalid")
-            if row["result_json"] is not None or row["infrastructure_code"] not in {None, code}:
+            if (
+                row["claim_state"] in {"dispatched", "dispatch_ambiguous"}
+                or row["result_json"] is not None
+                or row["infrastructure_code"] not in {None, code}
+            ):
                 raise LiveGatewayStateError("live_infrastructure_result_conflict")
             connection.execute(
                 """UPDATE gateway_grants
@@ -385,11 +496,16 @@ class SQLiteLiveGatewayStateStore:
         try:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
-                """SELECT collected, infrastructure_code FROM gateway_grants
+                """SELECT collected, claim_state, infrastructure_code FROM gateway_grants
                    WHERE token_digest = ?""",
                 (token_digest,),
             ).fetchone()
-            if row is None or row["collected"] or row["infrastructure_code"] not in {None, code}:
+            if (
+                row is None
+                or row["collected"]
+                or row["claim_state"] in {"dispatched", "dispatch_ambiguous"}
+                or row["infrastructure_code"] not in {None, code}
+            ):
                 raise LiveGatewayStateError("live_infrastructure_result_conflict")
             connection.execute(
                 """UPDATE gateway_grants
@@ -412,7 +528,7 @@ class SQLiteLiveGatewayStateStore:
         connection = self._connect()
         try:
             rows = connection.execute(
-                """SELECT subject, infrastructure_code FROM gateway_grants
+                """SELECT subject, infrastructure_code, claim_state FROM gateway_grants
                    WHERE pair_request_digest = ? AND task_id = ? AND attempt = ?
                    ORDER BY subject""",
                 (pair_request_digest, task_id, attempt),
@@ -424,7 +540,7 @@ class SQLiteLiveGatewayStateStore:
         return {
             row["subject"]: row["infrastructure_code"]
             for row in rows
-            if row["infrastructure_code"] is not None
+            if row["infrastructure_code"] is not None and row["claim_state"] == "invalid"
         }
 
     def reconcile_abandoned_claims(
@@ -439,9 +555,11 @@ class SQLiteLiveGatewayStateStore:
         try:
             connection.execute("BEGIN IMMEDIATE")
             rows = connection.execute(
-                """SELECT token_digest, claim_boot_id, claim_pid, claim_process_start
+                """SELECT token_digest, claim_state, claim_boot_id, claim_pid,
+                          claim_process_start
                    FROM gateway_grants
-                   WHERE claim_state = 'in_progress' AND claim_expires_at <= ?
+                   WHERE claim_state IN ('pre_dispatch', 'dispatched')
+                         AND claim_expires_at <= ?
                    ORDER BY token_digest""",
                 (observed_at,),
             ).fetchall()
@@ -454,13 +572,17 @@ class SQLiteLiveGatewayStateStore:
                 )
                 if alive_identity == row["claim_process_start"]:
                     continue
+                if row["claim_state"] == "pre_dispatch":
+                    next_state = "invalid"
+                    code = "gateway_pre_dispatch_abandoned"
+                else:
+                    next_state = "dispatch_ambiguous"
+                    code = "gateway_dispatch_ambiguous"
                 connection.execute(
                     """UPDATE gateway_grants
-                       SET claim_state = 'invalid',
-                           infrastructure_code = 'gateway_claim_abandoned'
-                       WHERE token_digest = ? AND claim_state = 'in_progress'
-                             AND claim_expires_at <= ?""",
-                    (row["token_digest"], observed_at),
+                       SET claim_state = ?, infrastructure_code = ?
+                       WHERE token_digest = ? AND claim_state = ? AND claim_expires_at <= ?""",
+                    (next_state, code, row["token_digest"], row["claim_state"], observed_at),
                 )
                 reconciled.append(row["token_digest"])
             connection.commit()

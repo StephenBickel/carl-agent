@@ -30,16 +30,19 @@ from carl_bench.live_evaluation_authority import (
     ProtectedEvidenceLocator,
     ProtectedLiveEvaluationAuthority,
 )
+from carl_bench.live_execution_receipt import model_result_digest, sign_execution_receipt
 from carl_bench.openai_gateway import (
     OpenAIModelGateway,
     OpenAIUsage,
     ProtectedOpenAIModelResult,
     SyntheticOpenAIModelResult,
 )
+from carl_bench.run_attestation import attest_bound_payload
 
 NOW = datetime(2026, 8, 22, 12, tzinfo=UTC)
 KEY = bytes(range(32))
 PROVENANCE_KEY = b"carl-openai-provenance-test-key!"
+EXECUTION_KEY = b"E" * 32
 PARENT = "1" * 40
 CANDIDATE = "2" * 40
 
@@ -191,6 +194,74 @@ def trials(
                 attempt=attempt,
             )
             status = "infrastructure_invalid" if (task.task_id, attempt) in invalid else "valid"
+            result = (
+                None
+                if status != "valid"
+                else model_result(request_digest, f"{subject}-{task.task_id}-{attempt}")
+            )
+            execution_receipt = None
+            if result is not None:
+                execution_receipt = sign_execution_receipt(
+                    fields={
+                        "argv": ("/srv/carl/checkouts/carl", "--bounded-live"),
+                        "timeout_seconds": 30,
+                        "repository": pair_identity.repository,
+                        "pair_request_digest": pair_identity.request_digest,
+                        "subject": subject,
+                        "subject_commit": PARENT if subject == "parent" else CANDIDATE,
+                        "subject_tree": (
+                            pair_identity.parent_tree
+                            if subject == "parent"
+                            else pair_identity.candidate_tree
+                        ),
+                        "task_id": task.task_id,
+                        "task_digest": task.task_digest,
+                        "input_digest": task.input_digest,
+                        "input_size": task.input_size,
+                        "grader_digest": task.grader_digest,
+                        "task_role": task.role,
+                        "seed": seed,
+                        "attempt": attempt,
+                        "environment_digest": pair_identity.environment_digest,
+                        "model": pair_identity.model,
+                        "reasoning_policy": pair_identity.reasoning_policy,
+                        "model_policy_digest": pair_identity.model_policy_digest,
+                        "live_policy_digest": hashlib.sha256(
+                            canonical_json_bytes(live_policy.to_canonical_dict())
+                        ).hexdigest(),
+                        "execution_context_digest": pair_identity.execution_context_digest(
+                            subject=subject,
+                            task=task,
+                            policy=live_policy,
+                            seed=seed,
+                            attempt=attempt,
+                        ),
+                        "process_id": 62_001 if subject == "parent" else 62_002,
+                        "worker_uid": 62_001 if subject == "parent" else 62_002,
+                        "worker_gid": 62_001 if subject == "parent" else 62_002,
+                        "executable_device": 1,
+                        "executable_inode": 2 if subject == "parent" else 3,
+                        "executable_size": 4_096,
+                        "executable_mode": 0o100755,
+                        "executable_mtime_ns": 5,
+                        "executable_digest": digest(f"{subject}-executable"),
+                        "checkout_device": 6,
+                        "checkout_inode": 7 if subject == "parent" else 8,
+                        "checkout_digest": digest(f"{subject}-checkout"),
+                        "cgroup_unit": "carl-live-gateway.service",
+                        "cgroup_path": (
+                            f"/system.slice/carl-live-gateway.service/worker-{subject}-{attempt}"
+                        ),
+                        "cgroup_observation_digest": digest(
+                            f"{subject}:{task.task_id}:{attempt}:cgroup"
+                        ),
+                        "model_result_digest": model_result_digest(result),
+                        "model_request_digest": result.request_digest,
+                        "model_output_digest": result.output_digest,
+                        "response_id": result.response_id,
+                    },
+                    key=EXECUTION_KEY,
+                )
             values.append(
                 LiveTrialEvidence(
                     pair_request_digest=pair_identity.request_digest,
@@ -204,11 +275,8 @@ def trials(
                     score_basis_points=0 if status != "valid" else scores[subject][task.task_id],
                     cost_microdollars=0 if status != "valid" else 100,
                     latency_ms=0 if status != "valid" else 100,
-                    model_result=(
-                        None
-                        if status != "valid"
-                        else model_result(request_digest, f"{subject}-{task.task_id}-{attempt}")
-                    ),
+                    model_result=result,
+                    execution_receipt=execution_receipt,
                     infrastructure_code=(
                         "runner_internal_error" if status == "infrastructure_invalid" else None
                     ),
@@ -816,6 +884,7 @@ def _protected_authority(
         clock=lambda: NOW,
         deterministic_key=deterministic_key,
         live_key=live_key,
+        execution_key=EXECUTION_KEY,
         result_key=bytes(reversed(range(32))),
         grader_key=b"G" * 32,
     )
@@ -858,6 +927,73 @@ def test_protected_authority_reads_exact_versions_and_is_the_only_eligible_join(
     encoded = canonical_json_bytes(receipt.to_canonical_dict())
     assert b"bounded fixture output" not in encoded
     assert b"OPENAI_API_KEY" not in encoded
+
+
+def test_protected_authority_rejects_live_pair_without_signed_execution_receipts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Omitting actual-execution receipts must make archived live evidence ineligible."""
+    pair, gateway = protected_pair(monkeypatch)
+    authority = _protected_authority(_ProtectedArchive(), gateway)
+    missing = ProtectedLivePair.create(
+        identity=pair.identity,
+        policy=pair.policy,
+        tasks=pair.tasks,
+        parent_trials=tuple(replace(item, execution_receipt=None) for item in pair.parent_trials),
+        candidate_trials=pair.candidate_trials,
+        gateway=gateway,
+    )
+
+    with pytest.raises(LiveEvaluationAuthorityError, match="live_execution_receipt_missing"):
+        authority.seal_live_pair(missing)
+
+
+def test_promotion_verifier_rejects_authenticated_archive_with_omitted_execution_receipt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pair, gateway = protected_pair(monkeypatch)
+    archive = _ProtectedArchive()
+    live_key = bytes(range(32, 64))
+    authority = _protected_authority(archive, gateway, live_key=live_key)
+    deterministic_locator = archive.add(
+        kind="protected_deterministic_pair",
+        payload=authority._seal_deterministic_summary_for_testing(
+            identity=pair.identity,
+            contract_eligible=True,
+            contract_reasons=(),
+        ),
+        version_id="det-omitted-receipt-v1",
+    )
+    document = json.loads(authority.seal_live_pair(pair))
+    document["payload"]["execution_receipts"][0] = None
+    unsigned = canonical_json_bytes(
+        {
+            "expires_at": document["expires_at"],
+            "issued_at": document["issued_at"],
+            "kind": document["kind"],
+            "payload": document["payload"],
+            "schema_version": document["schema_version"],
+        }
+    )
+    key_id, signature = attest_bound_payload(
+        unsigned,
+        purpose="protected_live_pair",
+        key=live_key,
+    )
+    live_locator = archive.add(
+        kind="protected_live_pair",
+        payload=canonical_json_bytes(
+            {**json.loads(unsigned), "key_id": key_id, "signature": signature}
+        ),
+        version_id="live-omitted-receipt-v1",
+    )
+
+    with pytest.raises(LiveEvaluationAuthorityError, match="live_execution_receipt_invalid"):
+        authority.combine(
+            request_digest=digest("omitted-receipt-promotion"),
+            deterministic_locator=deterministic_locator,
+            live_locator=live_locator,
+        )
 
 
 def test_protected_authority_rejects_caller_selected_scores_with_genuine_model_results(

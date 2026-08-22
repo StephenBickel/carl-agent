@@ -7,6 +7,7 @@ import shutil
 import signal
 import subprocess
 import time
+from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -478,6 +479,103 @@ def test_deterministic_receipt_requires_one_clean_checkout_lease_across_executio
         authority.seal_deterministic_run(replacement_result, lease=replacement_lease)
 
 
+def test_protected_deterministic_authority_uses_commissioned_cgroup_for_every_attempt(
+    tmp_path: Path,
+) -> None:
+    objects = _objects(tmp_path / "contracts")
+    immutable = {
+        kind: hashlib.sha256(path.read_bytes()).hexdigest() for kind, path in objects.items()
+    }
+    parent_binary, parent_commit, parent_tree = _git_subject(tmp_path / "parent", version_ok=False)
+    candidate_binary, candidate_commit, candidate_tree = _git_subject(
+        tmp_path / "candidate", version_ok=True
+    )
+    pair_identity = LiveEvaluationIdentity.create(
+        repository="StephenBickel/carl-agent",
+        parent_commit=parent_commit,
+        parent_tree=parent_tree,
+        candidate_commit=candidate_commit,
+        candidate_tree=candidate_tree,
+        experiment_digest=immutable["experiment"],
+        workflow_revision="5" * 40,
+        workflow_digest="6" * 64,
+        task_set_digest=immutable["task_set"],
+        metric_pack_digest=immutable["metric_pack"],
+        policy_digest=immutable["policy"],
+        model_policy_digest="7" * 64,
+        grader_digest="8" * 64,
+        environment_digest="9" * 64,
+        model="gpt-5.2",
+        reasoning_policy="medium/no-summary",
+        tool_protocol_revision="acp-v2/bounded-openai-v1",
+        task_order=("help", "memory-help", "version"),
+        seeds=(41000, 41001, 41002),
+        attempts=3,
+    )
+
+    class Scope:
+        attestation_digest = hashlib.sha256(b"deterministic-scope").hexdigest()
+
+        def attach_and_observe(
+            self, process_id: int, *, expected_uid: int, expected_gid: int
+        ) -> tuple[int, int]:
+            assert process_id > 0
+            return expected_uid, expected_gid
+
+        def cleanup_and_verify_empty(self) -> None:
+            return None
+
+    class Isolation:
+        def __init__(self) -> None:
+            self.digests: list[str] = []
+
+        def begin(self, execution_digest: str) -> Scope:
+            self.digests.append(execution_digest)
+            return Scope()
+
+    class Archive:
+        def read_exact(self, object_key: str, version_id: str) -> object:
+            del object_key, version_id
+            raise AssertionError("not used")
+
+    class Gateway:
+        def protected_execution_policy(self) -> dict[str, str]:
+            return {}
+
+        def verify_protected_result(self, value: object) -> bool:
+            del value
+            return False
+
+    isolation = Isolation()
+    authority = ProtectedLiveEvaluationAuthority._for_testing(
+        archive=Archive(),
+        gateway=Gateway(),
+        clock=lambda: datetime(2026, 8, 22, 12, tzinfo=UTC),
+        deterministic_key=b"D" * 32,
+        live_key=b"L" * 32,
+        result_key=b"R" * 32,
+        worker_isolation=isolation,
+    )
+    lease = authority.begin_deterministic_run(
+        identity=pair_identity,
+        parent_checkout=tmp_path / "parent",
+        candidate_checkout=tmp_path / "candidate",
+        parent_binary=parent_binary,
+        candidate_binary=candidate_binary,
+    )
+
+    authority.execute_deterministic_run(
+        lease=lease,
+        experiment_path=objects["experiment"],
+        task_set_path=objects["task_set"],
+        metric_pack_path=objects["metric_pack"],
+        policy_path=objects["policy"],
+    )
+
+    assert len(isolation.digests) == 18
+    assert len(set(isolation.digests)) == 18
+
+
 def test_protected_harness_rejects_shared_or_harness_subject_uid(tmp_path: Path) -> None:
     objects = _objects(tmp_path)
     parent = _subject(tmp_path / "parent-carl", version_ok=False)
@@ -561,6 +659,133 @@ def test_bounded_process_reaps_descendants_after_normal_leader_exit(tmp_path: Pa
     finally:
         if child_pid > 0 and _process_exists(child_pid):
             os.kill(child_pid, signal.SIGKILL)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires POSIX setsid semantics")
+def test_bounded_process_reaps_setsid_descendant_after_normal_leader_exit(
+    tmp_path: Path,
+) -> None:
+    """Removing non-escapable isolation must leave an escaped descendant alive."""
+    pid_path = tmp_path / "escaped-descendant.pid"
+    executable = tmp_path / "setsid-subject"
+    executable.write_text(
+        "#!/usr/bin/python3\n"
+        "import os, sys, time\n"
+        "child = os.fork()\n"
+        "if child == 0:\n"
+        "    os.setsid()\n"
+        "    os.close(1)\n"
+        "    os.close(2)\n"
+        "    open(sys.argv[1], 'w', encoding='utf-8').write(str(os.getpid()))\n"
+        "    time.sleep(60)\n"
+        "    raise SystemExit(0)\n"
+        "raise SystemExit(0)\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+
+    class Scope:
+        attestation_digest = hashlib.sha256(b"deterministic-cgroup").hexdigest()
+
+        def attach_and_observe(
+            self, process_id: int, *, expected_uid: int, expected_gid: int
+        ) -> tuple[int, int]:
+            assert process_id > 0
+            return expected_uid, expected_gid
+
+        def cleanup_and_verify_empty(self) -> None:
+            deadline = time.monotonic() + 2
+            while not pid_path.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            escaped = int(pid_path.read_text(encoding="utf-8"))
+            with suppress(ProcessLookupError):
+                os.kill(escaped, signal.SIGKILL)
+            while _process_exists(escaped) and time.monotonic() < deadline:
+                time.sleep(0.01)
+            if _process_exists(escaped):
+                raise RuntimeError("non-empty commissioned isolation")
+
+    class Isolation:
+        def __init__(self) -> None:
+            self.scope = Scope()
+
+        def begin(self, execution_digest: str) -> Scope:
+            assert len(execution_digest) == 64
+            return self.scope
+
+    isolation = Isolation()
+    child_pid = -1
+    try:
+        result = cloud_harness._bounded_process(
+            executable,
+            (os.fspath(pid_path),),
+            timeout_seconds=2,
+            output_limit=4_096,
+            subject_identity=None,
+            worker_isolation=isolation,
+        )
+        deadline = time.monotonic() + 2
+        while not pid_path.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        child_pid = int(pid_path.read_text(encoding="utf-8"))
+        while _process_exists(child_pid) and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        assert result[0] == 0
+        assert _process_exists(child_pid) is False
+    finally:
+        if child_pid > 0 and _process_exists(child_pid):
+            os.kill(child_pid, signal.SIGKILL)
+
+
+def test_protected_bounded_process_fails_closed_without_commissioned_isolation(
+    tmp_path: Path,
+) -> None:
+    executable = _subject(tmp_path / "subject", version_ok=True)
+
+    with pytest.raises(CloudHarnessError, match="subject_isolation_not_commissioned"):
+        cloud_harness._bounded_process(
+            executable,
+            ("--version",),
+            timeout_seconds=2,
+            output_limit=4_096,
+            subject_identity=(os.geteuid(), os.getegid()),
+            worker_isolation=None,
+        )
+
+
+def test_protected_bounded_process_cleans_scope_when_attach_fails(tmp_path: Path) -> None:
+    executable = _subject(tmp_path / "subject", version_ok=True)
+
+    class Scope:
+        cleaned = False
+
+        def attach_and_observe(self, *args: object, **kwargs: object) -> tuple[int, int]:
+            del args, kwargs
+            raise RuntimeError("attach failed")
+
+        def cleanup_and_verify_empty(self) -> None:
+            self.cleaned = True
+
+    class Isolation:
+        def __init__(self) -> None:
+            self.scope = Scope()
+
+        def begin(self, execution_digest: str) -> Scope:
+            assert len(execution_digest) == 64
+            return self.scope
+
+    isolation = Isolation()
+    with pytest.raises(CloudHarnessError, match="subject_isolation_attach_failed"):
+        cloud_harness._bounded_process(
+            executable,
+            ("--version",),
+            timeout_seconds=2,
+            output_limit=4_096,
+            subject_identity=None,
+            worker_isolation=isolation,
+        )
+    assert isolation.scope.cleaned is True
 
 
 @pytest.mark.skipif(os.name == "nt", reason="requires POSIX process groups")

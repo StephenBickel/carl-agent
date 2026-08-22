@@ -10,6 +10,7 @@ from typing import Any
 
 from carl_bench.canonical import canonical_json_bytes
 from carl_bench.evidence_archive import ArchivedEvidence
+from carl_bench.live_execution_receipt import ProtectedExecutionReceipt
 from carl_bench.openai_gateway import (
     OpenAIGatewayError,
     OpenAIModelGateway,
@@ -353,6 +354,7 @@ class LiveTrialEvidence:
     cost_microdollars: int
     latency_ms: int
     model_result: ProtectedOpenAIModelResult | object | None
+    execution_receipt: ProtectedExecutionReceipt | None = None
     infrastructure_code: str | None = None
 
     def __post_init__(self) -> None:
@@ -415,6 +417,11 @@ class LiveTrialEvidence:
             "attempt": self.attempt,
             "attempt_identity": self.attempt_identity,
             "cost_microdollars": self.cost_microdollars,
+            "execution_receipt": (
+                self.execution_receipt.to_canonical_dict()
+                if self.execution_receipt is not None
+                else None
+            ),
             "infrastructure_code": self.infrastructure_code,
             "latency_ms": self.latency_ms,
             "model_result": result,

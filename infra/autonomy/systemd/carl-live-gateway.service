@@ -2,7 +2,7 @@
 Description=Carl protected live model gateway
 After=network-online.target
 Wants=network-online.target
-Requires=carl-live-gateway.socket
+Requires=carl-live-gateway.socket carl-live-runner.socket
 
 [Service]
 Type=simple

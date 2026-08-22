@@ -1,0 +1,12 @@
+[Unit]
+Description=Carl protected live worker runner socket
+
+[Socket]
+FileDescriptorName=live-runner
+ListenStream=/run/carl/live-runner.sock
+SocketGroup=root
+SocketMode=0600
+Service=carl-live-gateway.service
+
+[Install]
+WantedBy=sockets.target

@@ -9,6 +9,7 @@ import shutil
 import socket
 import struct
 import tempfile
+from configparser import ConfigParser
 from importlib.metadata import entry_points
 from inspect import signature
 from pathlib import Path
@@ -184,19 +185,31 @@ def test_protected_service_constructs_its_pinned_archive_gateway_clock_and_keys(
 ) -> None:
     from carl_bench.live_evaluation_service import _load_protected_authority
     from carl_bench.live_grader import ProtectedGraderBundle
+    from carl_bench.live_worker_isolation import CgroupV2WorkerIsolation
 
     class Grader:
         def grade(self, **kwargs: object) -> int:
             del kwargs
             return 0
 
+    class Isolation:
+        def begin(self, execution_digest: str) -> object:
+            del execution_digest
+            return object()
+
     monkeypatch.setattr(ProtectedGraderBundle, "from_protected_process", lambda: Grader())
+    monkeypatch.setattr(
+        CgroupV2WorkerIsolation,
+        "from_live_evaluator_process",
+        lambda: Isolation(),
+    )
 
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test-1234567890123456")
     for name, key in (
         ("CARL_OPENAI_PROVENANCE_KEY_B64", b"P" * 32),
         ("CARL_DETERMINISTIC_ATTESTATION_KEY_B64", b"D" * 32),
         ("CARL_LIVE_ATTESTATION_KEY_B64", b"L" * 32),
+        ("CARL_LIVE_EXECUTION_KEY_B64", b"E" * 32),
         ("CARL_COMBINED_EVIDENCE_KEY_B64", b"R" * 32),
         ("CARL_GRADER_ATTESTATION_KEY_B64", b"G" * 32),
     ):
@@ -239,6 +252,45 @@ def test_protected_service_requires_distinct_unprivileged_worker_identities(
     monkeypatch.setenv("CARL_CANDIDATE_WORKER_GID", "62002")
     with pytest.raises(LiveEvaluationAuthorityError, match="live_worker_identity_invalid"):
         _load_protected_authority()
+
+
+def test_live_evaluator_systemd_contract_commissions_deterministic_cgroup_isolation() -> None:
+    root = Path(__file__).parents[2] / "infra/autonomy/systemd"
+    service = ConfigParser(interpolation=None, strict=True)
+    service.optionxform = str
+    socket_unit = ConfigParser(interpolation=None, strict=True)
+    socket_unit.optionxform = str
+
+    assert service.read(root / "carl-live-evaluator.service")
+    assert socket_unit.read(root / "carl-live-evaluator.socket")
+    assert service["Service"] == {
+        "Type": "simple",
+        "ExecStart": "/opt/carl/venv/bin/carl-live-evaluation-service",
+        "EnvironmentFile": "/etc/carl/live-evaluator.env",
+        "User": "root",
+        "Group": "root",
+        "Delegate": "pids",
+        "TasksMax": "256",
+        "NoNewPrivileges": "yes",
+        "PrivateDevices": "yes",
+        "PrivateTmp": "yes",
+        "ProtectControlGroups": "no",
+        "ProtectHome": "yes",
+        "ProtectKernelModules": "yes",
+        "ProtectKernelTunables": "yes",
+        "ProtectSystem": "strict",
+        "ReadOnlyPaths": "/srv/carl/checkouts",
+        "RestrictAddressFamilies": "AF_UNIX",
+        "RuntimeDirectory": "carl",
+        "RuntimeDirectoryMode": "0700",
+        "UMask": "0077",
+    }
+    assert socket_unit["Socket"] == {
+        "FileDescriptorName": "live-evaluator",
+        "ListenStream": "/run/carl/live-evaluator.sock",
+        "SocketMode": "0600",
+        "Service": "carl-live-evaluator.service",
+    }
 
 
 @pytest.mark.skipif(os.name == "nt", reason="requires Unix peer credentials")

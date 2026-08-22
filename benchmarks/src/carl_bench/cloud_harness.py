@@ -18,6 +18,7 @@ import selectors
 import signal
 import stat
 import subprocess
+import sys
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -634,6 +635,8 @@ def _bounded_process(
     timeout_seconds: int,
     output_limit: int,
     subject_identity: tuple[int, int] | None,
+    worker_isolation: object | None = None,
+    execution_attempt: int = 1,
 ) -> tuple[int | None, bytes, bytes, bool, bool]:
     subject_environment = {
         "LANG": "C.UTF-8",
@@ -650,31 +653,108 @@ def _bounded_process(
             os.setgid(gid)
             os.setuid(uid)
 
+    if subject_identity is not None and not callable(getattr(worker_isolation, "begin", None)):
+        raise CloudHarnessError("subject_isolation_not_commissioned")
+    executable_descriptor = -1
+    read_descriptor = -1
+    write_descriptor = -1
+    isolation_scope: object | None = None
+    observed_identity = subject_identity or (os.geteuid(), os.getegid())
+    environment = dict(subject_environment)
+    command = [os.fspath(binary), *argv]
+    pass_descriptors: tuple[int, ...] = ()
+    process: subprocess.Popen[bytes] | None = None
     try:
-        process = subprocess.Popen(
-            [os.fspath(binary), *argv],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            close_fds=True,
-            env=subject_environment,
-            start_new_session=True,
-            preexec_fn=demote,
-        )
-    except (OSError, subprocess.SubprocessError) as error:
-        raise CloudHarnessError("subject_binary_execution_failed") from error
-    try:
-        return _collect_bounded_process(
-            process,
-            timeout_seconds=timeout_seconds,
-            output_limit=output_limit,
-        )
-    except (KeyboardInterrupt, SystemExit):
+        if worker_isolation is not None:
+            execution_digest = hashlib.sha256(
+                canonical_json_bytes(
+                    {
+                        "argv": list(argv),
+                        "binary_digest": _validate_binary(binary),
+                        "execution_attempt": execution_attempt,
+                        "subject_gid": observed_identity[1],
+                        "subject_uid": observed_identity[0],
+                        "timeout_seconds": timeout_seconds,
+                    }
+                )
+            ).hexdigest()
+            isolation_scope = worker_isolation.begin(execution_digest)
+            executable_descriptor = os.open(
+                binary,
+                os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+            )
+            read_descriptor, write_descriptor = os.pipe()
+            os.set_inheritable(executable_descriptor, True)
+            os.set_inheritable(read_descriptor, True)
+            environment.update(
+                {
+                    "CARL_PINNED_EXECUTABLE_FD": str(executable_descriptor),
+                    "CARL_WORKER_BARRIER_FD": str(read_descriptor),
+                }
+            )
+            command = [
+                sys.executable,
+                os.fspath(Path(__file__).with_name("deterministic_worker.py")),
+                os.fspath(binary),
+                *argv,
+            ]
+            pass_descriptors = (executable_descriptor, read_descriptor)
+        try:
+            process = subprocess.Popen(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                close_fds=True,
+                pass_fds=pass_descriptors,
+                env=environment,
+                start_new_session=True,
+                preexec_fn=demote,
+            )
+        except (OSError, subprocess.SubprocessError) as error:
+            raise CloudHarnessError("subject_binary_execution_failed") from error
+        if isolation_scope is not None:
+            os.close(read_descriptor)
+            read_descriptor = -1
+            try:
+                observed = isolation_scope.attach_and_observe(
+                    process.pid,
+                    expected_uid=observed_identity[0],
+                    expected_gid=observed_identity[1],
+                )
+            except Exception as error:
+                raise CloudHarnessError("subject_isolation_attach_failed") from error
+            if observed != observed_identity:
+                raise CloudHarnessError("subject_identity_mismatch")
+            os.write(write_descriptor, b"1")
+            os.close(write_descriptor)
+            write_descriptor = -1
+        try:
+            return _collect_bounded_process(
+                process,
+                timeout_seconds=timeout_seconds,
+                output_limit=output_limit,
+            )
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as error:
+            raise CloudHarnessError("subject_process_collection_failed") from error
+    except CloudHarnessError:
         raise
     except Exception as error:
-        raise CloudHarnessError("subject_process_collection_failed") from error
+        raise CloudHarnessError("subject_isolation_not_commissioned") from error
     finally:
-        _cleanup_process_group(process)
+        if process is not None:
+            _cleanup_process_group(process)
+        if isolation_scope is not None:
+            try:
+                isolation_scope.cleanup_and_verify_empty()
+            except Exception as error:
+                raise CloudHarnessError("subject_isolation_cleanup_failed") from error
+        for descriptor in (read_descriptor, write_descriptor, executable_descriptor):
+            if descriptor >= 0:
+                with contextlib.suppress(OSError):
+                    os.close(descriptor)
 
 
 def _observe(
@@ -684,6 +764,7 @@ def _observe(
     attempts: int,
     output_limit: int,
     subject_identity: tuple[int, int] | None,
+    worker_isolation: object | None,
 ) -> ProbeObservation:
     all_passed = True
     any_timeout = False
@@ -699,6 +780,8 @@ def _observe(
             timeout_seconds=probe.timeout_seconds,
             output_limit=output_limit,
             subject_identity=subject_identity,
+            worker_isolation=worker_isolation,
+            execution_attempt=attempt,
         )
         stdout = final_stdout.decode("utf-8", errors="replace")
         passed = (
@@ -752,6 +835,7 @@ def _subject(
     output_limit: int,
     weights: dict[str, int],
     subject_identity: tuple[int, int] | None,
+    worker_isolation: object | None,
 ) -> SubjectResult:
     observations = tuple(
         _observe(
@@ -760,6 +844,7 @@ def _subject(
             attempts=attempts,
             output_limit=output_limit,
             subject_identity=subject_identity,
+            worker_isolation=worker_isolation,
         )
         for probe in probes
     )
@@ -792,6 +877,7 @@ def evaluate_carl_pair(
     parent_identity: tuple[int, int] | None = None,
     candidate_identity: tuple[int, int] | None = None,
     live_evaluation_identity: object | None = None,
+    worker_isolation: object | None = None,
 ) -> CloudHarnessResult:
     """Run protected probes against exact binaries and emit bounded canonical evidence."""
     if not _COMMIT_RE.fullmatch(parent_commit) or not _COMMIT_RE.fullmatch(candidate_commit):
@@ -805,6 +891,8 @@ def evaluate_carl_pair(
         or os.geteuid() in {parent_identity[0], candidate_identity[0]}
     ):
         raise CloudHarnessError("subject_identity_not_isolated")
+    if parent_identity is not None and not callable(getattr(worker_isolation, "begin", None)):
+        raise CloudHarnessError("subject_isolation_not_commissioned")
     parent_binary = Path(parent_binary)
     candidate_binary = Path(candidate_binary)
     digests = (_validate_binary(parent_binary), _validate_binary(candidate_binary))
@@ -839,6 +927,7 @@ def evaluate_carl_pair(
         output_limit=output_limit,
         weights=weights,
         subject_identity=parent_identity,
+        worker_isolation=worker_isolation,
     )
     candidate = _subject(
         candidate_binary,
@@ -849,6 +938,7 @@ def evaluate_carl_pair(
         output_limit=output_limit,
         weights=weights,
         subject_identity=candidate_identity,
+        worker_isolation=worker_isolation,
     )
     gain = candidate.score_basis_points - parent.score_basis_points
     reasons: list[str] = []

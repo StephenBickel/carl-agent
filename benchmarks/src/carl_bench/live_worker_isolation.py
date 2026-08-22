@@ -12,7 +12,8 @@ from pathlib import Path
 
 from carl_bench.canonical import canonical_json_bytes
 
-_SERVICE_CGROUP = "/system.slice/carl-live-gateway.service"
+_GATEWAY_CGROUP = "/system.slice/carl-live-gateway.service"
+_EVALUATOR_CGROUP = "/system.slice/carl-live-evaluator.service"
 _CGROUP_MOUNT = Path("/sys/fs/cgroup")
 _PROCESS_CGROUP = Path("/proc/self/cgroup")
 _DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -43,11 +44,12 @@ def _read_bounded(path: Path, *, maximum_bytes: int = 16_384) -> str:
 class CgroupV2WorkerScope:
     """One delegated cgroup whose descendants cannot escape through setsid()."""
 
-    __slots__ = ("_path", "_relative", "attestation_digest")
+    __slots__ = ("_path", "_relative", "_unit", "attestation_digest")
 
-    def __init__(self, *, path: Path, relative: str, execution_digest: str) -> None:
+    def __init__(self, *, path: Path, relative: str, unit: str, execution_digest: str) -> None:
         self._path = path
         self._relative = relative
+        self._unit = unit
         details = path.stat()
         self.attestation_digest = hashlib.sha256(
             canonical_json_bytes(
@@ -126,11 +128,18 @@ class CgroupV2WorkerScope:
         except OSError as error:
             raise LiveWorkerIsolationError("live_worker_isolation_cleanup_failed") from error
 
+    def receipt_observation(self) -> dict[str, str]:
+        return {
+            "cgroup_observation_digest": self.attestation_digest,
+            "cgroup_path": self._relative,
+            "cgroup_unit": self._unit,
+        }
+
 
 class CgroupV2WorkerIsolation:
     """Factory for exact root-owned delegated worker cgroups."""
 
-    __slots__ = ("_root",)
+    __slots__ = ("_root", "_service_cgroup", "_unit")
 
     def __new__(cls, *args: object, **kwargs: object) -> CgroupV2WorkerIsolation:
         del cls, args, kwargs
@@ -138,11 +147,23 @@ class CgroupV2WorkerIsolation:
 
     @classmethod
     def from_protected_process(cls) -> CgroupV2WorkerIsolation:
+        return cls.from_live_gateway_process()
+
+    @classmethod
+    def from_live_gateway_process(cls) -> CgroupV2WorkerIsolation:
+        return cls._from_service_cgroup(_GATEWAY_CGROUP)
+
+    @classmethod
+    def from_live_evaluator_process(cls) -> CgroupV2WorkerIsolation:
+        return cls._from_service_cgroup(_EVALUATOR_CGROUP)
+
+    @classmethod
+    def _from_service_cgroup(cls, service_cgroup: str) -> CgroupV2WorkerIsolation:
         if not sys.platform.startswith("linux"):
             raise LiveWorkerIsolationError("live_worker_isolation_not_commissioned")
-        if _read_bounded(_PROCESS_CGROUP).strip() != f"0::{_SERVICE_CGROUP}":
+        if _read_bounded(_PROCESS_CGROUP).strip() != f"0::{service_cgroup}":
             raise LiveWorkerIsolationError("live_worker_isolation_not_commissioned")
-        root = _CGROUP_MOUNT / _SERVICE_CGROUP.removeprefix("/")
+        root = _CGROUP_MOUNT / service_cgroup.removeprefix("/")
         try:
             details = root.lstat()
             entries = {item.name for item in root.iterdir()}
@@ -159,6 +180,8 @@ class CgroupV2WorkerIsolation:
             raise LiveWorkerIsolationError("live_worker_isolation_not_commissioned")
         value = object.__new__(cls)
         value._root = root
+        value._service_cgroup = service_cgroup
+        value._unit = service_cgroup.rsplit("/", 1)[-1]
         return value
 
     def begin(self, execution_digest: str) -> CgroupV2WorkerScope:
@@ -178,9 +201,10 @@ class CgroupV2WorkerIsolation:
             raise
         except OSError as error:
             raise LiveWorkerIsolationError("live_worker_isolation_unavailable") from error
-        relative = f"{_SERVICE_CGROUP}/{path.name}"
+        relative = f"{self._service_cgroup}/{path.name}"
         return CgroupV2WorkerScope(
             path=path,
             relative=relative,
+            unit=self._unit,
             execution_digest=execution_digest,
         )

@@ -383,7 +383,7 @@ def test_retry_capability_requires_exact_pair_scoped_infrastructure_failure() ->
     assert retry.attempt == 2
 
 
-def test_consumed_failed_model_call_can_be_durably_classified_for_pair_retry() -> None:
+def test_failed_model_call_after_dispatch_freezes_until_exact_reconciliation() -> None:
     class FailingGateway(_PinnedGateway):
         def evaluate(self, request: OpenAIModelRequest) -> ProtectedOpenAIModelResult:
             del request
@@ -408,7 +408,14 @@ def test_consumed_failed_model_call_can_be_durably_classified_for_pair_retry() -
     with pytest.raises(LiveGatewayAuthorityError, match="openai_timeout"):
         server.evaluate(capability.token, "held-out prompt")
 
-    server.record_infrastructure_invalid(capability.token, "openai_timeout")
+    with pytest.raises(LiveGatewayAuthorityError, match="live_gateway_dispatch_ambiguous"):
+        server.evaluate(capability.token, "held-out prompt")
+    with pytest.raises(
+        LiveGatewayAuthorityError,
+        match="live_infrastructure_result_conflict",
+    ):
+        server.record_infrastructure_invalid(capability.token, "openai_timeout")
+    assert server._state.retry_codes(identity.request_digest, task.task_id, 1) == {}
 
 
 def test_crash_after_provider_claim_never_replays_provider_without_reconciliation(
@@ -460,23 +467,31 @@ def test_crash_after_provider_claim_never_replays_provider_without_reconciliatio
     assert restarted_gateway.requests == []
 
 
-def test_expired_dead_claim_is_reconciled_to_stable_pair_retry_identity(tmp_path) -> None:
+def test_expired_post_dispatch_claim_freezes_pair_without_duplicate_provider_calls(
+    tmp_path,
+) -> None:
     from carl_bench.live_gateway_store import SQLiteLiveGatewayStateStore
 
     class SimulatedCrash(BaseException):
         pass
 
     class CrashingGateway(_PinnedGateway):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = 0
+
         def evaluate(self, request: OpenAIModelRequest) -> ProtectedOpenAIModelResult:
             del request
+            self.calls += 1
             raise SimulatedCrash
 
     now = datetime(2026, 8, 22, 12, 0, tzinfo=UTC)
     state_path = tmp_path / "gateway.sqlite3"
     tokens = iter(("parent-crash-token-1234567890", "candidate-crash-token-1234567890"))
     store = SQLiteLiveGatewayStateStore._for_testing(state_path)
+    crashing_gateway = CrashingGateway()
     first = ProtectedModelGatewayServer._for_testing(
-        gateway=CrashingGateway(),
+        gateway=crashing_gateway,
         endpoint="http://127.0.0.1:43117/v1/evaluate",
         token_source=lambda: next(tokens),
         state=store,
@@ -517,22 +532,252 @@ def test_expired_dead_claim_is_reconciled_to_stable_pair_retry_identity(tmp_path
         process_identity=lambda process_id: "200" if process_id == 61_002 else None,
     )
 
-    assert store.retry_codes(identity.request_digest, task.task_id, 1) == {
-        "candidate": "gateway_claim_abandoned",
-        "parent": "gateway_claim_abandoned",
-    }
+    assert store.retry_codes(identity.request_digest, task.task_id, 1) == {}
     for capability in (parent, candidate):
-        with pytest.raises(LiveGatewayAuthorityError, match="live_gateway_capability_consumed"):
+        with pytest.raises(LiveGatewayAuthorityError, match="live_gateway_dispatch_ambiguous"):
             restarted.evaluate(capability.token, "held-out prompt")
-    retry = restarted.issue_observed_capability_for_testing(
+        with pytest.raises(
+            LiveGatewayAuthorityError,
+            match="live_infrastructure_result_conflict",
+        ):
+            restarted.record_infrastructure_invalid(
+                capability.token,
+                "gateway_dispatch_ambiguous",
+            )
+        with pytest.raises(
+            LiveGatewayAuthorityError,
+            match="live_infrastructure_result_conflict",
+        ):
+            restarted.invalidate_execution(
+                capability.token,
+                "gateway_dispatch_ambiguous",
+            )
+    for subject in ("parent", "candidate"):
+        with pytest.raises(LiveGatewayAuthorityError, match="live_retry_not_authorized"):
+            restarted.issue_observed_capability_for_testing(
+                identity=identity,
+                policy=policy,
+                task=task,
+                subject=subject,
+                attempt=2,
+            )
+    assert crashing_gateway.calls == 2
+    assert replacement_gateway.requests == []
+
+
+def test_dispatched_claim_cannot_be_reclassified_as_retryable_infrastructure_failure(
+    tmp_path,
+) -> None:
+    from carl_bench.live_gateway_store import SQLiteLiveGatewayStateStore
+
+    now = datetime(2026, 8, 22, 12, 0, tzinfo=UTC)
+    identity = _identity()
+    policy = _policy()
+    task = _task()
+    store = SQLiteLiveGatewayStateStore._for_testing(tmp_path / "gateway.sqlite3")
+    server = ProtectedModelGatewayServer._for_testing(
+        gateway=_PinnedGateway(),
+        endpoint="http://127.0.0.1:43117/v1/evaluate",
+        token_source=lambda: "dispatched-token-1234567890",
+        state=store,
+        clock=lambda: now,
+        claim_holder=("11111111-1111-4111-8111-111111111111", 61_001, "100"),
+        process_identity=lambda process_id: "100" if process_id == 61_001 else None,
+    )
+    capability = server.issue_observed_capability_for_testing(
         identity=identity,
         policy=policy,
         task=task,
         subject="candidate",
-        attempt=2,
+        attempt=1,
     )
-    assert retry.attempt == 2
-    assert replacement_gateway.requests == []
+    token_digest = hashlib.sha256(capability.token.encode()).hexdigest()
+    claim_id = _digest("dispatched-claim")
+    store.claim_grant(
+        token_digest,
+        claim_id=claim_id,
+        boot_id="11111111-1111-4111-8111-111111111111",
+        process_id=61_001,
+        process_start="100",
+        started_at=int(now.timestamp()),
+        expires_at=int(now.timestamp()) + 60,
+    )
+    store.mark_provider_dispatched(
+        token_digest,
+        claim_id,
+        request_digest=identity.model_request_digest(
+            subject="candidate",
+            task=task,
+            policy=policy,
+            seed=identity.seeds[0],
+            attempt=1,
+        ),
+        dispatched_at=int(now.timestamp()),
+    )
+
+    for operation in (server.record_infrastructure_invalid, server.invalidate_execution):
+        with pytest.raises(
+            LiveGatewayAuthorityError,
+            match="live_infrastructure_result_conflict",
+        ):
+            operation(capability.token, "runner_exit_nonzero")
+    assert store.retry_codes(identity.request_digest, task.task_id, 1) == {}
+
+
+def test_dead_pre_dispatch_pair_authorizes_exactly_one_retry(tmp_path) -> None:
+    from carl_bench.live_gateway_store import SQLiteLiveGatewayStateStore
+
+    now = datetime(2026, 8, 22, 12, 0, tzinfo=UTC)
+    state_path = tmp_path / "gateway.sqlite3"
+    identity = _identity()
+    policy = _policy()
+    task = _task()
+    first_tokens = iter(
+        ("parent-pre-dispatch-token-1234567890", "candidate-pre-dispatch-token-1234567890")
+    )
+    store = SQLiteLiveGatewayStateStore._for_testing(state_path)
+    first = ProtectedModelGatewayServer._for_testing(
+        gateway=_PinnedGateway(),
+        endpoint="http://127.0.0.1:43117/v1/evaluate",
+        token_source=lambda: next(first_tokens),
+        state=store,
+        clock=lambda: now,
+        claim_holder=("11111111-1111-4111-8111-111111111111", 61_001, "100"),
+        process_identity=lambda process_id: "100" if process_id == 61_001 else None,
+    )
+    capabilities = tuple(
+        first.issue_observed_capability_for_testing(
+            identity=identity,
+            policy=policy,
+            task=task,
+            subject=subject,
+            attempt=1,
+        )
+        for subject in ("parent", "candidate")
+    )
+    for capability in capabilities:
+        store.claim_grant(
+            hashlib.sha256(capability.token.encode()).hexdigest(),
+            claim_id=_digest(f"pre-dispatch-{capability.subject}"),
+            boot_id="11111111-1111-4111-8111-111111111111",
+            process_id=61_001,
+            process_start="100",
+            started_at=int(now.timestamp()),
+            expires_at=int(now.timestamp()) + 60,
+        )
+
+    retry_tokens = iter(
+        (
+            "parent-retry-token-1234567890",
+            "candidate-retry-token-1234567890",
+            "parent-duplicate-retry-token-1234567890",
+            "candidate-duplicate-retry-token-1234567890",
+        )
+    )
+    restarted = ProtectedModelGatewayServer._for_testing(
+        gateway=_PinnedGateway(),
+        endpoint="http://127.0.0.1:43117/v1/evaluate",
+        token_source=lambda: next(retry_tokens),
+        state=SQLiteLiveGatewayStateStore._for_testing(state_path),
+        clock=lambda: now + timedelta(minutes=2),
+        claim_holder=("11111111-1111-4111-8111-111111111111", 61_002, "200"),
+        process_identity=lambda process_id: None,
+    )
+
+    assert store.retry_codes(identity.request_digest, task.task_id, 1) == {
+        "candidate": "gateway_pre_dispatch_abandoned",
+        "parent": "gateway_pre_dispatch_abandoned",
+    }
+    retries = tuple(
+        restarted.issue_observed_capability_for_testing(
+            identity=identity,
+            policy=policy,
+            task=task,
+            subject=subject,
+            attempt=2,
+        )
+        for subject in ("parent", "candidate")
+    )
+    assert [capability.attempt for capability in retries] == [2, 2]
+    for subject in ("parent", "candidate"):
+        with pytest.raises(LiveGatewayAuthorityError, match="live_gateway_capability_duplicate"):
+            restarted.issue_observed_capability_for_testing(
+                identity=identity,
+                policy=policy,
+                task=task,
+                subject=subject,
+                attempt=2,
+            )
+
+
+def test_ambiguous_dispatch_requires_exact_authenticated_provider_result_reconciliation(
+    tmp_path,
+) -> None:
+    from carl_bench.live_gateway_store import SQLiteLiveGatewayStateStore
+
+    class SimulatedCrash(BaseException):
+        pass
+
+    class CrashingGateway(_PinnedGateway):
+        def evaluate(self, request: OpenAIModelRequest) -> ProtectedOpenAIModelResult:
+            del request
+            raise SimulatedCrash
+
+    now = datetime(2026, 8, 22, 12, 0, tzinfo=UTC)
+    state_path = tmp_path / "gateway.sqlite3"
+    identity = _identity()
+    policy = _policy()
+    task = _task()
+    first = ProtectedModelGatewayServer._for_testing(
+        gateway=CrashingGateway(),
+        endpoint="http://127.0.0.1:43117/v1/evaluate",
+        token_source=lambda: "reconcile-token-1234567890",
+        state=SQLiteLiveGatewayStateStore._for_testing(state_path),
+        clock=lambda: now,
+        claim_holder=("11111111-1111-4111-8111-111111111111", 61_001, "100"),
+        process_identity=lambda process_id: "100" if process_id == 61_001 else None,
+    )
+    capability = first.issue_observed_capability_for_testing(
+        identity=identity,
+        policy=policy,
+        task=task,
+        subject="candidate",
+        attempt=1,
+    )
+    with pytest.raises(SimulatedCrash):
+        first.evaluate(capability.token, "held-out prompt")
+
+    restarted = ProtectedModelGatewayServer._for_testing(
+        gateway=_PinnedGateway(),
+        endpoint="http://127.0.0.1:43117/v1/evaluate",
+        token_source=lambda: "unused-token-1234567890",
+        state=SQLiteLiveGatewayStateStore._for_testing(state_path),
+        clock=lambda: now + timedelta(minutes=2),
+        claim_holder=("11111111-1111-4111-8111-111111111111", 61_002, "200"),
+        process_identity=lambda process_id: None,
+    )
+    expected_request = identity.model_request_digest(
+        subject="candidate",
+        task=task,
+        policy=policy,
+        seed=identity.seeds[0],
+        attempt=1,
+    )
+    recovered = ProtectedOpenAIModelResult(
+        response_id="resp-recovered-exact",
+        model="gpt-5.2",
+        status="completed",
+        usage=OpenAIUsage(3, 0, 2, 1, 5),
+        latency_ms=10,
+        request_digest=expected_request,
+        output_digest=_digest("recovered-output"),
+        output_text="recovered exact output",
+        provenance_tag=_digest("recovered-provenance"),
+    )
+
+    restarted.reconcile_provider_result(capability.token, recovered)
+
+    assert restarted.take_completed_result(capability) == recovered
 
 
 def test_expired_claim_with_same_live_process_identity_remains_in_progress(tmp_path) -> None:

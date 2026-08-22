@@ -165,6 +165,14 @@ class _GatewayState(Protocol):
 
     def complete_result(self, token_digest: str, claim_id: str, result: dict[str, Any]) -> None: ...
 
+    def reconcile_dispatched_result(self, token_digest: str, result: dict[str, Any]) -> None: ...
+
+    def mark_provider_dispatched(
+        self, token_digest: str, claim_id: str, **kwargs: object
+    ) -> None: ...
+
+    def mark_dispatch_ambiguous(self, token_digest: str, claim_id: str, *, code: str) -> None: ...
+
     def take_result(self, token_digest: str) -> tuple[dict[str, Any], dict[str, Any]]: ...
 
     def record_infrastructure_invalid(self, token_digest: str, code: str) -> None: ...
@@ -321,6 +329,7 @@ class _MemoryGatewayState:
             "result": None,
             "collected": False,
             "infrastructure_code": None,
+            "provider_request_digest": None,
         }
 
     def load_grant(self, token_digest: str) -> dict[str, Any]:
@@ -333,11 +342,13 @@ class _MemoryGatewayState:
         row = self.rows.get(token_digest)
         if row is None:
             raise LiveGatewayStateError("live_gateway_capability_invalid")
-        if row["claim_state"] == "in_progress":
+        if row["claim_state"] == "dispatch_ambiguous":
+            raise LiveGatewayStateError("live_gateway_dispatch_ambiguous")
+        if row["claim_state"] in {"pre_dispatch", "dispatched"}:
             raise LiveGatewayStateError("live_gateway_capability_in_progress")
         if row["claim_state"] != "ready":
             raise LiveGatewayStateError("live_gateway_capability_consumed")
-        row["claim_state"] = "in_progress"
+        row["claim_state"] = "pre_dispatch"
         for name in (
             "claim_id",
             "boot_id",
@@ -353,12 +364,38 @@ class _MemoryGatewayState:
             row[target] = kwargs[name]
         return row["grant"]
 
+    def mark_provider_dispatched(self, token_digest: str, claim_id: str, **kwargs: object) -> None:
+        row = self.rows[token_digest]
+        if row["claim_state"] != "pre_dispatch" or row["claim_id"] != claim_id:
+            raise LiveGatewayStateError("live_gateway_capability_invalid")
+        row["claim_state"] = "dispatched"
+        row["provider_request_digest"] = kwargs["request_digest"]
+
+    def mark_dispatch_ambiguous(self, token_digest: str, claim_id: str, *, code: str) -> None:
+        row = self.rows[token_digest]
+        if row["claim_state"] != "dispatched" or row["claim_id"] != claim_id:
+            raise LiveGatewayStateError("live_gateway_capability_invalid")
+        row["claim_state"] = "dispatch_ambiguous"
+        row["infrastructure_code"] = code
+
     def complete_result(self, token_digest: str, claim_id: str, result: dict[str, Any]) -> None:
         row = self.rows[token_digest]
-        if row["claim_state"] != "in_progress" or row["claim_id"] != claim_id:
+        if row["claim_state"] != "dispatched" or row["claim_id"] != claim_id:
             raise LiveGatewayStateError("live_gateway_capability_invalid")
+        if result.get("request_digest") != row["provider_request_digest"]:
+            raise LiveGatewayStateError("live_gateway_result_conflict")
         row["result"] = result
         row["claim_state"] = "completed"
+
+    def reconcile_dispatched_result(self, token_digest: str, result: dict[str, Any]) -> None:
+        row = self.rows[token_digest]
+        if row["claim_state"] != "dispatch_ambiguous":
+            raise LiveGatewayStateError("live_gateway_reconciliation_not_authorized")
+        if result.get("request_digest") != row["provider_request_digest"]:
+            raise LiveGatewayStateError("live_gateway_result_conflict")
+        row["result"] = result
+        row["claim_state"] = "completed"
+        row["infrastructure_code"] = None
 
     def take_result(self, token_digest: str) -> tuple[dict[str, Any], dict[str, Any]]:
         row = self.rows.get(token_digest)
@@ -375,14 +412,23 @@ class _MemoryGatewayState:
         row = self.rows.get(token_digest)
         if row is None:
             raise LiveGatewayStateError("live_gateway_capability_invalid")
-        if row["result"] is not None or row["infrastructure_code"] not in {None, code}:
+        if (
+            row["claim_state"] in {"dispatched", "dispatch_ambiguous"}
+            or row["result"] is not None
+            or row["infrastructure_code"] not in {None, code}
+        ):
             raise LiveGatewayStateError("live_infrastructure_result_conflict")
         row["claim_state"] = "invalid"
         row["infrastructure_code"] = code
 
     def invalidate_execution(self, token_digest: str, code: str) -> None:
         row = self.rows.get(token_digest)
-        if row is None or row["collected"] or row["infrastructure_code"] not in {None, code}:
+        if (
+            row is None
+            or row["collected"]
+            or row["claim_state"] in {"dispatched", "dispatch_ambiguous"}
+            or row["infrastructure_code"] not in {None, code}
+        ):
             raise LiveGatewayStateError("live_infrastructure_result_conflict")
         row["result"] = None
         row["claim_state"] = "invalid"
@@ -398,6 +444,7 @@ class _MemoryGatewayState:
                 and actual["task_id"] == task_id
                 and actual["attempt"] == attempt
                 and row["infrastructure_code"] is not None
+                and row["claim_state"] == "invalid"
             ):
                 result[actual["subject"]] = row["infrastructure_code"]
         return result
@@ -408,7 +455,10 @@ class _MemoryGatewayState:
         current_boot_id = kwargs["current_boot_id"]
         process_identity = kwargs["process_identity"]
         for token_digest, row in self.rows.items():
-            if row["claim_state"] != "in_progress" or row["claim_expires_at"] > observed_at:
+            if (
+                row["claim_state"] not in {"pre_dispatch", "dispatched"}
+                or row["claim_expires_at"] > observed_at
+            ):
                 continue
             alive = (
                 process_identity(row["claim_pid"])
@@ -417,8 +467,12 @@ class _MemoryGatewayState:
             )
             if alive == row["claim_process_start"]:
                 continue
-            row["claim_state"] = "invalid"
-            row["infrastructure_code"] = "gateway_claim_abandoned"
+            if row["claim_state"] == "pre_dispatch":
+                row["claim_state"] = "invalid"
+                row["infrastructure_code"] = "gateway_pre_dispatch_abandoned"
+            else:
+                row["claim_state"] = "dispatch_ambiguous"
+                row["infrastructure_code"] = "gateway_dispatch_ambiguous"
             reconciled.append(token_digest)
         return tuple(sorted(reconciled))
 
@@ -895,13 +949,25 @@ class ProtectedModelGatewayServer:
         if claimed != grant:
             raise LiveGatewayAuthorityError("live_gateway_grant_invalid")
         try:
+            self._state.mark_provider_dispatched(
+                grant.token_digest,
+                claim_id,
+                request_digest=request.request_digest,
+                dispatched_at=self._now_epoch(),
+            )
+        except LiveGatewayStateError as error:
+            raise LiveGatewayAuthorityError(error.code) from error
+        try:
             result = self._gateway.evaluate(request)
             verified = self._gateway.verify_protected_result(result)
         except OpenAIGatewayError as error:
+            self._mark_dispatch_ambiguous(grant.token_digest, claim_id)
             raise LiveGatewayAuthorityError(error.code) from error
         except Exception as error:
+            self._mark_dispatch_ambiguous(grant.token_digest, claim_id)
             raise LiveGatewayAuthorityError("live_gateway_unavailable") from error
         if type(result) is not ProtectedOpenAIModelResult or not verified:
+            self._mark_dispatch_ambiguous(grant.token_digest, claim_id)
             raise LiveGatewayAuthorityError("live_model_provenance_invalid")
         try:
             self._state.complete_result(
@@ -912,6 +978,16 @@ class ProtectedModelGatewayServer:
         except LiveGatewayStateError as error:
             raise LiveGatewayAuthorityError(error.code) from error
         return result
+
+    def _mark_dispatch_ambiguous(self, token_digest: str, claim_id: str) -> None:
+        try:
+            self._state.mark_dispatch_ambiguous(
+                token_digest,
+                claim_id,
+                code="gateway_dispatch_ambiguous",
+            )
+        except LiveGatewayStateError as error:
+            raise LiveGatewayAuthorityError(error.code) from error
 
     def take_completed_result(
         self, capability: BoundedModelGatewayCapability
@@ -940,6 +1016,32 @@ class ProtectedModelGatewayServer:
         if not verified:
             raise LiveGatewayAuthorityError("live_model_provenance_invalid")
         return result
+
+    def reconcile_provider_result(self, token: str, result: ProtectedOpenAIModelResult) -> None:
+        """Complete an ambiguous dispatch only from its exact authenticated provider result."""
+        grant = self._grant(token)
+        if type(result) is not ProtectedOpenAIModelResult:
+            raise LiveGatewayAuthorityError("live_model_provenance_invalid")
+        expected_request = grant.identity.model_request_digest(
+            subject=grant.actual.subject,
+            task=grant.task,
+            policy=grant.policy,
+            seed=grant.actual.seed,
+            attempt=grant.actual.attempt,
+        )
+        try:
+            verified = self._gateway.verify_protected_result(result)
+        except Exception as error:
+            raise LiveGatewayAuthorityError("live_model_provenance_invalid") from error
+        if not verified or result.request_digest != expected_request:
+            raise LiveGatewayAuthorityError("live_gateway_result_conflict")
+        try:
+            self._state.reconcile_dispatched_result(
+                grant.token_digest,
+                _result_document(result),
+            )
+        except LiveGatewayStateError as error:
+            raise LiveGatewayAuthorityError(error.code) from error
 
     def record_infrastructure_invalid(self, token: str, code: str) -> None:
         grant = self._grant(token)
