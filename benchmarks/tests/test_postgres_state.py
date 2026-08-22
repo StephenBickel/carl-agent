@@ -50,6 +50,7 @@ from carl_bench.coordinator_effects import (
     CoordinatorNodeEffectResponse,
     PreparedCoordinatorEffect,
 )
+from carl_bench.coordinator_recovery import CoordinatorRecoveryRequest
 from carl_bench.experiment import EventType, ExperimentEvent
 from carl_bench.github_cloud import GitHubEffectAttempt, workflow_dispatch_binding
 from carl_bench.github_effect_ipc import (
@@ -193,10 +194,14 @@ def test_sql_persists_exact_effect_fence_before_network_and_reuses_it_on_restart
 def test_sql_exposes_exact_coordinator_reconstruction_and_effect_fences() -> None:
     assert COORDINATOR_RUNTIME_PATH.is_file()
     for function_name in (
+        "enqueue_coordinator_graph",
+        "enqueue_pending_coordinator_graph",
+        "reactivate_coordinator_node",
         "load_coordinator_snapshot",
         "apply_coordinator_decision",
         "prepare_coordinator_effect",
         "complete_coordinator_effect",
+        "complete_coordinator_node_event",
     ):
         assert re.search(
             rf"FUNCTION\s+carl_autonomy\.{function_name}\b",
@@ -207,6 +212,8 @@ def test_sql_exposes_exact_coordinator_reconstruction_and_effect_fences() -> Non
     assert "decision_identity" in COORDINATOR_RUNTIME_SQL
     assert "request_digest" in COORDINATOR_RUNTIME_SQL
     assert "carl_state_backend" in COORDINATOR_RUNTIME_SQL
+    assert "coordinator_effect_occurrences" in COORDINATOR_RUNTIME_SQL
+    assert "graph_occurrence_key" in COORDINATOR_RUNTIME_SQL
 
 
 def test_coordinator_sql_strictly_validates_typed_effect_documents() -> None:
@@ -258,6 +265,52 @@ def test_coordinator_sql_strictly_validates_typed_effect_documents() -> None:
         r"canonical_utc_text_valid\(\s*response_value->>'retry_not_before'\s*\)",
         complete_body,
     )
+
+
+def test_coordinator_sql_binds_each_selected_node_and_fences_every_non_github_family() -> None:
+    apply = re.search(
+        r"FUNCTION\s+carl_autonomy\.apply_coordinator_decision\b.*?"
+        r"AS\s+\$\$(?P<body>.*?)\$\$;",
+        COORDINATOR_RUNTIME_SQL,
+        re.IGNORECASE | re.DOTALL,
+    )
+    local = re.search(
+        r"FUNCTION\s+carl_autonomy\.execute_coordinator_local_effect\b.*?"
+        r"AS\s+\$\$(?P<body>.*?)\$\$;",
+        COORDINATOR_RUNTIME_SQL,
+        re.IGNORECASE | re.DOTALL,
+    )
+    assert apply is not None
+    assert local is not None
+    apply_body = apply.group("body")
+    local_body = local.group("body")
+
+    assert "next_effect_request := carl_autonomy.canonical_jsonb" in apply_body
+    assert "'node_kind', ready_node->>'kind'" in apply_body
+    assert re.search(
+        r"effect_request_json\s*=\s*CASE\s+WHEN decision_value->>'action' IN"
+        r"\s*\('persist_command', 'retry_rework'\)\s+THEN next_effect_request",
+        apply_body,
+    )
+    occurrence_insert = local_body.index("INSERT INTO carl_autonomy.coordinator_effect_occurrences")
+    assert occurrence_insert < local_body.index("create_supervisor_trigger")
+    assert "status = 'effect_observed'" in local_body[occurrence_insert:]
+
+
+def test_non_github_reconciliation_can_replace_only_a_nonterminal_observation() -> None:
+    complete = re.search(
+        r"FUNCTION\s+carl_autonomy\.complete_coordinator_effect\b.*?"
+        r"AS\s+\$\$(?P<body>.*?)\$\$;",
+        COORDINATOR_RUNTIME_SQL,
+        re.IGNORECASE | re.DOTALL,
+    )
+    assert complete is not None
+    body = complete.group("body")
+
+    assert "prior_response_value" in body
+    assert "decision_value->>'action' <> 'reconcile_effect'" in body
+    assert "prior_response_value->>'status' IN ('completed', 'rejected')" in body
+    assert "coordinator_effect_response_conflict" in body
 
 
 def test_coordinator_sql_effect_family_table_matches_every_python_node() -> None:
@@ -969,6 +1022,8 @@ class FakeDatabase:
             "mark_effect_retry_scheduled",
             "mark_effect_completed",
             "load_coordinator_snapshot",
+            "enqueue_pending_coordinator_graph",
+            "reactivate_coordinator_node",
             "apply_coordinator_decision",
             "prepare_coordinator_effect",
             "complete_coordinator_effect",
@@ -2527,3 +2582,60 @@ def test_postgres_coordinator_empty_queue_is_not_a_failure_or_mutation() -> None
     assert result is None
     assert database.transactions_started == 1
     assert database.transactions_committed == 1
+
+
+def test_postgres_coordinator_enqueue_empty_manifest_queue_is_idempotent() -> None:
+    database = FakeDatabase()
+    database.responses["enqueue_pending_coordinator_graph"] = [
+        {
+            "applied": False,
+            "experiment_id": None,
+            "occurrence_key": None,
+            "request_digest": None,
+        }
+    ]
+
+    assert _backend(database).enqueue_pending_coordinator_graph(observed_at=NOW) is False
+    assert database.transactions_started == 1
+    assert database.transactions_committed == 1
+
+
+def test_postgres_coordinator_recovery_uses_supervisor_only_typed_cas() -> None:
+    recovery = CoordinatorRecoveryRequest(
+        schema_version=1,
+        domain="carl.coordinator.recovery.v1",
+        experiment_id="experiment-1",
+        node_id="experiment-1:archive_builder",
+        node_kind="archive_builder",
+        expected_revision=7,
+        evidence_digest=DIGEST_A,
+        repair_fingerprint=DIGEST_B,
+        requested_at=NOW_TEXT,
+    )
+    database = FakeDatabase()
+    database.responses["reactivate_coordinator_node"] = [
+        {
+            "applied": True,
+            "attempt": 2,
+            "request_digest": "c" * 64,
+            "revision": 8,
+        }
+    ]
+
+    result = _backend(database).reactivate_coordinator_node(recovery, observed_at=NOW)
+
+    assert result == {
+        "applied": True,
+        "attempt": 2,
+        "request_digest": "c" * 64,
+        "revision": 8,
+    }
+    query, parameters = next(
+        call for call in database.calls if "reactivate_coordinator_node" in call[0]
+    )
+    assert parameters == (_canonical(recovery.to_canonical_dict()), NOW)
+    assert any(
+        parameters == ("supervisor",)
+        for query, parameters in database.calls
+        if "set_config('carl_autonomy.authority'" in query
+    )

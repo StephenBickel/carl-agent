@@ -25,6 +25,10 @@ CREATE TABLE carl_autonomy.coordinator_runtime (
     decision_identity character(64),
     decision_json text,
     effect_response_json text,
+    graph_request_json text,
+    graph_request_digest character(64),
+    graph_occurrence_key varchar(192),
+    repair_fingerprint character(64),
     status varchar(24) NOT NULL DEFAULT 'ready' CHECK (
         status IN ('ready', 'effect_prepared', 'effect_observed', 'complete', 'frozen')
     ),
@@ -52,10 +56,48 @@ CREATE TABLE carl_autonomy.coordinator_runtime (
     ),
     CHECK (completion_event_digest IS NULL OR completion_event_digest ~ '^[0-9a-f]{64}$'),
     CHECK (effect_request_digest IS NULL OR effect_request_digest ~ '^[0-9a-f]{64}$'),
-    CHECK (decision_identity IS NULL OR decision_identity ~ '^[0-9a-f]{64}$')
+    CHECK (decision_identity IS NULL OR decision_identity ~ '^[0-9a-f]{64}$'),
+    CHECK (
+        (graph_request_json IS NULL AND graph_request_digest IS NULL
+            AND graph_occurrence_key IS NULL)
+        OR (graph_request_json IS NOT NULL AND graph_request_digest IS NOT NULL
+            AND graph_occurrence_key IS NOT NULL)
+    ),
+    CHECK (graph_request_digest IS NULL OR graph_request_digest ~ '^[0-9a-f]{64}$'),
+    CHECK (repair_fingerprint IS NULL OR repair_fingerprint ~ '^[0-9a-f]{64}$'),
+    UNIQUE (graph_occurrence_key)
 );
 
 REVOKE ALL ON carl_autonomy.coordinator_runtime FROM PUBLIC, carl_autonomy_workflow;
+
+CREATE TABLE carl_autonomy.coordinator_effect_occurrences (
+    effect_key varchar(192) PRIMARY KEY,
+    occurrence_key varchar(192) NOT NULL UNIQUE,
+    experiment_id varchar(128) NOT NULL
+        REFERENCES carl_autonomy.coordinator_runtime(experiment_id),
+    node_kind varchar(32) NOT NULL,
+    effect_family varchar(24) NOT NULL CHECK (
+        effect_family IN ('archive', 'evaluator', 'input', 'observer', 'state', 'supervisor')
+    ),
+    command_key varchar(192) NOT NULL,
+    request_json text NOT NULL CHECK (octet_length(request_json) BETWEEN 2 AND 32768),
+    request_digest character(64) NOT NULL CHECK (request_digest ~ '^[0-9a-f]{64}$'),
+    response_json text,
+    response_digest character(64),
+    status varchar(24) NOT NULL CHECK (
+        status IN ('effect_prepared', 'in_progress', 'effect_observed')
+    ),
+    prepared_at timestamptz NOT NULL,
+    updated_at timestamptz NOT NULL,
+    CHECK (
+        (response_json IS NULL AND response_digest IS NULL)
+        OR (response_json IS NOT NULL AND response_digest IS NOT NULL)
+    ),
+    CHECK (response_digest IS NULL OR response_digest ~ '^[0-9a-f]{64}$')
+);
+
+REVOKE ALL ON carl_autonomy.coordinator_effect_occurrences
+FROM PUBLIC, carl_autonomy_workflow;
 
 CREATE OR REPLACE FUNCTION carl_autonomy.coordinator_timestamp(p_value timestamptz)
 RETURNS text
@@ -165,6 +207,577 @@ AS $$
     END
 $$;
 
+CREATE OR REPLACE FUNCTION carl_autonomy.coordinator_node_authority(p_kind text)
+RETURNS text
+LANGUAGE sql
+IMMUTABLE
+STRICT
+SECURITY INVOKER
+SET search_path = pg_catalog, carl_autonomy
+AS $$
+    SELECT CASE p_kind
+        WHEN 'create_revert' THEN 'promoter'
+        WHEN 'observe_revert' THEN 'observer'
+        WHEN 'publish_input' THEN 'validator'
+        WHEN 'register_hypothesis' THEN 'builder'
+        WHEN 'request_builder' THEN 'coordinator'
+        WHEN 'dispatch_builder' THEN 'coordinator'
+        WHEN 'observe_builder' THEN 'observer'
+        WHEN 'archive_builder' THEN 'observer'
+        WHEN 'ingest_builder' THEN 'coordinator'
+        WHEN 'publish_experimental' THEN 'builder'
+        WHEN 'dispatch_validation' THEN 'coordinator'
+        WHEN 'observe_validation' THEN 'observer'
+        WHEN 'archive_validation' THEN 'validator'
+        WHEN 'ingest_validation' THEN 'coordinator'
+        WHEN 'record_disposition' THEN 'validator'
+        WHEN 'create_promotion_pr' THEN 'promoter'
+        WHEN 'observe_required_checks' THEN 'observer'
+        WHEN 'enable_auto_merge' THEN 'promoter'
+        WHEN 'schedule_soak' THEN 'coordinator'
+        WHEN 'observe_soak' THEN 'soak'
+        WHEN 'accept_soak' THEN 'soak'
+        WHEN 'trigger_supervisor' THEN 'supervisor'
+        ELSE NULL
+    END
+$$;
+
+CREATE OR REPLACE FUNCTION carl_autonomy.coordinator_node_operation(p_kind text)
+RETURNS text
+LANGUAGE sql
+IMMUTABLE
+STRICT
+SECURITY INVOKER
+SET search_path = pg_catalog, carl_autonomy
+AS $$
+    SELECT CASE p_kind
+        WHEN 'create_revert' THEN 'github_effect'
+        WHEN 'observe_revert' THEN 'observe'
+        WHEN 'publish_input' THEN 'register_evidence'
+        WHEN 'register_hypothesis' THEN 'register_manifest'
+        WHEN 'request_builder' THEN 'schedule'
+        WHEN 'dispatch_builder' THEN 'dispatch'
+        WHEN 'observe_builder' THEN 'observe'
+        WHEN 'archive_builder' THEN 'register_evidence'
+        WHEN 'ingest_builder' THEN 'record_success'
+        WHEN 'publish_experimental' THEN 'publish_experimental'
+        WHEN 'dispatch_validation' THEN 'dispatch'
+        WHEN 'observe_validation' THEN 'observe'
+        WHEN 'archive_validation' THEN 'register_evidence'
+        WHEN 'ingest_validation' THEN 'record_success'
+        WHEN 'record_disposition' THEN 'append_disposition'
+        WHEN 'create_promotion_pr' THEN 'github_effect'
+        WHEN 'observe_required_checks' THEN 'observe'
+        WHEN 'enable_auto_merge' THEN 'github_effect'
+        WHEN 'schedule_soak' THEN 'schedule'
+        WHEN 'observe_soak' THEN 'production_observation'
+        WHEN 'accept_soak' THEN 'record_soak'
+        WHEN 'trigger_supervisor' THEN 'claim_trigger'
+        ELSE NULL
+    END
+$$;
+
+CREATE OR REPLACE FUNCTION carl_autonomy.coordinator_node_event_authority(
+    p_kind text,
+    p_event_type text
+)
+RETURNS text
+LANGUAGE sql
+IMMUTABLE
+SECURITY INVOKER
+SET search_path = pg_catalog, carl_autonomy
+AS $$
+    SELECT CASE
+        WHEN p_kind = 'observe_revert' AND p_event_type = 'revert_recorded' THEN 'soak'
+        WHEN p_kind = 'observe_builder' AND p_event_type = 'candidate_sealed' THEN 'builder'
+        WHEN p_kind = 'archive_builder' AND p_event_type = 'state_transitioned'
+            THEN 'coordinator'
+        WHEN p_kind = 'observe_validation'
+            AND p_event_type = 'protected_validation_recorded' THEN 'validator'
+        WHEN p_kind = 'observe_required_checks' AND p_event_type = 'state_transitioned'
+            THEN 'coordinator'
+        WHEN p_kind = 'trigger_supervisor' AND p_event_type = 'retry_scheduled'
+            THEN 'coordinator'
+        ELSE NULL
+    END
+$$;
+
+CREATE OR REPLACE FUNCTION carl_autonomy.coordinator_command_allows_node(
+    p_command text,
+    p_kind text
+)
+RETURNS boolean
+LANGUAGE sql
+IMMUTABLE
+SECURITY INVOKER
+SET search_path = pg_catalog, carl_autonomy
+AS $$
+    SELECT CASE p_command
+        WHEN 'request' THEN p_kind IN ('register_hypothesis', 'request_builder')
+        WHEN 'coordinate' THEN carl_autonomy.coordinator_node_priority(p_kind) IS NOT NULL
+        WHEN 'observe' THEN p_kind IN (
+            'observe_builder', 'archive_builder', 'observe_validation', 'archive_validation',
+            'observe_required_checks', 'observe_soak', 'observe_revert'
+        )
+        WHEN 'ingest' THEN p_kind IN (
+            'ingest_builder', 'ingest_validation', 'record_disposition'
+        )
+        WHEN 'publish-input' THEN p_kind = 'publish_input'
+        WHEN 'health' THEN p_kind = 'trigger_supervisor'
+        WHEN 'commission-live' THEN p_kind IN (
+            'dispatch_validation', 'observe_validation', 'archive_validation',
+            'ingest_validation', 'record_disposition', 'create_promotion_pr',
+            'observe_required_checks', 'enable_auto_merge', 'schedule_soak',
+            'observe_soak', 'accept_soak', 'create_revert', 'observe_revert'
+        )
+        ELSE false
+    END
+$$;
+
+CREATE OR REPLACE FUNCTION carl_autonomy.enqueue_coordinator_graph(
+    p_request_json text,
+    p_observed_at timestamptz
+)
+RETURNS TABLE(applied boolean, experiment_id text, occurrence_key text, request_digest text)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, carl_autonomy
+AS $$
+DECLARE
+    request_value jsonb;
+    request_hash text;
+    manifest_state carl_autonomy.experiment_manifests%ROWTYPE;
+    manifest_value jsonb;
+    existing carl_autonomy.coordinator_runtime%ROWTYPE;
+    nodes_value jsonb;
+    snapshot_value text;
+    input_request jsonb;
+    input_request_text text;
+    input_request_digest text;
+BEGIN
+    PERFORM carl_autonomy.require_role(ARRAY['carl_coordinator']);
+    request_value := carl_autonomy.parse_object(
+        p_request_json, 'coordinator_graph_request_invalid'
+    );
+    IF carl_autonomy.canonical_jsonb(request_value) <> p_request_json
+        OR jsonb_object_length(request_value) <> 9
+        OR NOT request_value ?& ARRAY[
+            'schema_version', 'domain', 'occurrence_key', 'experiment_id',
+            'manifest_digest', 'parent_experiment_id', 'parent_commit',
+            'input_digest', 'requested_at'
+        ]
+        OR request_value->'schema_version' IS DISTINCT FROM '1'::jsonb
+        OR request_value->>'domain' <> 'carl.coordinator.graph-request.v1'
+        OR request_value->>'occurrence_key'
+            !~ '^[A-Za-z0-9][A-Za-z0-9._:/-]{0,191}$'
+        OR request_value->>'experiment_id'
+            !~ '^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$'
+        OR request_value->>'manifest_digest' !~ '^[0-9a-f]{64}$'
+        OR request_value->>'input_digest' !~ '^[0-9a-f]{64}$'
+        OR request_value->>'parent_commit' !~ '^([0-9a-f]{40}|[0-9a-f]{64})$'
+        OR NOT carl_autonomy.canonical_utc_text_valid(request_value->>'requested_at')
+        OR (request_value->>'requested_at')::timestamptz > p_observed_at
+        OR NOT (
+            request_value->'parent_experiment_id' = 'null'::jsonb
+            OR (
+                jsonb_typeof(request_value->'parent_experiment_id') = 'string'
+                AND request_value->>'parent_experiment_id'
+                    ~ '^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$'
+            )
+        )
+    THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '22023', MESSAGE = 'coordinator_graph_request_invalid';
+    END IF;
+    request_hash := carl_autonomy.sha256_text(p_request_json);
+    PERFORM pg_advisory_xact_lock(hashtextextended(request_value->>'occurrence_key', 11));
+    SELECT runtime.* INTO existing
+    FROM carl_autonomy.coordinator_runtime AS runtime
+    WHERE runtime.experiment_id = request_value->>'experiment_id'
+        OR runtime.graph_occurrence_key = request_value->>'occurrence_key'
+    FOR UPDATE;
+    IF FOUND THEN
+        IF existing.experiment_id = request_value->>'experiment_id'
+            AND existing.graph_occurrence_key = request_value->>'occurrence_key'
+            AND existing.graph_request_json = p_request_json
+            AND existing.graph_request_digest = request_hash
+        THEN
+            RETURN QUERY SELECT false, existing.experiment_id::text,
+                existing.graph_occurrence_key::text, existing.graph_request_digest::text;
+            RETURN;
+        END IF;
+        RAISE EXCEPTION USING
+            ERRCODE = '23505', MESSAGE = 'coordinator_graph_occurrence_conflict';
+    END IF;
+    SELECT manifest.* INTO manifest_state
+    FROM carl_autonomy.experiment_manifests AS manifest
+    WHERE manifest.experiment_id = request_value->>'experiment_id'
+    FOR SHARE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION USING ERRCODE = '23503', MESSAGE = 'coordinator_manifest_not_found';
+    END IF;
+    manifest_value := carl_autonomy.parse_object(
+        manifest_state.manifest_json, 'coordinator_manifest_invalid'
+    );
+    IF manifest_state.manifest_digest <> request_value->>'manifest_digest'
+        OR request_value->>'input_digest' <> manifest_state.manifest_digest
+        OR manifest_state.parent_experiment_id IS DISTINCT FROM
+            NULLIF(request_value->>'parent_experiment_id', '')
+        OR manifest_value->>'parent_commit' <> request_value->>'parent_commit'
+        OR manifest_state.registered_at_text <> request_value->>'requested_at'
+    THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '55000', MESSAGE = 'coordinator_graph_manifest_identity_mismatch';
+    END IF;
+    SELECT jsonb_agg(
+        jsonb_build_object(
+            'attempt', 1,
+            'authority', carl_autonomy.coordinator_node_authority(kind),
+            'command_key', request_value->>'experiment_id' || ':' || kind || ':attempt:1',
+            'kind', kind,
+            'max_attempts', 3,
+            'node_id', request_value->>'experiment_id' || ':' || kind,
+            'occurred_at', request_value->>'requested_at',
+            'operation', carl_autonomy.coordinator_node_operation(kind),
+            'request_digest', carl_autonomy.sha256_text(carl_autonomy.canonical_jsonb(
+                jsonb_build_object(
+                    'attempt', 1,
+                    'graph_request_digest', request_hash,
+                    'input_digest', request_value->>'input_digest',
+                    'node_kind', kind,
+                    'parent_commit', request_value->>'parent_commit'
+                )
+            )),
+            'status', CASE
+                WHEN kind IN ('create_revert', 'observe_revert', 'trigger_supervisor')
+                    THEN 'waiting'
+                ELSE 'ready'
+            END
+        ) ORDER BY ordinal
+    ) INTO nodes_value
+    FROM unnest(ARRAY[
+        'create_revert', 'observe_revert', 'publish_input', 'register_hypothesis',
+        'request_builder', 'dispatch_builder', 'observe_builder', 'archive_builder',
+        'ingest_builder', 'publish_experimental', 'dispatch_validation',
+        'observe_validation', 'archive_validation', 'ingest_validation',
+        'record_disposition', 'create_promotion_pr', 'observe_required_checks',
+        'enable_auto_merge', 'schedule_soak', 'observe_soak', 'accept_soak',
+        'trigger_supervisor'
+    ]::text[]) WITH ORDINALITY AS fixed(kind, ordinal);
+    snapshot_value := carl_autonomy.canonical_jsonb(jsonb_build_object(
+        'command', NULL,
+        'coordinator_id', 'carl-cloud-coordinator-v1',
+        'dead_holder_observation_digest', NULL,
+        'effect', NULL,
+        'experiment_id', request_value->>'experiment_id',
+        'failure', NULL,
+        'immutable_inputs', jsonb_build_array(jsonb_build_object(
+            'digest', request_value->>'input_digest',
+            'media_type', 'application/vnd.carl.improvement-request+json',
+            'media_version', 1,
+            'resolved_digest', request_value->>'input_digest',
+            'size_bytes', octet_length(manifest_state.manifest_json),
+            'visibility', 'private'
+        )),
+        'lease', NULL,
+        'nodes', nodes_value,
+        'observed_at', request_value->>'requested_at',
+        'production_authorization', NULL,
+        'revision', 0,
+        'schema_version', 1
+    ));
+    SELECT node INTO input_request
+    FROM jsonb_array_elements(nodes_value) AS node
+    WHERE node->>'kind' = 'publish_input';
+    input_request_text := carl_autonomy.canonical_jsonb(jsonb_build_object(
+        'command_key', input_request->>'command_key',
+        'domain', 'carl.coordinator-node-effect.request.v1',
+        'effect_key', 'cloud-effect-' || carl_autonomy.sha256_text(
+            carl_autonomy.canonical_jsonb(jsonb_build_object(
+                'authority', input_request->>'authority',
+                'command_key', input_request->>'command_key',
+                'operation', input_request->>'operation',
+                'request_digest', input_request->>'request_digest'
+            ))
+        ),
+        'family', 'input',
+        'node_kind', 'publish_input',
+        'occurred_at', input_request->>'occurred_at',
+        'request_digest', input_request->>'request_digest',
+        'schema_version', 1
+    ));
+    input_request_digest := carl_autonomy.sha256_text(input_request_text);
+    INSERT INTO carl_autonomy.coordinator_runtime(
+        experiment_id, command_name, snapshot_json, snapshot_digest,
+        effect_family, effect_request_json, effect_request_digest,
+        graph_request_json, graph_request_digest, graph_occurrence_key,
+        status, revision, updated_at
+    ) VALUES (
+        request_value->>'experiment_id', 'request', snapshot_value,
+        carl_autonomy.sha256_text(snapshot_value), 'input', input_request_text,
+        input_request_digest, p_request_json, request_hash,
+        request_value->>'occurrence_key', 'ready', 0, p_observed_at
+    );
+    RETURN QUERY SELECT true, request_value->>'experiment_id',
+        request_value->>'occurrence_key', request_hash;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION carl_autonomy.enqueue_pending_coordinator_graph(
+    p_observed_at timestamptz
+)
+RETURNS TABLE(applied boolean, experiment_id text, occurrence_key text, request_digest text)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, carl_autonomy
+AS $$
+DECLARE
+    selected carl_autonomy.experiment_manifests%ROWTYPE;
+    request_value text;
+    manifest_value jsonb;
+BEGIN
+    PERFORM carl_autonomy.require_role(ARRAY['carl_coordinator']);
+    SELECT manifest.* INTO selected
+    FROM carl_autonomy.experiment_manifests AS manifest
+    LEFT JOIN carl_autonomy.coordinator_runtime AS runtime
+        ON runtime.experiment_id = manifest.experiment_id
+    ORDER BY (runtime.experiment_id IS NULL) DESC,
+        manifest.registered_at, manifest.experiment_id
+    FOR UPDATE OF manifest SKIP LOCKED
+    LIMIT 1;
+    IF NOT FOUND THEN
+        RETURN QUERY SELECT false, NULL::text, NULL::text, NULL::text;
+        RETURN;
+    END IF;
+    manifest_value := carl_autonomy.parse_object(
+        selected.manifest_json, 'coordinator_manifest_invalid'
+    );
+    request_value := carl_autonomy.canonical_jsonb(jsonb_build_object(
+        'domain', 'carl.coordinator.graph-request.v1',
+        'experiment_id', selected.experiment_id,
+        'input_digest', selected.manifest_digest,
+        'manifest_digest', selected.manifest_digest,
+        'occurrence_key', 'manifest/' || selected.manifest_digest,
+        'parent_commit', manifest_value->>'parent_commit',
+        'parent_experiment_id', selected.parent_experiment_id,
+        'requested_at', selected.registered_at_text,
+        'schema_version', 1
+    ));
+    RETURN QUERY SELECT *
+    FROM carl_autonomy.enqueue_coordinator_graph(request_value, p_observed_at);
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION carl_autonomy.reactivate_coordinator_node(
+    p_recovery_json text,
+    p_observed_at timestamptz
+)
+RETURNS TABLE(applied boolean, attempt integer, request_digest text, revision integer)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, carl_autonomy
+AS $$
+DECLARE
+    recovery_value jsonb;
+    runtime carl_autonomy.coordinator_runtime%ROWTYPE;
+    snapshot_value jsonb;
+    decision_value jsonb;
+    selected_node jsonb;
+    repaired_node jsonb;
+    repaired_nodes jsonb;
+    evidence_state carl_autonomy.evidence_objects%ROWTYPE;
+    next_attempt integer;
+    next_revision integer;
+    next_request_digest text;
+    next_effect_key text;
+    next_effect_family text;
+    next_effect_request text;
+BEGIN
+    PERFORM carl_autonomy.require_role(ARRAY['carl_supervisor']);
+    recovery_value := carl_autonomy.parse_object(
+        p_recovery_json, 'coordinator_recovery_request_invalid'
+    );
+    IF carl_autonomy.canonical_jsonb(recovery_value) <> p_recovery_json
+        OR jsonb_object_length(recovery_value) <> 9
+        OR NOT recovery_value ?& ARRAY[
+            'schema_version', 'domain', 'experiment_id', 'node_id', 'node_kind',
+            'expected_revision', 'evidence_digest', 'repair_fingerprint', 'requested_at'
+        ]
+        OR recovery_value->'schema_version' IS DISTINCT FROM '1'::jsonb
+        OR recovery_value->>'domain' <> 'carl.coordinator.recovery.v1'
+        OR recovery_value->>'experiment_id'
+            !~ '^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$'
+        OR recovery_value->>'node_id'
+            <> recovery_value->>'experiment_id' || ':' || recovery_value->>'node_kind'
+        OR carl_autonomy.coordinator_node_priority(recovery_value->>'node_kind') IS NULL
+        OR jsonb_typeof(recovery_value->'expected_revision') <> 'number'
+        OR (recovery_value->>'expected_revision')::integer NOT BETWEEN 0 AND 2147483646
+        OR recovery_value->>'evidence_digest' !~ '^[0-9a-f]{64}$'
+        OR recovery_value->>'repair_fingerprint' !~ '^[0-9a-f]{64}$'
+        OR NOT carl_autonomy.canonical_utc_text_valid(recovery_value->>'requested_at')
+        OR (recovery_value->>'requested_at')::timestamptz > p_observed_at
+    THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '22023', MESSAGE = 'coordinator_recovery_request_invalid';
+    END IF;
+    SELECT item.* INTO runtime
+    FROM carl_autonomy.coordinator_runtime AS item
+    WHERE item.experiment_id = recovery_value->>'experiment_id'
+    FOR UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION USING ERRCODE = 'P0002', MESSAGE = 'coordinator_runtime_not_found';
+    END IF;
+    snapshot_value := carl_autonomy.parse_object(
+        runtime.snapshot_json, 'coordinator_snapshot_json_invalid'
+    );
+    SELECT node INTO selected_node
+    FROM jsonb_array_elements(snapshot_value->'nodes') AS node
+    WHERE node->>'node_id' = recovery_value->>'node_id';
+    IF runtime.repair_fingerprint = recovery_value->>'repair_fingerprint'
+        AND runtime.revision = (recovery_value->>'expected_revision')::integer + 1
+        AND selected_node->>'kind' = recovery_value->>'node_kind'
+    THEN
+        RETURN QUERY SELECT false, (selected_node->>'attempt')::integer,
+            selected_node->>'request_digest', runtime.revision;
+        RETURN;
+    END IF;
+    IF runtime.status <> 'frozen'
+        OR runtime.revision <> (recovery_value->>'expected_revision')::integer
+        OR runtime.repair_fingerprint = recovery_value->>'repair_fingerprint'
+        OR selected_node IS NULL
+        OR selected_node->>'kind' <> recovery_value->>'node_kind'
+        OR selected_node->>'status' NOT IN ('ready', 'failed')
+        OR (selected_node->>'attempt')::integer >= (selected_node->>'max_attempts')::integer
+        OR runtime.decision_json IS NULL
+        OR runtime.decision_identity IS NULL
+    THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '40001', MESSAGE = 'coordinator_recovery_cas_mismatch';
+    END IF;
+    decision_value := carl_autonomy.parse_object(
+        runtime.decision_json, 'coordinator_decision_json_invalid'
+    );
+    next_effect_family := carl_autonomy.coordinator_effect_family(selected_node->>'kind');
+    IF decision_value->>'action' <> 'frozen'
+        OR decision_value->>'node' <> selected_node->>'kind'
+        OR decision_value->>'reason' <> next_effect_family || '_service_uncommissioned'
+    THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '55000', MESSAGE = 'coordinator_recovery_freeze_mismatch';
+    END IF;
+    SELECT evidence.* INTO evidence_state
+    FROM carl_autonomy.evidence_objects AS evidence
+    WHERE evidence.digest = recovery_value->>'evidence_digest'
+    FOR SHARE;
+    IF NOT FOUND
+        OR evidence_state.digest <> recovery_value->>'repair_fingerprint'
+        OR evidence_state.request_digest <> selected_node->>'request_digest'
+        OR evidence_state.producer <> 'observer'
+        OR evidence_state.media_type NOT IN (
+            'application/vnd.carl.dependency-commissioning+json',
+            'application/vnd.carl.repair-receipt+json'
+        )
+        OR evidence_state.recorded_at > p_observed_at
+        OR evidence_state.retained_until <= p_observed_at
+    THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '55000', MESSAGE = 'coordinator_recovery_evidence_invalid';
+    END IF;
+    next_attempt := (selected_node->>'attempt')::integer + 1;
+    next_revision := runtime.revision + 1;
+    next_request_digest := carl_autonomy.sha256_text(carl_autonomy.canonical_jsonb(
+        jsonb_build_object(
+            'attempt', next_attempt,
+            'node_id', selected_node->>'node_id',
+            'prior_request_digest', selected_node->>'request_digest',
+            'repair_fingerprint', recovery_value->>'repair_fingerprint'
+        )
+    ));
+    repaired_node := jsonb_set(
+        jsonb_set(
+            jsonb_set(
+                jsonb_set(
+                    selected_node,
+                    '{attempt}',
+                    to_jsonb(next_attempt),
+                    false
+                ),
+                '{command_key}',
+                to_jsonb(
+                    recovery_value->>'experiment_id' || ':' || selected_node->>'kind'
+                        || ':attempt:' || next_attempt::text
+                ),
+                false
+            ),
+            '{request_digest}',
+            to_jsonb(next_request_digest),
+            false
+        ),
+        '{occurred_at}',
+        to_jsonb(recovery_value->>'requested_at'),
+        false
+    );
+    repaired_node := jsonb_set(repaired_node, '{status}', '"ready"'::jsonb, false);
+    SELECT jsonb_agg(
+        CASE WHEN node->>'node_id' = recovery_value->>'node_id' THEN repaired_node ELSE node END
+        ORDER BY ordinal
+    ) INTO repaired_nodes
+    FROM jsonb_array_elements(snapshot_value->'nodes')
+        WITH ORDINALITY AS value(node, ordinal);
+    snapshot_value := jsonb_set(snapshot_value, '{nodes}', repaired_nodes, false);
+    snapshot_value := jsonb_set(snapshot_value, '{failure}', 'null'::jsonb, false);
+    snapshot_value := jsonb_set(
+        snapshot_value, '{revision}', to_jsonb(next_revision), false
+    );
+    snapshot_value := jsonb_set(
+        snapshot_value, '{observed_at}', to_jsonb(recovery_value->>'requested_at'), false
+    );
+    next_effect_key := 'cloud-effect-' || carl_autonomy.sha256_text(
+        carl_autonomy.canonical_jsonb(jsonb_build_object(
+            'authority', repaired_node->>'authority',
+            'command_key', repaired_node->>'command_key',
+            'operation', repaired_node->>'operation',
+            'request_digest', repaired_node->>'request_digest'
+        ))
+    );
+    next_effect_request := CASE WHEN next_effect_family <> 'github' THEN
+        carl_autonomy.canonical_jsonb(jsonb_build_object(
+            'command_key', repaired_node->>'command_key',
+            'domain', 'carl.coordinator-node-effect.request.v1',
+            'effect_key', next_effect_key,
+            'family', next_effect_family,
+            'node_kind', repaired_node->>'kind',
+            'occurred_at', repaired_node->>'occurred_at',
+            'request_digest', repaired_node->>'request_digest',
+            'schema_version', 1
+        ))
+        ELSE NULL
+    END;
+    UPDATE carl_autonomy.coordinator_runtime AS item
+    SET snapshot_json = carl_autonomy.canonical_jsonb(snapshot_value),
+        snapshot_digest = carl_autonomy.sha256_text(
+            carl_autonomy.canonical_jsonb(snapshot_value)
+        ),
+        completion_event_json = NULL,
+        completion_event_digest = NULL,
+        effect_family = CASE WHEN next_effect_request IS NULL THEN NULL ELSE next_effect_family END,
+        effect_request_json = next_effect_request,
+        effect_request_digest = CASE
+            WHEN next_effect_request IS NULL THEN NULL
+            ELSE carl_autonomy.sha256_text(next_effect_request)
+        END,
+        effect_response_json = NULL,
+        decision_identity = NULL,
+        decision_json = NULL,
+        repair_fingerprint = recovery_value->>'repair_fingerprint',
+        revision = next_revision,
+        status = 'ready',
+        updated_at = p_observed_at
+    WHERE item.experiment_id = runtime.experiment_id;
+    RETURN QUERY SELECT true, next_attempt, next_request_digest, next_revision;
+END;
+$$;
+
 CREATE OR REPLACE FUNCTION carl_autonomy.load_coordinator_snapshot(
     p_command_name text,
     p_observed_at timestamptz
@@ -184,6 +797,7 @@ DECLARE
     command_state carl_autonomy.commands%ROWTYPE;
     lease_state carl_autonomy.leases%ROWTYPE;
     effect_state carl_autonomy.effect_attempts%ROWTYPE;
+    coordinator_effect_state carl_autonomy.coordinator_effect_occurrences%ROWTYPE;
     response_value jsonb;
     guard_state carl_autonomy.experiment_projection_guards%ROWTYPE;
     archive_state carl_autonomy.evidence_objects%ROWTYPE;
@@ -194,8 +808,21 @@ BEGIN
     PERFORM carl_autonomy.require_role(ARRAY['carl_coordinator']);
     SELECT runtime.* INTO selected
     FROM carl_autonomy.coordinator_runtime AS runtime
-    WHERE runtime.command_name = p_command_name
-        AND runtime.status NOT IN ('complete', 'frozen')
+    CROSS JOIN LATERAL (
+        SELECT node
+        FROM jsonb_array_elements(
+            carl_autonomy.parse_object(
+                runtime.snapshot_json, 'coordinator_snapshot_json_invalid'
+            )->'nodes'
+        ) AS active(node)
+        WHERE node->>'status' IN ('ready', 'failed')
+        ORDER BY carl_autonomy.coordinator_node_priority(node->>'kind'), node->>'node_id'
+        LIMIT 1
+    ) AS selected_node
+    WHERE runtime.status NOT IN ('complete', 'frozen')
+        AND carl_autonomy.coordinator_command_allows_node(
+            p_command_name, selected_node.node->>'kind'
+        )
     ORDER BY runtime.updated_at, runtime.experiment_id
     FOR UPDATE SKIP LOCKED
     LIMIT 1;
@@ -304,6 +931,26 @@ BEGIN
                 )
                 ELSE NULL
             END;
+        END IF;
+    END IF;
+    IF effect_value IS NULL
+        AND selected.effect_family IS NOT NULL
+        AND selected.effect_family <> 'github'
+    THEN
+        SELECT occurrence.* INTO coordinator_effect_state
+        FROM carl_autonomy.coordinator_effect_occurrences AS occurrence
+        WHERE occurrence.experiment_id = selected.experiment_id
+            AND occurrence.effect_key = command_state.effect_key;
+        IF FOUND AND coordinator_effect_state.status IN ('effect_prepared', 'in_progress') THEN
+            effect_value := jsonb_build_object(
+                'effect_key', coordinator_effect_state.effect_key,
+                'observed_at', carl_autonomy.coordinator_timestamp(
+                    coordinator_effect_state.updated_at
+                ),
+                'result_digest', NULL,
+                'retry_not_before', NULL,
+                'status', 'uncertain'
+            );
         END IF;
     END IF;
     IF effect_value IS NULL
@@ -647,6 +1294,94 @@ BEGIN
 END;
 $$;
 
+CREATE OR REPLACE FUNCTION carl_autonomy.complete_coordinator_node_event(
+    p_transition_json text,
+    p_event_json text,
+    p_event_digest text,
+    p_payload_json text,
+    p_node_kind text,
+    p_observed_at timestamptz
+)
+RETURNS TABLE(applied boolean)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, carl_autonomy
+AS $$
+DECLARE
+    transition_value jsonb;
+    event_value jsonb;
+    runtime carl_autonomy.coordinator_runtime%ROWTYPE;
+    snapshot_value jsonb;
+    selected_node jsonb;
+    command_state carl_autonomy.commands%ROWTYPE;
+    event_authority text;
+    command_result record;
+    event_result record;
+BEGIN
+    PERFORM carl_autonomy.require_role(ARRAY['carl_coordinator']);
+    transition_value := carl_autonomy.parse_object(
+        p_transition_json, 'coordinator_transition_invalid'
+    );
+    event_value := carl_autonomy.parse_object(p_event_json, 'coordinator_event_invalid');
+    event_authority := carl_autonomy.coordinator_node_event_authority(
+        p_node_kind, event_value->>'event_type'
+    );
+    SELECT item.* INTO runtime
+    FROM carl_autonomy.coordinator_runtime AS item
+    WHERE item.experiment_id = event_value->>'experiment_id'
+    FOR UPDATE;
+    IF NOT FOUND OR event_authority IS NULL THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '42501', MESSAGE = 'coordinator_node_event_authority_denied';
+    END IF;
+    snapshot_value := carl_autonomy.parse_object(
+        runtime.snapshot_json, 'coordinator_snapshot_json_invalid'
+    );
+    SELECT node INTO selected_node
+    FROM jsonb_array_elements(snapshot_value->'nodes') AS node
+    WHERE node->>'status' IN ('ready', 'failed')
+    ORDER BY carl_autonomy.coordinator_node_priority(node->>'kind'), node->>'node_id'
+    LIMIT 1;
+    SELECT command.* INTO command_state
+    FROM carl_autonomy.commands AS command
+    WHERE command.command_key = transition_value->>'command_key'
+    FOR UPDATE;
+    IF NOT FOUND
+        OR selected_node->>'kind' <> p_node_kind
+        OR selected_node->>'node_id' <> runtime.experiment_id || ':' || p_node_kind
+        OR selected_node->>'command_key' <> command_state.command_key
+        OR command_state.authority
+            <> carl_autonomy.coordinator_node_authority(p_node_kind)
+        OR command_state.authority NOT IN ('observer', 'supervisor')
+        OR event_value->>'stage_attempt_id'
+            <> 'coordinator-event-' || substr(carl_autonomy.sha256_text(
+                carl_autonomy.canonical_jsonb(jsonb_build_object(
+                    'attempt', (selected_node->>'attempt')::integer,
+                    'experiment_id', runtime.experiment_id,
+                    'node_kind', p_node_kind
+                ))
+            ), 1, 64)
+        OR carl_autonomy.sha256_text(p_event_json) <> p_event_digest
+        OR event_value->'payload' <> carl_autonomy.parse_object(
+            p_payload_json, 'coordinator_event_payload_invalid'
+        )
+    THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '42501', MESSAGE = 'coordinator_node_event_authority_denied';
+    END IF;
+    PERFORM set_config('carl_autonomy.authority', command_state.authority, true);
+    SELECT * INTO STRICT command_result
+    FROM carl_autonomy.terminal_command(p_transition_json, 'completed', p_observed_at);
+    PERFORM set_config('carl_autonomy.authority', event_authority, true);
+    SELECT * INTO STRICT event_result
+    FROM carl_autonomy.append_event(
+        p_event_json, p_event_digest, p_payload_json, p_observed_at
+    );
+    PERFORM set_config('carl_autonomy.authority', 'coordinator', true);
+    RETURN QUERY SELECT command_result.applied;
+END;
+$$;
+
 CREATE OR REPLACE FUNCTION carl_autonomy.apply_coordinator_decision(
     p_decision_json text,
     p_observed_at timestamptz
@@ -669,6 +1404,9 @@ DECLARE
     claim_value text;
     transition_value text;
     trigger_value text;
+    next_effect_family text;
+    next_effect_request text;
+    existing_effect_request jsonb;
     event_value jsonb;
     nodes_value jsonb;
     next_revision integer;
@@ -835,6 +1573,31 @@ BEGIN
                 RAISE EXCEPTION USING
                     ERRCODE = '55000', MESSAGE = 'coordinator_command_required';
             END IF;
+            IF command_value->>'authority' <> ready_node->>'authority'
+                OR command_value->>'operation' <> ready_node->>'operation'
+                OR (command_value->>'max_attempts')::integer
+                    <> (ready_node->>'max_attempts')::integer
+                OR (command_value->>'expected_revision')::integer <> runtime.revision
+                OR CASE decision_value->>'action'
+                    WHEN 'persist_command' THEN
+                        command_value->>'command_key' <> ready_node->>'command_key'
+                        OR command_value->>'request_digest' <> ready_node->>'request_digest'
+                        OR (command_value->>'attempt')::integer
+                            <> (ready_node->>'attempt')::integer
+                    WHEN 'retry_rework' THEN
+                        snapshot_value->'failure' IS NULL
+                        OR command_value->>'command_key'
+                            <> snapshot_value->'failure'->>'next_command_key'
+                        OR command_value->>'request_digest'
+                            <> snapshot_value->'failure'->>'next_request_digest'
+                        OR (command_value->>'attempt')::integer
+                            <> (ready_node->>'attempt')::integer + 1
+                    ELSE true
+                END
+            THEN
+                RAISE EXCEPTION USING
+                    ERRCODE = '42501', MESSAGE = 'coordinator_command_node_authority_denied';
+            END IF;
             PERFORM set_config('carl_autonomy.authority', command_value->>'authority', true);
             SELECT * INTO create_result
             FROM carl_autonomy.create_command(
@@ -870,6 +1633,36 @@ BEGIN
                 snapshot_value := jsonb_set(
                     snapshot_value, '{failure}', 'null'::jsonb, false
                 );
+            END IF;
+            next_effect_family := carl_autonomy.coordinator_effect_family(
+                ready_node->>'kind'
+            );
+            IF next_effect_family <> 'github' THEN
+                next_effect_request := carl_autonomy.canonical_jsonb(jsonb_build_object(
+                    'command_key', command_value->>'command_key',
+                    'domain', 'carl.coordinator-node-effect.request.v1',
+                    'effect_key', command_value->>'effect_key',
+                    'family', next_effect_family,
+                    'node_kind', ready_node->>'kind',
+                    'occurred_at', command_value->>'occurred_at',
+                    'request_digest', command_value->>'request_digest',
+                    'schema_version', 1
+                ));
+            ELSIF runtime.effect_family = 'github'
+                AND runtime.effect_request_json IS NOT NULL
+                AND runtime.effect_request_digest IS NOT NULL
+                AND carl_autonomy.sha256_text(runtime.effect_request_json)
+                    = runtime.effect_request_digest
+            THEN
+                existing_effect_request := carl_autonomy.parse_object(
+                    runtime.effect_request_json, 'coordinator_effect_request_json_invalid'
+                );
+                IF existing_effect_request->>'command_key' = command_value->>'command_key'
+                    AND existing_effect_request->>'effect_key' = command_value->>'effect_key'
+                    AND existing_effect_request->>'occurred_at' = command_value->>'occurred_at'
+                THEN
+                    next_effect_request := runtime.effect_request_json;
+                END IF;
             END IF;
         WHEN 'claim_command' THEN
             SELECT command.* INTO command_state
@@ -926,14 +1719,27 @@ BEGIN
                 'status', 'completed'
             ));
             PERFORM set_config('carl_autonomy.authority', command_state.authority, true);
-            SELECT * INTO completion_result
-            FROM carl_autonomy.complete_command_and_append_event(
-                transition_value,
-                runtime.completion_event_json,
-                runtime.completion_event_digest,
-                carl_autonomy.canonical_jsonb(event_value->'payload'),
-                p_observed_at
-            );
+            IF command_state.authority IN ('observer', 'supervisor') THEN
+                PERFORM set_config('carl_autonomy.authority', 'coordinator', true);
+                SELECT * INTO completion_result
+                FROM carl_autonomy.complete_coordinator_node_event(
+                    transition_value,
+                    runtime.completion_event_json,
+                    runtime.completion_event_digest,
+                    carl_autonomy.canonical_jsonb(event_value->'payload'),
+                    ready_node->>'kind',
+                    p_observed_at
+                );
+            ELSE
+                SELECT * INTO completion_result
+                FROM carl_autonomy.complete_command_and_append_event(
+                    transition_value,
+                    runtime.completion_event_json,
+                    runtime.completion_event_digest,
+                    carl_autonomy.canonical_jsonb(event_value->'payload'),
+                    p_observed_at
+                );
+            END IF;
             nodes_value := (
                 SELECT jsonb_agg(
                     CASE WHEN node->>'node_id' = ready_node->>'node_id'
@@ -1000,6 +1806,41 @@ BEGIN
         ),
         revision = next_revision,
         status = next_status,
+        completion_event_json = CASE
+            WHEN decision_value->>'action' IN ('retry_rework', 'complete_command')
+                THEN NULL
+            ELSE item.completion_event_json
+        END,
+        completion_event_digest = CASE
+            WHEN decision_value->>'action' IN ('retry_rework', 'complete_command')
+                THEN NULL
+            ELSE item.completion_event_digest
+        END,
+        effect_family = CASE
+            WHEN decision_value->>'action' IN ('persist_command', 'retry_rework')
+                THEN CASE
+                    WHEN next_effect_request IS NULL THEN NULL
+                    ELSE next_effect_family
+                END
+            ELSE item.effect_family
+        END,
+        effect_request_json = CASE
+            WHEN decision_value->>'action' IN ('persist_command', 'retry_rework')
+                THEN next_effect_request
+            ELSE item.effect_request_json
+        END,
+        effect_request_digest = CASE
+            WHEN decision_value->>'action' IN ('persist_command', 'retry_rework')
+                THEN CASE
+                    WHEN next_effect_request IS NULL THEN NULL
+                    ELSE carl_autonomy.sha256_text(next_effect_request)
+                END
+            ELSE item.effect_request_digest
+        END,
+        effect_response_json = CASE
+            WHEN decision_value->>'action' IN ('persist_command', 'retry_rework') THEN NULL
+            ELSE item.effect_response_json
+        END,
         updated_at = p_observed_at
     WHERE item.experiment_id = runtime.experiment_id;
     RETURN QUERY SELECT true, p_decision_json;
@@ -1022,6 +1863,7 @@ DECLARE
     snapshot_value jsonb;
     ready_node jsonb;
     command_state carl_autonomy.commands%ROWTYPE;
+    occurrence_state carl_autonomy.coordinator_effect_occurrences%ROWTYPE;
 BEGIN
     PERFORM carl_autonomy.require_role(ARRAY['carl_coordinator']);
     decision_value := carl_autonomy.parse_object(
@@ -1125,6 +1967,41 @@ BEGIN
     THEN
         RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'coordinator_effect_identity_mismatch';
     END IF;
+    IF runtime.effect_family <> 'github' THEN
+        SELECT occurrence.* INTO occurrence_state
+        FROM carl_autonomy.coordinator_effect_occurrences AS occurrence
+        WHERE occurrence.effect_key = command_state.effect_key
+        FOR UPDATE;
+        IF FOUND THEN
+            IF occurrence_state.experiment_id <> runtime.experiment_id
+                OR occurrence_state.node_kind <> ready_node->>'kind'
+                OR occurrence_state.effect_family <> runtime.effect_family
+                OR occurrence_state.command_key <> command_state.command_key
+                OR occurrence_state.request_json <> runtime.effect_request_json
+                OR occurrence_state.request_digest <> runtime.effect_request_digest
+            THEN
+                RAISE EXCEPTION USING
+                    ERRCODE = '23505', MESSAGE = 'coordinator_effect_occurrence_conflict';
+            END IF;
+        ELSE
+            INSERT INTO carl_autonomy.coordinator_effect_occurrences(
+                effect_key, occurrence_key, experiment_id, node_kind, effect_family,
+                command_key, request_json, request_digest, status, prepared_at, updated_at
+            ) VALUES (
+                command_state.effect_key,
+                'coordinator/' || runtime.effect_request_digest,
+                runtime.experiment_id,
+                ready_node->>'kind',
+                runtime.effect_family,
+                command_state.command_key,
+                runtime.effect_request_json,
+                runtime.effect_request_digest,
+                'in_progress',
+                p_observed_at,
+                p_observed_at
+            );
+        END IF;
+    END IF;
     UPDATE carl_autonomy.coordinator_runtime AS item
     SET decision_identity = decision_value->>'identity', decision_json = p_decision_json,
         status = 'effect_prepared', updated_at = p_observed_at
@@ -1146,9 +2023,11 @@ AS $$
 DECLARE
     decision_value jsonb;
     response_value jsonb;
+    prior_response_value jsonb;
     runtime carl_autonomy.coordinator_runtime%ROWTYPE;
     command_state carl_autonomy.commands%ROWTYPE;
     effect_state carl_autonomy.effect_attempts%ROWTYPE;
+    occurrence_state carl_autonomy.coordinator_effect_occurrences%ROWTYPE;
     transition_value text;
     failure_result record;
 BEGIN
@@ -1173,9 +2052,6 @@ BEGIN
     IF runtime.effect_response_json = p_response_json THEN
         RETURN QUERY SELECT false, runtime.decision_json;
         RETURN;
-    END IF;
-    IF runtime.effect_response_json IS NOT NULL THEN
-        RAISE EXCEPTION USING ERRCODE = '23505', MESSAGE = 'coordinator_effect_response_conflict';
     END IF;
     SELECT command.* INTO command_state
     FROM carl_autonomy.commands AS command
@@ -1264,6 +2140,62 @@ BEGIN
         RAISE EXCEPTION USING
             ERRCODE = '55000', MESSAGE = 'coordinator_effect_response_mismatch';
     END IF;
+    IF runtime.effect_response_json IS NOT NULL THEN
+        prior_response_value := carl_autonomy.parse_object(
+            runtime.effect_response_json, 'coordinator_effect_response_json_invalid'
+        );
+        IF runtime.effect_family = 'github'
+            OR decision_value->>'action' <> 'reconcile_effect'
+            OR prior_response_value->>'request_digest'
+                IS DISTINCT FROM runtime.effect_request_digest
+            OR prior_response_value->>'status' IN ('completed', 'rejected')
+            OR prior_response_value->>'status' NOT IN ('uncertain', 'retry_scheduled')
+            OR CASE
+                WHEN NOT carl_autonomy.canonical_utc_text_valid(
+                    prior_response_value->>'observed_at'
+                ) THEN true
+                ELSE (prior_response_value->>'observed_at')::timestamptz
+                    > (response_value->>'observed_at')::timestamptz
+            END
+            OR (
+                prior_response_value->>'status' = 'retry_scheduled'
+                AND CASE
+                    WHEN NOT carl_autonomy.canonical_utc_text_valid(
+                        prior_response_value->>'retry_not_before'
+                    ) THEN true
+                    ELSE (prior_response_value->>'retry_not_before')::timestamptz
+                        > p_observed_at
+                END
+            )
+        THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '23505', MESSAGE = 'coordinator_effect_response_conflict';
+        END IF;
+    END IF;
+    IF runtime.effect_family <> 'github' THEN
+        SELECT occurrence.* INTO occurrence_state
+        FROM carl_autonomy.coordinator_effect_occurrences AS occurrence
+        WHERE occurrence.effect_key = command_state.effect_key
+        FOR UPDATE;
+        IF NOT FOUND
+            OR occurrence_state.experiment_id <> runtime.experiment_id
+            OR occurrence_state.node_kind <> decision_value->>'node'
+            OR occurrence_state.effect_family <> runtime.effect_family
+            OR occurrence_state.command_key <> command_state.command_key
+            OR occurrence_state.request_json <> runtime.effect_request_json
+            OR occurrence_state.request_digest <> runtime.effect_request_digest
+            OR occurrence_state.response_json IS DISTINCT FROM runtime.effect_response_json
+        THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '55000', MESSAGE = 'coordinator_effect_occurrence_missing';
+        END IF;
+        UPDATE carl_autonomy.coordinator_effect_occurrences AS occurrence
+        SET response_json = p_response_json,
+            response_digest = carl_autonomy.sha256_text(p_response_json),
+            status = 'effect_observed',
+            updated_at = p_observed_at
+        WHERE occurrence.effect_key = command_state.effect_key;
+    END IF;
     IF response_value->>'status' = 'rejected' THEN
         transition_value := carl_autonomy.canonical_jsonb(jsonb_build_object(
             'authority', command_state.authority,
@@ -1309,6 +2241,7 @@ DECLARE
     request_value jsonb;
     response_value jsonb;
     command_state carl_autonomy.commands%ROWTYPE;
+    occurrence_state carl_autonomy.coordinator_effect_occurrences%ROWTYPE;
     trigger_value text;
     trigger_result record;
 BEGIN
@@ -1400,6 +2333,39 @@ BEGIN
     THEN
         RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'coordinator_effect_identity_mismatch';
     END IF;
+    SELECT occurrence.* INTO occurrence_state
+    FROM carl_autonomy.coordinator_effect_occurrences AS occurrence
+    WHERE occurrence.effect_key = command_state.effect_key
+    FOR UPDATE;
+    IF FOUND THEN
+        IF occurrence_state.experiment_id <> runtime.experiment_id
+            OR occurrence_state.node_kind <> ready_node->>'kind'
+            OR occurrence_state.effect_family <> runtime.effect_family
+            OR occurrence_state.command_key <> command_state.command_key
+            OR occurrence_state.request_json <> runtime.effect_request_json
+            OR occurrence_state.request_digest <> runtime.effect_request_digest
+        THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '23505', MESSAGE = 'coordinator_effect_occurrence_conflict';
+        END IF;
+    ELSE
+        INSERT INTO carl_autonomy.coordinator_effect_occurrences(
+            effect_key, occurrence_key, experiment_id, node_kind, effect_family,
+            command_key, request_json, request_digest, status, prepared_at, updated_at
+        ) VALUES (
+            command_state.effect_key,
+            'coordinator/' || runtime.effect_request_digest,
+            runtime.experiment_id,
+            ready_node->>'kind',
+            runtime.effect_family,
+            command_state.command_key,
+            runtime.effect_request_json,
+            runtime.effect_request_digest,
+            'in_progress',
+            p_observed_at,
+            p_observed_at
+        );
+    END IF;
     IF runtime.effect_family = 'supervisor' THEN
         trigger_value := carl_autonomy.canonical_jsonb(jsonb_build_object(
             'attempt_history', jsonb_build_array(),
@@ -1426,6 +2392,14 @@ BEGIN
         'schema_version', 1,
         'status', 'completed'
     );
+    UPDATE carl_autonomy.coordinator_effect_occurrences AS occurrence
+    SET response_json = carl_autonomy.canonical_jsonb(response_value),
+        response_digest = carl_autonomy.sha256_text(
+            carl_autonomy.canonical_jsonb(response_value)
+        ),
+        status = 'effect_observed',
+        updated_at = p_observed_at
+    WHERE occurrence.effect_key = command_state.effect_key;
     UPDATE carl_autonomy.coordinator_runtime AS item
     SET decision_identity = decision_value->>'identity',
         decision_json = p_decision_json,
@@ -1441,6 +2415,16 @@ REVOKE ALL ON FUNCTION
     carl_autonomy.coordinator_timestamp(timestamptz),
     carl_autonomy.coordinator_node_priority(text),
     carl_autonomy.coordinator_command_state(text),
+    carl_autonomy.coordinator_node_authority(text),
+    carl_autonomy.coordinator_node_operation(text),
+    carl_autonomy.coordinator_node_event_authority(text, text),
+    carl_autonomy.coordinator_command_allows_node(text, text),
+    carl_autonomy.enqueue_coordinator_graph(text, timestamptz),
+    carl_autonomy.enqueue_pending_coordinator_graph(timestamptz),
+    carl_autonomy.reactivate_coordinator_node(text, timestamptz),
+    carl_autonomy.complete_coordinator_node_event(
+        text, text, text, text, text, timestamptz
+    ),
     carl_autonomy.renew_coordinator_lease(text, text, integer, timestamptz),
     carl_autonomy.load_coordinator_snapshot(text, timestamptz),
     carl_autonomy.apply_coordinator_decision(text, timestamptz),
@@ -1451,6 +2435,12 @@ REVOKE ALL ON FUNCTION
 FROM PUBLIC, carl_autonomy_workflow;
 
 GRANT EXECUTE ON FUNCTION
+    carl_autonomy.coordinator_node_event_authority(text, text),
+    carl_autonomy.enqueue_pending_coordinator_graph(timestamptz),
+    carl_autonomy.reactivate_coordinator_node(text, timestamptz),
+    carl_autonomy.complete_coordinator_node_event(
+        text, text, text, text, text, timestamptz
+    ),
     carl_autonomy.load_coordinator_snapshot(text, timestamptz),
     carl_autonomy.apply_coordinator_decision(text, timestamptz),
     carl_autonomy.prepare_coordinator_effect(text, timestamptz),

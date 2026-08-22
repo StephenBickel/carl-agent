@@ -320,6 +320,11 @@ class _PostgresCoordinatorState:
         )
         return replace(snapshot, production_authorization=authorization)
 
+    def enqueue_pending_graph(self, *, observed_at: datetime) -> bool:
+        return self.__backend.enqueue_pending_coordinator_graph(  # type: ignore[attr-defined,no-any-return]
+            observed_at=observed_at
+        )
+
     def apply(
         self, decision: CloudCoordinatorDecision, *, observed_at: datetime
     ) -> CloudCoordinatorDecision:
@@ -417,6 +422,8 @@ class _ProtectedCoordinatorEffectRouter:
             "archive": (self.__archive, "archive"),
             "evaluator": (self.__evaluator, "evaluate"),
         }[family]
+        if decision.action == "reconcile_effect":
+            method_name = "reconcile"
         method = None if service is None else getattr(service, method_name, None)
         if not callable(method):
             raise ProtectedEffectUnavailable(f"{family}_service_uncommissioned")

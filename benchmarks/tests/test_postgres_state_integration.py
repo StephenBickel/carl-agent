@@ -17,6 +17,7 @@ import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from postgres_event_policy import EVENT_PAYLOAD_KEY_SETS, INVALID_EVENT_PAYLOAD_TYPES
+from psycopg.rows import dict_row
 from test_cloud_coordinator import node as coordinator_node
 from test_cloud_coordinator import snapshot as coordinator_snapshot
 from test_experiment import (
@@ -471,6 +472,348 @@ def test_postgres_effect_family_routing_is_exhaustive_and_matches_python(
         ).fetchall()
 
     assert {row["node_kind"]: row["family"] for row in rows} == dict(EFFECT_FAMILY_BY_NODE)
+
+
+def test_protected_enqueue_turns_an_authenticated_manifest_into_all_22_nodes(
+    postgres: object,
+) -> None:
+    from carl_bench.cloud_coordinator import NODE_ORDER
+
+    manifest = sample_manifest()
+    with _as_role(postgres, "carl_builder") as builder:
+        _register_manifest(builder, manifest)
+    with _as_role(postgres, "carl_coordinator") as coordinator:
+        enqueued = coordinator.execute(
+            "SELECT * FROM carl_autonomy.enqueue_pending_coordinator_graph(%s)",
+            (NOW,),
+        ).fetchone()
+        replay = coordinator.execute(
+            "SELECT * FROM carl_autonomy.enqueue_pending_coordinator_graph(%s)",
+            (NOW,),
+        ).fetchone()
+    with postgres.connect(  # type: ignore[attr-defined]
+        POSTGRES_DSN, autocommit=True, row_factory=dict_row
+    ) as admin:
+        row = admin.execute(
+            "SELECT snapshot_json, graph_request_digest, graph_occurrence_key "
+            "FROM carl_autonomy.coordinator_runtime WHERE experiment_id = %s",
+            (manifest.experiment_id,),
+        ).fetchone()
+
+    graph = json.loads(row["snapshot_json"])
+    assert enqueued["applied"] is True
+    assert replay["applied"] is False
+    assert enqueued["request_digest"] == row["graph_request_digest"]
+    assert enqueued["occurrence_key"] == row["graph_occurrence_key"]
+    assert [item["kind"] for item in graph["nodes"]] == list(NODE_ORDER)
+    assert len({item["node_id"] for item in graph["nodes"]}) == 22
+    assert graph["immutable_inputs"][0]["digest"] == manifest.digest
+
+
+def test_all_22_enqueued_nodes_persist_and_claim_under_exact_postgres_authority(
+    postgres: object,
+) -> None:
+    from carl_bench.cloud_coordinator import NODE_ORDER
+
+    manifest = sample_manifest()
+    with _as_role(postgres, "carl_builder") as builder:
+        _register_manifest(builder, manifest)
+    with _as_role(postgres, "carl_coordinator") as coordinator:
+        coordinator.execute(
+            "SELECT * FROM carl_autonomy.enqueue_pending_coordinator_graph(%s)", (NOW,)
+        ).fetchone()
+    with postgres.connect(  # type: ignore[attr-defined]
+        POSTGRES_DSN, autocommit=True, row_factory=dict_row
+    ) as admin:
+        row = admin.execute(
+            "SELECT snapshot_json FROM carl_autonomy.coordinator_runtime WHERE experiment_id=%s",
+            (manifest.experiment_id,),
+        ).fetchone()
+
+    nodes = json.loads(row["snapshot_json"])["nodes"]
+    for item in nodes:
+        command = CloudCommand.create(
+            command_key=item["command_key"],
+            authority=item["authority"],
+            operation=item["operation"],
+            request_digest=item["request_digest"],
+            occurred_at=item["occurred_at"],
+            expected_revision=0,
+            attempt=item["attempt"],
+            max_attempts=item["max_attempts"],
+        )
+        claim = CommandClaim(
+            command_key=command.command_key,
+            claim_id=f"claim:{item['kind']}",
+            authority=command.authority,
+            expected_revision=0,
+            claimed_at=NOW,
+            expires_at="2026-08-20T12:15:00Z",
+        )
+        with _as_role(postgres, f"carl_{command.authority}") as connection:
+            created = connection.execute(
+                "SELECT * FROM carl_autonomy.create_command(%s, %s)",
+                (_canonical(command.to_canonical_dict()), NOW),
+            ).fetchone()
+            claimed = connection.execute(
+                "SELECT * FROM carl_autonomy.claim_command(%s, %s)",
+                (_canonical(claim.to_canonical_dict()), NOW),
+            ).fetchone()
+        assert created["status"] == "pending"
+        assert claimed["status"] == "claimed"
+
+    assert [item["kind"] for item in nodes] == list(NODE_ORDER)
+    with postgres.connect(  # type: ignore[attr-defined]
+        POSTGRES_DSN, autocommit=True, row_factory=dict_row
+    ) as admin:
+        count = admin.execute(
+            "SELECT count(*) AS command_count FROM carl_autonomy.commands"
+        ).fetchone()["command_count"]
+    assert count == 22
+
+
+def test_non_github_effect_occurrence_is_durable_before_service_execution(
+    postgres: object,
+) -> None:
+    from carl_bench.cloud_coordinator import (
+        CoordinatorNode,
+        CoordinatorSnapshot,
+        choose_next_action,
+    )
+    from carl_bench.cloud_state import CommandState
+
+    manifest = sample_manifest()
+    with _as_role(postgres, "carl_builder") as builder:
+        _register_manifest(builder, manifest)
+    with _as_role(postgres, "carl_coordinator") as coordinator:
+        coordinator.execute(
+            "SELECT * FROM carl_autonomy.enqueue_pending_coordinator_graph(%s)", (NOW,)
+        ).fetchone()
+    with postgres.connect(  # type: ignore[attr-defined]
+        POSTGRES_DSN, autocommit=True, row_factory=dict_row
+    ) as admin:
+        row = admin.execute(
+            "SELECT snapshot_json FROM carl_autonomy.coordinator_runtime WHERE experiment_id=%s",
+            (manifest.experiment_id,),
+        ).fetchone()
+    graph = json.loads(row["snapshot_json"])
+    selected_value = next(item for item in graph["nodes"] if item["kind"] == "publish_input")
+    selected = CoordinatorNode.from_canonical_dict(selected_value)
+    command = selected.command(expected_revision=0)
+    claim = CommandClaim(
+        command_key=command.command_key,
+        claim_id="claim:publish_input",
+        authority=command.authority,
+        expected_revision=0,
+        claimed_at=NOW,
+        expires_at="2026-08-20T12:15:00Z",
+    )
+    with _as_role(postgres, "carl_validator") as validator:
+        validator.execute(
+            "SELECT * FROM carl_autonomy.create_command(%s, %s)",
+            (_canonical(command.to_canonical_dict()), NOW),
+        ).fetchone()
+        validator.execute(
+            "SELECT * FROM carl_autonomy.claim_command(%s, %s)",
+            (_canonical(claim.to_canonical_dict()), NOW),
+        ).fetchone()
+    current = CoordinatorSnapshot(
+        schema_version=1,
+        experiment_id=manifest.experiment_id,
+        revision=0,
+        observed_at=NOW,
+        coordinator_id="carl-cloud-coordinator-v1",
+        nodes=tuple(CoordinatorNode.from_canonical_dict(item) for item in graph["nodes"]),
+        lease=CloudLease(
+            lease_key=f"{manifest.experiment_id}:coordinator",
+            holder_id="carl-cloud-coordinator-v1",
+            authority="coordinator",
+            revision=1,
+            acquired_at="2026-08-20T11:30:00Z",
+            expires_at="2026-08-20T12:30:00Z",
+        ),
+        command=CommandState(
+            command=command,
+            revision=1,
+            status="claimed",
+            claim=claim,
+            transition=None,
+            result_digest=None,
+            failure_code=None,
+        ),
+        effect=None,
+        failure=None,
+        production_authorization=None,
+        immutable_inputs=(),
+        dead_holder_observation_digest=None,
+    )
+    decision = choose_next_action(current)
+    assert decision.action == "execute_effect"
+    decision_json = _canonical(decision.to_canonical_dict())
+    with _as_role(postgres, "carl_coordinator") as coordinator:
+        first = coordinator.execute(
+            "SELECT * FROM carl_autonomy.prepare_coordinator_effect(%s, %s)",
+            (decision_json, NOW),
+        ).fetchone()
+        second = coordinator.execute(
+            "SELECT * FROM carl_autonomy.prepare_coordinator_effect(%s, %s)",
+            (decision_json, NOW),
+        ).fetchone()
+    with postgres.connect(POSTGRES_DSN, autocommit=True) as admin:  # type: ignore[attr-defined]
+        occurrence = admin.execute(
+            "SELECT status, request_digest FROM carl_autonomy.coordinator_effect_occurrences "
+            "WHERE effect_key=%s",
+            (command.effect_key,),
+        ).fetchone()
+
+    assert first == second
+    assert occurrence == (
+        "in_progress",
+        hashlib.sha256(first["request_json"].encode("utf-8")).hexdigest(),
+    )
+
+
+def test_frozen_node_reactivates_only_with_changed_retained_repair_evidence(
+    postgres: object,
+) -> None:
+    manifest = sample_manifest()
+    with _as_role(postgres, "carl_builder") as builder:
+        _register_manifest(builder, manifest)
+    with _as_role(postgres, "carl_coordinator") as coordinator:
+        coordinator.execute(
+            "SELECT * FROM carl_autonomy.enqueue_pending_coordinator_graph(%s)", (NOW,)
+        ).fetchone()
+    with postgres.connect(  # type: ignore[attr-defined]
+        POSTGRES_DSN, autocommit=True, row_factory=dict_row
+    ) as admin:
+        row = admin.execute(
+            "SELECT snapshot_json FROM carl_autonomy.coordinator_runtime WHERE experiment_id=%s",
+            (manifest.experiment_id,),
+        ).fetchone()
+    graph = json.loads(row["snapshot_json"])
+    selected = next(item for item in graph["nodes"] if item["kind"] == "publish_input")
+    frozen = {
+        "action": "frozen",
+        "command": None,
+        "consequential": True,
+        "effect_key": None,
+        "event": None,
+        "experiment_id": manifest.experiment_id,
+        "identity": "1" * 64,
+        "node": "publish_input",
+        "reason": "input_service_uncommissioned",
+        "remote_effect": False,
+        "result_digest": None,
+        "revision": 7,
+        "schema_version": 1,
+    }
+    with postgres.connect(POSTGRES_DSN, autocommit=True) as admin:  # type: ignore[attr-defined]
+        admin.execute(
+            "UPDATE carl_autonomy.coordinator_runtime SET status='frozen', revision=7, "
+            "decision_json=%s, decision_identity=%s WHERE experiment_id=%s",
+            (_canonical(frozen), frozen["identity"], manifest.experiment_id),
+        )
+    evidence = EvidenceObject(
+        digest="c" * 64,
+        object_key=f"evidence/{'c' * 64}",
+        object_version="repair-v1",
+        producer="observer",
+        request_digest=selected["request_digest"],
+        media_type="application/vnd.carl.repair-receipt+json",
+        retained_until="2027-08-22T12:00:00Z",
+    )
+    recovery = {
+        "domain": "carl.coordinator.recovery.v1",
+        "evidence_digest": evidence.digest,
+        "expected_revision": 7,
+        "experiment_id": manifest.experiment_id,
+        "node_id": selected["node_id"],
+        "node_kind": selected["kind"],
+        "repair_fingerprint": evidence.digest,
+        "requested_at": NOW,
+        "schema_version": 1,
+    }
+    with (
+        _as_role(postgres, "carl_supervisor") as supervisor,
+        pytest.raises(psycopg.Error, match="coordinator_recovery_evidence_invalid"),
+    ):
+        supervisor.execute(
+            "SELECT * FROM carl_autonomy.reactivate_coordinator_node(%s, %s)",
+            (_canonical(recovery), NOW),
+        ).fetchone()
+    with _as_role(postgres, "carl_observer") as observer:
+        observer.execute(
+            "SELECT * FROM carl_autonomy.register_evidence(%s, %s)",
+            (_canonical(evidence.to_canonical_dict()), NOW),
+        ).fetchone()
+    with _as_role(postgres, "carl_supervisor") as supervisor:
+        repaired = supervisor.execute(
+            "SELECT * FROM carl_autonomy.reactivate_coordinator_node(%s, %s)",
+            (_canonical(recovery), NOW),
+        ).fetchone()
+        replay = supervisor.execute(
+            "SELECT * FROM carl_autonomy.reactivate_coordinator_node(%s, %s)",
+            (_canonical(recovery), NOW),
+        ).fetchone()
+
+    assert repaired["applied"] is True
+    assert replay["applied"] is False
+    assert repaired["attempt"] == 2
+    assert repaired["revision"] == 8
+
+
+@pytest.mark.parametrize(
+    ("node_kind", "event_type"),
+    (
+        ("observe_revert", "revert_recorded"),
+        ("observe_builder", "candidate_sealed"),
+        ("archive_builder", "state_transitioned"),
+        ("observe_validation", "protected_validation_recorded"),
+        ("observe_required_checks", "state_transitioned"),
+        ("trigger_supervisor", "retry_scheduled"),
+    ),
+)
+def test_exact_observer_and_supervisor_node_completion_authority_is_node_bound(
+    postgres: object, node_kind: str, event_type: str
+) -> None:
+    with _as_role(postgres, "carl_coordinator") as coordinator:
+        allowed = coordinator.execute(
+            "SELECT carl_autonomy.coordinator_node_event_authority(%s, %s) AS authority",
+            (node_kind, event_type),
+        ).fetchone()
+        denied = coordinator.execute(
+            "SELECT carl_autonomy.coordinator_node_event_authority(%s, %s) AS authority",
+            (node_kind, "live_spend_recorded"),
+        ).fetchone()
+
+    assert allowed["authority"] in {"builder", "coordinator", "validator", "soak"}
+    assert denied["authority"] is None
+
+
+def test_coordinator_state_backend_has_procedure_access_without_raw_table_access(
+    postgres: object,
+) -> None:
+    with postgres.connect(POSTGRES_DSN, autocommit=True) as admin:  # type: ignore[attr-defined]
+        privileges = admin.execute(
+            "SELECT "
+            "has_table_privilege('carl_state_backend', "
+            "'carl_autonomy.coordinator_runtime', 'SELECT,INSERT,UPDATE,DELETE') "
+            "AS runtime_raw, "
+            "has_table_privilege('carl_state_backend', "
+            "'carl_autonomy.coordinator_effect_occurrences', "
+            "'SELECT,INSERT,UPDATE,DELETE') AS occurrence_raw, "
+            "has_function_privilege('carl_state_backend', "
+            "'carl_autonomy.enqueue_pending_coordinator_graph(timestamptz)', "
+            "'EXECUTE') AS protected_enqueue, "
+            "has_function_privilege('carl_state_backend', "
+            "'carl_autonomy.reactivate_coordinator_node(text,timestamptz)', "
+            "'EXECUTE') AS protected_recovery, "
+            "has_function_privilege('carl_autonomy_workflow', "
+            "'carl_autonomy.enqueue_coordinator_graph(text,timestamptz)', "
+            "'EXECUTE') AS workflow_raw_enqueue"
+        ).fetchone()
+
+    assert privileges == (False, False, True, True, False)
 
 
 def _state_event(

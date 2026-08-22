@@ -1135,6 +1135,79 @@ class PostgresStateBackend(StateBackend):
             ),
         )
 
+    def enqueue_pending_coordinator_graph(self, *, observed_at: datetime) -> bool:
+        """Atomically enqueue one authenticated manifest as the fixed coordinator graph."""
+        if not isinstance(observed_at, datetime) or observed_at.tzinfo != UTC:
+            raise PostgresStateError("coordinator_enqueue_invalid")
+
+        def decode(row: dict[str, Any]) -> bool:
+            value = _strict_row(
+                row,
+                frozenset({"applied", "experiment_id", "occurrence_key", "request_digest"}),
+            )
+            applied = _strict_bool(value["applied"])
+            if not applied and all(
+                value[name] is None
+                for name in ("experiment_id", "occurrence_key", "request_digest")
+            ):
+                return False
+            for name in ("experiment_id", "occurrence_key"):
+                if not isinstance(value[name], str) or not value[name]:
+                    raise PostgresStateError("coordinator_enqueue_result_invalid")
+            if not isinstance(value["request_digest"], str) or len(value["request_digest"]) != 64:
+                raise PostgresStateError("coordinator_enqueue_result_invalid")
+            return applied
+
+        return cast(
+            bool,
+            self._mutation(
+                "coordinator",
+                "SELECT * FROM carl_autonomy.enqueue_pending_coordinator_graph(%s)",
+                (observed_at,),
+                decode,
+            ),
+        )
+
+    def reactivate_coordinator_node(
+        self, recovery: object, *, observed_at: datetime
+    ) -> dict[str, object]:
+        """Apply one supervisor-only, evidence-backed frozen-node recovery CAS."""
+        from carl_bench.coordinator_recovery import CoordinatorRecoveryRequest
+
+        if (
+            not isinstance(recovery, CoordinatorRecoveryRequest)
+            or not isinstance(observed_at, datetime)
+            or observed_at.tzinfo != UTC
+        ):
+            raise PostgresStateError("coordinator_recovery_invalid")
+
+        def decode(row: dict[str, Any]) -> dict[str, object]:
+            value = _strict_row(
+                row,
+                frozenset({"applied", "attempt", "request_digest", "revision"}),
+            )
+            _strict_bool(value["applied"])
+            if (
+                type(value["attempt"]) is not int
+                or not 1 <= value["attempt"] <= 3
+                or type(value["revision"]) is not int
+                or not 0 <= value["revision"] <= MAX_STATE_REVISION
+                or not isinstance(value["request_digest"], str)
+                or len(value["request_digest"]) != 64
+            ):
+                raise PostgresStateError("coordinator_recovery_result_invalid")
+            return value
+
+        return cast(
+            dict[str, object],
+            self._mutation(
+                "supervisor",
+                "SELECT * FROM carl_autonomy.reactivate_coordinator_node(%s, %s)",
+                (_canonical_text(recovery.to_canonical_dict()), observed_at),
+                decode,
+            ),
+        )
+
     @staticmethod
     def _decode_coordinator_decision(row: dict[str, Any], *, expected: object) -> object:
         from carl_bench.cloud_coordinator import CloudCoordinatorDecision

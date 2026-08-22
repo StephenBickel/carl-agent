@@ -1260,6 +1260,8 @@ def choose_next_action(snapshot: CoordinatorSnapshot) -> CloudCoordinatorDecisio
 class ProtectedCoordinatorState(Protocol):
     """Service-only durable state surface; ordinary CLI code cannot construct it."""
 
+    def enqueue_pending_graph(self, *, observed_at: datetime) -> bool: ...
+
     def reconstruct(self, command: str, *, observed_at: datetime) -> CoordinatorSnapshot | None: ...
 
     def apply(
@@ -1320,6 +1322,13 @@ class ProtectedCoordinatorExecutor:
         observed_at = self.__clock()
         if not isinstance(observed_at, datetime) or observed_at.tzinfo != UTC:
             raise CloudCoordinatorError("coordinator_clock_invalid")
+        if command == "request":
+            enqueue = getattr(self.__state, "enqueue_pending_graph", None)
+            if not callable(enqueue):
+                raise CloudCoordinatorError("coordinator_enqueue_unavailable")
+            enqueued = enqueue(observed_at=observed_at)
+            if type(enqueued) is not bool:
+                raise CloudCoordinatorError("coordinator_enqueue_invalid")
         snapshot = self.__state.reconstruct(command, observed_at=observed_at)
         if snapshot is None:
             return _empty_queue_decision(command)
