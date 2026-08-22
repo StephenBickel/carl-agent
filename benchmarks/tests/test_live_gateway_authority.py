@@ -963,6 +963,62 @@ def test_post_provider_precommit_crash_is_recovered_from_authenticated_receipt(
     assert len(gateway.requests) == 1
 
 
+def test_nonfatal_result_persistence_failure_is_reconciled_without_redispatch(
+    tmp_path,
+) -> None:
+    from carl_bench.live_gateway_store import (
+        LiveGatewayStateError,
+        SQLiteLiveGatewayStateStore,
+    )
+
+    class FailFirstResultCommit:
+        def __init__(self, delegate: object) -> None:
+            self.delegate = delegate
+            self.failures = 0
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(self.delegate, name)
+
+        def complete_result(self, *args: object, **kwargs: object) -> None:
+            if self.failures == 0:
+                self.failures += 1
+                raise LiveGatewayStateError("live_gateway_state_unavailable")
+            self.delegate.complete_result(*args, **kwargs)
+
+    now = datetime(2026, 8, 22, 12, 0, tzinfo=UTC)
+    observed = [now]
+    state_path = tmp_path / "gateway.sqlite3"
+    gateway = _PinnedGateway()
+    state = FailFirstResultCommit(SQLiteLiveGatewayStateStore._for_testing(state_path))
+    server = ProtectedModelGatewayServer._for_testing(
+        gateway=gateway,
+        endpoint="http://127.0.0.1:43117/v1/evaluate",
+        token_source=lambda: "nonfatal-result-commit-token-1234567890",
+        state=state,
+        clock=lambda: observed[0],
+        claim_holder=("11111111-1111-4111-8111-111111111111", 61_001, "100"),
+        process_identity=lambda process_id: "100" if process_id == 61_001 else None,
+    )
+    capability = server.issue_observed_capability_for_testing(
+        identity=_identity(),
+        policy=_policy(),
+        task=_task(),
+        subject="candidate",
+        attempt=1,
+    )
+
+    with pytest.raises(LiveGatewayAuthorityError, match="live_gateway_state_unavailable"):
+        server.evaluate(capability.token, "held-out prompt")
+
+    observed[0] = now + timedelta(minutes=2)
+    assert server.reconcile_expired_provider_operations() == (
+        hashlib.sha256(capability.token.encode()).hexdigest(),
+    )
+    assert server.take_completed_result(capability).output_text == "bounded result"
+    assert len(gateway.requests) == 1
+    assert state.failures == 1
+
+
 def test_lost_provider_response_is_recovered_without_a_second_create(tmp_path) -> None:
     from carl_bench.live_gateway_store import SQLiteLiveGatewayStateStore
 
@@ -1338,6 +1394,79 @@ def test_pending_reconciliation_becomes_terminal_after_bounded_observations(tmp_
         "candidate": "gateway_provider_reconciliation_exhausted"
     }
     assert gateway.dispatch_attempts == 1
+
+
+def test_unexpected_reconciliation_exceptions_freeze_after_three_attempts(tmp_path) -> None:
+    from carl_bench.live_gateway_store import SQLiteLiveGatewayStateStore
+
+    class UnexpectedReconciliationGateway(_PinnedGateway):
+        def __init__(self) -> None:
+            super().__init__()
+            self.reconciliation_calls = 0
+
+        def dispatch_reconciled(
+            self, request: OpenAIModelRequest, operation: object
+        ) -> ProtectedOpenAIModelResult:
+            del request, operation
+            raise OpenAIGatewayError("openai_create_ambiguous")
+
+        def reconcile_provider_operation(
+            self, request: OpenAIModelRequest, operation: object
+        ) -> ProviderReconciliationReceipt:
+            del request, operation
+            self.reconciliation_calls += 1
+            raise RuntimeError("unexpected-adapter-failure")
+
+    now = datetime(2026, 8, 22, 12, 0, tzinfo=UTC)
+    state_path = tmp_path / "gateway.sqlite3"
+    gateway = UnexpectedReconciliationGateway()
+    identity = _identity()
+    task = _task()
+    first = ProtectedModelGatewayServer._for_testing(
+        gateway=gateway,
+        endpoint="http://127.0.0.1:43117/v1/evaluate",
+        token_source=lambda: "unexpected-reconciliation-token-1234567890",
+        state=SQLiteLiveGatewayStateStore._for_testing(state_path),
+        clock=lambda: now,
+        claim_holder=("11111111-1111-4111-8111-111111111111", 61_001, "100"),
+        process_identity=lambda process_id: "100" if process_id == 61_001 else None,
+    )
+    capability = first.issue_observed_capability_for_testing(
+        identity=identity,
+        policy=_policy(),
+        task=task,
+        subject="candidate",
+        attempt=1,
+    )
+    with pytest.raises(LiveGatewayAuthorityError, match="openai_create_ambiguous"):
+        first.evaluate(capability.token, "held-out prompt")
+
+    for index, minutes in enumerate((2, 4, 6, 8), start=2):
+        ProtectedModelGatewayServer._for_testing(
+            gateway=gateway,
+            endpoint="http://127.0.0.1:43117/v1/evaluate",
+            token_source=lambda: "unused-unexpected-token-1234567890",
+            state=SQLiteLiveGatewayStateStore._for_testing(state_path),
+            clock=lambda minutes=minutes: now + timedelta(minutes=minutes),
+            claim_holder=(
+                "11111111-1111-4111-8111-111111111111",
+                61_000 + index,
+                str(index * 100),
+            ),
+            process_identity=lambda process_id: None,
+        )
+
+    token_digest = hashlib.sha256(capability.token.encode()).hexdigest()
+    with sqlite3.connect(state_path) as connection:
+        claim_state, code, reconciliation_count = connection.execute(
+            """SELECT claim_state, infrastructure_code, provider_reconciliation_count
+               FROM gateway_grants WHERE token_digest = ?""",
+            (token_digest,),
+        ).fetchone()
+    assert gateway.reconciliation_calls == 3
+    assert claim_state == "invalid"
+    assert code == "gateway_provider_reconciliation_exhausted"
+    assert reconciliation_count == 3
 
 
 def test_unsupported_provider_freezes_before_any_create() -> None:

@@ -8,6 +8,7 @@ import os
 import re
 import secrets
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -477,11 +478,11 @@ class _MemoryGatewayState:
         process_identity = kwargs["process_identity"]
         for token_digest, row in sorted(self.rows.items()):
             if (
-                row["claim_state"] not in {"dispatch_ambiguous", "reconciling"}
+                row["claim_state"] not in {"dispatched", "dispatch_ambiguous", "reconciling"}
                 or row["claim_expires_at"] > observed_at
             ):
                 continue
-            if row["claim_state"] == "reconciling":
+            if row["claim_state"] in {"dispatched", "reconciling"}:
                 alive = (
                     process_identity(row["claim_pid"])
                     if row["claim_boot_id"] == current_boot_id
@@ -1150,11 +1151,14 @@ class ProtectedModelGatewayServer:
                         self._mark_dispatch_ambiguous(token_digest, claim_id)
                         advanced.append(token_digest)
                         continue
-                    self._state.complete_result(
-                        token_digest,
-                        claim_id,
-                        _result_document(result),
-                    )
+                    try:
+                        self._state.complete_result(
+                            token_digest,
+                            claim_id,
+                            _result_document(result),
+                        )
+                    except LiveGatewayStateError:
+                        self._mark_dispatch_ambiguous(token_digest, claim_id)
                 else:
                     if claim["reconciliation_count"] >= 3:
                         raise LiveGatewayAuthorityError(
@@ -1178,8 +1182,12 @@ class ProtectedModelGatewayServer:
                 except LiveGatewayStateError as state_error:
                     raise LiveGatewayAuthorityError(state_error.code) from state_error
                 advanced.append(token_digest)
-            except (OpenAIGatewayError, LiveGatewayStateError) as error:
-                code = getattr(error, "code", "live_gateway_provider_reconciliation_invalid")
+            except Exception as error:
+                code = (
+                    getattr(error, "code", "live_gateway_provider_reconciliation_invalid")
+                    if isinstance(error, OpenAIGatewayError | LiveGatewayStateError)
+                    else "live_gateway_provider_reconciliation_unavailable"
+                )
                 try:
                     if claim["reconciliation_count"] >= 3:
                         self._state.freeze_provider_operation(
@@ -1557,6 +1565,8 @@ class ProtectedModelGatewayServer:
                 _result_document(result),
             )
         except LiveGatewayStateError as error:
+            with suppress(LiveGatewayAuthorityError):
+                self._mark_dispatch_ambiguous(grant.token_digest, claim_id)
             raise LiveGatewayAuthorityError(error.code) from error
         return result
 

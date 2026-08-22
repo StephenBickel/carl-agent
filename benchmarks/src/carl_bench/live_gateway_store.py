@@ -498,13 +498,13 @@ class SQLiteLiveGatewayStateStore:
                           provider_request_json, provider_retry_count,
                           provider_reconciliation_count
                    FROM gateway_grants
-                   WHERE claim_state IN ('dispatch_ambiguous', 'reconciling')
+                   WHERE claim_state IN ('dispatched', 'dispatch_ambiguous', 'reconciling')
                          AND claim_expires_at <= ?
                    ORDER BY token_digest""",
                 (observed_at,),
             ).fetchall()
             for row in rows:
-                if row["claim_state"] == "reconciling":
+                if row["claim_state"] in {"dispatched", "reconciling"}:
                     alive = (
                         process_identity(row["claim_pid"])
                         if row["claim_boot_id"] == current_boot_id
