@@ -2,12 +2,13 @@ BEGIN;
 
 DO $migration$
 DECLARE
-    column_signature text;
+    actual_column_signature text;
+    expected_column_signature text;
+    actual_constraint_signature text;
+    expected_constraint_signature text;
     table_owner text;
-    primary_count integer;
-    unique_count integer;
-    foreign_count integer;
-    check_count integer;
+    table_namespace text;
+    table_kind "char";
 BEGIN
 IF to_regclass('carl_autonomy.effect_attempts') IS NULL THEN
 EXECUTE $ddl$CREATE TABLE carl_autonomy.effect_attempts (
@@ -59,35 +60,126 @@ EXECUTE $ddl$CREATE TABLE carl_autonomy.effect_attempts (
         OR (attempt_state = 'completed' AND result_digest IS NOT NULL)
     )
 )$ddl$;
-ELSE
-    SELECT string_agg(
-        column_name || ':' || data_type || ':' || is_nullable,
-        '|' ORDER BY ordinal_position
-    ) INTO column_signature
-    FROM information_schema.columns
-    WHERE table_schema = 'carl_autonomy' AND table_name = 'effect_attempts';
-    IF column_signature <> 'effect_key:character varying:NO|command_key:character varying:NO|claim_id:character varying:NO|command_revision:integer:NO|claim_expected_revision:integer:NO|authority:character varying:NO|operation:character varying:NO|action:character varying:NO|endpoint_id:character varying:NO|method:character varying:NO|payload_digest:character:NO|command_request_digest:character:NO|repository:character varying:NO|target_identity:character varying:NO|request_key:character varying:NO|attempt_key:character varying:NO|command_occurred_at:timestamp with time zone:NO|command_occurred_at_text:character varying:NO|claim_expires_at:timestamp with time zone:NO|claim_expires_at_text:character varying:NO|attempt_state:character varying:NO|not_before:timestamp with time zone:NO|not_before_text:character varying:NO|attempt_json:text:NO|result_digest:character:YES|observed_at:timestamp with time zone:NO|observed_at_text:character varying:NO|created_at:timestamp with time zone:NO|updated_at:timestamp with time zone:NO'
-    THEN
-        RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'effect_fence_schema_invalid';
-    END IF;
-    SELECT pg_catalog.pg_get_userbyid(c.relowner),
-        count(*) FILTER (WHERE constraint_type = 'PRIMARY KEY'),
-        count(*) FILTER (WHERE constraint_type = 'UNIQUE'),
-        count(*) FILTER (WHERE constraint_type = 'FOREIGN KEY'),
-        count(*) FILTER (WHERE constraint_type = 'CHECK')
-    INTO table_owner, primary_count, unique_count, foreign_count, check_count
-    FROM pg_catalog.pg_class AS c
-    JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace
-    CROSS JOIN information_schema.table_constraints AS tc
-    WHERE n.nspname = 'carl_autonomy' AND c.relname = 'effect_attempts'
-        AND tc.table_schema = n.nspname AND tc.table_name = c.relname
-    GROUP BY c.relowner;
-    IF table_owner <> CURRENT_USER OR primary_count <> 1 OR unique_count <> 1
-        OR foreign_count <> 2 OR check_count <> 15
-    THEN
-        RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'effect_fence_schema_invalid';
-    END IF;
 END IF;
+
+DROP TABLE IF EXISTS pg_temp.expected_effect_attempts;
+CREATE TEMP TABLE expected_effect_attempts (
+    effect_key varchar(192) PRIMARY KEY REFERENCES carl_autonomy.commands(effect_key),
+    command_key varchar(192) NOT NULL UNIQUE REFERENCES carl_autonomy.commands(command_key),
+    claim_id varchar(192) NOT NULL,
+    command_revision integer NOT NULL CHECK (command_revision BETWEEN 0 AND 2147483647),
+    claim_expected_revision integer NOT NULL CHECK (
+        claim_expected_revision BETWEEN 0 AND 2147483646
+    ),
+    authority varchar(32) NOT NULL CHECK (
+        authority IN ('builder', 'validator', 'promoter', 'soak', 'supervisor', 'coordinator', 'observer')
+    ),
+    operation varchar(64) NOT NULL,
+    action varchar(64) NOT NULL,
+    endpoint_id varchar(64) NOT NULL,
+    method varchar(8) NOT NULL CHECK (method IN ('POST', 'PATCH', 'PUT')),
+    payload_digest character(64) NOT NULL CHECK (payload_digest ~ '^[0-9a-f]{64}$'),
+    command_request_digest character(64) NOT NULL CHECK (
+        command_request_digest ~ '^[0-9a-f]{64}$'
+    ),
+    repository varchar(192) NOT NULL,
+    target_identity varchar(1024) NOT NULL,
+    request_key varchar(192) NOT NULL,
+    attempt_key varchar(192) NOT NULL,
+    command_occurred_at timestamptz NOT NULL,
+    command_occurred_at_text varchar(64) NOT NULL,
+    claim_expires_at timestamptz NOT NULL,
+    claim_expires_at_text varchar(64) NOT NULL,
+    attempt_state varchar(16) NOT NULL CHECK (
+        attempt_state IN ('prepared', 'retry_scheduled', 'uncertain', 'completed')
+    ),
+    not_before timestamptz NOT NULL,
+    not_before_text varchar(64) NOT NULL,
+    attempt_json text NOT NULL CHECK (octet_length(attempt_json) BETWEEN 2 AND 32768),
+    result_digest character(64),
+    observed_at timestamptz NOT NULL,
+    observed_at_text varchar(64) NOT NULL,
+    created_at timestamptz NOT NULL,
+    updated_at timestamptz NOT NULL,
+    CHECK (claim_id ~ '^[A-Za-z0-9][A-Za-z0-9._:/-]{0,191}$'),
+    CHECK (action ~ '^[a-z][a-z0-9_-]{0,63}$'),
+    CHECK (endpoint_id ~ '^[a-z][a-z0-9_]{0,63}$'),
+    CHECK (octet_length(target_identity) BETWEEN 1 AND 1024),
+    CHECK (result_digest IS NULL OR result_digest ~ '^[0-9a-f]{64}$'),
+    CHECK (not_before >= observed_at),
+    CHECK (
+        (attempt_state IN ('prepared', 'retry_scheduled', 'uncertain') AND result_digest IS NULL)
+        OR (attempt_state = 'completed' AND result_digest IS NOT NULL)
+    )
+);
+
+SELECT pg_catalog.pg_get_userbyid(c.relowner), n.nspname, c.relkind
+INTO table_owner, table_namespace, table_kind
+FROM pg_catalog.pg_class AS c
+JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace
+WHERE c.oid = 'carl_autonomy.effect_attempts'::regclass;
+
+SELECT string_agg(
+    a.attnum::text || ':' || a.attname || ':'
+    || pg_catalog.format_type(a.atttypid, a.atttypmod) || ':'
+    || a.attnotnull::text || ':' || a.attidentity || ':' || a.attgenerated || ':'
+    || a.attstorage || ':' || a.attcompression || ':'
+    || coalesce(pg_catalog.pg_get_expr(d.adbin, d.adrelid), '<none>'),
+    '|' ORDER BY a.attnum
+)
+INTO actual_column_signature
+FROM pg_catalog.pg_attribute AS a
+LEFT JOIN pg_catalog.pg_attrdef AS d
+    ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+WHERE a.attrelid = 'carl_autonomy.effect_attempts'::regclass
+    AND a.attnum > 0 AND NOT a.attisdropped;
+
+SELECT string_agg(
+    a.attnum::text || ':' || a.attname || ':'
+    || pg_catalog.format_type(a.atttypid, a.atttypmod) || ':'
+    || a.attnotnull::text || ':' || a.attidentity || ':' || a.attgenerated || ':'
+    || a.attstorage || ':' || a.attcompression || ':'
+    || coalesce(pg_catalog.pg_get_expr(d.adbin, d.adrelid), '<none>'),
+    '|' ORDER BY a.attnum
+)
+INTO expected_column_signature
+FROM pg_catalog.pg_attribute AS a
+LEFT JOIN pg_catalog.pg_attrdef AS d
+    ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+WHERE a.attrelid = 'pg_temp.expected_effect_attempts'::regclass
+    AND a.attnum > 0 AND NOT a.attisdropped;
+
+SELECT string_agg(
+    c.contype || ':' || c.conkey::text || ':' || coalesce(c.confkey::text, '') || ':'
+    || c.confupdtype || ':' || c.confdeltype || ':' || c.confmatchtype || ':'
+    || c.condeferrable::text || ':' || c.condeferred::text || ':'
+    || c.convalidated::text || ':' || c.connoinherit::text || ':'
+    || pg_catalog.pg_get_constraintdef(c.oid, true),
+    '|' ORDER BY c.contype, c.conkey::text, pg_catalog.pg_get_constraintdef(c.oid, true)
+)
+INTO actual_constraint_signature
+FROM pg_catalog.pg_constraint AS c
+WHERE c.conrelid = 'carl_autonomy.effect_attempts'::regclass;
+
+SELECT string_agg(
+    c.contype || ':' || c.conkey::text || ':' || coalesce(c.confkey::text, '') || ':'
+    || c.confupdtype || ':' || c.confdeltype || ':' || c.confmatchtype || ':'
+    || c.condeferrable::text || ':' || c.condeferred::text || ':'
+    || c.convalidated::text || ':' || c.connoinherit::text || ':'
+    || pg_catalog.pg_get_constraintdef(c.oid, true),
+    '|' ORDER BY c.contype, c.conkey::text, pg_catalog.pg_get_constraintdef(c.oid, true)
+)
+INTO expected_constraint_signature
+FROM pg_catalog.pg_constraint AS c
+WHERE c.conrelid = 'pg_temp.expected_effect_attempts'::regclass;
+
+IF table_owner <> CURRENT_USER OR table_namespace <> 'carl_autonomy' OR table_kind <> 'r'
+    OR actual_column_signature IS DISTINCT FROM expected_column_signature
+    OR actual_constraint_signature IS DISTINCT FROM expected_constraint_signature
+THEN
+    RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'effect_fence_schema_invalid';
+END IF;
+
 END;
 $migration$;
 
@@ -95,33 +187,116 @@ CREATE INDEX IF NOT EXISTS effect_attempts_reconciliation
     ON carl_autonomy.effect_attempts(attempt_state, not_before, effect_key)
     WHERE attempt_state IN ('retry_scheduled', 'uncertain');
 
+CREATE INDEX expected_effect_attempts_reconciliation
+    ON pg_temp.expected_effect_attempts(attempt_state, not_before, effect_key)
+    WHERE attempt_state IN ('retry_scheduled', 'uncertain');
+
 DO $migration$
 DECLARE
     key_columns text[];
     predicate text;
+    expected_predicate text;
     valid boolean;
+    ready boolean;
+    live boolean;
     unique_index boolean;
+    primary_index boolean;
+    exclusion_index boolean;
+    immediate_index boolean;
+    clustered_index boolean;
+    replica_identity boolean;
+    access_method text;
+    index_owner text;
+    index_namespace text;
+    opclasses text[];
+    collations text[];
+    index_options smallint[];
+    expected_opclasses text[];
+    expected_collations text[];
+    expected_index_options smallint[];
+    nonconstraint_indexes integer;
 BEGIN
     SELECT array_agg(a.attname ORDER BY k.ordinality),
-        pg_catalog.pg_get_expr(i.indpred, i.indrelid), i.indisvalid, i.indisunique
-    INTO key_columns, predicate, valid, unique_index
+        pg_catalog.pg_get_expr(i.indpred, i.indrelid), i.indisvalid, i.indisready,
+        i.indislive, i.indisunique, i.indisprimary, i.indisexclusion, i.indimmediate,
+        i.indisclustered, i.indisreplident, am.amname,
+        pg_catalog.pg_get_userbyid(idx.relowner), ni.nspname,
+        ARRAY(
+            SELECT opc.opcname
+            FROM unnest(i.indclass) WITH ORDINALITY AS oc(opcoid, ordinal)
+            JOIN pg_catalog.pg_opclass AS opc ON opc.oid = oc.opcoid
+            ORDER BY oc.ordinal
+        ),
+        ARRAY(
+            SELECT coalesce(coll.collname, '')
+            FROM unnest(i.indcollation) WITH ORDINALITY AS co(colloid, ordinal)
+            LEFT JOIN pg_catalog.pg_collation AS coll ON coll.oid = co.colloid
+            ORDER BY co.ordinal
+        ),
+        ARRAY(SELECT option FROM unnest(i.indoption) AS option)
+    INTO key_columns, predicate, valid, ready, live, unique_index, primary_index,
+        exclusion_index, immediate_index, clustered_index, replica_identity,
+        access_method, index_owner, index_namespace, opclasses, collations, index_options
     FROM pg_catalog.pg_index AS i
     JOIN pg_catalog.pg_class AS idx ON idx.oid = i.indexrelid
+    JOIN pg_catalog.pg_namespace AS ni ON ni.oid = idx.relnamespace
     JOIN pg_catalog.pg_class AS tab ON tab.oid = i.indrelid
     JOIN pg_catalog.pg_namespace AS n ON n.oid = tab.relnamespace
+    JOIN pg_catalog.pg_am AS am ON am.oid = idx.relam
     JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS k(attnum, ordinality) ON true
     JOIN pg_catalog.pg_attribute AS a ON a.attrelid = tab.oid AND a.attnum = k.attnum
     WHERE n.nspname = 'carl_autonomy' AND tab.relname = 'effect_attempts'
         AND idx.relname = 'effect_attempts_reconciliation'
-    GROUP BY i.indpred, i.indrelid, i.indisvalid, i.indisunique;
+    GROUP BY i.indexrelid, i.indpred, i.indrelid, i.indisvalid, i.indisready,
+        i.indislive, i.indisunique, i.indisprimary, i.indisexclusion, i.indimmediate,
+        i.indisclustered, i.indisreplident, i.indclass, i.indcollation, i.indoption,
+        am.amname, idx.relowner, ni.nspname;
+
+    SELECT pg_catalog.pg_get_expr(i.indpred, i.indrelid),
+        ARRAY(
+            SELECT opc.opcname
+            FROM unnest(i.indclass) WITH ORDINALITY AS oc(opcoid, ordinal)
+            JOIN pg_catalog.pg_opclass AS opc ON opc.oid = oc.opcoid
+            ORDER BY oc.ordinal
+        ),
+        ARRAY(
+            SELECT coalesce(coll.collname, '')
+            FROM unnest(i.indcollation) WITH ORDINALITY AS co(colloid, ordinal)
+            LEFT JOIN pg_catalog.pg_collation AS coll ON coll.oid = co.colloid
+            ORDER BY co.ordinal
+        ),
+        ARRAY(SELECT option FROM unnest(i.indoption) AS option)
+    INTO expected_predicate, expected_opclasses, expected_collations,
+        expected_index_options
+    FROM pg_catalog.pg_index AS i
+    JOIN pg_catalog.pg_class AS idx ON idx.oid = i.indexrelid
+    WHERE i.indrelid = 'pg_temp.expected_effect_attempts'::regclass
+        AND idx.relname = 'expected_effect_attempts_reconciliation';
+
+    SELECT count(*) INTO nonconstraint_indexes
+    FROM pg_catalog.pg_index AS i
+    WHERE i.indrelid = 'carl_autonomy.effect_attempts'::regclass
+        AND NOT EXISTS (
+            SELECT 1 FROM pg_catalog.pg_constraint AS c WHERE c.conindid = i.indexrelid
+        );
+
     IF key_columns <> ARRAY['attempt_state', 'not_before', 'effect_key']
-        OR predicate IS NULL OR position('retry_scheduled' IN predicate) = 0
-        OR position('uncertain' IN predicate) = 0 OR NOT valid OR unique_index
+        OR predicate IS DISTINCT FROM expected_predicate
+        OR NOT valid OR NOT ready OR NOT live OR unique_index OR primary_index
+        OR exclusion_index OR NOT immediate_index OR clustered_index OR replica_identity
+        OR access_method <> 'btree' OR index_owner <> CURRENT_USER
+        OR index_namespace <> 'carl_autonomy'
+        OR opclasses IS DISTINCT FROM expected_opclasses
+        OR collations IS DISTINCT FROM expected_collations
+        OR index_options IS DISTINCT FROM expected_index_options
+        OR nonconstraint_indexes <> 1
     THEN
         RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'effect_fence_schema_invalid';
     END IF;
 END;
 $migration$;
+
+DROP TABLE pg_temp.expected_effect_attempts;
 
 CREATE OR REPLACE FUNCTION carl_autonomy.resolve_claimed_command(
     p_command_key text,
@@ -575,6 +750,104 @@ ALTER FUNCTION carl_autonomy.mark_effect_completed(
 )
     OWNER TO CURRENT_USER;
 
+DO $acl_normalization$
+DECLARE
+    unexpected_grantee oid;
+    sequence_record record;
+    function_record record;
+BEGIN
+    FOR unexpected_grantee IN
+        SELECT DISTINCT acl.grantee
+        FROM pg_catalog.pg_class AS c
+        CROSS JOIN LATERAL pg_catalog.aclexplode(
+            coalesce(c.relacl, pg_catalog.acldefault('r', c.relowner))
+        ) AS acl
+        WHERE c.oid = 'carl_autonomy.effect_attempts'::regclass
+            AND acl.grantee <> c.relowner
+    LOOP
+        IF unexpected_grantee = 0 THEN
+            EXECUTE 'REVOKE ALL ON TABLE carl_autonomy.effect_attempts FROM PUBLIC';
+        ELSE
+            EXECUTE format(
+                'REVOKE ALL ON TABLE carl_autonomy.effect_attempts FROM %I',
+                pg_catalog.pg_get_userbyid(unexpected_grantee)
+            );
+        END IF;
+    END LOOP;
+
+    FOR sequence_record IN
+        SELECT c.oid, c.relowner, n.nspname, c.relname
+        FROM pg_catalog.pg_class AS c
+        JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'carl_autonomy' AND c.relkind = 'S'
+    LOOP
+        FOR unexpected_grantee IN
+            SELECT DISTINCT acl.grantee
+            FROM pg_catalog.pg_class AS sequence_class
+            CROSS JOIN LATERAL pg_catalog.aclexplode(
+                coalesce(
+                    sequence_class.relacl,
+                    pg_catalog.acldefault('s', sequence_class.relowner)
+                )
+            ) AS acl
+            WHERE sequence_class.oid = sequence_record.oid
+                AND acl.grantee <> sequence_class.relowner
+        LOOP
+            IF unexpected_grantee = 0 THEN
+                EXECUTE format(
+                    'REVOKE ALL ON SEQUENCE %I.%I FROM PUBLIC',
+                    sequence_record.nspname, sequence_record.relname
+                );
+            ELSE
+                EXECUTE format(
+                    'REVOKE ALL ON SEQUENCE %I.%I FROM %I',
+                    sequence_record.nspname, sequence_record.relname,
+                    pg_catalog.pg_get_userbyid(unexpected_grantee)
+                );
+            END IF;
+        END LOOP;
+    END LOOP;
+
+    FOR function_record IN
+        SELECT p.oid, p.proowner
+        FROM pg_catalog.pg_proc AS p
+        WHERE p.oid = ANY(ARRAY[
+            'carl_autonomy.resolve_claimed_command(text,timestamptz)'::regprocedure::oid,
+            'carl_autonomy.prepare_effect_attempt(text,timestamptz)'::regprocedure::oid,
+            'carl_autonomy.mark_effect_retry_scheduled(text,text,text,timestamptz)'::regprocedure::oid,
+            'carl_autonomy.mark_effect_uncertain(text,text,text,timestamptz)'::regprocedure::oid,
+            'carl_autonomy.mark_effect_completed(text,text,text,integer,integer,text,text,text,timestamptz)'::regprocedure::oid
+        ])
+    LOOP
+        FOR unexpected_grantee IN
+            SELECT DISTINCT acl.grantee
+            FROM pg_catalog.pg_proc AS function_class
+            CROSS JOIN LATERAL pg_catalog.aclexplode(
+                coalesce(
+                    function_class.proacl,
+                    pg_catalog.acldefault('f', function_class.proowner)
+                )
+            ) AS acl
+            WHERE function_class.oid = function_record.oid
+                AND acl.grantee <> function_class.proowner
+        LOOP
+            IF unexpected_grantee = 0 THEN
+                EXECUTE format(
+                    'REVOKE ALL ON FUNCTION %s FROM PUBLIC',
+                    function_record.oid::regprocedure
+                );
+            ELSE
+                EXECUTE format(
+                    'REVOKE ALL ON FUNCTION %s FROM %I',
+                    function_record.oid::regprocedure,
+                    pg_catalog.pg_get_userbyid(unexpected_grantee)
+                );
+            END IF;
+        END LOOP;
+    END LOOP;
+END;
+$acl_normalization$;
+
 REVOKE ALL ON TABLE carl_autonomy.effect_attempts
     FROM PUBLIC, carl_autonomy_workflow, carl_state_backend;
 REVOKE ALL ON FUNCTION carl_autonomy.resolve_claimed_command(text, timestamptz),
@@ -593,5 +866,98 @@ GRANT EXECUTE ON FUNCTION carl_autonomy.resolve_claimed_command(text, timestampt
         text, text, text, integer, integer, text, text, text, timestamptz
     )
     TO carl_state_backend;
+
+DO $contract_verification$
+DECLARE
+    invalid_functions integer;
+    unexpected_grantee oid;
+    function_count integer;
+    function_acl_count integer;
+    owner_function_grants integer;
+    backend_function_grants integer;
+    table_acl_count integer;
+    owner_table_grants integer;
+BEGIN
+    SELECT count(*), count(*) FILTER (WHERE
+            n.nspname <> 'carl_autonomy'
+            OR pg_catalog.pg_get_userbyid(p.proowner) <> CURRENT_USER
+            OR l.lanname <> 'plpgsql' OR NOT p.prosecdef OR p.proleakproof
+            OR p.provolatile <> 'v' OR p.proparallel <> 'u' OR p.prokind <> 'f'
+            OR p.proconfig IS DISTINCT FROM ARRAY['search_path=pg_catalog, carl_autonomy']::text[]
+        )
+    INTO function_count, invalid_functions
+    FROM pg_catalog.pg_proc AS p
+    JOIN pg_catalog.pg_namespace AS n ON n.oid = p.pronamespace
+    JOIN pg_catalog.pg_language AS l ON l.oid = p.prolang
+    WHERE p.oid = ANY(ARRAY[
+        'carl_autonomy.resolve_claimed_command(text,timestamptz)'::regprocedure::oid,
+        'carl_autonomy.prepare_effect_attempt(text,timestamptz)'::regprocedure::oid,
+        'carl_autonomy.mark_effect_retry_scheduled(text,text,text,timestamptz)'::regprocedure::oid,
+        'carl_autonomy.mark_effect_uncertain(text,text,text,timestamptz)'::regprocedure::oid,
+        'carl_autonomy.mark_effect_completed(text,text,text,integer,integer,text,text,text,timestamptz)'::regprocedure::oid
+    ])
+        ;
+    IF function_count <> 5 OR invalid_functions <> 0 THEN
+        RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'effect_fence_function_invalid';
+    END IF;
+
+    SELECT count(*), count(*) FILTER (WHERE
+        acl.grantee = c.relowner
+        AND acl.privilege_type = ANY(ARRAY[
+            'DELETE', 'INSERT', 'REFERENCES', 'SELECT', 'TRIGGER', 'TRUNCATE', 'UPDATE'
+        ])
+    )
+    INTO table_acl_count, owner_table_grants
+    FROM pg_catalog.pg_class AS c
+    CROSS JOIN LATERAL pg_catalog.aclexplode(
+        coalesce(c.relacl, pg_catalog.acldefault('r', c.relowner))
+    ) AS acl
+    WHERE c.oid = 'carl_autonomy.effect_attempts'::regclass;
+    IF table_acl_count <> 7 OR owner_table_grants <> 7 THEN
+        RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'effect_fence_acl_invalid';
+    END IF;
+
+    SELECT count(*), count(*) FILTER (WHERE
+            acl.grantee = p.proowner AND acl.privilege_type = 'EXECUTE'
+        ), count(*) FILTER (WHERE
+            acl.grantee = 'carl_state_backend'::regrole::oid
+            AND acl.privilege_type = 'EXECUTE' AND NOT acl.is_grantable
+        )
+    INTO function_acl_count, owner_function_grants, backend_function_grants
+    FROM pg_catalog.pg_proc AS p
+    CROSS JOIN LATERAL pg_catalog.aclexplode(
+        coalesce(p.proacl, pg_catalog.acldefault('f', p.proowner))
+    ) AS acl
+    WHERE p.oid = ANY(ARRAY[
+        'carl_autonomy.resolve_claimed_command(text,timestamptz)'::regprocedure::oid,
+        'carl_autonomy.prepare_effect_attempt(text,timestamptz)'::regprocedure::oid,
+        'carl_autonomy.mark_effect_retry_scheduled(text,text,text,timestamptz)'::regprocedure::oid,
+        'carl_autonomy.mark_effect_uncertain(text,text,text,timestamptz)'::regprocedure::oid,
+        'carl_autonomy.mark_effect_completed(text,text,text,integer,integer,text,text,text,timestamptz)'::regprocedure::oid
+    ])
+        ;
+    IF function_acl_count <> 10 OR owner_function_grants <> 5
+        OR backend_function_grants <> 5
+    THEN
+        RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'effect_fence_acl_invalid';
+    END IF;
+
+    SELECT acl.grantee INTO unexpected_grantee
+    FROM pg_catalog.pg_class AS c
+    JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace
+    CROSS JOIN LATERAL pg_catalog.aclexplode(
+        coalesce(c.relacl, pg_catalog.acldefault('s', c.relowner))
+    ) AS acl
+    WHERE n.nspname = 'carl_autonomy' AND c.relkind = 'S'
+        AND (
+            pg_catalog.pg_get_userbyid(c.relowner) <> CURRENT_USER
+            OR acl.grantee <> c.relowner
+        )
+    LIMIT 1;
+    IF FOUND THEN
+        RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'effect_fence_acl_invalid';
+    END IF;
+END;
+$contract_verification$;
 
 COMMIT;

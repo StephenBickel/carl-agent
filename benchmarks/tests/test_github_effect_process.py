@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import importlib
 import json
@@ -8,6 +9,7 @@ import os
 import socket
 import struct
 import tempfile
+import time
 import tomllib
 from contextlib import suppress
 from inspect import getmembers, isfunction, signature
@@ -24,6 +26,49 @@ SHA = "2" * 40
 DIGEST = "a" * 64
 SECRET = "github_pat_REAL_PROTECTED_TOKEN"
 MAX_FRAME_BYTES = 262_144
+
+
+class _DurableRejectingState:
+    def __init__(self, calls: object) -> None:
+        self.calls = calls
+
+    def resolve_claimed_command(self, *args: object, **kwargs: object) -> object:
+        del args, kwargs
+        with self.calls.get_lock():
+            self.calls.value += 1
+        github = importlib.import_module("carl_bench.github_cloud")
+        raise github.GitHubCloudError("github_command_not_found")
+
+
+def _run_real_listener(socket_path: str, ready: object, calls: object) -> None:
+    service = importlib.import_module("carl_bench.github_effect_service")
+    now = __import__("datetime").datetime.fromisoformat("2026-08-21T12:00:00+00:00")
+    service._serve_listener(
+        socket_path=Path(socket_path),
+        allowed_client_uid=os.getuid(),
+        service_uid=os.getuid(),
+        gateway=object(),
+        policy=SimpleNamespace(
+            repository="StephenBickel/carl-agent",
+            workflow_ref="main",
+            dispatch_actor_login="carl-autonomy[bot]",
+        ),
+        state_controller=_DurableRejectingState(calls),
+        clock=lambda: now,
+        connection_timeout_seconds=0.2,
+        on_ready=ready.set,
+    )
+
+
+def _start_real_listener(socket_path: Path, calls: object) -> tuple[object, object]:
+    context = multiprocessing.get_context("spawn")
+    ready = context.Event()
+    process = context.Process(target=_run_real_listener, args=(str(socket_path), ready, calls))
+    process.start()
+    if not ready.wait(5):
+        _cleanup_service_process(process, socket_path, remove_runtime_directory=False)
+        pytest.fail("real effect listener did not become ready")
+    return process, ready
 
 
 def _module(name: str, failure: str) -> ModuleType:
@@ -60,6 +105,93 @@ def _request() -> object:
                 "required_checks": list(APPROVED_REQUIRED_CHECKS),
             },
             "request_key": f"github-checks-{SHA}",
+            "schema_version": 1,
+        }
+    )
+
+
+def _all_operation_documents() -> dict[str, dict[str, object]]:
+    workflow = {
+        "candidate_commit": SHA,
+        "experiment_digest": DIGEST,
+        "metric_pack_digest": "b" * 64,
+        "parent_commit": "3" * 40,
+        "policy_digest": "c" * 64,
+        "repository": "StephenBickel/carl-agent",
+        "task_set_digest": "d" * 64,
+        "workflow_blob_digest": "e" * 64,
+        "workflow_file": "autonomous-improvement.yml",
+        "workflow_revision": "3" * 40,
+    }
+    target = {
+        "base_branch": "main",
+        "head_branch": "experimental/promotion-001",
+        "head_sha": SHA,
+        "number": 17,
+        "promotion_id": "promotion-001",
+    }
+    checks = _request().to_canonical_dict()["parameters"]
+    return {
+        "create_experimental_ref": {
+            "branch": "experimental/experiment-001",
+            "candidate_commit": SHA,
+            "experiment_id": "experiment-001",
+        },
+        "create_pull_request": {
+            "base_branch": "main",
+            "draft": True,
+            "head_branch": "experimental/promotion-001",
+            "head_sha": SHA,
+            "promotion_id": "promotion-001",
+            "pull_request_body": "Capability evidence.",
+            "title": "Promote experiment",
+        },
+        "create_revert_pull_request": {
+            "base_branch": "main",
+            "draft": False,
+            "expected_restored_tree": "4" * 40,
+            "head_branch": "revert/promotion-001",
+            "promotion_id": "promotion-001",
+            "promotion_merge_commit": "3" * 40,
+            "pull_request_body": "Failed soak rollback.",
+            "revert_candidate_commit": SHA,
+            "title": "Revert promotion",
+        },
+        "create_revert_ref": {
+            "branch": "revert/promotion-001",
+            "expected_restored_tree": "4" * 40,
+            "promotion_id": "promotion-001",
+            "promotion_merge_commit": "3" * 40,
+            "revert_candidate_commit": SHA,
+        },
+        "discover_workflow_run": workflow,
+        "dispatch_workflow": workflow,
+        "enable_pull_request_auto_merge": {**target, "merge_method": "squash"},
+        "mark_pull_request_ready": target,
+        "observe_required_checks": checks,
+        "update_pull_request": {
+            **target,
+            "pull_request_body": "Updated capability evidence.",
+            "title": "Update promotion",
+        },
+    }
+
+
+def _operation_request(operation: str, parameters: dict[str, object]) -> object:
+    command_key = (
+        "github-dispatch-autonomous-improvement.yml-" + DIGEST + "-attempt-1"
+        if operation in {"dispatch_workflow", "discover_workflow_run"}
+        else f"ipc-{operation}-001"
+    )
+    return _ipc().GitHubEffectRequest.from_canonical_dict(
+        {
+            "command_key": command_key,
+            "domain": "carl.github-effect.ipc.request.v1",
+            "effect_key": f"cloud-effect-{DIGEST}",
+            "occurred_at": NOW,
+            "operation": operation,
+            "parameters": parameters,
+            "request_key": command_key,
             "schema_version": 1,
         }
     )
@@ -534,3 +666,255 @@ def test_service_executes_only_exact_durably_bound_high_level_request() -> None:
     assert response.status == "completed"
     assert gateway.calls == 1
     assert _ipc().decode_response_bytes(_ipc().encode_response_bytes(response)) == response
+
+
+@pytest.mark.parametrize("operation", tuple(_all_operation_documents()))
+def test_service_maps_every_closed_operation_to_one_typed_domain_request(operation: str) -> None:
+    service = _module("carl_bench.github_effect_service", "effect service is required")
+    request = _operation_request(operation, _all_operation_documents()[operation])
+
+    typed, _binding, method = service._typed_request(
+        request,
+        SimpleNamespace(
+            repository="StephenBickel/carl-agent",
+            workflow_ref="main",
+            dispatch_actor_login="carl-autonomy[bot]",
+        ),
+    )
+
+    assert method in {
+        "create_or_reconcile_experimental_branch",
+        "create_or_reconcile_pull_request",
+        "create_or_reconcile_revert_branch",
+        "create_or_reconcile_revert_pull_request",
+        "dispatch_workflow",
+        "enable_pull_request_auto_merge",
+        "mark_pull_request_ready",
+        "observe_required_checks",
+        "update_pull_request",
+    }
+    if operation in {"create_pull_request", "create_revert_pull_request", "update_pull_request"}:
+        assert typed.body == request.parameters["pull_request_body"]
+        assert not hasattr(typed, "pull_request_body")
+
+
+def test_pull_request_service_result_crosses_ipc_without_raw_transport_fields() -> None:
+    service = _module("carl_bench.github_effect_service", "effect service is required")
+    github = _module("carl_bench.github_cloud", "GitHub gateway module is required")
+    request = _operation_request(
+        "create_pull_request", _all_operation_documents()["create_pull_request"]
+    )
+    snapshot = github.PullRequestEffectSnapshot(
+        status="created",
+        repository="StephenBickel/carl-agent",
+        number=17,
+        url="https://github.com/StephenBickel/carl-agent/pull/17",
+        state="open",
+        draft=True,
+        base_branch="main",
+        head_branch="experimental/promotion-001",
+        head_sha=SHA,
+        title="Promote experiment",
+        body="Capability evidence.",
+        auto_merge_enabled=False,
+        request_key=request.request_key,
+        effect_key=request.effect_key,
+        command_occurred_at=NOW,
+        observed_at=NOW,
+    )
+    response = _ipc().GitHubEffectResponse(
+        schema_version=1,
+        domain="carl.github-effect.ipc.response.v1",
+        status="completed",
+        request_digest=request.digest,
+        observed_at=NOW,
+        result={
+            "result_type": "PullRequestEffectSnapshot",
+            "value": service._canonical_result(snapshot),
+        },
+        retry_not_before=None,
+        error_code=None,
+    )
+
+    decoded = _ipc().decode_response_bytes(_ipc().encode_response_bytes(response))
+    restored = github._result_from_ipc(
+        decoded, request=request, expected_type=github.PullRequestEffectSnapshot
+    )
+
+    assert restored == snapshot
+    wire = _ipc().encode_response_bytes(response)
+    assert b'"body"' not in wire
+    assert b'"url"' not in wire
+
+
+def test_partial_frames_time_out_and_next_client_remains_serviceable() -> None:
+    context = multiprocessing.get_context("spawn")
+    calls = context.Value("i", 0)
+    socket_path = _short_socket_path()
+    process, _ = _start_real_listener(socket_path, calls)
+    partial = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        partial.connect(os.fspath(socket_path))
+        partial.sendall(b"\x00\x00")
+        client = _client_module().GitHubEffectSocketClient._for_testing(
+            socket_path=socket_path,
+            expected_peer_uid=os.getuid(),
+            timeout_seconds=2.0,
+        )
+
+        started = time.monotonic()
+        response = client.execute(_request())
+        elapsed = time.monotonic() - started
+
+        assert response.status == "rejected"
+        assert response.error_code == "github_command_not_found"
+        assert elapsed < 1.25
+        assert calls.value == 1
+    finally:
+        partial.close()
+        _cleanup_service_process(process, socket_path)
+
+
+def test_crash_leaves_verified_stale_socket_that_entrypoint_safely_recovers() -> None:
+    context = multiprocessing.get_context("spawn")
+    calls = context.Value("i", 0)
+    socket_path = _short_socket_path()
+    first, _ = _start_real_listener(socket_path, calls)
+    client = _client_module().GitHubEffectSocketClient._for_testing(
+        socket_path=socket_path,
+        expected_peer_uid=os.getuid(),
+        timeout_seconds=2.0,
+    )
+    restarted = None
+    try:
+        assert client.execute(_request()).error_code == "github_command_not_found"
+        assert calls.value == 1
+        first.kill()
+        first.join(2)
+        assert not first.is_alive()
+        assert socket_path.is_socket()
+
+        restarted, _ = _start_real_listener(socket_path, calls)
+
+        assert client.execute(_request()).error_code == "github_command_not_found"
+        assert calls.value == 2
+    finally:
+        _cleanup_service_process(first, socket_path, remove_runtime_directory=False)
+        if restarted is not None:
+            _cleanup_service_process(restarted, socket_path, remove_runtime_directory=False)
+        socket_path.unlink(missing_ok=True)
+        with suppress(FileNotFoundError):
+            socket_path.parent.rmdir()
+
+
+def test_live_service_socket_is_never_unlinked_as_stale() -> None:
+    context = multiprocessing.get_context("spawn")
+    calls = context.Value("i", 0)
+    socket_path = _short_socket_path()
+    process, _ = _start_real_listener(socket_path, calls)
+    service = _module("carl_bench.github_effect_service", "effect service is required")
+    directory_fd = service._open_runtime_directory(socket_path.parent, expected_uid=os.getuid())
+    try:
+        with pytest.raises(RuntimeError, match="github_effect_service_already_running"):
+            service._remove_verified_stale_socket(
+                directory_fd, socket_path, expected_uid=os.getuid()
+            )
+        assert socket_path.is_socket()
+    finally:
+        os.close(directory_fd)
+        _cleanup_service_process(process, socket_path)
+
+
+@pytest.mark.parametrize("kind", ("file", "symlink", "wrong_mode"))
+def test_stale_socket_recovery_rejects_untrusted_endpoint_types(kind: str) -> None:
+    socket_path = _short_socket_path()
+    held = None
+    try:
+        if kind == "file":
+            socket_path.touch(mode=0o600)
+        elif kind == "symlink":
+            socket_path.symlink_to(socket_path.parent / "missing")
+        else:
+            held = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            held.bind(os.fspath(socket_path))
+            os.chmod(socket_path, 0o666)
+        service = _module("carl_bench.github_effect_service", "effect service is required")
+        directory_fd = service._open_runtime_directory(socket_path.parent, expected_uid=os.getuid())
+        try:
+            with pytest.raises(RuntimeError, match="github_effect_service_socket_identity_invalid"):
+                service._remove_verified_stale_socket(
+                    directory_fd, socket_path, expected_uid=os.getuid()
+                )
+            assert socket_path.exists() or socket_path.is_symlink()
+        finally:
+            os.close(directory_fd)
+    finally:
+        if held is not None:
+            held.close()
+        socket_path.unlink(missing_ok=True)
+        socket_path.parent.rmdir()
+
+
+def test_stale_socket_recovery_rejects_wrong_endpoint_owner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _module("carl_bench.github_effect_service", "effect service is required")
+    socket_path = _short_socket_path()
+    held = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    held.bind(os.fspath(socket_path))
+    os.chmod(socket_path, 0o600)
+    real_stat = service.os.stat
+
+    def wrong_owner_stat(*args: object, **kwargs: object) -> os.stat_result:
+        values = list(real_stat(*args, **kwargs))
+        values[4] = os.getuid() + 1
+        return os.stat_result(values)
+
+    directory_fd = service._open_runtime_directory(socket_path.parent, expected_uid=os.getuid())
+    monkeypatch.setattr(service.os, "stat", wrong_owner_stat)
+    try:
+        with pytest.raises(RuntimeError, match="github_effect_service_socket_identity_invalid"):
+            service._remove_verified_stale_socket(
+                directory_fd, socket_path, expected_uid=os.getuid()
+            )
+        assert socket_path.is_socket()
+    finally:
+        os.close(directory_fd)
+        held.close()
+        socket_path.unlink(missing_ok=True)
+        socket_path.parent.rmdir()
+
+
+def test_stale_socket_replacement_race_never_unlinks_replacement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _module("carl_bench.github_effect_service", "effect service is required")
+    socket_path = _short_socket_path()
+    stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    replacement = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    stale.bind(os.fspath(socket_path))
+    os.chmod(socket_path, 0o600)
+    original_connect = socket.socket.connect
+
+    def replace_then_refuse(probe: socket.socket, address: str) -> None:
+        del probe, address
+        socket_path.unlink()
+        replacement.bind(os.fspath(socket_path))
+        os.chmod(socket_path, 0o600)
+        raise ConnectionRefusedError(errno.ECONNREFUSED, "redacted")
+
+    monkeypatch.setattr(socket.socket, "connect", replace_then_refuse)
+    directory_fd = service._open_runtime_directory(socket_path.parent, expected_uid=os.getuid())
+    try:
+        with pytest.raises(RuntimeError, match="github_effect_service_socket_identity_invalid"):
+            service._remove_verified_stale_socket(
+                directory_fd, socket_path, expected_uid=os.getuid()
+            )
+        assert socket_path.is_socket()
+    finally:
+        monkeypatch.setattr(socket.socket, "connect", original_connect)
+        os.close(directory_fd)
+        stale.close()
+        replacement.close()
+        socket_path.unlink(missing_ok=True)
+        socket_path.parent.rmdir()

@@ -274,11 +274,32 @@ def test_effect_fence_migration_pins_and_validates_both_historical_starting_stat
     for contract in (
         "to_regclass('carl_autonomy.effect_attempts')",
         "effect_fence_schema_invalid",
-        "information_schema.columns",
+        "pg_catalog.pg_attribute",
         "pg_catalog.pg_get_userbyid",
         "effect_attempts_reconciliation",
     ):
         assert contract in GITHUB_EFFECT_FENCES_SQL
+
+
+def test_effect_fence_migration_compares_exact_catalog_contract_before_replacement() -> None:
+    for catalog_contract in (
+        "pg_catalog.pg_attribute",
+        "pg_catalog.format_type",
+        "pg_catalog.pg_attrdef",
+        "pg_catalog.pg_constraint",
+        "pg_catalog.pg_get_constraintdef",
+        "pg_catalog.pg_index",
+        "pg_catalog.pg_opclass",
+        "pg_catalog.pg_collation",
+        "pg_catalog.pg_proc",
+        "prosecdef",
+        "proconfig",
+        "aclexplode",
+    ):
+        assert catalog_contract in GITHUB_EFFECT_FENCES_SQL
+    assert "CREATE TEMP TABLE expected_effect_attempts" in GITHUB_EFFECT_FENCES_SQL
+    assert "unexpected_grantee" in GITHUB_EFFECT_FENCES_SQL
+    assert "effect_fence_function_invalid" in GITHUB_EFFECT_FENCES_SQL
 
 
 def test_shared_event_policy_keys_equal_production_event_type() -> None:

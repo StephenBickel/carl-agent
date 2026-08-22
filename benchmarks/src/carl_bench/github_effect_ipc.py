@@ -169,11 +169,8 @@ def _identifier(value: object) -> str:
     return value
 
 
-def _pull_target(parameters: dict[str, object]) -> None:
+def _pull_identity(parameters: dict[str, object]) -> None:
     _identifier(parameters["promotion_id"])
-    number = parameters["number"]
-    if isinstance(number, bool) or not isinstance(number, int) or number <= 0:
-        raise ValueError
     if parameters["base_branch"] != "main":
         raise ValueError
     if (
@@ -182,6 +179,13 @@ def _pull_target(parameters: dict[str, object]) -> None:
     ):
         raise ValueError
     _sha(parameters["head_sha"])
+
+
+def _pull_target(parameters: dict[str, object]) -> None:
+    _pull_identity(parameters)
+    number = parameters["number"]
+    if isinstance(number, bool) or not isinstance(number, int) or number <= 0:
+        raise ValueError
 
 
 def _validate_parameters(operation: GitHubEffectOperation, value: object) -> dict[str, object]:
@@ -207,11 +211,11 @@ def _validate_parameters(operation: GitHubEffectOperation, value: object) -> dic
                     value,
                     {
                         "base_branch",
-                        "body",
                         "draft",
                         "head_branch",
                         "head_sha",
                         "promotion_id",
+                        "pull_request_body",
                         "title",
                     },
                 )
@@ -222,12 +226,12 @@ def _validate_parameters(operation: GitHubEffectOperation, value: object) -> dic
                     value,
                     {
                         "base_branch",
-                        "body",
                         "draft",
                         "expected_restored_tree",
                         "head_branch",
                         "promotion_id",
                         "promotion_merge_commit",
+                        "pull_request_body",
                         "revert_candidate_commit",
                         "title",
                     },
@@ -238,9 +242,9 @@ def _validate_parameters(operation: GitHubEffectOperation, value: object) -> dic
                 result["head_sha"] = result["revert_candidate_commit"]
                 _sha(result["promotion_merge_commit"])
                 _sha(result["expected_restored_tree"])
-            _pull_target(result)
+            _pull_identity(result)
             _text(result["title"], maximum=256)
-            _text(result["body"], maximum=8_192)
+            _text(result["pull_request_body"], maximum=8_192)
             if operation is GitHubEffectOperation.CREATE_REVERT_PULL_REQUEST:
                 result.pop("head_sha")
         elif operation is GitHubEffectOperation.UPDATE_PULL_REQUEST:
@@ -248,17 +252,17 @@ def _validate_parameters(operation: GitHubEffectOperation, value: object) -> dic
                 value,
                 {
                     "base_branch",
-                    "body",
                     "head_branch",
                     "head_sha",
                     "number",
                     "promotion_id",
+                    "pull_request_body",
                     "title",
                 },
             )
             _pull_target(result)
             _text(result["title"], maximum=256)
-            _text(result["body"], maximum=8_192)
+            _text(result["pull_request_body"], maximum=8_192)
         elif operation in {
             GitHubEffectOperation.MARK_PULL_REQUEST_READY,
             GitHubEffectOperation.ENABLE_PULL_REQUEST_AUTO_MERGE,
@@ -363,7 +367,6 @@ _RESULT_FIELDS = {
     "PullRequestEffectSnapshot": {
         "auto_merge_enabled",
         "base_branch",
-        "body",
         "command_occurred_at",
         "draft",
         "effect_key",
@@ -371,12 +374,13 @@ _RESULT_FIELDS = {
         "head_sha",
         "number",
         "observed_at",
+        "pull_request_body",
+        "pull_request_url",
         "repository",
         "request_key",
         "state",
         "status",
         "title",
-        "url",
     },
     "RequiredChecksSnapshot": {
         "checks",
@@ -468,8 +472,8 @@ def _validate_response_result(value: object) -> dict[str, object]:
             if not isinstance(document[name], bool):
                 raise ValueError
         _text(document["title"], maximum=256)
-        _text(document["body"], maximum=8_192, nonempty=False)
-        _text(document["url"], maximum=512)
+        _text(document["pull_request_body"], maximum=8_192, nonempty=False)
+        _text(document["pull_request_url"], maximum=512)
     else:
         _sha(document["head_sha"])
         if not isinstance(document["complete"], bool) or type(document["checks"]) is not list:

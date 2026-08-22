@@ -4061,7 +4061,8 @@ def _ipc_parameters(request: object) -> dict[str, object]:
         if name in excluded:
             continue
         item = getattr(request, name)
-        value[name] = list(item) if isinstance(item, tuple) else item
+        wire_name = "pull_request_body" if name == "body" else name
+        value[wire_name] = list(item) if isinstance(item, tuple) else item
     return value
 
 
@@ -4102,6 +4103,14 @@ def _result_from_ipc(
         if type(checks) is not list:
             raise GitHubCloudError("github_effect_service_response_invalid")
         decoded["checks"] = tuple(RequiredCheckObservation(**item) for item in checks)
+        value = decoded
+    elif expected_type is PullRequestEffectSnapshot:
+        decoded = dict(value)
+        try:
+            decoded["body"] = decoded.pop("pull_request_body")
+            decoded["url"] = decoded.pop("pull_request_url")
+        except KeyError as error:
+            raise GitHubCloudError("github_effect_service_response_invalid") from error
         value = decoded
     try:
         return expected_type(**value)

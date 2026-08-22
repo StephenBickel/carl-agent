@@ -70,6 +70,12 @@ def _validate_peer(connection: socket.socket, expected_uid: int) -> None:
         _, peer_uid, _ = struct.unpack("3i", credentials)
         if peer_uid != expected_uid:
             raise GitHubEffectClientError("github_effect_service_identity_invalid")
+        return
+    if hasattr(socket, "LOCAL_PEERCRED"):
+        credentials = connection.getsockopt(0, socket.LOCAL_PEERCRED, 8)
+        _, peer_uid = struct.unpack("II", credentials)
+        if peer_uid != expected_uid:
+            raise GitHubEffectClientError("github_effect_service_identity_invalid")
 
 
 @dataclass(frozen=True, slots=True)

@@ -975,6 +975,116 @@ def test_effect_fence_migration_rejects_incompatible_existing_table(postgres: ob
             admin.execute(migration.read_text(encoding="utf-8"), prepare=False)
 
 
+@pytest.mark.parametrize(
+    "poison_sql",
+    (
+        "ALTER TABLE carl_autonomy.effect_attempts ALTER COLUMN claim_id TYPE varchar(191)",
+        "ALTER TABLE carl_autonomy.effect_attempts ALTER COLUMN claim_id SET DEFAULT 'forged'",
+        "DO $$ DECLARE n text; BEGIN SELECT conname INTO n FROM pg_constraint "
+        "WHERE conrelid='carl_autonomy.effect_attempts'::regclass AND contype='c' "
+        "AND pg_get_constraintdef(oid) LIKE '%command_revision%'; "
+        "EXECUTE format('ALTER TABLE carl_autonomy.effect_attempts DROP CONSTRAINT %I', n); "
+        "ALTER TABLE carl_autonomy.effect_attempts ADD CHECK (command_revision >= 0); END $$",
+        "DO $$ DECLARE n text; BEGIN SELECT conname INTO n FROM pg_constraint "
+        "WHERE conrelid='carl_autonomy.effect_attempts'::regclass AND contype='f' "
+        "AND conkey=ARRAY[1]::smallint[]; "
+        "EXECUTE format('ALTER TABLE carl_autonomy.effect_attempts DROP CONSTRAINT %I', n); "
+        "ALTER TABLE carl_autonomy.effect_attempts ADD FOREIGN KEY (effect_key) "
+        "REFERENCES carl_autonomy.commands(command_key); END $$",
+        "DROP INDEX carl_autonomy.effect_attempts_reconciliation; "
+        "CREATE INDEX effect_attempts_reconciliation ON carl_autonomy.effect_attempts"
+        "(attempt_state,not_before,effect_key) WHERE attempt_state='uncertain'",
+    ),
+)
+def test_effect_fence_migration_rejects_exact_catalog_poison(
+    postgres: object, poison_sql: str
+) -> None:
+    assert POSTGRES_DSN is not None
+    with postgres.connect(POSTGRES_DSN, autocommit=True) as admin:  # type: ignore[attr-defined]
+        admin.execute("DROP SCHEMA IF EXISTS carl_autonomy CASCADE")
+        for migration in BASE_MIGRATIONS:
+            admin.execute(migration.read_text(encoding="utf-8"), prepare=False)
+        admin.execute(HISTORICAL_EFFECT_FENCE_FIXTURE.read_text(encoding="utf-8"), prepare=False)
+        admin.execute(poison_sql, prepare=False)
+        with pytest.raises(Exception, match="effect_fence_schema_invalid"):
+            admin.execute(GITHUB_EFFECT_FENCES_MIGRATION.read_text(encoding="utf-8"), prepare=False)
+        admin.execute("DROP SCHEMA IF EXISTS carl_autonomy CASCADE")
+        for migration in MIGRATIONS:
+            admin.execute(migration.read_text(encoding="utf-8"), prepare=False)
+
+
+def test_effect_fence_migration_revokes_every_arbitrary_catalog_grantee(
+    postgres: object,
+) -> None:
+    from psycopg.rows import dict_row
+
+    assert POSTGRES_DSN is not None
+    with postgres.connect(POSTGRES_DSN, autocommit=True, row_factory=dict_row) as admin:  # type: ignore[attr-defined]
+        admin.execute("DROP SCHEMA IF EXISTS carl_autonomy CASCADE")
+        admin.execute("DROP ROLE IF EXISTS carl_effect_intruder")
+        admin.execute("CREATE ROLE carl_effect_intruder NOLOGIN")
+        for migration in BASE_MIGRATIONS:
+            admin.execute(migration.read_text(encoding="utf-8"), prepare=False)
+        admin.execute(HISTORICAL_EFFECT_FENCE_FIXTURE.read_text(encoding="utf-8"), prepare=False)
+        admin.execute("CREATE SEQUENCE carl_autonomy.effect_poison_sequence")
+        admin.execute(
+            "GRANT SELECT, INSERT ON carl_autonomy.effect_attempts TO carl_effect_intruder"
+        )
+        admin.execute(
+            "GRANT EXECUTE ON FUNCTION "
+            "carl_autonomy.prepare_effect_attempt(text,timestamptz) TO carl_effect_intruder"
+        )
+        admin.execute(
+            "GRANT USAGE, SELECT ON SEQUENCE carl_autonomy.effect_poison_sequence "
+            "TO carl_effect_intruder"
+        )
+
+        admin.execute(GITHUB_EFFECT_FENCES_MIGRATION.read_text(encoding="utf-8"), prepare=False)
+
+        table_acl = admin.execute(
+            "SELECT count(*) AS total, count(*) FILTER (WHERE acl.grantee=c.relowner) AS owner "
+            "FROM pg_class c CROSS JOIN LATERAL aclexplode("
+            "coalesce(c.relacl,acldefault('r',c.relowner))) acl "
+            "WHERE c.oid='carl_autonomy.effect_attempts'::regclass"
+        ).fetchone()
+        function_acl = admin.execute(
+            "SELECT count(*) AS total, "
+            "count(*) FILTER (WHERE acl.grantee=p.proowner) AS owner, "
+            "count(*) FILTER (WHERE acl.grantee='carl_state_backend'::regrole) AS backend "
+            "FROM pg_proc p CROSS JOIN LATERAL aclexplode("
+            "coalesce(p.proacl,acldefault('f',p.proowner))) acl "
+            "WHERE p.oid = ANY(ARRAY["
+            "'carl_autonomy.resolve_claimed_command(text,timestamptz)'::regprocedure::oid,"
+            "'carl_autonomy.prepare_effect_attempt(text,timestamptz)'::regprocedure::oid,"
+            "'carl_autonomy.mark_effect_retry_scheduled(text,text,text,timestamptz)'::regprocedure::oid,"
+            "'carl_autonomy.mark_effect_uncertain(text,text,text,timestamptz)'::regprocedure::oid,"
+            "'carl_autonomy.mark_effect_completed(text,text,text,integer,integer,text,text,text,timestamptz)'::regprocedure::oid])"
+        ).fetchone()
+        leaked = admin.execute(
+            "SELECT (has_table_privilege('carl_effect_intruder',"
+            "'carl_autonomy.effect_attempts','SELECT') OR "
+            "has_function_privilege('carl_effect_intruder',"
+            "'carl_autonomy.prepare_effect_attempt(text,timestamptz)','EXECUTE') OR "
+            "has_sequence_privilege('carl_effect_intruder',"
+            "'carl_autonomy.effect_poison_sequence','USAGE')) AS leaked"
+        ).fetchone()
+        sequence_acl = admin.execute(
+            "SELECT count(*) AS total, count(*) FILTER (WHERE acl.grantee=c.relowner) AS owner "
+            "FROM pg_class c CROSS JOIN LATERAL aclexplode("
+            "coalesce(c.relacl,acldefault('s',c.relowner))) acl "
+            "WHERE c.oid='carl_autonomy.effect_poison_sequence'::regclass"
+        ).fetchone()
+        assert table_acl == {"owner": 7, "total": 7}
+        assert function_acl == {"backend": 5, "owner": 5, "total": 10}
+        assert sequence_acl == {"owner": 3, "total": 3}
+        assert leaked == {"leaked": False}
+
+        admin.execute("DROP SCHEMA IF EXISTS carl_autonomy CASCADE")
+        admin.execute("DROP ROLE carl_effect_intruder")
+        for migration in MIGRATIONS:
+            admin.execute(migration.read_text(encoding="utf-8"), prepare=False)
+
+
 def test_schema_has_all_strict_transactional_state_tables(postgres: object) -> None:
     from psycopg.rows import dict_row
 

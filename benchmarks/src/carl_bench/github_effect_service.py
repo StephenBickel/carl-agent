@@ -8,6 +8,7 @@ requests over ``github_effect_ipc`` and never select an endpoint or payload.
 from __future__ import annotations
 
 import dataclasses
+import errno
 import hashlib
 import os
 import re
@@ -31,6 +32,7 @@ from carl_bench.github_effect_ipc import (
 
 _SOCKET_PATH = Path("/run/carl/github-effect.sock")
 _ALLOWED_CLIENT_UID = 0
+_CONNECTION_TIMEOUT_SECONDS = 2.0
 
 
 def _protected_graphql_documents() -> object:
@@ -109,11 +111,17 @@ def _typed_request(request: GitHubEffectRequest, policy: object) -> tuple[object
         binding = github.experimental_branch_binding(repository, typed)
         method = "create_or_reconcile_experimental_branch"
     elif operation is GitHubEffectOperation.CREATE_PULL_REQUEST:
-        typed = github.PullRequestCreateRequest(**parameters)
+        typed = github.PullRequestCreateRequest(
+            **{key: value for key, value in parameters.items() if key != "pull_request_body"},
+            body=parameters["pull_request_body"],
+        )
         binding = github.pull_request_create_binding(repository, typed)
         method = "create_or_reconcile_pull_request"
     elif operation is GitHubEffectOperation.UPDATE_PULL_REQUEST:
-        typed = github.PullRequestUpdateRequest(**parameters)
+        typed = github.PullRequestUpdateRequest(
+            **{key: value for key, value in parameters.items() if key != "pull_request_body"},
+            body=parameters["pull_request_body"],
+        )
         binding = github.pull_request_update_binding(repository, typed)
         method = "update_pull_request"
     elif operation is GitHubEffectOperation.MARK_PULL_REQUEST_READY:
@@ -135,7 +143,10 @@ def _typed_request(request: GitHubEffectRequest, policy: object) -> tuple[object
         binding = github.revert_branch_binding(repository, typed)
         method = "create_or_reconcile_revert_branch"
     elif operation is GitHubEffectOperation.CREATE_REVERT_PULL_REQUEST:
-        typed = github.RevertPullRequestRequest(**parameters)
+        typed = github.RevertPullRequestRequest(
+            **{key: value for key, value in parameters.items() if key != "pull_request_body"},
+            body=parameters["pull_request_body"],
+        )
         binding = github.revert_pull_request_binding(repository, typed)
         method = "create_or_reconcile_revert_pull_request"
     else:  # pragma: no cover - enum exhaustiveness guard
@@ -146,7 +157,13 @@ def _typed_request(request: GitHubEffectRequest, policy: object) -> tuple[object
 def _canonical_result(value: object) -> object:
     if dataclasses.is_dataclass(value):
         return {
-            field.name: _canonical_result(getattr(value, field.name))
+            (
+                "pull_request_body"
+                if field.name == "body"
+                else "pull_request_url"
+                if field.name == "url"
+                else field.name
+            ): _canonical_result(getattr(value, field.name))
             for field in dataclasses.fields(value)
         }
     if isinstance(value, tuple):
@@ -282,10 +299,10 @@ def _serve_connection(
     state_controller: object,
     clock: object,
 ) -> None:
-    size = struct.unpack(">I", _recv_exact(connection, 4))[0]
-    if not 0 < size <= MAX_FRAME_BYTES:
-        return
     try:
+        size = struct.unpack(">I", _recv_exact(connection, 4))[0]
+        if not 0 < size <= MAX_FRAME_BYTES:
+            return
         request = decode_request_bytes(_recv_exact(connection, size))
         response = _response_for(
             request,
@@ -294,10 +311,16 @@ def _serve_connection(
             state_controller=state_controller,
             clock=clock,
         )
-    except (EOFError, GitHubEffectProtocolError):
+        payload = encode_response_bytes(response)
+        connection.sendall(struct.pack(">I", len(payload)) + payload)
+    except (
+        EOFError,
+        OSError,
+        TimeoutError,
+        struct.error,
+        GitHubEffectProtocolError,
+    ):
         return
-    payload = encode_response_bytes(response)
-    connection.sendall(struct.pack(">I", len(payload)) + payload)
 
 
 def _validate_runtime_directory(path: Path) -> None:
@@ -311,6 +334,135 @@ def _validate_runtime_directory(path: Path) -> None:
         raise RuntimeError("github_effect_service_configuration_invalid")
 
 
+def _open_runtime_directory(path: Path, *, expected_uid: int) -> int:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        directory_fd = os.open(path, flags)
+        details = os.fstat(directory_fd)
+    except OSError as error:
+        raise RuntimeError("github_effect_service_configuration_invalid") from error
+    if (
+        not stat.S_ISDIR(details.st_mode)
+        or details.st_uid != expected_uid
+        or stat.S_IMODE(details.st_mode) & 0o022
+    ):
+        os.close(directory_fd)
+        raise RuntimeError("github_effect_service_configuration_invalid")
+    return directory_fd
+
+
+def _socket_identity(details: os.stat_result) -> tuple[int, int, int, int]:
+    return (details.st_dev, details.st_ino, details.st_mode, details.st_uid)
+
+
+def _validated_socket_at(directory_fd: int, name: str, *, expected_uid: int) -> os.stat_result:
+    try:
+        details = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except OSError as error:
+        raise RuntimeError("github_effect_service_socket_identity_invalid") from error
+    if (
+        stat.S_ISLNK(details.st_mode)
+        or not stat.S_ISSOCK(details.st_mode)
+        or details.st_uid != expected_uid
+        or stat.S_IMODE(details.st_mode) != 0o600
+    ):
+        raise RuntimeError("github_effect_service_socket_identity_invalid")
+    return details
+
+
+def _remove_verified_stale_socket(
+    directory_fd: int, socket_path: Path, *, expected_uid: int
+) -> None:
+    try:
+        original = os.stat(socket_path.name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    original = _validated_socket_at(directory_fd, socket_path.name, expected_uid=expected_uid)
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+        probe.settimeout(_CONNECTION_TIMEOUT_SECONDS)
+        try:
+            probe.connect(os.fspath(socket_path))
+        except OSError as error:
+            if error.errno not in {errno.ECONNREFUSED, errno.ECONNRESET}:
+                raise RuntimeError("github_effect_service_socket_identity_invalid") from error
+        else:
+            raise RuntimeError("github_effect_service_already_running")
+    current = _validated_socket_at(directory_fd, socket_path.name, expected_uid=expected_uid)
+    if _socket_identity(current) != _socket_identity(original):
+        raise RuntimeError("github_effect_service_socket_identity_invalid")
+    os.unlink(socket_path.name, dir_fd=directory_fd)
+
+
+def _bind_at(listener: socket.socket, directory_fd: int, name: str) -> None:
+    previous = os.open(".", os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fchdir(directory_fd)
+        listener.bind(name)
+    finally:
+        os.fchdir(previous)
+        os.close(previous)
+
+
+def _serve_listener(
+    *,
+    socket_path: Path,
+    allowed_client_uid: int,
+    service_uid: int,
+    gateway: object,
+    policy: object,
+    state_controller: object,
+    clock: object,
+    connection_timeout_seconds: float,
+    on_ready: object | None = None,
+) -> None:
+    """Serve fixed high-level requests through one pinned Unix-socket endpoint."""
+    if (
+        not socket_path.is_absolute()
+        or socket_path.name in {"", ".", ".."}
+        or isinstance(connection_timeout_seconds, bool)
+        or not isinstance(connection_timeout_seconds, int | float)
+        or not 0.05 <= connection_timeout_seconds <= 30.0
+    ):
+        raise RuntimeError("github_effect_service_configuration_invalid")
+    directory_fd = _open_runtime_directory(socket_path.parent, expected_uid=service_uid)
+    bound_identity: tuple[int, int, int, int] | None = None
+    try:
+        _remove_verified_stale_socket(directory_fd, socket_path, expected_uid=service_uid)
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+            _bind_at(listener, directory_fd, socket_path.name)
+            os.chmod(socket_path.name, 0o600, dir_fd=directory_fd, follow_symlinks=False)
+            details = _validated_socket_at(directory_fd, socket_path.name, expected_uid=service_uid)
+            bound_identity = _socket_identity(details)
+            listener.listen(32)
+            if on_ready is not None:
+                on_ready()
+            while True:
+                connection, _ = listener.accept()
+                with connection:
+                    connection.settimeout(float(connection_timeout_seconds))
+                    peer_uid = _peer_uid(connection)
+                    if peer_uid is None or peer_uid != allowed_client_uid:
+                        continue
+                    _serve_connection(
+                        connection,
+                        gateway=gateway,
+                        policy=policy,
+                        state_controller=state_controller,
+                        clock=clock,
+                    )
+    finally:
+        if bound_identity is not None:
+            try:
+                current = _validated_socket_at(
+                    directory_fd, socket_path.name, expected_uid=service_uid
+                )
+                if _socket_identity(current) == bound_identity:
+                    os.unlink(socket_path.name, dir_fd=directory_fd)
+            except (FileNotFoundError, RuntimeError):
+                pass
+        os.close(directory_fd)
+
+
 def _peer_uid(connection: socket.socket) -> int | None:
     getpeereid = getattr(connection, "getpeereid", None)
     if callable(getpeereid):
@@ -318,6 +470,9 @@ def _peer_uid(connection: socket.socket) -> int | None:
     if hasattr(socket, "SO_PEERCRED"):
         credentials = connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
         return struct.unpack("3i", credentials)[1]
+    if hasattr(socket, "LOCAL_PEERCRED"):
+        credentials = connection.getsockopt(0, socket.LOCAL_PEERCRED, 8)
+        return struct.unpack("II", credentials)[1]
     return None
 
 
@@ -339,26 +494,16 @@ def main() -> int:
         dispatch_actor_login=policy.dispatch_actor_login,
         graphql_documents=_protected_graphql_documents(),
     )
-    _validate_runtime_directory(_SOCKET_PATH.parent)
-    if _SOCKET_PATH.exists() or _SOCKET_PATH.is_symlink():
-        raise RuntimeError("github_effect_service_socket_exists")
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
-        listener.bind(os.fspath(_SOCKET_PATH))
-        os.chmod(_SOCKET_PATH, 0o600)
-        listener.listen(32)
-        while True:
-            connection, _ = listener.accept()
-            with connection:
-                peer_uid = _peer_uid(connection)
-                if peer_uid is None or peer_uid != _ALLOWED_CLIENT_UID:
-                    continue
-                _serve_connection(
-                    connection,
-                    gateway=gateway,
-                    policy=policy,
-                    state_controller=state_controller,
-                    clock=github._system_clock,
-                )
+    _serve_listener(
+        socket_path=_SOCKET_PATH,
+        allowed_client_uid=_ALLOWED_CLIENT_UID,
+        service_uid=0,
+        gateway=gateway,
+        policy=policy,
+        state_controller=state_controller,
+        clock=github._system_clock,
+        connection_timeout_seconds=_CONNECTION_TIMEOUT_SECONDS,
+    )
 
 
 if __name__ == "__main__":  # pragma: no cover - service manager entrypoint
