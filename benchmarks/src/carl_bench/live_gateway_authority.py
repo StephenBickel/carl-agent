@@ -8,7 +8,6 @@ import os
 import re
 import secrets
 from collections.abc import Callable
-from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -52,6 +51,15 @@ class LiveGatewayAuthorityError(ValueError):
     def __init__(self, code: str) -> None:
         self.code = code
         super().__init__(code)
+
+
+class LiveGatewayFatalPersistenceError(RuntimeError):
+    """Fatal loss of both result and ambiguity persistence after provider execution."""
+
+    code = "live_gateway_result_persistence_fatal"
+
+    def __init__(self) -> None:
+        super().__init__(self.code)
 
 
 def _digest(value: object, code: str) -> str:
@@ -1565,8 +1573,10 @@ class ProtectedModelGatewayServer:
                 _result_document(result),
             )
         except LiveGatewayStateError as error:
-            with suppress(LiveGatewayAuthorityError):
+            try:
                 self._mark_dispatch_ambiguous(grant.token_digest, claim_id)
+            except LiveGatewayAuthorityError as ambiguity_error:
+                raise LiveGatewayFatalPersistenceError() from ambiguity_error
             raise LiveGatewayAuthorityError(error.code) from error
         return result
 

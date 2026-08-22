@@ -22,6 +22,7 @@ from carl_bench.live_execution_receipt import (
 )
 from carl_bench.live_gateway_authority import (
     LiveGatewayAuthorityError,
+    LiveGatewayFatalPersistenceError,
     ProtectedModelGatewayServer,
 )
 from carl_bench.live_gateway_http import _serve_loopback_listener
@@ -1272,6 +1273,30 @@ def test_gateway_listener_thread_failure_is_fatal_to_service(
         monitor.check()
 
     assert isinstance(raised.value.__cause__, RuntimeError)
+
+
+def test_gateway_persistence_fatal_propagates_through_service_health_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from carl_bench import live_gateway_service
+
+    fatal = LiveGatewayFatalPersistenceError()
+
+    def fail_listener(**kwargs: object) -> None:
+        del kwargs
+        raise fatal
+
+    monkeypatch.setattr(live_gateway_service, "_serve_loopback_listener", fail_listener)
+    monitor = live_gateway_service._start_gateway_listener(
+        listener_fd=3,
+        server=object(),
+    )
+    assert monitor.failed.wait(2)
+
+    with pytest.raises(LiveGatewayFatalPersistenceError) as raised:
+        monitor.check()
+
+    assert raised.value is fatal
 
 
 def test_provider_reconciler_advances_expired_claims_without_runner_request() -> None:

@@ -8,6 +8,7 @@ import threading
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 
+from carl_bench.live_gateway_authority import LiveGatewayFatalPersistenceError
 from carl_bench.live_gateway_http import _serve_loopback_listener
 from carl_bench.live_gateway_runner import ProtectedLiveGatewayRunner
 from carl_bench.live_runner_service import _serve_runner_listener
@@ -24,6 +25,8 @@ class _GatewayListenerMonitor:
     def check(self) -> None:
         if self.failed.is_set():
             error = self._errors[0] if self._errors else None
+            if isinstance(error, LiveGatewayFatalPersistenceError):
+                raise error
             raise RuntimeError("live_gateway_listener_failed") from error
         if not self.thread.is_alive():
             raise RuntimeError("live_gateway_listener_failed")

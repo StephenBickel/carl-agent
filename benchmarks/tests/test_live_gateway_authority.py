@@ -20,6 +20,7 @@ from carl_bench.live_capability import (
 from carl_bench.live_gateway_authority import (
     ActualLiveExecution,
     LiveGatewayAuthorityError,
+    LiveGatewayFatalPersistenceError,
     ProtectedModelGatewayServer,
 )
 from carl_bench.live_gateway_http import _serve_loopback_listener
@@ -1019,6 +1020,79 @@ def test_nonfatal_result_persistence_failure_is_reconciled_without_redispatch(
     assert state.failures == 1
 
 
+def test_double_result_persistence_failure_is_fatal_then_reconciles_without_redispatch(
+    tmp_path,
+) -> None:
+    from carl_bench.live_gateway_store import (
+        LiveGatewayStateError,
+        SQLiteLiveGatewayStateStore,
+    )
+
+    class FailResultAndAmbiguityPersistence:
+        def __init__(self, delegate: object) -> None:
+            self.delegate = delegate
+            self.result_failures = 0
+            self.ambiguity_failures = 0
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(self.delegate, name)
+
+        def complete_result(self, *args: object, **kwargs: object) -> None:
+            del args, kwargs
+            self.result_failures += 1
+            raise LiveGatewayStateError("live_gateway_state_unavailable")
+
+        def mark_dispatch_ambiguous(self, *args: object, **kwargs: object) -> None:
+            del args, kwargs
+            self.ambiguity_failures += 1
+            raise LiveGatewayStateError("live_gateway_state_unavailable")
+
+    now = datetime(2026, 8, 22, 12, 0, tzinfo=UTC)
+    state_path = tmp_path / "gateway.sqlite3"
+    gateway = _PinnedGateway()
+    state = FailResultAndAmbiguityPersistence(SQLiteLiveGatewayStateStore._for_testing(state_path))
+    first = ProtectedModelGatewayServer._for_testing(
+        gateway=gateway,
+        endpoint="http://127.0.0.1:43117/v1/evaluate",
+        token_source=lambda: "double-persistence-failure-token-1234567890",
+        state=state,
+        clock=lambda: now,
+        claim_holder=("11111111-1111-4111-8111-111111111111", 61_001, "100"),
+        process_identity=lambda process_id: "100" if process_id == 61_001 else None,
+    )
+    capability = first.issue_observed_capability_for_testing(
+        identity=_identity(),
+        policy=_policy(),
+        task=_task(),
+        subject="candidate",
+        attempt=1,
+    )
+
+    with pytest.raises(
+        LiveGatewayFatalPersistenceError,
+        match="live_gateway_result_persistence_fatal",
+    ) as raised:
+        first.evaluate(capability.token, "held-out prompt")
+
+    assert raised.value.code == "live_gateway_result_persistence_fatal"
+    assert state.result_failures == 1
+    assert state.ambiguity_failures == 1
+    assert len(gateway.requests) == 1
+
+    restarted = ProtectedModelGatewayServer._for_testing(
+        gateway=gateway,
+        endpoint="http://127.0.0.1:43117/v1/evaluate",
+        token_source=lambda: "unused-double-failure-restart-token-1234567890",
+        state=SQLiteLiveGatewayStateStore._for_testing(state_path),
+        clock=lambda: now + timedelta(minutes=2),
+        claim_holder=("11111111-1111-4111-8111-111111111111", 61_002, "200"),
+        process_identity=lambda process_id: None,
+    )
+
+    assert restarted.take_completed_result(capability).output_text == "bounded result"
+    assert len(gateway.requests) == 1
+
+
 def test_lost_provider_response_is_recovered_without_a_second_create(tmp_path) -> None:
     from carl_bench.live_gateway_store import SQLiteLiveGatewayStateStore
 
@@ -1566,6 +1640,119 @@ def _serve_gateway_process(
         maximum_connections=2,
         on_ready=ready.set,
     )
+
+
+def _serve_one_gateway_request(
+    listener: socket.socket,
+    server: ProtectedModelGatewayServer,
+    ready: object,
+) -> None:
+    _serve_loopback_listener(
+        listener_fd=listener.fileno(),
+        server=server,
+        maximum_connections=1,
+        on_ready=ready.set,
+    )
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires inherited loopback listener")
+def test_gateway_process_exits_without_response_after_double_persistence_failure(
+    tmp_path,
+) -> None:
+    from carl_bench.live_gateway_store import (
+        LiveGatewayStateError,
+        SQLiteLiveGatewayStateStore,
+    )
+
+    class CountedGateway(_PinnedGateway):
+        def __init__(self, calls: object) -> None:
+            super().__init__()
+            self.calls = calls
+
+        def dispatch_reconciled(
+            self, request: OpenAIModelRequest, operation: object
+        ) -> ProtectedOpenAIModelResult:
+            with self.calls.get_lock():
+                self.calls.value += 1
+            return super().dispatch_reconciled(request, operation)
+
+    class FailResultAndAmbiguityPersistence:
+        def __init__(self, delegate: object) -> None:
+            self.delegate = delegate
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(self.delegate, name)
+
+        def complete_result(self, *args: object, **kwargs: object) -> None:
+            del args, kwargs
+            raise LiveGatewayStateError("live_gateway_state_unavailable")
+
+        def mark_dispatch_ambiguous(self, *args: object, **kwargs: object) -> None:
+            del args, kwargs
+            raise LiveGatewayStateError("live_gateway_state_unavailable")
+
+    context = multiprocessing.get_context("fork")
+    calls = context.Value("i", 0)
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    port = listener.getsockname()[1]
+    gateway = CountedGateway(calls)
+    server = ProtectedModelGatewayServer._for_testing(
+        gateway=gateway,
+        endpoint=f"http://127.0.0.1:{port}/v1/evaluate",
+        token_source=lambda: "fatal-process-token-1234567890",
+        state=FailResultAndAmbiguityPersistence(
+            SQLiteLiveGatewayStateStore._for_testing(tmp_path / "gateway.sqlite3")
+        ),
+    )
+    capability = server.issue_observed_capability_for_testing(
+        identity=_identity(),
+        policy=_policy(),
+        task=_task(),
+        subject="candidate",
+        attempt=1,
+    )
+    ready = context.Event()
+    process = context.Process(
+        target=_serve_one_gateway_request,
+        args=(listener, server, ready),
+    )
+    process.start()
+    response = bytearray()
+    try:
+        assert ready.wait(2)
+        body = canonical_json_bytes({"input": "held-out prompt"})
+        request = (
+            b"POST /v1/evaluate HTTP/1.1\r\n"
+            + f"Host: 127.0.0.1:{port}\r\n".encode()
+            + f"Authorization: Bearer {capability.token}\r\n".encode()
+            + b"Content-Type: application/json\r\n"
+            + f"Content-Length: {len(body)}\r\n".encode()
+            + b"Connection: close\r\n\r\n"
+            + body
+        )
+        with socket.create_connection(("127.0.0.1", port), timeout=2) as connection:
+            connection.sendall(request)
+            while True:
+                try:
+                    chunk = connection.recv(65_536)
+                except ConnectionResetError:
+                    break
+                if not chunk:
+                    break
+                response.extend(chunk)
+        process.join(3)
+    finally:
+        if process.is_alive():
+            process.terminate()
+            process.join(2)
+        listener.close()
+
+    assert bytes(response) == b""
+    assert calls.value == 1
+    assert process.exitcode not in {None, 0}
 
 
 @pytest.mark.skipif(os.name == "nt", reason="requires inherited loopback listener")
