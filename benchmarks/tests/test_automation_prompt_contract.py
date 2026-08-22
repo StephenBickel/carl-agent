@@ -591,3 +591,127 @@ def test_workflow_contract_binds_each_consumer_option_to_its_resolved_output() -
     assert duplicate_option != soak
     with pytest.raises(AssertionError):
         _assert_immutable_consumer_contract(duplicate_option, mode="soak")
+
+
+def _workflow_job_blocks(document: str) -> dict[str, str]:
+    jobs = document.split("\njobs:\n", 1)[1]
+    matches = list(re.finditer(r"(?m)^  ([a-z][a-z0-9_-]*):\n", jobs))
+    return {
+        match.group(1): jobs[match.start() : matches[index + 1].start()]
+        if index + 1 < len(matches)
+        else jobs[match.start() :]
+        for index, match in enumerate(matches)
+    }
+
+
+def _job_environment(block: str) -> str:
+    match = re.search(r"(?m)^    environment: ([a-z0-9-]+)$", block)
+    assert match is not None
+    return match.group(1)
+
+
+def _job_permissions(block: str) -> dict[str, str]:
+    match = re.search(r"(?m)^    permissions:\n(?P<body>(?:      [a-z-]+: [a-z]+\n)+)", block)
+    assert match is not None
+    return dict(re.findall(r"(?m)^      ([a-z-]+): ([a-z]+)$", match.group("body")))
+
+
+def test_protected_workflows_separate_cloud_authorities_and_close_permissions() -> None:
+    improvement = _workflow_job_blocks(IMPROVEMENT_WORKFLOW_PATH.read_text(encoding="utf-8"))
+    soak = _workflow_job_blocks(SOAK_WORKFLOW_PATH.read_text(encoding="utf-8"))
+
+    expected_improvement = {
+        "commission": ("carl-autonomy-builder", {"contents": "read"}),
+        "evaluate": ("carl-autonomy-subject", {"contents": "read"}),
+        "publish_private_inputs": (
+            "carl-autonomy-validator",
+            {"contents": "read", "id-token": "write"},
+        ),
+        "live_validation": (
+            "carl-autonomy-validator",
+            {"contents": "read", "id-token": "write"},
+        ),
+        "evidence": (
+            "carl-autonomy-observer",
+            {"contents": "read", "id-token": "write"},
+        ),
+        "promotion_handoff": ("carl-autonomy-promoter", {"contents": "read"}),
+    }
+    expected_soak = {
+        "commission": ("carl-autonomy-soak", {"contents": "read"}),
+        "evaluate": ("carl-autonomy-subject", {"contents": "read"}),
+        "live_soak": (
+            "carl-autonomy-soak",
+            {"contents": "read", "id-token": "write"},
+        ),
+        "evidence": (
+            "carl-autonomy-observer",
+            {"contents": "read", "id-token": "write"},
+        ),
+        "rollback_handoff": ("carl-autonomy-promoter", {"contents": "read"}),
+    }
+    for jobs, expected in ((improvement, expected_improvement), (soak, expected_soak)):
+        assert set(jobs) == set(expected)
+        for job, (environment, permissions) in expected.items():
+            assert _job_environment(jobs[job]) == environment
+            assert _job_permissions(jobs[job]) == permissions
+        oidc_jobs = {job for job, block in jobs.items() if "id-token: write" in block}
+        assert oidc_jobs == {
+            job for job, (_, permissions) in expected.items() if "id-token" in permissions
+        }
+
+
+def test_improvement_workflow_uses_protected_live_observe_archive_ingest_chain() -> None:
+    document = IMPROVEMENT_WORKFLOW_PATH.read_text(encoding="utf-8")
+    jobs = _workflow_job_blocks(document)
+
+    assert "cloud publish-input" in jobs["publish_private_inputs"]
+    assert "cloud commission-live" in jobs["live_validation"]
+    handoff = jobs["evidence"]
+    for node in ("observe_validation", "archive_validation", "ingest_validation"):
+        assert f"PROTECTED_NODE={node}" in handoff
+    assert handoff.count("run_node observe ") == 2
+    assert handoff.count("run_node ingest ") == 1
+    assert "cloud coordinate" in jobs["promotion_handoff"]
+    assert "GITHUB_TOKEN" not in jobs["promotion_handoff"]
+    assert "live_acp_credential_missing" not in document
+    assert 'get("eligible") is not False' not in document
+    assert "PAIRED_RESULT_PAYLOAD_B64" not in document
+    assert "OPENAI_API_KEY" not in jobs["evaluate"]
+    assert "secrets." not in jobs["evaluate"]
+    assert "id-token: write" not in jobs["evaluate"]
+
+
+def test_soak_workflow_is_six_hour_exact_merge_bound_and_protected() -> None:
+    document = SOAK_WORKFLOW_PATH.read_text(encoding="utf-8")
+    jobs = _workflow_job_blocks(document)
+
+    assert 'SOAK_CADENCE_HOURS: "6"' in document
+    assert 'test "$SOAK_CADENCE_HOURS" = "6"' in jobs["commission"]
+    assert "rev-list --parents -n 1" in jobs["commission"]
+    assert 'test "${MERGE_TOPOLOGY[1]}" = "$PARENT_COMMIT"' in jobs["commission"]
+    assert "run_node commission-live observe_soak" in jobs["live_soak"]
+    handoff = jobs["evidence"]
+    for node in ("observe_soak", "accept_soak"):
+        assert f"PROTECTED_NODE={node}" in handoff
+    assert "archive sign and ingest" in handoff
+    assert "cloud health" in jobs["rollback_handoff"]
+    assert "GITHUB_TOKEN" not in jobs["rollback_handoff"]
+    assert "github.sha" not in jobs["live_soak"]
+    assert "inputs.candidate_commit" in jobs["live_soak"]
+
+
+def test_each_protected_workflow_uploads_one_bounded_request_named_artifact() -> None:
+    for path, prefix in (
+        (IMPROVEMENT_WORKFLOW_PATH, "autonomous-improvement-evidence"),
+        (SOAK_WORKFLOW_PATH, "autonomous-soak-observation"),
+    ):
+        document = path.read_text(encoding="utf-8")
+        assert document.count("actions/upload-artifact@") == 1
+        assert f"name: {prefix}-${{{{ inputs.request_digest }}}}" in document
+        assert "MAX_PUBLIC_HANDOFF_BYTES: 1048576" in document
+        assert '"provider"' not in document
+        assert '"model"' not in document
+        assert "secret" not in "\n".join(
+            line.lower() for line in document.splitlines() if "cloud-handoff" in line
+        )

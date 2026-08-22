@@ -17,7 +17,7 @@ run-name: ${{ inputs.attempt_key }}
         required: true
         type: string
       candidate_commit:
-        description: Exact two-parent merge commit to observe
+        description: Exact two-parent production merge commit
         required: true
         type: string
       task_set_digest:
@@ -44,7 +44,6 @@ run-name: ${{ inputs.attempt_key }}
         description: Exact protected workflow file SHA-256
         required: true
         type: string
-
 permissions:
   contents: read
 
@@ -54,12 +53,12 @@ concurrency:
 
 jobs:
   commission:
-    name: Validate workflow, inputs, and exact merge topology
+    name: Bind exact merge topology and six-hour cadence
+    environment: carl-autonomy-soak
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    outputs:
-      trusted_inputs_digest: ${{ steps.inputs.outputs.trusted_inputs_digest }}
-      topology_digest: ${{ steps.topology.outputs.topology_digest }}
     steps:
       - name: Check out the protected parent
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -68,15 +67,14 @@ jobs:
           path: trusted-source
           fetch-depth: 1
           persist-credentials: false
-      - name: Check out the exact merge commit
+      - name: Check out the exact production merge
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           ref: ${{ inputs.candidate_commit }}
           path: merge-source
           fetch-depth: 2
           persist-credentials: false
-      - name: Validate request and exact immediate-parent topology
-        id: topology
+      - name: Validate request cadence and immediate-parent topology
         env:
           ATTEMPT_KEY: ${{ inputs.attempt_key }}
           CANDIDATE_COMMIT: ${{ inputs.candidate_commit }}
@@ -87,6 +85,7 @@ jobs:
           REPOSITORY: ${{ github.repository }}
           REQUEST_DIGEST: ${{ inputs.request_digest }}
           RUN_HEAD_SHA: ${{ github.sha }}
+          SOAK_CADENCE_HOURS: "6"
           TASK_SET_DIGEST: ${{ inputs.task_set_digest }}
           WORKFLOW_BLOB_DIGEST: ${{ inputs.workflow_blob_digest }}
           WORKFLOW_PATH: .github/workflows/autonomous-soak.yml
@@ -95,6 +94,7 @@ jobs:
           WORKFLOW_SHA: ${{ github.workflow_sha }}
         run: |
           set -euo pipefail
+          test "$SOAK_CADENCE_HOURS" = "6"
           test "$RUN_HEAD_SHA" = "$WORKFLOW_REVISION"
           test "$WORKFLOW_SHA" = "$WORKFLOW_REVISION"
           test "${WORKFLOW_REF%%@*}" = "$REPOSITORY/$WORKFLOW_PATH"
@@ -106,10 +106,6 @@ jobs:
           test "${#MERGE_TOPOLOGY[@]}" -eq 3
           test "${MERGE_TOPOLOGY[0]}" = "$CANDIDATE_COMMIT"
           test "${MERGE_TOPOLOGY[1]}" = "$PARENT_COMMIT"
-          printf '%s\n' "${MERGE_TOPOLOGY[*]}" | sha256sum | {
-            read -r digest rest
-            printf 'topology_digest=%s\n' "$digest" >> "$GITHUB_OUTPUT"
-          }
           python3 - <<'PY'
           import hashlib, json, os, re
           digest = re.compile(r"[0-9a-f]{64}\Z")
@@ -119,10 +115,8 @@ jobs:
               if not digest.fullmatch(os.environ[name]): raise SystemExit(f"invalid {name.lower()}")
           for name in ("PARENT_COMMIT", "CANDIDATE_COMMIT", "WORKFLOW_REVISION"):
               if not commit.fullmatch(os.environ[name]): raise SystemExit(f"invalid {name.lower()}")
-          attempt_prefix = f"cloud-run-{os.environ['REQUEST_DIGEST']}-attempt-"
-          if os.environ["ATTEMPT_KEY"] not in {
-              attempt_prefix + "1", attempt_prefix + "2", attempt_prefix + "3"
-          }:
+          prefix = f"cloud-run-{os.environ['REQUEST_DIGEST']}-attempt-"
+          if os.environ["ATTEMPT_KEY"] not in {prefix + "1", prefix + "2", prefix + "3"}:
               raise SystemExit("attempt_key mismatch")
           payload = {
               "candidate_commit": os.environ["CANDIDATE_COMMIT"],
@@ -130,7 +124,8 @@ jobs:
               "metric_pack_digest": os.environ["METRIC_PACK_DIGEST"],
               "parent_commit": os.environ["PARENT_COMMIT"],
               "policy_digest": os.environ["POLICY_DIGEST"],
-              "repository": os.environ["REPOSITORY"], "schema_version": 1,
+              "repository": os.environ["REPOSITORY"],
+              "schema_version": 1,
               "task_set_digest": os.environ["TASK_SET_DIGEST"],
               "workflow_file": "autonomous-soak.yml",
               "workflow_revision": os.environ["WORKFLOW_REVISION"],
@@ -146,37 +141,15 @@ jobs:
           go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7 \
             .github/workflows/autonomous-improvement.yml \
             .github/workflows/autonomous-soak.yml
-      - name: Resolve and verify protected immutable inputs
-        id: inputs
-        env:
-          EXPERIMENT_DIGEST: ${{ inputs.experiment_digest }}
-          METRIC_PACK_DIGEST: ${{ inputs.metric_pack_digest }}
-          POLICY_DIGEST: ${{ inputs.policy_digest }}
-          TASK_SET_DIGEST: ${{ inputs.task_set_digest }}
-        run: |
-          set -euo pipefail
-          resolved="$RUNNER_TEMP/immutable-inputs"; mkdir -p "$resolved"
-          aggregate="$(
-            PYTHONPATH=trusted-source/benchmarks/src python -m carl_bench.immutable_inputs resolve-set \
-              --registry trusted-source/benchmarks/immutable-inputs/registry.json \
-              --root trusted-source/benchmarks/immutable-inputs \
-              --mode soak \
-              --task-media-type application/vnd.carl.soak-task-set+tar \
-              --experiment-digest "$EXPERIMENT_DIGEST" \
-              --task-set-digest "$TASK_SET_DIGEST" \
-              --metric-pack-digest "$METRIC_PACK_DIGEST" \
-              --policy-digest "$POLICY_DIGEST" \
-              --output-dir "$resolved"
-          )"
-          printf 'trusted_inputs_digest=%s\n' "$aggregate" >> "$GITHUB_OUTPUT"
 
   evaluate:
-    name: Run merge-bound health probes in isolated subject
+    name: Run merge-bound probes without protected credentials
     needs: [commission]
+    environment: carl-autonomy-subject
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
     timeout-minutes: 60
-    outputs:
-      health_result_digest: ${{ steps.health.outputs.health_result_digest }}
     steps:
       - name: Check out trusted harness from protected parent
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -209,8 +182,7 @@ jobs:
           TASK_SET_DIGEST: ${{ inputs.task_set_digest }}
         run: |
           set -euo pipefail
-          resolved="$RUNNER_TEMP/immutable-inputs"
-          mkdir -p "$resolved"
+          resolved="$RUNNER_TEMP/immutable-inputs"; mkdir -p "$resolved"
           PYTHONPATH=trusted-source/benchmarks/src python -m carl_bench.immutable_inputs resolve-set \
             --registry trusted-source/benchmarks/immutable-inputs/registry.json \
             --root trusted-source/benchmarks/immutable-inputs \
@@ -222,10 +194,10 @@ jobs:
             --policy-digest "$POLICY_DIGEST" \
             --output-dir "$resolved" >/dev/null
           printf '%s  %s\n' \
-            "$EXPERIMENT_DIGEST" "$RUNNER_TEMP/immutable-inputs/experiment" \
-            "$TASK_SET_DIGEST" "$RUNNER_TEMP/immutable-inputs/task-set" \
-            "$METRIC_PACK_DIGEST" "$RUNNER_TEMP/immutable-inputs/metric-pack" \
-            "$POLICY_DIGEST" "$RUNNER_TEMP/immutable-inputs/policy" \
+            "$EXPERIMENT_DIGEST" "$resolved/experiment" \
+            "$TASK_SET_DIGEST" "$resolved/task-set" \
+            "$METRIC_PACK_DIGEST" "$resolved/metric-pack" \
+            "$POLICY_DIGEST" "$resolved/policy" \
             | sha256sum --check --strict -
           printf 'experiment=%s\n' "$resolved/experiment" >> "$GITHUB_OUTPUT"
           printf 'task_set=%s\n' "$resolved/task-set" >> "$GITHUB_OUTPUT"
@@ -248,8 +220,8 @@ jobs:
           rm -rf -- "$eval_root/benchmarks/tests" "$eval_root/benchmarks/tasks/dev"
           cp -R -- trusted-source/benchmarks/tests "$eval_root/benchmarks/tests"
           mkdir -p "$eval_root/benchmarks/tasks/dev"
-          tar --extract --file "$TASK_SET_INPUT" \
-            --directory "$eval_root/benchmarks/tasks/dev" --no-same-owner --no-same-permissions
+          tar --extract --file "$TASK_SET_INPUT" --directory "$eval_root/benchmarks/tasks/dev" \
+            --no-same-owner --no-same-permissions
           cp -- trusted-source/scripts/benchmark-smoke.sh "$eval_root/scripts/benchmark-smoke.sh"
           chmod -R a-w "$eval_root"
           mkdir -p "$sandbox/home" "$sandbox/tmp" "$sandbox/cargo" "$sandbox/target" "$sandbox/uv"
@@ -257,99 +229,171 @@ jobs:
           run_subject() {
             sudo -u nobody env -i HOME="$sandbox/home" PATH="$PATH" TMPDIR="$sandbox/tmp" \
               CARGO_HOME="$sandbox/cargo" CARGO_TARGET_DIR="$sandbox/target" \
-              RUSTUP_HOME="$RUSTUP_HOME" UV_CACHE_DIR="$sandbox/uv" \
-              PYTHONDONTWRITEBYTECODE=1 \
-              PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
-              UV_PROJECT_ENVIRONMENT="$sandbox/venv" SUBJECT_ROOT="$eval_root" \
-              bash --noprofile --norc -c "$1"
+              RUSTUP_HOME="$RUSTUP_HOME" UV_CACHE_DIR="$sandbox/uv" PYTHONDONTWRITEBYTECODE=1 \
+              PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 UV_PROJECT_ENVIRONMENT="$sandbox/venv" \
+              SUBJECT_ROOT="$eval_root" bash --noprofile --norc -c "$1"
           }
           rust_contracts=false
-          if run_subject 'set -euo pipefail; cd "$SUBJECT_ROOT"; \
-            cargo +1.97.0 test --locked --test workflow_contract --test docs_contract'; then
-            rust_contracts=true
-          fi
+          if run_subject 'set -euo pipefail; cd "$SUBJECT_ROOT"; cargo +1.97.0 test --locked --test workflow_contract --test docs_contract'; then rust_contracts=true; fi
           python_contracts=false
-          if run_subject 'set -euo pipefail; cd "$SUBJECT_ROOT"; \
-            uv sync --project benchmarks --python 3.12 --locked; \
-            uv run --offline --project benchmarks --locked pytest -q \
-              -c /dev/null -p no:cacheprovider \
-              benchmarks/tests/test_integration_contract.py \
-              benchmarks/tests/test_cloud_execution.py'; then
-            python_contracts=true
-          fi
+          if run_subject 'set -euo pipefail; cd "$SUBJECT_ROOT"; uv sync --project benchmarks --python 3.12 --locked; uv run --offline --project benchmarks --locked pytest -q -c /dev/null -p no:cacheprovider benchmarks/tests/test_integration_contract.py benchmarks/tests/test_cloud_execution.py'; then python_contracts=true; fi
           benchmark_smoke=false
-          if run_subject 'set -euo pipefail; cd "$SUBJECT_ROOT"; \
-            ./scripts/benchmark-smoke.sh'; then
-            benchmark_smoke=true
-          fi
+          if run_subject 'set -euo pipefail; cd "$SUBJECT_ROOT"; ./scripts/benchmark-smoke.sh'; then benchmark_smoke=true; fi
           observations="$RUNNER_TEMP/soak-observations.json"
           printf '{"benchmark-smoke":%s,"python-contracts":%s,"rust-contracts":%s}' \
-            "$benchmark_smoke" "$python_contracts" "$rust_contracts" \
-            > "$observations"
-          result="$RUNNER_TEMP/health-result.json"
+            "$benchmark_smoke" "$python_contracts" "$rust_contracts" > "$observations"
           PYTHONPATH=trusted-source/benchmarks/src python -m carl_bench.immutable_inputs soak-health \
-            --experiment "$EXPERIMENT_INPUT" \
-            --task-set "$TASK_SET_INPUT" \
-            --metric-pack "$METRIC_PACK_INPUT" \
-            --policy "$POLICY_INPUT" \
-            --observations "$observations" \
-            --output "$result"
-          printf 'health_result_digest=%s\n' "$(sha256sum "$result" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+            --experiment "$EXPERIMENT_INPUT" --task-set "$TASK_SET_INPUT" \
+            --metric-pack "$METRIC_PACK_INPUT" --policy "$POLICY_INPUT" \
+            --observations "$observations" --output "$RUNNER_TEMP/health-result.json"
 
-  evidence:
-    name: Create trusted bounded soak evidence
+  live_soak:
+    name: Require commissioned durable provider reconciliation
     needs: [commission, evaluate]
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
+    environment: carl-autonomy-soak
+    permissions:
+      contents: read
+      id-token: write
+    runs-on: [self-hosted, linux, x64, carl-autonomy-cloud]
+    timeout-minutes: 60
     steps:
-      - name: Write fresh trusted merge observation
+      - name: Retrieve protected soak inputs and execute exact merge observation
         env:
-          EXPERIMENT_DIGEST: ${{ inputs.experiment_digest }}
-          HEALTH_RESULT_DIGEST: ${{ needs.evaluate.outputs.health_result_digest }}
-          MERGE_COMMIT: ${{ inputs.candidate_commit }}
-          METRIC_PACK_DIGEST: ${{ inputs.metric_pack_digest }}
+          ATTEMPT_KEY: ${{ inputs.attempt_key }}
+          CANDIDATE_COMMIT: ${{ inputs.candidate_commit }}
           PARENT_COMMIT: ${{ inputs.parent_commit }}
-          POLICY_DIGEST: ${{ inputs.policy_digest }}
-          REPOSITORY: ${{ github.repository }}
           REQUEST_DIGEST: ${{ inputs.request_digest }}
-          RUN_ID: ${{ github.run_id }}
-          TASK_SET_DIGEST: ${{ inputs.task_set_digest }}
-          TOPOLOGY_DIGEST: ${{ needs.commission.outputs.topology_digest }}
-          TRUSTED_INPUTS_DIGEST: ${{ needs.commission.outputs.trusted_inputs_digest }}
-          WORKFLOW_BLOB_DIGEST: ${{ inputs.workflow_blob_digest }}
+          SOAK_CADENCE_HOURS: "6"
           WORKFLOW_REVISION: ${{ inputs.workflow_revision }}
         run: |
-          mkdir -p cloud-evidence
+          set -euo pipefail
+          test "$SOAK_CADENCE_HOURS" = "6"
+          run_node() {
+            command="$1"; expected="$2"; output="$RUNNER_TEMP/$expected.json"
+            set +e
+            /opt/carl-autonomy/venv/bin/python3 -I -m carl_bench.cli cloud "$command" > "$output"
+            status=$?
+            set -e
+            python3 - "$output" "$expected" <<'PY'
+          import json, pathlib, sys
+          raw = pathlib.Path(sys.argv[1]).read_bytes()
+          if not 0 < len(raw) <= 16384: raise SystemExit("protected cloud coordinator decision size")
+          value = json.loads(raw)
+          if value.get("node") not in (None, sys.argv[2]): raise SystemExit("protected node mismatch")
+          action = value.get("action")
+          if action == 'frozen':
+              raise SystemExit(2)
+          PY
+            test "$status" -eq 0
+          }
+          PROTECTED_NODE=publish_input run_node publish-input publish_input
+          PROTECTED_NODE=observe_soak run_node commission-live observe_soak
+
+  evidence:
+    name: Independently observe archive sign and ingest exact merge evidence
+    needs: [live_soak]
+    environment: carl-autonomy-observer
+    permissions:
+      contents: read
+      id-token: write
+    runs-on: [self-hosted, linux, x64, carl-autonomy-cloud]
+    timeout-minutes: 20
+    steps:
+      - name: Complete protected soak evidence and acceptance handoffs
+        env:
+          ATTEMPT_KEY: ${{ inputs.attempt_key }}
+          CANDIDATE_COMMIT: ${{ inputs.candidate_commit }}
+          MAX_PUBLIC_HANDOFF_BYTES: 1048576
+          PARENT_COMMIT: ${{ inputs.parent_commit }}
+          REQUEST_DIGEST: ${{ inputs.request_digest }}
+          SOAK_CADENCE_HOURS: "6"
+          WORKFLOW_REVISION: ${{ inputs.workflow_revision }}
+        run: |
+          set -euo pipefail
+          mkdir -p cloud-handoff
+          run_node() {
+            expected="$1"; output="cloud-handoff/$expected.json"
+            set +e
+            /opt/carl-autonomy/venv/bin/python3 -I -m carl_bench.cli cloud commission-live > "$output"
+            status=$?
+            set -e
+            python3 - "$output" "$expected" <<'PY'
+          import json, pathlib, sys
+          raw = pathlib.Path(sys.argv[1]).read_bytes()
+          if not 0 < len(raw) <= 16384: raise SystemExit("protected cloud coordinator decision size")
+          value = json.loads(raw)
+          if value.get("node") not in (None, sys.argv[2]): raise SystemExit("protected node mismatch")
+          action = value.get("action")
+          if action == 'frozen':
+              raise SystemExit(2)
+          PY
+            test "$status" -eq 0
+          }
+          PROTECTED_NODE=observe_soak run_node observe_soak
+          PROTECTED_NODE=accept_soak run_node accept_soak
           python3 - <<'PY'
           import json, os, pathlib
-          evidence = {
-              "experiment_digest": os.environ["EXPERIMENT_DIGEST"],
-              "health_result_digest": os.environ["HEALTH_RESULT_DIGEST"],
-              "kind": "autonomous_soak_observation", "merge_commit": os.environ["MERGE_COMMIT"],
-              "metric_pack_digest": os.environ["METRIC_PACK_DIGEST"],
+          root = pathlib.Path("cloud-handoff")
+          names = ("accept_soak", "observe_soak")
+          handoff = {
+              "attempt_key": os.environ["ATTEMPT_KEY"],
+              "cadence_hours": 6,
+              "decisions": {name: json.loads((root / f"{name}.json").read_text()) for name in names},
+              "kind": "protected_soak_handoff",
+              "merge_commit": os.environ["CANDIDATE_COMMIT"],
               "parent_commit": os.environ["PARENT_COMMIT"],
-              "policy_digest": os.environ["POLICY_DIGEST"],
-              "repository": os.environ["REPOSITORY"],
               "request_digest": os.environ["REQUEST_DIGEST"],
-              "run_id": int(os.environ["RUN_ID"]), "schema_version": 2,
-              "task_set_digest": os.environ["TASK_SET_DIGEST"],
-              "topology_digest": os.environ["TOPOLOGY_DIGEST"],
-              "trusted_inputs_digest": os.environ["TRUSTED_INPUTS_DIGEST"],
-              "workflow_file": "autonomous-soak.yml",
+              "schema_version": 1,
               "workflow_revision": os.environ["WORKFLOW_REVISION"],
-              "workflow_blob_digest": os.environ["WORKFLOW_BLOB_DIGEST"],
           }
-          target = pathlib.Path("cloud-evidence/autonomous-soak.json")
-          target.write_text(json.dumps(evidence, sort_keys=True, separators=(",", ":")) + "\n")
-          if target.stat().st_size > 1_048_576: raise SystemExit("observation exceeds bound")
+          target = root / f"autonomous-soak-{os.environ['REQUEST_DIGEST']}.json"
+          target.write_text(json.dumps(handoff, sort_keys=True, separators=(",", ":")) + "\n")
+          if target.stat().st_size > min(int(os.environ["MAX_PUBLIC_HANDOFF_BYTES"]), 1_048_576):
+              raise SystemExit("public handoff exceeds bound")
           PY
       - name: Upload the one request-named soak artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: autonomous-soak-observation-${{ inputs.request_digest }}
-          path: cloud-evidence/autonomous-soak.json
+          path: cloud-handoff/autonomous-soak-${{ inputs.request_digest }}.json
           if-no-files-found: error
           retention-days: 7
           compression-level: 9
           overwrite: false
           include-hidden-files: false
+
+  rollback_handoff:
+    name: Explicitly dispatch protected rollback health recovery
+    needs: [evidence]
+    environment: carl-autonomy-promoter
+    permissions:
+      contents: read
+    runs-on: [self-hosted, linux, x64, carl-autonomy-cloud]
+    timeout-minutes: 10
+    steps:
+      - name: Dispatch without default token recursion
+        env:
+          ATTEMPT_KEY: ${{ inputs.attempt_key }}
+          CANDIDATE_COMMIT: ${{ inputs.candidate_commit }}
+          PARENT_COMMIT: ${{ inputs.parent_commit }}
+          PROTECTED_NODE: trigger_supervisor
+          REQUEST_DIGEST: ${{ inputs.request_digest }}
+          WORKFLOW_REVISION: ${{ inputs.workflow_revision }}
+        run: |
+          set -euo pipefail
+          output="$RUNNER_TEMP/rollback-handoff.json"
+          set +e
+          /opt/carl-autonomy/venv/bin/python3 -I -m carl_bench.cli cloud health > "$output"
+          status=$?
+          set -e
+          python3 - "$output" "$PROTECTED_NODE" <<'PY'
+          import json, pathlib, sys
+          raw = pathlib.Path(sys.argv[1]).read_bytes()
+          if not 0 < len(raw) <= 16384: raise SystemExit("protected cloud coordinator decision size")
+          value = json.loads(raw)
+          if value.get("node") not in (None, sys.argv[2]): raise SystemExit("protected node mismatch")
+          action = value.get("action")
+          if action == 'frozen':
+              raise SystemExit(2)
+          PY
+          test "$status" -eq 0

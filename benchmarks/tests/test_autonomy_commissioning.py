@@ -3947,3 +3947,37 @@ def test_synthetic_commissioning_artifacts_cannot_claim_remote_acceptance_or_liv
             automation_data_root=REPOSITORY_ROOT / ".private-commissioning",
             repository_root=REPOSITORY_ROOT,
         )
+
+
+def test_live_workflows_require_durable_provider_reconciliation_and_never_fake_success() -> None:
+    improvement = (REPOSITORY_ROOT / ".github/workflows/autonomous-improvement.yml").read_text(
+        encoding="utf-8"
+    )
+    soak = (REPOSITORY_ROOT / ".github/workflows/autonomous-soak.yml").read_text(encoding="utf-8")
+
+    for workflow in (improvement, soak):
+        assert "Require commissioned durable provider reconciliation" in workflow
+        assert "cloud commission-live" in workflow
+        assert "direct-openai" not in workflow.lower()
+        assert "OPENAI_API_KEY" not in workflow
+        assert "synthetic" not in workflow.lower()
+        assert "hard-coded" not in workflow.lower()
+        assert "action == 'frozen'" in workflow
+        assert "raise SystemExit(2)" in workflow
+
+
+def test_protected_workflow_handoffs_bind_request_attempt_parent_and_exact_subject() -> None:
+    for workflow_name in ("autonomous-improvement.yml", "autonomous-soak.yml"):
+        workflow = (REPOSITORY_ROOT / ".github/workflows" / workflow_name).read_text(
+            encoding="utf-8"
+        )
+        for binding in (
+            "ATTEMPT_KEY: ${{ inputs.attempt_key }}",
+            "CANDIDATE_COMMIT: ${{ inputs.candidate_commit }}",
+            "PARENT_COMMIT: ${{ inputs.parent_commit }}",
+            "REQUEST_DIGEST: ${{ inputs.request_digest }}",
+            "WORKFLOW_REVISION: ${{ inputs.workflow_revision }}",
+        ):
+            assert workflow.count(binding) >= 2, (workflow_name, binding)
+        assert "cloud_configuration_unavailable" not in workflow
+        assert "protected cloud coordinator decision" in workflow.lower()

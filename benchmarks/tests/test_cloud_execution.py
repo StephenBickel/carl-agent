@@ -1486,7 +1486,9 @@ def test_workflow_dispatch_contract_is_parsed_and_immutable(name: str) -> None:
     assert workflow["permissions"] == {"contents": "read"}
     jobs = _jobs(workflow)
     assert set(jobs) >= {"commission", "evaluate", "evidence"}
-    assert jobs["evidence"]["needs"] == ["commission", "evaluate"]
+    assert jobs["evidence"]["needs"] == [
+        "live_validation" if name == "autonomous-improvement.yml" else "live_soak"
+    ]
     actions = [
         step["uses"]
         for job in jobs.values()
@@ -1495,9 +1497,27 @@ def test_workflow_dispatch_contract_is_parsed_and_immutable(name: str) -> None:
     ]
     assert set(actions) == PINNED_ACTIONS
     assert all(re.fullmatch(r"[\w.-]+/[\w.-]+@[0-9a-f]{40}", action) for action in actions)
-    for job in jobs.values():
-        assert "permissions" not in job
-        assert job["runs-on"] == "ubuntu-latest"
+    oidc_jobs = {
+        "autonomous-improvement.yml": {
+            "publish_private_inputs",
+            "live_validation",
+            "evidence",
+        },
+        "autonomous-soak.yml": {"live_soak", "evidence"},
+    }[name]
+    protected_jobs = oidc_jobs | {
+        "promotion_handoff" if name == "autonomous-improvement.yml" else "rollback_handoff"
+    }
+    for job_name, job in jobs.items():
+        expected_permissions = {"contents": "read"}
+        if job_name in oidc_jobs:
+            expected_permissions["id-token"] = "write"
+        assert job["permissions"] == expected_permissions
+        assert job["runs-on"] == (
+            ["self-hosted", "linux", "x64", "carl-autonomy-cloud"]
+            if job_name in protected_jobs
+            else "ubuntu-latest"
+        )
         assert isinstance(job["timeout-minutes"], int)
         assert job["timeout-minutes"] <= 60
         for step in job["steps"]:
@@ -1626,11 +1646,12 @@ def test_improvement_workflow_runs_real_exact_parent_candidate_pair() -> None:
     evidence_commands = "\n".join(
         step["run"] for step in jobs["evidence"]["steps"] if "run" in step
     )
-    assert '"paired_result": result' in evidence_commands
-    assert 'result.get("parent", {}).get("binary_digest")' in evidence_commands
-    assert 'result.get("candidate", {}).get("binary_digest")' in evidence_commands
-    assert "live_acp_credential_missing" in evidence
-    assert jobs["evidence"]["needs"] == ["commission", "evaluate"]
+    assert '"decisions"' in evidence_commands
+    assert "observe_validation" in evidence_commands
+    assert "archive_validation" in evidence_commands
+    assert "ingest_validation" in evidence_commands
+    assert "live_acp_credential_missing" not in evidence
+    assert jobs["evidence"]["needs"] == ["live_validation"]
 
 
 def test_improvement_workflow_runs_locked_suites_and_uploads_bounded_evidence() -> None:

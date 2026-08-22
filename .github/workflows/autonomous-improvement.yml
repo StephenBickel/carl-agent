@@ -13,11 +13,11 @@ run-name: ${{ inputs.attempt_key }}
         required: true
         type: string
       parent_commit:
-        description: Exact parent commit
+        description: Exact protected parent commit
         required: true
         type: string
       candidate_commit:
-        description: Exact candidate commit
+        description: Exact immutable candidate commit
         required: true
         type: string
       task_set_digest:
@@ -54,11 +54,12 @@ concurrency:
 
 jobs:
   commission:
-    name: Validate trusted workflow and immutable inputs
+    name: Bind immutable builder handoff
+    environment: carl-autonomy-builder
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    outputs:
-      trusted_inputs_digest: ${{ steps.inputs.outputs.trusted_inputs_digest }}
     steps:
       - name: Check out the protected parent
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -67,7 +68,14 @@ jobs:
           path: trusted-source
           fetch-depth: 1
           persist-credentials: false
-      - name: Validate canonical request
+      - name: Check out exact immutable candidate
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.candidate_commit }}
+          path: candidate-source
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Validate exact request attempt and protected parent
         env:
           ATTEMPT_KEY: ${{ inputs.attempt_key }}
           CANDIDATE_COMMIT: ${{ inputs.candidate_commit }}
@@ -85,33 +93,25 @@ jobs:
           WORKFLOW_REVISION: ${{ inputs.workflow_revision }}
           WORKFLOW_SHA: ${{ github.workflow_sha }}
         run: |
+          set -euo pipefail
           test "$RUN_HEAD_SHA" = "$WORKFLOW_REVISION"
           test "$WORKFLOW_SHA" = "$WORKFLOW_REVISION"
           test "${WORKFLOW_REF%%@*}" = "$REPOSITORY/$WORKFLOW_PATH"
           test "$(git -C trusted-source rev-parse HEAD)" = "$WORKFLOW_REVISION"
+          test "$(git -C candidate-source rev-parse HEAD)" = "$CANDIDATE_COMMIT"
           printf '%s  %s\n' "$WORKFLOW_BLOB_DIGEST" \
             "trusted-source/$WORKFLOW_PATH" | sha256sum --check --strict -
           python3 - <<'PY'
-          import hashlib
-          import json
-          import os
-          import re
-
+          import hashlib, json, os, re
           digest = re.compile(r"[0-9a-f]{64}\Z")
           commit = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
-          for name in (
-              "EXPERIMENT_DIGEST", "METRIC_PACK_DIGEST", "POLICY_DIGEST",
-              "REQUEST_DIGEST", "TASK_SET_DIGEST", "WORKFLOW_BLOB_DIGEST",
-          ):
-              if not digest.fullmatch(os.environ[name]):
-                  raise SystemExit(f"invalid {name.lower()}")
+          for name in ("EXPERIMENT_DIGEST", "METRIC_PACK_DIGEST", "POLICY_DIGEST",
+                       "REQUEST_DIGEST", "TASK_SET_DIGEST", "WORKFLOW_BLOB_DIGEST"):
+              if not digest.fullmatch(os.environ[name]): raise SystemExit(f"invalid {name.lower()}")
           for name in ("PARENT_COMMIT", "CANDIDATE_COMMIT", "WORKFLOW_REVISION"):
-              if not commit.fullmatch(os.environ[name]):
-                  raise SystemExit(f"invalid {name.lower()}")
-          attempt_prefix = f"cloud-run-{os.environ['REQUEST_DIGEST']}-attempt-"
-          if os.environ["ATTEMPT_KEY"] not in {
-              attempt_prefix + "1", attempt_prefix + "2", attempt_prefix + "3"
-          }:
+              if not commit.fullmatch(os.environ[name]): raise SystemExit(f"invalid {name.lower()}")
+          prefix = f"cloud-run-{os.environ['REQUEST_DIGEST']}-attempt-"
+          if os.environ["ATTEMPT_KEY"] not in {prefix + "1", prefix + "2", prefix + "3"}:
               raise SystemExit("attempt_key mismatch")
           payload = {
               "candidate_commit": os.environ["CANDIDATE_COMMIT"],
@@ -136,41 +136,15 @@ jobs:
           go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7 \
             .github/workflows/autonomous-improvement.yml \
             .github/workflows/autonomous-soak.yml
-      - name: Resolve and verify protected immutable inputs
-        id: inputs
-        env:
-          EXPERIMENT_DIGEST: ${{ inputs.experiment_digest }}
-          METRIC_PACK_DIGEST: ${{ inputs.metric_pack_digest }}
-          POLICY_DIGEST: ${{ inputs.policy_digest }}
-          TASK_SET_DIGEST: ${{ inputs.task_set_digest }}
-        run: |
-          set -euo pipefail
-          resolved="$RUNNER_TEMP/immutable-inputs"
-          mkdir -p "$resolved"
-          aggregate="$(
-            PYTHONPATH=trusted-source/benchmarks/src python -m carl_bench.immutable_inputs resolve-set \
-              --registry trusted-source/benchmarks/immutable-inputs/registry.json \
-              --root trusted-source/benchmarks/immutable-inputs \
-              --mode improvement \
-              --task-media-type application/vnd.carl.improvement-task-set+json \
-              --experiment-digest "$EXPERIMENT_DIGEST" \
-              --task-set-digest "$TASK_SET_DIGEST" \
-              --metric-pack-digest "$METRIC_PACK_DIGEST" \
-              --policy-digest "$POLICY_DIGEST" \
-              --output-dir "$resolved"
-          )"
-          printf 'trusted_inputs_digest=%s\n' "$aggregate" >> "$GITHUB_OUTPUT"
 
   evaluate:
-    name: Run exact parent and candidate pair
+    name: Run secret-free exact parent and candidate pair
     needs: [commission]
+    environment: carl-autonomy-subject
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
     timeout-minutes: 60
-    outputs:
-      candidate_binary_digest: ${{ steps.build.outputs.candidate_binary_digest }}
-      parent_binary_digest: ${{ steps.build.outputs.parent_binary_digest }}
-      paired_result_digest: ${{ steps.pair.outputs.paired_result_digest }}
-      paired_result_payload_b64: ${{ steps.pair.outputs.paired_result_payload_b64 }}
     steps:
       - name: Check out trusted harness from protected parent
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -214,8 +188,7 @@ jobs:
           set -euo pipefail
           test "$(git -C subject-parent rev-parse HEAD)" = "$PARENT_COMMIT"
           test "$(git -C subject-candidate rev-parse HEAD)" = "$CANDIDATE_COMMIT"
-          resolved="$RUNNER_TEMP/immutable-inputs"
-          mkdir -p "$resolved"
+          resolved="$RUNNER_TEMP/immutable-inputs"; mkdir -p "$resolved"
           PYTHONPATH=trusted-source/benchmarks/src python -m carl_bench.immutable_inputs resolve-set \
             --registry trusted-source/benchmarks/immutable-inputs/registry.json \
             --root trusted-source/benchmarks/immutable-inputs \
@@ -227,27 +200,23 @@ jobs:
             --policy-digest "$POLICY_DIGEST" \
             --output-dir "$resolved" >/dev/null
           printf '%s  %s\n' \
-            "$EXPERIMENT_DIGEST" "$RUNNER_TEMP/immutable-inputs/experiment" \
-            "$TASK_SET_DIGEST" "$RUNNER_TEMP/immutable-inputs/task-set" \
-            "$METRIC_PACK_DIGEST" "$RUNNER_TEMP/immutable-inputs/metric-pack" \
-            "$POLICY_DIGEST" "$RUNNER_TEMP/immutable-inputs/policy" \
+            "$EXPERIMENT_DIGEST" "$resolved/experiment" \
+            "$TASK_SET_DIGEST" "$resolved/task-set" \
+            "$METRIC_PACK_DIGEST" "$resolved/metric-pack" \
+            "$POLICY_DIGEST" "$resolved/policy" \
             | sha256sum --check --strict -
           printf 'experiment=%s\n' "$resolved/experiment" >> "$GITHUB_OUTPUT"
           printf 'task_set=%s\n' "$resolved/task-set" >> "$GITHUB_OUTPUT"
           printf 'metric_pack=%s\n' "$resolved/metric-pack" >> "$GITHUB_OUTPUT"
           printf 'policy=%s\n' "$resolved/policy" >> "$GITHUB_OUTPUT"
-      - name: Build and bind exact subjects under distinct identities
+      - name: Build exact subjects under distinct Unix identities
         id: build
-        env:
-          CANDIDATE_COMMIT: ${{ inputs.candidate_commit }}
-          PARENT_COMMIT: ${{ inputs.parent_commit }}
         run: |
           set -euo pipefail
           chmod 700 "$(dirname "$GITHUB_ENV")"
           sudo useradd --system --no-create-home --shell /usr/sbin/nologin carlparent
           sudo useradd --system --no-create-home --shell /usr/sbin/nologin carlcandidate
-          parent_root="$RUNNER_TEMP/build-parent"
-          candidate_root="$RUNNER_TEMP/build-candidate"
+          parent_root="$RUNNER_TEMP/build-parent"; candidate_root="$RUNNER_TEMP/build-candidate"
           bound="$RUNNER_TEMP/bound-subjects"
           sudo install -d -m 0700 -o carlparent -g carlparent \
             "$parent_root" "$parent_root/home" "$parent_root/tmp" \
@@ -265,8 +234,7 @@ jobs:
           sha256sum "$parent_binary" > "$bound/parent.sha256"
           parent_digest="$(cut -d' ' -f1 "$bound/parent.sha256")"
           chmod 0444 "$bound/parent.sha256"
-          chmod -R a-w "$parent_root"
-          chmod -R go+rX "$parent_root"
+          chmod -R a-w "$parent_root"; chmod -R go+rX "$parent_root"
           sudo -u carlcandidate test ! -w "$parent_root"
           sudo -u carlcandidate test ! -w "$parent_binary"
           sudo -u carlcandidate env -i HOME="$candidate_root/home" PATH="$PATH" \
@@ -278,8 +246,7 @@ jobs:
           sha256sum "$candidate_binary" > "$bound/candidate.sha256"
           candidate_digest="$(cut -d' ' -f1 "$bound/candidate.sha256")"
           chmod 0444 "$bound/candidate.sha256"
-          chmod -R a-w "$candidate_root"
-          chmod -R go+rX "$candidate_root"
+          chmod -R a-w "$candidate_root"; chmod -R go+rX "$candidate_root"
           (cd / && sha256sum --check "$bound/parent.sha256")
           printf 'parent_binary_digest=%s\n' "$parent_digest" >> "$GITHUB_OUTPUT"
           printf 'candidate_binary_digest=%s\n' "$candidate_digest" >> "$GITHUB_OUTPUT"
@@ -295,33 +262,24 @@ jobs:
         run: |
           set -euo pipefail
           chmod 700 "$(dirname "$GITHUB_ENV")"
-          results="$RUNNER_TEMP/paired-results"
-          sandbox="$RUNNER_TEMP/harness-sandbox"
+          results="$RUNNER_TEMP/paired-results"; sandbox="$RUNNER_TEMP/harness-sandbox"
           bound="$RUNNER_TEMP/bound-subjects"
-          sudo install -d -m 0700 -o root -g root \
-            "$results" "$sandbox" "$sandbox/home" "$sandbox/tmp"
+          sudo install -d -m 0700 -o root -g root "$results" "$sandbox" "$sandbox/home" "$sandbox/tmp"
           test "$(id -u)" != "$(id -u carlparent)"
           test "$(id -u)" != "$(id -u carlcandidate)"
           sudo -u carlparent test ! -r "$results"
-          sudo -u carlparent test ! -w "$results"
-          sudo -u carlparent test ! -x "$results"
           sudo -u carlcandidate test ! -r "$results"
-          sudo -u carlcandidate test ! -w "$results"
-          sudo -u carlcandidate test ! -x "$results"
           (cd / && sha256sum --check "$bound/parent.sha256")
           (cd / && sha256sum --check "$bound/candidate.sha256")
           uv sync --project trusted-source/benchmarks --python 3.12 --locked
-          umask 077
           sudo env -i HOME="$sandbox/home" PATH="$PATH" TMPDIR="$sandbox/tmp" \
             PYTHONDONTWRITEBYTECODE=1 \
             trusted-source/benchmarks/.venv/bin/python -m carl_bench.cloud_harness \
               --parent-binary "$RUNNER_TEMP/build-parent/target/release/carl" \
               --candidate-binary "$RUNNER_TEMP/build-candidate/target/release/carl" \
               --parent-commit "$PARENT_COMMIT" --candidate-commit "$CANDIDATE_COMMIT" \
-              --experiment "$EXPERIMENT_INPUT" \
-              --task-set "$TASK_SET_INPUT" \
-              --metric-pack "$METRIC_PACK_INPUT" \
-              --policy "$POLICY_INPUT" \
+              --experiment "$EXPERIMENT_INPUT" --task-set "$TASK_SET_INPUT" \
+              --metric-pack "$METRIC_PACK_INPUT" --policy "$POLICY_INPUT" \
               --parent-uid carlparent --candidate-uid carlcandidate \
               --mode improvement --output "$results/paired-result.json"
           (cd / && sha256sum --check "$bound/parent.sha256")
@@ -331,88 +289,185 @@ jobs:
           sudo -u carlparent test ! -r "$results/paired-result.json"
           sudo -u carlcandidate test ! -r "$results/paired-result.json"
           test "$(wc -c < "$results/paired-result.json")" -le 262145
-          printf 'paired_result_digest=%s\n' "$(sha256sum "$results/paired-result.json" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
-          printf 'paired_result_payload_b64=%s\n' "$(base64 -w0 "$results/paired-result.json")" >> "$GITHUB_OUTPUT"
 
-  evidence:
-    name: Create trusted bounded evidence
-    needs: [commission, evaluate]
-    runs-on: ubuntu-latest
+  publish_private_inputs:
+    name: Retrieve private input through protected authority
+    needs: [commission]
+    environment: carl-autonomy-validator
+    permissions:
+      contents: read
+      id-token: write
+    runs-on: [self-hosted, linux, x64, carl-autonomy-cloud]
     timeout-minutes: 10
     steps:
-      - name: Write fresh trusted evidence
+      - name: Publish exact protected input request
         env:
+          ATTEMPT_KEY: ${{ inputs.attempt_key }}
           CANDIDATE_COMMIT: ${{ inputs.candidate_commit }}
-          EXPERIMENT_DIGEST: ${{ inputs.experiment_digest }}
-          METRIC_PACK_DIGEST: ${{ inputs.metric_pack_digest }}
-          CANDIDATE_BINARY_DIGEST: ${{ needs.evaluate.outputs.candidate_binary_digest }}
-          PAIRED_RESULT_DIGEST: ${{ needs.evaluate.outputs.paired_result_digest }}
-          PAIRED_RESULT_PAYLOAD_B64: ${{ needs.evaluate.outputs.paired_result_payload_b64 }}
-          PARENT_BINARY_DIGEST: ${{ needs.evaluate.outputs.parent_binary_digest }}
           PARENT_COMMIT: ${{ inputs.parent_commit }}
-          POLICY_DIGEST: ${{ inputs.policy_digest }}
-          REPOSITORY: ${{ github.repository }}
+          PROTECTED_NODE: publish_input
           REQUEST_DIGEST: ${{ inputs.request_digest }}
-          RUN_ID: ${{ github.run_id }}
-          TASK_SET_DIGEST: ${{ inputs.task_set_digest }}
-          TRUSTED_INPUTS_DIGEST: ${{ needs.commission.outputs.trusted_inputs_digest }}
-          WORKFLOW_BLOB_DIGEST: ${{ inputs.workflow_blob_digest }}
           WORKFLOW_REVISION: ${{ inputs.workflow_revision }}
         run: |
-          mkdir -p cloud-evidence
+          set -euo pipefail
+          output="$RUNNER_TEMP/publish-input.json"
+          set +e
+          /opt/carl-autonomy/venv/bin/python3 -I -m carl_bench.cli cloud publish-input > "$output"
+          status=$?
+          set -e
+          python3 - "$output" "$PROTECTED_NODE" <<'PY'
+          import json, pathlib, sys
+          raw = pathlib.Path(sys.argv[1]).read_bytes()
+          if not 0 < len(raw) <= 16384: raise SystemExit("protected cloud coordinator decision size")
+          value = json.loads(raw)
+          if value.get("node") not in (None, sys.argv[2]): raise SystemExit("protected node mismatch")
+          action = value.get("action")
+          if action == 'frozen':
+              raise SystemExit(2)
+          PY
+          test "$status" -eq 0
+
+  live_validation:
+    name: Require commissioned durable provider reconciliation
+    needs: [evaluate, publish_private_inputs]
+    environment: carl-autonomy-validator
+    permissions:
+      contents: read
+      id-token: write
+    runs-on: [self-hosted, linux, x64, carl-autonomy-cloud]
+    timeout-minutes: 60
+    steps:
+      - name: Execute protected live evaluator
+        env:
+          ATTEMPT_KEY: ${{ inputs.attempt_key }}
+          CANDIDATE_COMMIT: ${{ inputs.candidate_commit }}
+          PARENT_COMMIT: ${{ inputs.parent_commit }}
+          PROTECTED_NODE: ingest_validation
+          REQUEST_DIGEST: ${{ inputs.request_digest }}
+          WORKFLOW_REVISION: ${{ inputs.workflow_revision }}
+        run: |
+          set -euo pipefail
+          output="$RUNNER_TEMP/live-validation.json"
+          set +e
+          /opt/carl-autonomy/venv/bin/python3 -I -m carl_bench.cli cloud commission-live > "$output"
+          status=$?
+          set -e
+          python3 - "$output" "$PROTECTED_NODE" <<'PY'
+          import json, pathlib, sys
+          raw = pathlib.Path(sys.argv[1]).read_bytes()
+          if not 0 < len(raw) <= 16384: raise SystemExit("protected cloud coordinator decision size")
+          value = json.loads(raw)
+          if value.get("node") not in (None, sys.argv[2]): raise SystemExit("protected node mismatch")
+          action = value.get("action")
+          if action == 'frozen':
+              raise SystemExit(2)
+          PY
+          test "$status" -eq 0
+
+  evidence:
+    name: Independently observe archive sign and ingest
+    needs: [live_validation]
+    environment: carl-autonomy-observer
+    permissions:
+      contents: read
+      id-token: write
+    runs-on: [self-hosted, linux, x64, carl-autonomy-cloud]
+    timeout-minutes: 20
+    steps:
+      - name: Complete mandatory protected handoffs
+        env:
+          ATTEMPT_KEY: ${{ inputs.attempt_key }}
+          CANDIDATE_COMMIT: ${{ inputs.candidate_commit }}
+          MAX_PUBLIC_HANDOFF_BYTES: 1048576
+          PARENT_COMMIT: ${{ inputs.parent_commit }}
+          REQUEST_DIGEST: ${{ inputs.request_digest }}
+          WORKFLOW_REVISION: ${{ inputs.workflow_revision }}
+        run: |
+          set -euo pipefail
+          mkdir -p cloud-handoff
+          run_node() {
+            command="$1"; expected="$2"; output="cloud-handoff/$expected.json"
+            set +e
+            /opt/carl-autonomy/venv/bin/python3 -I -m carl_bench.cli cloud "$command" > "$output"
+            status=$?
+            set -e
+            python3 - "$output" "$expected" <<'PY'
+          import json, pathlib, sys
+          raw = pathlib.Path(sys.argv[1]).read_bytes()
+          if not 0 < len(raw) <= 16384: raise SystemExit("protected cloud coordinator decision size")
+          value = json.loads(raw)
+          if value.get("node") not in (None, sys.argv[2]): raise SystemExit("protected node mismatch")
+          action = value.get("action")
+          if action == 'frozen':
+              raise SystemExit(2)
+          PY
+            test "$status" -eq 0
+          }
+          PROTECTED_NODE=observe_validation run_node observe observe_validation
+          PROTECTED_NODE=archive_validation run_node observe archive_validation
+          PROTECTED_NODE=ingest_validation run_node ingest ingest_validation
           python3 - <<'PY'
-          import base64, hashlib, json, os, pathlib
-          payload = base64.b64decode(os.environ["PAIRED_RESULT_PAYLOAD_B64"], validate=True)
-          if hashlib.sha256(payload).hexdigest() != os.environ["PAIRED_RESULT_DIGEST"]:
-              raise SystemExit("paired result digest mismatch")
-          result = json.loads(payload)
-          expected_inputs = {
-              "experiment": os.environ["EXPERIMENT_DIGEST"],
-              "metric_pack": os.environ["METRIC_PACK_DIGEST"],
-              "policy": os.environ["POLICY_DIGEST"],
-              "task_set": os.environ["TASK_SET_DIGEST"],
-          }
-          if result.get("immutable_inputs") != expected_inputs:
-              raise SystemExit("paired result immutable input mismatch")
-          if result.get("parent", {}).get("commit") != os.environ["PARENT_COMMIT"]:
-              raise SystemExit("paired result parent mismatch")
-          if result.get("candidate", {}).get("commit") != os.environ["CANDIDATE_COMMIT"]:
-              raise SystemExit("paired result candidate mismatch")
-          if result.get("parent", {}).get("binary_digest") != os.environ["PARENT_BINARY_DIGEST"]:
-              raise SystemExit("paired result parent binary mismatch")
-          if result.get("candidate", {}).get("binary_digest") != os.environ["CANDIDATE_BINARY_DIGEST"]:
-              raise SystemExit("paired result candidate binary mismatch")
-          if result.get("eligible") is not False or result.get("reasons") != ["live_acp_credential_missing"]:
-              raise SystemExit("live ACP fail-closed gate missing")
-          evidence = {
+          import json, os, pathlib
+          root = pathlib.Path("cloud-handoff")
+          names = ("archive_validation", "ingest_validation", "observe_validation")
+          handoff = {
+              "attempt_key": os.environ["ATTEMPT_KEY"],
               "candidate_commit": os.environ["CANDIDATE_COMMIT"],
-              "experiment_digest": os.environ["EXPERIMENT_DIGEST"],
-              "kind": "autonomous_improvement_evidence",
-              "metric_pack_digest": os.environ["METRIC_PACK_DIGEST"],
-              "paired_result_digest": os.environ["PAIRED_RESULT_DIGEST"],
-              "paired_result": result,
+              "decisions": {name: json.loads((root / f"{name}.json").read_text()) for name in names},
+              "kind": "protected_validation_handoff",
               "parent_commit": os.environ["PARENT_COMMIT"],
-              "policy_digest": os.environ["POLICY_DIGEST"],
-              "repository": os.environ["REPOSITORY"],
               "request_digest": os.environ["REQUEST_DIGEST"],
-              "run_id": int(os.environ["RUN_ID"]), "schema_version": 3,
-              "task_set_digest": os.environ["TASK_SET_DIGEST"],
-              "trusted_inputs_digest": os.environ["TRUSTED_INPUTS_DIGEST"],
-              "workflow_file": "autonomous-improvement.yml",
+              "schema_version": 1,
               "workflow_revision": os.environ["WORKFLOW_REVISION"],
-              "workflow_blob_digest": os.environ["WORKFLOW_BLOB_DIGEST"],
           }
-          target = pathlib.Path("cloud-evidence/autonomous-improvement.json")
-          target.write_text(json.dumps(evidence, sort_keys=True, separators=(",", ":")) + "\n")
-          if target.stat().st_size > 1_048_576: raise SystemExit("evidence exceeds bound")
+          target = root / f"autonomous-improvement-{os.environ['REQUEST_DIGEST']}.json"
+          target.write_text(json.dumps(handoff, sort_keys=True, separators=(",", ":")) + "\n")
+          if target.stat().st_size > min(int(os.environ["MAX_PUBLIC_HANDOFF_BYTES"]), 1_048_576):
+              raise SystemExit("public handoff exceeds bound")
           PY
       - name: Upload the one request-named evidence artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: autonomous-improvement-evidence-${{ inputs.request_digest }}
-          path: cloud-evidence/autonomous-improvement.json
+          path: cloud-handoff/autonomous-improvement-${{ inputs.request_digest }}.json
           if-no-files-found: error
           retention-days: 7
           compression-level: 9
           overwrite: false
           include-hidden-files: false
+
+  promotion_handoff:
+    name: Explicitly dispatch next protected production node
+    needs: [evidence]
+    environment: carl-autonomy-promoter
+    permissions:
+      contents: read
+    runs-on: [self-hosted, linux, x64, carl-autonomy-cloud]
+    timeout-minutes: 10
+    steps:
+      - name: Dispatch through protected GitHub App authority
+        env:
+          ATTEMPT_KEY: ${{ inputs.attempt_key }}
+          CANDIDATE_COMMIT: ${{ inputs.candidate_commit }}
+          PARENT_COMMIT: ${{ inputs.parent_commit }}
+          PROTECTED_NODE: create_promotion_pr
+          REQUEST_DIGEST: ${{ inputs.request_digest }}
+          WORKFLOW_REVISION: ${{ inputs.workflow_revision }}
+        run: |
+          set -euo pipefail
+          output="$RUNNER_TEMP/promotion-handoff.json"
+          set +e
+          /opt/carl-autonomy/venv/bin/python3 -I -m carl_bench.cli cloud coordinate > "$output"
+          status=$?
+          set -e
+          python3 - "$output" "$PROTECTED_NODE" <<'PY'
+          import json, pathlib, sys
+          raw = pathlib.Path(sys.argv[1]).read_bytes()
+          if not 0 < len(raw) <= 16384: raise SystemExit("protected cloud coordinator decision size")
+          value = json.loads(raw)
+          if value.get("node") not in (None, sys.argv[2]): raise SystemExit("protected node mismatch")
+          action = value.get("action")
+          if action == 'frozen':
+              raise SystemExit(2)
+          PY
+          test "$status" -eq 0
