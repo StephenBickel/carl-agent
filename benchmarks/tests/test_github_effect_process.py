@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import errno
 import hashlib
 import importlib
 import json
@@ -40,10 +39,13 @@ class _DurableRejectingState:
         raise github.GitHubCloudError("github_command_not_found")
 
 
-def _run_real_listener(socket_path: str, ready: object, calls: object) -> None:
+def _run_real_listener(
+    listener: socket.socket, socket_path: str, ready: object, calls: object
+) -> None:
     service = importlib.import_module("carl_bench.github_effect_service")
     now = __import__("datetime").datetime.fromisoformat("2026-08-21T12:00:00+00:00")
-    service._serve_listener(
+    service._serve_activated_listener(
+        listener_fd=listener.fileno(),
         socket_path=Path(socket_path),
         allowed_client_uid=os.getuid(),
         service_uid=os.getuid(),
@@ -60,15 +62,90 @@ def _run_real_listener(socket_path: str, ready: object, calls: object) -> None:
     )
 
 
-def _start_real_listener(socket_path: Path, calls: object) -> tuple[object, object]:
+def _supervisor_listener(socket_path: Path) -> socket.socket:
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(os.fspath(socket_path))
+    os.chmod(socket_path, 0o600)
+    listener.listen(32)
+    return listener
+
+
+def _start_real_listener(
+    listener: socket.socket, socket_path: Path, calls: object
+) -> tuple[object, object]:
     context = multiprocessing.get_context("spawn")
     ready = context.Event()
-    process = context.Process(target=_run_real_listener, args=(str(socket_path), ready, calls))
+    process = context.Process(
+        target=_run_real_listener,
+        args=(listener, str(socket_path), ready, calls),
+    )
     process.start()
     if not ready.wait(5):
         _cleanup_service_process(process, socket_path, remove_runtime_directory=False)
         pytest.fail("real effect listener did not become ready")
     return process, ready
+
+
+def _probe_activated_listener(
+    listener: socket.socket,
+    socket_path: str,
+    expected_uid: int,
+    declared_descriptors: int,
+    observed: object,
+) -> None:
+    service = importlib.import_module("carl_bench.github_effect_service")
+    environment = {
+        "LISTEN_PID": str(os.getpid()),
+        "LISTEN_FDS": str(declared_descriptors),
+        "LISTEN_FDNAMES": "github-effect",
+    }
+    try:
+        descriptor = service._activation_descriptor_from_environment(
+            environment=environment,
+            process_id=os.getpid(),
+            descriptor_fd=listener.fileno(),
+        )
+        with service._validated_activated_listener(
+            listener_fd=descriptor,
+            socket_path=Path(socket_path),
+            expected_uid=expected_uid,
+        ):
+            pass
+    except RuntimeError as error:
+        observed.put(str(error))
+    else:
+        observed.put("accepted")
+
+
+def _activation_probe(
+    listener: socket.socket,
+    socket_path: Path,
+    *,
+    expected_uid: int | None = None,
+    declared_descriptors: int = 1,
+) -> str:
+    context = multiprocessing.get_context("spawn")
+    observed = context.Queue()
+    process = context.Process(
+        target=_probe_activated_listener,
+        args=(
+            listener,
+            os.fspath(socket_path),
+            os.getuid() if expected_uid is None else expected_uid,
+            declared_descriptors,
+            observed,
+        ),
+    )
+    process.start()
+    try:
+        result = observed.get(timeout=5)
+        _join(process)
+        return result
+    finally:
+        process.join(0.05)
+        if process.is_alive():
+            process.kill()
+            process.join(2)
 
 
 def _module(name: str, failure: str) -> ModuleType:
@@ -164,7 +241,6 @@ def _all_operation_documents() -> dict[str, dict[str, object]]:
             "promotion_merge_commit": "3" * 40,
             "revert_candidate_commit": SHA,
         },
-        "discover_workflow_run": workflow,
         "dispatch_workflow": workflow,
         "enable_pull_request_auto_merge": {**target, "merge_method": "squash"},
         "mark_pull_request_ready": target,
@@ -180,7 +256,7 @@ def _all_operation_documents() -> dict[str, dict[str, object]]:
 def _operation_request(operation: str, parameters: dict[str, object]) -> object:
     command_key = (
         "github-dispatch-autonomous-improvement.yml-" + DIGEST + "-attempt-1"
-        if operation in {"dispatch_workflow", "discover_workflow_run"}
+        if operation == "dispatch_workflow"
         else f"ipc-{operation}-001"
     )
     return _ipc().GitHubEffectRequest.from_canonical_dict(
@@ -285,7 +361,8 @@ def _join(process: object) -> None:
 
 
 def _short_socket_path() -> Path:
-    directory = Path(tempfile.mkdtemp(prefix="carl-ipc-", dir="/tmp"))
+    temporary_root = Path("/private/tmp") if Path("/tmp").is_symlink() else Path("/tmp")
+    directory = Path(tempfile.mkdtemp(prefix="carl-ipc-", dir=temporary_root))
     directory.chmod(0o700)
     return directory / "effect.sock"
 
@@ -698,6 +775,138 @@ def test_service_maps_every_closed_operation_to_one_typed_domain_request(operati
         assert not hasattr(typed, "pull_request_body")
 
 
+@pytest.mark.parametrize("operation", tuple(_all_operation_documents()))
+def test_service_executes_every_advertised_operation_through_its_typed_gateway(
+    operation: str,
+) -> None:
+    service = _module("carl_bench.github_effect_service", "effect service is required")
+    github = _module("carl_bench.github_cloud", "GitHub gateway module is required")
+    policy = SimpleNamespace(
+        repository="StephenBickel/carl-agent",
+        workflow_ref="main",
+        dispatch_actor_login="carl-autonomy[bot]",
+    )
+    seed = _operation_request(operation, _all_operation_documents()[operation])
+    typed, binding, method = service._typed_request(seed, policy)
+    command = CloudCommand.create(
+        command_key=binding.command_key,
+        authority=binding.authority,
+        operation=binding.operation,
+        request_digest=binding.request_digest,
+        occurred_at=NOW,
+        expected_revision=8,
+        attempt=1,
+        max_attempts=3,
+    )
+    request_document = seed.to_canonical_dict()
+    request_document.update(
+        command_key=binding.command_key,
+        effect_key=command.effect_key,
+        request_key=binding.request_key,
+    )
+    request = _ipc().GitHubEffectRequest.from_canonical_dict(request_document)
+    state = CommandState(
+        command=command,
+        revision=9,
+        status="claimed",
+        claim=CommandClaim(
+            command_key=command.command_key,
+            claim_id=f"claim-{operation}",
+            authority=command.authority,
+            expected_revision=8,
+            claimed_at=NOW,
+            expires_at="2026-08-21T12:05:00Z",
+        ),
+        transition=None,
+        result_digest=None,
+        failure_code=None,
+    )
+
+    class ExistingState:
+        def resolve_claimed_command(self, *args: object, **kwargs: object) -> object:
+            del args, kwargs
+            return state
+
+    class ExactGateway:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str, object]] = []
+
+        def __getattr__(self, name: str) -> object:
+            if name != method:
+                raise AssertionError(f"unexpected gateway method: {name}")
+
+            def execute(command_key: str, candidate: object) -> object:
+                self.calls.append((name, command_key, candidate))
+                common = {
+                    "repository": policy.repository,
+                    "request_key": binding.request_key,
+                    "effect_key": command.effect_key,
+                    "command_occurred_at": NOW,
+                    "observed_at": NOW,
+                }
+                if method == "dispatch_workflow":
+                    return github.WorkflowDispatchSnapshot(
+                        status="dispatched",
+                        workflow_file=typed.workflow_file,
+                        workflow_revision=typed.workflow_revision,
+                        attempt_key=binding.attempt_key,
+                        run_id=41,
+                        head_sha=typed.candidate_commit,
+                        **common,
+                    )
+                if method in {
+                    "create_or_reconcile_experimental_branch",
+                    "create_or_reconcile_revert_branch",
+                }:
+                    branch = typed.branch
+                    commit_sha = (
+                        getattr(typed, "candidate_commit", None) or typed.revert_candidate_commit
+                    )
+                    return github.GitReferenceSnapshot(
+                        status="created",
+                        ref=f"refs/heads/{branch}",
+                        commit_sha=commit_sha,
+                        **common,
+                    )
+                if method == "observe_required_checks":
+                    return github.RequiredChecksSnapshot(
+                        head_sha=typed.head_sha,
+                        checks=(),
+                        complete=False,
+                        **common,
+                    )
+                return github.PullRequestEffectSnapshot(
+                    status="updated" if method != "create_or_reconcile_pull_request" else "created",
+                    number=getattr(typed, "number", 17),
+                    url="https://github.com/StephenBickel/carl-agent/pull/17",
+                    state="open",
+                    draft=getattr(typed, "draft", False),
+                    base_branch=typed.base_branch,
+                    head_branch=typed.head_branch,
+                    head_sha=getattr(typed, "head_sha", None) or typed.revert_candidate_commit,
+                    title=getattr(typed, "title", "Promote experiment"),
+                    body=getattr(typed, "body", "Capability evidence."),
+                    auto_merge_enabled=method == "enable_pull_request_auto_merge",
+                    **common,
+                )
+
+            return execute
+
+    gateway = ExactGateway()
+    response = service._response_for(
+        request,
+        gateway=gateway,
+        policy=policy,
+        state_controller=ExistingState(),
+        clock=lambda: __import__("datetime").datetime.fromisoformat("2026-08-21T12:00:00+00:00"),
+    )
+
+    assert response.status == "completed"
+    assert response.error_code is None
+    assert gateway.calls == [(method, binding.command_key, typed)]
+    assert _ipc().decode_response_bytes(_ipc().encode_response_bytes(response)) == response
+
+
 def test_pull_request_service_result_crosses_ipc_without_raw_transport_fields() -> None:
     service = _module("carl_bench.github_effect_service", "effect service is required")
     github = _module("carl_bench.github_cloud", "GitHub gateway module is required")
@@ -751,7 +960,8 @@ def test_partial_frames_time_out_and_next_client_remains_serviceable() -> None:
     context = multiprocessing.get_context("spawn")
     calls = context.Value("i", 0)
     socket_path = _short_socket_path()
-    process, _ = _start_real_listener(socket_path, calls)
+    listener = _supervisor_listener(socket_path)
+    process, _ = _start_real_listener(listener, socket_path, calls)
     partial = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
         partial.connect(os.fspath(socket_path))
@@ -773,13 +983,16 @@ def test_partial_frames_time_out_and_next_client_remains_serviceable() -> None:
     finally:
         partial.close()
         _cleanup_service_process(process, socket_path)
+        listener.close()
 
 
-def test_crash_leaves_verified_stale_socket_that_entrypoint_safely_recovers() -> None:
+def test_supervisor_listener_survives_sigkill_and_replacement_service_reuses_it() -> None:
     context = multiprocessing.get_context("spawn")
     calls = context.Value("i", 0)
     socket_path = _short_socket_path()
-    first, _ = _start_real_listener(socket_path, calls)
+    listener = _supervisor_listener(socket_path)
+    original_identity = socket_path.stat().st_ino
+    first, _ = _start_real_listener(listener, socket_path, calls)
     client = _client_module().GitHubEffectSocketClient._for_testing(
         socket_path=socket_path,
         expected_peer_uid=os.getuid(),
@@ -793,128 +1006,190 @@ def test_crash_leaves_verified_stale_socket_that_entrypoint_safely_recovers() ->
         first.join(2)
         assert not first.is_alive()
         assert socket_path.is_socket()
+        assert socket_path.stat().st_ino == original_identity
 
-        restarted, _ = _start_real_listener(socket_path, calls)
+        restarted, _ = _start_real_listener(listener, socket_path, calls)
 
         assert client.execute(_request()).error_code == "github_command_not_found"
         assert calls.value == 2
+        assert socket_path.stat().st_ino == original_identity
     finally:
         _cleanup_service_process(first, socket_path, remove_runtime_directory=False)
         if restarted is not None:
             _cleanup_service_process(restarted, socket_path, remove_runtime_directory=False)
+        listener.close()
         socket_path.unlink(missing_ok=True)
         with suppress(FileNotFoundError):
             socket_path.parent.rmdir()
 
 
-def test_live_service_socket_is_never_unlinked_as_stale() -> None:
+def test_service_exit_never_unlinks_or_replaces_supervisor_socket() -> None:
     context = multiprocessing.get_context("spawn")
     calls = context.Value("i", 0)
     socket_path = _short_socket_path()
-    process, _ = _start_real_listener(socket_path, calls)
-    service = _module("carl_bench.github_effect_service", "effect service is required")
-    directory_fd = service._open_runtime_directory(socket_path.parent, expected_uid=os.getuid())
+    listener = _supervisor_listener(socket_path)
+    identity = socket_path.stat().st_ino
+    process, _ = _start_real_listener(listener, socket_path, calls)
     try:
-        with pytest.raises(RuntimeError, match="github_effect_service_already_running"):
-            service._remove_verified_stale_socket(
-                directory_fd, socket_path, expected_uid=os.getuid()
-            )
+        process.terminate()
+        process.join(2)
+        assert not process.is_alive()
         assert socket_path.is_socket()
+        assert socket_path.stat().st_ino == identity
     finally:
-        os.close(directory_fd)
-        _cleanup_service_process(process, socket_path)
+        _cleanup_service_process(process, socket_path, remove_runtime_directory=False)
+        listener.close()
+        socket_path.unlink(missing_ok=True)
+        socket_path.parent.rmdir()
 
 
-@pytest.mark.parametrize("kind", ("file", "symlink", "wrong_mode"))
-def test_stale_socket_recovery_rejects_untrusted_endpoint_types(kind: str) -> None:
+@pytest.mark.parametrize("defect", ("wrong_path", "wrong_mode", "wrong_owner"))
+def test_activated_listener_process_rejects_wrong_path_mode_or_owner(defect: str) -> None:
     socket_path = _short_socket_path()
-    held = None
+    listener = _supervisor_listener(socket_path)
     try:
-        if kind == "file":
-            socket_path.touch(mode=0o600)
-        elif kind == "symlink":
-            socket_path.symlink_to(socket_path.parent / "missing")
-        else:
-            held = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            held.bind(os.fspath(socket_path))
+        expected_path = socket_path
+        expected_uid = os.getuid()
+        if defect == "wrong_path":
+            expected_path = socket_path.parent / "other.sock"
+        elif defect == "wrong_mode":
             os.chmod(socket_path, 0o666)
-        service = _module("carl_bench.github_effect_service", "effect service is required")
-        directory_fd = service._open_runtime_directory(socket_path.parent, expected_uid=os.getuid())
-        try:
-            with pytest.raises(RuntimeError, match="github_effect_service_socket_identity_invalid"):
-                service._remove_verified_stale_socket(
-                    directory_fd, socket_path, expected_uid=os.getuid()
-                )
-            assert socket_path.exists() or socket_path.is_symlink()
-        finally:
-            os.close(directory_fd)
-    finally:
-        if held is not None:
-            held.close()
-        socket_path.unlink(missing_ok=True)
-        socket_path.parent.rmdir()
+        else:
+            expected_uid += 1
 
-
-def test_stale_socket_recovery_rejects_wrong_endpoint_owner(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    service = _module("carl_bench.github_effect_service", "effect service is required")
-    socket_path = _short_socket_path()
-    held = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    held.bind(os.fspath(socket_path))
-    os.chmod(socket_path, 0o600)
-    real_stat = service.os.stat
-
-    def wrong_owner_stat(*args: object, **kwargs: object) -> os.stat_result:
-        values = list(real_stat(*args, **kwargs))
-        values[4] = os.getuid() + 1
-        return os.stat_result(values)
-
-    directory_fd = service._open_runtime_directory(socket_path.parent, expected_uid=os.getuid())
-    monkeypatch.setattr(service.os, "stat", wrong_owner_stat)
-    try:
-        with pytest.raises(RuntimeError, match="github_effect_service_socket_identity_invalid"):
-            service._remove_verified_stale_socket(
-                directory_fd, socket_path, expected_uid=os.getuid()
-            )
+        expected_error = (
+            "github_effect_service_listener_invalid"
+            if defect == "wrong_owner"
+            else "github_effect_service_socket_identity_invalid"
+        )
+        assert (
+            _activation_probe(listener, expected_path, expected_uid=expected_uid) == expected_error
+        )
         assert socket_path.is_socket()
     finally:
-        os.close(directory_fd)
-        held.close()
+        listener.close()
         socket_path.unlink(missing_ok=True)
         socket_path.parent.rmdir()
 
 
-def test_stale_socket_replacement_race_never_unlinks_replacement(
+@pytest.mark.parametrize("defect", ("datagram", "non_listening", "extra_descriptor"))
+def test_activated_listener_process_rejects_wrong_type_state_or_extra_fd(defect: str) -> None:
+    socket_path = _short_socket_path()
+    socket_type = socket.SOCK_DGRAM if defect == "datagram" else socket.SOCK_STREAM
+    listener = socket.socket(socket.AF_UNIX, socket_type)
+    listener.bind(os.fspath(socket_path))
+    os.chmod(socket_path, 0o600)
+    if defect != "non_listening" and defect != "datagram":
+        listener.listen(1)
+    try:
+        count = 2 if defect == "extra_descriptor" else 1
+        expected = (
+            "github_effect_service_activation_invalid"
+            if defect == "extra_descriptor"
+            else "github_effect_service_listener_invalid"
+        )
+        assert _activation_probe(listener, socket_path, declared_descriptors=count) == expected
+        assert socket_path.is_socket()
+    finally:
+        listener.close()
+        socket_path.unlink(missing_ok=True)
+        socket_path.parent.rmdir()
+
+
+def test_activated_listener_and_client_reject_symlinked_ancestor() -> None:
+    temporary_root = Path("/private/tmp") if Path("/tmp").is_symlink() else Path("/tmp")
+    root = Path(tempfile.mkdtemp(prefix="carl-ipc-", dir=temporary_root))
+    real = root / "real"
+    alias = root / "alias"
+    real.mkdir(mode=0o700)
+    alias.symlink_to(real, target_is_directory=True)
+    socket_path = alias / "effect.sock"
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(os.fspath(socket_path))
+    os.chmod(real / "effect.sock", 0o600)
+    listener.listen(1)
+    try:
+        assert (
+            _activation_probe(listener, socket_path)
+            == "github_effect_service_socket_identity_invalid"
+        )
+        client = _client_module().GitHubEffectSocketClient._for_testing(
+            socket_path=socket_path,
+            expected_peer_uid=os.getuid(),
+            timeout_seconds=0.2,
+        )
+        with pytest.raises(
+            _client_module().GitHubEffectClientError,
+            match="github_effect_service_identity_invalid",
+        ):
+            client.execute(_request())
+    finally:
+        listener.close()
+        (real / "effect.sock").unlink(missing_ok=True)
+        alias.unlink()
+        real.rmdir()
+        root.rmdir()
+
+
+def test_client_rejects_socket_path_substitution_between_connect_checks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    service = _module("carl_bench.github_effect_service", "effect service is required")
     socket_path = _short_socket_path()
-    stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    original = _supervisor_listener(socket_path)
     replacement = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    stale.bind(os.fspath(socket_path))
-    os.chmod(socket_path, 0o600)
-    original_connect = socket.socket.connect
+    connect = socket.socket.connect
 
-    def replace_then_refuse(probe: socket.socket, address: str) -> None:
-        del probe, address
+    def substitute_then_connect(connection: socket.socket, address: str) -> None:
         socket_path.unlink()
         replacement.bind(os.fspath(socket_path))
         os.chmod(socket_path, 0o600)
-        raise ConnectionRefusedError(errno.ECONNREFUSED, "redacted")
+        replacement.listen(1)
+        connect(connection, address)
 
-    monkeypatch.setattr(socket.socket, "connect", replace_then_refuse)
-    directory_fd = service._open_runtime_directory(socket_path.parent, expected_uid=os.getuid())
+    client = _client_module().GitHubEffectSocketClient._for_testing(
+        socket_path=socket_path,
+        expected_peer_uid=os.getuid(),
+        timeout_seconds=0.2,
+    )
+    monkeypatch.setattr(socket.socket, "connect", substitute_then_connect)
     try:
-        with pytest.raises(RuntimeError, match="github_effect_service_socket_identity_invalid"):
-            service._remove_verified_stale_socket(
-                directory_fd, socket_path, expected_uid=os.getuid()
-            )
+        with pytest.raises(
+            _client_module().GitHubEffectClientError,
+            match="github_effect_service_identity_invalid",
+        ):
+            client.execute(_request())
         assert socket_path.is_socket()
     finally:
-        monkeypatch.setattr(socket.socket, "connect", original_connect)
-        os.close(directory_fd)
-        stale.close()
+        original.close()
         replacement.close()
         socket_path.unlink(missing_ok=True)
         socket_path.parent.rmdir()
+
+
+@pytest.mark.parametrize(
+    ("overrides", "descriptor"),
+    (
+        ({"LISTEN_PID": "999999"}, 3),
+        ({"LISTEN_FDS": "0"}, 3),
+        ({"LISTEN_FDS": "2"}, 3),
+        ({"LISTEN_FDNAMES": "substituted"}, 3),
+        ({}, -1),
+    ),
+)
+def test_activation_contract_rejects_wrong_process_count_name_or_descriptor(
+    overrides: dict[str, str], descriptor: int
+) -> None:
+    service = _module("carl_bench.github_effect_service", "effect service is required")
+    environment = {
+        "LISTEN_PID": str(os.getpid()),
+        "LISTEN_FDS": "1",
+        "LISTEN_FDNAMES": "github-effect",
+        **overrides,
+    }
+
+    with pytest.raises(RuntimeError, match="github_effect_service_activation_invalid"):
+        service._activation_descriptor_from_environment(
+            environment=environment,
+            process_id=os.getpid(),
+            descriptor_fd=descriptor,
+        )

@@ -59,7 +59,6 @@ class GitHubEffectOperation(str, Enum):
     CREATE_PULL_REQUEST = "create_pull_request"
     CREATE_REVERT_PULL_REQUEST = "create_revert_pull_request"
     CREATE_REVERT_REF = "create_revert_ref"
-    DISCOVER_WORKFLOW_RUN = "discover_workflow_run"
     DISPATCH_WORKFLOW = "dispatch_workflow"
     ENABLE_PULL_REQUEST_AUTO_MERGE = "enable_pull_request_auto_merge"
     MARK_PULL_REQUEST_READY = "mark_pull_request_ready"
@@ -297,10 +296,7 @@ def _validate_parameters(operation: GitHubEffectOperation, value: object) -> dic
                 "revert_candidate_commit",
             ):
                 _sha(result[name])
-        elif operation in {
-            GitHubEffectOperation.DISPATCH_WORKFLOW,
-            GitHubEffectOperation.DISCOVER_WORKFLOW_RUN,
-        }:
+        elif operation is GitHubEffectOperation.DISPATCH_WORKFLOW:
             result = _exact(
                 value,
                 {

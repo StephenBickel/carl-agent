@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import os
 import socket
-import stat
 import struct
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,6 +15,11 @@ from carl_bench.github_effect_ipc import (
     GitHubEffectResponse,
     decode_response_bytes,
     encode_request_bytes,
+)
+from carl_bench.unix_socket_security import (
+    ProtectedSocketPathError,
+    open_pinned_parent,
+    socket_identity_at,
 )
 
 _PROTECTED_SOCKET_PATH = Path("/run/carl/github-effect.sock")
@@ -39,23 +43,13 @@ def _recv_exact(connection: socket.socket, count: int) -> bytes:
     return b"".join(chunks)
 
 
-def _validate_socket_path(path: Path, expected_uid: int) -> None:
+def _pin_socket_path(path: Path, expected_uid: int) -> tuple[int, tuple[int, ...]]:
     try:
-        parent = path.parent.lstat()
-        endpoint = path.lstat()
-    except OSError as error:
-        raise GitHubEffectClientError("github_effect_service_unavailable") from error
-    if (
-        stat.S_ISLNK(parent.st_mode)
-        or not stat.S_ISDIR(parent.st_mode)
-        or parent.st_uid != expected_uid
-        or stat.S_IMODE(parent.st_mode) & 0o022
-        or stat.S_ISLNK(endpoint.st_mode)
-        or not stat.S_ISSOCK(endpoint.st_mode)
-        or endpoint.st_uid != expected_uid
-        or stat.S_IMODE(endpoint.st_mode) & 0o077
-    ):
-        raise GitHubEffectClientError("github_effect_service_identity_invalid")
+        parent_fd = open_pinned_parent(path, expected_uid=expected_uid)
+        identity = socket_identity_at(parent_fd, path.name, expected_uid=expected_uid)
+    except ProtectedSocketPathError as error:
+        raise GitHubEffectClientError("github_effect_service_identity_invalid") from error
+    return parent_fd, identity
 
 
 def _validate_peer(connection: socket.socket, expected_uid: int) -> None:
@@ -113,12 +107,24 @@ class GitHubEffectSocketClient:
 
     def execute(self, request: GitHubEffectRequest) -> GitHubEffectResponse:
         payload = encode_request_bytes(request)
-        _validate_socket_path(self._socket_path, self._expected_peer_uid)
+        parent_fd, identity_before = _pin_socket_path(self._socket_path, self._expected_peer_uid)
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
                 connection.settimeout(self._timeout_seconds)
                 connection.connect(os.fspath(self._socket_path))
                 _validate_peer(connection, self._expected_peer_uid)
+                try:
+                    identity_after = socket_identity_at(
+                        parent_fd,
+                        self._socket_path.name,
+                        expected_uid=self._expected_peer_uid,
+                    )
+                except ProtectedSocketPathError as error:
+                    raise GitHubEffectClientError(
+                        "github_effect_service_identity_invalid"
+                    ) from error
+                if identity_after != identity_before:
+                    raise GitHubEffectClientError("github_effect_service_identity_invalid")
                 connection.sendall(struct.pack(">I", len(payload)) + payload)
                 size = struct.unpack(">I", _recv_exact(connection, 4))[0]
                 if not 0 < size <= MAX_FRAME_BYTES:
@@ -128,6 +134,8 @@ class GitHubEffectSocketClient:
             raise
         except (OSError, struct.error, GitHubEffectProtocolError) as error:
             raise GitHubEffectClientError("github_effect_service_unavailable") from error
+        finally:
+            os.close(parent_fd)
         if response.request_digest != request.digest:
             raise GitHubEffectClientError("github_effect_service_response_invalid")
         return response

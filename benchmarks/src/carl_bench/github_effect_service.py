@@ -8,13 +8,14 @@ requests over ``github_effect_ipc`` and never select an endpoint or payload.
 from __future__ import annotations
 
 import dataclasses
-import errno
 import hashlib
 import os
 import re
 import socket
 import stat
 import struct
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -28,6 +29,11 @@ from carl_bench.github_effect_ipc import (
     GitHubEffectResponse,
     decode_request_bytes,
     encode_response_bytes,
+)
+from carl_bench.unix_socket_security import (
+    ProtectedSocketPathError,
+    open_pinned_parent,
+    socket_identity_at,
 )
 
 _SOCKET_PATH = Path("/run/carl/github-effect.sock")
@@ -91,10 +97,7 @@ def _typed_request(request: GitHubEffectRequest, policy: object) -> tuple[object
     parameters = request.parameters
     operation = request.operation
     repository = policy.repository
-    if operation in {
-        GitHubEffectOperation.DISPATCH_WORKFLOW,
-        GitHubEffectOperation.DISCOVER_WORKFLOW_RUN,
-    }:
+    if operation is GitHubEffectOperation.DISPATCH_WORKFLOW:
         typed = CloudRunRequest.create(**parameters)
         match = re.search(r"-attempt-([1-3])$", request.command_key)
         if match is None:
@@ -188,10 +191,6 @@ def _execute_validated(
     """Validate durable authority, then invoke one fixed high-level executor method."""
     github = _github_cloud()
     typed, binding, method = _typed_request(request, policy)
-    if request.operation is GitHubEffectOperation.DISCOVER_WORKFLOW_RUN:
-        # Discovery cannot silently escalate into dispatch. A dedicated observer is
-        # added with the next effect family; fail closed until then.
-        raise github.GitHubCloudError("github_operation_not_available")
     observed_at = clock()
     if not isinstance(observed_at, datetime) or observed_at.tzinfo != UTC:
         raise github.GitHubCloudError("github_clock_invalid")
@@ -323,88 +322,96 @@ def _serve_connection(
         return
 
 
-def _validate_runtime_directory(path: Path) -> None:
-    details = path.lstat()
+def _activation_descriptor_from_environment(
+    *, environment: Mapping[str, str], process_id: int, descriptor_fd: int = 3
+) -> int:
+    """Accept exactly one named supervisor descriptor for this process."""
     if (
-        stat.S_ISLNK(details.st_mode)
-        or not stat.S_ISDIR(details.st_mode)
-        or details.st_uid != 0
-        or stat.S_IMODE(details.st_mode) & 0o022
+        isinstance(process_id, bool)
+        or not isinstance(process_id, int)
+        or process_id <= 0
+        or isinstance(descriptor_fd, bool)
+        or not isinstance(descriptor_fd, int)
+        or descriptor_fd < 0
+        or environment.get("LISTEN_PID") != str(process_id)
+        or environment.get("LISTEN_FDS") != "1"
+        or environment.get("LISTEN_FDNAMES") != "github-effect"
     ):
-        raise RuntimeError("github_effect_service_configuration_invalid")
+        raise RuntimeError("github_effect_service_activation_invalid")
+    return descriptor_fd
 
 
-def _open_runtime_directory(path: Path, *, expected_uid: int) -> int:
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+def _descriptor_identity(descriptor: int, *, expected_uid: int) -> tuple[int, int, int, int]:
     try:
-        directory_fd = os.open(path, flags)
-        details = os.fstat(directory_fd)
+        details = os.fstat(descriptor)
     except OSError as error:
-        raise RuntimeError("github_effect_service_configuration_invalid") from error
-    if (
-        not stat.S_ISDIR(details.st_mode)
-        or details.st_uid != expected_uid
-        or stat.S_IMODE(details.st_mode) & 0o022
-    ):
-        os.close(directory_fd)
-        raise RuntimeError("github_effect_service_configuration_invalid")
-    return directory_fd
+        raise RuntimeError("github_effect_service_listener_invalid") from error
+    if not stat.S_ISSOCK(details.st_mode) or details.st_uid != expected_uid:
+        raise RuntimeError("github_effect_service_listener_invalid")
+    return details.st_dev, details.st_ino, details.st_mode, details.st_uid
 
 
-def _socket_identity(details: os.stat_result) -> tuple[int, int, int, int]:
-    return (details.st_dev, details.st_ino, details.st_mode, details.st_uid)
-
-
-def _validated_socket_at(directory_fd: int, name: str, *, expected_uid: int) -> os.stat_result:
+def _listener_is_accepting(listener: socket.socket) -> bool:
+    """Check listening state, including AF_UNIX platforms without SO_ACCEPTCONN."""
     try:
-        details = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-    except OSError as error:
-        raise RuntimeError("github_effect_service_socket_identity_invalid") from error
-    if (
-        stat.S_ISLNK(details.st_mode)
-        or not stat.S_ISSOCK(details.st_mode)
-        or details.st_uid != expected_uid
-        or stat.S_IMODE(details.st_mode) != 0o600
-    ):
-        raise RuntimeError("github_effect_service_socket_identity_invalid")
-    return details
-
-
-def _remove_verified_stale_socket(
-    directory_fd: int, socket_path: Path, *, expected_uid: int
-) -> None:
-    try:
-        original = os.stat(socket_path.name, dir_fd=directory_fd, follow_symlinks=False)
-    except FileNotFoundError:
-        return
-    original = _validated_socket_at(directory_fd, socket_path.name, expected_uid=expected_uid)
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
-        probe.settimeout(_CONNECTION_TIMEOUT_SECONDS)
+        return listener.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN) == 1
+    except OSError:
+        previous_timeout = listener.gettimeout()
+        listener.setblocking(False)
         try:
-            probe.connect(os.fspath(socket_path))
-        except OSError as error:
-            if error.errno not in {errno.ECONNREFUSED, errno.ECONNRESET}:
-                raise RuntimeError("github_effect_service_socket_identity_invalid") from error
+            connection, _ = listener.accept()
+        except BlockingIOError:
+            return True
+        except OSError:
+            return False
         else:
-            raise RuntimeError("github_effect_service_already_running")
-    current = _validated_socket_at(directory_fd, socket_path.name, expected_uid=expected_uid)
-    if _socket_identity(current) != _socket_identity(original):
-        raise RuntimeError("github_effect_service_socket_identity_invalid")
-    os.unlink(socket_path.name, dir_fd=directory_fd)
+            connection.close()
+            return False
+        finally:
+            listener.settimeout(previous_timeout)
 
 
-def _bind_at(listener: socket.socket, directory_fd: int, name: str) -> None:
-    previous = os.open(".", os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+@contextmanager
+def _validated_activated_listener(
+    *, listener_fd: int, socket_path: Path, expected_uid: int
+) -> Iterator[socket.socket]:
+    """Duplicate and validate a supervisor-owned listening Unix socket."""
+    descriptor_before = _descriptor_identity(listener_fd, expected_uid=expected_uid)
     try:
-        os.fchdir(directory_fd)
-        listener.bind(name)
+        parent_fd = open_pinned_parent(socket_path, expected_uid=expected_uid)
+        path_before = socket_identity_at(parent_fd, socket_path.name, expected_uid=expected_uid)
+    except ProtectedSocketPathError as error:
+        raise RuntimeError("github_effect_service_socket_identity_invalid") from error
+    try:
+        try:
+            duplicate = os.dup(listener_fd)
+            listener = socket.socket(fileno=duplicate)
+        except OSError as error:
+            raise RuntimeError("github_effect_service_listener_invalid") from error
+        try:
+            if (
+                listener.family != socket.AF_UNIX
+                or listener.getsockopt(socket.SOL_SOCKET, socket.SO_TYPE) != socket.SOCK_STREAM
+                or not _listener_is_accepting(listener)
+                or listener.getsockname() != os.fspath(socket_path)
+            ):
+                raise RuntimeError("github_effect_service_listener_invalid")
+            descriptor_after = _descriptor_identity(listener_fd, expected_uid=expected_uid)
+            path_after = socket_identity_at(parent_fd, socket_path.name, expected_uid=expected_uid)
+            if descriptor_after != descriptor_before or path_after != path_before:
+                raise RuntimeError("github_effect_service_socket_identity_invalid")
+            yield listener
+        finally:
+            listener.close()
+    except ProtectedSocketPathError as error:
+        raise RuntimeError("github_effect_service_socket_identity_invalid") from error
     finally:
-        os.fchdir(previous)
-        os.close(previous)
+        os.close(parent_fd)
 
 
-def _serve_listener(
+def _serve_activated_listener(
     *,
+    listener_fd: int,
     socket_path: Path,
     allowed_client_uid: int,
     service_uid: int,
@@ -415,7 +422,7 @@ def _serve_listener(
     connection_timeout_seconds: float,
     on_ready: object | None = None,
 ) -> None:
-    """Serve fixed high-level requests through one pinned Unix-socket endpoint."""
+    """Serve requests from a validated supervisor-owned listener without path mutation."""
     if (
         not socket_path.is_absolute()
         or socket_path.name in {"", ".", ".."}
@@ -424,43 +431,27 @@ def _serve_listener(
         or not 0.05 <= connection_timeout_seconds <= 30.0
     ):
         raise RuntimeError("github_effect_service_configuration_invalid")
-    directory_fd = _open_runtime_directory(socket_path.parent, expected_uid=service_uid)
-    bound_identity: tuple[int, int, int, int] | None = None
-    try:
-        _remove_verified_stale_socket(directory_fd, socket_path, expected_uid=service_uid)
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
-            _bind_at(listener, directory_fd, socket_path.name)
-            os.chmod(socket_path.name, 0o600, dir_fd=directory_fd, follow_symlinks=False)
-            details = _validated_socket_at(directory_fd, socket_path.name, expected_uid=service_uid)
-            bound_identity = _socket_identity(details)
-            listener.listen(32)
-            if on_ready is not None:
-                on_ready()
-            while True:
-                connection, _ = listener.accept()
-                with connection:
-                    connection.settimeout(float(connection_timeout_seconds))
-                    peer_uid = _peer_uid(connection)
-                    if peer_uid is None or peer_uid != allowed_client_uid:
-                        continue
-                    _serve_connection(
-                        connection,
-                        gateway=gateway,
-                        policy=policy,
-                        state_controller=state_controller,
-                        clock=clock,
-                    )
-    finally:
-        if bound_identity is not None:
-            try:
-                current = _validated_socket_at(
-                    directory_fd, socket_path.name, expected_uid=service_uid
+    with _validated_activated_listener(
+        listener_fd=listener_fd,
+        socket_path=socket_path,
+        expected_uid=service_uid,
+    ) as listener:
+        if on_ready is not None:
+            on_ready()
+        while True:
+            connection, _ = listener.accept()
+            with connection:
+                connection.settimeout(float(connection_timeout_seconds))
+                peer_uid = _peer_uid(connection)
+                if peer_uid is None or peer_uid != allowed_client_uid:
+                    continue
+                _serve_connection(
+                    connection,
+                    gateway=gateway,
+                    policy=policy,
+                    state_controller=state_controller,
+                    clock=clock,
                 )
-                if _socket_identity(current) == bound_identity:
-                    os.unlink(socket_path.name, dir_fd=directory_fd)
-            except (FileNotFoundError, RuntimeError):
-                pass
-        os.close(directory_fd)
 
 
 def _peer_uid(connection: socket.socket) -> int | None:
@@ -478,6 +469,10 @@ def _peer_uid(connection: socket.socket) -> int | None:
 
 def main() -> int:
     """Run the fixed protected service. No caller-selected dependencies or paths."""
+    listener_fd = _activation_descriptor_from_environment(
+        environment=os.environ,
+        process_id=os.getpid(),
+    )
     github = _github_cloud()
     policy = github._load_protected_policy()
     token = os.environ.get(github._PROTECTED_TOKEN_ENV)
@@ -494,7 +489,8 @@ def main() -> int:
         dispatch_actor_login=policy.dispatch_actor_login,
         graphql_documents=_protected_graphql_documents(),
     )
-    _serve_listener(
+    _serve_activated_listener(
+        listener_fd=listener_fd,
         socket_path=_SOCKET_PATH,
         allowed_client_uid=_ALLOWED_CLIENT_UID,
         service_uid=0,
