@@ -870,11 +870,11 @@ DECLARE
     existing carl_autonomy.coordinator_recovery_receipts%ROWTYPE;
     occurrence carl_autonomy.coordinator_freeze_occurrences%ROWTYPE;
 BEGIN
-    IF CASE
+    IF (CASE
         WHEN current_setting('role', true) IS NULL
             OR current_setting('role', true) = 'none' THEN session_user::text
         ELSE current_setting('role', true)
-    END <> 'carl_archive_backend'
+    END) <> 'carl_archive_backend'
     THEN
         RAISE EXCEPTION USING ERRCODE = '42501', MESSAGE = 'database_role_denied';
     END IF;
