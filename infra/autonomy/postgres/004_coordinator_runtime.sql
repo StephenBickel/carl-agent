@@ -286,9 +286,7 @@ AS $$
     SELECT to_char(p_value AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS')
         || CASE
             WHEN (extract(microseconds FROM p_value)::bigint % 1000000) = 0 THEN ''
-            ELSE '.' || regexp_replace(
-                to_char(p_value AT TIME ZONE 'UTC', 'US'), '0+$', ''
-            )
+            ELSE '.' || to_char(p_value AT TIME ZONE 'UTC', 'US')
         END
         || 'Z'
 $$;
@@ -515,8 +513,19 @@ BEGIN
     IF authority_value IS NULL
         OR p_experiment_id !~ '^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$'
         OR p_attempt NOT BETWEEN 1 AND 3
-        OR p_command_key <> p_experiment_id || ':' || p_node_kind
-            || ':attempt:' || p_attempt::text
+        OR NOT (
+            p_command_key = p_experiment_id || ':' || p_node_kind
+                || ':attempt:' || p_attempt::text
+            OR (
+                p_node_kind = 'publish_experimental'
+                AND p_command_key = 'github-experimental-' || p_experiment_id
+            )
+            OR (
+                p_node_kind = 'dispatch_validation'
+                AND p_command_key ~ '^cloud-run-[0-9a-f]{64}-attempt-[1-3]$'
+                AND p_command_key LIKE '%-attempt-' || p_attempt::text
+            )
+        )
         OR p_effect_key !~ '^cloud-effect-[0-9a-f]{64}$'
         OR p_request_digest !~ '^[0-9a-f]{64}$'
         OR p_result_digest !~ '^[0-9a-f]{64}$'
@@ -1234,7 +1243,6 @@ BEGIN
         OR recovery_receipt.attempt <> (selected_node->>'attempt')::integer
         OR recovery_receipt.reason <> runtime.freeze_reason
         OR recovery_receipt.command_key <> selected_node->>'command_key'
-        OR recovery_receipt.effect_key <> selected_node->>'effect_key'
         OR recovery_receipt.request_digest <> selected_node->>'request_digest'
         OR recovery_receipt.runtime_revision <> runtime.revision
         OR recovery_receipt.decision_identity <> runtime.decision_identity
@@ -1339,7 +1347,7 @@ BEGIN
         AND occurrence.attempt = (selected_node->>'attempt')::integer
         AND occurrence.reason = runtime.freeze_reason
         AND occurrence.command_key = selected_node->>'command_key'
-        AND occurrence.effect_key = selected_node->>'effect_key'
+        AND occurrence.effect_key = recovery_receipt.effect_key
         AND occurrence.request_digest = selected_node->>'request_digest'
         AND occurrence.runtime_revision = runtime.revision
         AND occurrence.decision_identity = runtime.decision_identity
@@ -2060,6 +2068,7 @@ DECLARE
     expected_completion record;
     existing_completion carl_autonomy.coordinator_completion_receipts%ROWTYPE;
     existing_freeze carl_autonomy.coordinator_freeze_occurrences%ROWTYPE;
+    freeze_effect_key_value text;
 BEGIN
     PERFORM carl_autonomy.require_role(ARRAY['carl_coordinator']);
     decision_value := carl_autonomy.parse_object(
@@ -2475,6 +2484,27 @@ BEGIN
                     'revision', runtime.revision
                 ))
             );
+            freeze_effect_key_value := ready_node->>'effect_key';
+            IF freeze_effect_key_value IS NULL AND runtime.effect_request_json IS NOT NULL THEN
+                existing_effect_request := carl_autonomy.parse_object(
+                    runtime.effect_request_json, 'coordinator_effect_request_invalid'
+                );
+                IF existing_effect_request->>'command_key'
+                        IS DISTINCT FROM ready_node->>'command_key'
+                    OR existing_effect_request->>'node_kind'
+                        IS DISTINCT FROM ready_node->>'kind'
+                    OR existing_effect_request->>'request_digest'
+                        IS DISTINCT FROM ready_node->>'request_digest'
+                THEN
+                    RAISE EXCEPTION USING
+                        ERRCODE = '55000', MESSAGE = 'coordinator_effect_request_mismatch';
+                END IF;
+                freeze_effect_key_value := existing_effect_request->>'effect_key';
+            END IF;
+            IF freeze_effect_key_value !~ '^cloud-effect-[0-9a-f]{64}$' THEN
+                RAISE EXCEPTION USING
+                    ERRCODE = '55000', MESSAGE = 'coordinator_effect_identity_invalid';
+            END IF;
             INSERT INTO carl_autonomy.coordinator_freeze_occurrences(
                 occurrence_key, freeze_fingerprint, experiment_id, node_id, node_kind,
                 attempt, reason, command_key, effect_key, request_digest, runtime_revision,
@@ -2488,7 +2518,7 @@ BEGIN
                 (ready_node->>'attempt')::integer,
                 decision_value->>'reason',
                 ready_node->>'command_key',
-                ready_node->>'effect_key',
+                freeze_effect_key_value,
                 ready_node->>'request_digest',
                 runtime.revision,
                 decision_value->>'identity',
@@ -2509,7 +2539,7 @@ BEGIN
                 OR existing_freeze.attempt <> (ready_node->>'attempt')::integer
                 OR existing_freeze.reason <> decision_value->>'reason'
                 OR existing_freeze.command_key <> ready_node->>'command_key'
-                OR existing_freeze.effect_key <> ready_node->>'effect_key'
+                OR existing_freeze.effect_key <> freeze_effect_key_value
                 OR existing_freeze.request_digest <> ready_node->>'request_digest'
                 OR existing_freeze.runtime_revision <> runtime.revision
                 OR existing_freeze.decision_identity <> decision_value->>'identity'
@@ -3478,7 +3508,7 @@ DECLARE
     claim_result record;
     existing_command carl_autonomy.commands%ROWTYPE;
 BEGIN
-    PERFORM carl_autonomy.require_role(ARRAY['carl_state_backend']);
+    PERFORM carl_autonomy.require_role(ARRAY['carl_coordinator']);
     registration := carl_autonomy.parse_object(
         p_registration_json, 'builder_effect_registration_invalid'
     );
@@ -3712,7 +3742,7 @@ DECLARE
     receipt_value text;
     existing_builder_receipt carl_autonomy.builder_effect_completion_receipts%ROWTYPE;
 BEGIN
-    PERFORM carl_autonomy.require_role(ARRAY['carl_state_backend']);
+    PERFORM carl_autonomy.require_role(ARRAY['carl_coordinator']);
     completion := carl_autonomy.parse_object(
         p_completion_json, 'builder_effect_completion_invalid'
     );
@@ -3871,6 +3901,7 @@ BEGIN
         OR selected_node->>'kind' <> completion->>'node'
         OR selected_node->>'node_id'
             <> runtime.experiment_id || ':' || (completion->>'node')
+        OR selected_node->>'command_key' <> command_state.command_key
         OR NOT FOUND
         OR command_state.status <> 'claimed'
         OR command_state.effect_key <> completion->>'effect_key'
@@ -3904,15 +3935,8 @@ BEGIN
     ));
     PERFORM set_config('carl_autonomy.authority', command_state.authority, true);
     SELECT * INTO completion_result
-    FROM carl_autonomy.complete_command_and_append_event(
+    FROM carl_autonomy.complete_command(
         transition_value,
-        completion_event.event_json,
-        completion_event.event_digest,
-        carl_autonomy.canonical_jsonb(
-            carl_autonomy.parse_object(
-                completion_event.event_json, 'coordinator_completion_event_invalid'
-            )->'payload'
-        ),
         (completion->>'observed_at')::timestamptz
     );
     INSERT INTO carl_autonomy.coordinator_completion_receipts(
@@ -4023,7 +4047,7 @@ DECLARE
     expected_effect_key text;
     expected_idempotency text;
 BEGIN
-    PERFORM carl_autonomy.require_role(ARRAY['carl_state_backend']);
+    PERFORM carl_autonomy.require_role(ARRAY['carl_coordinator']);
     identity_value := carl_autonomy.parse_object(
         p_identity_json, 'builder_effect_completion_identity_invalid'
     );

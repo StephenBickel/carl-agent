@@ -40,6 +40,7 @@ from carl_bench.cloud_coordinator import (
     CloudCoordinatorDecision,
     CoordinatorSnapshot,
     choose_next_action,
+    reconstruct_snapshot,
 )
 from carl_bench.cloud_state import (
     AuthorityCapability,
@@ -145,6 +146,18 @@ def test_jsonb_object_cardinality_is_exact_and_fails_closed(
             "SELECT carl_autonomy.jsonb_object_cardinality(%s::jsonb)", (value,)
         ).fetchone()[0]
     assert actual == expected
+
+
+def test_coordinator_timestamp_preserves_six_digit_python_canonical_fraction(
+    postgres: object,
+) -> None:
+    assert POSTGRES_DSN is not None
+    with postgres.connect(POSTGRES_DSN, autocommit=True) as connection:  # type: ignore[attr-defined]
+        actual = connection.execute(
+            "SELECT carl_autonomy.coordinator_timestamp(%s::timestamptz)",
+            ("2026-08-23T22:12:22.258780Z",),
+        ).fetchone()[0]
+    assert actual == "2026-08-23T22:12:22.258780Z"
 
 
 @pytest.mark.parametrize(
@@ -543,11 +556,11 @@ def test_acceptance_append_rechecks_a_concurrent_production_worse_commit(
         _as_role(postgres, "carl_soak") as failure_connection,
     ):
         acceptance_connection.execute("BEGIN")
-        acceptance_connection.execute(
-            "SELECT lifecycle_state FROM carl_autonomy.experiment_projection_guards "
-            "WHERE experiment_id = %s",
+        observed = acceptance_connection.execute(
+            "SELECT count(*) AS count FROM carl_autonomy.load_experiment_events(%s)",
             (manifest.experiment_id,),
         ).fetchone()
+        assert observed == {"count": accepted_index}
         failure_connection.execute("BEGIN")
         _append_event(failure_connection, production_worse)
         failure_connection.execute("COMMIT")
@@ -630,7 +643,7 @@ def test_invalid_completion_freeze_is_atomic_across_crash_and_replay(
                 ("coordinate", NOW),
             ).fetchone()
             assert row["snapshot_json"] is not None
-            return CoordinatorSnapshot.from_canonical_dict(json.loads(row["snapshot_json"]))
+            return reconstruct_snapshot(json.loads(row["snapshot_json"]))
 
         for expected_action in ("acquire_lease", "persist_command", "claim_command"):
             decision = choose_next_action(load())
@@ -1122,6 +1135,15 @@ def test_frozen_node_reactivates_only_with_changed_retained_repair_evidence(
             (_canonical(frozen.to_canonical_dict()), NOW),
         ).fetchone()
     assert applied["applied"] is True
+    with postgres.connect(  # type: ignore[attr-defined]
+        POSTGRES_DSN, autocommit=True, row_factory=dict_row
+    ) as admin:
+        freeze = admin.execute(
+            "SELECT effect_key FROM carl_autonomy.coordinator_freeze_occurrences "
+            "WHERE freeze_fingerprint=%s",
+            (freeze_fingerprint,),
+        ).fetchone()
+    assert freeze is not None
     evidence = EvidenceObject(
         digest="c" * 64,
         object_key=f"evidence/{'c' * 64}",
@@ -1169,7 +1191,7 @@ def test_frozen_node_reactivates_only_with_changed_retained_repair_evidence(
         "changed_action_digest": "d" * 64,
         "command_key": selected["command_key"],
         "decision_identity": frozen.identity,
-        "effect_key": selected["effect_key"],
+        "effect_key": freeze["effect_key"],
         "experiment_id": manifest.experiment_id,
         "freeze_fingerprint": freeze_fingerprint,
         "node_id": selected["node_id"],
@@ -1682,7 +1704,9 @@ def _backend(postgres: object) -> PostgresStateBackend:
     assert POSTGRES_DSN is not None
 
     def connect(dsn: str):
-        connection = postgres.connect(dsn, row_factory=dict_row)  # type: ignore[attr-defined]
+        connection = postgres.connect(  # type: ignore[attr-defined]
+            dsn, autocommit=True, row_factory=dict_row
+        )
         connection.execute(sql.SQL("SET ROLE {}").format(sql.Identifier("carl_state_backend")))
         return connection
 
@@ -1930,7 +1954,9 @@ def _archive_registrar(postgres: object) -> PostgresCoordinatorRecoveryReceiptRe
     assert POSTGRES_DSN is not None
 
     def connect(dsn: str):
-        connection = postgres.connect(dsn, row_factory=dict_row)  # type: ignore[attr-defined]
+        connection = postgres.connect(  # type: ignore[attr-defined]
+            dsn, autocommit=True, row_factory=dict_row
+        )
         connection.execute(sql.SQL("SET ROLE {}").format(sql.Identifier("carl_archive_backend")))
         return connection
 
@@ -2366,20 +2392,30 @@ def test_effect_fence_migration_upgrades_populated_pinned_4aa2ab5_state(
 
 def test_effect_fence_migration_rejects_incompatible_existing_table(postgres: object) -> None:
     assert POSTGRES_DSN is not None
-    with postgres.connect(POSTGRES_DSN, autocommit=True) as admin:  # type: ignore[attr-defined]
-        admin.execute("DROP SCHEMA IF EXISTS carl_autonomy CASCADE")
-        admin.execute("DROP SCHEMA IF EXISTS carl_poison CASCADE")
-        for migration in BASE_MIGRATIONS:
-            admin.execute(migration.read_text(encoding="utf-8"), prepare=False)
-        admin.execute("CREATE TABLE carl_autonomy.effect_attempts(effect_key text PRIMARY KEY)")
-        with pytest.raises(Exception, match="effect_fence_schema_invalid"):
+    try:
+        with postgres.connect(  # type: ignore[attr-defined]
+            POSTGRES_DSN, autocommit=True
+        ) as admin:
+            admin.execute("DROP SCHEMA IF EXISTS carl_autonomy CASCADE")
+            admin.execute("DROP SCHEMA IF EXISTS carl_poison CASCADE")
+            for migration in BASE_MIGRATIONS:
+                admin.execute(migration.read_text(encoding="utf-8"), prepare=False)
             admin.execute(
-                GITHUB_EFFECT_FENCES_MIGRATION.read_text(encoding="utf-8"),
-                prepare=False,
+                "CREATE TABLE carl_autonomy.effect_attempts(effect_key text PRIMARY KEY)"
             )
-        admin.execute("DROP SCHEMA IF EXISTS carl_autonomy CASCADE")
-        for migration in MIGRATIONS:
-            admin.execute(migration.read_text(encoding="utf-8"), prepare=False)
+            with pytest.raises(Exception, match="effect_fence_schema_invalid"):
+                admin.execute(
+                    GITHUB_EFFECT_FENCES_MIGRATION.read_text(encoding="utf-8"),
+                    prepare=False,
+                )
+            admin.rollback()
+    finally:
+        with postgres.connect(  # type: ignore[attr-defined]
+            POSTGRES_DSN, autocommit=True
+        ) as restore:
+            restore.execute("DROP SCHEMA IF EXISTS carl_autonomy CASCADE")
+            for migration in MIGRATIONS:
+                restore.execute(migration.read_text(encoding="utf-8"), prepare=False)
 
 
 def test_effect_fence_migration_rejects_scratch_poison_and_drops_its_own_scratch(
