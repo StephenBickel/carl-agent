@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import json
 import os
@@ -13,6 +15,10 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 from carl_bench.artifacts import (
     MAX_ARTIFACT_BYTES,
@@ -248,6 +254,169 @@ class SyntheticCommissioningReceipt:
     @property
     def digest(self) -> str:
         return hashlib.sha256(canonical_json_bytes(self.to_canonical_dict())).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class RemoteCloudAcceptanceReceipt:
+    """Production-only signed acceptance; synthetic reports have a disjoint schema."""
+
+    schema_version: int
+    authority_kind: str
+    synthetic_test_only: bool
+    remote_cloud_acceptance: str
+    repository: str
+    experiment_id: str
+    experimental_ref: str
+    candidate_commit: str
+    candidate_tree: str
+    provider_kind: str
+    provider_account_id: str
+    provider_run_id: int
+    workflow_revision: str
+    signed_observation_digest: str
+    archive_object_key: str
+    archive_version_id: str
+    archive_digest: str
+    signer_key_id: str
+    disposition_digest: str
+    promotion_id: str
+    pull_request_number: int
+    required_checks_digest: str
+    merge_commit: str
+    merge_tree: str
+    merged_at: str
+    accepted_soak_digest: str
+    accepted_at: str
+    signature_base64: str
+
+    def __post_init__(self) -> None:
+        if (
+            self.schema_version != 1
+            or self.authority_kind != "remote_cloud_acceptance"
+            or self.synthetic_test_only is not False
+            or self.remote_cloud_acceptance != "commissioned"
+        ):
+            raise CommissioningArtifactError("invalid_remote_cloud_acceptance_receipt")
+        if not isinstance(self.repository, str) or not re.fullmatch(
+            r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", self.repository
+        ):
+            raise CommissioningArtifactError("invalid_remote_cloud_acceptance_receipt")
+        if self.provider_kind != "github_actions":
+            raise CommissioningArtifactError("invalid_remote_cloud_acceptance_receipt")
+        _identifier(
+            self.provider_account_id,
+            "invalid_remote_cloud_acceptance_receipt",
+        )
+        _identifier(self.experiment_id, "invalid_remote_cloud_acceptance_receipt")
+        if self.experimental_ref != f"refs/heads/experimental/{self.experiment_id}":
+            raise CommissioningArtifactError("invalid_remote_cloud_acceptance_receipt")
+        for value in (
+            self.candidate_commit,
+            self.candidate_tree,
+            self.merge_commit,
+            self.merge_tree,
+            self.workflow_revision,
+        ):
+            _object(value, "invalid_remote_cloud_acceptance_receipt")
+        if self.merge_tree != self.candidate_tree:
+            raise CommissioningArtifactError("invalid_remote_cloud_acceptance_receipt")
+        for value in (
+            self.signed_observation_digest,
+            self.archive_digest,
+            self.disposition_digest,
+            self.accepted_soak_digest,
+            self.required_checks_digest,
+        ):
+            _digest(value, "invalid_remote_cloud_acceptance_receipt")
+        for value in (
+            self.archive_object_key,
+            self.archive_version_id,
+            self.signer_key_id,
+            self.promotion_id,
+        ):
+            if (
+                not isinstance(value, str)
+                or not value
+                or len(value.encode("utf-8")) > 512
+                or "\x00" in value
+            ):
+                raise CommissioningArtifactError("invalid_remote_cloud_acceptance_receipt")
+        for value in (self.provider_run_id, self.pull_request_number):
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise CommissioningArtifactError("invalid_remote_cloud_acceptance_receipt")
+        merged = self._utc(self.merged_at)
+        accepted = self._utc(self.accepted_at)
+        if (accepted - merged).total_seconds() < 24 * 60 * 60:
+            raise CommissioningArtifactError("remote_cloud_acceptance_soak_too_short")
+        try:
+            signature = base64.b64decode(self.signature_base64, validate=True)
+        except (ValueError, binascii.Error) as error:
+            raise CommissioningArtifactError("invalid_remote_cloud_acceptance_receipt") from error
+        if len(signature) != 64:
+            raise CommissioningArtifactError("invalid_remote_cloud_acceptance_receipt")
+
+    @staticmethod
+    def _utc(value: object) -> datetime:
+        if not isinstance(value, str) or not value.endswith("Z"):
+            raise CommissioningArtifactError("invalid_remote_cloud_acceptance_receipt")
+        try:
+            parsed = datetime.fromisoformat(value.removesuffix("Z") + "+00:00")
+        except ValueError as error:
+            raise CommissioningArtifactError("invalid_remote_cloud_acceptance_receipt") from error
+        if parsed.tzinfo != UTC or parsed.isoformat().replace("+00:00", "Z") != value:
+            raise CommissioningArtifactError("invalid_remote_cloud_acceptance_receipt")
+        return parsed
+
+    def signing_payload(self) -> dict[str, Any]:
+        return {
+            name: getattr(self, name)
+            for name in self.__dataclass_fields__
+            if name != "signature_base64"
+        }
+
+    def to_canonical_dict(self) -> dict[str, Any]:
+        return {**self.signing_payload(), "signature_base64": self.signature_base64}
+
+    @classmethod
+    def from_canonical_dict(cls, value: Any) -> RemoteCloudAcceptanceReceipt:
+        if type(value) is not dict or set(value) != set(cls.__dataclass_fields__):
+            raise CommissioningArtifactError("invalid_remote_cloud_acceptance_receipt")
+        try:
+            return cls(**value)
+        except TypeError as error:
+            raise CommissioningArtifactError("invalid_remote_cloud_acceptance_receipt") from error
+
+    @property
+    def digest(self) -> str:
+        return hashlib.sha256(canonical_json_bytes(self.to_canonical_dict())).hexdigest()
+
+
+def require_remote_cloud_acceptance(
+    value: object,
+    *,
+    trusted_key: object,
+) -> RemoteCloudAcceptanceReceipt:
+    """Verify the distinct production acceptance type under its pinned remote key."""
+    from carl_bench.cloud_execution import TrustedCloudReceiptKey
+
+    if type(value) is not RemoteCloudAcceptanceReceipt:
+        raise CommissioningArtifactError("remote_cloud_acceptance_receipt_type_required")
+    if not isinstance(trusted_key, TrustedCloudReceiptKey):
+        raise CommissioningArtifactError("remote_cloud_acceptance_trusted_key_required")
+    if value.signer_key_id != trusted_key.key_id:
+        raise CommissioningArtifactError("remote_cloud_acceptance_key_mismatch")
+    try:
+        key = serialization.load_pem_public_key(trusted_key.public_key_pem)
+    except (TypeError, ValueError) as error:
+        raise CommissioningArtifactError("remote_cloud_acceptance_trusted_key_invalid") from error
+    if not isinstance(key, Ed25519PublicKey):
+        raise CommissioningArtifactError("remote_cloud_acceptance_trusted_key_invalid")
+    try:
+        signature = base64.b64decode(value.signature_base64, validate=True)
+        key.verify(signature, canonical_json_bytes(value.signing_payload()))
+    except (ValueError, binascii.Error, InvalidSignature) as error:
+        raise CommissioningArtifactError("remote_cloud_acceptance_signature_invalid") from error
+    return value
 
 
 @dataclass(frozen=True, slots=True)

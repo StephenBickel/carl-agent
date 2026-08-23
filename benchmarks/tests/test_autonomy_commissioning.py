@@ -56,13 +56,16 @@ from carl_bench.cloud_execution import (
     CloudArtifact,
     CloudRunRequest,
     CloudRunSnapshot,
+    TrustedCloudReceiptKey,
     reconcile_cloud_run,
 )
 from carl_bench.commissioning import (
     CommissioningArtifactError,
     CommissioningArtifactStore,
+    RemoteCloudAcceptanceReceipt,
     SyntheticCommissioningReceipt,
     SyntheticCommissioningSources,
+    require_remote_cloud_acceptance,
 )
 from carl_bench.experiment import (
     EventType,
@@ -3947,6 +3950,36 @@ def test_synthetic_commissioning_artifacts_cannot_claim_remote_acceptance_or_liv
             automation_data_root=REPOSITORY_ROOT / ".private-commissioning",
             repository_root=REPOSITORY_ROOT,
         )
+
+
+def test_synthetic_receipt_shape_cannot_be_reinterpreted_as_remote_cloud_acceptance() -> None:
+    signer = Ed25519PrivateKey.generate()
+    trusted_key = TrustedCloudReceiptKey(
+        key_id="remote-cloud-acceptance-v1",
+        public_key_pem=signer.public_key().public_bytes(
+            serialization.Encoding.PEM,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        ),
+    )
+
+    with pytest.raises(
+        CommissioningArtifactError,
+        match="remote_cloud_acceptance_receipt_type_required",
+    ):
+        require_remote_cloud_acceptance(_synthetic_receipt(), trusted_key=trusted_key)
+
+    forged = {
+        **_synthetic_receipt().to_canonical_dict(),
+        "authority_kind": "remote_cloud_acceptance",
+        "remote_cloud_acceptance": "commissioned",
+        "signature_base64": base64.b64encode(b"x" * 64).decode("ascii"),
+        "synthetic_test_only": False,
+    }
+    with pytest.raises(
+        CommissioningArtifactError,
+        match="invalid_remote_cloud_acceptance_receipt",
+    ):
+        RemoteCloudAcceptanceReceipt.from_canonical_dict(forged)
 
 
 def test_live_workflows_require_durable_provider_reconciliation_and_never_fake_success() -> None:
