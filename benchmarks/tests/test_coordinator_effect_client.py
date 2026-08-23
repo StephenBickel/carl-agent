@@ -150,7 +150,9 @@ def test_each_fixed_effect_family_round_trips_over_a_credential_free_socket(
 ) -> None:
     from carl_bench.coordinator_effect_client import CoordinatorEffectSocketClient
 
-    with tempfile.TemporaryDirectory(prefix="carl-cef-", dir="/private/tmp") as directory:
+    with tempfile.TemporaryDirectory(
+        prefix="carl-cef-", dir="/private/tmp" if Path("/private/tmp").is_dir() else "/tmp"
+    ) as directory:
         socket_path = Path(directory) / f"{family}.sock"
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         listener.bind(os.fspath(socket_path))
@@ -195,7 +197,9 @@ def test_each_packaged_protected_effect_service_responds_on_its_activated_socket
 ) -> None:
     from carl_bench.coordinator_effect_client import CoordinatorEffectSocketClient
 
-    with tempfile.TemporaryDirectory(prefix="carl-ces-", dir="/private/tmp") as directory:
+    with tempfile.TemporaryDirectory(
+        prefix="carl-ces-", dir="/private/tmp" if Path("/private/tmp").is_dir() else "/tmp"
+    ) as directory:
         socket_path = Path(directory) / f"{family}.sock"
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         listener.bind(os.fspath(socket_path))
@@ -326,7 +330,9 @@ def test_root_activated_socket_accepts_first_publish_input_from_exact_responder(
 def test_all_four_effect_services_are_distinct_long_lived_responders() -> None:
     from carl_bench.coordinator_effect_client import CoordinatorEffectSocketClient
 
-    with tempfile.TemporaryDirectory(prefix="carl-ces-all-", dir="/private/tmp") as directory:
+    with tempfile.TemporaryDirectory(
+        prefix="carl-ces-all-", dir="/private/tmp" if Path("/private/tmp").is_dir() else "/tmp"
+    ) as directory:
         root = Path(directory)
         context = multiprocessing.get_context("spawn")
         services: list[tuple[socket.socket, object, object, object, Path]] = []

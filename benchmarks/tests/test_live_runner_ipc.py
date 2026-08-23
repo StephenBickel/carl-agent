@@ -172,7 +172,11 @@ def test_credential_free_runner_client_reaches_protected_execute_worker_and_rest
             return _bundle(self.requests[-1])
 
     runner = Runner()
-    socket_root = Path(tempfile.mkdtemp(prefix="carl-runner-", dir="/private/tmp"))
+    socket_root = Path(
+        tempfile.mkdtemp(
+            prefix="carl-runner-", dir="/private/tmp" if Path("/private/tmp").is_dir() else "/tmp"
+        )
+    )
     socket_root.chmod(0o700)
     try:
         for generation in (1, 2):

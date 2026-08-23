@@ -315,7 +315,10 @@ def test_every_node_survives_restart_and_reaches_exact_completion(kind: str) -> 
 def test_all_22_nodes_complete_through_real_routers_and_activated_effect_processes() -> None:
     from carl_bench.coordinator_effect_client import CoordinatorEffectSocketClient
 
-    with tempfile.TemporaryDirectory(prefix="carl-all-node-router-", dir="/private/tmp") as path:
+    with tempfile.TemporaryDirectory(
+        prefix="carl-all-node-router-",
+        dir="/private/tmp" if Path("/private/tmp").is_dir() else "/tmp",
+    ) as path:
         root = Path(path)
         context = multiprocessing.get_context("spawn")
         services: dict[str, tuple[socket.socket, object, object, Path]] = {}

@@ -86,7 +86,9 @@ def test_separate_service_process_owns_state_secret_and_advances_replay(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv("CARL_AUTONOMY_POSTGRES_DSN", raising=False)
-    with tempfile.TemporaryDirectory(prefix="carl-coord-", dir="/private/tmp") as directory:
+    with tempfile.TemporaryDirectory(
+        prefix="carl-coord-", dir="/private/tmp" if Path("/private/tmp").is_dir() else "/tmp"
+    ) as directory:
         socket_path = Path(directory) / "coordinator.sock"
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         listener.bind(os.fspath(socket_path))
