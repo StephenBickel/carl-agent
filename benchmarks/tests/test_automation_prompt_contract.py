@@ -21,6 +21,9 @@ SOAK_WORKFLOW_PATH = REPOSITORY_ROOT / ".github/workflows/autonomous-soak.yml"
 COORDINATOR_WORKFLOW_PATH = REPOSITORY_ROOT / ".github/workflows/autonomy-coordinator.yml"
 BUILDER_WORKFLOW_PATH = REPOSITORY_ROOT / ".github/workflows/autonomy-builder.yml"
 BUILDER_PROMPT_PATH = REPOSITORY_ROOT / "docs/automation-prompts/carl-product-builder.md"
+SUPERVISOR_WORKFLOW_PATH = REPOSITORY_ROOT / ".github/workflows/autonomy-supervisor.yml"
+SOAK_SCHEDULER_WORKFLOW_PATH = REPOSITORY_ROOT / ".github/workflows/autonomy-soak-scheduler.yml"
+SUPERVISOR_PROMPT_PATH = REPOSITORY_ROOT / "docs/automation-prompts/carl-autonomy-supervisor.md"
 ACTIONLINT_CONFIG_PATH = REPOSITORY_ROOT / ".github/actionlint.yaml"
 
 
@@ -811,6 +814,95 @@ def _job_permissions(block: str) -> dict[str, str]:
     match = re.search(r"(?m)^    permissions:\n(?P<body>(?:      [a-z-]+: [a-z]+\n)+)", block)
     assert match is not None
     return dict(re.findall(r"(?m)^      ([a-z-]+): ([a-z]+)$", match.group("body")))
+
+
+def _assert_task_15_supervisor_contract(document: str, prompt: str) -> None:
+    assert 'cron: "17 */6 * * *"' in document
+    assert "workflow_dispatch:" in document
+    assert "permissions:\n  contents: read" in document
+    assert (
+        "group: carl-autonomy-supervisor-${{ github.event.repository.default_branch }}" in document
+    )
+    assert "cancel-in-progress: false" in document
+    assert "github.event.repository.default_branch" in document
+    assert "environment: carl-autonomy-supervisor" in document
+    assert _job_permissions(_workflow_job_blocks(document)["recover"]) == {
+        "contents": "read",
+        "id-token": "write",
+    }
+    assert "gpt-5.6-sol" in document
+    assert 'model_reasoning_effort="ultra"' in document
+    assert "carl-bench cloud coordinate" in document
+    assert "CARL_STATE_BACKEND: postgresql" in document
+    assert "actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683" in document
+    assert "astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990" in document
+    assert "persist-credentials: false" in document
+    assert "secrets." not in document
+    assert "contents: write" not in document
+
+    normalized = " ".join(prompt.lower().split())
+    for phrase in (
+        "exact trigger-claim compare-and-swap",
+        "at most three infrastructure attempts",
+        "no identical action against unchanged state",
+        "rollback outranks acp and commissioning outages",
+        "reconcile durable state",
+        "redispatch one exact safe node",
+        "ordinary protected control-plane repair pr",
+        "freeze a precise stable boundary",
+        "may not mutate candidate code",
+        "may not mint validation, disposition, promotion, or soak-acceptance evidence",
+        "may not weaken gates, push `main`, force-push, deploy, or release",
+    ):
+        assert phrase in normalized
+
+
+def test_task_15_supervisor_uses_protected_model_and_bounded_authority() -> None:
+    _assert_task_15_supervisor_contract(
+        SUPERVISOR_WORKFLOW_PATH.read_text(encoding="utf-8"),
+        SUPERVISOR_PROMPT_PATH.read_text(encoding="utf-8"),
+    )
+
+
+def test_task_15_supervisor_contract_rejects_authority_and_policy_mutations() -> None:
+    document = SUPERVISOR_WORKFLOW_PATH.read_text(encoding="utf-8")
+    prompt = SUPERVISOR_PROMPT_PATH.read_text(encoding="utf-8")
+    mutations = {
+        "weaker model": (document.replace("gpt-5.6-sol", "gpt-5.6-terra", 1), prompt),
+        "write token": (document.replace("contents: read", "contents: write", 1), prompt),
+        "candidate authority": (
+            document,
+            prompt.replace("may not mutate candidate code", "may mutate candidate code", 1),
+        ),
+    }
+    for name, (mutated_document, mutated_prompt) in mutations.items():
+        assert (mutated_document, mutated_prompt) != (document, prompt), name
+        with pytest.raises(AssertionError):
+            _assert_task_15_supervisor_contract(mutated_document, mutated_prompt)
+
+
+def test_task_15_soak_scheduler_is_exact_active_merge_bound_every_six_hours() -> None:
+    document = SOAK_SCHEDULER_WORKFLOW_PATH.read_text(encoding="utf-8")
+    assert 'cron: "23 */6 * * *"' in document
+    assert "workflow_dispatch:" in document
+    assert "permissions:\n  contents: read" in document
+    assert "group: carl-autonomy-soak-${{ github.event.repository.default_branch }}" in document
+    assert "cancel-in-progress: false" in document
+    assert "environment: carl-autonomy-soak" in document
+    assert _job_permissions(_workflow_job_blocks(document)["schedule"]) == {
+        "contents": "read",
+        "id-token": "write",
+    }
+    assert "CARL_STATE_BACKEND: postgresql" in document
+    assert "carl-bench cloud coordinate" in document
+    assert "schedule_soak observe_soak create_revert observe_revert" in document
+    assert "exact active merge" in document.lower()
+    assert 'SOAK_STALE_CRITICAL_HOURS: "26"' in document
+    assert 'HARD_FAILURE_REVERT_SLA_HOURS: "2"' in document
+    assert "github.sha" not in document
+    assert "inputs.candidate_commit" not in document
+    assert "secrets." not in document
+    assert "contents: write" not in document
 
 
 def _assert_soak_health_probes_use_protected_revision(document: str) -> None:

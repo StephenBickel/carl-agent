@@ -18,6 +18,16 @@ _DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 _KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,191}$")
 _OUTCOME_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _TERMINAL_STATUSES = frozenset({"rejected", "resolved"})
+_MATERIAL_RECOVERY_OUTCOMES = frozenset(
+    {
+        "repair_pr_opened",
+        "safe_node_redispatched",
+        "stable_boundary_frozen",
+        "state_reconciled",
+    }
+)
+_INFRASTRUCTURE_ATTEMPT_OUTCOME = "infrastructure_attempted"
+_MAX_INFRASTRUCTURE_ATTEMPTS = 3
 
 
 class SupervisorTriggerError(ValueError):
@@ -53,9 +63,7 @@ class RecoveryAttempt:
     def __post_init__(self) -> None:
         if not _valid_key(self.attempt_id):
             raise SupervisorTriggerError("invalid_attempt_id")
-        if not isinstance(self.action_digest, str) or not _DIGEST_RE.fullmatch(
-            self.action_digest
-        ):
+        if not isinstance(self.action_digest, str) or not _DIGEST_RE.fullmatch(self.action_digest):
             raise SupervisorTriggerError("invalid_action_digest")
         _validate_timestamp(self.occurred_at)
         if not isinstance(self.outcome, str) or not _OUTCOME_RE.fullmatch(self.outcome):
@@ -175,9 +183,7 @@ class TriggerResolution:
             self.evidence_digest
         ):
             raise SupervisorTriggerError("invalid_resolution_evidence_digest")
-        if not isinstance(self.result_digest, str) or not _DIGEST_RE.fullmatch(
-            self.result_digest
-        ):
+        if not isinstance(self.result_digest, str) or not _DIGEST_RE.fullmatch(self.result_digest):
             raise SupervisorTriggerError("invalid_resolution_result_digest")
         _validate_timestamp(self.resolved_at)
 
@@ -203,9 +209,7 @@ class TriggerResolution:
         try:
             return cls(
                 status=value["status"],
-                recovery_action=RecoveryAttempt.from_canonical_dict(
-                    value["recovery_action"]
-                ),
+                recovery_action=RecoveryAttempt.from_canonical_dict(value["recovery_action"]),
                 evidence_digest=value["evidence_digest"],
                 result_digest=value["result_digest"],
                 resolved_at=value["resolved_at"],
@@ -424,6 +428,7 @@ class SupervisorTriggerStore:
                     sorted(
                         records,
                         key=lambda record: (
+                            not record.trigger.unsafe_boundary.startswith("rollback:"),
                             record.trigger.created_at,
                             record.trigger.trigger_id,
                         ),
@@ -507,9 +512,7 @@ class SupervisorTriggerStore:
                 if row is None:
                     raise SupervisorTriggerError("trigger_not_found")
                 record = self._record(row)
-                existing_by_id = {
-                    item.attempt_id: item for item in record.trigger.attempt_history
-                }
+                existing_by_id = {item.attempt_id: item for item in record.trigger.attempt_history}
                 existing = existing_by_id.get(attempt.attempt_id)
                 if record.claim_id == claim_id and existing == attempt:
                     connection.commit()
@@ -522,6 +525,15 @@ class SupervisorTriggerStore:
                     raise SupervisorTriggerError("trigger_claim_conflict")
                 if record.revision != expected_revision:
                     raise SupervisorTriggerError("trigger_cas_mismatch")
+                if (
+                    attempt.outcome == _INFRASTRUCTURE_ATTEMPT_OUTCOME
+                    and sum(
+                        item.outcome == _INFRASTRUCTURE_ATTEMPT_OUTCOME
+                        for item in record.trigger.attempt_history
+                    )
+                    >= _MAX_INFRASTRUCTURE_ATTEMPTS
+                ):
+                    raise SupervisorTriggerError("infrastructure_attempt_budget_exhausted")
                 if any(
                     item.action_digest == attempt.action_digest
                     for item in record.trigger.attempt_history
@@ -533,9 +545,9 @@ class SupervisorTriggerStore:
                     attempt_history=(*record.trigger.attempt_history, attempt),
                 )
                 updated_revision = record.revision + 1
-                updated_json = canonical_json_bytes(
-                    updated_trigger.to_canonical_dict()
-                ).decode("utf-8")
+                updated_json = canonical_json_bytes(updated_trigger.to_canonical_dict()).decode(
+                    "utf-8"
+                )
                 cursor = connection.execute(
                     "UPDATE supervisor_triggers SET trigger_json = ?, revision = ?, claim_id = ? "
                     "WHERE trigger_id = ? AND revision = ? "
@@ -614,11 +626,16 @@ class SupervisorTriggerStore:
                     raise SupervisorTriggerError("resolution_action_mismatch")
                 if record.trigger.evidence_digest != resolution.evidence_digest:
                     raise SupervisorTriggerError("resolution_evidence_mismatch")
+                if (
+                    resolution.status == "resolved"
+                    and resolution.recovery_action.outcome not in _MATERIAL_RECOVERY_OUTCOMES
+                ):
+                    raise SupervisorTriggerError("recovery_outcome_not_material")
 
                 updated_revision = record.revision + 1
-                resolution_json = canonical_json_bytes(
-                    resolution.to_canonical_dict()
-                ).decode("utf-8")
+                resolution_json = canonical_json_bytes(resolution.to_canonical_dict()).decode(
+                    "utf-8"
+                )
                 cursor = connection.execute(
                     "UPDATE supervisor_triggers "
                     "SET revision = ?, resolution_json = ? "
