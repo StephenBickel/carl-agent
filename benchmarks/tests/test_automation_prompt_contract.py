@@ -629,18 +629,14 @@ def _assert_remote_product_builder_contract(document: str, prompt: str) -> None:
     assert "timeout-minutes: 10" in jobs["publish"]
     assert "timeout-minutes: 10" in jobs["dispatch_validation"]
     assert "python -m carl_bench.product_builder" in jobs["build"]
-    assert "OpenAIModelGateway.from_protected_environment" in jobs["build"]
-    assert "preregister_and_call_model" in jobs["build"]
+    assert "run-protected" in jobs["build"]
     assert "candidate-environment.json" in jobs["build"]
     assert "candidate_packet" in jobs["build"]
     assert "candidate publish-experimental" not in jobs["publish"]
-    assert "PROTECTED_NODE: publish_experimental" in jobs["publish"]
-    assert "GitHubEffectSocketClient.from_protected_environment" in jobs["publish"]
-    assert "reconcile_experimental_publication" in jobs["publish"]
-    assert "carl-bench cloud coordinate" in jobs["publish"]
+    assert "publish-protected" in jobs["publish"]
+    assert "carl-bench cloud coordinate" not in jobs["publish"]
     assert "CARL_GITHUB_APP_EFFECT_SOCKET" in jobs["publish"]
-    assert "dispatch_validation" in jobs["dispatch_validation"]
-    assert "GitHubEffectSocketClient.from_protected_environment" in jobs["dispatch_validation"]
+    assert "dispatch-validation-protected" in jobs["dispatch_validation"]
     assert "GITHUB_TOKEN" not in document
     assert "github.token" not in document
     assert "OPENAI_API_KEY" not in document
@@ -673,6 +669,29 @@ def test_autonomous_remote_product_builder_is_bounded_secret_free_and_explicitly
         BUILDER_WORKFLOW_PATH.read_text(encoding="utf-8"),
         BUILDER_PROMPT_PATH.read_text(encoding="utf-8"),
     )
+
+
+def test_product_builder_workflow_uses_purpose_bound_commands_and_valid_schedule_claim() -> None:
+    document = BUILDER_WORKFLOW_PATH.read_text(encoding="utf-8")
+    jobs = _workflow_job_blocks(document)
+
+    assert "carl-bench cloud coordinate" not in document
+    assert "run-protected" in jobs["build"]
+    assert "--scheduled" in jobs["build"]
+    assert "github.event_name" in jobs["build"]
+    assert "publish-protected" in jobs["publish"]
+    assert "dispatch-validation-protected" in jobs["dispatch_validation"]
+    for identity in (
+        "experiment_id",
+        "request_digest",
+        "publication_request_digest",
+        "candidate_packet_digest",
+        "parent_commit",
+        "expected_revision",
+        "idempotency_key",
+    ):
+        assert f"--{identity.replace('_', '-')}" in jobs["publish"]
+        assert f"--{identity.replace('_', '-')}" in jobs["dispatch_validation"]
 
 
 def test_builder_contract_rejects_report_only_credential_and_recursion_mutations() -> None:

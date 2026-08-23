@@ -555,7 +555,7 @@ class CandidateSandboxResult:
 
     attempt: BuildAttemptEvidence
     candidate_packet: SealedCandidate | None
-    disposition: Literal["rejected", "inconclusive"] | None
+    disposition: Literal["repairable", "rejected", "inconclusive"] | None
     evidence_digest: str | None
     next_hypothesis: ProductHypothesis | None
 
@@ -568,21 +568,15 @@ class CandidateSandboxResult:
             and self.evidence_digest is None
             and self.next_hypothesis is None
         )
-        repair_result = (
+        unsuccessful_result = (
             self.candidate_packet is None
-            and self.disposition is None
-            and self.evidence_digest is None
-            and self.next_hypothesis is None
-        )
-        learning_result = (
-            self.candidate_packet is None
-            and self.disposition in {"rejected", "inconclusive"}
+            and self.disposition in {"repairable", "rejected", "inconclusive"}
             and isinstance(self.evidence_digest, str)
             and type(self.next_hypothesis) is ProductHypothesis
         )
-        if sum((packet_result, repair_result, learning_result)) != 1:
+        if sum((packet_result, unsuccessful_result)) != 1:
             raise BuilderError("builder_sandbox_result_invalid")
-        if learning_result:
+        if unsuccessful_result:
             _digest(self.evidence_digest, "builder_learning_evidence_invalid")
 
 
@@ -598,14 +592,14 @@ class CandidateSandbox(Protocol):
         """Execute one bounded, credential-free candidate attempt."""
 
 
-class ExperimentalPublisher(Protocol):
-    def publish(
+class CandidatePacketStore(Protocol):
+    def persist(
         self,
         *,
         registration: BuilderPreregistration,
         packet: SealedCandidate,
-    ) -> ExperimentalPublicationDecision:
-        """Publish only through the protected experimental publication boundary."""
+    ) -> bool:
+        """Durably persist a complete packet without GitHub publication authority."""
 
 
 def validate_attempts(
@@ -621,6 +615,8 @@ def validate_attempts(
         raise BuilderError("builder_repair_budget_exceeded")
     elapsed = 0
     cost = 0
+    patch_bytes = 0
+    changed_paths: set[str] = set()
     action_digests: set[str] = set()
     patch_digests: set[str] = set()
     for expected_attempt, item in enumerate(attempts, 1):
@@ -634,16 +630,18 @@ def validate_attempts(
             raise BuilderError("builder_unchanged_retry_forbidden")
         action_digests.add(item.action_digest)
         patch_digests.add(item.patch_digest)
-        if len(item.changed_paths) > limits.max_changed_paths:
-            raise BuilderError("builder_changed_path_budget_exceeded")
         for path in item.changed_paths:
             if any(_inside(surface, path) for surface in limits.forbidden_paths):
                 raise BuilderError("builder_patch_path_forbidden")
             if not any(_inside(surface, path) for surface in limits.allowed_paths):
                 raise BuilderError("builder_patch_path_outside_scope")
+            changed_paths.add(path)
+        if len(changed_paths) > limits.max_changed_paths:
+            raise BuilderError("builder_changed_path_budget_exceeded")
         if any(tool not in limits.allowed_tools for tool in item.tools):
             raise BuilderError("builder_tool_forbidden")
-        if item.patch_bytes > limits.max_patch_bytes:
+        patch_bytes += item.patch_bytes
+        if patch_bytes > limits.max_patch_bytes:
             raise BuilderError("builder_patch_budget_exceeded")
         elapsed += item.elapsed_seconds
         cost += item.cost_microdollars
@@ -691,7 +689,8 @@ def credential_free_candidate_environment(
 @dataclass(frozen=True, slots=True)
 class RepairRequest:
     experiment_id: str
-    attempt: int
+    repair_number: int
+    next_attempt: int
     finding_digest: str
     changed_action_digest: str
     patch_digest: str
@@ -699,14 +698,20 @@ class RepairRequest:
     def __post_init__(self) -> None:
         _identifier(self.experiment_id, "builder_experiment_id_invalid")
         if (
-            isinstance(self.attempt, bool)
-            or not isinstance(self.attempt, int)
-            or not 2 <= self.attempt <= 3
+            isinstance(self.repair_number, bool)
+            or not isinstance(self.repair_number, int)
+            or not 1 <= self.repair_number <= 2
+            or self.next_attempt != self.repair_number + 1
         ):
             raise BuilderError("builder_repair_budget_exceeded")
         _digest(self.finding_digest, "builder_repair_finding_required")
         _digest(self.changed_action_digest, "builder_action_digest_invalid")
         _digest(self.patch_digest, "builder_patch_digest_invalid")
+
+    @property
+    def attempt(self) -> int:
+        """Compatibility alias for the attempt the request authorizes."""
+        return self.next_attempt
 
 
 @dataclass(frozen=True, slots=True)
@@ -873,7 +878,8 @@ def request_changed_repair(
         raise BuilderError("builder_unchanged_retry_forbidden")
     repair = RepairRequest(
         experiment_id=registration.experiment_id,
-        attempt=changed_attempt.attempt,
+        repair_number=changed_attempt.attempt - 1,
+        next_attempt=changed_attempt.attempt,
         finding_digest=changed_attempt.finding_digest,
         changed_action_digest=changed_attempt.action_digest,
         patch_digest=changed_attempt.patch_digest,
@@ -888,6 +894,67 @@ def request_changed_repair(
         live_validated=False,
         production_eligible=False,
         next_safe_node=f"repair:{registration.experiment_id}:{changed_attempt.attempt}",
+    )
+
+
+def terminalize_unsuccessful_attempt(
+    *,
+    registration: BuilderPreregistration,
+    current: ProductHypothesis,
+    limits: BuilderLimits,
+    attempts: tuple[BuildAttemptEvidence, ...],
+    finding_digest: str,
+    disposition: Literal["repairable", "rejected", "inconclusive"],
+    next_hypothesis: ProductHypothesis,
+) -> BuilderTerminalResult:
+    """Turn repairable, unchanged, or exhausted work into an explicit durable next node."""
+    _digest(finding_digest, "builder_repair_finding_required")
+    try:
+        validate_attempts(limits, attempts)
+    except BuilderError as error:
+        if error.code != "builder_unchanged_retry_forbidden":
+            raise
+        retained_disposition: Literal["rejected", "inconclusive"] = (
+            "inconclusive" if disposition == "repairable" else disposition
+        )
+        return retain_builder_learning(
+            registration=registration,
+            current=current,
+            disposition=retained_disposition,
+            evidence_digest=finding_digest,
+            next_hypothesis=next_hypothesis,
+        )
+    if len(attempts) >= 3 or disposition != "repairable":
+        retained_disposition = "inconclusive" if disposition == "repairable" else disposition
+        return retain_builder_learning(
+            registration=registration,
+            current=current,
+            disposition=retained_disposition,
+            evidence_digest=finding_digest,
+            next_hypothesis=next_hypothesis,
+        )
+    if not attempts:
+        raise BuilderError("builder_attempts_invalid")
+    latest = attempts[-1]
+    repair_number = len(attempts)
+    repair = RepairRequest(
+        experiment_id=registration.experiment_id,
+        repair_number=repair_number,
+        next_attempt=repair_number + 1,
+        finding_digest=finding_digest,
+        changed_action_digest=latest.action_digest,
+        patch_digest=latest.patch_digest,
+    )
+    return BuilderTerminalResult(
+        outcome="repair_request",
+        experiment_id=registration.experiment_id,
+        candidate_packet_digest=None,
+        experimental_ref=None,
+        repair_request=repair,
+        retained_learning=None,
+        live_validated=False,
+        production_eligible=False,
+        next_safe_node=f"repair:{registration.experiment_id}:{repair.next_attempt}",
     )
 
 
@@ -940,7 +1007,7 @@ def retain_builder_learning(
 class AutonomousProductBuilder:
     """Own one complete protected build transition from selection to a terminal result."""
 
-    __slots__ = ("_gateway", "_publisher", "_registrar", "_sandbox")
+    __slots__ = ("_gateway", "_packet_store", "_registrar", "_sandbox")
 
     def __init__(
         self,
@@ -948,19 +1015,19 @@ class AutonomousProductBuilder:
         registrar: BuilderPreregistrar,
         gateway: BuilderModelGateway,
         sandbox: CandidateSandbox,
-        publisher: ExperimentalPublisher,
+        packet_store: CandidatePacketStore,
     ) -> None:
         if (
             not callable(getattr(registrar, "register", None))
             or not callable(getattr(gateway, "evaluate", None))
             or not callable(getattr(sandbox, "execute", None))
-            or not callable(getattr(publisher, "publish", None))
+            or not callable(getattr(packet_store, "persist", None))
         ):
             raise BuilderError("builder_runtime_boundary_invalid")
         self._registrar = registrar
         self._gateway = gateway
         self._sandbox = sandbox
-        self._publisher = publisher
+        self._packet_store = packet_store
 
     def run(
         self,
@@ -1010,34 +1077,37 @@ class AutonomousProductBuilder:
             raise BuilderError("builder_candidate_execution_failed") from error
         if type(result) is not CandidateSandboxResult:
             raise BuilderError("builder_sandbox_result_invalid")
-        validate_attempts(limits, (*prior_attempts, result.attempt))
-
         if result.candidate_packet is not None:
-            complete_candidate_packet(invocation.registration, result.candidate_packet)
+            validate_attempts(limits, (*prior_attempts, result.attempt))
+            terminal = complete_candidate_packet(invocation.registration, result.candidate_packet)
             try:
-                publication = self._publisher.publish(
+                persisted = self._packet_store.persist(
                     registration=invocation.registration,
                     packet=result.candidate_packet,
                 )
             except Exception as error:
-                raise BuilderError("builder_experimental_publication_failed") from error
-            return complete_experimental_publication(
-                invocation.registration,
-                result.candidate_packet,
-                publication,
-            )
-        if result.disposition is not None:
-            if result.evidence_digest is None or result.next_hypothesis is None:
-                raise BuilderError("builder_sandbox_result_invalid")
-            return retain_builder_learning(
-                registration=invocation.registration,
-                current=selection.selected,
-                disposition=result.disposition,
-                evidence_digest=result.evidence_digest,
-                next_hypothesis=result.next_hypothesis,
-            )
-        return request_changed_repair(
-            invocation.registration,
-            prior_attempts,
-            result.attempt,
+                raise BuilderError("builder_candidate_packet_persistence_failed") from error
+            if persisted is not True:
+                raise BuilderError("builder_candidate_packet_persistence_failed")
+            return terminal
+        if (
+            result.disposition is None
+            or result.evidence_digest is None
+            or result.next_hypothesis is None
+        ):
+            raise BuilderError("builder_sandbox_result_invalid")
+        return terminalize_unsuccessful_attempt(
+            registration=invocation.registration,
+            current=selection.selected,
+            limits=limits,
+            attempts=(*prior_attempts, result.attempt),
+            finding_digest=result.evidence_digest,
+            disposition=result.disposition,
+            next_hypothesis=result.next_hypothesis,
         )
+
+
+if __name__ == "__main__":
+    from carl_bench.product_builder_runtime import main
+
+    raise SystemExit(main())

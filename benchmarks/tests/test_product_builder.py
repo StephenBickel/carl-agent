@@ -221,19 +221,13 @@ class RecordingSandbox:
         )
 
 
-class RecordingPublisher:
+class RecordingPacketStore:
     def __init__(self, events: list[str]) -> None:
         self.events = events
 
-    def publish(self, *, registration, packet) -> ExperimentalPublicationDecision:
-        self.events.append("publish")
-        return ExperimentalPublicationDecision(
-            outcome="push_branch",
-            ref=f"refs/heads/experimental/{registration.experiment_id}",
-            candidate_commit=packet.candidate_commit,
-            candidate_tree="f" * 40,
-            candidate_packet_digest=packet.digest,
-        )
+    def persist(self, *, registration, packet) -> bool:
+        self.events.append("packet-store")
+        return packet.experiment_id == registration.experiment_id
 
 
 def _register(hypothesis=None):
@@ -583,7 +577,7 @@ def test_stateful_builder_owns_the_complete_protected_product_run(tmp_path: Path
         registrar=RecordingRegistrar(events),
         gateway=RecordingGateway(events),
         sandbox=sandbox,
-        publisher=RecordingPublisher(events),
+        packet_store=RecordingPacketStore(events),
     )
 
     terminal = builder.run(
@@ -603,8 +597,9 @@ def test_stateful_builder_owns_the_complete_protected_product_run(tmp_path: Path
         sandbox_home=tmp_path,
     )
 
-    assert events == ["preregister", "model", "sandbox", "publish"]
-    assert terminal.outcome == "experimental_publication"
+    assert events == ["preregister", "model", "sandbox", "packet-store"]
+    assert terminal.outcome == "candidate_packet"
+    assert terminal.next_safe_node == "publish_experimental"
     assert terminal.live_validated is False
     assert terminal.production_eligible is False
     assert sandbox.environment == {
@@ -614,3 +609,81 @@ def test_stateful_builder_owns_the_complete_protected_product_run(tmp_path: Path
         "LC_ALL": "C.UTF-8",
         "PATH": "/usr/bin:/bin",
     }
+
+
+def test_attempt_budgets_are_cumulative_across_patch_bytes_and_path_union() -> None:
+    initial = replace(
+        _attempt(),
+        patch_bytes=70_000,
+        changed_paths=("src/runtime/recovery.rs",),
+    )
+    repair = replace(
+        _attempt(attempt=2, action_marker="a", patch_marker="b"),
+        patch_bytes=70_000,
+        changed_paths=("tests/runtime/recovery.rs",),
+    )
+
+    with pytest.raises(_api("BuilderError"), match="^builder_patch_budget_exceeded$"):
+        _api("validate_attempts")(_limits(), (initial, repair))
+
+    one_path = replace(_limits(), max_changed_paths=1, max_patch_bytes=200_000)
+    with pytest.raises(_api("BuilderError"), match="^builder_changed_path_budget_exceeded$"):
+        _api("validate_attempts")(one_path, (initial, repair))
+
+
+def test_first_failure_requests_repair_one_and_exhaustion_retains_learning() -> None:
+    current = _hypothesis("recovery-001")
+    next_hypothesis = _hypothesis("tool-001", family="tool-use", work_marker="7")
+    registration = _register(current)
+
+    repair = _api("terminalize_unsuccessful_attempt")(
+        registration=registration,
+        current=current,
+        limits=_limits(),
+        attempts=(_attempt(),),
+        finding_digest="a" * 64,
+        disposition="repairable",
+        next_hypothesis=next_hypothesis,
+    )
+    assert repair.outcome == "repair_request"
+    assert repair.repair_request.repair_number == 1
+    assert repair.repair_request.next_attempt == 2
+
+    exhausted = _api("terminalize_unsuccessful_attempt")(
+        registration=registration,
+        current=current,
+        limits=_limits(),
+        attempts=(
+            _attempt(),
+            _attempt(attempt=2, action_marker="a", patch_marker="b"),
+            _attempt(attempt=3, action_marker="c", patch_marker="d"),
+        ),
+        finding_digest="e" * 64,
+        disposition="repairable",
+        next_hypothesis=next_hypothesis,
+    )
+    assert exhausted.outcome == "retained_learning"
+    assert exhausted.next_safe_node == "register_hypothesis:tool-001"
+
+
+def test_unchanged_repair_retains_learning_instead_of_raising() -> None:
+    current = _hypothesis("recovery-001")
+    next_hypothesis = _hypothesis("tool-001", family="tool-use", work_marker="7")
+    initial = _attempt()
+    unchanged = replace(
+        _attempt(attempt=2, action_marker="a", patch_marker="b"),
+        action_digest=initial.action_digest,
+    )
+
+    terminal = _api("terminalize_unsuccessful_attempt")(
+        registration=_register(current),
+        current=current,
+        limits=_limits(),
+        attempts=(initial, unchanged),
+        finding_digest="e" * 64,
+        disposition="rejected",
+        next_hypothesis=next_hypothesis,
+    )
+
+    assert terminal.outcome == "retained_learning"
+    assert terminal.retained_learning.disposition == "rejected"
