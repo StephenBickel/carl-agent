@@ -1069,8 +1069,7 @@ def test_non_github_effect_is_fenced_then_constructs_receipt_after_verified_resu
     ) as admin:
         receipt = admin.execute(
             "SELECT completion_event_json, completion_event_digest, effect_response_json, "
-            "status, (SELECT event.authority FROM carl_autonomy.experiment_events AS event "
-            "WHERE event.event_digest = runtime.completion_event_digest) "
+            "status, carl_autonomy.coordinator_node_authority('publish_input') "
             "AS completion_event_authority "
             "FROM carl_autonomy.coordinator_runtime AS runtime WHERE experiment_id=%s",
             (manifest.experiment_id,),
@@ -2734,9 +2733,9 @@ def test_effect_fence_migration_rejects_scratch_poison_and_drops_its_own_scratch
         "CREATE INDEX effect_attempts_reconciliation ON carl_autonomy.effect_attempts"
         "(attempt_state,not_before,effect_key) WHERE attempt_state='uncertain'",
         "CREATE SCHEMA carl_poison; "
-        'CREATE COLLATION carl_poison."default" FROM pg_catalog."default"; '
+        "CREATE COLLATION carl_poison.poison (provider = libc, locale = 'C'); "
         "ALTER TABLE carl_autonomy.effect_attempts ALTER COLUMN command_key "
-        'TYPE varchar(192) COLLATE carl_poison."default"',
+        "TYPE varchar(192) COLLATE carl_poison.poison",
         "ALTER TABLE carl_autonomy.effect_attempts "
         "DROP CONSTRAINT effect_attempts_command_key_key; "
         "CREATE INDEX effect_attempts_command_key_key "
@@ -2776,20 +2775,31 @@ def test_effect_fence_migration_rejects_exact_catalog_poison(
     postgres: object, poison_sql: str
 ) -> None:
     assert POSTGRES_DSN is not None
-    with postgres.connect(POSTGRES_DSN, autocommit=True) as admin:  # type: ignore[attr-defined]
-        admin.execute("DROP SCHEMA IF EXISTS carl_autonomy CASCADE")
-        admin.execute("DROP SCHEMA IF EXISTS carl_poison CASCADE")
+    failed_connection = postgres.connect(POSTGRES_DSN, autocommit=True)  # type: ignore[attr-defined]
+    try:
+        failed_connection.execute("DROP SCHEMA IF EXISTS carl_autonomy CASCADE")
+        failed_connection.execute("DROP SCHEMA IF EXISTS carl_poison CASCADE")
         for migration in BASE_MIGRATIONS:
-            admin.execute(migration.read_text(encoding="utf-8"), prepare=False)
-        admin.execute(HISTORICAL_EFFECT_FENCE_FIXTURE.read_text(encoding="utf-8"), prepare=False)
-        admin.execute(GITHUB_EFFECT_FENCES_MIGRATION.read_text(encoding="utf-8"), prepare=False)
-        admin.execute(poison_sql, prepare=False)
+            failed_connection.execute(migration.read_text(encoding="utf-8"), prepare=False)
+        failed_connection.execute(
+            HISTORICAL_EFFECT_FENCE_FIXTURE.read_text(encoding="utf-8"), prepare=False
+        )
+        failed_connection.execute(
+            GITHUB_EFFECT_FENCES_MIGRATION.read_text(encoding="utf-8"), prepare=False
+        )
+        failed_connection.execute(poison_sql, prepare=False)
         with pytest.raises(Exception, match="effect_fence_schema_invalid"):
-            admin.execute(GITHUB_EFFECT_FENCES_MIGRATION.read_text(encoding="utf-8"), prepare=False)
-        admin.execute("DROP SCHEMA IF EXISTS carl_autonomy CASCADE")
-        admin.execute("DROP SCHEMA IF EXISTS carl_poison CASCADE")
-        for migration in MIGRATIONS:
-            admin.execute(migration.read_text(encoding="utf-8"), prepare=False)
+            failed_connection.execute(
+                GITHUB_EFFECT_FENCES_MIGRATION.read_text(encoding="utf-8"), prepare=False
+            )
+        failed_connection.rollback()
+    finally:
+        failed_connection.close()
+        with postgres.connect(POSTGRES_DSN, autocommit=True) as restore:  # type: ignore[attr-defined]
+            restore.execute("DROP SCHEMA IF EXISTS carl_autonomy CASCADE")
+            restore.execute("DROP SCHEMA IF EXISTS carl_poison CASCADE")
+            for migration in MIGRATIONS:
+                restore.execute(migration.read_text(encoding="utf-8"), prepare=False)
 
 
 def test_effect_fence_migration_revokes_every_arbitrary_catalog_grantee(
