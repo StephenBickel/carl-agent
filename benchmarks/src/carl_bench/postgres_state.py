@@ -7,6 +7,7 @@ import binascii
 import hashlib
 import json
 import os
+import re
 import stat
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -1609,6 +1610,135 @@ class PostgresStateBackend(StateBackend):
         if mutation.state.status != "claimed":
             raise PostgresStateError("builder_effect_registration_not_claimed")
         return mutation.state
+
+    def complete_builder_effect(
+        self,
+        *,
+        node: str,
+        experiment_id: str,
+        expected_revision: int,
+        idempotency_key: str,
+        command_key: str,
+        effect_key: str,
+        github_binding_request_digest: str,
+        github_request_digest: str,
+        github_response: object,
+        result_digest: str,
+        observed_at: str,
+    ) -> int:
+        """Atomically complete one exact builder effect and advance its graph node."""
+        from carl_bench.cloud_state import _timestamp
+        from carl_bench.github_effect_ipc import GitHubEffectResponse
+
+        if (
+            node not in {"publish_experimental", "dispatch_validation"}
+            or not isinstance(experiment_id, str)
+            or not experiment_id
+            or type(expected_revision) is not int
+            or expected_revision < 0
+            or not isinstance(command_key, str)
+            or not command_key
+            or not isinstance(effect_key, str)
+            or not effect_key.startswith("cloud-effect-")
+            or not isinstance(github_response, GitHubEffectResponse)
+            or github_response.status != "completed"
+            or github_response.request_digest != github_request_digest
+            or hashlib.sha256(canonical_json_bytes(github_response.result)).hexdigest()
+            != result_digest
+            or any(
+                not isinstance(value, str)
+                or len(value) != 64
+                or re.fullmatch(r"[0-9a-f]{64}", value) is None
+                for value in (
+                    idempotency_key,
+                    github_binding_request_digest,
+                    github_request_digest,
+                    result_digest,
+                )
+            )
+        ):
+            raise PostgresStateError("builder_effect_completion_invalid")
+        _timestamp("builder_effect_observed_at", observed_at)
+        completion = {
+            "command_key": command_key,
+            "effect_key": effect_key,
+            "expected_revision": expected_revision,
+            "experiment_id": experiment_id,
+            "github_binding_request_digest": github_binding_request_digest,
+            "github_request_digest": github_request_digest,
+            "github_response": github_response.to_canonical_dict(),
+            "idempotency_key": idempotency_key,
+            "node": node,
+            "observed_at": observed_at,
+            "result_digest": result_digest,
+            "schema_version": 1,
+        }
+
+        def decode(row: dict[str, Any]) -> int:
+            value = _strict_row(row, frozenset({"applied", "revision"}))
+            _strict_bool(value["applied"])
+            revision = value["revision"]
+            if type(revision) is not int or revision != expected_revision + 1:
+                raise PostgresStateError("builder_effect_completion_identity_mismatch")
+            return revision
+
+        return cast(
+            int,
+            self._mutation(
+                "coordinator",
+                "SELECT * FROM carl_autonomy.complete_builder_effect(%s)",
+                (_canonical_text(completion),),
+                decode,
+            ),
+        )
+
+    def recover_builder_effect_completion(
+        self,
+        *,
+        node: str,
+        experiment_id: str,
+        expected_revision: int,
+        command_key: str,
+        effect_key: str,
+        github_binding_request_digest: str,
+        idempotency_key: str,
+    ) -> tuple[str, int] | None:
+        identity = {
+            "command_key": command_key,
+            "effect_key": effect_key,
+            "expected_revision": expected_revision,
+            "experiment_id": experiment_id,
+            "github_binding_request_digest": github_binding_request_digest,
+            "idempotency_key": idempotency_key,
+            "node": node,
+            "schema_version": 1,
+        }
+
+        def decode(row: dict[str, Any]) -> tuple[str, int] | None:
+            value = _strict_row(row, frozenset({"found", "result_digest", "revision"}))
+            found = _strict_bool(value["found"])
+            if not found:
+                if value["result_digest"] is not None or value["revision"] is not None:
+                    raise PostgresStateError("builder_effect_completion_identity_mismatch")
+                return None
+            if (
+                not isinstance(value["result_digest"], str)
+                or re.fullmatch(r"[0-9a-f]{64}", value["result_digest"]) is None
+                or type(value["revision"]) is not int
+                or value["revision"] != expected_revision + 1
+            ):
+                raise PostgresStateError("builder_effect_completion_identity_mismatch")
+            return value["result_digest"], value["revision"]
+
+        return cast(
+            tuple[str, int] | None,
+            self._mutation(
+                "coordinator",
+                "SELECT * FROM carl_autonomy.recover_builder_effect_completion(%s)",
+                (_canonical_text(identity),),
+                decode,
+            ),
+        )
 
     @staticmethod
     def _builder_effect_policy() -> object:

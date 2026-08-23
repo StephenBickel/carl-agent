@@ -96,7 +96,12 @@ def test_candidate_packet_seals_and_reverifies_exact_receipt_digests() -> None:
     registration = _register()
     receipt = _receipt()
     envelope = _evidence("SignedAttemptReceipt").sign(receipt, key)
-    candidate = replace(_candidate(registration), changed_path_count=1)
+    base_candidate = _candidate(registration)
+    candidate = replace(
+        base_candidate,
+        changed_path_count=1,
+        diff_artifact=replace(base_candidate.diff_artifact, digest=receipt.diff_artifact_digest),
+    )
 
     packet = _evidence("ProtectedCandidatePacket")(
         schema_version=1,
@@ -121,6 +126,27 @@ def test_candidate_packet_seals_and_reverifies_exact_receipt_digests() -> None:
     ):
         with pytest.raises(ValueError, match="^builder_candidate_receipt_mismatch$"):
             replace(packet, **mutation).verify(key)
+
+
+def test_candidate_packet_rejects_candidate_diff_artifact_identity_mismatch() -> None:
+    key = b"k" * 32
+    registration = _register()
+    receipt = _receipt()
+    envelope = _evidence("SignedAttemptReceipt").sign(receipt, key)
+    candidate = replace(_candidate(registration), changed_path_count=1)
+    packet = _evidence("ProtectedCandidatePacket")(
+        schema_version=1,
+        builder_request_digest=receipt.builder_request_digest,
+        registration_digest=registration.digest,
+        parent_commit=registration.parent_commit,
+        candidate_tree=receipt.postpatch_tree,
+        diff_artifact_digest=receipt.diff_artifact_digest,
+        candidate=candidate,
+        attempt_receipts=(envelope,),
+    )
+
+    with pytest.raises(ValueError, match="^builder_candidate_receipt_mismatch$"):
+        packet.verify(key)
 
 
 def test_packet_rejects_receipt_sequence_with_a_tree_gap() -> None:

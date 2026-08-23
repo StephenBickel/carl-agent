@@ -1144,6 +1144,8 @@ class FakeDatabase:
         for operation in (
             "register_dead_holder_observation",
             "register_and_claim_builder_effect",
+            "complete_builder_effect",
+            "recover_builder_effect_completion",
             "complete_command_and_append_event",
             "register_manifest",
             "append_event",
@@ -1885,6 +1887,74 @@ def test_builder_effect_registration_returns_exact_atomically_claimed_command() 
     assert persisted["node"] == "publish_experimental"
     assert persisted["github_request"] == github_request.to_canonical_dict()
     assert persisted["candidate_packet_digest"] == "d" * 64
+
+
+def test_builder_effect_completion_atomically_advances_authoritative_graph_revision() -> None:
+    database = FakeDatabase()
+    database.responses["complete_builder_effect"] = [{"applied": True, "revision": 8}]
+
+    github_response = GitHubEffectResponse(
+        schema_version=1,
+        domain=RESPONSE_DOMAIN,
+        status="completed",
+        request_digest="d" * 64,
+        observed_at="2026-08-23T12:11:00Z",
+        result={"result_type": "GitReferenceSnapshot", "value": {"status": "created"}},
+        retry_not_before=None,
+        error_code=None,
+    )
+    result_digest = hashlib.sha256(canonical_json_bytes(github_response.result)).hexdigest()
+    revision = _backend(database).complete_builder_effect(
+        node="publish_experimental",
+        experiment_id="exp-recovery-001",
+        expected_revision=7,
+        idempotency_key="a" * 64,
+        command_key="exp-recovery-001:publish_experimental:attempt:1",
+        effect_key="cloud-effect-" + "b" * 64,
+        github_binding_request_digest="c" * 64,
+        github_request_digest="d" * 64,
+        github_response=github_response,
+        result_digest=result_digest,
+        observed_at="2026-08-23T12:11:00Z",
+    )
+
+    assert revision == 8
+    query, parameters = database.calls[-1]
+    assert "complete_builder_effect" in query
+    persisted = json.loads(parameters[0])
+    assert persisted == {
+        "command_key": "exp-recovery-001:publish_experimental:attempt:1",
+        "effect_key": "cloud-effect-" + "b" * 64,
+        "expected_revision": 7,
+        "experiment_id": "exp-recovery-001",
+        "github_binding_request_digest": "c" * 64,
+        "github_request_digest": "d" * 64,
+        "github_response": github_response.to_canonical_dict(),
+        "idempotency_key": "a" * 64,
+        "node": "publish_experimental",
+        "observed_at": "2026-08-23T12:11:00Z",
+        "result_digest": result_digest,
+        "schema_version": 1,
+    }
+
+
+def test_builder_effect_lost_local_response_recovers_exact_authoritative_completion() -> None:
+    database = FakeDatabase()
+    database.responses["recover_builder_effect_completion"] = [
+        {"found": True, "result_digest": "e" * 64, "revision": 8}
+    ]
+
+    recovered = _backend(database).recover_builder_effect_completion(
+        node="publish_experimental",
+        experiment_id="exp-recovery-001",
+        expected_revision=7,
+        command_key="exp-recovery-001:publish_experimental:attempt:1",
+        effect_key="cloud-effect-" + "b" * 64,
+        github_binding_request_digest="c" * 64,
+        idempotency_key="a" * 64,
+    )
+
+    assert recovered == ("e" * 64, 8)
 
 
 def test_postgres_adapter_resolves_durable_claim_and_atomically_prepares_effect_fence() -> None:

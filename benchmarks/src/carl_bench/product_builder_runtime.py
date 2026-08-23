@@ -33,6 +33,8 @@ from carl_bench.product_builder import (
     validate_attempts,
 )
 from carl_bench.product_builder_gateway import ProtectedOpenAIGateway
+from carl_bench.product_builder_identity import ProtectedCandidateIdentityResolver
+from carl_bench.product_builder_state import kernel_request_lock
 
 _PROTECTED_RUNTIME_ROOT = Path("/var/lib/carl/product-builder")
 _DIGEST = frozenset("0123456789abcdef")
@@ -426,12 +428,7 @@ class ProtectedBuilderStore:
     ) -> ClaimedBuilderRequest:
         status_path = self._root / "requests" / f"{request.digest}.status.json"
         lock_path = self._root / "claims" / f"{request.digest}.lock"
-        try:
-            lock_fd = os.open(lock_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        except FileExistsError as error:
-            raise BuilderError("builder_request_claim_busy") from error
-        os.close(lock_fd)
-        try:
+        with kernel_request_lock(lock_path):
             state = self._request_state(request.digest)
             now_text = _canonical_now() if claimed_at is None else claimed_at
             now = _claim_timestamp(now_text, "builder_claim_timestamp_invalid")
@@ -486,8 +483,6 @@ class ProtectedBuilderStore:
                 },
             )
             return ClaimedBuilderRequest(request, selected_claim, next_revision, selected_expiry)
-        finally:
-            lock_path.unlink(missing_ok=True)
 
     def claim_manual(
         self,
@@ -607,12 +602,7 @@ class ProtectedBuilderStore:
         status: str,
     ) -> None:
         lock_path = self._root / "claims" / f"{request_digest}.lock"
-        try:
-            lock_fd = os.open(lock_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        except FileExistsError as error:
-            raise BuilderError("builder_request_claim_busy") from error
-        os.close(lock_fd)
-        try:
+        with kernel_request_lock(lock_path):
             state = self._request_state(request_digest)
             if (
                 state["status"] != "claimed"
@@ -631,8 +621,6 @@ class ProtectedBuilderStore:
                     "status": status,
                 },
             )
-        finally:
-            lock_path.unlink(missing_ok=True)
 
     def complete_request(
         self, request_digest: str, *, claim_id: str, expected_revision: int
@@ -800,6 +788,7 @@ class ProtectedBuilderStore:
                     request.command_key,
                     request.effect_key,
                     request.github_request_digest,
+                    None,
                     "frozen",
                     None,
                     "builder_effect_persisted_identity_mismatch",
@@ -819,6 +808,7 @@ class ProtectedBuilderStore:
                     request.command_key,
                     request.effect_key,
                     request.github_request_digest,
+                    None,
                     "frozen",
                     None,
                     "builder_effect_persisted_identity_mismatch",
@@ -908,10 +898,13 @@ class ProtectedBuilderStore:
             raise BuilderError("builder_effect_status_invalid")
         return value["status"]
 
-    def publication_completed(self, terminal: object) -> bool:
+    def publication_completed(
+        self, terminal: object, *, downstream_request: object | None = None
+    ) -> bool:
         from carl_bench.product_builder_effects import (
             BuilderTerminalDocument,
             PurposeBoundEffectRequest,
+            PurposeBoundEffectResponse,
         )
 
         if type(terminal) is not BuilderTerminalDocument:
@@ -920,6 +913,22 @@ class ProtectedBuilderStore:
         try:
             response = self.load_effect_response(request.idempotency_key, expected_request=request)
         except OSError:
+            return False
+        except BuilderError:
+            if type(downstream_request) is PurposeBoundEffectRequest:
+                frozen = PurposeBoundEffectResponse(
+                    1,
+                    downstream_request.node,
+                    downstream_request.idempotency_key,
+                    downstream_request.command_key,
+                    downstream_request.effect_key,
+                    downstream_request.github_request_digest,
+                    None,
+                    "frozen",
+                    None,
+                    "builder_publication_identity_mismatch",
+                )
+                self.finish_effect(frozen, force_freeze=True)
             return False
         return response.status == "completed" and response.node == "publish_experimental"
 
@@ -1285,6 +1294,10 @@ def run_protected(args: argparse.Namespace) -> int:
         candidate=observation.candidate,
         attempt_receipts=all_envelopes,
     ).verify(verification_key)
+    ProtectedCandidateIdentityResolver.from_store(store).verify(
+        observation.candidate.candidate_commit,
+        observation.candidate_tree,
+    )
     packet_store.persist(request.digest, packet, verification_key=verification_key)
     terminal = BuilderTerminalDocument.create(
         request=request,
@@ -1316,7 +1329,9 @@ def run_effect(args: argparse.Namespace) -> int:
     expected = (
         PurposeBoundEffectRequest.for_publication(terminal)
         if args.command == "publish-protected"
-        else PurposeBoundEffectRequest.for_validation(terminal)
+        else PurposeBoundEffectRequest.for_validation(
+            terminal, expected_revision=args.expected_revision
+        )
     )
     supplied = (
         args.experiment_id,
@@ -1348,6 +1363,7 @@ def run_effect(args: argparse.Namespace) -> int:
                 expected.command_key,
                 expected.effect_key,
                 expected.github_request_digest,
+                None,
                 "frozen",
                 None,
                 "builder_effect_cli_identity_mismatch",

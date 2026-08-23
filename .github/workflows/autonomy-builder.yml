@@ -173,6 +173,8 @@ jobs:
       id-token: write
     runs-on: [self-hosted, linux, x64, carl-autonomy-cloud]
     timeout-minutes: 10
+    outputs:
+      authoritative_revision: ${{ steps.publication_outputs.outputs.authoritative_revision }}
     steps:
       - name: Check out the exact protected default-branch revision
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -187,6 +189,7 @@ jobs:
           python-version: "3.12"
           enable-cache: false
       - name: Publish through the protected GitHub App effect boundary
+        id: publish
         env:
           CANDIDATE_PACKET_DIGEST: ${{ needs.build.outputs.candidate_packet_digest }}
           CARL_GITHUB_APP_EFFECT_SOCKET: /run/carl/github-effect.sock
@@ -209,6 +212,30 @@ jobs:
             --expected-revision "$EXPECTED_REVISION" \
             --idempotency-key "$IDEMPOTENCY_KEY" \
             --result "$RUNNER_TEMP/publication-terminal.json"
+      - name: Export exact authoritative post-publication revision
+        id: publication_outputs
+        env:
+          RESULT_PATH: ${{ runner.temp }}/publication-terminal.json
+        run: |
+          set -euo pipefail
+          RESULT_PATH="$RESULT_PATH" uv run --offline --project benchmarks --locked python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          from carl_bench.canonical import canonical_json_bytes
+          from carl_bench.product_builder_effects import PurposeBoundEffectResponse
+
+          raw = Path(os.environ["RESULT_PATH"]).read_bytes()
+          value = json.loads(raw)
+          if canonical_json_bytes(value) != raw:
+              raise SystemExit("builder_effect_response_not_canonical")
+          response = PurposeBoundEffectResponse.from_canonical_dict(value)
+          if response.status != "completed" or response.authoritative_revision is None:
+              raise SystemExit("builder_publication_not_authoritatively_completed")
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as output:
+              print(f"authoritative_revision={response.authoritative_revision}", file=output)
+          PY
 
   dispatch_validation:
     if: needs.publish.result == 'success'
@@ -237,7 +264,7 @@ jobs:
         env:
           CARL_GITHUB_APP_EFFECT_SOCKET: /run/carl/github-effect.sock
           CANDIDATE_PACKET_DIGEST: ${{ needs.build.outputs.candidate_packet_digest }}
-          EXPECTED_REVISION: ${{ needs.build.outputs.expected_revision }}
+          EXPECTED_REVISION: ${{ needs.publish.outputs.authoritative_revision }}
           EXPERIMENT_ID: ${{ needs.build.outputs.experiment_id }}
           IDEMPOTENCY_KEY: ${{ needs.build.outputs.validation_idempotency_key }}
           PARENT_COMMIT: ${{ needs.build.outputs.parent_commit }}

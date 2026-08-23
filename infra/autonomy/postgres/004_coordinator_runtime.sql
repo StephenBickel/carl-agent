@@ -3644,6 +3644,266 @@ BEGIN
 END;
 $$;
 
+CREATE OR REPLACE FUNCTION carl_autonomy.complete_builder_effect(
+    p_completion_json text
+)
+RETURNS TABLE(applied boolean, revision integer)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, carl_autonomy
+AS $$
+DECLARE
+    completion jsonb;
+    github_response jsonb;
+    runtime carl_autonomy.coordinator_runtime%ROWTYPE;
+    snapshot_value jsonb;
+    selected_node jsonb;
+    nodes_value jsonb;
+    command_state carl_autonomy.commands%ROWTYPE;
+    transition_value text;
+    completion_event record;
+    completion_result record;
+    next_revision integer;
+BEGIN
+    PERFORM carl_autonomy.require_role(ARRAY['carl_state_backend']);
+    completion := carl_autonomy.parse_object(
+        p_completion_json, 'builder_effect_completion_invalid'
+    );
+    IF carl_autonomy.canonical_jsonb(completion) <> p_completion_json
+        OR carl_autonomy.jsonb_object_cardinality(completion) IS DISTINCT FROM 12
+        OR NOT completion ?& ARRAY[
+            'schema_version', 'node', 'experiment_id', 'expected_revision',
+            'idempotency_key', 'command_key', 'effect_key',
+            'github_binding_request_digest', 'github_request_digest',
+            'github_response', 'result_digest', 'observed_at'
+        ]
+        OR completion->'schema_version' IS DISTINCT FROM '1'::jsonb
+        OR completion->>'node' NOT IN ('publish_experimental', 'dispatch_validation')
+        OR completion->>'experiment_id' !~ '^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$'
+        OR jsonb_typeof(completion->'expected_revision') <> 'number'
+        OR (completion->>'expected_revision')::integer NOT BETWEEN 0 AND 2147483646
+        OR completion->>'idempotency_key' !~ '^[0-9a-f]{64}$'
+        OR completion->>'effect_key' !~ '^cloud-effect-[0-9a-f]{64}$'
+        OR completion->>'github_binding_request_digest' !~ '^[0-9a-f]{64}$'
+        OR completion->>'github_request_digest' !~ '^[0-9a-f]{64}$'
+        OR completion->>'result_digest' !~ '^[0-9a-f]{64}$'
+        OR NOT carl_autonomy.canonical_utc_text_valid(completion->>'observed_at')
+        OR jsonb_typeof(completion->'github_response') <> 'object'
+    THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '22023', MESSAGE = 'builder_effect_completion_invalid';
+    END IF;
+    github_response := completion->'github_response';
+    IF github_response->>'status' <> 'completed'
+        OR github_response->>'request_digest' <> completion->>'github_request_digest'
+        OR carl_autonomy.sha256_text(
+            carl_autonomy.canonical_jsonb(github_response->'result')
+        ) <> completion->>'result_digest'
+    THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '55000', MESSAGE = 'builder_effect_response_mismatch';
+    END IF;
+    SELECT item.* INTO runtime
+    FROM carl_autonomy.coordinator_runtime AS item
+    WHERE item.experiment_id = completion->>'experiment_id'
+    FOR UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '40001', MESSAGE = 'builder_effect_revision_cas_mismatch';
+    END IF;
+    IF runtime.revision = (completion->>'expected_revision')::integer + 1 THEN
+        IF EXISTS (
+            SELECT 1 FROM carl_autonomy.coordinator_completion_receipts AS receipt
+            WHERE receipt.experiment_id = runtime.experiment_id
+                AND receipt.node_kind = completion->>'node'
+                AND receipt.command_key = completion->>'command_key'
+                AND receipt.effect_key = completion->>'effect_key'
+                AND receipt.request_digest = completion->>'github_binding_request_digest'
+                AND receipt.result_digest = completion->>'result_digest'
+        ) THEN
+            RETURN QUERY SELECT false, runtime.revision;
+            RETURN;
+        END IF;
+    END IF;
+    IF runtime.status IN ('complete', 'frozen')
+        OR runtime.revision <> (completion->>'expected_revision')::integer
+        OR runtime.effect_request_digest <> completion->>'github_request_digest'
+    THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '40001', MESSAGE = 'builder_effect_revision_cas_mismatch';
+    END IF;
+    snapshot_value := carl_autonomy.parse_object(
+        runtime.snapshot_json, 'coordinator_snapshot_json_invalid'
+    );
+    SELECT node INTO selected_node
+    FROM jsonb_array_elements(snapshot_value->'nodes') AS node
+    WHERE node->>'status' = 'ready'
+    ORDER BY carl_autonomy.coordinator_node_priority(node->>'kind'), node->>'node_id'
+    LIMIT 1;
+    SELECT command.* INTO command_state
+    FROM carl_autonomy.commands AS command
+    WHERE command.command_key = completion->>'command_key'
+    FOR UPDATE;
+    IF selected_node IS NULL
+        OR selected_node->>'kind' <> completion->>'node'
+        OR selected_node->>'node_id'
+            <> runtime.experiment_id || ':' || (completion->>'node')
+        OR NOT FOUND
+        OR command_state.status <> 'claimed'
+        OR command_state.effect_key <> completion->>'effect_key'
+        OR command_state.request_digest <> completion->>'github_binding_request_digest'
+        OR command_state.expected_revision <> runtime.revision
+        OR command_state.claim_expires_at <= (completion->>'observed_at')::timestamptz
+    THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '55000', MESSAGE = 'builder_effect_completion_identity_mismatch';
+    END IF;
+    SELECT * INTO completion_event
+    FROM carl_autonomy.build_coordinator_completion_event(
+        runtime.experiment_id,
+        selected_node->>'kind',
+        (selected_node->>'attempt')::integer,
+        command_state.command_key,
+        command_state.effect_key,
+        command_state.request_digest,
+        completion->>'result_digest',
+        (completion->>'observed_at')::timestamptz
+    );
+    transition_value := carl_autonomy.canonical_jsonb(jsonb_build_object(
+        'authority', command_state.authority,
+        'claim_id', command_state.claim_id,
+        'command_key', command_state.command_key,
+        'expected_revision', command_state.revision,
+        'failure_code', NULL,
+        'next_revision', command_state.revision + 1,
+        'result_digest', completion->>'result_digest',
+        'status', 'completed'
+    ));
+    PERFORM set_config('carl_autonomy.authority', command_state.authority, true);
+    SELECT * INTO completion_result
+    FROM carl_autonomy.complete_command_and_append_event(
+        transition_value,
+        completion_event.event_json,
+        completion_event.event_digest,
+        carl_autonomy.canonical_jsonb(
+            carl_autonomy.parse_object(
+                completion_event.event_json, 'coordinator_completion_event_invalid'
+            )->'payload'
+        ),
+        (completion->>'observed_at')::timestamptz
+    );
+    INSERT INTO carl_autonomy.coordinator_completion_receipts(
+        event_digest, experiment_id, node_kind, authority, command_key,
+        effect_key, request_digest, result_digest, event_json, occurred_at, recorded_at
+    ) VALUES (
+        completion_event.event_digest,
+        runtime.experiment_id,
+        selected_node->>'kind',
+        completion_event.event_authority,
+        command_state.command_key,
+        command_state.effect_key,
+        command_state.request_digest,
+        completion->>'result_digest',
+        completion_event.event_json,
+        (completion->>'observed_at')::timestamptz,
+        statement_timestamp()
+    );
+    SELECT jsonb_agg(
+        CASE WHEN node->>'node_id' = selected_node->>'node_id'
+            THEN jsonb_set(node, '{status}', '"complete"'::jsonb, false)
+            ELSE node END
+        ORDER BY ordinal
+    ) INTO nodes_value
+    FROM jsonb_array_elements(snapshot_value->'nodes')
+        WITH ORDINALITY AS value(node, ordinal);
+    next_revision := runtime.revision + 1;
+    snapshot_value := jsonb_set(snapshot_value, '{nodes}', nodes_value, false);
+    snapshot_value := jsonb_set(
+        snapshot_value, '{revision}', to_jsonb(next_revision), false
+    );
+    PERFORM set_config('carl_autonomy.authority', 'coordinator', true);
+    UPDATE carl_autonomy.coordinator_runtime AS item
+    SET snapshot_json = carl_autonomy.canonical_jsonb(snapshot_value),
+        snapshot_digest = carl_autonomy.sha256_text(
+            carl_autonomy.canonical_jsonb(snapshot_value)
+        ),
+        revision = next_revision,
+        status = 'ready',
+        completion_event_json = NULL,
+        completion_event_digest = NULL,
+        effect_family = NULL,
+        effect_request_json = NULL,
+        effect_request_digest = NULL,
+        effect_response_json = carl_autonomy.canonical_jsonb(github_response),
+        updated_at = statement_timestamp()
+    WHERE item.experiment_id = runtime.experiment_id
+        AND item.revision = runtime.revision;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '40001', MESSAGE = 'builder_effect_revision_cas_mismatch';
+    END IF;
+    RETURN QUERY SELECT true, next_revision;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION carl_autonomy.recover_builder_effect_completion(
+    p_identity_json text
+)
+RETURNS TABLE(found boolean, result_digest text, revision integer)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, carl_autonomy
+AS $$
+DECLARE
+    identity_value jsonb;
+    runtime carl_autonomy.coordinator_runtime%ROWTYPE;
+    receipt carl_autonomy.coordinator_completion_receipts%ROWTYPE;
+BEGIN
+    PERFORM carl_autonomy.require_role(ARRAY['carl_state_backend']);
+    identity_value := carl_autonomy.parse_object(
+        p_identity_json, 'builder_effect_completion_identity_invalid'
+    );
+    IF carl_autonomy.canonical_jsonb(identity_value) <> p_identity_json
+        OR carl_autonomy.jsonb_object_cardinality(identity_value) IS DISTINCT FROM 8
+        OR NOT identity_value ?& ARRAY[
+            'schema_version', 'node', 'experiment_id', 'expected_revision',
+            'idempotency_key', 'command_key', 'effect_key',
+            'github_binding_request_digest'
+        ]
+        OR identity_value->'schema_version' IS DISTINCT FROM '1'::jsonb
+        OR identity_value->>'node' NOT IN ('publish_experimental', 'dispatch_validation')
+        OR identity_value->>'idempotency_key' !~ '^[0-9a-f]{64}$'
+        OR identity_value->>'effect_key' !~ '^cloud-effect-[0-9a-f]{64}$'
+        OR identity_value->>'github_binding_request_digest' !~ '^[0-9a-f]{64}$'
+        OR jsonb_typeof(identity_value->'expected_revision') <> 'number'
+    THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '22023', MESSAGE = 'builder_effect_completion_identity_invalid';
+    END IF;
+    SELECT item.* INTO runtime
+    FROM carl_autonomy.coordinator_runtime AS item
+    WHERE item.experiment_id = identity_value->>'experiment_id';
+    SELECT item.* INTO receipt
+    FROM carl_autonomy.coordinator_completion_receipts AS item
+    WHERE item.experiment_id = identity_value->>'experiment_id'
+        AND item.node_kind = identity_value->>'node'
+        AND item.command_key = identity_value->>'command_key'
+        AND item.effect_key = identity_value->>'effect_key'
+        AND item.request_digest = identity_value->>'github_binding_request_digest';
+    IF receipt.event_digest IS NULL THEN
+        RETURN QUERY SELECT false, NULL::text, NULL::integer;
+        RETURN;
+    END IF;
+    IF runtime.revision <> (identity_value->>'expected_revision')::integer + 1
+        OR receipt.result_digest !~ '^[0-9a-f]{64}$'
+    THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '55000', MESSAGE = 'builder_effect_completion_identity_mismatch';
+    END IF;
+    RETURN QUERY SELECT true, receipt.result_digest::text, runtime.revision;
+END;
+$$;
+
 REVOKE ALL ON FUNCTION
     carl_autonomy.coordinator_timestamp(timestamptz),
     carl_autonomy.coordinator_node_priority(text),
@@ -3677,6 +3937,8 @@ REVOKE ALL ON FUNCTION
     carl_autonomy.execute_coordinator_local_effect_unchecked(text, timestamptz),
     carl_autonomy.execute_coordinator_local_effect(text, timestamptz),
     carl_autonomy.register_and_claim_builder_effect(text),
+    carl_autonomy.complete_builder_effect(text),
+    carl_autonomy.recover_builder_effect_completion(text),
     carl_autonomy.coordinator_effect_family(text)
 FROM PUBLIC, carl_autonomy_workflow;
 
@@ -3697,7 +3959,9 @@ GRANT EXECUTE ON FUNCTION
     carl_autonomy.prepare_coordinator_effect(text, timestamptz),
     carl_autonomy.complete_coordinator_effect(text, text, timestamptz),
     carl_autonomy.execute_coordinator_local_effect(text, timestamptz),
-    carl_autonomy.register_and_claim_builder_effect(text)
+    carl_autonomy.register_and_claim_builder_effect(text),
+    carl_autonomy.complete_builder_effect(text),
+    carl_autonomy.recover_builder_effect_completion(text)
 TO carl_state_backend;
 
 COMMIT;

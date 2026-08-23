@@ -375,6 +375,7 @@ class ProtectedCandidatePacket:
         paths = {path for receipt in receipts for path in receipt.changed_paths}
         if (
             self.candidate.parent_commit != self.parent_commit
+            or self.candidate.diff_artifact.digest != self.diff_artifact_digest
             or any(receipt.registration_digest != self.registration_digest for receipt in receipts)
             or receipts[-1].builder_request_digest != self.builder_request_digest
             or len({receipt.builder_request_digest for receipt in receipts}) != len(receipts)

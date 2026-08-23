@@ -31,7 +31,14 @@ def _packet():
     envelope = importlib.import_module(
         "carl_bench.product_builder_evidence"
     ).SignedAttemptReceipt.sign(receipt, b"k" * 32)
-    candidate = replace(_candidate(registration), changed_path_count=1)
+    candidate = replace(
+        _candidate(registration),
+        changed_path_count=1,
+        diff_artifact=replace(
+            _candidate(registration).diff_artifact,
+            digest=receipt.diff_artifact_digest,
+        ),
+    )
     packet = importlib.import_module(
         "carl_bench.product_builder_evidence"
     ).ProtectedCandidatePacket(
@@ -265,13 +272,14 @@ def test_real_effect_socket_executes_durable_publication_before_downstream_comma
     thread.join(2)
 
     assert result.status == "completed"
-    state = authority.resolve_claimed_command(
-        request.command_key,
-        authority="builder",
-        observed_at=datetime(2026, 8, 23, 12, 12, tzinfo=UTC),
-    )
-    assert state.command.effect_key == request.effect_key
-    assert state.command.request_digest == request.github_binding_request_digest
+    assert result.authoritative_revision == terminal.expected_revision + 1
+    position = authority.coordinator_position(terminal.experiment_id)
+    assert position == {
+        "completed_node": "publish_experimental",
+        "ready_node": "dispatch_validation",
+        "revision": terminal.expected_revision + 1,
+    }
+    assert authority.command_state(request.command_key).status == "completed"
     assert not thread.is_alive()
     socket_path.unlink(missing_ok=True)
 
@@ -284,7 +292,9 @@ def test_real_effect_socket_executes_durable_publication_before_downstream_comma
         expected_peer_uid=os.getuid(),
         timeout_seconds=2.0,
     )
-    downstream = _effects("PurposeBoundEffectRequest").for_validation(terminal)
+    downstream = _effects("PurposeBoundEffectRequest").for_validation(
+        terminal, expected_revision=result.authoritative_revision
+    )
     downstream_result = (
         _effects("ProtectedBuilderEffectExecutor")
         ._for_testing(
@@ -297,16 +307,89 @@ def test_real_effect_socket_executes_durable_publication_before_downstream_comma
     downstream_thread.join(2)
 
     assert downstream_result.status == "completed"
-    downstream_state = authority.resolve_claimed_command(
-        downstream.command_key,
-        authority="coordinator",
-        observed_at=datetime(2026, 8, 23, 12, 12, tzinfo=UTC),
-    )
+    assert downstream_result.authoritative_revision == terminal.expected_revision + 2
+    downstream_state = authority.command_state(downstream.command_key)
+    assert downstream_state.status == "completed"
     assert downstream_state.command.effect_key == downstream.effect_key
     assert downstream_state.command.request_digest == downstream.github_binding_request_digest
     assert not downstream_thread.is_alive()
     downstream_socket.unlink(missing_ok=True)
     socket_directory.rmdir()
+
+
+def test_publication_completion_replay_does_not_advance_graph_twice(tmp_path: Path) -> None:
+    store, terminal = _prepared(tmp_path)
+    authority = _effects("DurableCoordinatorCommandAuthority")._for_testing(
+        tmp_path / "coordinator-state"
+    )
+    github = RecordingGitHub()
+    executor = _effects("ProtectedBuilderEffectExecutor")._for_testing(
+        store=store, authority=authority, github=github
+    )
+    request = _effects("PurposeBoundEffectRequest").for_publication(terminal)
+
+    first = executor.execute(request)
+    replay = executor.execute(request)
+
+    assert replay == first
+    assert first.authoritative_revision == terminal.expected_revision + 1
+    assert authority.coordinator_position(terminal.experiment_id)["revision"] == (
+        terminal.expected_revision + 1
+    )
+    assert len(github.requests) == 1
+
+
+def test_authoritative_completion_recovers_when_local_response_write_was_lost(
+    tmp_path: Path,
+) -> None:
+    store, terminal = _prepared(tmp_path)
+    authority = _effects("DurableCoordinatorCommandAuthority")._for_testing(
+        tmp_path / "coordinator-state"
+    )
+    request = _effects("PurposeBoundEffectRequest").for_publication(terminal)
+    store.begin_effect(request)
+    authority.register_and_claim(request, terminal)
+    github_request = request.github_request(terminal)
+    github_response = RecordingGitHub().execute(github_request)
+    result_digest = (
+        importlib.import_module("hashlib")
+        .sha256(
+            importlib.import_module("carl_bench.canonical").canonical_json_bytes(
+                github_response.result
+            )
+        )
+        .hexdigest()
+    )
+    authoritative_revision = authority.complete_effect(
+        request,
+        terminal,
+        github_response=github_response,
+        result_digest=result_digest,
+        observed_at=github_response.observed_at,
+    )
+
+    class GitHubMustNotReplay:
+        @staticmethod
+        def execute(github_request):  # pragma: no cover - exploit assertion
+            del github_request
+            raise AssertionError("completed authoritative effect must not replay")
+
+    recovered = (
+        _effects("ProtectedBuilderEffectExecutor")
+        ._for_testing(
+            store=store,
+            authority=authority,
+            github=GitHubMustNotReplay(),
+        )
+        .execute(request)
+    )
+
+    assert recovered.status == "completed"
+    assert recovered.result_digest == result_digest
+    assert recovered.authoritative_revision == authoritative_revision
+    assert authority.coordinator_position(terminal.experiment_id)["revision"] == (
+        terminal.expected_revision + 1
+    )
 
 
 def test_persisted_response_identity_drift_freezes_before_replay_or_downstream(
@@ -334,6 +417,35 @@ def test_persisted_response_identity_drift_freezes_before_replay_or_downstream(
     assert replay.status == "frozen"
     assert replay.reason == "builder_effect_persisted_identity_mismatch"
     assert len(github.requests) == 1
+
+
+def test_canonical_publication_response_identity_drift_freezes_downstream(
+    tmp_path: Path,
+) -> None:
+    store, terminal = _prepared(tmp_path)
+    authority = _effects("DurableCoordinatorCommandAuthority")._for_testing(
+        tmp_path / "coordinator-state"
+    )
+    executor = _effects("ProtectedBuilderEffectExecutor")._for_testing(
+        store=store, authority=authority, github=RecordingGitHub()
+    )
+    publication = _effects("PurposeBoundEffectRequest").for_publication(terminal)
+    completed = executor.execute(publication)
+    response_path = tmp_path / "state" / "effects" / f"{publication.idempotency_key}.response.json"
+    value = importlib.import_module("json").loads(response_path.read_bytes())
+    value["github_request_digest"] = "0" * 64
+    response_path.write_bytes(
+        importlib.import_module("carl_bench.canonical").canonical_json_bytes(value)
+    )
+    downstream = _effects("PurposeBoundEffectRequest").for_validation(
+        terminal, expected_revision=completed.authoritative_revision
+    )
+
+    result = executor.execute(downstream)
+
+    assert result.status == "frozen"
+    assert result.reason == "builder_publication_identity_mismatch"
+    assert store.effect_status(downstream.idempotency_key) == "frozen"
 
 
 def test_pending_publication_recovers_with_same_claimed_command_after_restart(
