@@ -19,6 +19,8 @@ SUPERVISOR_TRIGGER_PATH = (
 IMPROVEMENT_WORKFLOW_PATH = REPOSITORY_ROOT / ".github/workflows/autonomous-improvement.yml"
 SOAK_WORKFLOW_PATH = REPOSITORY_ROOT / ".github/workflows/autonomous-soak.yml"
 COORDINATOR_WORKFLOW_PATH = REPOSITORY_ROOT / ".github/workflows/autonomy-coordinator.yml"
+BUILDER_WORKFLOW_PATH = REPOSITORY_ROOT / ".github/workflows/autonomy-builder.yml"
+BUILDER_PROMPT_PATH = REPOSITORY_ROOT / "docs/automation-prompts/carl-product-builder.md"
 ACTIONLINT_CONFIG_PATH = REPOSITORY_ROOT / ".github/actionlint.yaml"
 
 
@@ -591,6 +593,111 @@ def test_scheduled_cloud_coordinator_is_single_node_default_branch_only_and_stat
     assert ACTIONLINT_CONFIG_PATH.read_text(encoding="utf-8") == (
         "self-hosted-runner:\n  labels:\n    - carl-autonomy-cloud\n"
     )
+
+
+def _assert_remote_product_builder_contract(document: str, prompt: str) -> None:
+    assert 'cron: "17 3 * * *"' in document
+    assert "workflow_dispatch:" in document
+    for name in ("request_digest", "parent_commit", "immutable_inputs_digest"):
+        assert re.search(rf"(?m)^      {name}:\n        required: true$", document)
+    assert (
+        "if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)"
+        in document
+    )
+    assert "group: carl-autonomy-builder-${{ github.event.repository.default_branch }}" in document
+    assert "cancel-in-progress: false" in document
+    assert "permissions:\n  contents: read" in document
+
+    jobs = _workflow_job_blocks(document)
+    assert set(jobs) == {"build", "publish", "dispatch_validation"}
+    assert _job_environment(jobs["build"]) == "carl-autonomy-builder"
+    assert _job_environment(jobs["publish"]) == "carl-autonomy-builder"
+    assert _job_environment(jobs["dispatch_validation"]) == "carl-autonomy-coordinator"
+    assert _job_permissions(jobs["build"]) == {"contents": "read", "id-token": "write"}
+    assert _job_permissions(jobs["publish"]) == {"contents": "read", "id-token": "write"}
+    assert _job_permissions(jobs["dispatch_validation"]) == {
+        "contents": "read",
+        "id-token": "write",
+    }
+    for block in jobs.values():
+        assert "runs-on: [self-hosted, linux, x64, carl-autonomy-cloud]" in block
+        assert "actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683" in block
+        assert "astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990" in block
+        assert "persist-credentials: false" in block
+        assert "ref: ${{ github.sha }}" in block
+    assert "timeout-minutes: 45" in jobs["build"]
+    assert "timeout-minutes: 10" in jobs["publish"]
+    assert "timeout-minutes: 10" in jobs["dispatch_validation"]
+    assert "python -m carl_bench.product_builder" in jobs["build"]
+    assert "OpenAIModelGateway.from_protected_environment" in jobs["build"]
+    assert "preregister_and_call_model" in jobs["build"]
+    assert "candidate-environment.json" in jobs["build"]
+    assert "candidate_packet" in jobs["build"]
+    assert "candidate publish-experimental" not in jobs["publish"]
+    assert "PROTECTED_NODE: publish_experimental" in jobs["publish"]
+    assert "GitHubEffectSocketClient.from_protected_environment" in jobs["publish"]
+    assert "reconcile_experimental_publication" in jobs["publish"]
+    assert "carl-bench cloud coordinate" in jobs["publish"]
+    assert "CARL_GITHUB_APP_EFFECT_SOCKET" in jobs["publish"]
+    assert "dispatch_validation" in jobs["dispatch_validation"]
+    assert "GitHubEffectSocketClient.from_protected_environment" in jobs["dispatch_validation"]
+    assert "GITHUB_TOKEN" not in document
+    assert "github.token" not in document
+    assert "OPENAI_API_KEY" not in document
+    assert "secrets." not in document
+    assert "actions/upload-artifact@" not in document
+    assert "actions/download-artifact@" not in document
+
+    normalized = " ".join(prompt.casefold().split())
+    for phrase in (
+        "product capability work outranks factory infrastructure",
+        "preregister before any model call",
+        "exact protected parent",
+        "private input commitments",
+        "failing behavioral test before implementation",
+        "at most two materially changed repair attempts",
+        "candidate process receives no service credentials",
+        "immutable experimental publication is not live validation",
+        "retained learning and a distinct next safe node",
+        "never finish with a report-only result",
+        "default github_token recursion is not authority",
+        "protected github app effect boundary",
+    ):
+        assert phrase in normalized
+
+
+def test_autonomous_remote_product_builder_is_bounded_secret_free_and_explicitly_dispatched() -> (
+    None
+):
+    _assert_remote_product_builder_contract(
+        BUILDER_WORKFLOW_PATH.read_text(encoding="utf-8"),
+        BUILDER_PROMPT_PATH.read_text(encoding="utf-8"),
+    )
+
+
+def test_builder_contract_rejects_report_only_credential_and_recursion_mutations() -> None:
+    workflow = BUILDER_WORKFLOW_PATH.read_text(encoding="utf-8")
+    prompt = BUILDER_PROMPT_PATH.read_text(encoding="utf-8")
+    mutations = {
+        "default token recursion": workflow.replace(
+            "CARL_GITHUB_APP_EFFECT_SOCKET", "GITHUB_TOKEN", 1
+        ),
+        "candidate service credential": workflow.replace(
+            "candidate-environment.json", "OPENAI_API_KEY", 1
+        ),
+        "missing downstream dispatch": workflow.replace("dispatch_validation", "idle_report"),
+        "report-only terminal": prompt.replace(
+            "Never finish with a report-only result",
+            "A report-only result is acceptable",
+        ),
+    }
+    for name, mutation in mutations.items():
+        assert mutation != (prompt if name == "report-only terminal" else workflow), name
+        with pytest.raises(AssertionError):
+            _assert_remote_product_builder_contract(
+                workflow if name == "report-only terminal" else mutation,
+                mutation if name == "report-only terminal" else prompt,
+            )
 
 
 def test_autonomous_workflows_resolve_inputs_only_through_the_versioned_registry() -> None:
