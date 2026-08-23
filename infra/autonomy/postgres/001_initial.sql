@@ -29,8 +29,9 @@ CREATE TABLE carl_autonomy.experiment_events (
             'lease_released', 'live_spend_recorded', 'workspace_prepared', 'candidate_sealed',
             'paired_evidence_recorded', 'review_packet_recorded', 'review_attested',
             'draft_pr_requested', 'draft_pr_recorded', 'workspace_disposed', 'retry_scheduled',
-            'experimental_published', 'protected_validation_recorded', 'promotion_recorded',
-            'soak_observed', 'revert_recorded'
+            'coordinator_node_completed', 'experimental_published',
+            'protected_validation_recorded', 'promotion_recorded', 'soak_observed',
+            'revert_recorded'
         )
     ),
     occurred_at timestamptz NOT NULL,

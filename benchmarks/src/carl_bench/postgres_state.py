@@ -665,6 +665,11 @@ class PostgresStateBackend(StateBackend):
             ):
                 return "soak"
             return "coordinator"
+        if event.event_type is EventType.COORDINATOR_NODE_COMPLETED:
+            return {
+                "publish_experimental": "builder",
+                "dispatch_validation": "coordinator",
+            }.get(event.payload.get("node_kind"), "")
         try:
             return _EVENT_AUTHORITIES[event.event_type]
         except KeyError as error:

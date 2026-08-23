@@ -248,6 +248,9 @@ AS $$
         ('retry_scheduled', ARRAY[
             'attempt', 'changed_action', 'failed_stage_attempt_id', 'failure_class', 'scheduled_at'
         ]::text[]),
+        ('coordinator_node_completed', ARRAY[
+            'command_key', 'effect_key', 'node_kind', 'request_digest', 'result_digest'
+        ]::text[]),
         ('experimental_published', ARRAY[
             'branch', 'candidate_packet_digest', 'commit', 'tree'
         ]::text[]),
@@ -667,6 +670,17 @@ AS $$
             AND p_payload->>'failure_class' ~ '^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$'
             AND jsonb_typeof(p_payload->'scheduled_at') = 'string'
             AND carl_autonomy.canonical_utc_text_valid(p_payload->>'scheduled_at')
+        WHEN 'coordinator_node_completed' THEN
+            jsonb_typeof(p_payload->'command_key') = 'string'
+            AND octet_length(p_payload->>'command_key') BETWEEN 1 AND 192
+            AND jsonb_typeof(p_payload->'effect_key') = 'string'
+            AND p_payload->>'effect_key' ~ '^cloud-effect-[0-9a-f]{64}$'
+            AND jsonb_typeof(p_payload->'node_kind') = 'string'
+            AND p_payload->>'node_kind' IN ('publish_experimental', 'dispatch_validation')
+            AND jsonb_typeof(p_payload->'request_digest') = 'string'
+            AND p_payload->>'request_digest' ~ '^[0-9a-f]{64}$'
+            AND jsonb_typeof(p_payload->'result_digest') = 'string'
+            AND p_payload->>'result_digest' ~ '^[0-9a-f]{64}$'
         WHEN 'experimental_published' THEN
             jsonb_typeof(p_payload->'branch') = 'string'
             AND octet_length(p_payload->>'branch') BETWEEN 1 AND 256
@@ -728,6 +742,9 @@ AS $$
     SELECT CASE role_name
         WHEN 'carl_builder' THEN event_type IN (
             'role_recorded', 'workspace_prepared', 'candidate_sealed', 'experimental_published'
+        ) OR (
+            event_type = 'coordinator_node_completed'
+            AND payload->>'node_kind' = 'publish_experimental'
         )
         WHEN 'carl_validator' THEN event_type IN (
             'paired_evidence_recorded', 'review_packet_recorded', 'review_attested',
@@ -746,6 +763,9 @@ AS $$
         WHEN 'carl_coordinator' THEN event_type IN (
             'state_transitioned', 'lease_acquired', 'lease_reconciled', 'lease_released',
             'live_spend_recorded', 'retry_scheduled'
+        ) OR (
+            event_type = 'coordinator_node_completed'
+            AND payload->>'node_kind' = 'dispatch_validation'
         )
         ELSE false
     END
@@ -1400,6 +1420,8 @@ BEGIN
             THEN
                 RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'invalid_spend_payload';
             END IF;
+        WHEN 'coordinator_node_completed' THEN
+            NULL;
         WHEN 'retry_scheduled' THEN
             retry_key := p_payload->>'failed_stage_attempt_id';
             IF jsonb_typeof(p_payload->'attempt') <> 'number'

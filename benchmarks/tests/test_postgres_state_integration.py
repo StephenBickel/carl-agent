@@ -1891,6 +1891,7 @@ def test_builder_publication_uses_postgres_authority_and_one_real_socket_effect(
         authority=authority,
         github=GitHubMustNotReplay(),
     ).execute(publication)
+    backend.load_projection(terminal.experiment_id)
     downstream = PurposeBoundEffectRequest.for_validation(
         terminal, expected_revision=receipt.authoritative_revision
     )
@@ -1913,6 +1914,13 @@ def test_builder_publication_uses_postgres_authority_and_one_real_socket_effect(
             "WHERE idempotency_key = %s",
             (publication.idempotency_key,),
         ).fetchone()
+        completion_events = admin.execute(
+            "SELECT authority, event_digest, event_json "
+            "FROM carl_autonomy.experiment_events "
+            "WHERE experiment_id = %s "
+            "AND (event_json::jsonb)->>'event_type' = 'coordinator_node_completed'",
+            (terminal.experiment_id,),
+        ).fetchall()
     nodes = {
         node["kind"]: node["status"] for node in json.loads(runtime["snapshot_json"])["nodes"]
     }
@@ -1939,6 +1947,21 @@ def test_builder_publication_uses_postgres_authority_and_one_real_socket_effect(
         "result_digest": result_digest,
         "expected_revision": terminal.expected_revision,
         "authoritative_revision": terminal.expected_revision + 1,
+    }
+    assert len(completion_events) == 1
+    completion_event = json.loads(completion_events[0]["event_json"])
+    assert completion_events[0]["authority"] == "builder"
+    assert completion_events[0]["event_digest"] == hashlib.sha256(
+        completion_events[0]["event_json"].encode()
+    ).hexdigest()
+    assert completion_event["event_type"] == "coordinator_node_completed"
+    assert completion_event["experiment_id"] == terminal.experiment_id
+    assert completion_event["payload"] == {
+        "command_key": publication.command_key,
+        "effect_key": publication.effect_key,
+        "node_kind": "publish_experimental",
+        "request_digest": publication.github_binding_request_digest,
+        "result_digest": result_digest,
     }
     assert downstream_state.status == "claimed"
     assert downstream_state.command.expected_revision == terminal.expected_revision + 1

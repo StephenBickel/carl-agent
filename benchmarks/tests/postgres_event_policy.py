@@ -140,6 +140,11 @@ EVENT_PAYLOAD_KEY_SETS: dict[EventType, tuple[frozenset[str], ...]] = {
             }
         ),
     ),
+    EventType.COORDINATOR_NODE_COMPLETED: (
+        frozenset(
+            {"command_key", "effect_key", "node_kind", "request_digest", "result_digest"}
+        ),
+    ),
     EventType.EXPERIMENTAL_PUBLISHED: (
         frozenset({"branch", "candidate_packet_digest", "commit", "tree"}),
     ),
@@ -222,6 +227,9 @@ EVENT_STRING_FIELDS: dict[EventType, frozenset[str]] = {
     EventType.RETRY_SCHEDULED: frozenset(
         {"changed_action", "failed_stage_attempt_id", "failure_class", "scheduled_at"}
     ),
+    EventType.COORDINATOR_NODE_COMPLETED: frozenset(
+        {"command_key", "effect_key", "node_kind", "request_digest", "result_digest"}
+    ),
     EventType.EXPERIMENTAL_PUBLISHED: frozenset(
         {"branch", "candidate_packet_digest", "commit", "tree"}
     ),
@@ -265,6 +273,7 @@ EVENT_INTEGER_FIELDS: dict[EventType, dict[str, tuple[int, int] | None]] = {
     EventType.DRAFT_PR_RECORDED: {"number": None, "schema_version": (1, 1)},
     EventType.WORKSPACE_DISPOSED: {},
     EventType.RETRY_SCHEDULED: {"attempt": (1, 3)},
+    EventType.COORDINATOR_NODE_COMPLETED: {},
     EventType.EXPERIMENTAL_PUBLISHED: {},
     EventType.PROTECTED_VALIDATION_RECORDED: {},
     EventType.PROMOTION_RECORDED: {},
@@ -288,6 +297,7 @@ EVENT_BOOLEAN_FIELDS: dict[EventType, dict[str, bool | None]] = {
     EventType.DRAFT_PR_RECORDED: {"is_draft": True},
     EventType.WORKSPACE_DISPOSED: {},
     EventType.RETRY_SCHEDULED: {},
+    EventType.COORDINATOR_NODE_COMPLETED: {},
     EventType.EXPERIMENTAL_PUBLISHED: {},
     EventType.PROTECTED_VALIDATION_RECORDED: {},
     EventType.PROMOTION_RECORDED: {},
@@ -342,6 +352,7 @@ EVENT_REDUCER_BINDINGS: dict[EventType, frozenset[str]] = {
     EventType.RETRY_SCHEDULED: frozenset(
         {"attempt", "changed_action", "failed_stage_attempt_id", "scheduled_at"}
     ),
+    EventType.COORDINATOR_NODE_COMPLETED: frozenset(),
     EventType.EXPERIMENTAL_PUBLISHED: frozenset({"branch", "candidate_packet_digest", "commit"}),
     EventType.PROTECTED_VALIDATION_RECORDED: frozenset({"candidate_commit", "candidate_tree"}),
     EventType.PROMOTION_RECORDED: frozenset({"protected_validation"}),
@@ -369,6 +380,7 @@ INVALID_EVENT_PAYLOAD_TYPES: tuple[tuple[EventType, tuple[str | int, ...], Any],
     (EventType.DRAFT_PR_RECORDED, ("is_draft",), "true"),
     (EventType.WORKSPACE_DISPOSED, ("candidate_commit",), {}),
     (EventType.RETRY_SCHEDULED, ("attempt",), 1.5),
+    (EventType.COORDINATOR_NODE_COMPLETED, ("effect_key",), False),
     (EventType.EXPERIMENTAL_PUBLISHED, ("candidate_packet_digest",), 1),
     (EventType.PROTECTED_VALIDATION_RECORDED, ("candidate_tree",), False),
     (EventType.PROMOTION_RECORDED, ("merge_tree",), []),

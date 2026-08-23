@@ -23,6 +23,7 @@ _IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
 _AUTONOMY_EVENT_TYPES = frozenset(
     {
         EventType.RETRY_SCHEDULED,
+        EventType.COORDINATOR_NODE_COMPLETED,
         EventType.EXPERIMENTAL_PUBLISHED,
         EventType.PROTECTED_VALIDATION_RECORDED,
         EventType.PROMOTION_RECORDED,

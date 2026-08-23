@@ -140,6 +140,7 @@ EVENT_POLICY_CASES = (
     (EventType.DRAFT_PR_RECORDED, frozenset({"promoter"}), "case"),
     (EventType.WORKSPACE_DISPOSED, frozenset({"promoter"}), "case"),
     (EventType.RETRY_SCHEDULED, frozenset({"coordinator"}), "case"),
+    (EventType.COORDINATOR_NODE_COMPLETED, frozenset({"builder", "coordinator"}), "case"),
     (EventType.EXPERIMENTAL_PUBLISHED, frozenset({"builder"}), "case"),
     (EventType.PROTECTED_VALIDATION_RECORDED, frozenset({"validator"}), "case"),
     (EventType.PROMOTION_RECORDED, frozenset({"promoter"}), "case"),

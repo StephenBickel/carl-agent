@@ -1,5 +1,20 @@
 BEGIN;
 
+ALTER TABLE carl_autonomy.experiment_events
+    DROP CONSTRAINT experiment_events_event_type_check;
+ALTER TABLE carl_autonomy.experiment_events
+    ADD CONSTRAINT experiment_events_event_type_check CHECK (
+        event_type IN (
+            'state_transitioned', 'role_recorded', 'lease_acquired', 'lease_reconciled',
+            'lease_released', 'live_spend_recorded', 'workspace_prepared', 'candidate_sealed',
+            'paired_evidence_recorded', 'review_packet_recorded', 'review_attested',
+            'draft_pr_requested', 'draft_pr_recorded', 'workspace_disposed', 'retry_scheduled',
+            'coordinator_node_completed', 'experimental_published',
+            'protected_validation_recorded', 'promotion_recorded', 'soak_observed',
+            'revert_recorded'
+        )
+    );
+
 CREATE TABLE carl_autonomy.coordinator_runtime (
     experiment_id varchar(128) PRIMARY KEY
         REFERENCES carl_autonomy.experiment_manifests(experiment_id),
@@ -547,8 +562,6 @@ BEGIN
         64
     );
     event_value := carl_autonomy.canonical_jsonb(jsonb_build_object(
-        'authority', authority_value,
-        'domain', 'carl.coordinator-node-completion.v1',
         'event_type', 'coordinator_node_completed',
         'experiment_id', p_experiment_id,
         'occurred_at', carl_autonomy.coordinator_timestamp(p_occurred_at),
@@ -3935,8 +3948,15 @@ BEGIN
     ));
     PERFORM set_config('carl_autonomy.authority', command_state.authority, true);
     SELECT * INTO completion_result
-    FROM carl_autonomy.complete_command(
+    FROM carl_autonomy.complete_command_and_append_event(
         transition_value,
+        completion_event.event_json,
+        completion_event.event_digest,
+        carl_autonomy.canonical_jsonb(
+            carl_autonomy.parse_object(
+                completion_event.event_json, 'coordinator_completion_event_invalid'
+            )->'payload'
+        ),
         (completion->>'observed_at')::timestamptz
     );
     INSERT INTO carl_autonomy.coordinator_completion_receipts(
