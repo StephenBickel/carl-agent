@@ -18,6 +18,8 @@ SUPERVISOR_TRIGGER_PATH = (
 )
 IMPROVEMENT_WORKFLOW_PATH = REPOSITORY_ROOT / ".github/workflows/autonomous-improvement.yml"
 SOAK_WORKFLOW_PATH = REPOSITORY_ROOT / ".github/workflows/autonomous-soak.yml"
+COORDINATOR_WORKFLOW_PATH = REPOSITORY_ROOT / ".github/workflows/autonomy-coordinator.yml"
+ACTIONLINT_CONFIG_PATH = REPOSITORY_ROOT / ".github/actionlint.yaml"
 
 
 @dataclass(frozen=True)
@@ -520,6 +522,75 @@ def test_sanitized_live_manifest_matches_the_complete_canonical_portfolio() -> N
         assert entry["status"] == "ACTIVE"
         assert entry["configuration"] == snapshot.metadata
         assert entry["prompt_sha256"] == hashlib.sha256(snapshot.prompt.encode("utf-8")).hexdigest()
+
+
+def test_scheduled_cloud_coordinator_is_single_node_default_branch_only_and_state_scoped() -> None:
+    document = COORDINATOR_WORKFLOW_PATH.read_text(encoding="utf-8")
+    manifest = json.loads(LIVE_MANIFEST_PATH.read_text(encoding="utf-8"))
+
+    assert 'cron: "0 */2 * * *"' in document
+    assert "workflow_dispatch:" in document
+    assert (
+        "if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)"
+        in document
+    )
+    assert (
+        "group: carl-autonomy-coordinator-${{ github.event.repository.default_branch }}" in document
+    )
+    assert "cancel-in-progress: false" in document
+    assert "permissions:\n  contents: read" in document
+
+    jobs = _workflow_job_blocks(document)
+    assert set(jobs) == {"coordinate"}
+    coordinate = jobs["coordinate"]
+    assert _job_environment(coordinate) == "carl-autonomy-coordinator"
+    assert _job_permissions(coordinate) == {"contents": "read", "id-token": "write"}
+    assert "runs-on: [self-hosted, linux, x64, carl-autonomy-cloud]" in coordinate
+    assert "timeout-minutes: 10" in coordinate
+    assert "actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683" in coordinate
+    assert "astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990" in coordinate
+    assert "persist-credentials: false" in coordinate
+    assert "ref: ${{ github.sha }}" in coordinate
+    assert coordinate.count("carl-bench cloud coordinate") == 1
+    assert "uv run --offline --project benchmarks --locked python - <<'PY'" in coordinate
+    assert 'MAX_COORDINATOR_RESULT_BYTES: "1048576"' in coordinate
+    assert "canonical_json_bytes" in coordinate
+    assert coordinate.count("printf '%s\\n' \"$RESULT\"") == 1
+
+    forbidden = (
+        "actions/upload-artifact@",
+        "actions/download-artifact@",
+        "GITHUB_TOKEN",
+        "OPENAI_API_KEY",
+        "secrets.",
+        "candidate",
+        "publisher",
+        "promoter",
+        "subject",
+        "model",
+    )
+    assert not any(value in document for value in forbidden)
+    assert manifest["cloud_workflows"] == [
+        {
+            "configuration": {
+                "default_branch_only": True,
+                "durable_state": "postgresql_and_protected_object_storage",
+                "identity": "coordinator",
+                "maximum_consequential_nodes_per_run": 1,
+                "no_idle_narrative_ledger_event": True,
+                "oidc_state_role_only": True,
+                "runner_label": "carl-autonomy-cloud",
+                "schedule": "0 */2 * * *",
+                "workflow_dispatch": True,
+            },
+            "id": "autonomy-coordinator",
+            "status": "PENDING_COMMISSIONING",
+            "workflow_path": ".github/workflows/autonomy-coordinator.yml",
+        }
+    ]
+    assert ACTIONLINT_CONFIG_PATH.read_text(encoding="utf-8") == (
+        "self-hosted-runner:\n  labels:\n    - carl-autonomy-cloud\n"
+    )
 
 
 def test_autonomous_workflows_resolve_inputs_only_through_the_versioned_registry() -> None:

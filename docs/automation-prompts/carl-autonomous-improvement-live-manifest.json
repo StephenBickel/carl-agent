@@ -151,6 +151,24 @@
       "status": "ACTIVE"
     }
   ],
+  "cloud_workflows": [
+    {
+      "configuration": {
+        "default_branch_only": true,
+        "durable_state": "postgresql_and_protected_object_storage",
+        "identity": "coordinator",
+        "maximum_consequential_nodes_per_run": 1,
+        "no_idle_narrative_ledger_event": true,
+        "oidc_state_role_only": true,
+        "runner_label": "carl-autonomy-cloud",
+        "schedule": "0 */2 * * *",
+        "workflow_dispatch": true
+      },
+      "id": "autonomy-coordinator",
+      "status": "PENDING_COMMISSIONING",
+      "workflow_path": ".github/workflows/autonomy-coordinator.yml"
+    }
+  ],
   "schema_version": 1,
   "source": "sanitized_live_definition_export"
 }
