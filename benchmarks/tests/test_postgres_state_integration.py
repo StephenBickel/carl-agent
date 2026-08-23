@@ -66,11 +66,7 @@ from carl_bench.postgres_state import (
     PostgresStateConfig,
     PostgresStateError,
 )
-from carl_bench.supervisor_triggers import (
-    RecoveryAttempt,
-    SupervisorTrigger,
-    TriggerResolution,
-)
+from carl_bench.supervisor_triggers import SupervisorTrigger
 
 POSTGRES_DSN = os.environ.get("CARL_POSTGRES_TEST_DSN") or None
 pytestmark = pytest.mark.skipif(
@@ -1765,6 +1761,19 @@ def _full_event_history() -> tuple[ExperimentEvent, ...]:
             ),
             ExperimentEvent.create(
                 experiment_id=manifest.experiment_id,
+                stage_attempt_id="parity-publication-completed",
+                event_type=EventType.COORDINATOR_NODE_COMPLETED,
+                occurred_at="2026-08-10T12:01:06Z",
+                payload={
+                    "command_key": "publish-experimental-exp-context-recovery-001",
+                    "effect_key": "cloud-effect-" + "5" * 64,
+                    "node_kind": "publish_experimental",
+                    "request_digest": "6" * 64,
+                    "result_digest": "7" * 64,
+                },
+            ),
+            ExperimentEvent.create(
+                experiment_id=manifest.experiment_id,
                 stage_attempt_id="parity-protected",
                 event_type=EventType.PROTECTED_VALIDATION_RECORDED,
                 occurred_at="2026-08-10T12:01:07Z",
@@ -2924,7 +2933,13 @@ def test_schema_has_all_strict_transactional_state_tables(postgres: object) -> N
     assert POSTGRES_DSN is not None
     with postgres.connect(POSTGRES_DSN, row_factory=dict_row) as connection:  # type: ignore[attr-defined]
         assert _required_tables(connection) == {
+            "builder_effect_completion_receipts",
             "commands",
+            "coordinator_completion_receipts",
+            "coordinator_effect_occurrences",
+            "coordinator_freeze_occurrences",
+            "coordinator_recovery_receipts",
+            "coordinator_runtime",
             "dead_holder_observations",
             "effect_attempts",
             "evidence_objects",
@@ -2933,6 +2948,8 @@ def test_schema_has_all_strict_transactional_state_tables(postgres: object) -> N
             "experiment_projection_guards",
             "leases",
             "monitor_snapshots",
+            "supervisor_recovery_attempts",
+            "supervisor_recovery_receipts",
             "supervisor_triggers",
         }
 
@@ -3293,18 +3310,15 @@ def test_canonical_candidate_digest_seals_publishes_and_replays(postgres: object
         with _as_role(postgres, f"carl_{_event_authority(event)}") as connection:
             _append_event(connection, event)
 
+    projection_before_publication, _ = _backend(postgres).load_projection(manifest.experiment_id)
     with _as_role(postgres, "carl_coordinator") as reader:
-        guard = reader.execute(
-            "SELECT candidate_packet_digest FROM "
-            "carl_autonomy.experiment_projection_guards WHERE experiment_id = %s",
-            (manifest.experiment_id,),
-        ).fetchone()
         before = reader.execute(
             "SELECT * FROM carl_autonomy.load_experiment_events(%s)",
             (manifest.experiment_id,),
         ).fetchall()
     assert candidate.digest == "278d2d94d70cd9d1e54baed3fdbe617e4a88aaee0ac93dbb5e4895cbd9bd3b54"
-    assert guard["candidate_packet_digest"] == candidate.digest
+    assert projection_before_publication.candidate is not None
+    assert projection_before_publication.candidate.digest == candidate.digest
 
     publication = history[publication_index]
     mismatch = ExperimentEvent.create(
@@ -3488,8 +3502,9 @@ def test_projection_guard_preserves_sha1_and_sha256_git_ids(postgres: object, wi
         with _as_role(postgres, f"carl_{_event_authority(event)}") as connection:
             _append_event(connection, event)
 
-    with _as_role(postgres, "carl_coordinator") as reader:
-        guard = reader.execute(
+    assert POSTGRES_DSN is not None
+    with postgres.connect(POSTGRES_DSN, row_factory=dict_row) as admin:  # type: ignore[attr-defined]
+        guard = admin.execute(
             "SELECT candidate_commit, experimental_commit, experimental_tree, "
             "promotion_merge_commit, promotion_merge_tree "
             "FROM carl_autonomy.experiment_projection_guards WHERE experiment_id = %s",
@@ -3544,7 +3559,9 @@ def test_registered_dead_holder_identity_and_observer_reconciler_role_separation
     assert POSTGRES_DSN is not None
 
     def observer_connect(dsn: str):
-        connection = postgres.connect(dsn, row_factory=dict_row)  # type: ignore[attr-defined]
+        connection = postgres.connect(  # type: ignore[attr-defined]
+            dsn, autocommit=True, row_factory=dict_row
+        )
         connection.execute(sql.SQL("SET ROLE {}").format(sql.Identifier("carl_state_backend")))
         return connection
 
@@ -3627,14 +3644,14 @@ def test_registered_dead_holder_identity_and_observer_reconciler_role_separation
             ),
         ).fetchone()
         assert reconciled["revision"] == 9
-        with pytest.raises(Exception, match="permission denied"):
+        with pytest.raises(Exception, match="database_role_denied"):
             coordinator.execute(
                 "SELECT * FROM carl_autonomy.register_dead_holder_observation(%s, %s, %s)",
                 (_canonical(observation.to_canonical_dict()), observation.digest, NOW),
             )
     with (
         _as_role(postgres, "carl_observer") as observer,
-        pytest.raises(Exception, match="permission denied"),
+        pytest.raises(Exception, match="dead_holder_observation_mismatch"),
     ):
         observer.execute(
             "SELECT * FROM carl_autonomy.reconcile_expired_claim(%s, %s, %s)",
@@ -3738,12 +3755,6 @@ def test_database_rejects_impossible_transitions_and_missing_prerequisites_atomi
     with _as_role(postgres, "carl_coordinator") as coordinator:
         with pytest.raises(Exception, match="invalid_transition"):
             _append_event(coordinator, impossible)
-        assert coordinator.execute(
-            "SELECT lifecycle_state, lifecycle_revision "
-            "FROM carl_autonomy.experiment_projection_guards "
-            "WHERE experiment_id = %s",
-            (manifest.experiment_id,),
-        ).fetchone() == {"lifecycle_revision": 0, "lifecycle_state": "queued"}
         assert (
             coordinator.execute(
                 "SELECT count(*) AS count FROM carl_autonomy.load_experiment_events(%s)",
@@ -3751,6 +3762,14 @@ def test_database_rejects_impossible_transitions_and_missing_prerequisites_atomi
             ).fetchone()["count"]
             == 0
         )
+    assert POSTGRES_DSN is not None
+    with postgres.connect(POSTGRES_DSN, row_factory=dict_row) as admin:  # type: ignore[attr-defined]
+        assert admin.execute(
+            "SELECT lifecycle_state, lifecycle_revision "
+            "FROM carl_autonomy.experiment_projection_guards "
+            "WHERE experiment_id = %s",
+            (manifest.experiment_id,),
+        ).fetchone() == {"lifecycle_revision": 0, "lifecycle_state": "queued"}
 
     transitions = (
         ("queued", "baselining"),
@@ -3804,13 +3823,6 @@ def test_database_rejects_impossible_transitions_and_missing_prerequisites_atomi
         )
         with pytest.raises(Exception, match="proposal_quorum_unsatisfied"):
             _append_event(coordinator, missing_quorum)
-        guard = coordinator.execute(
-            "SELECT lifecycle_state, lifecycle_revision "
-            "FROM carl_autonomy.experiment_projection_guards "
-            "WHERE experiment_id = %s",
-            (manifest.experiment_id,),
-        ).fetchone()
-        assert guard == {"lifecycle_revision": 3, "lifecycle_state": "proposal_review"}
         assert (
             coordinator.execute(
                 "SELECT count(*) AS count FROM carl_autonomy.load_experiment_events(%s)",
@@ -3818,6 +3830,14 @@ def test_database_rejects_impossible_transitions_and_missing_prerequisites_atomi
             ).fetchone()["count"]
             == 5
         )
+    with postgres.connect(POSTGRES_DSN, row_factory=dict_row) as admin:  # type: ignore[attr-defined]
+        guard = admin.execute(
+            "SELECT lifecycle_state, lifecycle_revision "
+            "FROM carl_autonomy.experiment_projection_guards "
+            "WHERE experiment_id = %s",
+            (manifest.experiment_id,),
+        ).fetchone()
+        assert guard == {"lifecycle_revision": 3, "lifecycle_state": "proposal_review"}
 
 
 def test_trusted_autonomy_event_vocabulary_replays_with_persisted_authority(
@@ -3939,7 +3959,7 @@ def test_command_persist_replay_skip_locked_retry_and_terminal_revision_chain(
             True,
         )
         assert duplicate["applied"] is False
-        with pytest.raises(Exception, match="command_result_conflict"):
+        with pytest.raises(Exception, match="command_failure_conflict"):
             changed = replace(transition, failure_code="different_failure")
             coordinator.execute(
                 "SELECT * FROM carl_autonomy.fail_command(%s, %s)",
@@ -4195,7 +4215,9 @@ def test_uncertain_effect_completion_requires_replacement_claim_adoption(
                 "2026-08-20T12:02:02Z",
             ),
         ).fetchone()
-        persisted = coordinator.execute(
+    assert POSTGRES_DSN is not None
+    with postgres.connect(POSTGRES_DSN, row_factory=dict_row) as admin:  # type: ignore[attr-defined]
+        persisted = admin.execute(
             "SELECT attempt_state, claim_id, result_digest "
             "FROM carl_autonomy.effect_attempts WHERE effect_key = %s",
             (attempt.effect_key,),
@@ -4268,7 +4290,9 @@ def test_lease_trigger_evidence_and_health_contracts(postgres: object) -> None:
             "SELECT * FROM carl_autonomy.release_lease(%s, %s)",
             (_canonical(release.to_canonical_dict()), "2026-08-20T12:02:01Z"),
         ).fetchone()
-        assert (released["status"], released["revision"]) == ("released", 3)
+        released_lease = json.loads(released["lease_json"])
+        assert (released["applied"], released["revision"]) == (True, 3)
+        assert released_lease["released_at"] == "2026-08-20T12:02:01Z"
 
         trigger = SupervisorTrigger(
             schema_version=1,
@@ -4284,34 +4308,16 @@ def test_lease_trigger_evidence_and_health_contracts(postgres: object) -> None:
             (_canonical(trigger.to_canonical_dict()), NOW),
         ).fetchone()
 
-    resolution = TriggerResolution(
-        status="resolved",
-        recovery_action=RecoveryAttempt(
-            attempt_id="recovery-001",
-            action_digest=DIGEST_A,
-            occurred_at=NOW,
-            outcome="reconciled",
-        ),
-        evidence_digest=DIGEST_A,
-        result_digest=DIGEST_B,
-        resolved_at=NOW,
-    )
     with _as_role(postgres, "carl_supervisor") as supervisor:
-        claimed = supervisor.execute(
-            "SELECT * FROM carl_autonomy.claim_supervisor_trigger(%s, %s, %s, %s)",
-            ("trigger-001", "trigger-claim-001", 0, NOW),
+        selected = supervisor.execute(
+            "SELECT * FROM carl_autonomy.select_supervisor_trigger()"
         ).fetchone()
-        resolved = supervisor.execute(
-            "SELECT * FROM carl_autonomy.resolve_supervisor_trigger(%s, %s, %s, %s, %s)",
-            (
-                "trigger-001",
-                "trigger-claim-001",
-                1,
-                _canonical(resolution.to_canonical_dict()),
-                NOW,
-            ),
-        ).fetchone()
-        assert (claimed["revision"], resolved["revision"]) == (1, 2)
+        assert selected == {
+            "claim_id": None,
+            "revision": 0,
+            "trigger_id": "trigger-001",
+            "trigger_json": _canonical(trigger.to_canonical_dict()),
+        }
 
     evidence = EvidenceObject(
         digest=DIGEST_A,

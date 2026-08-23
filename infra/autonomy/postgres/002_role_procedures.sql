@@ -2790,7 +2790,7 @@ BEGIN
         'carl_supervisor', 'carl_coordinator', 'carl_observer'
     ]);
     RETURN QUERY
-    SELECT s.observed_at_text, s.healthy, s.detail_digest::text
+    SELECT s.observed_at_text::text, s.healthy, s.detail_digest::text
     FROM carl_autonomy.monitor_snapshots AS s
     ORDER BY s.observed_at DESC, s.snapshot_id DESC
     LIMIT 1;

@@ -520,6 +520,9 @@ BEGIN
                     claim_expected_revision = claim_revision_value,
                     claim_expires_at = claim_expires_time,
                     claim_expires_at_text = claim_expires_text,
+                    not_before = not_before_time,
+                    not_before_text = not_before_text_value,
+                    attempt_json = p_attempt_json,
                     observed_at = p_observed_at,
                     observed_at_text = observed_text,
                     updated_at = p_observed_at
