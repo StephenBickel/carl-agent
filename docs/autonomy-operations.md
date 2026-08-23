@@ -30,7 +30,7 @@ hypothesis
 | Builder | Product builder | Failing test, bounded implementation, exact candidate commit and tree | Paired evaluator |
 | Paired evaluation | Product builder under protected inputs | Parent/candidate task outcomes, invalid attempts, cost, latency, guards | Experimental publisher or repair |
 | Immutable experimental | Experimental publisher | New immutable ref plus complete candidate packet and publication receipt | Independent validator |
-| Independent disposition | Validator | One production-candidate, repair, reject, or inconclusive receipt | Promoter, builder, or retained learning |
+| Independent disposition | Validator | One production-candidate, repair, reject, or inconclusive receipt | Promoter, builder, retained learning, or independent validator re-evaluation |
 | Protected production | Promoter | Protected PR, required checks, auto-merge, exact merge commit and tree | Soak controller |
 | Soak | Soak controller | Six-hour observations through 24 hours and accepted or hard-failure result | Accepted baseline or rollback |
 | Revert | Rollback controller | Exact revert branch, protected PR, checks, and restored tree | Retained learning |
@@ -39,6 +39,9 @@ hypothesis
 Only the builder mutates candidate code. Only the validator assigns disposition. Only the promoter
 changes protected PR promotion state. Recovery may reconcile an interrupted effect but cannot assume
 any of those authorities.
+
+An inconclusive disposition preserves the candidate, blocks promotion, and returns ownership to the
+independent validator for one materially different evaluation; it never becomes a pass.
 
 ## Cloud-heavy execution
 

@@ -25,7 +25,9 @@ flowchart LR
     X --> D[Independent disposition\nreproduce and challenge]
     D -->|production candidate| P[Protected production PR\nrequired checks and auto-merge]
     D -->|repair| Q
-    D -->|reject or inconclusive| L[Retained learning\nnew hypothesis]
+    D -->|reject| L[Retained learning\nnew hypothesis]
+    D -->|inconclusive| I[Changed independent re-evaluation\ncandidate preserved]
+    I --> D
     P --> S[24-hour production soak]
     S -->|accepted| A[Accepted production baseline]
     S -->|hard regression| R[Exact revert PR\nprotected auto-merge]
@@ -45,6 +47,9 @@ The only successful product path is:
 A higher score, a new report, or another watchdog run is not a product outcome. A candidate that
 does not improve transferable capability is disposed once, its learning is retained, and the next
 cycle must use a new or materially changed hypothesis.
+
+An inconclusive disposition preserves the candidate, blocks promotion, and returns ownership to the
+independent validator for one materially different evaluation; it never becomes a pass.
 
 ## Role ownership
 

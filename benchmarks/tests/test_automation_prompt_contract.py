@@ -579,6 +579,14 @@ def test_task_18_portfolio_documents_concrete_outcome_only_updates() -> None:
     assert "an inconclusive result preserves the candidate without promotion" in normalized
     assert "it never becomes a pass" in normalized
 
+    for path in (AUTONOMY_GUIDE_PATH, AUTONOMY_OPERATIONS_PATH):
+        public_contract = " ".join(path.read_text(encoding="utf-8").casefold().split())
+        assert "an inconclusive disposition preserves the candidate" in public_contract
+        assert "blocks promotion" in public_contract
+        assert "returns ownership to the independent validator" in public_contract
+        assert "one materially different evaluation" in public_contract
+        assert "it never becomes a pass" in public_contract
+
 
 def test_scheduled_cloud_coordinator_is_single_node_default_branch_only_and_state_scoped() -> None:
     document = COORDINATOR_WORKFLOW_PATH.read_text(encoding="utf-8")
@@ -636,6 +644,52 @@ def test_scheduled_cloud_coordinator_is_single_node_default_branch_only_and_stat
         ".github/workflows/autonomous-soak.yml",
     }
     assert all(item["status"] == "PENDING_COMMISSIONING" for item in cloud_workflows)
+    assert {
+        (
+            item["id"],
+            item["workflow_path"],
+            item["configuration"]["identity"],
+            item["configuration"].get("schedule"),
+        )
+        for item in cloud_workflows
+    } == {
+        (
+            "autonomy-coordinator",
+            ".github/workflows/autonomy-coordinator.yml",
+            "coordinator",
+            "0 */2 * * *",
+        ),
+        (
+            "autonomy-builder",
+            ".github/workflows/autonomy-builder.yml",
+            "builder",
+            "17 3 * * *",
+        ),
+        (
+            "autonomy-supervisor",
+            ".github/workflows/autonomy-supervisor.yml",
+            "supervisor",
+            "17 */6 * * *",
+        ),
+        (
+            "autonomy-soak-scheduler",
+            ".github/workflows/autonomy-soak-scheduler.yml",
+            "soak",
+            "23 */6 * * *",
+        ),
+        (
+            "autonomous-improvement",
+            ".github/workflows/autonomous-improvement.yml",
+            "validator_promoter",
+            None,
+        ),
+        (
+            "autonomous-soak",
+            ".github/workflows/autonomous-soak.yml",
+            "soak_observer",
+            None,
+        ),
+    }
     coordinator = next(item for item in cloud_workflows if item["id"] == "autonomy-coordinator")
     assert coordinator["configuration"] == {
         "default_branch_only": True,
