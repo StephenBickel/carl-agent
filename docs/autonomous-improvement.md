@@ -1,4 +1,4 @@
-# Autonomous improvement graph
+# Autonomous improvement: commissioning
 
 Carl is a self-improving project.
 
@@ -6,6 +6,9 @@ Status: commissioning
 
 This page defines the repository's responsibility graph and safety boundary. The factory remains
 in commissioning until a genuine `remote_cloud_acceptance_receipt` proves one complete live cycle.
+Experimental changes move through independent validation into protected main, followed by a
+24-hour soak and exact revert when required. No routine human approval is required; capability
+transfer, not benchmark gaming, is the acceptance target.
 Current zero-human operation is not proven and is not claimed. The configured system is intended to
 run without routine human approval once commissioned; that authority is not evidence that it has
 already done so.

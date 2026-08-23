@@ -8,11 +8,14 @@ Carl's personality and operating principles are public in the
 [public operating contract](CARL.md). The name is Stephen's middle name and his
 grandfather's name.
 
-## Autonomous improvement
+## Autonomous improvement: commissioning
 
 Status: commissioning
 
 Carl's self-improving project is commissioning a graph-engineered improvement factory.
+Experimental changes move through independent validation into protected main, followed by a
+24-hour soak and exact revert when required. No routine human approval is required; capability
+transfer, not benchmark gaming, is the acceptance target.
 The responsibility chain is hypothesis → builder → paired evaluation → immutable
 experimental branch → independent disposition → protected production PR → 24-hour
 soak → exact revert when required → retained learning. The configured policy explicitly
