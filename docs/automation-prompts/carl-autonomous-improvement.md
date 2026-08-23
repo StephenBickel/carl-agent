@@ -159,7 +159,9 @@ invalid attempts, held-out transfer, task-level regressions, cost, latency, code
 review, and evidence signatures. Probe for hard-coded fixtures, test detection, narrowed inputs,
 selective retries, changed graders, missing tasks, and other benchmark gaming.
 
-Assign exactly one independent disposition: `production_candidate`, `repair`, or `reject`. For a
+Assign exactly one independent disposition: `production_candidate`, `repair`, `reject`, or
+`inconclusive`. An inconclusive result preserves the candidate without promotion and schedules one
+materially different independent evaluation; it never becomes a pass. For a
 repairable failure, retry or rework a repairable failure by recording the failed gate and a materially
 changed repair action, then return mutation ownership to the builder. For a non-improving or gamed
 candidate, reject once, preserve retained learning, and require a different hypothesis.

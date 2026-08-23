@@ -575,6 +575,10 @@ def test_task_18_portfolio_documents_concrete_outcome_only_updates() -> None:
     ):
         assert phrase in normalized
 
+    assert "`production_candidate`, `repair`, `reject`, or `inconclusive`" in normalized
+    assert "an inconclusive result preserves the candidate without promotion" in normalized
+    assert "it never becomes a pass" in normalized
+
 
 def test_scheduled_cloud_coordinator_is_single_node_default_branch_only_and_state_scoped() -> None:
     document = COORDINATOR_WORKFLOW_PATH.read_text(encoding="utf-8")
@@ -622,24 +626,28 @@ def test_scheduled_cloud_coordinator_is_single_node_default_branch_only_and_stat
         "model",
     )
     assert not any(value in document for value in forbidden)
-    assert manifest["cloud_workflows"] == [
-        {
-            "configuration": {
-                "default_branch_only": True,
-                "durable_state": "postgresql_and_protected_object_storage",
-                "identity": "coordinator",
-                "maximum_consequential_nodes_per_run": 1,
-                "no_idle_narrative_ledger_event": True,
-                "oidc_state_role_only": True,
-                "runner_label": "carl-autonomy-cloud",
-                "schedule": "0 */2 * * *",
-                "workflow_dispatch": True,
-            },
-            "id": "autonomy-coordinator",
-            "status": "PENDING_COMMISSIONING",
-            "workflow_path": ".github/workflows/autonomy-coordinator.yml",
-        }
-    ]
+    cloud_workflows = manifest["cloud_workflows"]
+    assert {item["workflow_path"] for item in cloud_workflows} == {
+        ".github/workflows/autonomy-coordinator.yml",
+        ".github/workflows/autonomy-builder.yml",
+        ".github/workflows/autonomy-supervisor.yml",
+        ".github/workflows/autonomy-soak-scheduler.yml",
+        ".github/workflows/autonomous-improvement.yml",
+        ".github/workflows/autonomous-soak.yml",
+    }
+    assert all(item["status"] == "PENDING_COMMISSIONING" for item in cloud_workflows)
+    coordinator = next(item for item in cloud_workflows if item["id"] == "autonomy-coordinator")
+    assert coordinator["configuration"] == {
+        "default_branch_only": True,
+        "durable_state": "postgresql_and_protected_object_storage",
+        "identity": "coordinator",
+        "maximum_consequential_nodes_per_run": 1,
+        "no_idle_narrative_ledger_event": True,
+        "oidc_state_role_only": True,
+        "runner_label": "carl-autonomy-cloud",
+        "schedule": "0 */2 * * *",
+        "workflow_dispatch": True,
+    }
     assert ACTIONLINT_CONFIG_PATH.read_text(encoding="utf-8") == (
         "self-hosted-runner:\n  labels:\n    - carl-autonomy-cloud\n"
     )
