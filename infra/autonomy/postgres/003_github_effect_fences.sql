@@ -127,8 +127,8 @@ SELECT string_agg(
     || pg_catalog.format_type(a.atttypid, a.atttypmod) || ':'
     || a.attcollation::text || ':' || coalesce(cn.nspname, '<none>') || ':'
     || coalesce(coll.collname, '<none>') || ':'
-    || a.attnotnull::text || ':' || a.attidentity || ':' || a.attgenerated || ':'
-    || a.attstorage || ':' || a.attcompression || ':'
+    || a.attnotnull::text || ':' || a.attidentity::text || ':' || a.attgenerated::text || ':'
+    || a.attstorage::text || ':' || a.attcompression::text || ':'
     || coalesce(pg_catalog.pg_get_expr(d.adbin, d.adrelid), '<none>'),
     '|' ORDER BY a.attnum
 )
@@ -146,8 +146,8 @@ SELECT string_agg(
     || pg_catalog.format_type(a.atttypid, a.atttypmod) || ':'
     || a.attcollation::text || ':' || coalesce(cn.nspname, '<none>') || ':'
     || coalesce(coll.collname, '<none>') || ':'
-    || a.attnotnull::text || ':' || a.attidentity || ':' || a.attgenerated || ':'
-    || a.attstorage || ':' || a.attcompression || ':'
+    || a.attnotnull::text || ':' || a.attidentity::text || ':' || a.attgenerated::text || ':'
+    || a.attstorage::text || ':' || a.attcompression::text || ':'
     || coalesce(pg_catalog.pg_get_expr(d.adbin, d.adrelid), '<none>'),
     '|' ORDER BY a.attnum
 )
@@ -161,8 +161,8 @@ WHERE a.attrelid = 'carl_autonomy._migration_expected_effect_attempts'::regclass
     AND a.attnum > 0 AND NOT a.attisdropped;
 
 SELECT string_agg(
-    c.contype || ':' || c.conkey::text || ':' || coalesce(c.confkey::text, '') || ':'
-    || c.confupdtype || ':' || c.confdeltype || ':' || c.confmatchtype || ':'
+    c.contype::text || ':' || c.conkey::text || ':' || coalesce(c.confkey::text, '') || ':'
+    || c.confupdtype::text || ':' || c.confdeltype::text || ':' || c.confmatchtype::text || ':'
     || c.condeferrable::text || ':' || c.condeferred::text || ':'
     || c.convalidated::text || ':' || c.connoinherit::text || ':'
     || pg_catalog.pg_get_constraintdef(c.oid, true),
@@ -173,8 +173,8 @@ FROM pg_catalog.pg_constraint AS c
 WHERE c.conrelid = 'carl_autonomy.effect_attempts'::regclass;
 
 SELECT string_agg(
-    c.contype || ':' || c.conkey::text || ':' || coalesce(c.confkey::text, '') || ':'
-    || c.confupdtype || ':' || c.confdeltype || ':' || c.confmatchtype || ':'
+    c.contype::text || ':' || c.conkey::text || ':' || coalesce(c.confkey::text, '') || ':'
+    || c.confupdtype::text || ':' || c.confdeltype::text || ':' || c.confmatchtype::text || ':'
     || c.condeferrable::text || ':' || c.condeferred::text || ':'
     || c.convalidated::text || ':' || c.connoinherit::text || ':'
     || pg_catalog.pg_get_constraintdef(c.oid, true),

@@ -136,6 +136,47 @@ CREATE TABLE carl_autonomy.coordinator_completion_receipts (
 REVOKE ALL ON carl_autonomy.coordinator_completion_receipts
 FROM PUBLIC, carl_autonomy_workflow;
 
+CREATE TABLE carl_autonomy.builder_effect_completion_receipts (
+    idempotency_key character(64) PRIMARY KEY
+        CHECK (idempotency_key ~ '^[0-9a-f]{64}$'),
+    experiment_id varchar(128) NOT NULL
+        REFERENCES carl_autonomy.coordinator_runtime(experiment_id),
+    node_kind varchar(32) NOT NULL
+        CHECK (node_kind IN ('publish_experimental', 'dispatch_validation')),
+    expected_revision integer NOT NULL CHECK (expected_revision BETWEEN 0 AND 2147483646),
+    authoritative_revision integer NOT NULL
+        CHECK (authoritative_revision BETWEEN 1 AND 2147483647),
+    request_digest character(64) NOT NULL CHECK (request_digest ~ '^[0-9a-f]{64}$'),
+    publication_request_digest character(64) NOT NULL
+        CHECK (publication_request_digest ~ '^[0-9a-f]{64}$'),
+    candidate_packet_digest character(64) NOT NULL
+        CHECK (candidate_packet_digest ~ '^[0-9a-f]{64}$'),
+    parent_commit varchar(64) NOT NULL
+        CHECK (parent_commit ~ '^([0-9a-f]{40}|[0-9a-f]{64})$'),
+    command_key varchar(192) NOT NULL,
+    effect_key varchar(192) NOT NULL UNIQUE CHECK (effect_key ~ '^cloud-effect-[0-9a-f]{64}$'),
+    github_binding_request_digest character(64) NOT NULL
+        CHECK (github_binding_request_digest ~ '^[0-9a-f]{64}$'),
+    github_request_digest character(64) NOT NULL
+        CHECK (github_request_digest ~ '^[0-9a-f]{64}$'),
+    github_response_digest character(64) NOT NULL
+        CHECK (github_response_digest ~ '^[0-9a-f]{64}$'),
+    result_digest character(64) NOT NULL CHECK (result_digest ~ '^[0-9a-f]{64}$'),
+    coordinator_event_digest character(64) NOT NULL UNIQUE
+        REFERENCES carl_autonomy.coordinator_completion_receipts(event_digest),
+    receipt_json text NOT NULL CHECK (octet_length(receipt_json) BETWEEN 2 AND 32768),
+    occurred_at timestamptz NOT NULL,
+    recorded_at timestamptz NOT NULL,
+    CHECK (authoritative_revision = expected_revision + 1)
+);
+
+REVOKE ALL ON carl_autonomy.builder_effect_completion_receipts
+FROM PUBLIC, carl_autonomy_workflow;
+
+CREATE TRIGGER builder_effect_completion_receipts_immutable
+BEFORE UPDATE OR DELETE ON carl_autonomy.builder_effect_completion_receipts
+FOR EACH ROW EXECUTE FUNCTION carl_autonomy.reject_immutable_mutation();
+
 CREATE TABLE carl_autonomy.coordinator_freeze_occurrences (
     occurrence_key varchar(96) PRIMARY KEY,
     freeze_fingerprint character(64) NOT NULL UNIQUE
@@ -3647,7 +3688,7 @@ $$;
 CREATE OR REPLACE FUNCTION carl_autonomy.complete_builder_effect(
     p_completion_json text
 )
-RETURNS TABLE(applied boolean, revision integer)
+RETURNS TABLE(applied boolean, receipt_json text)
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = pg_catalog, carl_autonomy
@@ -3664,16 +3705,23 @@ DECLARE
     completion_event record;
     completion_result record;
     next_revision integer;
+    next_node_kind text;
+    expected_effect_key text;
+    expected_idempotency text;
+    github_response_digest text;
+    receipt_value text;
+    existing_builder_receipt carl_autonomy.builder_effect_completion_receipts%ROWTYPE;
 BEGIN
     PERFORM carl_autonomy.require_role(ARRAY['carl_state_backend']);
     completion := carl_autonomy.parse_object(
         p_completion_json, 'builder_effect_completion_invalid'
     );
     IF carl_autonomy.canonical_jsonb(completion) <> p_completion_json
-        OR carl_autonomy.jsonb_object_cardinality(completion) IS DISTINCT FROM 12
+        OR carl_autonomy.jsonb_object_cardinality(completion) IS DISTINCT FROM 16
         OR NOT completion ?& ARRAY[
             'schema_version', 'node', 'experiment_id', 'expected_revision',
-            'idempotency_key', 'command_key', 'effect_key',
+            'idempotency_key', 'request_digest', 'publication_request_digest',
+            'candidate_packet_digest', 'parent_commit', 'command_key', 'effect_key',
             'github_binding_request_digest', 'github_request_digest',
             'github_response', 'result_digest', 'observed_at'
         ]
@@ -3683,6 +3731,10 @@ BEGIN
         OR jsonb_typeof(completion->'expected_revision') <> 'number'
         OR (completion->>'expected_revision')::integer NOT BETWEEN 0 AND 2147483646
         OR completion->>'idempotency_key' !~ '^[0-9a-f]{64}$'
+        OR completion->>'request_digest' !~ '^[0-9a-f]{64}$'
+        OR completion->>'publication_request_digest' !~ '^[0-9a-f]{64}$'
+        OR completion->>'candidate_packet_digest' !~ '^[0-9a-f]{64}$'
+        OR completion->>'parent_commit' !~ '^([0-9a-f]{40}|[0-9a-f]{64})$'
         OR completion->>'effect_key' !~ '^cloud-effect-[0-9a-f]{64}$'
         OR completion->>'github_binding_request_digest' !~ '^[0-9a-f]{64}$'
         OR completion->>'github_request_digest' !~ '^[0-9a-f]{64}$'
@@ -3694,6 +3746,9 @@ BEGIN
             ERRCODE = '22023', MESSAGE = 'builder_effect_completion_invalid';
     END IF;
     github_response := completion->'github_response';
+    github_response_digest := carl_autonomy.sha256_text(
+        carl_autonomy.canonical_jsonb(github_response)
+    );
     IF github_response->>'status' <> 'completed'
         OR github_response->>'request_digest' <> completion->>'github_request_digest'
         OR carl_autonomy.sha256_text(
@@ -3703,6 +3758,57 @@ BEGIN
         RAISE EXCEPTION USING
             ERRCODE = '55000', MESSAGE = 'builder_effect_response_mismatch';
     END IF;
+    expected_effect_key := 'cloud-effect-' || carl_autonomy.sha256_text(
+        carl_autonomy.canonical_jsonb(jsonb_build_object(
+            'authority', CASE completion->>'node'
+                WHEN 'publish_experimental' THEN 'builder' ELSE 'coordinator' END,
+            'command_key', completion->>'command_key',
+            'operation', CASE completion->>'node'
+                WHEN 'publish_experimental' THEN 'publish_experimental' ELSE 'dispatch' END,
+            'request_digest', completion->>'github_binding_request_digest'
+        ))
+    );
+    expected_idempotency := carl_autonomy.sha256_text(
+        carl_autonomy.canonical_jsonb(jsonb_build_object(
+            'candidate_packet_digest', completion->>'candidate_packet_digest',
+            'command_key', completion->>'command_key',
+            'effect_key', expected_effect_key,
+            'expected_revision', (completion->>'expected_revision')::integer,
+            'experiment_id', completion->>'experiment_id',
+            'github_binding_request_digest', completion->>'github_binding_request_digest',
+            'github_request_digest', completion->>'github_request_digest',
+            'node', completion->>'node',
+            'parent_commit', completion->>'parent_commit',
+            'publication_request_digest', completion->>'publication_request_digest',
+            'request_digest', completion->>'request_digest',
+            'schema_version', 1
+        ))
+    );
+    next_revision := (completion->>'expected_revision')::integer + 1;
+    receipt_value := carl_autonomy.canonical_jsonb(jsonb_build_object(
+        'authoritative_revision', next_revision,
+        'candidate_packet_digest', completion->>'candidate_packet_digest',
+        'command_key', completion->>'command_key',
+        'effect_key', completion->>'effect_key',
+        'expected_revision', (completion->>'expected_revision')::integer,
+        'experiment_id', completion->>'experiment_id',
+        'github_binding_request_digest', completion->>'github_binding_request_digest',
+        'github_request_digest', completion->>'github_request_digest',
+        'github_response_digest', github_response_digest,
+        'idempotency_key', completion->>'idempotency_key',
+        'node', completion->>'node',
+        'parent_commit', completion->>'parent_commit',
+        'publication_request_digest', completion->>'publication_request_digest',
+        'request_digest', completion->>'request_digest',
+        'result_digest', completion->>'result_digest',
+        'schema_version', 1
+    ));
+    IF completion->>'effect_key' <> expected_effect_key
+        OR completion->>'idempotency_key' <> expected_idempotency
+    THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '55000', MESSAGE = 'builder_effect_completion_identity_mismatch';
+    END IF;
     SELECT item.* INTO runtime
     FROM carl_autonomy.coordinator_runtime AS item
     WHERE item.experiment_id = completion->>'experiment_id'
@@ -3711,19 +3817,36 @@ BEGIN
         RAISE EXCEPTION USING
             ERRCODE = '40001', MESSAGE = 'builder_effect_revision_cas_mismatch';
     END IF;
-    IF runtime.revision = (completion->>'expected_revision')::integer + 1 THEN
-        IF EXISTS (
-            SELECT 1 FROM carl_autonomy.coordinator_completion_receipts AS receipt
-            WHERE receipt.experiment_id = runtime.experiment_id
-                AND receipt.node_kind = completion->>'node'
-                AND receipt.command_key = completion->>'command_key'
-                AND receipt.effect_key = completion->>'effect_key'
-                AND receipt.request_digest = completion->>'github_binding_request_digest'
-                AND receipt.result_digest = completion->>'result_digest'
-        ) THEN
-            RETURN QUERY SELECT false, runtime.revision;
-            RETURN;
+    SELECT item.* INTO existing_builder_receipt
+    FROM carl_autonomy.builder_effect_completion_receipts AS item
+    WHERE item.idempotency_key = completion->>'idempotency_key';
+    IF FOUND THEN
+        IF existing_builder_receipt.experiment_id <> completion->>'experiment_id'
+            OR existing_builder_receipt.node_kind <> completion->>'node'
+            OR existing_builder_receipt.expected_revision
+                <> (completion->>'expected_revision')::integer
+            OR existing_builder_receipt.authoritative_revision <> next_revision
+            OR existing_builder_receipt.request_digest <> completion->>'request_digest'
+            OR existing_builder_receipt.publication_request_digest
+                <> completion->>'publication_request_digest'
+            OR existing_builder_receipt.candidate_packet_digest
+                <> completion->>'candidate_packet_digest'
+            OR existing_builder_receipt.parent_commit <> completion->>'parent_commit'
+            OR existing_builder_receipt.command_key <> completion->>'command_key'
+            OR existing_builder_receipt.effect_key <> completion->>'effect_key'
+            OR existing_builder_receipt.github_binding_request_digest
+                <> completion->>'github_binding_request_digest'
+            OR existing_builder_receipt.github_request_digest
+                <> completion->>'github_request_digest'
+            OR existing_builder_receipt.github_response_digest <> github_response_digest
+            OR existing_builder_receipt.result_digest <> completion->>'result_digest'
+            OR existing_builder_receipt.receipt_json <> receipt_value
+        THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '23505', MESSAGE = 'builder_effect_completion_receipt_conflict';
         END IF;
+        RETURN QUERY SELECT false, existing_builder_receipt.receipt_json;
+        RETURN;
     END IF;
     IF runtime.status IN ('complete', 'frozen')
         OR runtime.revision <> (completion->>'expected_revision')::integer
@@ -3808,14 +3931,36 @@ BEGIN
         (completion->>'observed_at')::timestamptz,
         statement_timestamp()
     );
+    next_node_kind := CASE completion->>'node'
+        WHEN 'publish_experimental' THEN 'dispatch_validation'
+        WHEN 'dispatch_validation' THEN 'observe_validation'
+        ELSE NULL
+    END;
     SELECT jsonb_agg(
-        CASE WHEN node->>'node_id' = selected_node->>'node_id'
-            THEN jsonb_set(node, '{status}', '"complete"'::jsonb, false)
-            ELSE node END
+        CASE
+            WHEN node->>'node_id' = selected_node->>'node_id'
+                THEN jsonb_set(node, '{status}', '"complete"'::jsonb, false)
+            WHEN node->>'kind' = next_node_kind
+                THEN jsonb_set(node, '{status}', '"ready"'::jsonb, false)
+            WHEN node->>'status' IN ('ready', 'failed')
+                THEN jsonb_set(node, '{status}', '"waiting"'::jsonb, false)
+            ELSE node
+        END
         ORDER BY ordinal
     ) INTO nodes_value
     FROM jsonb_array_elements(snapshot_value->'nodes')
         WITH ORDINALITY AS value(node, ordinal);
+    IF next_node_kind IS NULL OR (
+        SELECT count(*) FROM jsonb_array_elements(nodes_value) AS ready(node)
+        WHERE ready.node->>'status' = 'ready'
+    ) <> 1 OR NOT EXISTS (
+        SELECT 1 FROM jsonb_array_elements(nodes_value) AS ready(node)
+        WHERE ready.node->>'status' = 'ready'
+            AND ready.node->>'kind' = next_node_kind
+    ) THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '55000', MESSAGE = 'builder_effect_dependency_transition_invalid';
+    END IF;
     next_revision := runtime.revision + 1;
     snapshot_value := jsonb_set(snapshot_value, '{nodes}', nodes_value, false);
     snapshot_value := jsonb_set(
@@ -3842,14 +3987,30 @@ BEGIN
         RAISE EXCEPTION USING
             ERRCODE = '40001', MESSAGE = 'builder_effect_revision_cas_mismatch';
     END IF;
-    RETURN QUERY SELECT true, next_revision;
+    INSERT INTO carl_autonomy.builder_effect_completion_receipts(
+        idempotency_key, experiment_id, node_kind, expected_revision,
+        authoritative_revision, request_digest, publication_request_digest,
+        candidate_packet_digest, parent_commit, command_key, effect_key,
+        github_binding_request_digest, github_request_digest, github_response_digest,
+        result_digest, coordinator_event_digest, receipt_json, occurred_at, recorded_at
+    ) VALUES (
+        completion->>'idempotency_key', runtime.experiment_id, selected_node->>'kind',
+        (completion->>'expected_revision')::integer, next_revision,
+        completion->>'request_digest', completion->>'publication_request_digest',
+        completion->>'candidate_packet_digest', completion->>'parent_commit',
+        command_state.command_key, command_state.effect_key,
+        completion->>'github_binding_request_digest', completion->>'github_request_digest',
+        github_response_digest, completion->>'result_digest', completion_event.event_digest,
+        receipt_value, (completion->>'observed_at')::timestamptz, statement_timestamp()
+    );
+    RETURN QUERY SELECT true, receipt_value;
 END;
 $$;
 
 CREATE OR REPLACE FUNCTION carl_autonomy.recover_builder_effect_completion(
     p_identity_json text
 )
-RETURNS TABLE(found boolean, result_digest text, revision integer)
+RETURNS TABLE(found boolean, receipt_json text)
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = pg_catalog, carl_autonomy
@@ -3857,50 +4018,125 @@ AS $$
 DECLARE
     identity_value jsonb;
     runtime carl_autonomy.coordinator_runtime%ROWTYPE;
-    receipt carl_autonomy.coordinator_completion_receipts%ROWTYPE;
+    receipt carl_autonomy.builder_effect_completion_receipts%ROWTYPE;
+    receipt_value jsonb;
+    expected_effect_key text;
+    expected_idempotency text;
 BEGIN
     PERFORM carl_autonomy.require_role(ARRAY['carl_state_backend']);
     identity_value := carl_autonomy.parse_object(
         p_identity_json, 'builder_effect_completion_identity_invalid'
     );
     IF carl_autonomy.canonical_jsonb(identity_value) <> p_identity_json
-        OR carl_autonomy.jsonb_object_cardinality(identity_value) IS DISTINCT FROM 8
+        OR carl_autonomy.jsonb_object_cardinality(identity_value) IS DISTINCT FROM 13
         OR NOT identity_value ?& ARRAY[
             'schema_version', 'node', 'experiment_id', 'expected_revision',
-            'idempotency_key', 'command_key', 'effect_key',
-            'github_binding_request_digest'
+            'idempotency_key', 'request_digest', 'publication_request_digest',
+            'candidate_packet_digest', 'parent_commit', 'command_key', 'effect_key',
+            'github_binding_request_digest', 'github_request_digest'
         ]
         OR identity_value->'schema_version' IS DISTINCT FROM '1'::jsonb
         OR identity_value->>'node' NOT IN ('publish_experimental', 'dispatch_validation')
+        OR identity_value->>'experiment_id' !~ '^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$'
         OR identity_value->>'idempotency_key' !~ '^[0-9a-f]{64}$'
+        OR identity_value->>'request_digest' !~ '^[0-9a-f]{64}$'
+        OR identity_value->>'publication_request_digest' !~ '^[0-9a-f]{64}$'
+        OR identity_value->>'candidate_packet_digest' !~ '^[0-9a-f]{64}$'
+        OR identity_value->>'parent_commit' !~ '^([0-9a-f]{40}|[0-9a-f]{64})$'
         OR identity_value->>'effect_key' !~ '^cloud-effect-[0-9a-f]{64}$'
         OR identity_value->>'github_binding_request_digest' !~ '^[0-9a-f]{64}$'
+        OR identity_value->>'github_request_digest' !~ '^[0-9a-f]{64}$'
         OR jsonb_typeof(identity_value->'expected_revision') <> 'number'
+        OR (identity_value->>'expected_revision')::integer NOT BETWEEN 0 AND 2147483646
     THEN
         RAISE EXCEPTION USING
             ERRCODE = '22023', MESSAGE = 'builder_effect_completion_identity_invalid';
+    END IF;
+    expected_effect_key := 'cloud-effect-' || carl_autonomy.sha256_text(
+        carl_autonomy.canonical_jsonb(jsonb_build_object(
+            'authority', CASE identity_value->>'node'
+                WHEN 'publish_experimental' THEN 'builder' ELSE 'coordinator' END,
+            'command_key', identity_value->>'command_key',
+            'operation', CASE identity_value->>'node'
+                WHEN 'publish_experimental' THEN 'publish_experimental' ELSE 'dispatch' END,
+            'request_digest', identity_value->>'github_binding_request_digest'
+        ))
+    );
+    expected_idempotency := carl_autonomy.sha256_text(
+        carl_autonomy.canonical_jsonb(jsonb_build_object(
+            'candidate_packet_digest', identity_value->>'candidate_packet_digest',
+            'command_key', identity_value->>'command_key',
+            'effect_key', expected_effect_key,
+            'expected_revision', (identity_value->>'expected_revision')::integer,
+            'experiment_id', identity_value->>'experiment_id',
+            'github_binding_request_digest', identity_value->>'github_binding_request_digest',
+            'github_request_digest', identity_value->>'github_request_digest',
+            'node', identity_value->>'node',
+            'parent_commit', identity_value->>'parent_commit',
+            'publication_request_digest', identity_value->>'publication_request_digest',
+            'request_digest', identity_value->>'request_digest',
+            'schema_version', 1
+        ))
+    );
+    IF identity_value->>'effect_key' <> expected_effect_key
+        OR identity_value->>'idempotency_key' <> expected_idempotency
+    THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '55000', MESSAGE = 'builder_effect_completion_identity_mismatch';
     END IF;
     SELECT item.* INTO runtime
     FROM carl_autonomy.coordinator_runtime AS item
     WHERE item.experiment_id = identity_value->>'experiment_id';
     SELECT item.* INTO receipt
-    FROM carl_autonomy.coordinator_completion_receipts AS item
-    WHERE item.experiment_id = identity_value->>'experiment_id'
-        AND item.node_kind = identity_value->>'node'
-        AND item.command_key = identity_value->>'command_key'
-        AND item.effect_key = identity_value->>'effect_key'
-        AND item.request_digest = identity_value->>'github_binding_request_digest';
-    IF receipt.event_digest IS NULL THEN
-        RETURN QUERY SELECT false, NULL::text, NULL::integer;
+    FROM carl_autonomy.builder_effect_completion_receipts AS item
+    WHERE item.idempotency_key = identity_value->>'idempotency_key';
+    IF receipt.idempotency_key IS NULL THEN
+        RETURN QUERY SELECT false, NULL::text;
         RETURN;
     END IF;
-    IF runtime.revision <> (identity_value->>'expected_revision')::integer + 1
-        OR receipt.result_digest !~ '^[0-9a-f]{64}$'
+    receipt_value := carl_autonomy.parse_object(
+        receipt.receipt_json, 'builder_effect_completion_receipt_invalid'
+    );
+    IF runtime.experiment_id IS NULL
+        OR runtime.revision < receipt.authoritative_revision
+        OR receipt.experiment_id <> identity_value->>'experiment_id'
+        OR receipt.node_kind <> identity_value->>'node'
+        OR receipt.expected_revision <> (identity_value->>'expected_revision')::integer
+        OR receipt.authoritative_revision <> receipt.expected_revision + 1
+        OR receipt.request_digest <> identity_value->>'request_digest'
+        OR receipt.publication_request_digest
+            <> identity_value->>'publication_request_digest'
+        OR receipt.candidate_packet_digest <> identity_value->>'candidate_packet_digest'
+        OR receipt.parent_commit <> identity_value->>'parent_commit'
+        OR receipt.command_key <> identity_value->>'command_key'
+        OR receipt.effect_key <> identity_value->>'effect_key'
+        OR receipt.github_binding_request_digest
+            <> identity_value->>'github_binding_request_digest'
+        OR receipt.github_request_digest <> identity_value->>'github_request_digest'
+        OR carl_autonomy.canonical_jsonb(receipt_value) <> receipt.receipt_json
+        OR carl_autonomy.jsonb_object_cardinality(receipt_value) IS DISTINCT FROM 16
+        OR receipt_value->>'idempotency_key' <> receipt.idempotency_key
+        OR receipt_value->>'experiment_id' <> receipt.experiment_id
+        OR receipt_value->>'node' <> receipt.node_kind
+        OR (receipt_value->>'expected_revision')::integer <> receipt.expected_revision
+        OR (receipt_value->>'authoritative_revision')::integer
+            <> receipt.authoritative_revision
+        OR receipt_value->>'request_digest' <> receipt.request_digest
+        OR receipt_value->>'publication_request_digest' <> receipt.publication_request_digest
+        OR receipt_value->>'candidate_packet_digest' <> receipt.candidate_packet_digest
+        OR receipt_value->>'parent_commit' <> receipt.parent_commit
+        OR receipt_value->>'command_key' <> receipt.command_key
+        OR receipt_value->>'effect_key' <> receipt.effect_key
+        OR receipt_value->>'github_binding_request_digest'
+            <> receipt.github_binding_request_digest
+        OR receipt_value->>'github_request_digest' <> receipt.github_request_digest
+        OR receipt_value->>'github_response_digest' <> receipt.github_response_digest
+        OR receipt_value->>'result_digest' <> receipt.result_digest
     THEN
         RAISE EXCEPTION USING
             ERRCODE = '55000', MESSAGE = 'builder_effect_completion_identity_mismatch';
     END IF;
-    RETURN QUERY SELECT true, receipt.result_digest::text, runtime.revision;
+    RETURN QUERY SELECT true, receipt.receipt_json;
 END;
 $$;
 

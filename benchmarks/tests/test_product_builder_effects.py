@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 from test_product_builder import _candidate, _register
 from test_product_builder_evidence import _receipt
 from test_product_builder_runtime import PARENT, _dispatch, _request
@@ -360,7 +361,7 @@ def test_authoritative_completion_recovers_when_local_response_write_was_lost(
         )
         .hexdigest()
     )
-    authoritative_revision = authority.complete_effect(
+    receipt = authority.complete_effect(
         request,
         terminal,
         github_response=github_response,
@@ -386,10 +387,99 @@ def test_authoritative_completion_recovers_when_local_response_write_was_lost(
 
     assert recovered.status == "completed"
     assert recovered.result_digest == result_digest
-    assert recovered.authoritative_revision == authoritative_revision
+    assert recovered.authoritative_revision == receipt.authoritative_revision
     assert authority.coordinator_position(terminal.experiment_id)["revision"] == (
         terminal.expected_revision + 1
     )
+
+
+def test_authoritative_completion_receipt_binds_full_effect_identity_and_replays_exactly(
+    tmp_path: Path,
+) -> None:
+    _, terminal = _prepared(tmp_path)
+    authority = _effects("DurableCoordinatorCommandAuthority")._for_testing(
+        tmp_path / "coordinator-state"
+    )
+    request = _effects("PurposeBoundEffectRequest").for_publication(terminal)
+    authority.register_and_claim(request, terminal)
+    github_response = RecordingGitHub().execute(request.github_request(terminal))
+    result_digest = (
+        importlib.import_module("hashlib")
+        .sha256(
+            importlib.import_module("carl_bench.canonical").canonical_json_bytes(
+                github_response.result
+            )
+        )
+        .hexdigest()
+    )
+    response_digest = (
+        importlib.import_module("hashlib")
+        .sha256(
+            importlib.import_module("carl_bench.canonical").canonical_json_bytes(
+                github_response.to_canonical_dict()
+            )
+        )
+        .hexdigest()
+    )
+
+    completed = authority.complete_effect(
+        request,
+        terminal,
+        github_response=github_response,
+        result_digest=result_digest,
+        observed_at=github_response.observed_at,
+    )
+    replay = authority.recover_completed(request, terminal)
+
+    assert replay == completed
+    assert completed.to_canonical_dict() == {
+        **request.to_canonical_dict(),
+        "authoritative_revision": request.expected_revision + 1,
+        "github_response_digest": response_digest,
+        "result_digest": result_digest,
+    }
+
+
+@pytest.mark.parametrize(
+    ("field", "drifted"),
+    (
+        ("idempotency_key", "0" * 64),
+        ("command_key", "github-experimental-drifted"),
+        ("effect_key", "cloud-effect-" + "0" * 64),
+        ("github_request_digest", "0" * 64),
+        ("result_digest", "0" * 64),
+        ("authoritative_revision", 99),
+    ),
+)
+def test_publication_completed_rebinds_local_response_to_authoritative_receipt(
+    tmp_path: Path, field: str, drifted: object
+) -> None:
+    store, terminal = _prepared(tmp_path)
+    github = RecordingGitHub()
+    authority = _effects("DurableCoordinatorCommandAuthority")._for_testing(
+        tmp_path / "coordinator-state"
+    )
+    executor = _effects("ProtectedBuilderEffectExecutor")._for_testing(
+        store=store, authority=authority, github=github
+    )
+    publication = _effects("PurposeBoundEffectRequest").for_publication(terminal)
+    completed = executor.execute(publication)
+    response_path = tmp_path / "state" / "effects" / f"{publication.idempotency_key}.response.json"
+    value = importlib.import_module("json").loads(response_path.read_bytes())
+    value[field] = drifted
+    response_path.write_bytes(
+        importlib.import_module("carl_bench.canonical").canonical_json_bytes(value)
+    )
+    downstream = _effects("PurposeBoundEffectRequest").for_validation(
+        terminal, expected_revision=completed.authoritative_revision
+    )
+
+    result = executor.execute(downstream)
+
+    assert result.status == "frozen"
+    assert result.reason == "builder_publication_identity_mismatch"
+    assert store.effect_status(downstream.idempotency_key) == "frozen"
+    assert len(github.requests) == 1
 
 
 def test_persisted_response_identity_drift_freezes_before_replay_or_downstream(

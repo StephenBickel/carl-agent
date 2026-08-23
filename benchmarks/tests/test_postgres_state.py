@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import importlib
 import json
 import re
 from contextlib import AbstractContextManager
@@ -793,6 +794,17 @@ def test_effect_fence_migration_compares_exact_catalog_contract_before_replaceme
     )
     assert "unexpected_grantee" in GITHUB_EFFECT_FENCES_SQL
     assert "effect_fence_function_invalid" in GITHUB_EFFECT_FENCES_SQL
+    for catalog_char in (
+        "a.attidentity",
+        "a.attgenerated",
+        "a.attstorage",
+        "a.attcompression",
+        "c.contype",
+        "c.confupdtype",
+        "c.confdeltype",
+        "c.confmatchtype",
+    ):
+        assert f"{catalog_char}::text" in GITHUB_EFFECT_FENCES_SQL
 
 
 def test_shared_event_policy_keys_equal_production_event_type() -> None:
@@ -1889,72 +1901,126 @@ def test_builder_effect_registration_returns_exact_atomically_claimed_command() 
     assert persisted["candidate_packet_digest"] == "d" * 64
 
 
-def test_builder_effect_completion_atomically_advances_authoritative_graph_revision() -> None:
-    database = FakeDatabase()
-    database.responses["complete_builder_effect"] = [{"applied": True, "revision": 8}]
+def test_builder_effect_completion_atomically_advances_authoritative_graph_revision(
+    tmp_path: Path,
+) -> None:
+    from test_product_builder_effects import RecordingGitHub, _prepared
 
-    github_response = GitHubEffectResponse(
-        schema_version=1,
-        domain=RESPONSE_DOMAIN,
-        status="completed",
-        request_digest="d" * 64,
-        observed_at="2026-08-23T12:11:00Z",
-        result={"result_type": "GitReferenceSnapshot", "value": {"status": "created"}},
-        retry_not_before=None,
-        error_code=None,
-    )
+    _, terminal = _prepared(tmp_path)
+    effects = importlib.import_module("carl_bench.product_builder_effects")
+    request = effects.PurposeBoundEffectRequest.for_publication(terminal)
+    github_response = RecordingGitHub().execute(request.github_request(terminal))
     result_digest = hashlib.sha256(canonical_json_bytes(github_response.result)).hexdigest()
-    revision = _backend(database).complete_builder_effect(
-        node="publish_experimental",
-        experiment_id="exp-recovery-001",
-        expected_revision=7,
-        idempotency_key="a" * 64,
-        command_key="exp-recovery-001:publish_experimental:attempt:1",
-        effect_key="cloud-effect-" + "b" * 64,
-        github_binding_request_digest="c" * 64,
-        github_request_digest="d" * 64,
+    receipt = effects.BuilderEffectCompletionReceipt.create(
+        request,
+        github_response=github_response,
+        result_digest=result_digest,
+        authoritative_revision=8,
+    )
+    database = FakeDatabase()
+    database.responses["complete_builder_effect"] = [
+        {"applied": True, "receipt_json": _canonical(receipt.to_canonical_dict())}
+    ]
+
+    completed = _backend(database).complete_builder_effect(
+        request=request,
         github_response=github_response,
         result_digest=result_digest,
         observed_at="2026-08-23T12:11:00Z",
     )
 
-    assert revision == 8
+    assert completed == receipt
+    assert completed.authoritative_revision == 8
     query, parameters = database.calls[-1]
     assert "complete_builder_effect" in query
     persisted = json.loads(parameters[0])
     assert persisted == {
-        "command_key": "exp-recovery-001:publish_experimental:attempt:1",
-        "effect_key": "cloud-effect-" + "b" * 64,
-        "expected_revision": 7,
-        "experiment_id": "exp-recovery-001",
-        "github_binding_request_digest": "c" * 64,
-        "github_request_digest": "d" * 64,
+        **request.to_canonical_dict(),
         "github_response": github_response.to_canonical_dict(),
-        "idempotency_key": "a" * 64,
-        "node": "publish_experimental",
         "observed_at": "2026-08-23T12:11:00Z",
         "result_digest": result_digest,
-        "schema_version": 1,
     }
 
 
-def test_builder_effect_lost_local_response_recovers_exact_authoritative_completion() -> None:
+def test_builder_effect_lost_local_response_recovers_exact_authoritative_completion(
+    tmp_path: Path,
+) -> None:
+    from test_product_builder_effects import RecordingGitHub, _prepared
+
+    _, terminal = _prepared(tmp_path)
+    effects = importlib.import_module("carl_bench.product_builder_effects")
+    request = effects.PurposeBoundEffectRequest.for_publication(terminal)
+    github_response = RecordingGitHub().execute(request.github_request(terminal))
+    result_digest = hashlib.sha256(canonical_json_bytes(github_response.result)).hexdigest()
+    receipt = effects.BuilderEffectCompletionReceipt.create(
+        request,
+        github_response=github_response,
+        result_digest=result_digest,
+        authoritative_revision=8,
+    )
     database = FakeDatabase()
     database.responses["recover_builder_effect_completion"] = [
-        {"found": True, "result_digest": "e" * 64, "revision": 8}
+        {"found": True, "receipt_json": _canonical(receipt.to_canonical_dict())}
     ]
 
-    recovered = _backend(database).recover_builder_effect_completion(
-        node="publish_experimental",
-        experiment_id="exp-recovery-001",
-        expected_revision=7,
-        command_key="exp-recovery-001:publish_experimental:attempt:1",
-        effect_key="cloud-effect-" + "b" * 64,
-        github_binding_request_digest="c" * 64,
-        idempotency_key="a" * 64,
-    )
+    recovered = _backend(database).recover_builder_effect_completion(request=request)
 
-    assert recovered == ("e" * 64, 8)
+    assert recovered == receipt
+
+
+def test_builder_effect_completion_and_recovery_bind_the_full_authoritative_receipt(
+    tmp_path: Path,
+) -> None:
+    from test_product_builder_effects import RecordingGitHub, _prepared
+
+    store, terminal = _prepared(tmp_path)
+    del store
+    effects = importlib.import_module("carl_bench.product_builder_effects")
+    request = effects.PurposeBoundEffectRequest.for_publication(terminal)
+    github_response = RecordingGitHub().execute(request.github_request(terminal))
+    result_digest = hashlib.sha256(canonical_json_bytes(github_response.result)).hexdigest()
+    response_digest = hashlib.sha256(
+        canonical_json_bytes(github_response.to_canonical_dict())
+    ).hexdigest()
+    receipt = {
+        **request.to_canonical_dict(),
+        "authoritative_revision": request.expected_revision + 1,
+        "github_response_digest": response_digest,
+        "result_digest": result_digest,
+    }
+    database = FakeDatabase()
+    database.responses["complete_builder_effect"] = [
+        {"applied": True, "receipt_json": _canonical(receipt)}
+    ]
+    database.responses["recover_builder_effect_completion"] = [
+        {"found": True, "receipt_json": _canonical(receipt)}
+    ]
+    backend = _backend(database)
+
+    completed = backend.complete_builder_effect(
+        request=request,
+        github_response=github_response,
+        result_digest=result_digest,
+        observed_at=github_response.observed_at,
+    )
+    recovered = backend.recover_builder_effect_completion(request=request)
+
+    assert completed == recovered
+    assert completed.to_canonical_dict() == receipt
+    completion_call = next(
+        call for call in database.calls if "complete_builder_effect" in call[0]
+    )
+    persisted = json.loads(completion_call[1][0])
+    assert persisted == {
+        **request.to_canonical_dict(),
+        "github_response": github_response.to_canonical_dict(),
+        "observed_at": github_response.observed_at,
+        "result_digest": result_digest,
+    }
+    recovery_call = next(
+        call for call in database.calls if "recover_builder_effect_completion" in call[0]
+    )
+    assert json.loads(recovery_call[1][0]) == request.to_canonical_dict()
 
 
 def test_postgres_adapter_resolves_durable_claim_and_atomically_prepares_effect_fence() -> None:

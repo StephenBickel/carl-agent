@@ -444,9 +444,31 @@ def test_candidate_commit_tree_is_independently_resolved_from_protected_reposito
         capture_output=True,
         text=True,
     ).stdout.strip()
+    blob = subprocess.run(
+        ["git", "-C", os.fspath(repository), "rev-parse", "HEAD:product.txt"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    subprocess.run(
+        ["git", "-C", os.fspath(repository), "tag", "-a", "candidate-tag", "-m", "tag"],
+        check=True,
+    )
+    tag = subprocess.run(
+        ["git", "-C", os.fspath(repository), "rev-parse", "candidate-tag"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
     resolver = _runtime("ProtectedCandidateIdentityResolver")._for_testing(repository)
 
     assert resolver.resolve_tree(commit) == tree
+    for non_commit in (tree, blob, tag):
+        with pytest.raises(
+            importlib.import_module("carl_bench.product_builder").BuilderError,
+            match="^builder_candidate_commit_unresolvable$",
+        ):
+            resolver.resolve_tree(non_commit)
     with pytest.raises(
         importlib.import_module("carl_bench.product_builder").BuilderError,
         match="^builder_candidate_tree_mismatch$",

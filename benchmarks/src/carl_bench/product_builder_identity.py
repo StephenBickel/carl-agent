@@ -34,6 +34,15 @@ class ProtectedCandidateIdentityResolver:
         if not isinstance(candidate_commit, str) or _OBJECT.fullmatch(candidate_commit) is None:
             raise BuilderError("builder_candidate_commit_invalid")
         try:
+            object_type = subprocess.run(
+                ("git", "-C", os.fspath(self._repository), "cat-file", "-t", candidate_commit),
+                check=False,
+                capture_output=True,
+                env={"LANG": "C", "LC_ALL": "C", "PATH": "/usr/bin:/bin"},
+                timeout=10,
+            )
+            if object_type.returncode != 0 or object_type.stdout != b"commit\n":
+                raise BuilderError("builder_candidate_commit_unresolvable")
             completed = subprocess.run(
                 (
                     "git",
@@ -48,6 +57,8 @@ class ProtectedCandidateIdentityResolver:
                 env={"LANG": "C", "LC_ALL": "C", "PATH": "/usr/bin:/bin"},
                 timeout=10,
             )
+        except BuilderError:
+            raise
         except (OSError, subprocess.SubprocessError) as error:
             raise BuilderError("builder_candidate_commit_unresolvable") from error
         try:

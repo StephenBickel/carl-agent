@@ -391,6 +391,98 @@ class PurposeBoundEffectRequest:
 
 
 @dataclass(frozen=True, slots=True)
+class BuilderEffectCompletionReceipt:
+    schema_version: int
+    node: Literal["publish_experimental", "dispatch_validation"]
+    experiment_id: str
+    request_digest: str
+    publication_request_digest: str
+    candidate_packet_digest: str
+    parent_commit: str
+    expected_revision: int
+    command_key: str
+    effect_key: str
+    github_binding_request_digest: str
+    github_request_digest: str
+    idempotency_key: str
+    authoritative_revision: int
+    github_response_digest: str
+    result_digest: str
+
+    def __post_init__(self) -> None:
+        request = PurposeBoundEffectRequest(
+            schema_version=self.schema_version,
+            node=self.node,
+            experiment_id=self.experiment_id,
+            request_digest=self.request_digest,
+            publication_request_digest=self.publication_request_digest,
+            candidate_packet_digest=self.candidate_packet_digest,
+            parent_commit=self.parent_commit,
+            expected_revision=self.expected_revision,
+            command_key=self.command_key,
+            effect_key=self.effect_key,
+            github_binding_request_digest=self.github_binding_request_digest,
+            github_request_digest=self.github_request_digest,
+            idempotency_key=self.idempotency_key,
+        )
+        if (
+            self.authoritative_revision != request.expected_revision + 1
+            or _digest(
+                self.github_response_digest, "builder_effect_completion_receipt_invalid"
+            )
+            != self.github_response_digest
+            or _digest(self.result_digest, "builder_effect_completion_receipt_invalid")
+            != self.result_digest
+        ):
+            raise BuilderError("builder_effect_completion_receipt_invalid")
+
+    @classmethod
+    def create(
+        cls,
+        request: PurposeBoundEffectRequest,
+        *,
+        github_response: GitHubEffectResponse,
+        result_digest: str,
+        authoritative_revision: int,
+    ) -> BuilderEffectCompletionReceipt:
+        if (
+            type(request) is not PurposeBoundEffectRequest
+            or not isinstance(github_response, GitHubEffectResponse)
+            or github_response.status != "completed"
+            or github_response.request_digest != request.github_request_digest
+            or hashlib.sha256(canonical_json_bytes(github_response.result)).hexdigest()
+            != result_digest
+        ):
+            raise BuilderError("builder_effect_completion_receipt_invalid")
+        return cls(
+            **request.to_canonical_dict(),
+            authoritative_revision=authoritative_revision,
+            github_response_digest=hashlib.sha256(
+                canonical_json_bytes(github_response.to_canonical_dict())
+            ).hexdigest(),
+            result_digest=result_digest,
+        )
+
+    def matches(self, request: PurposeBoundEffectRequest) -> bool:
+        return type(request) is PurposeBoundEffectRequest and all(
+            getattr(self, name) == getattr(request, name)
+            for name in PurposeBoundEffectRequest.__dataclass_fields__
+        )
+
+    def to_canonical_dict(self) -> dict[str, object]:
+        return {name: getattr(self, name) for name in self.__dataclass_fields__}
+
+    @classmethod
+    def from_canonical_dict(cls, value: object) -> BuilderEffectCompletionReceipt:
+        if type(value) is not dict or set(value) != set(cls.__dataclass_fields__):
+            raise BuilderError("builder_effect_completion_receipt_invalid")
+        try:
+            return cls(**value)
+        except (BuilderError, TypeError) as error:
+            raise BuilderError("builder_effect_completion_receipt_invalid") from error
+
+
+@dataclass(frozen=True, slots=True)
 class PurposeBoundEffectResponse:
     schema_version: int
     node: str
@@ -441,6 +533,31 @@ class PurposeBoundEffectResponse:
             return cls(**value)
         except TypeError as error:
             raise BuilderError("builder_effect_response_invalid") from error
+
+    @classmethod
+    def for_completion(
+        cls,
+        request: PurposeBoundEffectRequest,
+        receipt: BuilderEffectCompletionReceipt,
+    ) -> PurposeBoundEffectResponse:
+        if (
+            type(request) is not PurposeBoundEffectRequest
+            or type(receipt) is not BuilderEffectCompletionReceipt
+            or not receipt.matches(request)
+        ):
+            raise BuilderError("builder_effect_completion_identity_mismatch")
+        return cls(
+            1,
+            request.node,
+            request.idempotency_key,
+            request.command_key,
+            request.effect_key,
+            request.github_request_digest,
+            receipt.authoritative_revision,
+            "completed",
+            receipt.result_digest,
+            "builder_effect_completed",
+        )
 
 
 class ProtectedExperimentalPublicationAuthorizer:
@@ -505,6 +622,9 @@ class DurableCoordinatorCommandAuthority:
     def _graph_path(self, experiment_id: str) -> Path:
         digest = hashlib.sha256(experiment_id.encode()).hexdigest()
         return self._root / f"graph-{digest}.json"
+
+    def _receipt_path(self, idempotency_key: str) -> Path:
+        return self._root / f"completion-{idempotency_key}.json"
 
     def _write(self, path: Path, value: object) -> None:
         payload = canonical_json_bytes(value)
@@ -595,18 +715,19 @@ class DurableCoordinatorCommandAuthority:
         github_response: GitHubEffectResponse,
         result_digest: str,
         observed_at: str,
-    ) -> int:
-        del terminal, github_response
+    ) -> BuilderEffectCompletionReceipt:
+        del terminal
         path = self._path(request.command_key)
         state = CommandState.from_canonical_dict(json.loads(path.read_bytes()))
         graph_path = self._graph_path(request.experiment_id)
-        if graph_path.exists():
-            graph = json.loads(graph_path.read_bytes())
-            if (
-                graph.get("completed_node") == request.node
-                and graph.get("revision") == request.expected_revision + 1
-            ):
-                return graph["revision"]
+        receipt_path = self._receipt_path(request.idempotency_key)
+        if receipt_path.exists():
+            receipt = BuilderEffectCompletionReceipt.from_canonical_dict(
+                json.loads(receipt_path.read_bytes())
+            )
+            if not receipt.matches(request):
+                raise BuilderError("builder_effect_completion_identity_mismatch")
+            return receipt
         if (
             state.status != "claimed"
             or state.command.effect_key != request.effect_key
@@ -635,6 +756,12 @@ class DurableCoordinatorCommandAuthority:
             failure_code=None,
         )
         next_revision = request.expected_revision + 1
+        receipt = BuilderEffectCompletionReceipt.create(
+            request,
+            github_response=github_response,
+            result_digest=result_digest,
+            authoritative_revision=next_revision,
+        )
         self._write(path, completed.to_canonical_dict())
         self._write(
             graph_path,
@@ -648,40 +775,38 @@ class DurableCoordinatorCommandAuthority:
                 "revision": next_revision,
             },
         )
-        return next_revision
+        self._write(receipt_path, receipt.to_canonical_dict())
+        return receipt
 
     def coordinator_position(self, experiment_id: str) -> dict[str, object]:
         return json.loads(self._graph_path(experiment_id).read_bytes())
 
     def recover_completed(
         self, request: PurposeBoundEffectRequest, terminal: BuilderTerminalDocument
-    ) -> tuple[str, int] | None:
+    ) -> BuilderEffectCompletionReceipt | None:
         del terminal
         path = self._path(request.command_key)
         graph_path = self._graph_path(request.experiment_id)
-        if not path.exists() or not graph_path.exists():
+        receipt_path = self._receipt_path(request.idempotency_key)
+        if not path.exists() or not graph_path.exists() or not receipt_path.exists():
             return None
         state = CommandState.from_canonical_dict(json.loads(path.read_bytes()))
         graph = json.loads(graph_path.read_bytes())
+        receipt = BuilderEffectCompletionReceipt.from_canonical_dict(
+            json.loads(receipt_path.read_bytes())
+        )
         if state.status != "completed":
             return None
         if (
-            state.command.effect_key != request.effect_key
+            not receipt.matches(request)
+            or state.command.effect_key != request.effect_key
             or state.command.request_digest != request.github_binding_request_digest
-            or state.result_digest is None
-            or graph
-            != {
-                "completed_node": request.node,
-                "ready_node": (
-                    "dispatch_validation"
-                    if request.node == "publish_experimental"
-                    else "observe_validation"
-                ),
-                "revision": request.expected_revision + 1,
-            }
+            or state.result_digest != receipt.result_digest
+            or type(graph.get("revision")) is not int
+            or graph["revision"] < receipt.authoritative_revision
         ):
             raise BuilderError("builder_effect_completion_identity_mismatch")
-        return state.result_digest, graph["revision"]
+        return receipt
 
     def resolve_claimed_command(
         self, command_key: str, *, authority: str, observed_at: datetime
@@ -747,37 +872,31 @@ class ProtectedCoordinatorCommandAuthority:
         github_response: GitHubEffectResponse,
         result_digest: str,
         observed_at: str,
-    ) -> int:
-        revision = self._backend.complete_builder_effect(
-            node=request.node,
-            experiment_id=request.experiment_id,
-            expected_revision=request.expected_revision,
-            idempotency_key=request.idempotency_key,
-            command_key=request.command_key,
-            effect_key=request.effect_key,
-            github_binding_request_digest=request.github_binding_request_digest,
-            github_request_digest=request.github_request_digest,
+    ) -> BuilderEffectCompletionReceipt:
+        receipt = self._backend.complete_builder_effect(
+            request=request,
             github_response=github_response,
             result_digest=result_digest,
             observed_at=observed_at,
         )
-        if type(revision) is not int or revision != request.expected_revision + 1:
+        if (
+            type(receipt) is not BuilderEffectCompletionReceipt
+            or not receipt.matches(request)
+        ):
             raise BuilderError("builder_effect_completion_identity_mismatch")
-        return revision
+        return receipt
 
     def recover_completed(
         self, request: PurposeBoundEffectRequest, terminal: BuilderTerminalDocument
-    ) -> tuple[str, int] | None:
+    ) -> BuilderEffectCompletionReceipt | None:
         del terminal
-        return self._backend.recover_builder_effect_completion(
-            node=request.node,
-            experiment_id=request.experiment_id,
-            expected_revision=request.expected_revision,
-            command_key=request.command_key,
-            effect_key=request.effect_key,
-            github_binding_request_digest=request.github_binding_request_digest,
-            idempotency_key=request.idempotency_key,
-        )
+        receipt = self._backend.recover_builder_effect_completion(request=request)
+        if receipt is not None and (
+            type(receipt) is not BuilderEffectCompletionReceipt
+            or not receipt.matches(request)
+        ):
+            raise BuilderError("builder_effect_completion_identity_mismatch")
+        return receipt
 
 
 class ProtectedBuilderEffectExecutor:
@@ -950,6 +1069,19 @@ class ProtectedBuilderEffectExecutor:
             raise BuilderError("builder_effect_request_invalid")
         existing = self._store.begin_effect(request)
         if existing is not None:
+            if existing.status == "completed":
+                try:
+                    terminal = self._store.load_terminal(request.request_digest)
+                    receipt = self._authority.recover_completed(request, terminal)
+                    rebound = PurposeBoundEffectResponse.for_completion(request, receipt)
+                except Exception:
+                    return self._freeze(
+                        request, "builder_effect_completion_identity_mismatch"
+                    )
+                if existing != rebound:
+                    return self._freeze(
+                        request, "builder_effect_completion_identity_mismatch"
+                    )
             return existing
         try:
             terminal = self._store.load_terminal(request.request_digest)
@@ -961,7 +1093,7 @@ class ProtectedBuilderEffectExecutor:
         if not self._identity_matches(request, terminal, packet):
             return self._freeze(request, "builder_effect_request_identity_mismatch")
         if request.node == "dispatch_validation" and not self._store.publication_completed(
-            terminal, downstream_request=request
+            terminal, downstream_request=request, authority=self._authority
         ):
             existing = self._store.begin_effect(request)
             if existing is not None and existing.status == "frozen":
@@ -977,14 +1109,7 @@ class ProtectedBuilderEffectExecutor:
         except Exception:
             return self._freeze(request, "builder_effect_completion_identity_mismatch")
         if recovered is not None:
-            result_digest, authoritative_revision = recovered
-            completed = self._response(
-                request,
-                "completed",
-                "builder_effect_completed",
-                result_digest,
-                authoritative_revision,
-            )
+            completed = PurposeBoundEffectResponse.for_completion(request, recovered)
             self._store.finish_effect(completed)
             return completed
         github_request = self._github_request(request, terminal)
@@ -1007,7 +1132,7 @@ class ProtectedBuilderEffectExecutor:
             return self._freeze(request, "builder_effect_response_identity_mismatch")
         result_digest = hashlib.sha256(canonical_json_bytes(response.result)).hexdigest()
         try:
-            authoritative_revision = self._authority.complete_effect(
+            receipt = self._authority.complete_effect(
                 request,
                 terminal,
                 github_response=response,
@@ -1016,12 +1141,9 @@ class ProtectedBuilderEffectExecutor:
             )
         except Exception:
             return self._response(request, "pending", "builder_effect_completion_unavailable")
-        completed = self._response(
-            request,
-            "completed",
-            "builder_effect_completed",
-            result_digest,
-            authoritative_revision,
-        )
+        try:
+            completed = PurposeBoundEffectResponse.for_completion(request, receipt)
+        except Exception:
+            return self._freeze(request, "builder_effect_completion_identity_mismatch")
         self._store.finish_effect(completed)
         return completed

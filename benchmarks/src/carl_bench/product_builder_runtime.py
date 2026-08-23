@@ -899,7 +899,11 @@ class ProtectedBuilderStore:
         return value["status"]
 
     def publication_completed(
-        self, terminal: object, *, downstream_request: object | None = None
+        self,
+        terminal: object,
+        *,
+        downstream_request: object | None = None,
+        authority: object | None = None,
     ) -> bool:
         from carl_bench.product_builder_effects import (
             BuilderTerminalDocument,
@@ -910,11 +914,8 @@ class ProtectedBuilderStore:
         if type(terminal) is not BuilderTerminalDocument:
             return False
         request = PurposeBoundEffectRequest.for_publication(terminal)
-        try:
-            response = self.load_effect_response(request.idempotency_key, expected_request=request)
-        except OSError:
-            return False
-        except BuilderError:
+
+        def freeze_downstream() -> None:
             if type(downstream_request) is PurposeBoundEffectRequest:
                 frozen = PurposeBoundEffectResponse(
                     1,
@@ -929,8 +930,42 @@ class ProtectedBuilderStore:
                     "builder_publication_identity_mismatch",
                 )
                 self.finish_effect(frozen, force_freeze=True)
+
+        if not callable(getattr(authority, "recover_completed", None)):
+            freeze_downstream()
             return False
-        return response.status == "completed" and response.node == "publish_experimental"
+        try:
+            receipt = authority.recover_completed(request, terminal)
+        except Exception:
+            freeze_downstream()
+            return False
+        try:
+            response = self.load_effect_response(request.idempotency_key, expected_request=request)
+        except OSError:
+            if receipt is None:
+                return False
+            try:
+                response = PurposeBoundEffectResponse.for_completion(request, receipt)
+                self.finish_effect(response)
+            except Exception:
+                freeze_downstream()
+                return False
+        except BuilderError:
+            freeze_downstream()
+            return False
+        try:
+            rebound = PurposeBoundEffectResponse.for_completion(request, receipt)
+        except Exception:
+            freeze_downstream()
+            return False
+        if (
+            response != rebound
+            or type(downstream_request) is not PurposeBoundEffectRequest
+            or downstream_request.expected_revision != receipt.authoritative_revision
+        ):
+            freeze_downstream()
+            return False
+        return True
 
     def load_publication_eligibility(self, publication_request_digest: str) -> dict[str, Any]:
         try:

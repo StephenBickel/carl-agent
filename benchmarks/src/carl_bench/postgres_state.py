@@ -1614,76 +1614,59 @@ class PostgresStateBackend(StateBackend):
     def complete_builder_effect(
         self,
         *,
-        node: str,
-        experiment_id: str,
-        expected_revision: int,
-        idempotency_key: str,
-        command_key: str,
-        effect_key: str,
-        github_binding_request_digest: str,
-        github_request_digest: str,
+        request: object,
         github_response: object,
         result_digest: str,
         observed_at: str,
-    ) -> int:
+    ) -> object:
         """Atomically complete one exact builder effect and advance its graph node."""
         from carl_bench.cloud_state import _timestamp
         from carl_bench.github_effect_ipc import GitHubEffectResponse
+        from carl_bench.product_builder_effects import (
+            BuilderEffectCompletionReceipt,
+            PurposeBoundEffectRequest,
+        )
 
         if (
-            node not in {"publish_experimental", "dispatch_validation"}
-            or not isinstance(experiment_id, str)
-            or not experiment_id
-            or type(expected_revision) is not int
-            or expected_revision < 0
-            or not isinstance(command_key, str)
-            or not command_key
-            or not isinstance(effect_key, str)
-            or not effect_key.startswith("cloud-effect-")
+            type(request) is not PurposeBoundEffectRequest
             or not isinstance(github_response, GitHubEffectResponse)
             or github_response.status != "completed"
-            or github_response.request_digest != github_request_digest
+            or github_response.request_digest != request.github_request_digest
             or hashlib.sha256(canonical_json_bytes(github_response.result)).hexdigest()
             != result_digest
-            or any(
-                not isinstance(value, str)
-                or len(value) != 64
-                or re.fullmatch(r"[0-9a-f]{64}", value) is None
-                for value in (
-                    idempotency_key,
-                    github_binding_request_digest,
-                    github_request_digest,
-                    result_digest,
-                )
-            )
+            or not isinstance(result_digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", result_digest) is None
         ):
             raise PostgresStateError("builder_effect_completion_invalid")
         _timestamp("builder_effect_observed_at", observed_at)
         completion = {
-            "command_key": command_key,
-            "effect_key": effect_key,
-            "expected_revision": expected_revision,
-            "experiment_id": experiment_id,
-            "github_binding_request_digest": github_binding_request_digest,
-            "github_request_digest": github_request_digest,
+            **request.to_canonical_dict(),
             "github_response": github_response.to_canonical_dict(),
-            "idempotency_key": idempotency_key,
-            "node": node,
             "observed_at": observed_at,
             "result_digest": result_digest,
-            "schema_version": 1,
         }
 
-        def decode(row: dict[str, Any]) -> int:
-            value = _strict_row(row, frozenset({"applied", "revision"}))
+        def decode(row: dict[str, Any]) -> BuilderEffectCompletionReceipt:
+            value = _strict_row(row, frozenset({"applied", "receipt_json"}))
             _strict_bool(value["applied"])
-            revision = value["revision"]
-            if type(revision) is not int or revision != expected_revision + 1:
+            receipt = BuilderEffectCompletionReceipt.from_canonical_dict(
+                _strict_json_object(
+                    value["receipt_json"], code="builder_effect_completion_receipt_invalid"
+                )
+            )
+            if (
+                not receipt.matches(request)
+                or receipt.result_digest != result_digest
+                or receipt.github_response_digest
+                != hashlib.sha256(
+                    canonical_json_bytes(github_response.to_canonical_dict())
+                ).hexdigest()
+            ):
                 raise PostgresStateError("builder_effect_completion_identity_mismatch")
-            return revision
+            return receipt
 
         return cast(
-            int,
+            BuilderEffectCompletionReceipt,
             self._mutation(
                 "coordinator",
                 "SELECT * FROM carl_autonomy.complete_builder_effect(%s)",
@@ -1695,47 +1678,38 @@ class PostgresStateBackend(StateBackend):
     def recover_builder_effect_completion(
         self,
         *,
-        node: str,
-        experiment_id: str,
-        expected_revision: int,
-        command_key: str,
-        effect_key: str,
-        github_binding_request_digest: str,
-        idempotency_key: str,
-    ) -> tuple[str, int] | None:
-        identity = {
-            "command_key": command_key,
-            "effect_key": effect_key,
-            "expected_revision": expected_revision,
-            "experiment_id": experiment_id,
-            "github_binding_request_digest": github_binding_request_digest,
-            "idempotency_key": idempotency_key,
-            "node": node,
-            "schema_version": 1,
-        }
+        request: object,
+    ) -> object | None:
+        from carl_bench.product_builder_effects import (
+            BuilderEffectCompletionReceipt,
+            PurposeBoundEffectRequest,
+        )
 
-        def decode(row: dict[str, Any]) -> tuple[str, int] | None:
-            value = _strict_row(row, frozenset({"found", "result_digest", "revision"}))
+        if type(request) is not PurposeBoundEffectRequest:
+            raise PostgresStateError("builder_effect_completion_identity_invalid")
+
+        def decode(row: dict[str, Any]) -> BuilderEffectCompletionReceipt | None:
+            value = _strict_row(row, frozenset({"found", "receipt_json"}))
             found = _strict_bool(value["found"])
             if not found:
-                if value["result_digest"] is not None or value["revision"] is not None:
+                if value["receipt_json"] is not None:
                     raise PostgresStateError("builder_effect_completion_identity_mismatch")
                 return None
-            if (
-                not isinstance(value["result_digest"], str)
-                or re.fullmatch(r"[0-9a-f]{64}", value["result_digest"]) is None
-                or type(value["revision"]) is not int
-                or value["revision"] != expected_revision + 1
-            ):
+            receipt = BuilderEffectCompletionReceipt.from_canonical_dict(
+                _strict_json_object(
+                    value["receipt_json"], code="builder_effect_completion_receipt_invalid"
+                )
+            )
+            if not receipt.matches(request):
                 raise PostgresStateError("builder_effect_completion_identity_mismatch")
-            return value["result_digest"], value["revision"]
+            return receipt
 
         return cast(
-            tuple[str, int] | None,
+            BuilderEffectCompletionReceipt | None,
             self._mutation(
                 "coordinator",
                 "SELECT * FROM carl_autonomy.recover_builder_effect_completion(%s)",
-                (_canonical_text(identity),),
+                (_canonical_text(request.to_canonical_dict()),),
                 decode,
             ),
         )

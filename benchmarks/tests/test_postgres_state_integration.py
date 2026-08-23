@@ -4,6 +4,8 @@ import base64
 import hashlib
 import json
 import os
+import socket
+import tempfile
 import threading
 import time
 from contextlib import contextmanager
@@ -1694,6 +1696,231 @@ def _backend(postgres: object) -> PostgresStateBackend:
             connect=connect,
         )
     )
+
+
+def test_builder_publication_uses_postgres_authority_and_one_real_socket_effect(
+    postgres: object, tmp_path: Path
+) -> None:
+    from test_product_builder_effects import _prepared
+    from test_product_builder_runtime import _request
+
+    from carl_bench.cloud_coordinator import CoordinatorNode
+    from carl_bench.github_cloud import (
+        GitReferenceSnapshot,
+        experimental_branch_binding,
+    )
+    from carl_bench.github_effect_client import GitHubEffectSocketClient
+    from carl_bench.product_builder_effects import (
+        ProtectedBuilderEffectExecutor,
+        ProtectedCoordinatorCommandAuthority,
+        PurposeBoundEffectRequest,
+    )
+
+    store, terminal = _prepared(tmp_path)
+    manifest = _request().manifest
+    with _as_role(postgres, "carl_builder") as builder:
+        assert _register_manifest(builder, manifest) is True
+
+    def graph_node(kind: str, status: str, marker: str) -> CoordinatorNode:
+        bindings = {
+            "publish_experimental": ("builder", "publish_experimental"),
+            "dispatch_validation": ("coordinator", "dispatch"),
+            "observe_validation": ("observer", "observe"),
+        }
+        authority, operation = bindings[kind]
+        return CoordinatorNode(
+            node_id=f"{terminal.experiment_id}:{kind}",
+            kind=kind,
+            status=status,
+            authority=authority,
+            operation=operation,
+            command_key=f"{terminal.experiment_id}:{kind}:attempt:1",
+            request_digest=marker * 64,
+            occurred_at=terminal.requested_at,
+            attempt=1,
+            max_attempts=3,
+        )
+
+    snapshot = CoordinatorSnapshot(
+        schema_version=1,
+        experiment_id=terminal.experiment_id,
+        revision=terminal.expected_revision,
+        observed_at=terminal.requested_at,
+        coordinator_id="carl-cloud-coordinator-v1",
+        nodes=(
+            graph_node("publish_experimental", "ready", "6"),
+            graph_node("dispatch_validation", "waiting", "7"),
+            graph_node("observe_validation", "waiting", "8"),
+        ),
+        lease=None,
+        command=None,
+        effect=None,
+        failure=None,
+        production_authorization=None,
+        immutable_inputs=(),
+        dead_holder_observation_digest=None,
+    )
+    snapshot_json = _canonical(snapshot.to_canonical_dict())
+    assert POSTGRES_DSN is not None
+    with postgres.connect(  # type: ignore[attr-defined]
+        POSTGRES_DSN, autocommit=True, row_factory=dict_row
+    ) as admin:
+        admin.execute(
+            "INSERT INTO carl_autonomy.coordinator_runtime("
+            "experiment_id, command_name, snapshot_json, snapshot_digest, status, revision, "
+            "updated_at) VALUES (%s, 'coordinate', %s, %s, 'ready', %s, %s)",
+            (
+                terminal.experiment_id,
+                snapshot_json,
+                hashlib.sha256(snapshot_json.encode()).hexdigest(),
+                terminal.expected_revision,
+                terminal.requested_at,
+            ),
+        )
+
+    backend = _backend(postgres)
+    authority = ProtectedCoordinatorCommandAuthority(backend)
+    publication = PurposeBoundEffectRequest.for_publication(terminal)
+    store.begin_effect(publication)
+    authority.register_and_claim(publication, terminal)
+    github_request = publication.github_request(terminal)
+    service_clock = datetime.now(UTC)
+
+    class OneEffectGateway:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def create_or_reconcile_experimental_branch(
+            self, command_key: str, request: object
+        ) -> GitReferenceSnapshot:
+            self.calls.append(command_key)
+            binding = experimental_branch_binding("StephenBickel/carl-agent", request)
+            return GitReferenceSnapshot(
+                status="created",
+                repository="StephenBickel/carl-agent",
+                ref=f"refs/heads/{request.branch}",
+                commit_sha=request.candidate_commit,
+                request_key=binding.request_key,
+                effect_key=publication.effect_key,
+                command_occurred_at=github_request.occurred_at,
+                observed_at=service_clock.isoformat().replace("+00:00", "Z"),
+            )
+
+    gateway = OneEffectGateway()
+    socket_root = Path("/private/tmp") if Path("/tmp").is_symlink() else Path("/tmp")
+    socket_directory = Path(tempfile.mkdtemp(prefix="carl-postgres-builder-", dir=socket_root))
+    socket_path = socket_directory / "github-effect.sock"
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(os.fspath(socket_path))
+    os.chmod(socket_path, 0o600)
+    listener.listen(1)
+
+    def serve() -> None:
+        from carl_bench.github_effect_service import _serve_connection
+
+        connection, _ = listener.accept()
+        with connection:
+            _serve_connection(
+                connection,
+                gateway=gateway,
+                policy=type(
+                    "Policy",
+                    (),
+                    {
+                        "repository": "StephenBickel/carl-agent",
+                        "workflow_ref": "main",
+                        "dispatch_actor_login": "carl-autonomy[bot]",
+                    },
+                )(),
+                state_controller=backend,
+                clock=lambda: service_clock,
+            )
+        listener.close()
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    client = GitHubEffectSocketClient._for_testing(
+        socket_path=socket_path,
+        expected_peer_uid=os.getuid(),
+        timeout_seconds=2.0,
+    )
+    github_response = client.execute(github_request)
+    thread.join(2)
+    assert not thread.is_alive()
+    result_digest = hashlib.sha256(canonical_json_bytes(github_response.result)).hexdigest()
+    receipt = authority.complete_effect(
+        publication,
+        terminal,
+        github_response=github_response,
+        result_digest=result_digest,
+        observed_at=github_response.observed_at,
+    )
+
+    class GitHubMustNotReplay:
+        @staticmethod
+        def execute(request: object) -> object:  # pragma: no cover - exploit assertion
+            del request
+            raise AssertionError("authoritative publication must not replay")
+
+    replayed = ProtectedBuilderEffectExecutor._for_testing(
+        store=store,
+        authority=authority,
+        github=GitHubMustNotReplay(),
+    ).execute(publication)
+    downstream = PurposeBoundEffectRequest.for_validation(
+        terminal, expected_revision=receipt.authoritative_revision
+    )
+    downstream_state = authority.register_and_claim(downstream, terminal)
+
+    with postgres.connect(  # type: ignore[attr-defined]
+        POSTGRES_DSN, autocommit=True, row_factory=dict_row
+    ) as admin:
+        runtime = admin.execute(
+            "SELECT revision, snapshot_json FROM carl_autonomy.coordinator_runtime "
+            "WHERE experiment_id = %s",
+            (terminal.experiment_id,),
+        ).fetchone()
+        durable_receipt = admin.execute(
+            "SELECT idempotency_key, request_digest, publication_request_digest, "
+            "candidate_packet_digest, command_key, effect_key, "
+            "github_binding_request_digest, github_request_digest, result_digest, "
+            "expected_revision, authoritative_revision "
+            "FROM carl_autonomy.builder_effect_completion_receipts "
+            "WHERE idempotency_key = %s",
+            (publication.idempotency_key,),
+        ).fetchone()
+    nodes = {
+        node["kind"]: node["status"] for node in json.loads(runtime["snapshot_json"])["nodes"]
+    }
+    assert replayed.result_digest == result_digest
+    assert replayed.authoritative_revision == terminal.expected_revision + 1
+    assert runtime["revision"] == terminal.expected_revision + 1
+    assert nodes == {
+        "publish_experimental": "complete",
+        "dispatch_validation": "ready",
+        "observe_validation": "waiting",
+    }
+    assert [kind for kind, status in nodes.items() if status == "ready"] == [
+        "dispatch_validation"
+    ]
+    assert durable_receipt == {
+        "idempotency_key": publication.idempotency_key,
+        "request_digest": publication.request_digest,
+        "publication_request_digest": publication.publication_request_digest,
+        "candidate_packet_digest": publication.candidate_packet_digest,
+        "command_key": publication.command_key,
+        "effect_key": publication.effect_key,
+        "github_binding_request_digest": publication.github_binding_request_digest,
+        "github_request_digest": publication.github_request_digest,
+        "result_digest": result_digest,
+        "expected_revision": terminal.expected_revision,
+        "authoritative_revision": terminal.expected_revision + 1,
+    }
+    assert downstream_state.status == "claimed"
+    assert downstream_state.command.expected_revision == terminal.expected_revision + 1
+    assert gateway.calls == [publication.command_key]
+    socket_path.unlink(missing_ok=True)
+    socket_directory.rmdir()
 
 
 def _archive_registrar(postgres: object) -> PostgresCoordinatorRecoveryReceiptRegistrar:
