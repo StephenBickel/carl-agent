@@ -21,6 +21,9 @@ const TEST_RUN_COMMANDS: &[&str] = &[
 ];
 const SETUP_UV_ACTION: &str = "astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990";
 const SETUP_UV_TAG: &str = "v8.3.2";
+const SETUP_TERRAFORM_ACTION: &str =
+    "hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd";
+const SETUP_TERRAFORM_TAG: &str = "v3.1.2";
 
 fn repository_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -621,14 +624,24 @@ fn validate_ci_workflow(workflow: &str) -> Result<(), String> {
 fn validate_security_workflow(workflow: &str) -> Result<(), String> {
     let document = parse_workflow(workflow)?;
     let root = value_map(&document, "workflow")?;
-    validate_common(root, workflow, &[(CHECKOUT_ACTION, CHECKOUT_TAG)])?;
+    validate_common(
+        root,
+        workflow,
+        &[
+            (CHECKOUT_ACTION, CHECKOUT_TAG),
+            (SETUP_TERRAFORM_ACTION, SETUP_TERRAFORM_TAG),
+        ],
+    )?;
 
     let triggers = triggers(root)?;
     validate_exact_trigger_keys(
         triggers,
-        &["schedule", "workflow_dispatch"],
-        "`schedule` and `workflow_dispatch`",
+        &["pull_request", "schedule", "workflow_dispatch"],
+        "`pull_request`, `schedule`, and `workflow_dispatch`",
     )?;
+    if !trigger_is_unrestricted(field(triggers, "pull_request", "workflow.on")?) {
+        return Err("workflow.on.pull_request must be null or an empty mapping".to_owned());
+    }
     let schedule = field(triggers, "schedule", "workflow.on")?
         .as_sequence()
         .ok_or_else(|| {
@@ -1399,7 +1412,7 @@ fn checker_rejects_extra_security_trigger() {
 
     assert_security_rejected(
         &workflow,
-        "workflow.on must contain exactly `schedule` and `workflow_dispatch`",
+        "workflow.on must contain exactly `pull_request`, `schedule`, and `workflow_dispatch`",
     );
 }
 
