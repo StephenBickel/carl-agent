@@ -217,30 +217,52 @@ jobs:
           set -euo pipefail
           chmod 700 "$(dirname "$GITHUB_ENV")"
           test "$(git -C subject-merge rev-parse HEAD)" = "$MERGE_COMMIT"
-          eval_root="$RUNNER_TEMP/eval-merge"; sandbox="$RUNNER_TEMP/sandbox-merge"
-          cp -R -- subject-merge "$eval_root"
-          rm -rf -- "$eval_root/benchmarks/tests" "$eval_root/benchmarks/tasks/dev"
-          cp -R -- trusted-source/benchmarks/tests "$eval_root/benchmarks/tests"
-          mkdir -p "$eval_root/benchmarks/tasks/dev"
-          tar --extract --file "$TASK_SET_INPUT" --directory "$eval_root/benchmarks/tasks/dev" \
+          rust_probe_root="$RUNNER_TEMP/rust-probe"
+          python_probe_root="$RUNNER_TEMP/python-probe"
+          trusted_benchmark_root="$RUNNER_TEMP/trusted-benchmark-probe"
+          sandbox="$RUNNER_TEMP/sandbox-merge"
+          cp -R -- subject-merge "$rust_probe_root"
+          if find "$rust_probe_root" -type l -print -quit | grep -q .; then
+            echo "candidate symlinks cannot enter protected probes" >&2
+            exit 1
+          fi
+          rm -rf -- "$rust_probe_root/.cargo" "$rust_probe_root/tests"
+          rm -f -- "$rust_probe_root/build.rs"
+          cp -- trusted-source/Cargo.toml trusted-source/Cargo.lock "$rust_probe_root/"
+          cp -R -- trusted-source/tests "$rust_probe_root/tests"
+          cp -R -- trusted-source/benchmarks "$python_probe_root"
+          rm -rf -- "$python_probe_root/src/carl_bench"
+          test -d subject-merge/benchmarks/src/carl_bench
+          if find subject-merge/benchmarks/src/carl_bench -type l -print -quit | grep -q .; then
+            echo "candidate Python symlinks cannot enter protected probes" >&2
+            exit 1
+          fi
+          cp -R -- subject-merge/benchmarks/src/carl_bench "$python_probe_root/src/carl_bench"
+          cp -R -- trusted-source/benchmarks "$trusted_benchmark_root"
+          rm -rf -- "$trusted_benchmark_root/tasks/dev"
+          mkdir -p "$trusted_benchmark_root/tasks/dev"
+          tar --extract --file "$TASK_SET_INPUT" --directory "$trusted_benchmark_root/tasks/dev" \
             --no-same-owner --no-same-permissions
-          cp -- trusted-source/scripts/benchmark-smoke.sh "$eval_root/scripts/benchmark-smoke.sh"
-          chmod -R a-w "$eval_root"
-          mkdir -p "$sandbox/home" "$sandbox/tmp" "$sandbox/cargo" "$sandbox/target" "$sandbox/uv"
+          chmod -R a-w "$rust_probe_root" "$python_probe_root" "$trusted_benchmark_root"
+          mkdir -p "$sandbox/home" "$sandbox/tmp" "$sandbox/cargo" "$sandbox/target" \
+            "$sandbox/uv" "$sandbox/python-venv" "$sandbox/trusted-venv"
           chown -R nobody:nogroup "$sandbox"
           run_subject() {
             sudo -u nobody env -i HOME="$sandbox/home" PATH="$PATH" TMPDIR="$sandbox/tmp" \
               CARGO_HOME="$sandbox/cargo" CARGO_TARGET_DIR="$sandbox/target" \
               RUSTUP_HOME="$RUSTUP_HOME" UV_CACHE_DIR="$sandbox/uv" PYTHONDONTWRITEBYTECODE=1 \
-              PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 UV_PROJECT_ENVIRONMENT="$sandbox/venv" \
-              SUBJECT_ROOT="$eval_root" bash --noprofile --norc -c "$1"
+              PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 UV_PROJECT_ENVIRONMENT="$sandbox/python-venv" \
+              MERGE_COMMIT="$MERGE_COMMIT" PYTHON_PROBE_ROOT="$python_probe_root" \
+              RUST_PROBE_ROOT="$rust_probe_root" \
+              TRUSTED_BENCHMARK_ROOT="$trusted_benchmark_root" \
+              TRUSTED_VENV="$sandbox/trusted-venv" bash --noprofile --norc -c "$1"
           }
           rust_contracts=false
-          if run_subject 'set -euo pipefail; cd "$SUBJECT_ROOT"; cargo +1.97.0 test --locked --test workflow_contract --test docs_contract'; then rust_contracts=true; fi
+          if run_subject 'set -euo pipefail; cd "$RUST_PROBE_ROOT"; cargo +1.97.0 test --locked --test workflow_contract --test docs_contract'; then rust_contracts=true; fi
           python_contracts=false
-          if run_subject 'set -euo pipefail; cd "$SUBJECT_ROOT"; uv sync --project benchmarks --python 3.12 --locked; uv run --offline --project benchmarks --locked pytest -q -c /dev/null -p no:cacheprovider benchmarks/tests/test_integration_contract.py benchmarks/tests/test_cloud_execution.py'; then python_contracts=true; fi
+          if run_subject 'set -euo pipefail; cd "$TMPDIR"; uv sync --project "$PYTHON_PROBE_ROOT" --python 3.12 --locked; uv run --offline --project "$PYTHON_PROBE_ROOT" --locked pytest -q -c /dev/null -p no:cacheprovider --confcutdir "$PYTHON_PROBE_ROOT/tests" "$PYTHON_PROBE_ROOT/tests/test_integration_contract.py" "$PYTHON_PROBE_ROOT/tests/test_cloud_execution.py"'; then python_contracts=true; fi
           benchmark_smoke=false
-          if run_subject 'set -euo pipefail; cd "$SUBJECT_ROOT"; ./scripts/benchmark-smoke.sh'; then benchmark_smoke=true; fi
+          if run_subject 'set -euo pipefail; export UV_PROJECT_ENVIRONMENT="$TRUSTED_VENV"; cd "$TMPDIR"; uv sync --project "$TRUSTED_BENCHMARK_ROOT" --python 3.12 --locked; PYTHONPATH="$TRUSTED_BENCHMARK_ROOT/src" uv run --offline --project "$TRUSTED_BENCHMARK_ROOT" --locked carl-bench tasks validate --root "$TRUSTED_BENCHMARK_ROOT/tasks/dev"; PYTHONPATH="$TRUSTED_BENCHMARK_ROOT/src" uv run --offline --project "$TRUSTED_BENCHMARK_ROOT" --locked carl-bench run --tasks "$TRUSTED_BENCHMARK_ROOT/tasks/dev" --adapter scripted --attempts 1 --seed 20260810 --subject-commit "$MERGE_COMMIT" --public-result "$TMPDIR/scorecard.json"; PYTHONPATH="$TRUSTED_BENCHMARK_ROOT/src" uv run --offline --project "$TRUSTED_BENCHMARK_ROOT" --locked python -c '\''import json,sys; value=json.load(open(sys.argv[1], encoding="utf-8")); assert value["subject_commit"] == sys.argv[2]; assert value["passed_trials"] == 3; assert value["valid_trials"] == 3; assert value["invalid_trials"] == 0; assert value["pass_rate"] == 1.0'\'' "$TMPDIR/scorecard.json" "$MERGE_COMMIT"'; then benchmark_smoke=true; fi
           observations="$RUNNER_TEMP/soak-observations.json"
           printf '{"benchmark-smoke":%s,"python-contracts":%s,"rust-contracts":%s}' \
             "$benchmark_smoke" "$python_contracts" "$rust_contracts" > "$observations"
@@ -292,11 +314,17 @@ jobs:
         run: |
           set -euo pipefail
           /opt/carl-autonomy/venv/bin/python3 -I - <<'PY'
-          import base64, hashlib, json, os, pathlib
+          import base64, hashlib, json, os, pathlib, re
           from datetime import UTC, datetime, timedelta
           from cryptography.hazmat.primitives import serialization
           from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
           from carl_bench.canonical import canonical_json_bytes
+
+          EXPECTED_CHAIN_LENGTH = 5
+          CADENCE_MIN = timedelta(hours=6)
+          CADENCE_MAX = timedelta(hours=6, minutes=30)
+          SOAK_MAX = timedelta(hours=26)
+          DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 
           def pairs(items):
               value = {}
@@ -322,61 +350,119 @@ jobs:
               if set(receipt) != {"domain", "key_id", "payload", "receipt_digest",
                                   "schema_version", "signature_base64"}:
                   raise SystemExit("signed soak receipt schema invalid")
-              if receipt["domain"] != "carl.soak-observation.receipt.v1" or receipt["schema_version"] != 1:
+              if (receipt["domain"] != "carl.soak-observation.chain-receipt.v2"
+                      or receipt["schema_version"] != 2):
                   raise SystemExit("signed soak receipt schema invalid")
               payload = receipt["payload"]
               if type(payload) is not dict or set(payload) != {
-                  "active_merge_commit", "health_receipt_digest", "merged_at", "observed_at",
-                  "request_digest", "schema_version"
-              } or payload["schema_version"] != 1:
+                  "active_merge_commit", "health_receipt_digest", "merged_at",
+                  "observation_chain", "previous_receipt_digest", "request_digest",
+                  "schema_version"
+              } or payload["schema_version"] != 2:
                   raise SystemExit("signed soak receipt payload invalid")
-              if payload["request_digest"] != os.environ["REQUEST_DIGEST"]:
-                  raise SystemExit("signed soak request identity mismatch")
               encoded = canonical_json_bytes(payload)
-              if hashlib.sha256(encoded).hexdigest() != receipt["receipt_digest"]:
+              if (hashlib.sha256(encoded).hexdigest() != receipt["receipt_digest"]
+                      or DIGEST.fullmatch(receipt["receipt_digest"]) is None):
                   raise SystemExit("signed soak receipt digest invalid")
               keyring_raw = pathlib.Path(os.environ["SOAK_RECEIPT_KEYRING_PATH"]).read_bytes()
               keyring = json.loads(keyring_raw, object_pairs_hook=pairs)
-              if set(keyring) != {"domain", "keys", "schema_version"} or keyring["domain"] != "carl.soak-observation.keyring.v1" or keyring["schema_version"] != 1:
+              if (set(keyring) != {"domain", "keys", "schema_version"}
+                      or keyring["domain"] != "carl.soak-observation.keyring.v1"
+                      or keyring["schema_version"] != 1
+                      or type(keyring["keys"]) is not dict):
                   raise SystemExit("signed soak keyring invalid")
               pem = keyring["keys"].get(receipt["key_id"])
+              if not isinstance(pem, str): raise SystemExit("signed soak key invalid")
               key = serialization.load_pem_public_key(pem.encode("ascii"))
               if not isinstance(key, Ed25519PublicKey): raise SystemExit("signed soak key invalid")
               key.verify(base64.b64decode(receipt["signature_base64"], validate=True), encoded)
               return payload
 
+          def validate_observation_chain(payload):
+              if (payload["active_merge_commit"] != os.environ["CANDIDATE_COMMIT"]
+                      or payload["request_digest"] != os.environ["REQUEST_DIGEST"]
+                      or payload["health_receipt_digest"] != os.environ["EXPECTED_OUTCOME_DIGEST"]):
+                  raise SystemExit("signed soak chain binding mismatch")
+              chain = payload["observation_chain"]
+              if type(chain) is not list or not 1 <= len(chain) <= EXPECTED_CHAIN_LENGTH:
+                  raise SystemExit("signed soak chain length invalid")
+              if ((len(chain) == 1) != (payload["previous_receipt_digest"] is None)
+                      or (len(chain) > 1
+                          and DIGEST.fullmatch(payload["previous_receipt_digest"] or "") is None)):
+                  raise SystemExit("signed soak previous receipt invalid")
+              merged_at = parse_time(payload["merged_at"])
+              previous_time = None
+              previous_digest = None
+              seen_digests = set()
+              for index, item in enumerate(chain):
+                  if type(item) is not dict or set(item) != {
+                      "active_merge_commit", "health_receipt_digest", "merged_at",
+                      "observation_digest", "observed_at", "previous_observation_digest",
+                      "request_digest", "sequence"
+                  }:
+                      raise SystemExit("signed soak observation schema invalid")
+                  if (type(item["sequence"]) is not int or item["sequence"] != index
+                          or item["active_merge_commit"] != payload["active_merge_commit"]
+                          or item["health_receipt_digest"] != payload["health_receipt_digest"]
+                          or item["merged_at"] != payload["merged_at"]
+                          or item["request_digest"] != payload["request_digest"]
+                          or item["previous_observation_digest"] != previous_digest):
+                      raise SystemExit("signed soak observation binding invalid")
+                  core = {key: value for key, value in item.items() if key != "observation_digest"}
+                  observation_digest = hashlib.sha256(canonical_json_bytes(core)).hexdigest()
+                  if (item["observation_digest"] != observation_digest
+                          or observation_digest in seen_digests):
+                      raise SystemExit("signed soak observation replay invalid")
+                  observed_at = parse_time(item["observed_at"])
+                  if index == 0:
+                      if chain[0]["observed_at"] != payload["merged_at"]:
+                          raise SystemExit("signed soak chain anchor invalid")
+                  else:
+                      interval = observed_at - previous_time
+                      if interval < CADENCE_MIN or interval > CADENCE_MAX:
+                          raise SystemExit("signed soak observation cadence gap")
+                  seen_digests.add(observation_digest)
+                  previous_digest = observation_digest
+                  previous_time = observed_at
+              if previous_time > merged_at + SOAK_MAX:
+                  raise SystemExit("soak_observation_stale_critical")
+              return chain, merged_at, previous_time
+
           def trusted_current_time():
               return datetime.now(UTC)
 
           previous = verify_previous_signed_soak_receipt(load_previous_signed_soak_receipt())
-          active_merge_commit = previous["active_merge_commit"]
-          if active_merge_commit != os.environ["CANDIDATE_COMMIT"]:
-              raise SystemExit("signed soak active merge mismatch")
-          previous_observed_at = parse_time(previous["observed_at"])
-          merged_at = parse_time(previous["merged_at"])
+          previous_chain, merged_at, previous_observed_at = validate_observation_chain(previous)
           now = trusted_current_time()
-          if now < previous_observed_at + timedelta(hours=6):
-              raise SystemExit("soak_observation_too_early")
-          if now > previous_observed_at + timedelta(hours=26):
-              raise SystemExit("soak_observation_stale_critical")
-          if merged_at > previous_observed_at or previous_observed_at > now:
+          if previous_observed_at > now:
               raise SystemExit("signed soak chronology invalid")
+          if now > merged_at + SOAK_MAX:
+              raise SystemExit("soak_observation_stale_critical")
+          observation_due = len(previous_chain) < EXPECTED_CHAIN_LENGTH
+          if observation_due and now < previous_observed_at + CADENCE_MIN:
+              raise SystemExit("soak_observation_too_early")
+          if observation_due and now > previous_observed_at + CADENCE_MAX:
+              raise SystemExit("signed soak observation cadence gap")
           context = {
               "merged_at": previous["merged_at"],
-              "previous_receipt_digest": hashlib.sha256(canonical_json_bytes(previous)).hexdigest(),
-              "previous_observed_at": previous["observed_at"],
+              "observation_due": observation_due,
+              "previous_observation_chain": previous_chain,
+              "previous_receipt_digest": hashlib.sha256(
+                  canonical_json_bytes(previous)
+              ).hexdigest(),
               "trusted_before": now.isoformat().replace("+00:00", "Z"),
           }
           pathlib.Path(os.environ["RUNNER_TEMP"], "soak-cadence-context.json").write_bytes(
               canonical_json_bytes(context) + b"\n"
           )
-          with pathlib.Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as outputs:
-              outputs.write(f"previous_observed_at={previous['observed_at']}\n")
           PY
           output="$RUNNER_TEMP/observe-soak.json"
-          /opt/carl-autonomy/venv/bin/python3 -I - \
-            commission-live observe_soak accept_soak "$REQUEST_DIGEST" \
-            "$EXPECTED_OUTCOME_DIGEST" "$output" <<'PY'
+          observation_due="$(/opt/carl-autonomy/venv/bin/python3 -I -c \
+            'import json,os,pathlib; print(str(json.loads(pathlib.Path(os.environ["RUNNER_TEMP"], "soak-cadence-context.json").read_bytes())["observation_due"]).lower())')"
+          if test "$observation_due" = "true"; then
+            /opt/carl-autonomy/venv/bin/python3 -I - \
+              commission-live observe_soak accept_soak "$REQUEST_DIGEST" \
+              "$EXPECTED_OUTCOME_DIGEST" "$output" <<'PY'
           import hashlib, json, os, pathlib, re, stat, sys
           from carl_bench.canonical import canonical_json_bytes
           from carl_bench.cloud_coordinator import CloudCoordinatorDecision
@@ -565,12 +651,19 @@ jobs:
           except Exception:
               persist_exact_node_freeze()
           PY
+          fi
           /opt/carl-autonomy/venv/bin/python3 -I - "$output" <<'PY'
-          import base64, hashlib, json, os, pathlib, sys
+          import base64, hashlib, json, os, pathlib, re, sys
           from datetime import UTC, datetime, timedelta
           from cryptography.hazmat.primitives import serialization
           from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
           from carl_bench.canonical import canonical_json_bytes
+
+          EXPECTED_CHAIN_LENGTH = 5
+          CADENCE_MIN = timedelta(hours=6)
+          CADENCE_MAX = timedelta(hours=6, minutes=30)
+          SOAK_MAX = timedelta(hours=26)
+          DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 
           def pairs(items):
               value = {}
@@ -580,60 +673,128 @@ jobs:
               return value
 
           def parse_time(value):
+              if not isinstance(value, str) or not value.endswith("Z"):
+                  raise SystemExit("signed soak receipt time invalid")
               parsed = datetime.fromisoformat(value[:-1] + "+00:00")
-              if not value.endswith("Z") or parsed.tzinfo != UTC or parsed.isoformat().replace("+00:00", "Z") != value:
+              if parsed.tzinfo != UTC or parsed.isoformat().replace("+00:00", "Z") != value:
                   raise SystemExit("signed soak receipt time invalid")
               return parsed
+
+          def verify_current_signed_soak_receipt(receipt):
+              if set(receipt) != {"domain", "key_id", "payload", "receipt_digest",
+                                  "schema_version", "signature_base64"}:
+                  raise SystemExit("current signed soak receipt schema invalid")
+              payload = receipt["payload"]
+              if (receipt["domain"] != "carl.soak-observation.chain-receipt.v2"
+                      or receipt["schema_version"] != 2
+                      or type(payload) is not dict
+                      or set(payload) != {"active_merge_commit", "health_receipt_digest",
+                                          "merged_at", "observation_chain",
+                                          "previous_receipt_digest", "request_digest",
+                                          "schema_version"}
+                      or payload["schema_version"] != 2):
+                  raise SystemExit("current signed soak receipt schema invalid")
+              encoded = canonical_json_bytes(payload)
+              if (hashlib.sha256(encoded).hexdigest() != receipt["receipt_digest"]
+                      or DIGEST.fullmatch(receipt["receipt_digest"]) is None):
+                  raise SystemExit("current signed soak receipt invalid")
+              keyring = json.loads(
+                  pathlib.Path(os.environ["SOAK_RECEIPT_KEYRING_PATH"]).read_bytes(),
+                  object_pairs_hook=pairs,
+              )
+              if (set(keyring) != {"domain", "keys", "schema_version"}
+                      or keyring["domain"] != "carl.soak-observation.keyring.v1"
+                      or keyring["schema_version"] != 1
+                      or type(keyring["keys"]) is not dict):
+                  raise SystemExit("current signed soak keyring invalid")
+              pem = keyring["keys"].get(receipt["key_id"])
+              if not isinstance(pem, str): raise SystemExit("current signed soak key invalid")
+              key = serialization.load_pem_public_key(pem.encode("ascii"))
+              if not isinstance(key, Ed25519PublicKey):
+                  raise SystemExit("current signed soak key invalid")
+              key.verify(base64.b64decode(receipt["signature_base64"], validate=True), encoded)
+              return payload
+
+          def validate_observation_chain(payload):
+              if (payload["active_merge_commit"] != os.environ["CANDIDATE_COMMIT"]
+                      or payload["request_digest"] != os.environ["REQUEST_DIGEST"]
+                      or payload["health_receipt_digest"] != os.environ["EXPECTED_OUTCOME_DIGEST"]):
+                  raise SystemExit("current signed soak chain binding mismatch")
+              chain = payload["observation_chain"]
+              if type(chain) is not list or not 1 <= len(chain) <= EXPECTED_CHAIN_LENGTH:
+                  raise SystemExit("current signed soak chain length invalid")
+              if ((len(chain) == 1) != (payload["previous_receipt_digest"] is None)
+                      or (len(chain) > 1
+                          and DIGEST.fullmatch(payload["previous_receipt_digest"] or "") is None)):
+                  raise SystemExit("current signed soak previous receipt invalid")
+              merged_at = parse_time(payload["merged_at"])
+              previous_time = None
+              previous_digest = None
+              seen_digests = set()
+              for index, item in enumerate(chain):
+                  if type(item) is not dict or set(item) != {
+                      "active_merge_commit", "health_receipt_digest", "merged_at",
+                      "observation_digest", "observed_at", "previous_observation_digest",
+                      "request_digest", "sequence"
+                  }:
+                      raise SystemExit("current signed soak observation schema invalid")
+                  if (type(item["sequence"]) is not int or item["sequence"] != index
+                          or item["active_merge_commit"] != payload["active_merge_commit"]
+                          or item["health_receipt_digest"] != payload["health_receipt_digest"]
+                          or item["merged_at"] != payload["merged_at"]
+                          or item["request_digest"] != payload["request_digest"]
+                          or item["previous_observation_digest"] != previous_digest):
+                      raise SystemExit("current signed soak observation binding invalid")
+                  core = {key: value for key, value in item.items() if key != "observation_digest"}
+                  observation_digest = hashlib.sha256(canonical_json_bytes(core)).hexdigest()
+                  if (item["observation_digest"] != observation_digest
+                          or observation_digest in seen_digests):
+                      raise SystemExit("current signed soak observation replay invalid")
+                  observed_at = parse_time(item["observed_at"])
+                  if index == 0:
+                      if chain[0]["observed_at"] != payload["merged_at"]:
+                          raise SystemExit("current signed soak chain anchor invalid")
+                  else:
+                      interval = observed_at - previous_time
+                      if interval < CADENCE_MIN or interval > CADENCE_MAX:
+                          raise SystemExit("current signed soak observation cadence gap")
+                  seen_digests.add(observation_digest)
+                  previous_digest = observation_digest
+                  previous_time = observed_at
+              if previous_time > merged_at + SOAK_MAX:
+                  raise SystemExit("soak_observation_stale_critical")
+              return chain, merged_at, previous_time
 
           context = json.loads(
               pathlib.Path(os.environ["RUNNER_TEMP"], "soak-cadence-context.json").read_bytes(),
               object_pairs_hook=pairs,
           )
-          stage = json.loads(pathlib.Path(sys.argv[1]).read_bytes(), object_pairs_hook=pairs)
           receipt = json.loads(
               pathlib.Path(os.environ["PREVIOUS_SOAK_RECEIPT_PATH"]).read_bytes(),
               object_pairs_hook=pairs,
           )
-          if set(receipt) != {"domain", "key_id", "payload", "receipt_digest",
-                              "schema_version", "signature_base64"}:
-              raise SystemExit("current signed soak receipt schema invalid")
-          payload = receipt["payload"]
-          if type(payload) is not dict or set(payload) != {
-              "active_merge_commit", "health_receipt_digest", "merged_at", "observed_at",
-              "request_digest", "schema_version"
-          } or payload["schema_version"] != 1:
-              raise SystemExit("current signed soak receipt payload invalid")
-          encoded = canonical_json_bytes(payload)
-          if (receipt["domain"] != "carl.soak-observation.receipt.v1"
-                  or receipt["schema_version"] != 1
-                  or hashlib.sha256(encoded).hexdigest() != receipt["receipt_digest"]):
-              raise SystemExit("current signed soak receipt invalid")
-          keyring = json.loads(
-              pathlib.Path(os.environ["SOAK_RECEIPT_KEYRING_PATH"]).read_bytes(),
-              object_pairs_hook=pairs,
-          )
-          if set(keyring) != {"domain", "keys", "schema_version"} or keyring["domain"] != "carl.soak-observation.keyring.v1" or keyring["schema_version"] != 1:
-              raise SystemExit("current signed soak keyring invalid")
-          pem = keyring["keys"].get(receipt["key_id"])
-          key = serialization.load_pem_public_key(pem.encode("ascii"))
-          if not isinstance(key, Ed25519PublicKey): raise SystemExit("current signed soak key invalid")
-          key.verify(base64.b64decode(receipt["signature_base64"], validate=True), encoded)
-          active_merge_commit = payload["active_merge_commit"]
-          if active_merge_commit != os.environ["CANDIDATE_COMMIT"]:
-              raise SystemExit("current signed soak active merge mismatch")
-          if (payload["request_digest"] != os.environ["REQUEST_DIGEST"]
-                  or payload["health_receipt_digest"] != os.environ["EXPECTED_OUTCOME_DIGEST"]
-                  or payload["merged_at"] != context["merged_at"]
-                  or stage["protected_receipt_digest"] != receipt["receipt_digest"]
-                  or receipt["receipt_digest"] == context["previous_receipt_digest"]):
+          payload = verify_current_signed_soak_receipt(receipt)
+          current_chain, merged_at, observed_at = validate_observation_chain(payload)
+          if payload["merged_at"] != context["merged_at"]:
               raise SystemExit("current signed soak receipt binding mismatch")
           trusted_before = parse_time(context["trusted_before"])
-          observed_at = parse_time(payload["observed_at"])
           now = datetime.now(UTC)
-          if not trusted_before <= observed_at <= now or observed_at > trusted_before + timedelta(hours=1):
-              raise SystemExit("current signed soak observation time invalid")
-          merged_at = parse_time(context["merged_at"])
-          accept_ready = observed_at >= merged_at + timedelta(hours=24)
+          if observed_at > now or now > merged_at + SOAK_MAX:
+              raise SystemExit("soak_observation_stale_critical")
+          if context["observation_due"]:
+              stage = json.loads(pathlib.Path(sys.argv[1]).read_bytes(), object_pairs_hook=pairs)
+              if (payload["previous_receipt_digest"] != context["previous_receipt_digest"]
+                      or current_chain[:-1] != context["previous_observation_chain"]
+                      or len(current_chain) != len(context["previous_observation_chain"]) + 1
+                      or stage["protected_receipt_digest"] != receipt["receipt_digest"]
+                      or not trusted_before <= observed_at <= now
+                      or observed_at > trusted_before + timedelta(hours=1)):
+                  raise SystemExit("current signed soak chain extension invalid")
+          elif (receipt["receipt_digest"] != context["previous_receipt_digest"]
+                  or current_chain != context["previous_observation_chain"]
+                  or len(current_chain) != EXPECTED_CHAIN_LENGTH):
+              raise SystemExit("current signed soak receipt replay invalid")
+          accept_ready = len(current_chain) == EXPECTED_CHAIN_LENGTH
           handoff_root = pathlib.Path(os.environ["RUNNER_TEMP"], "protected-soak-receipt-handoff")
           handoff_root.mkdir(mode=0o700)
           handoff = handoff_root / "soak-receipt.json"
@@ -642,7 +803,7 @@ jobs:
           with pathlib.Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as outputs:
               outputs.write(f"accept_ready={str(accept_ready).lower()}\n")
               outputs.write(f"protected_health_receipt_digest={receipt['receipt_digest']}\n")
-              outputs.write(f"trusted_observed_at={payload['observed_at']}\n")
+              outputs.write(f"trusted_observed_at={current_chain[-1]['observed_at']}\n")
           PY
       - name: Hand exact signed soak receipt to the independent acceptor
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -703,9 +864,17 @@ jobs:
           receipt="$RUNNER_TEMP/protected-soak-receipt/soak-receipt.json"
           /opt/carl-autonomy/venv/bin/python3 -I - "$outcome" "$receipt" <<'PY'
           import base64, hashlib, json, os, pathlib, re, sys
+          from datetime import UTC, datetime, timedelta
           from cryptography.hazmat.primitives import serialization
           from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
           from carl_bench.canonical import canonical_json_bytes
+
+          EXPECTED_CHAIN_LENGTH = 5
+          CADENCE_MIN = timedelta(hours=6)
+          CADENCE_MAX = timedelta(hours=6, minutes=30)
+          SOAK_MAX = timedelta(hours=26)
+          DIGEST = re.compile(r"[0-9a-f]{64}\Z")
+
           def pairs(items):
               value = {}
               for key, item in items:
@@ -744,21 +913,21 @@ jobs:
                                   "schema_version", "signature_base64"}:
                   raise SystemExit("signed health receipt schema invalid")
               payload = receipt["payload"]
-              if (receipt["domain"] != "carl.soak-observation.receipt.v1"
-                      or receipt["schema_version"] != 1
+              if (receipt["domain"] != "carl.soak-observation.chain-receipt.v2"
+                      or receipt["schema_version"] != 2
                       or type(payload) is not dict
                       or set(payload) != {"active_merge_commit", "health_receipt_digest",
-                                          "merged_at", "observed_at", "request_digest",
+                                          "merged_at", "observation_chain",
+                                          "previous_receipt_digest", "request_digest",
                                           "schema_version"}
-                      or payload["schema_version"] != 1):
+                      or payload["schema_version"] != 2):
                   raise SystemExit("signed health receipt schema invalid")
               encoded = canonical_json_bytes(payload)
               if (hashlib.sha256(encoded).hexdigest() != receipt["receipt_digest"]
                       or receipt["receipt_digest"] != os.environ["EXPECTED_HEALTH_RECEIPT"]
                       or payload["active_merge_commit"] != os.environ["CANDIDATE_COMMIT"]
                       or payload["request_digest"] != os.environ["REQUEST_DIGEST"]
-                      or payload["health_receipt_digest"] != os.environ["EXPECTED_OUTCOME_DIGEST"]
-                      or payload["observed_at"] != os.environ["TRUSTED_OBSERVED_AT"]):
+                      or payload["health_receipt_digest"] != os.environ["EXPECTED_OUTCOME_DIGEST"]):
                   raise SystemExit("signed health receipt binding mismatch")
               keyring_raw = pathlib.Path(
                   "/etc/carl/soak-observation-keyring.json"
@@ -777,8 +946,73 @@ jobs:
               if not isinstance(key, Ed25519PublicKey):
                   raise SystemExit("signed health key invalid")
               key.verify(base64.b64decode(receipt["signature_base64"], validate=True), encoded)
-              if re.fullmatch(r"[0-9a-f]{64}", receipt["receipt_digest"]) is None:
+              if DIGEST.fullmatch(receipt["receipt_digest"]) is None:
                   raise SystemExit("signed health receipt digest invalid")
+
+              def parse_time(timestamp):
+                  if not isinstance(timestamp, str) or not timestamp.endswith("Z"):
+                      raise SystemExit("signed soak observation time invalid")
+                  parsed = datetime.fromisoformat(timestamp[:-1] + "+00:00")
+                  if parsed.tzinfo != UTC or parsed.isoformat().replace("+00:00", "Z") != timestamp:
+                      raise SystemExit("signed soak observation time invalid")
+                  return parsed
+
+              def validate_observation_chain():
+                  chain = payload["observation_chain"]
+                  if type(chain) is not list or not 1 <= len(chain) <= EXPECTED_CHAIN_LENGTH:
+                      raise SystemExit("signed soak chain length invalid")
+                  if ((len(chain) == 1) != (payload["previous_receipt_digest"] is None)
+                          or (len(chain) > 1
+                              and DIGEST.fullmatch(payload["previous_receipt_digest"] or "") is None)):
+                      raise SystemExit("signed soak previous receipt invalid")
+                  merged_at = parse_time(payload["merged_at"])
+                  previous_time = None
+                  previous_digest = None
+                  seen_digests = set()
+                  for index, item in enumerate(chain):
+                      if type(item) is not dict or set(item) != {
+                          "active_merge_commit", "health_receipt_digest", "merged_at",
+                          "observation_digest", "observed_at", "previous_observation_digest",
+                          "request_digest", "sequence"
+                      }:
+                          raise SystemExit("signed soak observation schema invalid")
+                      if (type(item["sequence"]) is not int or item["sequence"] != index
+                              or item["active_merge_commit"] != payload["active_merge_commit"]
+                              or item["health_receipt_digest"] != payload["health_receipt_digest"]
+                              or item["merged_at"] != payload["merged_at"]
+                              or item["request_digest"] != payload["request_digest"]
+                              or item["previous_observation_digest"] != previous_digest):
+                          raise SystemExit("signed soak observation binding invalid")
+                      core = {
+                          key: item_value
+                          for key, item_value in item.items()
+                          if key != "observation_digest"
+                      }
+                      observation_digest = hashlib.sha256(canonical_json_bytes(core)).hexdigest()
+                      if (item["observation_digest"] != observation_digest
+                              or observation_digest in seen_digests):
+                          raise SystemExit("signed soak observation replay invalid")
+                      observed_at = parse_time(item["observed_at"])
+                      if index == 0:
+                          if chain[0]["observed_at"] != payload["merged_at"]:
+                              raise SystemExit("signed soak chain anchor invalid")
+                      else:
+                          interval = observed_at - previous_time
+                          if interval < CADENCE_MIN or interval > CADENCE_MAX:
+                              raise SystemExit("signed soak observation cadence gap")
+                      seen_digests.add(observation_digest)
+                      previous_digest = observation_digest
+                      previous_time = observed_at
+                  if previous_time > merged_at + SOAK_MAX:
+                      raise SystemExit("soak_observation_stale_critical")
+                  return chain
+
+              chain = validate_observation_chain()
+              chain_complete = len(chain) == EXPECTED_CHAIN_LENGTH
+              if (payload["observation_chain"][-1]["observed_at"]
+                      != os.environ["TRUSTED_OBSERVED_AT"]
+                      or os.environ["ACCEPT_READY"] != str(chain_complete).lower()):
+                  raise SystemExit("signed soak chain readiness mismatch")
 
           verify_exact_health_receipt(sys.argv[2])
           PY

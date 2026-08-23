@@ -616,6 +616,154 @@ def _job_permissions(block: str) -> dict[str, str]:
     return dict(re.findall(r"(?m)^      ([a-z-]+): ([a-z]+)$", match.group("body")))
 
 
+def _assert_soak_health_probes_use_protected_revision(document: str) -> None:
+    steps = _parse_workflow_steps(document)
+    health_steps = [
+        step for step in steps if step.job == "evaluate" and step.identifier == "health"
+    ]
+    assert len(health_steps) == 1
+    health = health_steps[0].run
+
+    assert 'rust_probe_root="$RUNNER_TEMP/rust-probe"' in health
+    assert 'python_probe_root="$RUNNER_TEMP/python-probe"' in health
+    assert 'trusted_benchmark_root="$RUNNER_TEMP/trusted-benchmark-probe"' in health
+    assert 'rm -rf -- "$rust_probe_root/.cargo" "$rust_probe_root/tests"' in health
+    assert 'rm -f -- "$rust_probe_root/build.rs"' in health
+    assert 'cp -- trusted-source/Cargo.toml trusted-source/Cargo.lock "$rust_probe_root/"' in health
+    assert 'cp -R -- trusted-source/tests "$rust_probe_root/tests"' in health
+    assert 'cp -R -- trusted-source/benchmarks "$python_probe_root"' in health
+    assert (
+        'cp -R -- subject-merge/benchmarks/src/carl_bench "$python_probe_root/src/carl_bench"'
+    ) in health
+    assert 'cp -R -- trusted-source/benchmarks "$trusted_benchmark_root"' in health
+    assert 'cd "$RUST_PROBE_ROOT"; cargo +1.97.0 test --locked' in health
+    assert 'uv sync --project "$PYTHON_PROBE_ROOT" --python 3.12 --locked' in health
+    assert '--confcutdir "$PYTHON_PROBE_ROOT/tests"' in health
+    assert "PYTEST_DISABLE_PLUGIN_AUTOLOAD=1" in health
+    assert health.count('PYTHONPATH="$TRUSTED_BENCHMARK_ROOT/src"') == 3
+
+    assert 'cd "$SUBJECT_ROOT"; cargo +1.97.0 test' not in health
+    assert "uv sync --project benchmarks" not in health
+    assert "./scripts/benchmark-smoke.sh" not in health
+
+
+def test_soak_health_probes_use_only_protected_revision_targets_and_hooks() -> None:
+    _assert_soak_health_probes_use_protected_revision(
+        SOAK_WORKFLOW_PATH.read_text(encoding="utf-8")
+    )
+
+
+def test_soak_health_probe_contract_rejects_candidate_controlled_hook_mutations() -> None:
+    soak = SOAK_WORKFLOW_PATH.read_text(encoding="utf-8")
+    mutations = {
+        "candidate Rust manifest": soak.replace(
+            'cp -- trusted-source/Cargo.toml trusted-source/Cargo.lock "$rust_probe_root/"',
+            ": # keep candidate Cargo manifest",
+            1,
+        ),
+        "candidate Rust targets": soak.replace(
+            'cp -R -- trusted-source/tests "$rust_probe_root/tests"',
+            ": # keep candidate Rust targets",
+            1,
+        ),
+        "candidate Cargo hooks": soak.replace(
+            'rm -rf -- "$rust_probe_root/.cargo" "$rust_probe_root/tests"',
+            'rm -rf -- "$rust_probe_root/tests"',
+            1,
+        ),
+        "candidate pytest project": soak.replace(
+            'uv sync --project "$PYTHON_PROBE_ROOT" --python 3.12 --locked',
+            "uv sync --project benchmarks --python 3.12 --locked",
+            1,
+        ),
+        "candidate pytest hooks": soak.replace(
+            '--confcutdir "$PYTHON_PROBE_ROOT/tests"',
+            '--rootdir "$SUBJECT_ROOT"',
+            1,
+        ),
+        "candidate benchmark runner": soak.replace(
+            'PYTHONPATH="$TRUSTED_BENCHMARK_ROOT/src"',
+            'PYTHONPATH="$SUBJECT_ROOT/benchmarks/src"',
+            1,
+        ),
+    }
+    for mutation, mutated in mutations.items():
+        assert mutated != soak, mutation
+        with pytest.raises(AssertionError):
+            _assert_soak_health_probes_use_protected_revision(mutated)
+
+
+def _assert_complete_signed_soak_chain(document: str) -> None:
+    jobs = _workflow_job_blocks(document)
+    live_soak = jobs["live_soak"]
+    evidence = jobs["evidence"]
+
+    for block in (live_soak, evidence):
+        assert "carl.soak-observation.chain-receipt.v2" in block
+        assert '"observation_chain"' in block
+        assert '"previous_receipt_digest"' in block
+        assert "EXPECTED_CHAIN_LENGTH = 5" in block
+        assert "CADENCE_MIN = timedelta(hours=6)" in block
+        assert "CADENCE_MAX = timedelta(hours=6, minutes=30)" in block
+        assert "SOAK_MAX = timedelta(hours=26)" in block
+        assert "validate_observation_chain" in block
+        assert 'item["sequence"] != index' in block
+        assert 'item["active_merge_commit"] != payload["active_merge_commit"]' in block
+        assert 'item["previous_observation_digest"] != previous_digest' in block
+        assert "observation_digest in seen_digests" in block
+        assert "interval < CADENCE_MIN or interval > CADENCE_MAX" in block
+        assert 'chain[0]["observed_at"] != payload["merged_at"]' in block
+
+    assert "now > merged_at + SOAK_MAX" in live_soak
+    assert 'payload["previous_receipt_digest"] != context["previous_receipt_digest"]' in live_soak
+    assert 'current_chain[:-1] != context["previous_observation_chain"]' in live_soak
+    assert 'len(current_chain) != len(context["previous_observation_chain"]) + 1' in live_soak
+    assert "accept_ready = len(current_chain) == EXPECTED_CHAIN_LENGTH" in live_soak
+    assert "accept_ready = observed_at >= merged_at + timedelta(hours=24)" not in live_soak
+    assert 'payload["observation_chain"][-1]["observed_at"]' in evidence
+    assert 'os.environ["ACCEPT_READY"] != str(chain_complete).lower()' in evidence
+
+
+def test_soak_acceptance_requires_complete_exact_six_hour_signed_chain() -> None:
+    _assert_complete_signed_soak_chain(SOAK_WORKFLOW_PATH.read_text(encoding="utf-8"))
+
+
+def test_soak_chain_contract_rejects_gap_replay_and_rebinding_mutations() -> None:
+    soak = SOAK_WORKFLOW_PATH.read_text(encoding="utf-8")
+    mutations = {
+        "24-hour cadence gap": soak.replace(
+            "CADENCE_MAX = timedelta(hours=6, minutes=30)",
+            "CADENCE_MAX = timedelta(hours=26)",
+        ),
+        "receipt replay": soak.replace(
+            'payload["previous_receipt_digest"] != context["previous_receipt_digest"]',
+            "False",
+            1,
+        ),
+        "chain prefix splice": soak.replace(
+            'current_chain[:-1] != context["previous_observation_chain"]',
+            "False",
+            1,
+        ),
+        "duplicate observation": soak.replace(
+            "observation_digest in seen_digests",
+            "False",
+        ),
+        "merge rebinding": soak.replace(
+            'item["active_merge_commit"] != payload["active_merge_commit"]',
+            "False",
+        ),
+        "stale acceptance": soak.replace(
+            "now > merged_at + SOAK_MAX",
+            "False",
+        ),
+    }
+    for mutation, mutated in mutations.items():
+        assert mutated != soak, mutation
+        with pytest.raises(AssertionError):
+            _assert_complete_signed_soak_chain(mutated)
+
+
 def test_protected_workflows_separate_cloud_authorities_and_close_permissions() -> None:
     improvement = _workflow_job_blocks(IMPROVEMENT_WORKFLOW_PATH.read_text(encoding="utf-8"))
     soak = _workflow_job_blocks(SOAK_WORKFLOW_PATH.read_text(encoding="utf-8"))
@@ -845,9 +993,12 @@ def test_soak_acceptance_uses_signed_durable_cadence_and_trusted_time() -> None:
     assert "soak_observation_too_early" in live_soak
     assert "soak_observation_stale_critical" in live_soak
     assert "active_merge_commit" in live_soak
-    assert 'active_merge_commit != os.environ["CANDIDATE_COMMIT"]' in live_soak
+    assert 'payload["active_merge_commit"] != os.environ["CANDIDATE_COMMIT"]' in live_soak
     assert 'payload["request_digest"] != os.environ["REQUEST_DIGEST"]' in live_soak
     assert 'payload["merged_at"] != context["merged_at"]' in live_soak
+    assert 'payload["previous_receipt_digest"] != context["previous_receipt_digest"]' in live_soak
+    assert 'current_chain[:-1] != context["previous_observation_chain"]' in live_soak
+    assert "accept_ready = len(current_chain) == EXPECTED_CHAIN_LENGTH" in live_soak
     assert "accept_soak" in evidence
     assert "EXPECTED_HEALTH_RECEIPT" in evidence
     assert "verify_exact_health_receipt" in evidence
