@@ -136,6 +136,8 @@ class DurableState:
             self.current = replace(self.current, command=create_command_state(decision.command))
         elif decision.action == "claim_command":
             self.current = replace(self.current, command=claimed_command_for(selected))
+        elif decision.action == "frozen":
+            pass
         else:  # pragma: no cover - a wrong production branch is the tested defect
             raise AssertionError(decision.action)
         return decision
@@ -163,6 +165,31 @@ def test_repeated_service_invocation_advances_durable_state() -> None:
     assert second.result is not None and second.result["action"] == "claim_command"
     assert first.result["identity"] != second.result["identity"]
     assert state.applied == ["persist_command", "claim_command"]
+
+
+def test_request_allowlist_selects_only_the_authorized_ready_node() -> None:
+    state = DurableState()
+    state.current = snapshot(
+        node("dispatch_builder"),
+        node("schedule_soak"),
+        current_lease=lease(),
+        production_authorization=None,
+    )
+    executor = ProtectedCoordinatorExecutor._for_testing(
+        state=state,
+        effects=NoEffects(),
+        clock=lambda: datetime(2026, 8, 22, 12, tzinfo=UTC),
+    )
+    request = CoordinatorServiceRequest.create("coordinate", allowed_nodes=("schedule_soak",))
+
+    response = coordinator_response(request, controller=executor)
+
+    assert response.status == "completed"
+    assert response.result is not None
+    assert response.result["node"] == "schedule_soak"
+    assert response.result["action"] == "frozen"
+    assert response.result["reason"] == "protected_production_receipts_required"
+    assert state.applied == ["frozen"]
 
 
 def test_worker_with_no_applicable_node_is_canonical_idle() -> None:

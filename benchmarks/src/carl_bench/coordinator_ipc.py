@@ -8,7 +8,12 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from carl_bench.canonical import CanonicalizationError, canonical_json_bytes
-from carl_bench.cloud_coordinator import CloudCoordinatorDecision
+from carl_bench.cloud_coordinator import (
+    CloudCoordinatorDecision,
+    CloudCoordinatorError,
+    canonical_allowed_nodes,
+    command_nodes,
+)
 
 COORDINATOR_REQUEST_DOMAIN = "carl.coordinator.ipc.request.v1"
 COORDINATOR_RESPONSE_DOMAIN = "carl.coordinator.ipc.response.v1"
@@ -52,11 +57,20 @@ class CoordinatorServiceRequest:
     schema_version: int
     domain: str
     command: str
+    allowed_nodes: tuple[str, ...]
 
     @classmethod
-    def create(cls, command: str) -> CoordinatorServiceRequest:
+    def create(
+        cls, command: str, *, allowed_nodes: tuple[str, ...] | None = None
+    ) -> CoordinatorServiceRequest:
+        selected = command_nodes(command) if allowed_nodes is None else allowed_nodes
         return cls.from_canonical_dict(
-            {"command": command, "domain": COORDINATOR_REQUEST_DOMAIN, "schema_version": 1}
+            {
+                "allowed_nodes": list(selected),
+                "command": command,
+                "domain": COORDINATOR_REQUEST_DOMAIN,
+                "schema_version": 1,
+            }
         )
 
     @classmethod
@@ -64,17 +78,26 @@ class CoordinatorServiceRequest:
         code = "coordinator_ipc_request_invalid"
         if (
             type(value) is not dict
-            or set(value) != {"command", "domain", "schema_version"}
+            or set(value) != {"allowed_nodes", "command", "domain", "schema_version"}
             or isinstance(value["schema_version"], bool)
             or value["schema_version"] != 1
             or value["domain"] != COORDINATOR_REQUEST_DOMAIN
             or value["command"] not in _COMMANDS
         ):
             raise CoordinatorProtocolError(code)
-        return cls(1, COORDINATOR_REQUEST_DOMAIN, value["command"])
+        try:
+            allowed_nodes = canonical_allowed_nodes(value["command"], value["allowed_nodes"])
+        except CloudCoordinatorError as error:
+            raise CoordinatorProtocolError(code) from error
+        return cls(1, COORDINATOR_REQUEST_DOMAIN, value["command"], allowed_nodes)
 
     def to_canonical_dict(self) -> dict[str, object]:
-        return {"command": self.command, "domain": self.domain, "schema_version": 1}
+        return {
+            "allowed_nodes": list(self.allowed_nodes),
+            "command": self.command,
+            "domain": self.domain,
+            "schema_version": 1,
+        }
 
     @property
     def digest(self) -> str:

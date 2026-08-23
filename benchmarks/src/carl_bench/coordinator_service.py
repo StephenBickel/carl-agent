@@ -494,7 +494,7 @@ def coordinator_response(
     ):
         raise CloudCoordinatorError("coordinator_service_request_invalid")
     try:
-        result = controller.advance(request.command)
+        result = controller.advance(request.command, allowed_nodes=request.allowed_nodes)
     except (CloudCoordinatorError, PostgresStateError):
         return CoordinatorServiceResponse(
             schema_version=1,

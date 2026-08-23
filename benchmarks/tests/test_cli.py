@@ -112,6 +112,30 @@ def test_cloud_command_emits_one_canonical_json_result_without_prose(
     assert captured.out == json.dumps(expected, separators=(",", ":"), sort_keys=True) + "\n"
     assert len(observed) == 1
     assert observed[0].to_canonical_dict() == {
+        "allowed_nodes": [
+            "create_revert",
+            "observe_revert",
+            "publish_input",
+            "register_hypothesis",
+            "request_builder",
+            "dispatch_builder",
+            "observe_builder",
+            "archive_builder",
+            "ingest_builder",
+            "publish_experimental",
+            "dispatch_validation",
+            "observe_validation",
+            "archive_validation",
+            "ingest_validation",
+            "record_disposition",
+            "create_promotion_pr",
+            "observe_required_checks",
+            "enable_auto_merge",
+            "schedule_soak",
+            "observe_soak",
+            "accept_soak",
+            "trigger_supervisor",
+        ],
         "command": "coordinate",
         "domain": "carl.coordinator.ipc.request.v1",
         "schema_version": 1,
@@ -190,11 +214,98 @@ def test_cloud_cli_ignores_caller_snapshot_clock_authority_and_evidence(
     assert json.loads(capsys.readouterr().out)["action"] == "idle"
     assert observed == [
         {
+            "allowed_nodes": [
+                "create_revert",
+                "observe_revert",
+                "publish_input",
+                "register_hypothesis",
+                "request_builder",
+                "dispatch_builder",
+                "observe_builder",
+                "archive_builder",
+                "ingest_builder",
+                "publish_experimental",
+                "dispatch_validation",
+                "observe_validation",
+                "archive_validation",
+                "ingest_validation",
+                "record_disposition",
+                "create_promotion_pr",
+                "observe_required_checks",
+                "enable_auto_merge",
+                "schedule_soak",
+                "observe_soak",
+                "accept_soak",
+                "trigger_supervisor",
+            ],
             "command": "coordinate",
             "domain": "carl.coordinator.ipc.request.v1",
             "schema_version": 1,
         }
     ]
+
+
+def test_cloud_cli_passes_a_closed_node_allowlist_to_the_protected_service(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    observed = []
+
+    class Client:
+        def execute(self, request):
+            observed.append(request)
+            return CoordinatorServiceResponse(
+                schema_version=1,
+                domain=COORDINATOR_RESPONSE_DOMAIN,
+                status="completed",
+                request_digest=request.digest,
+                result={
+                    "action": "idle",
+                    "command": None,
+                    "consequential": False,
+                    "effect_key": None,
+                    "event": None,
+                    "experiment_id": "experiment-1",
+                    "identity": "1" * 64,
+                    "node": None,
+                    "reason": "no_applicable_node",
+                    "remote_effect": False,
+                    "result_digest": None,
+                    "revision": 7,
+                    "schema_version": 1,
+                },
+                error_code=None,
+            )
+
+    monkeypatch.setattr(
+        cli.CoordinatorSocketClient,
+        "from_protected_environment",
+        classmethod(lambda cls: Client()),
+    )
+
+    assert (
+        cli.main(
+            [
+                "cloud",
+                "coordinate",
+                "--allowed-node",
+                "create_revert",
+                "--allowed-node",
+                "observe_revert",
+                "--allowed-node",
+                "schedule_soak",
+                "--allowed-node",
+                "observe_soak",
+            ]
+        )
+        == 0
+    )
+    assert json.loads(capsys.readouterr().out)["action"] == "idle"
+    assert observed[0].allowed_nodes == (
+        "create_revert",
+        "observe_revert",
+        "schedule_soak",
+        "observe_soak",
+    )
 
 
 def test_scripted_run_writes_only_sanitized_scorecard(tmp_path: Path) -> None:

@@ -1186,6 +1186,118 @@ class PostgresStateBackend(StateBackend):
         finally:
             connection.close()
 
+    @staticmethod
+    def _decode_supervisor_recovery_receipt(row: dict[str, Any]) -> dict[str, object]:
+        value = _strict_row(
+            row,
+            frozenset({"action_digest", "outcome", "receipt_json", "revision", "trigger_id"}),
+        )
+        if (
+            not isinstance(value["action_digest"], str)
+            or len(value["action_digest"]) != 64
+            or value["outcome"]
+            not in {
+                "infrastructure_attempted",
+                "repair_pr_opened",
+                "safe_node_redispatched",
+                "stable_boundary_frozen",
+                "state_reconciled",
+            }
+            or not isinstance(value["trigger_id"], str)
+        ):
+            raise PostgresStateError("supervisor_recovery_receipt_invalid")
+        _strict_revision(value["revision"])
+        _strict_json_object(value["receipt_json"], code="supervisor_recovery_receipt_invalid")
+        return value
+
+    def select_supervisor_trigger(self) -> dict[str, object]:
+        def decode(row: dict[str, Any]) -> dict[str, object]:
+            value = _strict_row(
+                row, frozenset({"claim_id", "revision", "trigger_id", "trigger_json"})
+            )
+            _strict_revision(value["revision"])
+            if (
+                not isinstance(value["trigger_id"], str)
+                or not isinstance(value["trigger_json"], str)
+                or (value["claim_id"] is not None and not isinstance(value["claim_id"], str))
+            ):
+                raise PostgresStateError("supervisor_trigger_state_invalid")
+            _strict_json_object(value["trigger_json"], code="supervisor_trigger_state_invalid")
+            return value
+
+        return cast(
+            dict[str, object],
+            self._mutation(
+                "supervisor",
+                "SELECT * FROM carl_autonomy.select_supervisor_trigger()",
+                (),
+                decode,
+            ),
+        )
+
+    def claim_supervisor_recovery(self, value: dict[str, object]) -> dict[str, object]:
+        def decode(row: dict[str, Any]) -> dict[str, object]:
+            decoded = _strict_row(
+                row,
+                frozenset(
+                    {"action_digest", "applied", "attempt_id", "claim_id", "revision", "trigger_id"}
+                ),
+            )
+            _strict_bool(decoded["applied"])
+            _strict_revision(decoded["revision"])
+            return decoded
+
+        return cast(
+            dict[str, object],
+            self._mutation(
+                "supervisor",
+                "SELECT * FROM carl_autonomy.claim_supervisor_recovery(%s, %s)",
+                (_canonical_text(value), _utc_now()),
+                decode,
+            ),
+        )
+
+    def _supervisor_recovery_mutation(
+        self, function: str, value: dict[str, object]
+    ) -> dict[str, object]:
+        if function not in {
+            "complete_supervisor_recovery",
+            "complete_supervisor_redispatch",
+            "fail_supervisor_recovery",
+        }:
+            raise PostgresStateError("supervisor_recovery_function_invalid")
+        return cast(
+            dict[str, object],
+            self._mutation(
+                "supervisor",
+                f"SELECT * FROM carl_autonomy.{function}(%s, %s)",
+                (_canonical_text(value), _utc_now()),
+                self._decode_supervisor_recovery_receipt,
+            ),
+        )
+
+    def complete_supervisor_recovery(self, value: dict[str, object]) -> dict[str, object]:
+        return self._supervisor_recovery_mutation("complete_supervisor_recovery", value)
+
+    def complete_supervisor_redispatch(self, value: dict[str, object]) -> dict[str, object]:
+        return self._supervisor_recovery_mutation("complete_supervisor_redispatch", value)
+
+    def fail_supervisor_recovery(self, value: dict[str, object]) -> dict[str, object]:
+        return self._supervisor_recovery_mutation("fail_supervisor_recovery", value)
+
+    def read_supervisor_recovery_receipt(
+        self, trigger_id: str, action_digest: str
+    ) -> dict[str, object]:
+        return cast(
+            dict[str, object],
+            self._mutation(
+                "supervisor",
+                "SELECT * FROM carl_autonomy.read_supervisor_recovery_receipt(%s, %s)",
+                (trigger_id, action_digest),
+                self._decode_supervisor_recovery_receipt,
+            ),
+        )
+
     def reconstruct_coordinator_snapshot(
         self, command: str, *, observed_at: datetime
     ) -> tuple[object, dict[str, Any] | None] | None:

@@ -42,42 +42,29 @@ jobs:
           CARL_STATE_BACKEND: postgresql
           SUPERVISOR_COORDINATOR_COMMAND: uv run --offline --project benchmarks --locked carl-bench cloud coordinate
           SUPERVISOR_PROMPT: docs/automation-prompts/carl-autonomy-supervisor.md
+          SUPERVISOR_PROPOSAL: ${{ runner.temp }}/supervisor-proposal.json
           SUPERVISOR_RESULT: ${{ runner.temp }}/supervisor-result.json
+          SUPERVISOR_TRIGGER: ${{ runner.temp }}/supervisor-trigger.json
         run: |
           set -euo pipefail
           test "$CARL_STATE_BACKEND" = postgresql
           test -S "$CARL_GITHUB_APP_EFFECT_SOCKET"
           test -S "$CARL_MODEL_GATEWAY_SOCKET"
           test -s "$SUPERVISOR_PROMPT"
-          codex exec \
+          uv run --offline --project benchmarks --locked carl-bench supervisor inspect \
+            > "$SUPERVISOR_TRIGGER"
+          {
+            cat "$SUPERVISOR_PROMPT"
+            printf '\n\nExact PostgreSQL-selected trigger:\n'
+            cat "$SUPERVISOR_TRIGGER"
+          } | codex exec \
             --model gpt-5.6-sol \
             -c 'model_reasoning_effort="ultra"' \
             --sandbox workspace-write \
-            --output-last-message "$SUPERVISOR_RESULT" \
-            - < "$SUPERVISOR_PROMPT"
-          SUPERVISOR_RESULT="$SUPERVISOR_RESULT" uv run --offline --project benchmarks --locked python - <<'PY'
-          import json
-          import os
-          from pathlib import Path
-
-          from carl_bench.canonical import canonical_json_bytes
-
-          path = Path(os.environ["SUPERVISOR_RESULT"])
-          raw = path.read_bytes()
-          value = json.loads(raw)
-          if canonical_json_bytes(value) != raw:
-              raise SystemExit("supervisor_result_not_canonical")
-          if set(value) != {"action_digest", "outcome", "revision", "trigger_id"}:
-              raise SystemExit("supervisor_result_schema_invalid")
-          if value["outcome"] not in {
-              "repair_pr_opened",
-              "safe_node_redispatched",
-              "stable_boundary_frozen",
-              "state_reconciled",
-          }:
-              raise SystemExit("supervisor_result_not_material")
-          if not isinstance(value["revision"], int) or isinstance(value["revision"], bool):
-              raise SystemExit("supervisor_result_revision_invalid")
-          if not isinstance(value["action_digest"], str) or len(value["action_digest"]) != 64:
-              raise SystemExit("supervisor_result_digest_invalid")
-          PY
+            --output-last-message "$SUPERVISOR_PROPOSAL" \
+            -
+          uv run --offline --project benchmarks --locked carl-bench supervisor recover \
+            --proposal "$SUPERVISOR_PROPOSAL" \
+            --repository "$GITHUB_WORKSPACE" \
+            > "$SUPERVISOR_RESULT"
+          cat "$SUPERVISOR_RESULT"

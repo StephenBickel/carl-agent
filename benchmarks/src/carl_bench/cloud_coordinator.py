@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from types import MappingProxyType
 from typing import Any, Literal, Protocol
@@ -160,6 +160,28 @@ _COMMAND_NODES: dict[str, frozenset[str]] = {
         }
     ),
 }
+
+
+def command_nodes(command: str) -> tuple[str, ...]:
+    """Return the fixed canonical node vocabulary for one cloud command."""
+    if command not in _CLOUD_COMMANDS:
+        raise CloudCoordinatorError("cloud_command_invalid")
+    allowed = _COMMAND_NODES[command]
+    return tuple(node for node in NODE_ORDER if node in allowed)
+
+
+def canonical_allowed_nodes(command: str, nodes: object) -> tuple[str, ...]:
+    """Validate a non-empty, ordered subset of a command's fixed node vocabulary."""
+    if type(nodes) not in {list, tuple} or not nodes:
+        raise CloudCoordinatorError("cloud_allowed_nodes_invalid")
+    values = tuple(nodes)
+    if not all(isinstance(node, str) for node in values) or len(set(values)) != len(values):
+        raise CloudCoordinatorError("cloud_allowed_nodes_invalid")
+    allowed = command_nodes(command)
+    expected = tuple(node for node in allowed if node in values)
+    if values != expected:
+        raise CloudCoordinatorError("cloud_allowed_nodes_invalid")
+    return values
 _NODE_BINDINGS: dict[str, tuple[str, str]] = {
     "create_revert": ("promoter", "github_effect"),
     "observe_revert": ("observer", "observe"),
@@ -1355,9 +1377,14 @@ class ProtectedCoordinatorExecutor:
     ) -> ProtectedCoordinatorExecutor:
         return cls(state=state, effects=effects, clock=clock, _testing=True)
 
-    def advance(self, command: str) -> CloudCoordinatorDecision:
+    def advance(
+        self, command: str, *, allowed_nodes: tuple[str, ...] | None = None
+    ) -> CloudCoordinatorDecision:
         if command not in _CLOUD_COMMANDS:
             raise CloudCoordinatorError("cloud_command_invalid")
+        selected_nodes = canonical_allowed_nodes(
+            command, command_nodes(command) if allowed_nodes is None else allowed_nodes
+        )
         observed_at = self.__clock()
         if not isinstance(observed_at, datetime) or observed_at.tzinfo != UTC:
             raise CloudCoordinatorError("coordinator_clock_invalid")
@@ -1379,8 +1406,18 @@ class ProtectedCoordinatorExecutor:
         trusted_time = observed_at.isoformat().replace("+00:00", "Z")
         if snapshot.observed_at != trusted_time:
             raise CloudCoordinatorError("coordinator_snapshot_clock_mismatch")
-        decision = choose_next_action(snapshot)
-        allowed = _COMMAND_NODES[command]
+        allowed = frozenset(selected_nodes)
+        if snapshot.command is not None:
+            selected = _selected_node(snapshot)
+            if selected is None or selected.kind not in allowed:
+                return _decision(snapshot, "idle", "no_applicable_node")
+            authorized_snapshot = snapshot
+        else:
+            authorized_snapshot = replace(
+                snapshot,
+                nodes=tuple(node for node in snapshot.nodes if node.kind in allowed),
+            )
+        decision = choose_next_action(authorized_snapshot)
         if decision.node is not None and decision.node not in allowed:
             return _decision(snapshot, "idle", "no_applicable_node")
         if decision.node is None and command not in {"coordinate", "health"}:

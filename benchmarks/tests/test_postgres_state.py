@@ -114,6 +114,10 @@ COORDINATOR_RUNTIME_SQL = (
     if COORDINATOR_RUNTIME_PATH.exists()
     else ""
 )
+SUPERVISOR_AUTHORITY_PATH = (
+    Path(__file__).parents[2] / "infra/autonomy/postgres/005_supervisor_authority.sql"
+)
+SUPERVISOR_AUTHORITY_SQL = SUPERVISOR_AUTHORITY_PATH.read_text(encoding="utf-8")
 POSTGRES_INTEGRATION_SOURCE = (
     Path(__file__).with_name("test_postgres_state_integration.py").read_text(encoding="utf-8")
 )
@@ -371,6 +375,8 @@ def test_coordinator_sql_effect_family_table_matches_every_python_node() -> None
 def test_coordinator_migration_is_mandatory_in_integration_and_ci() -> None:
     assert "004_coordinator_runtime.sql" in POSTGRES_INTEGRATION_SOURCE
     assert "--file infra/autonomy/postgres/004_coordinator_runtime.sql" in BENCHMARK_WORKFLOW
+    assert "005_supervisor_authority.sql" in POSTGRES_INTEGRATION_SOURCE
+    assert "--file infra/autonomy/postgres/005_supervisor_authority.sql" in BENCHMARK_WORKFLOW
 
 
 def test_protected_policy_decodes_canonical_bounded_base64_public_keys(

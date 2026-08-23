@@ -38,7 +38,7 @@ from carl_bench.candidate_evidence import (
 )
 from carl_bench.candidate_git import CandidateGitManager, TrustedCheckRegistry
 from carl_bench.canonical import canonical_json_bytes
-from carl_bench.cloud_coordinator import protected_cloud_failure
+from carl_bench.cloud_coordinator import NODE_ORDER, protected_cloud_failure
 from carl_bench.coordinator_client import CoordinatorClientError, CoordinatorSocketClient
 from carl_bench.coordinator_ipc import CoordinatorServiceRequest
 from carl_bench.experiment import (
@@ -67,6 +67,7 @@ from carl_bench.report import compare_runs, summarize_run
 from carl_bench.run_attestation import attest_run
 from carl_bench.runner import BenchmarkRunner
 from carl_bench.sanitize import PublicSafetyError, assert_public_safe, write_public_json
+from carl_bench.supervisor_recovery import SupervisorProposal, SupervisorRecoveryRunner
 from carl_bench.tasks import BenchmarkTask, TaskContractError, discover_tasks
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
@@ -298,7 +299,23 @@ def _parser() -> argparse.ArgumentParser:
         "health",
         "commission-live",
     ):
-        cloud_commands.add_parser(name, help=f"run one protected {name} node")
+        command = cloud_commands.add_parser(name, help=f"run one protected {name} node")
+        command.add_argument(
+            "--allowed-node",
+            action="append",
+            choices=NODE_ORDER,
+            dest="allowed_nodes",
+        )
+    supervisor = commands.add_parser(
+        "supervisor", help="execute one PostgreSQL-authoritative recovery"
+    )
+    supervisor_commands = supervisor.add_subparsers(dest="supervisor_command", required=True)
+    supervisor_commands.add_parser("inspect", help="select one exact prioritized trigger")
+    recover = supervisor_commands.add_parser(
+        "recover", help="claim, execute, and bind one proposed recovery"
+    )
+    recover.add_argument("--proposal", required=True, type=Path)
+    recover.add_argument("--repository", required=True, type=Path)
     return parser
 
 
@@ -1394,7 +1411,10 @@ def _validate_command(args: argparse.Namespace) -> int:
 
 
 def _cloud_command(args: argparse.Namespace) -> int:
-    request = CoordinatorServiceRequest.create(args.cloud_command)
+    request = CoordinatorServiceRequest.create(
+        args.cloud_command,
+        allowed_nodes=(None if args.allowed_nodes is None else tuple(args.allowed_nodes)),
+    )
     try:
         response = CoordinatorSocketClient.from_protected_environment().execute(request)
     except CoordinatorClientError:
@@ -1407,6 +1427,18 @@ def _cloud_command(args: argparse.Namespace) -> int:
         )
     sys.stdout.write(canonical_json_bytes(value).decode("utf-8") + "\n")
     return 2 if value.get("action") == "frozen" else 0
+
+
+def _supervisor_command(args: argparse.Namespace) -> int:
+    repository = REPOSITORY_ROOT if args.supervisor_command == "inspect" else args.repository
+    runner = SupervisorRecoveryRunner.from_protected_environment(repository=repository)
+    if args.supervisor_command == "inspect":
+        value = runner.inspect()
+    else:
+        proposal = SupervisorProposal.from_bytes(args.proposal.read_bytes())
+        value = runner.recover(proposal)
+    sys.stdout.write(canonical_json_bytes(value).decode("utf-8") + "\n")
+    return 0
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -1422,6 +1454,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _candidate_command(args)
         if args.command == "cloud":
             return _cloud_command(args)
+        if args.command == "supervisor":
+            return _supervisor_command(args)
         if args.command == "attestation-key":
             return _init_attestation_key(args)
         if args.command == "run-attested":

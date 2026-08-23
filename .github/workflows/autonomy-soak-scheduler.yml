@@ -37,16 +37,18 @@ jobs:
           enable-cache: false
       - name: Select from PostgreSQL truth and advance one exact soak node
         env:
-          CARL_COORDINATOR_ALLOWED_NODES: schedule_soak observe_soak create_revert observe_revert
           CARL_STATE_BACKEND: postgresql
           HARD_FAILURE_REVERT_SLA_HOURS: "2"
           SOAK_STALE_CRITICAL_HOURS: "26"
         run: |
           set -euo pipefail
           test "$CARL_STATE_BACKEND" = postgresql
-          test "$CARL_COORDINATOR_ALLOWED_NODES" = "schedule_soak observe_soak create_revert observe_revert"
           test "$SOAK_STALE_CRITICAL_HOURS" = "26"
           test "$HARD_FAILURE_REVERT_SLA_HOURS" = "2"
           # The protected coordinator reconstructs the exact active merge from durable state;
           # neither the workflow revision nor caller input can select a candidate or merge.
-          uv run --offline --project benchmarks --locked carl-bench cloud coordinate
+          uv run --offline --project benchmarks --locked carl-bench cloud coordinate \
+            --allowed-node create_revert \
+            --allowed-node observe_revert \
+            --allowed-node schedule_soak \
+            --allowed-node observe_soak

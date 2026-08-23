@@ -89,6 +89,9 @@ GITHUB_EFFECT_FENCES_MIGRATION = (
 COORDINATOR_RUNTIME_MIGRATION = (
     REPOSITORY_ROOT / "infra/autonomy/postgres/004_coordinator_runtime.sql"
 )
+SUPERVISOR_AUTHORITY_MIGRATION = (
+    REPOSITORY_ROOT / "infra/autonomy/postgres/005_supervisor_authority.sql"
+)
 HISTORICAL_EFFECT_FENCE_FIXTURE = (
     REPOSITORY_ROOT / "benchmarks/tests/fixtures/postgres-4aa2ab5-github-effect-fences.sql"
 )
@@ -96,6 +99,7 @@ MIGRATIONS = (
     *BASE_MIGRATIONS,
     GITHUB_EFFECT_FENCES_MIGRATION,
     COORDINATOR_RUNTIME_MIGRATION,
+    SUPERVISOR_AUTHORITY_MIGRATION,
 )
 NOW = "2026-08-20T12:00:00Z"
 DIGEST_A = "a" * 64
@@ -211,7 +215,9 @@ def clean_state(postgres: object) -> None:
     assert POSTGRES_DSN is not None
     with postgres.connect(POSTGRES_DSN, autocommit=True) as connection:  # type: ignore[attr-defined]
         connection.execute(
-            "TRUNCATE carl_autonomy.coordinator_recovery_receipts, "
+            "TRUNCATE carl_autonomy.supervisor_recovery_receipts, "
+            "carl_autonomy.supervisor_recovery_attempts, "
+            "carl_autonomy.coordinator_recovery_receipts, "
             "carl_autonomy.coordinator_runtime, "
             "carl_autonomy.experiment_events, "
             "carl_autonomy.experiment_manifests, carl_autonomy.commands, "
@@ -220,6 +226,217 @@ def clean_state(postgres: object) -> None:
             "carl_autonomy.dead_holder_observations "
             "RESTART IDENTITY CASCADE"
         )
+
+
+def _supervisor_claim_document(
+    trigger_id: str,
+    *,
+    expected_revision: int,
+    action_digest: str,
+    attempt_id: str,
+) -> dict[str, object]:
+    return {
+        "action_digest": action_digest,
+        "action_kind": "freeze_stable_boundary",
+        "attempt_id": attempt_id,
+        "claim_id": f"supervisor:{trigger_id}",
+        "expected_revision": expected_revision,
+        "schema_version": 1,
+        "trigger_id": trigger_id,
+    }
+
+
+def _create_supervisor_trigger(
+    connection: object,
+    *,
+    trigger_id: str,
+    unsafe_boundary: str,
+    created_at: str,
+) -> None:
+    trigger = SupervisorTrigger(
+        schema_version=1,
+        trigger_id=trigger_id,
+        evidence_digest=DIGEST_A,
+        unsafe_boundary=unsafe_boundary,
+        attempt_history=(),
+        next_safe_node_key="experiment-1:schedule_soak",
+        created_at=created_at,
+    )
+    connection.execute(  # type: ignore[attr-defined]
+        "SELECT * FROM carl_autonomy.create_supervisor_trigger(%s, %s)",
+        (_canonical(trigger.to_canonical_dict()), created_at),
+    ).fetchone()
+
+
+def test_supervisor_authority_prioritizes_rollback_and_denies_lower_priority_claim(
+    postgres: object,
+) -> None:
+    with _as_role(postgres, "carl_coordinator") as coordinator:
+        _create_supervisor_trigger(
+            coordinator,
+            trigger_id="commissioning-outage",
+            unsafe_boundary="commissioning:provider",
+            created_at="2026-08-20T10:00:00Z",
+        )
+        _create_supervisor_trigger(
+            coordinator,
+            trigger_id="rollback-required",
+            unsafe_boundary="rollback:hard_failure",
+            created_at="2026-08-20T11:00:00Z",
+        )
+
+    with _as_role(postgres, "carl_supervisor") as supervisor:
+        selected = supervisor.execute(
+            "SELECT * FROM carl_autonomy.select_supervisor_trigger()"
+        ).fetchone()
+        assert selected["trigger_id"] == "rollback-required"
+        with pytest.raises(psycopg.Error, match="rollback_priority_required"):
+            supervisor.execute(
+                "SELECT * FROM carl_autonomy.claim_supervisor_recovery(%s, %s)",
+                (
+                    _canonical(
+                        _supervisor_claim_document(
+                            "commissioning-outage",
+                            expected_revision=0,
+                            action_digest="1" * 64,
+                            attempt_id="attempt-1",
+                        )
+                    ),
+                    NOW,
+                ),
+            ).fetchone()
+
+
+def test_supervisor_authority_enforces_changed_action_and_three_infrastructure_attempts(
+    postgres: object,
+) -> None:
+    with _as_role(postgres, "carl_coordinator") as coordinator:
+        _create_supervisor_trigger(
+            coordinator,
+            trigger_id="provider-outage",
+            unsafe_boundary="commissioning:provider",
+            created_at=NOW,
+        )
+
+    revision = 0
+    with _as_role(postgres, "carl_supervisor") as supervisor:
+        for index in range(1, 4):
+            action_digest = str(index) * 64
+            attempt_id = f"infrastructure-attempt-{index}"
+            claim = supervisor.execute(
+                "SELECT * FROM carl_autonomy.claim_supervisor_recovery(%s, %s)",
+                (
+                    _canonical(
+                        _supervisor_claim_document(
+                            "provider-outage",
+                            expected_revision=revision,
+                            action_digest=action_digest,
+                            attempt_id=attempt_id,
+                        )
+                    ),
+                    NOW,
+                ),
+            ).fetchone()
+            revision = claim["revision"]
+            failure = {
+                "action_digest": action_digest,
+                "attempt_id": attempt_id,
+                "claim_id": "supervisor:provider-outage",
+                "expected_revision": revision,
+                "failure_code": "coordinator_service_unavailable",
+                "result_digest": str(index + 3) * 64,
+                "schema_version": 1,
+                "trigger_id": "provider-outage",
+            }
+            failed = supervisor.execute(
+                "SELECT * FROM carl_autonomy.fail_supervisor_recovery(%s, %s)",
+                (_canonical(failure), NOW),
+            ).fetchone()
+            assert failed["outcome"] == "infrastructure_attempted"
+            revision = failed["revision"]
+
+        with pytest.raises(psycopg.Error, match="infrastructure_attempt_budget_exhausted"):
+            supervisor.execute(
+                "SELECT * FROM carl_autonomy.claim_supervisor_recovery(%s, %s)",
+                (
+                    _canonical(
+                        _supervisor_claim_document(
+                            "provider-outage",
+                            expected_revision=revision,
+                            action_digest="9" * 64,
+                            attempt_id="infrastructure-attempt-4",
+                        )
+                    ),
+                    NOW,
+                ),
+            ).fetchone()
+
+        with pytest.raises(psycopg.Error, match="recovery_action_unchanged"):
+            supervisor.execute(
+                "SELECT * FROM carl_autonomy.claim_supervisor_recovery(%s, %s)",
+                (
+                    _canonical(
+                        _supervisor_claim_document(
+                            "provider-outage",
+                            expected_revision=revision,
+                            action_digest="1" * 64,
+                            attempt_id="changed-id-same-action",
+                        )
+                    ),
+                    NOW,
+                ),
+            ).fetchone()
+
+
+def test_supervisor_completion_is_material_and_rereads_exact_durable_receipt(
+    postgres: object,
+) -> None:
+    with _as_role(postgres, "carl_coordinator") as coordinator:
+        _create_supervisor_trigger(
+            coordinator,
+            trigger_id="stable-boundary",
+            unsafe_boundary="commissioning:provider",
+            created_at=NOW,
+        )
+    claim_document = _supervisor_claim_document(
+        "stable-boundary",
+        expected_revision=0,
+        action_digest="7" * 64,
+        attempt_id="freeze-attempt-1",
+    )
+    with _as_role(postgres, "carl_supervisor") as supervisor:
+        claimed = supervisor.execute(
+            "SELECT * FROM carl_autonomy.claim_supervisor_recovery(%s, %s)",
+            (_canonical(claim_document), NOW),
+        ).fetchone()
+        completion = {
+            "action_digest": "7" * 64,
+            "attempt_id": "freeze-attempt-1",
+            "boundary": "commissioning:provider",
+            "claim_id": "supervisor:stable-boundary",
+            "evidence_digest": DIGEST_A,
+            "expected_revision": claimed["revision"],
+            "outcome": "stable_boundary_frozen",
+            "result_digest": DIGEST_B,
+            "schema_version": 1,
+            "trigger_id": "stable-boundary",
+        }
+        completed = supervisor.execute(
+            "SELECT * FROM carl_autonomy.complete_supervisor_recovery(%s, %s)",
+            (_canonical(completion), NOW),
+        ).fetchone()
+        reread = supervisor.execute(
+            "SELECT * FROM carl_autonomy.read_supervisor_recovery_receipt(%s, %s)",
+            ("stable-boundary", "7" * 64),
+        ).fetchone()
+
+    assert completed == reread
+    assert completed["outcome"] == "stable_boundary_frozen"
+    assert completed["revision"] == 2
+    receipt = json.loads(completed["receipt_json"])
+    assert receipt["action_digest"] == "7" * 64
+    assert receipt["authoritative_revision"] == 2
+    assert receipt["outcome"] == "stable_boundary_frozen"
 
 
 @contextmanager
@@ -852,7 +1069,10 @@ def test_non_github_effect_is_fenced_then_constructs_receipt_after_verified_resu
     ) as admin:
         receipt = admin.execute(
             "SELECT completion_event_json, completion_event_digest, effect_response_json, "
-            "status FROM carl_autonomy.coordinator_runtime WHERE experiment_id=%s",
+            "status, (SELECT event.authority FROM carl_autonomy.experiment_events AS event "
+            "WHERE event.event_digest = runtime.completion_event_digest) "
+            "AS completion_event_authority "
+            "FROM carl_autonomy.coordinator_runtime AS runtime WHERE experiment_id=%s",
             (manifest.experiment_id,),
         ).fetchone()
 
@@ -864,7 +1084,8 @@ def test_non_github_effect_is_fenced_then_constructs_receipt_after_verified_resu
         receipt["completion_event_digest"]
         == hashlib.sha256(receipt["completion_event_json"].encode()).hexdigest()
     )
-    assert event["authority"] == "validator"
+    assert "authority" not in event
+    assert receipt["completion_event_authority"] == "validator"
     assert event["payload"] == {
         "command_key": command.command_key,
         "effect_key": command.effect_key,
@@ -2448,34 +2669,49 @@ def test_effect_fence_migration_rejects_scratch_poison_and_drops_its_own_scratch
 
     assert POSTGRES_DSN is not None
     scratch = "carl_autonomy._migration_expected_effect_attempts"
-    with postgres.connect(POSTGRES_DSN, autocommit=True, row_factory=dict_row) as admin:  # type: ignore[attr-defined]
-        admin.execute("DROP SCHEMA IF EXISTS carl_autonomy CASCADE")
+    failed_connection = postgres.connect(  # type: ignore[attr-defined]
+        POSTGRES_DSN, autocommit=True, row_factory=dict_row
+    )
+    try:
+        failed_connection.execute("DROP SCHEMA IF EXISTS carl_autonomy CASCADE")
         for migration in BASE_MIGRATIONS:
-            admin.execute(migration.read_text(encoding="utf-8"), prepare=False)
-        admin.execute(f"CREATE TABLE {scratch}(poison integer)")
+            failed_connection.execute(migration.read_text(encoding="utf-8"), prepare=False)
+        failed_connection.execute(f"CREATE TABLE {scratch}(poison integer)")
         with pytest.raises(Exception, match="effect_fence_scratch_exists"):
-            admin.execute(
+            failed_connection.execute(
                 GITHUB_EFFECT_FENCES_MIGRATION.read_text(encoding="utf-8"),
                 prepare=False,
             )
-        assert admin.execute(
-            "SELECT to_regclass(%s) IS NOT NULL AS poison_preserved",
-            (scratch,),
-        ).fetchone() == {"poison_preserved": True}
-        admin.execute(f"DROP TABLE {scratch}")
+        failed_connection.rollback()
+        failed_connection.close()
 
-        admin.execute(
-            GITHUB_EFFECT_FENCES_MIGRATION.read_text(encoding="utf-8"),
-            prepare=False,
-        )
-        assert admin.execute(
-            "SELECT to_regclass(%s) IS NULL AS scratch_dropped",
-            (scratch,),
-        ).fetchone() == {"scratch_dropped": True}
+        with postgres.connect(  # type: ignore[attr-defined]
+            POSTGRES_DSN, autocommit=True, row_factory=dict_row
+        ) as recovered:
+            assert recovered.execute(
+                "SELECT to_regclass(%s) IS NOT NULL AS poison_preserved",
+                (scratch,),
+            ).fetchone() == {"poison_preserved": True}
+            recovered.execute(f"DROP TABLE {scratch}")
 
-        admin.execute("DROP SCHEMA IF EXISTS carl_autonomy CASCADE")
-        for migration in MIGRATIONS:
-            admin.execute(migration.read_text(encoding="utf-8"), prepare=False)
+            recovered.execute(
+                GITHUB_EFFECT_FENCES_MIGRATION.read_text(encoding="utf-8"),
+                prepare=False,
+            )
+            assert recovered.execute(
+                "SELECT to_regclass(%s) IS NULL AS scratch_dropped",
+                (scratch,),
+            ).fetchone() == {"scratch_dropped": True}
+    finally:
+        if not failed_connection.closed:
+            failed_connection.rollback()
+            failed_connection.close()
+        with postgres.connect(  # type: ignore[attr-defined]
+            POSTGRES_DSN, autocommit=True
+        ) as restore:
+            restore.execute("DROP SCHEMA IF EXISTS carl_autonomy CASCADE")
+            for migration in MIGRATIONS:
+                restore.execute(migration.read_text(encoding="utf-8"), prepare=False)
 
 
 @pytest.mark.parametrize(
