@@ -1,27 +1,40 @@
 # Carl
 
-Carl is Stephen Bickel's personal, local-first Rust coding agent and an open-source
-agent harness. It is built around a deterministic kernel, durable and replayable
-events, explicit permission boundaries, and provider-owned subscription login.
+Carl is Stephen Bickel's personal, local-first Rust coding agent, an open-source
+agent harness, and a self-improving project. It is built around a deterministic
+kernel, durable and replayable events, explicit permission boundaries, and
+provider-owned subscription login.
 Carl's personality and operating principles are public in the
 [public operating contract](CARL.md). The name is Stephen's middle name and his
 grandfather's name.
 
-## Autonomous improvement: commissioning
+## Autonomous improvement
 
-Carl is commissioning a graph-engineered autonomous improvement factory. Within that
-commissioned flow, it implements and evaluates a bounded hypothesis, pushes an
-experimental candidate, independently promotes verified gains through protected main,
-observes a 24-hour soak, and performs an exact revert for a hard regression. Independent
-validation and the remaining flow require no routine human approval. The flow uses
-capability transfer only when durable evidence establishes that the receiving role has
-the narrowly scoped authority it needs.
+Status: commissioning
 
-This commissioning status does not claim that all historical commits were autonomous. It
-also does not claim that current product promotion is autonomous. The public safety
-boundaries, evidence requirements, and responsibility graph are in the
-[autonomous improvement graph](docs/autonomous-improvement.md). The approved design is
-[the autonomous improvement operating-system design](docs/superpowers/specs/2026-08-19-carl-autonomous-improvement-operating-system-design.md).
+Carl's self-improving project is commissioning a graph-engineered improvement factory.
+The responsibility chain is hypothesis → builder → paired evaluation → immutable
+experimental branch → independent disposition → protected production PR → 24-hour
+soak → exact revert when required → retained learning. The configured policy explicitly
+authorizes autonomous experimental pushes and protected production promotion without
+routine human approval, while required checks and branch protection remain authoritative.
+No automation may directly push `main`, force-push, weaken a gate, edit observed
+evidence, deploy, or release.
+
+Heavy builds, paired evaluations, protected validation, and soak probes are cloud-heavy
+execution; local automations are thin control-plane clients and may not silently run the
+heavy workload on the owner's computer. Held-out transfer checks, novelty checks,
+immutable provenance, task-level regressions, and independent review prevent a higher
+benchmark score from standing in for broader capability.
+
+This status remains commissioning until a genuine `remote_cloud_acceptance_receipt`
+binds an exact experimental ref, independent disposition, protected PR and production
+commit, and accepted soak. Current zero-human operation is not proven and is not claimed.
+This commissioning status does not claim that all historical commits were autonomous.
+The public safety boundaries and graph are in the
+[autonomous improvement graph](docs/autonomous-improvement.md); operator evidence,
+recovery, and update rules are in [autonomy operations](docs/autonomy-operations.md).
+The approved design is [the autonomous improvement operating-system design](docs/superpowers/specs/2026-08-19-carl-autonomous-improvement-operating-system-design.md).
 
 ## Status: pre-alpha, usable terminal and ACP coding paths
 

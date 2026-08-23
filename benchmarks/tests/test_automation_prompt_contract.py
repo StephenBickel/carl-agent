@@ -13,6 +13,9 @@ import pytest
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 PORTFOLIO_PATH = REPOSITORY_ROOT / "docs" / "automation-prompts" / "carl-autonomous-improvement.md"
 LIVE_MANIFEST_PATH = PORTFOLIO_PATH.with_name("carl-autonomous-improvement-live-manifest.json")
+README_PATH = REPOSITORY_ROOT / "README.md"
+AUTONOMY_GUIDE_PATH = REPOSITORY_ROOT / "docs" / "autonomous-improvement.md"
+AUTONOMY_OPERATIONS_PATH = REPOSITORY_ROOT / "docs" / "autonomy-operations.md"
 SUPERVISOR_TRIGGER_PATH = (
     "/Users/openclaw/.codex/automations/.shared-private/carl-autonomy-supervisor-triggers.sqlite3"
 )
@@ -527,6 +530,50 @@ def test_sanitized_live_manifest_matches_the_complete_canonical_portfolio() -> N
         assert entry["status"] == "ACTIVE"
         assert entry["configuration"] == snapshot.metadata
         assert entry["prompt_sha256"] == hashlib.sha256(snapshot.prompt.encode("utf-8")).hexdigest()
+
+
+def test_task_18_public_contract_keeps_live_autonomy_in_commissioning() -> None:
+    manifest = json.loads(LIVE_MANIFEST_PATH.read_text(encoding="utf-8"))
+
+    assert manifest["autonomy_status"] == {
+        "acceptance_receipt": None,
+        "evidence": "docs/autonomy-operations.md#commissioning-and-live-acceptance",
+        "operational_claim_requires": "remote_cloud_acceptance_receipt",
+        "status": "commissioning",
+    }
+
+    documents = {
+        "README": README_PATH.read_text(encoding="utf-8"),
+        "graph": AUTONOMY_GUIDE_PATH.read_text(encoding="utf-8"),
+        "operations": AUTONOMY_OPERATIONS_PATH.read_text(encoding="utf-8"),
+    }
+    for name, document in documents.items():
+        normalized = " ".join(document.casefold().split())
+        assert "self-improving project" in normalized, name
+        assert "status: commissioning" in normalized, name
+        assert "remote_cloud_acceptance_receipt" in normalized, name
+        assert "current zero-human operation" in normalized, name
+        assert "not" in normalized.split("current zero-human operation", 1)[1][:80], name
+
+
+def test_task_18_portfolio_documents_concrete_outcome_only_updates() -> None:
+    document = PORTFOLIO_PATH.read_text(encoding="utf-8")
+    normalized = " ".join(document.casefold().split())
+
+    for phrase in (
+        "hypothesis -> builder -> paired evaluation -> immutable experimental",
+        "independent disposition -> protected production -> soak -> revert -> retained learning",
+        "autonomously push immutable experimental branches",
+        "autonomously promote eligible candidates through protected production prs",
+        "held-out transfer",
+        "novelty check",
+        "provenance",
+        "never directly push `main`",
+        "never weaken required checks",
+        "concrete pushed, disposed, promoted, soaked, reverted, or frozen outcome",
+        "exact identity and authoritative time",
+    ):
+        assert phrase in normalized
 
 
 def test_scheduled_cloud_coordinator_is_single_node_default_branch_only_and_state_scoped() -> None:
