@@ -2219,7 +2219,7 @@ BEGIN
                 OR (command_value->>'max_attempts')::integer
                     <> (ready_node->>'max_attempts')::integer
                 OR (command_value->>'expected_revision')::integer <> runtime.revision
-                OR CASE decision_value->>'action'
+                OR (CASE decision_value->>'action'
                     WHEN 'persist_command' THEN
                         command_value->>'command_key' <> ready_node->>'command_key'
                         OR command_value->>'request_digest' <> ready_node->>'request_digest'
@@ -2234,7 +2234,7 @@ BEGIN
                         OR (command_value->>'attempt')::integer
                             <> (ready_node->>'attempt')::integer + 1
                     ELSE true
-                END
+                END)
             THEN
                 RAISE EXCEPTION USING
                     ERRCODE = '42501', MESSAGE = 'coordinator_command_node_authority_denied';
@@ -2661,7 +2661,7 @@ BEGIN
         OR request_value->>'effect_key' IS DISTINCT FROM command_state.effect_key
         OR carl_autonomy.canonical_jsonb(decision_value->'command')
             <> command_state.command_json
-        OR CASE
+        OR (CASE
             WHEN runtime.effect_family = 'github' THEN CASE ready_node->>'kind'
                 WHEN 'dispatch_builder' THEN
                     request_value->>'operation' IS DISTINCT FROM 'dispatch_workflow'
@@ -2708,7 +2708,7 @@ BEGIN
                 OR NOT carl_autonomy.canonical_utc_text_valid(
                     request_value->>'occurred_at'
                 )
-        END
+        END)
     THEN
         RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'coordinator_effect_identity_mismatch';
     END IF;
@@ -2846,7 +2846,7 @@ BEGIN
         OR response_value->>'request_digest'
             IS DISTINCT FROM runtime.effect_request_digest
         OR response_value->>'request_digest' !~ '^[0-9a-f]{64}$'
-        OR CASE
+        OR (CASE
             WHEN jsonb_typeof(response_value->'observed_at') <> 'string' THEN true
             WHEN NOT carl_autonomy.canonical_utc_text_valid(
                 response_value->>'observed_at'
@@ -2855,8 +2855,8 @@ BEGIN
                     < command_state.occurred_at
                 OR (response_value->>'observed_at')::timestamptz
                     > p_observed_at + interval '30 seconds'
-        END
-        OR CASE response_value->>'status'
+        END)
+        OR (CASE response_value->>'status'
             WHEN 'completed' THEN
                 jsonb_typeof(response_value->'result_digest') <> 'string'
                 OR response_value->>'result_digest' !~ '^[0-9a-f]{64}$'
@@ -2869,20 +2869,20 @@ BEGIN
             WHEN 'retry_scheduled' THEN
                 response_value->'result_digest' IS DISTINCT FROM 'null'::jsonb
                 OR response_value->'error_code' IS DISTINCT FROM 'null'::jsonb
-                OR CASE
+                OR (CASE
                     WHEN jsonb_typeof(response_value->'retry_not_before') <> 'string'
                         THEN true
                     WHEN NOT carl_autonomy.canonical_utc_text_valid(
                         response_value->>'retry_not_before'
                     ) THEN true
                     ELSE (response_value->>'retry_not_before')::timestamptz < p_observed_at
-                END
+                END)
             WHEN 'uncertain' THEN
                 response_value->'result_digest' IS DISTINCT FROM 'null'::jsonb
                 OR response_value->'retry_not_before' IS DISTINCT FROM 'null'::jsonb
                 OR response_value->'error_code' IS DISTINCT FROM 'null'::jsonb
             ELSE true
-        END
+        END)
     THEN
         RAISE EXCEPTION USING
             ERRCODE = '55000', MESSAGE = 'coordinator_effect_response_mismatch';
@@ -2897,22 +2897,22 @@ BEGIN
                 IS DISTINCT FROM runtime.effect_request_digest
             OR prior_response_value->>'status' IN ('completed', 'rejected')
             OR prior_response_value->>'status' NOT IN ('uncertain', 'retry_scheduled')
-            OR CASE
+            OR (CASE
                 WHEN NOT carl_autonomy.canonical_utc_text_valid(
                     prior_response_value->>'observed_at'
                 ) THEN true
                 ELSE (prior_response_value->>'observed_at')::timestamptz
                     > (response_value->>'observed_at')::timestamptz
-            END
+            END)
             OR (
                 prior_response_value->>'status' = 'retry_scheduled'
-                AND CASE
+                AND (CASE
                     WHEN NOT carl_autonomy.canonical_utc_text_valid(
                         prior_response_value->>'retry_not_before'
                     ) THEN true
                     ELSE (prior_response_value->>'retry_not_before')::timestamptz
                         > p_observed_at
-                END
+                END)
             )
         THEN
             RAISE EXCEPTION USING
@@ -3516,13 +3516,13 @@ BEGIN
         OR github_request->'schema_version' IS DISTINCT FROM '1'::jsonb
         OR github_request->>'domain' <> 'carl.github-effect.ipc.request.v1'
         OR NOT carl_autonomy.canonical_utc_text_valid(github_request->>'occurred_at')
-        OR CASE registration->>'node'
+        OR (CASE registration->>'node'
             WHEN 'publish_experimental' THEN
                 github_request->>'operation' <> 'create_experimental_ref'
             WHEN 'dispatch_validation' THEN
                 github_request->>'operation' <> 'dispatch_workflow'
             ELSE true
-        END
+        END)
     THEN
         RAISE EXCEPTION USING
             ERRCODE = '22023', MESSAGE = 'builder_effect_github_request_invalid';
