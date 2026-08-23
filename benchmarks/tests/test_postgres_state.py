@@ -57,7 +57,12 @@ from carl_bench.coordinator_effects import (
 )
 from carl_bench.coordinator_recovery import CoordinatorRecoveryRequest
 from carl_bench.experiment import EventType, ExperimentEvent
-from carl_bench.github_cloud import GitHubEffectAttempt, workflow_dispatch_binding
+from carl_bench.github_cloud import (
+    ExperimentalBranchRequest,
+    GitHubEffectAttempt,
+    experimental_branch_binding,
+    workflow_dispatch_binding,
+)
 from carl_bench.github_effect_ipc import (
     REQUEST_DOMAIN,
     RESPONSE_DOMAIN,
@@ -1138,6 +1143,7 @@ class FakeDatabase:
     def operation(query: str) -> str:
         for operation in (
             "register_dead_holder_observation",
+            "register_and_claim_builder_effect",
             "complete_command_and_append_event",
             "register_manifest",
             "append_event",
@@ -1804,6 +1810,81 @@ def _effect_attempt() -> GitHubEffectAttempt:
         not_before="2026-08-20T12:00:30Z",
         observed_at=NOW_TEXT,
     )
+
+
+def test_builder_effect_registration_returns_exact_atomically_claimed_command() -> None:
+    database = FakeDatabase()
+    typed = ExperimentalBranchRequest.create(
+        experiment_id="exp-recovery-001", candidate_commit="2" * 40
+    )
+    binding = experimental_branch_binding("StephenBickel/carl-agent", typed)
+    command = CloudCommand.create(
+        command_key=binding.command_key,
+        authority=binding.authority,
+        operation=binding.operation,
+        request_digest=binding.request_digest,
+        occurred_at="2026-08-23T12:10:00Z",
+        expected_revision=7,
+        attempt=1,
+        max_attempts=3,
+    )
+    claim = CommandClaim(
+        command_key=command.command_key,
+        claim_id="builder-effect-" + "a" * 48,
+        authority=command.authority,
+        expected_revision=7,
+        claimed_at="2026-08-23T12:10:01Z",
+        expires_at="2026-08-23T12:25:01Z",
+    )
+    database.responses["register_and_claim_builder_effect"] = [
+        {
+            "applied": True,
+            "claim_json": _canonical(claim.to_canonical_dict()),
+            "command_json": _canonical(command.to_canonical_dict()),
+            "failure_code": None,
+            "result_digest": None,
+            "revision": 8,
+            "status": "claimed",
+            "transition_json": None,
+        }
+    ]
+    github_request = GitHubEffectRequest.from_canonical_dict(
+        {
+            "command_key": command.command_key,
+            "domain": REQUEST_DOMAIN,
+            "effect_key": command.effect_key,
+            "occurred_at": command.occurred_at,
+            "operation": "create_experimental_ref",
+            "parameters": {
+                "branch": typed.branch,
+                "candidate_commit": typed.candidate_commit,
+                "experiment_id": typed.experiment_id,
+            },
+            "request_key": binding.request_key,
+            "schema_version": 1,
+        }
+    )
+
+    state = _backend(database).register_and_claim_builder_effect(
+        node="publish_experimental",
+        experiment_id=typed.experiment_id,
+        expected_revision=7,
+        idempotency_key="a" * 64,
+        builder_request_digest="b" * 64,
+        publication_request_digest="c" * 64,
+        candidate_packet_digest="d" * 64,
+        parent_commit="1" * 40,
+        github_binding_request_digest=binding.request_digest,
+        github_request=github_request,
+    )
+
+    assert state.command == command
+    assert state.claim == claim
+    assert state.status == "claimed"
+    persisted = json.loads(database.calls[-1][1][0])
+    assert persisted["node"] == "publish_experimental"
+    assert persisted["github_request"] == github_request.to_canonical_dict()
+    assert persisted["candidate_packet_digest"] == "d" * 64
 
 
 def test_postgres_adapter_resolves_durable_claim_and_atomically_prepares_effect_fence() -> None:

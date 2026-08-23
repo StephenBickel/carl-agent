@@ -1534,6 +1534,92 @@ class PostgresStateBackend(StateBackend):
             ),
         )
 
+    def register_and_claim_builder_effect(
+        self,
+        *,
+        node: str,
+        experiment_id: str,
+        expected_revision: int,
+        idempotency_key: str,
+        builder_request_digest: str,
+        publication_request_digest: str,
+        candidate_packet_digest: str,
+        parent_commit: str,
+        github_binding_request_digest: str,
+        github_request: object,
+    ) -> CommandState:
+        """Atomically bind and claim one builder GitHub effect in coordinator state."""
+        from carl_bench.github_effect_ipc import GitHubEffectRequest
+
+        if (
+            node not in {"publish_experimental", "dispatch_validation"}
+            or not isinstance(experiment_id, str)
+            or not experiment_id
+            or type(expected_revision) is not int
+            or expected_revision < 0
+            or not isinstance(github_request, GitHubEffectRequest)
+        ):
+            raise PostgresStateError("builder_effect_registration_invalid")
+        expected_authority, expected_operation = (
+            ("builder", "publish_experimental")
+            if node == "publish_experimental"
+            else ("coordinator", "dispatch")
+        )
+        derived_binding_digest = (
+            __import__("carl_bench.github_effect_service", fromlist=["_typed_request"])
+            ._typed_request(github_request, self._builder_effect_policy())[1]
+            .request_digest
+        )
+        if derived_binding_digest != github_binding_request_digest:
+            raise PostgresStateError("builder_effect_registration_invalid")
+        command = CloudCommand.create(
+            command_key=github_request.command_key,
+            authority=expected_authority,
+            operation=expected_operation,
+            request_digest=derived_binding_digest,
+            occurred_at=github_request.occurred_at,
+            expected_revision=expected_revision,
+            attempt=1,
+            max_attempts=3,
+        )
+        if command.effect_key != github_request.effect_key:
+            raise PostgresStateError("builder_effect_registration_invalid")
+        registration = {
+            "builder_request_digest": builder_request_digest,
+            "candidate_packet_digest": candidate_packet_digest,
+            "domain": "carl.product-builder.coordinator-effect.v1",
+            "expected_revision": expected_revision,
+            "experiment_id": experiment_id,
+            "github_request": github_request.to_canonical_dict(),
+            "github_binding_request_digest": github_binding_request_digest,
+            "idempotency_key": idempotency_key,
+            "node": node,
+            "parent_commit": parent_commit,
+            "publication_request_digest": publication_request_digest,
+            "schema_version": 1,
+        }
+        mutation = self._mutation(
+            "coordinator",
+            "SELECT * FROM carl_autonomy.register_and_claim_builder_effect(%s)",
+            (_canonical_text(registration),),
+            self._decode_command,
+        )
+        if not isinstance(mutation, CommandMutation) or mutation.state.command != command:
+            raise PostgresStateError("builder_effect_registration_identity_mismatch")
+        if mutation.state.status != "claimed":
+            raise PostgresStateError("builder_effect_registration_not_claimed")
+        return mutation.state
+
+    @staticmethod
+    def _builder_effect_policy() -> object:
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            repository="StephenBickel/carl-agent",
+            workflow_ref="main",
+            dispatch_actor_login="carl-autonomy[bot]",
+        )
+
     def execute_coordinator_effect(
         self,
         decision: object,

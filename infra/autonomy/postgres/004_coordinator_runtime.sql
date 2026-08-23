@@ -3404,6 +3404,246 @@ BEGIN
 END;
 $$;
 
+CREATE OR REPLACE FUNCTION carl_autonomy.register_and_claim_builder_effect(
+    p_registration_json text
+)
+RETURNS TABLE(
+    applied boolean,
+    claim_json text,
+    command_json text,
+    failure_code text,
+    result_digest text,
+    revision integer,
+    status text,
+    transition_json text
+)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, carl_autonomy
+AS $$
+DECLARE
+    registration jsonb;
+    github_request jsonb;
+    runtime carl_autonomy.coordinator_runtime%ROWTYPE;
+    snapshot_value jsonb;
+    selected_node jsonb;
+    repaired_nodes jsonb;
+    command_value text;
+    claim_value text;
+    command_effect_key text;
+    expected_idempotency text;
+    observed_at timestamptz := statement_timestamp();
+    create_result record;
+    claim_result record;
+    existing_command carl_autonomy.commands%ROWTYPE;
+BEGIN
+    PERFORM carl_autonomy.require_role(ARRAY['carl_state_backend']);
+    registration := carl_autonomy.parse_object(
+        p_registration_json, 'builder_effect_registration_invalid'
+    );
+    IF carl_autonomy.canonical_jsonb(registration) <> p_registration_json
+        OR carl_autonomy.jsonb_object_cardinality(registration) IS DISTINCT FROM 12
+        OR NOT registration ?& ARRAY[
+            'schema_version', 'domain', 'node', 'experiment_id', 'expected_revision',
+            'idempotency_key', 'builder_request_digest', 'publication_request_digest',
+            'candidate_packet_digest', 'parent_commit',
+            'github_binding_request_digest', 'github_request'
+        ]
+        OR registration->'schema_version' IS DISTINCT FROM '1'::jsonb
+        OR registration->>'domain' <> 'carl.product-builder.coordinator-effect.v1'
+        OR registration->>'node' NOT IN ('publish_experimental', 'dispatch_validation')
+        OR registration->>'experiment_id' !~ '^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$'
+        OR jsonb_typeof(registration->'expected_revision') <> 'number'
+        OR (registration->>'expected_revision')::integer NOT BETWEEN 0 AND 2147483646
+        OR registration->>'idempotency_key' !~ '^[0-9a-f]{64}$'
+        OR registration->>'builder_request_digest' !~ '^[0-9a-f]{64}$'
+        OR registration->>'publication_request_digest' !~ '^[0-9a-f]{64}$'
+        OR registration->>'candidate_packet_digest' !~ '^[0-9a-f]{64}$'
+        OR registration->>'github_binding_request_digest' !~ '^[0-9a-f]{64}$'
+        OR registration->>'parent_commit' !~ '^([0-9a-f]{40}|[0-9a-f]{64})$'
+        OR jsonb_typeof(registration->'github_request') <> 'object'
+    THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '22023', MESSAGE = 'builder_effect_registration_invalid';
+    END IF;
+    github_request := registration->'github_request';
+    IF carl_autonomy.jsonb_object_cardinality(github_request) IS DISTINCT FROM 8
+        OR NOT github_request ?& ARRAY[
+            'schema_version', 'domain', 'operation', 'command_key', 'effect_key',
+            'request_key', 'occurred_at', 'parameters'
+        ]
+        OR github_request->'schema_version' IS DISTINCT FROM '1'::jsonb
+        OR github_request->>'domain' <> 'carl.github-effect.ipc.request.v1'
+        OR NOT carl_autonomy.canonical_utc_text_valid(github_request->>'occurred_at')
+        OR CASE registration->>'node'
+            WHEN 'publish_experimental' THEN
+                github_request->>'operation' <> 'create_experimental_ref'
+            WHEN 'dispatch_validation' THEN
+                github_request->>'operation' <> 'dispatch_workflow'
+            ELSE true
+        END
+    THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '22023', MESSAGE = 'builder_effect_github_request_invalid';
+    END IF;
+    command_effect_key := 'cloud-effect-' || carl_autonomy.sha256_text(
+        carl_autonomy.canonical_jsonb(jsonb_build_object(
+            'authority', CASE registration->>'node'
+                WHEN 'publish_experimental' THEN 'builder' ELSE 'coordinator' END,
+            'command_key', github_request->>'command_key',
+            'operation', CASE registration->>'node'
+                WHEN 'publish_experimental' THEN 'publish_experimental' ELSE 'dispatch' END,
+            'request_digest', registration->>'github_binding_request_digest'
+        ))
+    );
+    expected_idempotency := carl_autonomy.sha256_text(
+        carl_autonomy.canonical_jsonb(jsonb_build_object(
+            'candidate_packet_digest', registration->>'candidate_packet_digest',
+            'command_key', github_request->>'command_key',
+            'effect_key', command_effect_key,
+            'expected_revision', (registration->>'expected_revision')::integer,
+            'experiment_id', registration->>'experiment_id',
+            'github_binding_request_digest', registration->>'github_binding_request_digest',
+            'github_request_digest', carl_autonomy.sha256_text(
+                carl_autonomy.canonical_jsonb(github_request)
+            ),
+            'node', registration->>'node',
+            'parent_commit', registration->>'parent_commit',
+            'publication_request_digest', registration->>'publication_request_digest',
+            'request_digest', registration->>'builder_request_digest',
+            'schema_version', 1
+        ))
+    );
+    IF github_request->>'effect_key' <> command_effect_key
+        OR registration->>'idempotency_key' <> expected_idempotency
+    THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '55000', MESSAGE = 'builder_effect_identity_mismatch';
+    END IF;
+    SELECT item.* INTO runtime
+    FROM carl_autonomy.coordinator_runtime AS item
+    WHERE item.experiment_id = registration->>'experiment_id'
+    FOR UPDATE;
+    IF NOT FOUND
+        OR runtime.status IN ('complete', 'frozen')
+        OR runtime.revision <> (registration->>'expected_revision')::integer
+    THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '40001', MESSAGE = 'builder_effect_revision_cas_mismatch';
+    END IF;
+    snapshot_value := carl_autonomy.parse_object(
+        runtime.snapshot_json, 'coordinator_snapshot_json_invalid'
+    );
+    SELECT node INTO selected_node
+    FROM jsonb_array_elements(snapshot_value->'nodes') AS node
+    WHERE node->>'status' = 'ready'
+    ORDER BY carl_autonomy.coordinator_node_priority(node->>'kind'), node->>'node_id'
+    LIMIT 1;
+    IF selected_node IS NULL
+        OR selected_node->>'kind' <> registration->>'node'
+        OR selected_node->>'node_id'
+            <> ((registration->>'experiment_id') || ':' || (registration->>'node'))
+    THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '55000', MESSAGE = 'builder_effect_node_mismatch';
+    END IF;
+    SELECT command.* INTO existing_command
+    FROM carl_autonomy.commands AS command
+    WHERE command.command_key = github_request->>'command_key';
+    IF FOUND THEN
+        IF existing_command.effect_key <> command_effect_key
+            OR existing_command.request_digest
+                <> (registration->>'github_binding_request_digest')::character(64)
+            OR existing_command.status <> 'claimed'
+            OR runtime.effect_request_json <> carl_autonomy.canonical_jsonb(github_request)
+            OR runtime.effect_request_digest
+                <> carl_autonomy.sha256_text(carl_autonomy.canonical_jsonb(github_request))
+        THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '23505', MESSAGE = 'builder_effect_replay_conflict';
+        END IF;
+        RETURN QUERY SELECT false, existing_command.claim_json,
+            existing_command.command_json, existing_command.failure_code,
+            existing_command.result_digest, existing_command.revision,
+            existing_command.status, existing_command.transition_json;
+        RETURN;
+    END IF;
+    command_value := carl_autonomy.canonical_jsonb(jsonb_build_object(
+        'attempt', 1,
+        'authority', CASE registration->>'node'
+            WHEN 'publish_experimental' THEN 'builder' ELSE 'coordinator' END,
+        'command_key', github_request->>'command_key',
+        'effect_key', command_effect_key,
+        'expected_revision', runtime.revision,
+        'max_attempts', 3,
+        'occurred_at', github_request->>'occurred_at',
+        'operation', CASE registration->>'node'
+            WHEN 'publish_experimental' THEN 'publish_experimental' ELSE 'dispatch' END,
+        'request_digest', registration->>'github_binding_request_digest',
+        'schema_version', 1
+    ));
+    PERFORM set_config(
+        'carl_autonomy.authority',
+        CASE registration->>'node'
+            WHEN 'publish_experimental' THEN 'builder' ELSE 'coordinator' END,
+        true
+    );
+    SELECT * INTO STRICT create_result
+    FROM carl_autonomy.create_command(command_value, observed_at);
+    claim_value := carl_autonomy.canonical_jsonb(jsonb_build_object(
+        'authority', (command_value::jsonb)->>'authority',
+        'claimed_at', carl_autonomy.coordinator_timestamp(observed_at),
+        'command_key', github_request->>'command_key',
+        'claim_id', 'builder-effect-' || substr(registration->>'idempotency_key', 1, 48),
+        'expected_revision', runtime.revision,
+        'expires_at', carl_autonomy.coordinator_timestamp(
+            observed_at + interval '15 minutes'
+        )
+    ));
+    SELECT * INTO STRICT claim_result
+    FROM carl_autonomy.claim_command(claim_value, observed_at);
+    SELECT jsonb_agg(
+        CASE WHEN node->>'node_id' = selected_node->>'node_id' THEN
+            jsonb_set(
+                jsonb_set(
+                    jsonb_set(node, '{command_key}', to_jsonb(github_request->>'command_key'), false),
+                    '{request_digest}',
+                    to_jsonb(registration->>'github_binding_request_digest'),
+                    false
+                ),
+                '{occurred_at}', to_jsonb(github_request->>'occurred_at'), false
+            )
+        ELSE node END
+        ORDER BY ordinal
+    ) INTO repaired_nodes
+    FROM jsonb_array_elements(snapshot_value->'nodes')
+        WITH ORDINALITY AS value(node, ordinal);
+    snapshot_value := jsonb_set(snapshot_value, '{nodes}', repaired_nodes, false);
+    PERFORM set_config('carl_autonomy.authority', 'coordinator', true);
+    UPDATE carl_autonomy.coordinator_runtime AS item
+    SET snapshot_json = carl_autonomy.canonical_jsonb(snapshot_value),
+        snapshot_digest = carl_autonomy.sha256_text(
+            carl_autonomy.canonical_jsonb(snapshot_value)
+        ),
+        effect_family = 'github',
+        effect_request_json = carl_autonomy.canonical_jsonb(github_request),
+        effect_request_digest = carl_autonomy.sha256_text(
+            carl_autonomy.canonical_jsonb(github_request)
+        ),
+        updated_at = observed_at
+    WHERE item.experiment_id = runtime.experiment_id
+        AND item.revision = runtime.revision;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '40001', MESSAGE = 'builder_effect_revision_cas_mismatch';
+    END IF;
+    RETURN QUERY SELECT claim_result.applied, claim_result.claim_json,
+        claim_result.command_json, claim_result.failure_code,
+        claim_result.result_digest, claim_result.revision,
+        claim_result.status, claim_result.transition_json;
+END;
+$$;
+
 REVOKE ALL ON FUNCTION
     carl_autonomy.coordinator_timestamp(timestamptz),
     carl_autonomy.coordinator_node_priority(text),
@@ -3436,6 +3676,7 @@ REVOKE ALL ON FUNCTION
     carl_autonomy.complete_coordinator_effect(text, text, timestamptz),
     carl_autonomy.execute_coordinator_local_effect_unchecked(text, timestamptz),
     carl_autonomy.execute_coordinator_local_effect(text, timestamptz),
+    carl_autonomy.register_and_claim_builder_effect(text),
     carl_autonomy.coordinator_effect_family(text)
 FROM PUBLIC, carl_autonomy_workflow;
 
@@ -3455,7 +3696,8 @@ GRANT EXECUTE ON FUNCTION
     carl_autonomy.apply_coordinator_decision(text, timestamptz),
     carl_autonomy.prepare_coordinator_effect(text, timestamptz),
     carl_autonomy.complete_coordinator_effect(text, text, timestamptz),
-    carl_autonomy.execute_coordinator_local_effect(text, timestamptz)
+    carl_autonomy.execute_coordinator_local_effect(text, timestamptz),
+    carl_autonomy.register_and_claim_builder_effect(text)
 TO carl_state_backend;
 
 COMMIT;

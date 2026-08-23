@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 from dataclasses import dataclass
+from itertools import pairwise
 
 from carl_bench.candidate import SealedCandidate
 from carl_bench.canonical import canonical_json_bytes
@@ -29,6 +30,7 @@ def _commit(value: object, code: str) -> str:
 @dataclass(frozen=True, slots=True)
 class ProtectedAttemptReceipt:
     schema_version: int
+    builder_request_digest: str
     registration_digest: str
     action_digest: str
     parent_commit: str
@@ -36,6 +38,7 @@ class ProtectedAttemptReceipt:
     test_command: tuple[str, ...]
     test_command_digest: str
     test_output_artifact_digest: str
+    diff_artifact_digest: str
     failing_test_id: str
     red_exit_code: int
     red_observed_at: str
@@ -46,6 +49,7 @@ class ProtectedAttemptReceipt:
     model_output_digest: str
     gateway_usage: dict[str, int]
     gateway_usage_digest: str
+    gateway_cost_receipt_digest: str
     trusted_cost_microdollars: int
     changed_paths: tuple[str, ...]
     tools: tuple[str, ...]
@@ -58,14 +62,17 @@ class ProtectedAttemptReceipt:
         if self.schema_version != 1:
             raise ValueError("builder_attempt_receipt_invalid")
         for value, code in (
+            (self.builder_request_digest, "builder_attempt_request_invalid"),
             (self.registration_digest, "builder_attempt_registration_invalid"),
             (self.action_digest, "builder_attempt_action_invalid"),
             (self.test_command_digest, "builder_attempt_test_command_invalid"),
             (self.test_output_artifact_digest, "builder_attempt_test_output_invalid"),
+            (self.diff_artifact_digest, "builder_attempt_diff_artifact_invalid"),
             (self.patch_digest, "builder_attempt_patch_invalid"),
             (self.model_request_digest, "builder_attempt_model_request_invalid"),
             (self.model_output_digest, "builder_attempt_model_output_invalid"),
             (self.gateway_usage_digest, "builder_attempt_gateway_usage_invalid"),
+            (self.gateway_cost_receipt_digest, "builder_attempt_gateway_cost_invalid"),
         ):
             _digest(value, code)
         _commit(self.parent_commit, "builder_attempt_parent_invalid")
@@ -132,15 +139,17 @@ class ProtectedAttemptReceipt:
         cls,
         *,
         registration: BuilderPreregistration,
+        builder_request_digest: str,
         attempt: BuildAttemptEvidence,
         exact_parent: str,
         prepatch_tree: str,
         test_command: tuple[str, ...],
         test_output_artifact_digest: str,
+        diff_artifact_digest: str,
         postpatch_tree: str,
         model_request: OpenAIModelRequest,
         model_result: OpenAIModelResult,
-        trusted_cost_microdollars: int,
+        gateway_cost_receipt: object,
     ) -> ProtectedAttemptReceipt:
         if (
             type(registration) is not BuilderPreregistration
@@ -151,8 +160,18 @@ class ProtectedAttemptReceipt:
             or model_request.execution_context_digest != registration.digest
             or model_request.request_digest != model_result.request_digest
             or model_request.attempt != attempt.attempt
-            or trusted_cost_microdollars != attempt.cost_microdollars
             or test_output_artifact_digest != attempt.red_output_digest
+            or diff_artifact_digest != attempt.patch_digest
+        ):
+            raise ValueError("builder_attempt_observation_mismatch")
+        _digest(builder_request_digest, "builder_attempt_request_invalid")
+        from carl_bench.product_builder_gateway import ProtectedGatewayCostReceipt
+
+        if (
+            type(gateway_cost_receipt) is not ProtectedGatewayCostReceipt
+            or gateway_cost_receipt.model_request_digest != model_request.request_digest
+            or gateway_cost_receipt.model_output_digest != model_result.output_digest
+            or gateway_cost_receipt.cost_microdollars != attempt.cost_microdollars
         ):
             raise ValueError("builder_attempt_observation_mismatch")
         usage = {
@@ -164,6 +183,7 @@ class ProtectedAttemptReceipt:
         }
         return cls(
             schema_version=1,
+            builder_request_digest=builder_request_digest,
             registration_digest=registration.digest,
             action_digest=attempt.action_digest,
             parent_commit=exact_parent,
@@ -173,6 +193,7 @@ class ProtectedAttemptReceipt:
                 canonical_json_bytes(list(test_command))
             ).hexdigest(),
             test_output_artifact_digest=test_output_artifact_digest,
+            diff_artifact_digest=diff_artifact_digest,
             failing_test_id=attempt.failing_test_id,
             red_exit_code=attempt.red_exit_code,
             red_observed_at=attempt.red_observed_at,
@@ -183,7 +204,8 @@ class ProtectedAttemptReceipt:
             model_output_digest=model_result.output_digest,
             gateway_usage=usage,
             gateway_usage_digest=hashlib.sha256(canonical_json_bytes(usage)).hexdigest(),
-            trusted_cost_microdollars=trusted_cost_microdollars,
+            gateway_cost_receipt_digest=gateway_cost_receipt.digest,
+            trusted_cost_microdollars=gateway_cost_receipt.cost_microdollars,
             changed_paths=attempt.changed_paths,
             tools=attempt.tools,
             attempt=attempt.attempt,
@@ -196,12 +218,15 @@ class ProtectedAttemptReceipt:
         return {
             "action_digest": self.action_digest,
             "attempt": self.attempt,
+            "builder_request_digest": self.builder_request_digest,
             "changed_paths": list(self.changed_paths),
             "elapsed_seconds": self.elapsed_seconds,
+            "diff_artifact_digest": self.diff_artifact_digest,
             "finding_digest": self.finding_digest,
             "failing_test_id": self.failing_test_id,
             "gateway_usage": self.gateway_usage,
             "gateway_usage_digest": self.gateway_usage_digest,
+            "gateway_cost_receipt_digest": self.gateway_cost_receipt_digest,
             "model_output_digest": self.model_output_digest,
             "model_request_digest": self.model_request_digest,
             "parent_commit": self.parent_commit,
@@ -318,16 +343,22 @@ class SignedAttemptReceipt:
 @dataclass(frozen=True, slots=True)
 class ProtectedCandidatePacket:
     schema_version: int
+    builder_request_digest: str
     registration_digest: str
     parent_commit: str
+    candidate_tree: str
+    diff_artifact_digest: str
     candidate: SealedCandidate
     attempt_receipts: tuple[SignedAttemptReceipt, ...]
 
     def __post_init__(self) -> None:
         if (
             self.schema_version != 1
+            or not _digest(self.builder_request_digest, "builder_candidate_receipt_mismatch")
             or not _digest(self.registration_digest, "builder_candidate_receipt_mismatch")
             or not _commit(self.parent_commit, "builder_candidate_receipt_mismatch")
+            or not _commit(self.candidate_tree, "builder_candidate_receipt_mismatch")
+            or not _digest(self.diff_artifact_digest, "builder_candidate_receipt_mismatch")
             or type(self.candidate) is not SealedCandidate
             or not isinstance(self.attempt_receipts, tuple)
             or not self.attempt_receipts
@@ -345,8 +376,16 @@ class ProtectedCandidatePacket:
         if (
             self.candidate.parent_commit != self.parent_commit
             or any(receipt.registration_digest != self.registration_digest for receipt in receipts)
+            or receipts[-1].builder_request_digest != self.builder_request_digest
+            or len({receipt.builder_request_digest for receipt in receipts}) != len(receipts)
             or any(receipt.parent_commit != self.parent_commit for receipt in receipts)
             or tuple(receipt.attempt for receipt in receipts) != tuple(range(1, len(receipts) + 1))
+            or any(
+                earlier.postpatch_tree != later.prepatch_tree
+                for earlier, later in pairwise(receipts)
+            )
+            or receipts[-1].postpatch_tree != self.candidate_tree
+            or receipts[-1].diff_artifact_digest != self.diff_artifact_digest
             or self.candidate.changed_path_count != len(paths)
         ):
             raise ValueError("builder_candidate_receipt_mismatch")
@@ -356,7 +395,10 @@ class ProtectedCandidatePacket:
         return {
             "attempt_receipt_digests": list(self.attempt_receipt_digests),
             "attempt_receipts": [item.to_canonical_dict() for item in self.attempt_receipts],
+            "builder_request_digest": self.builder_request_digest,
             "candidate": self.candidate.to_canonical_dict(),
+            "candidate_tree": self.candidate_tree,
+            "diff_artifact_digest": self.diff_artifact_digest,
             "parent_commit": self.parent_commit,
             "registration_digest": self.registration_digest,
             "schema_version": self.schema_version,
@@ -371,7 +413,10 @@ class ProtectedCandidatePacket:
         if type(value) is not dict or set(value) != {
             "attempt_receipt_digests",
             "attempt_receipts",
+            "builder_request_digest",
             "candidate",
+            "candidate_tree",
+            "diff_artifact_digest",
             "parent_commit",
             "registration_digest",
             "schema_version",
@@ -383,8 +428,11 @@ class ProtectedCandidatePacket:
         try:
             packet = cls(
                 schema_version=value["schema_version"],
+                builder_request_digest=value["builder_request_digest"],
                 registration_digest=value["registration_digest"],
                 parent_commit=value["parent_commit"],
+                candidate_tree=value["candidate_tree"],
+                diff_artifact_digest=value["diff_artifact_digest"],
                 candidate=SealedCandidate.from_canonical_dict(value["candidate"]),
                 attempt_receipts=tuple(
                     SignedAttemptReceipt.from_canonical_dict(item) for item in receipts

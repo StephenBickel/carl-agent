@@ -38,20 +38,38 @@ def _model(registration) -> tuple[OpenAIModelRequest, OpenAIModelResult]:
     return request, result
 
 
+def _cost_receipt(registration):
+    request, result = _model(registration)
+    gateway = importlib.import_module("carl_bench.product_builder_gateway")
+    policy = gateway.BuilderPricingPolicy(
+        schema_version=1,
+        model="gpt-5.2",
+        policy_revision="builder-pricing-test-v1",
+        input_cost_microdollars_per_million_tokens=1_000_000_000,
+        cached_input_cost_microdollars_per_million_tokens=1_000_000_000,
+        output_cost_microdollars_per_million_tokens=1_000_000_000,
+    )
+    return gateway.ProtectedGatewayCostReceipt.sign(
+        request=request, result=result, policy=policy, key=b"k" * 32
+    )
+
+
 def _receipt():
     registration = _register()
     request, result = _model(registration)
     return _evidence("ProtectedAttemptReceipt").from_observation(
         registration=registration,
-        attempt=_attempt(),
+        builder_request_digest="9" * 64,
+        attempt=_attempt(cost_microdollars=150_000),
         exact_parent=registration.parent_commit,
         prepatch_tree="1" * 40,
         test_command=("cargo", "test", "restart-preserves-progress"),
         test_output_artifact_digest="8" * 64,
+        diff_artifact_digest="7" * 64,
         postpatch_tree="3" * 40,
         model_request=request,
         model_result=result,
-        trusted_cost_microdollars=250_000,
+        gateway_cost_receipt=_cost_receipt(registration),
     )
 
 
@@ -82,8 +100,11 @@ def test_candidate_packet_seals_and_reverifies_exact_receipt_digests() -> None:
 
     packet = _evidence("ProtectedCandidatePacket")(
         schema_version=1,
+        builder_request_digest="9" * 64,
         registration_digest=registration.digest,
         parent_commit=registration.parent_commit,
+        candidate_tree=receipt.postpatch_tree,
+        diff_artifact_digest=receipt.patch_digest,
         candidate=candidate,
         attempt_receipts=(envelope,),
     )
@@ -92,3 +113,43 @@ def test_candidate_packet_seals_and_reverifies_exact_receipt_digests() -> None:
     assert packet.verify(key).candidate == candidate
     with pytest.raises(ValueError, match="^builder_candidate_receipt_mismatch$"):
         replace(packet, registration_digest="f" * 64).verify(key)
+
+    for mutation in (
+        {"candidate_tree": "4" * 40},
+        {"diff_artifact_digest": "5" * 64},
+        {"builder_request_digest": "6" * 64},
+    ):
+        with pytest.raises(ValueError, match="^builder_candidate_receipt_mismatch$"):
+            replace(packet, **mutation).verify(key)
+
+
+def test_packet_rejects_receipt_sequence_with_a_tree_gap() -> None:
+    key = b"k" * 32
+    registration = _register()
+    first = _receipt()
+    second = replace(
+        first,
+        attempt=2,
+        action_digest="c" * 64,
+        patch_digest="d" * 64,
+        prepatch_tree="4" * 40,
+        postpatch_tree="5" * 40,
+        finding_digest="e" * 64,
+    )
+    candidate = replace(_candidate(registration), changed_path_count=1)
+    packet = _evidence("ProtectedCandidatePacket")(
+        schema_version=1,
+        builder_request_digest="9" * 64,
+        registration_digest=registration.digest,
+        parent_commit=registration.parent_commit,
+        candidate_tree=second.postpatch_tree,
+        diff_artifact_digest=second.patch_digest,
+        candidate=candidate,
+        attempt_receipts=(
+            _evidence("SignedAttemptReceipt").sign(first, key),
+            _evidence("SignedAttemptReceipt").sign(second, key),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="^builder_candidate_receipt_mismatch$"):
+        packet.verify(key)

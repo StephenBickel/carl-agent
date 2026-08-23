@@ -41,6 +41,7 @@ jobs:
       publication_request_digest: ${{ steps.build.outputs.publication_request_digest }}
       request_digest: ${{ steps.build.outputs.request_digest }}
       validation_idempotency_key: ${{ steps.build.outputs.validation_idempotency_key }}
+      outcome: ${{ steps.build.outputs.outcome }}
     steps:
       - name: Check out the exact protected default-branch revision
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -124,25 +125,39 @@ jobs:
               BuilderTerminalDocument,
               PurposeBoundEffectRequest,
           )
+          from carl_bench.product_builder_terminal import BuilderOutcomeTerminalDocument
 
           path = Path(os.environ["RESULT_PATH"])
           raw = path.read_bytes()
           value = json.loads(raw)
           if canonical_json_bytes(value) != raw:
               raise SystemExit("builder_terminal_not_canonical")
-          terminal = BuilderTerminalDocument.from_canonical_dict(value)
-          publication = PurposeBoundEffectRequest.for_publication(terminal)
-          validation = PurposeBoundEffectRequest.for_validation(terminal)
-          with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as output:
-              values = {
+          if value.get("outcome") == "candidate_packet":
+              terminal = BuilderTerminalDocument.from_canonical_dict(value)
+              publication = PurposeBoundEffectRequest.for_publication(terminal)
+              validation = PurposeBoundEffectRequest.for_validation(terminal)
+              candidate_values = {
                   "candidate_packet_digest": terminal.candidate_packet_digest,
-                  "expected_revision": terminal.expected_revision,
-                  "experiment_id": terminal.experiment_id,
-                  "parent_commit": terminal.parent_commit,
                   "publication_idempotency_key": publication.idempotency_key,
                   "publication_request_digest": terminal.publication_request_digest,
-                  "request_digest": terminal.request_digest,
                   "validation_idempotency_key": validation.idempotency_key,
+              }
+          else:
+              terminal = BuilderOutcomeTerminalDocument.from_canonical_dict(value)
+              candidate_values = {
+                  "candidate_packet_digest": "",
+                  "publication_idempotency_key": "",
+                  "publication_request_digest": "",
+                  "validation_idempotency_key": "",
+              }
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as output:
+              values = {
+                  "expected_revision": terminal.expected_revision,
+                  "experiment_id": terminal.experiment_id,
+                  "outcome": terminal.outcome,
+                  "parent_commit": terminal.parent_commit,
+                  "request_digest": terminal.request_digest,
+                  **candidate_values,
               }
               for name, item in values.items():
                   print(f"{name}={item}", file=output)
