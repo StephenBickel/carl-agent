@@ -307,6 +307,42 @@ def test_supervisor_authority_prioritizes_rollback_and_denies_lower_priority_cla
             ).fetchone()
 
 
+def test_supervisor_authority_rejects_unimplemented_repair_and_reconcile_actions(
+    postgres: object,
+) -> None:
+    with _as_role(postgres, "carl_coordinator") as coordinator:
+        _create_supervisor_trigger(
+            coordinator,
+            trigger_id="unsupported-recovery",
+            unsafe_boundary="commissioning:provider",
+            created_at=NOW,
+        )
+
+    with _as_role(postgres, "carl_supervisor") as supervisor:
+        for index, action in enumerate(("open_repair_pr", "reconcile_state"), start=1):
+            claim = _supervisor_claim_document(
+                "unsupported-recovery",
+                expected_revision=0,
+                action_digest=str(index) * 64,
+                attempt_id=f"unsupported-{index}",
+            )
+            claim["action_kind"] = action
+            with pytest.raises(psycopg.Error, match="supervisor_recovery_claim_invalid"):
+                supervisor.execute(
+                    "SELECT * FROM carl_autonomy.claim_supervisor_recovery(%s, %s)",
+                    (_canonical(claim), NOW),
+                ).fetchone()
+
+
+def test_supervisor_selection_is_empty_when_every_trigger_is_resolved(postgres: object) -> None:
+    with _as_role(postgres, "carl_supervisor") as supervisor:
+        selected = supervisor.execute(
+            "SELECT * FROM carl_autonomy.select_supervisor_trigger()"
+        ).fetchone()
+
+    assert selected is None
+
+
 def test_supervisor_authority_enforces_changed_action_and_three_infrastructure_attempts(
     postgres: object,
 ) -> None:
@@ -2141,9 +2177,7 @@ def test_builder_publication_uses_postgres_authority_and_one_real_socket_effect(
             "AND (event_json::jsonb)->>'event_type' = 'coordinator_node_completed'",
             (terminal.experiment_id,),
         ).fetchall()
-    nodes = {
-        node["kind"]: node["status"] for node in json.loads(runtime["snapshot_json"])["nodes"]
-    }
+    nodes = {node["kind"]: node["status"] for node in json.loads(runtime["snapshot_json"])["nodes"]}
     assert replayed.result_digest == result_digest
     assert replayed.authoritative_revision == terminal.expected_revision + 1
     assert runtime["revision"] == terminal.expected_revision + 1
@@ -2152,9 +2186,7 @@ def test_builder_publication_uses_postgres_authority_and_one_real_socket_effect(
         "dispatch_validation": "ready",
         "observe_validation": "waiting",
     }
-    assert [kind for kind, status in nodes.items() if status == "ready"] == [
-        "dispatch_validation"
-    ]
+    assert [kind for kind, status in nodes.items() if status == "ready"] == ["dispatch_validation"]
     assert durable_receipt == {
         "idempotency_key": publication.idempotency_key,
         "request_digest": publication.request_digest,
@@ -2171,9 +2203,10 @@ def test_builder_publication_uses_postgres_authority_and_one_real_socket_effect(
     assert len(completion_events) == 1
     completion_event = json.loads(completion_events[0]["event_json"])
     assert completion_events[0]["authority"] == "builder"
-    assert completion_events[0]["event_digest"] == hashlib.sha256(
-        completion_events[0]["event_json"].encode()
-    ).hexdigest()
+    assert (
+        completion_events[0]["event_digest"]
+        == hashlib.sha256(completion_events[0]["event_json"].encode()).hexdigest()
+    )
     assert completion_event["event_type"] == "coordinator_node_completed"
     assert completion_event["experiment_id"] == terminal.experiment_id
     assert completion_event["payload"] == {
@@ -2643,9 +2676,7 @@ def test_effect_fence_migration_rejects_incompatible_existing_table(postgres: ob
             admin.execute("DROP SCHEMA IF EXISTS carl_poison CASCADE")
             for migration in BASE_MIGRATIONS:
                 admin.execute(migration.read_text(encoding="utf-8"), prepare=False)
-            admin.execute(
-                "CREATE TABLE carl_autonomy.effect_attempts(effect_key text PRIMARY KEY)"
-            )
+            admin.execute("CREATE TABLE carl_autonomy.effect_attempts(effect_key text PRIMARY KEY)")
             with pytest.raises(Exception, match="effect_fence_schema_invalid"):
                 admin.execute(
                     GITHUB_EFFECT_FENCES_MIGRATION.read_text(encoding="utf-8"),

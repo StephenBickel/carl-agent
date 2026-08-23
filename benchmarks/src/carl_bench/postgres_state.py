@@ -492,6 +492,20 @@ class PostgresStateBackend(StateBackend):
             raise PostgresStateError("postgres_result_shape_invalid")
         return dict(row)
 
+    @staticmethod
+    def _zero_or_one(
+        cursor: Any, query: str, parameters: tuple[object, ...]
+    ) -> dict[str, Any] | None:
+        cursor.execute(query, parameters)
+        row = cursor.fetchone()
+        if cursor.fetchone() is not None:
+            raise PostgresStateError("postgres_result_shape_invalid")
+        if row is None:
+            return None
+        if not isinstance(row, Mapping):
+            raise PostgresStateError("postgres_result_shape_invalid")
+        return dict(row)
+
     def _mutation(
         self,
         authority: str,
@@ -505,6 +519,32 @@ class PostgresStateBackend(StateBackend):
                 self._verify_role(cursor)
                 self._set_authority(cursor, authority)
                 return decode(self._one(cursor, query, parameters))
+        except Exception as error:
+            if isinstance(error, PostgresStateError | CloudStateError | GraphContractError):
+                if isinstance(error, PostgresStateError):
+                    raise
+                raise PostgresStateError("postgres_domain_result_invalid") from error
+            primary = getattr(getattr(error, "diag", None), "message_primary", None)
+            if primary in _AUTHORITATIVE_RECEIPT_FAILURES:
+                raise PostgresStateError(primary) from None
+            raise PostgresStateError("postgres_mutation_failed") from None
+        finally:
+            connection.close()
+
+    def _optional_mutation(
+        self,
+        authority: str,
+        query: str,
+        parameters: tuple[object, ...],
+        decode: Callable[[dict[str, Any]], Any],
+    ) -> Any | None:
+        connection = self._connection()
+        try:
+            with connection.transaction(), connection.cursor() as cursor:
+                self._verify_role(cursor)
+                self._set_authority(cursor, authority)
+                row = self._zero_or_one(cursor, query, parameters)
+                return None if row is None else decode(row)
         except Exception as error:
             if isinstance(error, PostgresStateError | CloudStateError | GraphContractError):
                 if isinstance(error, PostgresStateError):
@@ -1198,10 +1238,8 @@ class PostgresStateBackend(StateBackend):
             or value["outcome"]
             not in {
                 "infrastructure_attempted",
-                "repair_pr_opened",
                 "safe_node_redispatched",
                 "stable_boundary_frozen",
-                "state_reconciled",
             }
             or not isinstance(value["trigger_id"], str)
         ):
@@ -1210,7 +1248,7 @@ class PostgresStateBackend(StateBackend):
         _strict_json_object(value["receipt_json"], code="supervisor_recovery_receipt_invalid")
         return value
 
-    def select_supervisor_trigger(self) -> dict[str, object]:
+    def select_supervisor_trigger(self) -> dict[str, object] | None:
         def decode(row: dict[str, Any]) -> dict[str, object]:
             value = _strict_row(
                 row, frozenset({"claim_id", "revision", "trigger_id", "trigger_json"})
@@ -1226,8 +1264,8 @@ class PostgresStateBackend(StateBackend):
             return value
 
         return cast(
-            dict[str, object],
-            self._mutation(
+            dict[str, object] | None,
+            self._optional_mutation(
                 "supervisor",
                 "SELECT * FROM carl_autonomy.select_supervisor_trigger()",
                 (),

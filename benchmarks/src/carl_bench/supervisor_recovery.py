@@ -23,8 +23,6 @@ _REASON = re.compile(r"^[a-z][a-z0-9_]{0,95}$")
 _ACTIONS = frozenset(
     {
         "freeze_stable_boundary",
-        "open_repair_pr",
-        "reconcile_state",
         "redispatch_safe_node",
     }
 )
@@ -160,9 +158,7 @@ def control_plane_diff(repository: Path) -> ControlPlaneDiff:
     except UnicodeError as error:
         raise SupervisorRecoveryError("repair_diff_scope_forbidden") from error
     if any(
-        path.startswith("/")
-        or ".." in Path(path).parts
-        or not _allowed_control_plane_path(path)
+        path.startswith("/") or ".." in Path(path).parts or not _allowed_control_plane_path(path)
         for path in paths
     ):
         raise SupervisorRecoveryError("repair_diff_scope_forbidden")
@@ -179,9 +175,7 @@ def control_plane_diff(repository: Path) -> ControlPlaneDiff:
             or metadata.st_size > _MAX_REPAIR_FILE_BYTES
         ):
             raise SupervisorRecoveryError("repair_diff_scope_forbidden")
-        bindings.append(
-            {"digest": hashlib.sha256(target.read_bytes()).hexdigest(), "path": path}
-        )
+        bindings.append({"digest": hashlib.sha256(target.read_bytes()).hexdigest(), "path": path})
     return ControlPlaneDiff(
         paths=paths,
         digest=hashlib.sha256(
@@ -191,7 +185,7 @@ def control_plane_diff(repository: Path) -> ControlPlaneDiff:
 
 
 class SupervisorBackend(Protocol):
-    def select_supervisor_trigger(self) -> dict[str, object]: ...
+    def select_supervisor_trigger(self) -> dict[str, object] | None: ...
 
     def claim_supervisor_recovery(self, value: dict[str, object]) -> dict[str, object]: ...
 
@@ -258,6 +252,8 @@ class SupervisorRecoveryRunner:
 
     def inspect(self) -> dict[str, object]:
         selected = self._backend.select_supervisor_trigger()
+        if selected is None:
+            return {"action": "idle", "outcome": "idle: healthy", "schema_version": 1}
         return self._strict_selected(selected)
 
     @staticmethod
@@ -285,16 +281,17 @@ class SupervisorRecoveryRunner:
     def recover(self, proposal: SupervisorProposal) -> dict[str, object]:
         if not isinstance(proposal, SupervisorProposal):
             raise SupervisorRecoveryError("supervisor_proposal_invalid")
-        selected = self.inspect()
+        raw_selected = self._backend.select_supervisor_trigger()
+        if raw_selected is None:
+            raise SupervisorRecoveryError("supervisor_trigger_not_found")
+        selected = self._strict_selected(raw_selected)
         if (
             proposal.trigger_id != selected["trigger_id"]
             or proposal.expected_revision != selected["revision"]
         ):
             raise SupervisorRecoveryError("supervisor_trigger_cas_mismatch")
         diff = control_plane_diff(self._repository)
-        if proposal.action == "open_repair_pr" and not diff.paths:
-            raise SupervisorRecoveryError("repair_diff_required")
-        if proposal.action != "open_repair_pr" and diff.paths:
+        if diff.paths:
             raise SupervisorRecoveryError("unexpected_repair_diff")
 
         action_digest = hashlib.sha256(
@@ -306,6 +303,9 @@ class SupervisorRecoveryRunner:
                 }
             )
         ).hexdigest()
+        now = self._clock()
+        if not isinstance(now, datetime) or now.tzinfo != UTC:
+            raise SupervisorRecoveryError("supervisor_clock_invalid")
         attempt_id = f"recovery-{action_digest[:32]}"
         claim_id = f"supervisor:{proposal.trigger_id}"
         claim = {
@@ -324,9 +324,6 @@ class SupervisorRecoveryRunner:
         trigger = SupervisorTrigger.from_canonical_dict(
             __import__("json").loads(selected["trigger_json"])
         )
-        now = self._clock()
-        if not isinstance(now, datetime) or now.tzinfo != UTC:
-            raise SupervisorRecoveryError("supervisor_clock_invalid")
 
         if proposal.action == "redispatch_safe_node":
             completion = self._redispatch(
@@ -337,11 +334,7 @@ class SupervisorRecoveryRunner:
             )
             completed = self._backend.complete_supervisor_redispatch(completion)
         else:
-            boundary = (
-                trigger.unsafe_boundary
-                if proposal.action == "freeze_stable_boundary"
-                else f"{proposal.action}:{proposal.reason}"
-            )
+            boundary = trigger.unsafe_boundary
             result_digest = hashlib.sha256(
                 canonical_json_bytes(
                     {
@@ -365,9 +358,7 @@ class SupervisorRecoveryRunner:
                     "trigger_id": trigger.trigger_id,
                 }
             )
-        reread = self._backend.read_supervisor_recovery_receipt(
-            proposal.trigger_id, action_digest
-        )
+        reread = self._backend.read_supervisor_recovery_receipt(proposal.trigger_id, action_digest)
         if reread != completed:
             raise SupervisorRecoveryError("supervisor_authoritative_receipt_mismatch")
         try:
@@ -392,25 +383,30 @@ class SupervisorRecoveryRunner:
     ) -> dict[str, object]:
         experiment_id, separator, node = trigger.next_safe_node_key.rpartition(":")
         if not separator or not experiment_id or node not in NODE_ORDER:
+            self._record_failure(
+                trigger=trigger,
+                claim=claim,
+                claimed_revision=claimed_revision,
+                failure_code="supervisor_safe_node_invalid",
+            )
             raise SupervisorRecoveryError("supervisor_safe_node_invalid")
         if self._coordinator is None:
+            self._record_failure(
+                trigger=trigger,
+                claim=claim,
+                claimed_revision=claimed_revision,
+                failure_code="coordinator_service_unavailable",
+            )
             raise SupervisorRecoveryError("coordinator_service_unavailable")
         request = CoordinatorServiceRequest.create("coordinate", allowed_nodes=(node,))
         try:
             response = self._coordinator.execute(request)
         except CoordinatorClientError as error:
-            failure_digest = hashlib.sha256(error.args[0].encode("utf-8")).hexdigest()
-            self._backend.fail_supervisor_recovery(
-                {
-                    "action_digest": claim["action_digest"],
-                    "attempt_id": claim["attempt_id"],
-                    "claim_id": claim["claim_id"],
-                    "expected_revision": claimed_revision,
-                    "failure_code": "coordinator_service_unavailable",
-                    "result_digest": failure_digest,
-                    "schema_version": 1,
-                    "trigger_id": trigger.trigger_id,
-                }
+            self._record_failure(
+                trigger=trigger,
+                claim=claim,
+                claimed_revision=claimed_revision,
+                failure_code="coordinator_service_unavailable",
             )
             raise SupervisorRecoveryError("coordinator_service_unavailable") from error
         result = response.result
@@ -421,6 +417,12 @@ class SupervisorRecoveryRunner:
             or result.get("node") != node
             or result.get("consequential") is not True
         ):
+            self._record_failure(
+                trigger=trigger,
+                claim=claim,
+                claimed_revision=claimed_revision,
+                failure_code="supervisor_redispatch_not_material",
+            )
             raise SupervisorRecoveryError("supervisor_redispatch_not_material")
         return {
             "action_digest": claim["action_digest"],
@@ -435,3 +437,28 @@ class SupervisorRecoveryRunner:
             "schema_version": 1,
             "trigger_id": trigger.trigger_id,
         }
+
+    def _record_failure(
+        self,
+        *,
+        trigger: SupervisorTrigger,
+        claim: dict[str, object],
+        claimed_revision: int,
+        failure_code: str,
+    ) -> None:
+        failure = {
+            "action_digest": claim["action_digest"],
+            "attempt_id": claim["attempt_id"],
+            "claim_id": claim["claim_id"],
+            "expected_revision": claimed_revision,
+            "failure_code": failure_code,
+            "result_digest": hashlib.sha256(failure_code.encode("utf-8")).hexdigest(),
+            "schema_version": 1,
+            "trigger_id": trigger.trigger_id,
+        }
+        completed = self._backend.fail_supervisor_recovery(failure)
+        reread = self._backend.read_supervisor_recovery_receipt(
+            trigger.trigger_id, str(claim["action_digest"])
+        )
+        if reread != completed:
+            raise SupervisorRecoveryError("supervisor_authoritative_receipt_mismatch")

@@ -839,6 +839,11 @@ def _assert_task_15_supervisor_contract(document: str, prompt: str) -> None:
     assert "persist-credentials: false" in document
     assert "secrets." not in document
     assert "contents: write" not in document
+    assert "CARL_GITHUB_APP_EFFECT_SOCKET" not in document
+    assert "--sandbox read-only" in document
+    assert '"outcome":"idle: healthy"' in document
+    assert "open_repair_pr" not in document
+    assert "reconcile_state" not in document
 
     normalized = " ".join(prompt.lower().split())
     for phrase in (
@@ -846,15 +851,15 @@ def _assert_task_15_supervisor_contract(document: str, prompt: str) -> None:
         "at most three infrastructure attempts",
         "no identical action against unchanged state",
         "rollback outranks acp and commissioning outages",
-        "reconcile durable state",
         "redispatch one exact safe node",
-        "ordinary protected control-plane repair pr",
         "freeze a precise stable boundary",
         "may not mutate candidate code",
         "may not mint validation, disposition, promotion, or soak-acceptance evidence",
         "may not weaken gates, push `main`, force-push, deploy, or release",
     ):
         assert phrase in normalized
+    assert "open_repair_pr" not in normalized
+    assert "reconcile_state" not in normalized
 
 
 def test_task_15_supervisor_uses_protected_model_and_bounded_authority() -> None:
@@ -895,7 +900,12 @@ def test_task_15_soak_scheduler_is_exact_active_merge_bound_every_six_hours() ->
     }
     assert "CARL_STATE_BACKEND: postgresql" in document
     assert "carl-bench cloud coordinate" in document
-    assert "schedule_soak observe_soak create_revert observe_revert" in document
+    assert re.findall(r"--allowed-node ([a-z_]+)", document) == [
+        "create_revert",
+        "observe_revert",
+        "schedule_soak",
+        "observe_soak",
+    ]
     assert "exact active merge" in document.lower()
     assert 'SOAK_STALE_CRITICAL_HOURS: "26"' in document
     assert 'HARD_FAILURE_REVERT_SLA_HOURS: "2"' in document

@@ -152,8 +152,10 @@ def test_request_command_vocabulary_is_exact(command: str) -> None:
 
 
 def test_request_rejects_unknown_command() -> None:
+    document = request_document()
+    document["command"] = "push-main"
     with pytest.raises(CoordinatorProtocolError, match="coordinator_ipc_request_invalid"):
-        decode_request_bytes(canonical(request_document("push-main")))
+        decode_request_bytes(canonical(document))
 
 
 def test_request_carries_only_a_canonical_subset_of_command_nodes() -> None:

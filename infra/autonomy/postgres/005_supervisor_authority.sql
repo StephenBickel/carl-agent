@@ -5,8 +5,7 @@ CREATE TABLE carl_autonomy.supervisor_recovery_attempts (
     attempt_id varchar(192) PRIMARY KEY,
     claim_id varchar(192) NOT NULL,
     action_kind varchar(32) NOT NULL CHECK (action_kind IN (
-        'freeze_stable_boundary', 'open_repair_pr', 'reconcile_state',
-        'redispatch_safe_node'
+        'freeze_stable_boundary', 'redispatch_safe_node'
     )),
     action_digest character(64) NOT NULL CHECK (action_digest ~ '^[0-9a-f]{64}$'),
     expected_revision integer NOT NULL CHECK (expected_revision BETWEEN 0 AND 2147483646),
@@ -42,8 +41,7 @@ CREATE TABLE carl_autonomy.supervisor_recovery_receipts (
         REFERENCES carl_autonomy.supervisor_recovery_attempts(attempt_id),
     action_digest character(64) NOT NULL CHECK (action_digest ~ '^[0-9a-f]{64}$'),
     outcome varchar(32) NOT NULL CHECK (outcome IN (
-        'infrastructure_attempted', 'repair_pr_opened', 'safe_node_redispatched',
-        'stable_boundary_frozen', 'state_reconciled'
+        'infrastructure_attempted', 'safe_node_redispatched', 'stable_boundary_frozen'
     )),
     authoritative_revision integer NOT NULL CHECK (
         authoritative_revision BETWEEN 1 AND 2147483647
@@ -138,8 +136,7 @@ BEGIN
         OR request_value->>'attempt_id' !~ '^[A-Za-z0-9][A-Za-z0-9._:/-]{0,191}$'
         OR request_value->>'action_digest' !~ '^[0-9a-f]{64}$'
         OR request_value->>'action_kind' NOT IN (
-            'freeze_stable_boundary', 'open_repair_pr', 'reconcile_state',
-            'redispatch_safe_node'
+            'freeze_stable_boundary', 'redispatch_safe_node'
         )
         OR jsonb_typeof(request_value->'expected_revision') <> 'number'
         OR (request_value->>'expected_revision')::integer NOT BETWEEN 0 AND 2147483646
@@ -414,7 +411,7 @@ BEGIN
         OR current_attempt.trigger_id <> current_state.trigger_id
         OR current_attempt.claim_id <> current_state.claim_id
         OR current_attempt.action_digest <> completion_value->>'action_digest'
-        OR current_attempt.action_kind = 'redispatch_safe_node'
+        OR current_attempt.action_kind <> 'freeze_stable_boundary'
         OR current_attempt.status <> 'started'
         OR trigger_value->>'evidence_digest' <> completion_value->>'evidence_digest'
     THEN

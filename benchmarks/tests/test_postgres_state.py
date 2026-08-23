@@ -1191,6 +1191,12 @@ class FakeDatabase:
             "release_lease",
             "claim_supervisor_trigger",
             "resolve_supervisor_trigger",
+            "select_supervisor_trigger",
+            "claim_supervisor_recovery",
+            "complete_supervisor_recovery",
+            "complete_supervisor_redispatch",
+            "fail_supervisor_recovery",
+            "read_supervisor_recovery_receipt",
             "register_evidence",
             "record_health",
             "load_experiment_manifest",
@@ -1223,6 +1229,14 @@ def _backend(database: FakeDatabase, *, role: str = "carl_state_backend") -> Pos
 
 def _canonical(value: dict[str, Any]) -> str:
     return canonical_json_bytes(value).decode("utf-8")
+
+
+def test_supervisor_selection_allows_no_unresolved_trigger() -> None:
+    database = FakeDatabase()
+    database.responses["select_supervisor_trigger"] = []
+
+    assert _backend(database).select_supervisor_trigger() is None
+    assert database.transactions_committed == 1
 
 
 @pytest.mark.parametrize("workflow_role", WORKFLOW_DATABASE_ROLES)
@@ -2014,9 +2028,7 @@ def test_builder_effect_completion_and_recovery_bind_the_full_authoritative_rece
 
     assert completed == recovered
     assert completed.to_canonical_dict() == receipt
-    completion_call = next(
-        call for call in database.calls if "complete_builder_effect" in call[0]
-    )
+    completion_call = next(call for call in database.calls if "complete_builder_effect" in call[0])
     persisted = json.loads(completion_call[1][0])
     assert persisted == {
         **request.to_canonical_dict(),

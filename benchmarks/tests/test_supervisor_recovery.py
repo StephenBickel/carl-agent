@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from carl_bench.canonical import canonical_json_bytes
+from carl_bench.coordinator_ipc import CoordinatorServiceResponse
 from carl_bench.supervisor_recovery import (
     SupervisorProposal,
     SupervisorRecoveryError,
@@ -79,6 +80,7 @@ class _Backend:
     def __init__(self) -> None:
         self.claims: list[dict[str, object]] = []
         self.completions: list[dict[str, object]] = []
+        self.failures: list[dict[str, object]] = []
         self.receipt: dict[str, object] | None = None
 
     def select_supervisor_trigger(self) -> dict[str, object]:
@@ -113,6 +115,27 @@ class _Backend:
                     "action_digest": value["action_digest"],
                     "authoritative_revision": 2,
                     "outcome": "stable_boundary_frozen",
+                    "schema_version": 1,
+                    "trigger_id": "trigger-1",
+                }
+            ).decode(),
+            "revision": 2,
+            "trigger_id": "trigger-1",
+        }
+        self.receipt = receipt
+        return receipt
+
+    def fail_supervisor_recovery(self, value: dict[str, object]) -> dict[str, object]:
+        self.failures.append(value)
+        receipt = {
+            "action_digest": value["action_digest"],
+            "outcome": "infrastructure_attempted",
+            "receipt_json": canonical_json_bytes(
+                {
+                    "action_digest": value["action_digest"],
+                    "authoritative_revision": 2,
+                    "failure_code": value["failure_code"],
+                    "outcome": "infrastructure_attempted",
                     "schema_version": 1,
                     "trigger_id": "trigger-1",
                 }
@@ -160,19 +183,70 @@ def test_runner_claims_executes_and_exactly_rebinds_the_durable_receipt(
     assert backend.completions[0]["expected_revision"] == 1
 
 
-def test_repair_proposal_requires_a_nonempty_allowed_diff_before_claim(
-    tmp_path: Path,
-) -> None:
-    repository = _repository(tmp_path)
+@pytest.mark.parametrize("action", ("open_repair_pr", "reconcile_state"))
+def test_proposal_rejects_unimplemented_effect_actions(action: str) -> None:
+    with pytest.raises(SupervisorRecoveryError, match="supervisor_proposal_invalid"):
+        _proposal(action)
+
+
+def test_zero_trigger_inspection_returns_canonical_idle(tmp_path: Path) -> None:
+    class EmptyBackend(_Backend):
+        def select_supervisor_trigger(self) -> None:
+            return None
+
+    runner = SupervisorRecoveryRunner._for_testing(
+        backend=EmptyBackend(),
+        coordinator=None,
+        repository=_repository(tmp_path),
+        clock=lambda: datetime(2026, 8, 23, 12, tzinfo=UTC),
+    )
+
+    assert runner.inspect() == {
+        "action": "idle",
+        "outcome": "idle: healthy",
+        "schema_version": 1,
+    }
+
+
+def test_non_material_redispatch_is_terminally_recorded_before_error(tmp_path: Path) -> None:
+    class NonMaterialCoordinator:
+        def execute(self, request):
+            return CoordinatorServiceResponse(
+                schema_version=1,
+                domain="carl.coordinator.ipc.response.v1",
+                status="rejected",
+                request_digest=request.digest,
+                result=None,
+                error_code="coordinator_no_applicable_node",
+            )
+
+    backend = _Backend()
+    runner = SupervisorRecoveryRunner._for_testing(
+        backend=backend,
+        coordinator=NonMaterialCoordinator(),
+        repository=_repository(tmp_path),
+        clock=lambda: datetime(2026, 8, 23, 12, tzinfo=UTC),
+    )
+
+    with pytest.raises(SupervisorRecoveryError, match="supervisor_redispatch_not_material"):
+        runner.recover(_proposal("redispatch_safe_node"))
+
+    assert len(backend.failures) == 1
+    assert backend.failures[0]["failure_code"] == "supervisor_redispatch_not_material"
+    assert backend.receipt is not None
+    assert backend.receipt["outcome"] == "infrastructure_attempted"
+
+
+def test_invalid_clock_is_rejected_before_claiming_an_attempt(tmp_path: Path) -> None:
     backend = _Backend()
     runner = SupervisorRecoveryRunner._for_testing(
         backend=backend,
         coordinator=None,
-        repository=repository,
-        clock=lambda: datetime(2026, 8, 23, 12, tzinfo=UTC),
+        repository=_repository(tmp_path),
+        clock=lambda: datetime(2026, 8, 23, 12),
     )
 
-    with pytest.raises(SupervisorRecoveryError, match="repair_diff_required"):
-        runner.recover(_proposal("open_repair_pr"))
+    with pytest.raises(SupervisorRecoveryError, match="supervisor_clock_invalid"):
+        runner.recover(_proposal())
 
     assert backend.claims == []

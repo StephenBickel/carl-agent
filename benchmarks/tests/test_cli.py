@@ -77,6 +77,25 @@ def test_exact_cloud_command_surface_is_available(subcommand: str) -> None:
     assert help_exit.value.code == 0
 
 
+def test_supervisor_inspect_idle_is_canonical_and_exits_zero(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    class Runner:
+        def inspect(self):
+            return {"action": "idle", "outcome": "idle: healthy", "schema_version": 1}
+
+    monkeypatch.setattr(
+        cli.SupervisorRecoveryRunner,
+        "from_protected_environment",
+        classmethod(lambda cls, *, repository: Runner()),
+    )
+
+    assert cli.main(["supervisor", "inspect"]) == 0
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert captured.out == '{"action":"idle","outcome":"idle: healthy","schema_version":1}\n'
+
+
 def test_cloud_command_emits_one_canonical_json_result_without_prose(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
