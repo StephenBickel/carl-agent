@@ -8,9 +8,19 @@ provider "aws" {
 }
 
 locals {
-  database_identifier = "${var.name_prefix}-state"
-  cloudtrail_name     = "${var.name_prefix}-audit"
-  cloudtrail_arn      = "arn:aws:cloudtrail:${var.aws_region}:${var.aws_account_id}:trail/${local.cloudtrail_name}"
+  database_identifier     = "${var.name_prefix}-state"
+  cloudtrail_name         = "${var.name_prefix}-audit"
+  cloudtrail_arn          = "arn:aws:cloudtrail:${var.aws_region}:${var.aws_account_id}:trail/${local.cloudtrail_name}"
+  cloudwatch_logs_service = "logs.${var.aws_region}.amazonaws.com"
+  s3_service              = "s3.${var.aws_region}.amazonaws.com"
+  log_group_names = {
+    postgresql = "/aws/rds/instance/${local.database_identifier}/postgresql"
+    cloudtrail = "/aws/cloudtrail/${local.cloudtrail_name}"
+  }
+  log_group_arns = {
+    for purpose, name in local.log_group_names :
+    purpose => "arn:aws:logs:${var.aws_region}:${var.aws_account_id}:log-group:${name}"
+  }
   bucket_names = {
     inputs   = "${var.name_prefix}-${var.aws_account_id}-${var.aws_region}-inputs"
     evidence = "${var.name_prefix}-${var.aws_account_id}-${var.aws_region}-evidence"
@@ -61,6 +71,29 @@ resource "aws_kms_key" "storage" {
           StringEquals = {
             "AWS:SourceArn"                            = local.cloudtrail_arn
             "kms:EncryptionContext:aws:cloudtrail:arn" = local.cloudtrail_arn
+          }
+        }
+      },
+      {
+        Sid       = "CloudWatchLogsUseKey"
+        Effect    = "Allow"
+        Principal = { Service = local.cloudwatch_logs_service }
+        Action = [
+          "kms:Encrypt",
+          "kms:Decrypt",
+          "kms:ReEncryptFrom",
+          "kms:ReEncryptTo",
+          "kms:GenerateDataKey",
+          "kms:GenerateDataKeyWithoutPlaintext",
+          "kms:DescribeKey",
+        ]
+        Resource = "*"
+        Condition = {
+          ArnEquals = {
+            "kms:EncryptionContext:aws:logs:arn" = values(local.log_group_arns)
+          }
+          StringEquals = {
+            "kms:ViaService" = local.cloudwatch_logs_service
           }
         }
       }
@@ -165,7 +198,7 @@ resource "aws_db_parameter_group" "control_plane" {
 }
 
 resource "aws_cloudwatch_log_group" "postgresql" {
-  name              = "/aws/rds/instance/${local.database_identifier}/postgresql"
+  name              = local.log_group_names.postgresql
   retention_in_days = 365
   kms_key_id        = aws_kms_key.storage.arn
 
@@ -395,19 +428,53 @@ resource "aws_s3_bucket_policy" "evidence" {
   bucket = aws_s3_bucket.evidence.id
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [{
-      Sid       = "DenyInsecureTransport"
-      Effect    = "Deny"
-      Principal = "*"
-      Action    = "s3:*"
-      Resource  = [aws_s3_bucket.evidence.arn, "${aws_s3_bucket.evidence.arn}/*"]
-      Condition = { Bool = { "aws:SecureTransport" = "false" } }
-    }]
+    Statement = [
+      {
+        Sid       = "DenyInsecureTransport"
+        Effect    = "Deny"
+        Principal = "*"
+        Action    = "s3:*"
+        Resource  = [aws_s3_bucket.evidence.arn, "${aws_s3_bucket.evidence.arn}/*"]
+        Condition = { Bool = { "aws:SecureTransport" = "false" } }
+      },
+      {
+        Sid       = "DenyMissingEvidenceEncryptionAlgorithm"
+        Effect    = "Deny"
+        Principal = "*"
+        Action    = "s3:PutObject"
+        Resource  = "${aws_s3_bucket.evidence.arn}/*"
+        Condition = { Null = { "s3:x-amz-server-side-encryption" = "true" } }
+      },
+      {
+        Sid       = "DenyWrongEvidenceEncryptionAlgorithm"
+        Effect    = "Deny"
+        Principal = "*"
+        Action    = "s3:PutObject"
+        Resource  = "${aws_s3_bucket.evidence.arn}/*"
+        Condition = { StringNotEquals = { "s3:x-amz-server-side-encryption" = "aws:kms" } }
+      },
+      {
+        Sid       = "DenyMissingEvidenceKmsKey"
+        Effect    = "Deny"
+        Principal = "*"
+        Action    = "s3:PutObject"
+        Resource  = "${aws_s3_bucket.evidence.arn}/*"
+        Condition = { Null = { "s3:x-amz-server-side-encryption-aws-kms-key-id" = "true" } }
+      },
+      {
+        Sid       = "DenyWrongEvidenceKmsKey"
+        Effect    = "Deny"
+        Principal = "*"
+        Action    = "s3:PutObject"
+        Resource  = "${aws_s3_bucket.evidence.arn}/*"
+        Condition = { ArnNotEquals = { "s3:x-amz-server-side-encryption-aws-kms-key-id" = aws_kms_key.storage.arn } }
+      },
+    ]
   })
 }
 
 resource "aws_cloudwatch_log_group" "cloudtrail" {
-  name              = "/aws/cloudtrail/${local.cloudtrail_name}"
+  name              = local.log_group_names.cloudtrail
   retention_in_days = 2557
   kms_key_id        = aws_kms_key.storage.arn
 

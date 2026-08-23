@@ -113,4 +113,36 @@ run "github_oidc_subjects_and_permissions_are_exact" {
     condition     = strcontains(aws_iam_role_policy.autonomy["builder"].policy, "kms:Decrypt") && strcontains(aws_iam_role_policy.autonomy["validator"].policy, "kms:Decrypt") && strcontains(aws_iam_role_policy.autonomy["soak"].policy, "kms:Decrypt") && strcontains(aws_iam_role_policy.autonomy["observer"].policy, "kms:GenerateDataKey") && !strcontains(aws_iam_role_policy.autonomy["promoter"].policy, aws_kms_key.storage.arn)
     error_message = "Only object readers and the archive writer may use the exact storage key required by SSE-KMS."
   }
+
+  assert {
+    condition = try(alltrue([
+      for role, expected in {
+        builder   = { bucket_arn = aws_s3_bucket.inputs.arn, actions = ["kms:Decrypt"] }
+        validator = { bucket_arn = aws_s3_bucket.inputs.arn, actions = ["kms:Decrypt"] }
+        soak      = { bucket_arn = aws_s3_bucket.inputs.arn, actions = ["kms:Decrypt"] }
+        observer  = { bucket_arn = aws_s3_bucket.evidence.arn, actions = ["kms:Decrypt", "kms:Encrypt", "kms:GenerateDataKey"] }
+        } : (
+        length([
+          for statement in jsondecode(aws_iam_role_policy.autonomy[role].policy).Statement : statement
+          if try(statement.Resource, "") == aws_kms_key.storage.arn
+        ]) == 1 &&
+        one([
+          for statement in jsondecode(aws_iam_role_policy.autonomy[role].policy).Statement : statement
+          if try(statement.Resource, "") == aws_kms_key.storage.arn
+        ]).Condition.StringEquals["kms:ViaService"] == "s3.us-east-1.amazonaws.com" &&
+        one([
+          for statement in jsondecode(aws_iam_role_policy.autonomy[role].policy).Statement : statement
+          if try(statement.Resource, "") == aws_kms_key.storage.arn
+        ]).Condition.StringEquals["kms:EncryptionContext:aws:s3:arn"] == expected.bucket_arn &&
+        toset(try(tolist(one([
+          for statement in jsondecode(aws_iam_role_policy.autonomy[role].policy).Statement : statement
+          if try(statement.Resource, "") == aws_kms_key.storage.arn
+          ]).Action), [one([
+          for statement in jsondecode(aws_iam_role_policy.autonomy[role].policy).Statement : statement
+          if try(statement.Resource, "") == aws_kms_key.storage.arn
+        ]).Action])) == toset(expected.actions)
+      )
+    ]), false)
+    error_message = "Every workload storage-key grant must bind S3 in-region and the exact bucket encryption context."
+  }
 }

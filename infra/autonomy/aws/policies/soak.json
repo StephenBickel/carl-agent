@@ -16,8 +16,14 @@
     {
       "Sid": "DecryptSoakInputs",
       "Effect": "Allow",
-      "Action": ["kms:Decrypt", "kms:DescribeKey"],
-      "Resource": ${storage_key_arn}
+      "Action": "kms:Decrypt",
+      "Resource": ${storage_key_arn},
+      "Condition": {
+        "StringEquals": {
+          "kms:ViaService": ${s3_via_service},
+          "kms:EncryptionContext:aws:s3:arn": ${input_bucket_arn}
+        }
+      }
     },
     {
       "Sid": "ReadExactRevertAppCredential",

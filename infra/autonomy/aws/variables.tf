@@ -130,13 +130,13 @@ variable "database_instance_class" {
 }
 
 variable "database_engine_version" {
-  description = "PostgreSQL engine version; the major version must be 16 or newer."
+  description = "PostgreSQL engine version pinned to the supported major version 16."
   type        = string
   default     = "16"
 
   validation {
-    condition     = can(tonumber(split(".", var.database_engine_version)[0])) && tonumber(split(".", var.database_engine_version)[0]) >= 16
-    error_message = "database_engine_version must select PostgreSQL 16 or newer."
+    condition     = can(regex("^16(\\.[0-9]+)*$", var.database_engine_version))
+    error_message = "database_engine_version must select PostgreSQL major version 16."
   }
 }
 

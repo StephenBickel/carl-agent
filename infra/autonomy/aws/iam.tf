@@ -34,12 +34,16 @@ locals {
     builder = jsonencode(jsondecode(templatefile("${path.module}/policies/builder.json", {
       database_user_arn = jsonencode(local.database_user_arns.builder)
       input_object_arn  = jsonencode("${aws_s3_bucket.inputs.arn}/public/*")
+      input_bucket_arn  = jsonencode(aws_s3_bucket.inputs.arn)
+      s3_via_service    = jsonencode(local.s3_service)
       storage_key_arn   = jsonencode(aws_kms_key.storage.arn)
       secret_arn        = jsonencode(var.secret_arns.builder_model)
     })))
     validator = jsonencode(jsondecode(templatefile("${path.module}/policies/validator.json", {
       database_user_arn = jsonencode(local.database_user_arns.validator)
       input_object_arn  = jsonencode("${aws_s3_bucket.inputs.arn}/holdout/*")
+      input_bucket_arn  = jsonencode(aws_s3_bucket.inputs.arn)
+      s3_via_service    = jsonencode(local.s3_service)
       storage_key_arn   = jsonencode(aws_kms_key.storage.arn)
       secret_arn        = jsonencode(var.secret_arns.validator_model)
     })))
@@ -50,12 +54,16 @@ locals {
     soak = jsonencode(jsondecode(templatefile("${path.module}/policies/soak.json", {
       database_user_arn = jsonencode(local.database_user_arns.soak)
       input_object_arn  = jsonencode("${aws_s3_bucket.inputs.arn}/soak/*")
+      input_bucket_arn  = jsonencode(aws_s3_bucket.inputs.arn)
+      s3_via_service    = jsonencode(local.s3_service)
       storage_key_arn   = jsonencode(aws_kms_key.storage.arn)
       secret_arn        = jsonencode(var.secret_arns.soak_github_app)
     })))
     observer = jsonencode(jsondecode(templatefile("${path.module}/policies/observer.json", {
       database_user_arn   = jsonencode(local.database_user_arns.observer)
       evidence_object_arn = jsonencode("${aws_s3_bucket.evidence.arn}/archive/*")
+      evidence_bucket_arn = jsonencode(aws_s3_bucket.evidence.arn)
+      s3_via_service      = jsonencode(local.s3_service)
       storage_key_arn     = jsonencode(aws_kms_key.storage.arn)
       signing_key_arn     = jsonencode(aws_kms_key.signing.arn)
     })))

@@ -30,8 +30,8 @@ run "database_is_durable_encrypted_and_private" {
   command = plan
 
   assert {
-    condition     = aws_db_instance.control_plane.engine == "postgres" && tonumber(split(".", aws_db_instance.control_plane.engine_version)[0]) >= 16
-    error_message = "The control-plane database must run PostgreSQL 16 or newer."
+    condition     = aws_db_instance.control_plane.engine == "postgres" && tonumber(split(".", aws_db_instance.control_plane.engine_version)[0]) == 16 && aws_db_parameter_group.control_plane.family == "postgres16"
+    error_message = "The control-plane database engine and parameter group must both remain on supported PostgreSQL major 16."
   }
 
   assert {
@@ -58,4 +58,14 @@ run "database_is_durable_encrypted_and_private" {
     condition     = aws_db_instance.control_plane.iam_database_authentication_enabled && aws_db_instance.control_plane.manage_master_user_password
     error_message = "Database access must use short-lived IAM auth and an AWS-managed bootstrap password."
   }
+}
+
+run "rejects_database_major_without_matching_parameter_family" {
+  command = plan
+
+  variables {
+    database_engine_version = "17"
+  }
+
+  expect_failures = [var.database_engine_version]
 }

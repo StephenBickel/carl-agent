@@ -11,14 +11,14 @@ This Terraform root is the least-privilege AWS reference profile for Carl's auto
 | validator | `carl-autonomy-validator` environment | validator DB identity, private holdouts, validator model secret |
 | promoter | `carl-autonomy-promoter` environment | promoter DB identity and promotion GitHub App secret only |
 | soak | `carl-autonomy-soak` environment | soak DB identity, soak inputs, exact-revert GitHub App secret |
-| observer | `carl-autonomy-observer` environment | observer DB identity, evidence archive, KMS sign/verify only |
+| observer | `carl-autonomy-observer` environment | observer DB identity, evidence archive with S3-bound storage-key use, KMS sign/verify |
 
-Every OIDC trust binds `sts.amazonaws.com` plus one exact repository ref or Environment subject. Role policies contain no role assumption, role passing, wildcard action, or account-wide resource. Candidate jobs receive no OIDC role, database access, object access, secret access, or signing authority.
+Every OIDC trust binds `sts.amazonaws.com` plus one exact repository ref or Environment subject. Role policies contain no role assumption, role passing, wildcard action, or account-wide resource. Storage-key grants are restricted to regional S3 calls with the exact encrypted bucket context. Candidate jobs receive no OIDC role, database access, object access, secret access, or signing authority.
 
 The profile creates:
 
-- private Multi-AZ RDS PostgreSQL 16+ with KMS encryption, IAM database authentication, deletion protection, final snapshots, 35-day backups, log exports, and storage alarms;
-- private versioned input and evidence buckets with Object Lock, KMS encryption, public-access blocks, TLS-only policies, and deletion prevention;
+- private Multi-AZ RDS PostgreSQL 16 with KMS encryption, IAM database authentication, deletion protection, final snapshots, 35-day backups, log exports, and storage alarms;
+- private versioned input and evidence buckets with Object Lock, KMS encryption, public-access blocks, TLS-only policies, and deletion prevention; evidence uploads must explicitly name SSE-KMS and the dedicated key;
 - a non-exportable P-256 KMS signing key for `ECDSA_SHA_256` receipts, separate from the symmetric storage key;
 - immutable CloudTrail storage, management and protected-object data events, log validation, CloudWatch retention, and denied-operation alarms.
 
