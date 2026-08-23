@@ -543,6 +543,9 @@ fn validate_ci_workflow(workflow: &str) -> Result<(), String> {
     if string_field(test, "runs-on", "jobs.test")? != "${{ matrix.os }}" {
         return Err("jobs.test.runs-on must use matrix.os".to_owned());
     }
+    if field(test, "timeout-minutes", "jobs.test")?.as_u64() != Some(40) {
+        return Err("jobs.test.timeout-minutes must equal `40`".to_owned());
+    }
     let strategy = value_map(field(test, "strategy", "jobs.test")?, "jobs.test.strategy")?;
     let matrix = value_map(
         field(strategy, "matrix", "jobs.test.strategy")?,
@@ -837,6 +840,17 @@ fn fixture_replacement_normalizes_crlf_before_matching_lf_snippets() {
 #[test]
 fn ci_workflow_enforces_required_cross_platform_checks() {
     assert_ci_workflow(&read_workflow("ci.yml"));
+}
+
+#[test]
+fn checker_rejects_an_insufficient_cross_platform_timeout() {
+    let workflow = replace_in_workflow(
+        "ci.yml",
+        "    timeout-minutes: 40\n    steps:\n",
+        "    timeout-minutes: 30\n    steps:\n",
+    );
+
+    assert_ci_rejected(&workflow, "jobs.test.timeout-minutes must equal `40`");
 }
 
 #[test]
