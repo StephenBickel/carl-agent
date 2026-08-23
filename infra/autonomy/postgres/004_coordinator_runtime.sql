@@ -673,10 +673,10 @@ BEGIN
         jsonb_build_object(
             'attempt', 1,
             'authority', carl_autonomy.coordinator_node_authority(kind),
-            'command_key', request_value->>'experiment_id' || ':' || kind || ':attempt:1',
+            'command_key', (request_value->>'experiment_id') || ':' || kind || ':attempt:1',
             'kind', kind,
             'max_attempts', 3,
-            'node_id', request_value->>'experiment_id' || ':' || kind,
+            'node_id', (request_value->>'experiment_id') || ':' || kind,
             'occurred_at', request_value->>'requested_at',
             'operation', carl_autonomy.coordinator_node_operation(kind),
             'request_digest', carl_autonomy.sha256_text(carl_autonomy.canonical_jsonb(
@@ -890,16 +890,18 @@ BEGIN
         OR artifact_value->>'experiment_id'
             !~ '^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$'
         OR carl_autonomy.coordinator_node_priority(artifact_value->>'node_kind') IS NULL
-        OR artifact_value->>'node_id'
-            <> artifact_value->>'experiment_id' || ':' || artifact_value->>'node_kind'
+        OR artifact_value->>'node_id' <> (
+            (artifact_value->>'experiment_id') || ':' || (artifact_value->>'node_kind')
+        )
         OR jsonb_typeof(artifact_value->'attempt') <> 'number'
         OR (artifact_value->>'attempt')::integer NOT BETWEEN 1 AND 3
-        OR artifact_value->>'command_key'
-            <> artifact_value->>'experiment_id' || ':' || artifact_value->>'node_kind'
-                || ':attempt:' || artifact_value->>'attempt'
+        OR artifact_value->>'command_key' <> (
+            (artifact_value->>'experiment_id') || ':' || (artifact_value->>'node_kind')
+                || ':attempt:' || (artifact_value->>'attempt')
+        )
         OR artifact_value->>'effect_key' !~ '^cloud-effect-[0-9a-f]{64}$'
         OR artifact_value->>'occurrence_key'
-            <> 'coordinator-freeze/' || artifact_value->>'freeze_fingerprint'
+            <> ('coordinator-freeze/' || (artifact_value->>'freeze_fingerprint'))
         OR NOT carl_autonomy.coordinator_freeze_reason_valid(
             artifact_value->>'node_kind', artifact_value->>'reason'
         )
@@ -986,9 +988,10 @@ BEGIN
     ));
     IF receipt_value->>'evidence_digest' <> evidence_digest_value
         OR receipt_value->>'archive_checksum_sha256' <> evidence_digest_value
-        OR receipt_value->>'archive_object_key'
-            <> 'carl-evidence/v1/sha256/' || substr(evidence_digest_value, 1, 2)
+        OR receipt_value->>'archive_object_key' <> (
+            'carl-evidence/v1/sha256/' || substr(evidence_digest_value, 1, 2)
                 || '/' || evidence_digest_value
+        )
         OR (receipt_value->>'archive_byte_length')::integer <> octet_length(envelope_json)
         OR artifact_value->>'repair_fingerprint'
             <> carl_autonomy.sha256_text(identity_value)
@@ -1108,8 +1111,9 @@ BEGIN
         OR recovery_value->>'domain' <> 'carl.coordinator.recovery.v1'
         OR recovery_value->>'experiment_id'
             !~ '^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$'
-        OR recovery_value->>'node_id'
-            <> recovery_value->>'experiment_id' || ':' || recovery_value->>'node_kind'
+        OR recovery_value->>'node_id' <> (
+            (recovery_value->>'experiment_id') || ':' || (recovery_value->>'node_kind')
+        )
         OR carl_autonomy.coordinator_node_priority(recovery_value->>'node_kind') IS NULL
         OR jsonb_typeof(recovery_value->'expected_revision') <> 'number'
         OR (recovery_value->>'expected_revision')::integer NOT BETWEEN 0 AND 2147483646
@@ -1233,7 +1237,7 @@ BEGIN
                 ),
                 '{command_key}',
                 to_jsonb(
-                    recovery_value->>'experiment_id' || ':' || selected_node->>'kind'
+                    (recovery_value->>'experiment_id') || ':' || (selected_node->>'kind')
                         || ':attempt:' || next_attempt::text
                 ),
                 false
@@ -1644,7 +1648,7 @@ BEGIN
             OR receipt_value->>'candidate_commit' IS DISTINCT FROM guard_state.experimental_commit
             OR receipt_value->>'candidate_tree' IS DISTINCT FROM guard_state.experimental_tree
             OR receipt_value->>'experimental_ref'
-                IS DISTINCT FROM 'refs/heads/' || guard_state.experimental_branch
+                IS DISTINCT FROM ('refs/heads/' || guard_state.experimental_branch)
             OR receipt_value->>'experimental_receipt_digest'
                 IS DISTINCT FROM guard_state.experimental_candidate_packet_digest
             OR receipt_value->>'live_provenance_receipt_digest'
@@ -1938,19 +1942,21 @@ BEGIN
     FOR UPDATE;
     IF NOT FOUND
         OR selected_node->>'kind' <> p_node_kind
-        OR selected_node->>'node_id' <> runtime.experiment_id || ':' || p_node_kind
+        OR selected_node->>'node_id'
+            <> (runtime.experiment_id || ':' || p_node_kind)
         OR selected_node->>'command_key' <> command_state.command_key
         OR command_state.authority
             <> carl_autonomy.coordinator_node_authority(p_node_kind)
         OR command_state.authority NOT IN ('observer', 'supervisor')
-        OR event_value->>'stage_attempt_id'
-            <> 'coordinator-event-' || substr(carl_autonomy.sha256_text(
+        OR event_value->>'stage_attempt_id' <> (
+            'coordinator-event-' || substr(carl_autonomy.sha256_text(
                 carl_autonomy.canonical_jsonb(jsonb_build_object(
                     'attempt', (selected_node->>'attempt')::integer,
                     'experiment_id', runtime.experiment_id,
                     'node_kind', p_node_kind
                 ))
             ), 1, 64)
+        )
         OR carl_autonomy.sha256_text(p_event_json) <> p_event_digest
         OR event_value->'payload' <> carl_autonomy.parse_object(
             p_payload_json, 'coordinator_event_payload_invalid'

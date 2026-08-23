@@ -145,6 +145,40 @@ def test_jsonb_object_cardinality_is_exact_and_fails_closed(
     assert actual == expected
 
 
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    (
+        ("https://github.com/StephenBickel/carl-agent/pull/17", True),
+        ("https://github.com/StephenBickel/carl-agent/pull/18", False),
+        ("https://github.com/other-owner/carl-agent/pull/17", False),
+        ({"value": "https://github.com/StephenBickel/carl-agent/pull/17"}, False),
+    ),
+)
+def test_draft_pr_url_identity_uses_exact_text_concatenation(
+    postgres: object, url: object, expected: bool
+) -> None:
+    payload = {
+        "_lease": {"owner_id": "promoter-1", "stage_attempt_id": "draft-pr-1"},
+        "base_branch": "main",
+        "candidate_commit": "a" * 40,
+        "head_branch": "codex/experiment-url-precedence-0123456789",
+        "is_draft": True,
+        "number": 17,
+        "repository": "StephenBickel/carl-agent",
+        "schema_version": 1,
+        "state": "OPEN",
+        "url": url,
+    }
+    assert POSTGRES_DSN is not None
+    with postgres.connect(POSTGRES_DSN, autocommit=True) as connection:  # type: ignore[attr-defined]
+        actual = connection.execute(
+            "SELECT carl_autonomy.event_payload_keys_exact('draft_pr_recorded', %s::jsonb) "
+            "AND carl_autonomy.event_payload_shape_valid('draft_pr_recorded', %s::jsonb)",
+            (json.dumps(payload), json.dumps(payload)),
+        ).fetchone()[0]
+    assert actual is expected
+
+
 @pytest.fixture(scope="module")
 def postgres() -> object:
     import psycopg

@@ -142,6 +142,15 @@ EVENT_POLICY_CASES = (
 )
 
 
+def _assert_json_concat_operands_are_explicit_text(sql: str) -> None:
+    unsafe_patterns = (
+        re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*\s*->>?\s*'[^']+'\s*\|\|", re.IGNORECASE),
+        re.compile(r"\|\|\s*\b[A-Za-z_][A-Za-z0-9_]*\s*->>?\s*'[^']+'", re.IGNORECASE),
+    )
+    unsafe = [match.group(0) for pattern in unsafe_patterns for match in pattern.finditer(sql)]
+    assert unsafe == [], unsafe
+
+
 def test_sql_persists_exact_effect_fence_before_network_and_reuses_it_on_restart() -> None:
     assert GITHUB_EFFECT_FENCES_PATH.is_file()
     assert not re.search(
@@ -905,6 +914,55 @@ def test_postgres16_migrations_use_exact_fail_closed_object_cardinality() -> Non
     )
 
 
+def test_postgres16_json_text_concat_operands_are_parenthesized() -> None:
+    migrations = "\n".join(
+        (INITIAL_SQL, ROLE_PROCEDURES_SQL, GITHUB_EFFECT_FENCES_SQL, COORDINATOR_RUNTIME_SQL)
+    )
+    _assert_json_concat_operands_are_explicit_text(migrations)
+    assert re.search(
+        r"p_payload->>'url'\s*=\s*\(\s*'https://github\.com/'\s*\|\|\s*"
+        r"\(p_payload->>'repository'\)\s*\|\|\s*'/pull/'\s*\|\|\s*"
+        r"\(p_payload->'number'\)::text\s*\)",
+        ROLE_PROCEDURES_SQL,
+        re.IGNORECASE | re.DOTALL,
+    )
+
+
+def test_postgres16_json_text_concat_contract_rejects_precedence_mutations() -> None:
+    migrations = "\n".join((ROLE_PROCEDURES_SQL, COORDINATOR_RUNTIME_SQL))
+    mutations = (
+        (
+            "'https://github.com/' || (p_payload->>'repository')",
+            "'https://github.com/' || p_payload->>'repository'",
+        ),
+        (
+            "'command_key', (request_value->>'experiment_id') ||",
+            "'command_key', request_value->>'experiment_id' ||",
+        ),
+        (
+            "|| ':' || (artifact_value->>'node_kind')",
+            "|| ':' || artifact_value->>'node_kind'",
+        ),
+        (
+            "'coordinator-freeze/' || (artifact_value->>'freeze_fingerprint')",
+            "'coordinator-freeze/' || artifact_value->>'freeze_fingerprint'",
+        ),
+        (
+            "|| ':' || (recovery_value->>'node_kind')",
+            "|| ':' || recovery_value->>'node_kind'",
+        ),
+        (
+            "|| ':' || (selected_node->>'kind')",
+            "|| ':' || selected_node->>'kind'",
+        ),
+    )
+    for safe, unsafe in mutations:
+        assert safe in migrations
+        mutated = migrations.replace(safe, unsafe, 1)
+        with pytest.raises(AssertionError):
+            _assert_json_concat_operands_are_explicit_text(mutated)
+
+
 def test_append_and_atomic_event_ingress_require_exact_top_level_keys() -> None:
     append = re.search(
         r"FUNCTION\s+carl_autonomy\.append_event\(.*?"
@@ -1180,7 +1238,7 @@ def test_sql_binds_experimental_publication_branch_to_experiment() -> None:
     assert branch is not None
     assert re.search(
         r"p_payload->>'branch'\s+IS\s+DISTINCT\s+FROM\s+"
-        r"'experimental/'\s*\|\|\s*p_experiment_id",
+        r"\(\s*'experimental/'\s*\|\|\s*p_experiment_id\s*\)",
         branch.group("body"),
         flags=re.IGNORECASE,
     )
@@ -1322,7 +1380,7 @@ def test_sql_binds_experimental_publication_to_sealed_candidate_guard() -> None:
     )
     assert re.search(
         r"p_payload->>'branch'\s+IS\s+DISTINCT\s+FROM\s+"
-        r"'experimental/'\s*\|\|\s*p_experiment_id",
+        r"\(\s*'experimental/'\s*\|\|\s*p_experiment_id\s*\)",
         publication.group("body"),
         re.I,
     )

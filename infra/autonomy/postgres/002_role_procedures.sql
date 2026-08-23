@@ -644,8 +644,10 @@ AS $$
             AND jsonb_typeof(p_payload->'state') = 'string'
             AND p_payload->>'state' = 'OPEN'
             AND jsonb_typeof(p_payload->'url') = 'string'
-            AND p_payload->>'url' = 'https://github.com/' || p_payload->>'repository'
+            AND p_payload->>'url' = (
+                'https://github.com/' || (p_payload->>'repository')
                 || '/pull/' || (p_payload->'number')::text
+            )
         WHEN 'workspace_disposed' THEN
             carl_autonomy.lease_payload_valid(p_payload->'_lease')
             AND jsonb_typeof(p_payload->'branch') = 'string'
@@ -1272,7 +1274,8 @@ BEGIN
         WHEN 'experimental_published' THEN
             IF guard.experimental_published OR NOT guard.candidate_sealed
                 OR jsonb_typeof(p_payload->'branch') <> 'string'
-                OR p_payload->>'branch' IS DISTINCT FROM 'experimental/' || p_experiment_id
+                OR p_payload->>'branch'
+                    IS DISTINCT FROM ('experimental/' || p_experiment_id)
                 OR octet_length(p_payload->>'branch') > 256
                 OR p_payload->>'candidate_packet_digest' !~ '^[0-9a-f]{64}$'
                 OR p_payload->>'candidate_packet_digest'
