@@ -264,6 +264,24 @@ AS $$
         ]::text[])
 $$;
 
+CREATE OR REPLACE FUNCTION carl_autonomy.jsonb_object_cardinality(value jsonb)
+RETURNS integer
+LANGUAGE sql
+IMMUTABLE
+STRICT
+PARALLEL SAFE
+SECURITY INVOKER
+SET search_path = pg_catalog
+AS $$
+    SELECT CASE WHEN jsonb_typeof(value) = 'object'
+        THEN count(*)::integer
+        ELSE NULL
+    END
+    FROM jsonb_object_keys(
+        CASE WHEN jsonb_typeof(value) = 'object' THEN value ELSE '{}'::jsonb END
+    )
+$$;
+
 CREATE OR REPLACE FUNCTION carl_autonomy.event_payload_keys_exact(
     p_event_type text,
     p_payload jsonb
@@ -278,7 +296,8 @@ AS $$
         SELECT 1
         FROM carl_autonomy.event_payload_key_policy() AS policy
         WHERE policy.event_type = p_event_type
-          AND cardinality(policy.required_keys) = jsonb_object_length(p_payload)
+          AND cardinality(policy.required_keys)
+              = carl_autonomy.jsonb_object_cardinality(p_payload)
           AND p_payload ?& policy.required_keys
     )
 $$;
@@ -350,7 +369,7 @@ SECURITY INVOKER
 SET search_path = pg_catalog, carl_autonomy
 AS $$
     SELECT jsonb_typeof(value) = 'object'
-        AND jsonb_object_length(value) = 2
+        AND carl_autonomy.jsonb_object_cardinality(value) = 2
         AND value ?& ARRAY['owner_id', 'stage_attempt_id']
         AND jsonb_typeof(value->'owner_id') = 'string'
         AND jsonb_typeof(value->'stage_attempt_id') = 'string'
@@ -366,7 +385,7 @@ SECURITY INVOKER
 SET search_path = pg_catalog, carl_autonomy
 AS $$
     SELECT jsonb_typeof(value) = 'object'
-        AND jsonb_object_length(value) = 5
+        AND carl_autonomy.jsonb_object_cardinality(value) = 5
         AND value ?& ARRAY['byte_size', 'digest', 'evidence_kind', 'media_type', 'schema_version']
         AND carl_autonomy.jsonb_integer_between(value->'schema_version', 1, 1)
         AND jsonb_typeof(value->'digest') = 'string'
@@ -388,7 +407,7 @@ SECURITY INVOKER
 SET search_path = pg_catalog, carl_autonomy
 AS $$
     SELECT jsonb_typeof(value) = 'object'
-        AND jsonb_object_length(value) = 5
+        AND carl_autonomy.jsonb_object_cardinality(value) = 5
         AND value ?& ARRAY['check_id', 'elapsed_ms', 'exit_code', 'output_artifact', 'status']
         AND jsonb_typeof(value->'check_id') = 'string'
         AND value->>'check_id' ~ '^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$'
@@ -1090,7 +1109,7 @@ BEGIN
             IF guard.lifecycle_state <> 'paired_evaluation' OR NOT guard.candidate_sealed
                 OR NOT guard.paired_evidence_recorded OR NOT guard.experimental_published
                 OR guard.protected_validation_recorded
-                OR jsonb_object_length(p_payload) <> 3
+                OR carl_autonomy.jsonb_object_cardinality(p_payload) IS DISTINCT FROM 3
                 OR NOT p_payload ?& ARRAY['candidate_commit', 'candidate_tree', 'receipt_digest']
                 OR p_payload->>'candidate_commit' IS DISTINCT FROM guard.candidate_commit
                 OR p_payload->>'candidate_commit' IS DISTINCT FROM guard.experimental_commit
@@ -1286,7 +1305,8 @@ BEGIN
                 promotion_merged_at = p_occurred_at,
                 updated_at = p_observed_at WHERE experiment_id = p_experiment_id;
         WHEN 'soak_observed' THEN
-            IF NOT guard.promotion_recorded OR jsonb_object_length(p_payload) <> 4
+            IF NOT guard.promotion_recorded
+                OR carl_autonomy.jsonb_object_cardinality(p_payload) IS DISTINCT FROM 4
                 OR NOT p_payload ?& ARRAY[
                     'evidence_digest', 'healthy', 'merge_commit', 'observed_at'
                 ]
@@ -1370,7 +1390,7 @@ BEGIN
                 lease_owner_id = NULL, lease_expires_at = NULL, updated_at = p_observed_at
             WHERE experiment_id = p_experiment_id;
         WHEN 'live_spend_recorded' THEN
-            IF jsonb_object_length(p_payload) <> 2
+            IF carl_autonomy.jsonb_object_cardinality(p_payload) IS DISTINCT FROM 2
                 OR NOT p_payload ?& ARRAY['live_microdollars', 'run_id']
                 OR jsonb_typeof(p_payload->'live_microdollars') <> 'number'
                 OR (p_payload->>'live_microdollars')::bigint NOT BETWEEN 1 AND 1000000000
@@ -1448,7 +1468,7 @@ BEGIN
     authority_name := carl_autonomy.role_authority(caller);
     value := carl_autonomy.parse_object(p_event_json, 'event_json_invalid');
     payload := carl_autonomy.parse_object(p_payload_json, 'event_payload_invalid');
-    IF jsonb_object_length(value) <> 6
+    IF carl_autonomy.jsonb_object_cardinality(value) IS DISTINCT FROM 6
         OR NOT value ?& ARRAY[
             'schema_version', 'experiment_id', 'stage_attempt_id',
             'event_type', 'occurred_at', 'payload'

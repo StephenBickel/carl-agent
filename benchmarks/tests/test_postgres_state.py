@@ -865,6 +865,46 @@ def test_sql_requires_canonical_utc_z_event_timestamps() -> None:
     )
 
 
+def test_postgres16_migrations_use_exact_fail_closed_object_cardinality() -> None:
+    migrations = "\n".join(
+        (INITIAL_SQL, ROLE_PROCEDURES_SQL, GITHUB_EFFECT_FENCES_SQL, COORDINATOR_RUNTIME_SQL)
+    )
+    assert "jsonb_object_length" not in migrations.lower()
+
+    helper = re.search(
+        r"FUNCTION\s+carl_autonomy\.jsonb_object_cardinality\(value\s+jsonb\).*?"
+        r"RETURNS\s+integer.*?AS\s+\$\$(?P<body>.*?)\$\$;",
+        ROLE_PROCEDURES_SQL,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    assert helper is not None
+    declaration = helper.group(0)
+    body = helper.group("body")
+    assert re.search(r"\bIMMUTABLE\b", declaration, re.IGNORECASE)
+    assert re.search(r"\bSTRICT\b", declaration, re.IGNORECASE)
+    assert re.search(r"count\(\*\)::integer", body, re.IGNORECASE)
+    assert re.search(r"FROM\s+jsonb_object_keys\s*\(", body, re.IGNORECASE)
+    assert re.search(
+        r"CASE\s+WHEN\s+jsonb_typeof\(value\)\s*=\s*'object'\s+"
+        r"THEN\s+value\s+ELSE\s+'\{\}'::jsonb\s+END",
+        body,
+        re.IGNORECASE | re.DOTALL,
+    )
+    assert re.search(
+        r"CASE\s+WHEN\s+jsonb_typeof\(value\)\s*=\s*'object'\s+"
+        r"THEN\s+count\(\*\)::integer\s+ELSE\s+NULL\s+END",
+        body,
+        re.IGNORECASE | re.DOTALL,
+    )
+    assert not re.search(r"jsonb_object_cardinality\([^)]*\)\s*<>", migrations, re.IGNORECASE)
+    assert re.search(
+        r"cardinality\(policy\.required_keys\)\s*=\s*"
+        r"carl_autonomy\.jsonb_object_cardinality\(p_payload\)",
+        ROLE_PROCEDURES_SQL,
+        re.IGNORECASE,
+    )
+
+
 def test_append_and_atomic_event_ingress_require_exact_top_level_keys() -> None:
     append = re.search(
         r"FUNCTION\s+carl_autonomy\.append_event\(.*?"
@@ -874,7 +914,7 @@ def test_append_and_atomic_event_ingress_require_exact_top_level_keys() -> None:
     )
     assert append is not None
     body = append.group("body")
-    assert re.search(r"jsonb_object_length\(value\)\s*<>\s*6", body, re.I)
+    assert re.search(r"jsonb_object_cardinality\(value\)\s+IS\s+DISTINCT\s+FROM\s+6", body, re.I)
     assert re.search(
         r"value\s+\?&\s+ARRAY\[\s*'schema_version',\s*'experiment_id',\s*"
         r"'stage_attempt_id',\s*'event_type',\s*'occurred_at',\s*'payload'\s*\]",
@@ -1379,14 +1419,14 @@ def test_sql_nested_payload_family_uses_exact_typed_helpers(
     assert re.search(
         r"FUNCTION\s+carl_autonomy\.lease_payload_valid\(.*?"
         r"jsonb_typeof\(value\)\s*=\s*'object'.*?"
-        r"jsonb_object_length\(value\)\s*=\s*2.*?"
+        r"jsonb_object_cardinality\(value\)\s*=\s*2.*?"
         r"value\s+\?&\s+ARRAY\['owner_id',\s*'stage_attempt_id'\]",
         ROLE_PROCEDURES_SQL,
         flags=re.IGNORECASE | re.DOTALL,
     )
     assert re.search(
         r"FUNCTION\s+carl_autonomy\.artifact_payload_valid\(.*?"
-        r"jsonb_object_length\(value\)\s*=\s*5.*?"
+        r"jsonb_object_cardinality\(value\)\s*=\s*5.*?"
         r"jsonb_typeof\(value->'byte_size'\)\s*=\s*'number'",
         ROLE_PROCEDURES_SQL,
         flags=re.IGNORECASE | re.DOTALL,

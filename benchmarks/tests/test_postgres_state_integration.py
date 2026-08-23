@@ -121,6 +121,30 @@ def _canonical(value: dict[str, Any]) -> str:
     return canonical_json_bytes(value).decode("utf-8")
 
 
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    (
+        ("{}", 0),
+        ('{"alpha":1,"beta":{"nested":true}}', 2),
+        ('{"duplicate":1,"duplicate":2}', 1),
+        ("[]", None),
+        ("[1,2]", None),
+        ('"scalar"', None),
+        ("1", None),
+        ("null", None),
+    ),
+)
+def test_jsonb_object_cardinality_is_exact_and_fails_closed(
+    postgres: object, value: str, expected: int | None
+) -> None:
+    assert POSTGRES_DSN is not None
+    with postgres.connect(POSTGRES_DSN, autocommit=True) as connection:  # type: ignore[attr-defined]
+        actual = connection.execute(
+            "SELECT carl_autonomy.jsonb_object_cardinality(%s::jsonb)", (value,)
+        ).fetchone()[0]
+    assert actual == expected
+
+
 @pytest.fixture(scope="module")
 def postgres() -> object:
     import psycopg

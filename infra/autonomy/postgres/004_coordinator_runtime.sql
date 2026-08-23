@@ -600,7 +600,7 @@ BEGIN
         p_request_json, 'coordinator_graph_request_invalid'
     );
     IF carl_autonomy.canonical_jsonb(request_value) <> p_request_json
-        OR jsonb_object_length(request_value) <> 9
+        OR carl_autonomy.jsonb_object_cardinality(request_value) IS DISTINCT FROM 9
         OR NOT request_value ?& ARRAY[
             'schema_version', 'domain', 'occurrence_key', 'experiment_id',
             'manifest_digest', 'parent_experiment_id', 'parent_commit',
@@ -844,7 +844,7 @@ BEGIN
     signed_envelope_value := receipt_value->'signed_envelope';
     binding_value := signed_envelope_value->'binding';
     IF carl_autonomy.canonical_jsonb(receipt_value) <> p_receipt_json
-        OR jsonb_object_length(receipt_value) <> 18
+        OR carl_autonomy.jsonb_object_cardinality(receipt_value) IS DISTINCT FROM 18
         OR NOT receipt_value ?& ARRAY[
             'archive_byte_length', 'archive_checksum_sha256', 'archive_created_at',
             'archive_object_key', 'archive_version_id', 'artifact', 'domain',
@@ -856,7 +856,7 @@ BEGIN
         OR receipt_value->>'domain'
             <> 'carl.coordinator-recovery-archive-receipt.v1'
         OR jsonb_typeof(signed_envelope_value) <> 'object'
-        OR jsonb_object_length(signed_envelope_value) <> 10
+        OR carl_autonomy.jsonb_object_cardinality(signed_envelope_value) IS DISTINCT FROM 10
         OR NOT signed_envelope_value ?& ARRAY[
             'algorithm', 'artifact', 'binding', 'domain', 'expires_at', 'issued_at',
             'key_id', 'purpose', 'schema_version', 'signature_base64'
@@ -872,13 +872,13 @@ BEGIN
             !~ '^[A-Za-z0-9+/]{86}==$'
         OR signed_envelope_value->'artifact' IS DISTINCT FROM artifact_value
         OR jsonb_typeof(binding_value) <> 'object'
-        OR jsonb_object_length(binding_value) <> 7
+        OR carl_autonomy.jsonb_object_cardinality(binding_value) IS DISTINCT FROM 7
         OR NOT binding_value ?& ARRAY[
             'command_key', 'effect_key', 'freeze_fingerprint', 'occurrence_key',
             'reason', 'repair_fingerprint', 'request_digest'
         ]
         OR jsonb_typeof(artifact_value) <> 'object'
-        OR jsonb_object_length(artifact_value) <> 17
+        OR carl_autonomy.jsonb_object_cardinality(artifact_value) IS DISTINCT FROM 17
         OR NOT artifact_value ?& ARRAY[
             'attempt', 'changed_action_digest', 'command_key', 'decision_identity',
             'domain', 'effect_key', 'experiment_id', 'freeze_fingerprint', 'node_id',
@@ -1099,7 +1099,7 @@ BEGIN
         p_recovery_json, 'coordinator_recovery_request_invalid'
     );
     IF carl_autonomy.canonical_jsonb(recovery_value) <> p_recovery_json
-        OR jsonb_object_length(recovery_value) <> 9
+        OR carl_autonomy.jsonb_object_cardinality(recovery_value) IS DISTINCT FROM 9
         OR NOT recovery_value ?& ARRAY[
             'schema_version', 'domain', 'experiment_id', 'node_id', 'node_kind',
             'expected_revision', 'evidence_digest', 'repair_fingerprint', 'requested_at'
@@ -2633,7 +2633,7 @@ BEGIN
                     request_value->>'operation' IS DISTINCT FROM 'create_revert_ref'
                 ELSE true
             END
-            ELSE jsonb_object_length(request_value) <> 8
+            ELSE carl_autonomy.jsonb_object_cardinality(request_value) IS DISTINCT FROM 8
                 OR NOT request_value ?& ARRAY[
                     'schema_version', 'domain', 'family', 'node_kind', 'command_key',
                     'effect_key', 'request_digest', 'occurred_at'
@@ -2785,7 +2785,7 @@ BEGIN
                 ERRCODE = '55000', MESSAGE = 'coordinator_effect_receipt_missing';
         END IF;
     ELSIF runtime.effect_family NOT IN ('archive', 'evaluator', 'input', 'observer')
-        OR jsonb_object_length(response_value) <> 8
+        OR carl_autonomy.jsonb_object_cardinality(response_value) IS DISTINCT FROM 8
         OR NOT response_value ?& ARRAY[
             'schema_version', 'domain', 'status', 'request_digest', 'observed_at',
             'result_digest', 'retry_not_before', 'error_code'
@@ -3031,7 +3031,7 @@ BEGIN
         OR decision_value->>'effect_key' IS DISTINCT FROM command_state.effect_key
         OR carl_autonomy.canonical_jsonb(decision_value->'command')
             <> command_state.command_json
-        OR jsonb_object_length(request_value) <> 8
+        OR carl_autonomy.jsonb_object_cardinality(request_value) IS DISTINCT FROM 8
         OR NOT request_value ?& ARRAY[
             'schema_version', 'domain', 'family', 'node_kind', 'command_key',
             'effect_key', 'request_digest', 'occurred_at'
