@@ -773,6 +773,190 @@ class CommissioningEffectStore:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class LiveCommissioningCommandState:
+    command_key: str
+    request_digest: str
+    request_payload: dict[str, Any]
+    occurred_at: str
+    status: str
+    result: dict[str, Any] | None
+    result_digest: str | None
+
+
+class LiveCommissioningCommandStore:
+    """Small durable command boundary used by live commissioning reconciliation."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = Path(path).expanduser().absolute()
+        if not _owner_private_directory(self.path.parent):
+            raise CommissioningControllerError("unsafe_live_commissioning_store_parent")
+        if (self.path.exists() or self.path.is_symlink()) and not _owner_private_file(self.path):
+            raise CommissioningControllerError("unsafe_live_commissioning_store_file")
+        try:
+            with self._connect() as connection:
+                connection.execute(
+                    "CREATE TABLE IF NOT EXISTS live_commissioning_commands("
+                    "command_key TEXT PRIMARY KEY, request_digest TEXT NOT NULL, "
+                    "request_json TEXT NOT NULL, occurred_at TEXT NOT NULL, "
+                    "status TEXT NOT NULL, result_json TEXT, result_digest TEXT)"
+                )
+        except sqlite3.Error as error:
+            raise CommissioningControllerError("live_commissioning_store_unavailable") from error
+        if os.name != "nt":
+            self.path.chmod(0o600)
+        if not _owner_private_file(self.path):
+            raise CommissioningControllerError("unsafe_live_commissioning_store_file")
+
+    def _connect(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(self.path, timeout=30)
+        connection.row_factory = sqlite3.Row
+        return connection
+
+    @staticmethod
+    def _encoded_payload(payload: object, code: str) -> tuple[str, str]:
+        if type(payload) is not dict:
+            raise CommissioningControllerError(code)
+        try:
+            encoded = canonical_json_bytes(payload)
+        except (TypeError, ValueError, UnicodeError) as error:
+            raise CommissioningControllerError(code) from error
+        if len(encoded) > 1_048_576:
+            raise CommissioningControllerError(code)
+        return encoded.decode("utf-8"), hashlib.sha256(encoded).hexdigest()
+
+    @staticmethod
+    def _state(row: sqlite3.Row) -> LiveCommissioningCommandState:
+        try:
+            request = json.loads(row["request_json"])
+            result = json.loads(row["result_json"]) if row["result_json"] is not None else None
+        except (json.JSONDecodeError, UnicodeError) as error:
+            raise CommissioningControllerError("live_commissioning_store_corrupt") from error
+        if row["status"] not in {"pending", "completed"}:
+            raise CommissioningControllerError("live_commissioning_store_corrupt")
+        try:
+            request_encoded = canonical_json_bytes(request).decode("utf-8")
+            result_encoded = (
+                canonical_json_bytes(result).decode("utf-8") if result is not None else None
+            )
+        except (TypeError, ValueError, UnicodeError) as error:
+            raise CommissioningControllerError("live_commissioning_store_corrupt") from error
+        expected_result_digest = (
+            hashlib.sha256(result_encoded.encode("utf-8")).hexdigest()
+            if result_encoded is not None
+            else None
+        )
+        if (
+            request_encoded != row["request_json"]
+            or hashlib.sha256(request_encoded.encode("utf-8")).hexdigest() != row["request_digest"]
+            or result_encoded != row["result_json"]
+            or expected_result_digest != row["result_digest"]
+            or (row["status"] == "completed") != (result is not None)
+        ):
+            raise CommissioningControllerError("live_commissioning_store_corrupt")
+        return LiveCommissioningCommandState(
+            command_key=row["command_key"],
+            request_digest=row["request_digest"],
+            request_payload=request,
+            occurred_at=row["occurred_at"],
+            status=row["status"],
+            result=result,
+            result_digest=row["result_digest"],
+        )
+
+    def begin(
+        self,
+        *,
+        command_key: str,
+        request_payload: dict[str, Any],
+        occurred_at: str,
+    ) -> LiveCommissioningCommandState:
+        _key(command_key, "invalid_live_commissioning_command_key")
+        _timestamp(occurred_at, "invalid_live_commissioning_occurred_at")
+        encoded, digest = self._encoded_payload(
+            request_payload, "invalid_live_commissioning_request"
+        )
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM live_commissioning_commands WHERE command_key = ?",
+                (command_key,),
+            ).fetchone()
+            if row is None:
+                connection.execute(
+                    "INSERT INTO live_commissioning_commands("
+                    "command_key, request_digest, request_json, occurred_at, status) "
+                    "VALUES(?, ?, ?, ?, 'pending')",
+                    (command_key, digest, encoded, occurred_at),
+                )
+                row = connection.execute(
+                    "SELECT * FROM live_commissioning_commands WHERE command_key = ?",
+                    (command_key,),
+                ).fetchone()
+            elif (
+                row["request_digest"] != digest
+                or row["request_json"] != encoded
+                or row["occurred_at"] != occurred_at
+            ):
+                raise CommissioningControllerError("live_commissioning_command_conflict")
+            connection.commit()
+        assert row is not None
+        return self._state(row)
+
+    def complete(
+        self,
+        *,
+        command_key: str,
+        request_payload: dict[str, Any],
+        result: dict[str, Any],
+    ) -> LiveCommissioningCommandState:
+        _key(command_key, "invalid_live_commissioning_command_key")
+        request_json, request_digest = self._encoded_payload(
+            request_payload, "invalid_live_commissioning_request"
+        )
+        result_json, result_digest = self._encoded_payload(
+            result, "invalid_live_commissioning_result"
+        )
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM live_commissioning_commands WHERE command_key = ?",
+                (command_key,),
+            ).fetchone()
+            if row is None:
+                raise CommissioningControllerError("live_commissioning_command_missing")
+            if row["request_digest"] != request_digest or row["request_json"] != request_json:
+                raise CommissioningControllerError("live_commissioning_command_conflict")
+            if row["status"] == "completed":
+                if row["result_json"] != result_json or row["result_digest"] != result_digest:
+                    raise CommissioningControllerError("live_commissioning_result_conflict")
+            elif row["status"] == "pending":
+                connection.execute(
+                    "UPDATE live_commissioning_commands "
+                    "SET status = 'completed', result_json = ?, result_digest = ? "
+                    "WHERE command_key = ? AND status = 'pending'",
+                    (result_json, result_digest, command_key),
+                )
+            else:
+                raise CommissioningControllerError("live_commissioning_store_corrupt")
+            row = connection.execute(
+                "SELECT * FROM live_commissioning_commands WHERE command_key = ?",
+                (command_key,),
+            ).fetchone()
+            connection.commit()
+        assert row is not None
+        return self._state(row)
+
+    def load(self, command_key: str) -> LiveCommissioningCommandState | None:
+        _key(command_key, "invalid_live_commissioning_command_key")
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM live_commissioning_commands WHERE command_key = ?",
+                (command_key,),
+            ).fetchone()
+        return None if row is None else self._state(row)
+
+
 def _git(*arguments: str, check: bool = True) -> subprocess.CompletedProcess[str]:
     try:
         return subprocess.run(

@@ -1,0 +1,973 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import subprocess
+import sys
+import tomllib
+from dataclasses import replace
+from datetime import UTC, datetime
+from inspect import signature
+from pathlib import Path
+
+import pytest
+from test_cloud_coordinator import claimed_command_for, lease, node, snapshot
+
+from carl_bench import coordinator_service
+from carl_bench.canonical import canonical_json_bytes
+from carl_bench.cloud_coordinator import (
+    CloudCoordinatorDecision,
+    CloudCoordinatorError,
+    EffectObservation,
+    ProtectedCoordinatorExecutor,
+    choose_next_action,
+)
+from carl_bench.cloud_state import create_command_state
+from carl_bench.coordinator_ipc import CoordinatorServiceRequest
+from carl_bench.coordinator_service import coordinator_response
+from carl_bench.github_promotion import APPROVED_REQUIRED_CHECKS
+from carl_bench.live_evaluation_authority import ProtectedArchiveVersion
+from carl_bench.postgres_state import PostgresStateError
+
+NOW_TEXT = "2026-08-22T12:00:00Z"
+DIGEST = "1" * 64
+
+
+def durable_production_receipts(node_kind: str = "create_promotion_pr") -> dict[str, object]:
+    receipts: dict[str, object] = {
+        "experiment_id": "experiment-1",
+        "node_kind": node_kind,
+        "request_digest": DIGEST,
+        "repository": "StephenBickel/carl-agent",
+        "candidate_commit": "2" * 40,
+        "candidate_tree": "3" * 40,
+        "experimental_ref": "refs/heads/experimental/experiment-1",
+        "archive_object_key": f"carl-evidence/v1/sha256/{DIGEST[:2]}/{DIGEST}",
+        "archive_version_id": "version-1",
+        "archive_digest": DIGEST,
+        "archive_receipt_digest": "2" * 64,
+        "experimental_receipt_digest": "3" * 64,
+        "live_provenance_receipt_digest": "4" * 64,
+        "independent_disposition_receipt_digest": "5" * 64,
+        "verified_at": NOW_TEXT,
+        "archive_retain_until": "2026-09-22T12:00:00Z",
+        "pull_request_number": None,
+        "pull_request_head": None,
+        "pull_request_base": None,
+        "required_checks_receipt_digest": None,
+        "branch_protection_receipt_digest": None,
+        "merge_commit": None,
+        "merge_tree": None,
+        "merged_at": None,
+        "soak_observation_digest": None,
+        "soak_observed_at": None,
+        "hard_failure_digest": None,
+        "revert_candidate_commit": None,
+    }
+    if node_kind not in {"create_promotion_pr", "create_revert"}:
+        receipts.update(
+            {
+                "pull_request_number": 42,
+                "pull_request_head": "2" * 40,
+                "pull_request_base": "main",
+            }
+        )
+    if node_kind not in {
+        "create_promotion_pr",
+        "observe_required_checks",
+        "create_revert",
+    }:
+        receipts.update(
+            {
+                "required_checks_receipt_digest": "6" * 64,
+                "branch_protection_receipt_digest": "7" * 64,
+            }
+        )
+    if node_kind in {
+        "schedule_soak",
+        "observe_soak",
+        "accept_soak",
+        "create_revert",
+        "observe_revert",
+    }:
+        receipts.update(
+            {
+                "merge_commit": "4" * 40,
+                "merge_tree": "5" * 40,
+                "merged_at": "2026-08-21T12:00:00Z",
+            }
+        )
+    if node_kind in {"accept_soak", "create_revert", "observe_revert"}:
+        receipts.update(
+            {
+                "soak_observation_digest": "8" * 64,
+                "soak_observed_at": NOW_TEXT,
+            }
+        )
+    if node_kind in {"create_revert", "observe_revert"}:
+        receipts.update(
+            {
+                "hard_failure_digest": "9" * 64,
+                "revert_candidate_commit": "6" * 40,
+            }
+        )
+        if node_kind == "observe_revert":
+            receipts["pull_request_head"] = "6" * 40
+    return receipts
+
+
+class DurableState:
+    def __init__(self, expected_command: str = "coordinate") -> None:
+        self.current = snapshot(node(), current_lease=lease())
+        self.applied: list[str] = []
+        self.expected_command = expected_command
+
+    def reconstruct(self, command: str, *, observed_at: datetime):
+        assert command == self.expected_command
+        assert observed_at == datetime(2026, 8, 22, 12, tzinfo=UTC)
+        return self.current
+
+    def apply(self, decision, *, observed_at: datetime):
+        assert observed_at == datetime(2026, 8, 22, 12, tzinfo=UTC)
+        self.applied.append(decision.action)
+        selected = node()
+        if decision.action == "persist_command":
+            self.current = replace(self.current, command=create_command_state(decision.command))
+        elif decision.action == "claim_command":
+            self.current = replace(self.current, command=claimed_command_for(selected))
+        elif decision.action == "frozen":
+            pass
+        else:  # pragma: no cover - a wrong production branch is the tested defect
+            raise AssertionError(decision.action)
+        return decision
+
+
+class NoEffects:
+    def execute(self, decision, *, observed_at: datetime):  # pragma: no cover
+        del decision, observed_at
+        raise AssertionError("no remote effect belongs to these two invocations")
+
+
+def test_repeated_service_invocation_advances_durable_state() -> None:
+    state = DurableState()
+    executor = ProtectedCoordinatorExecutor._for_testing(
+        state=state,
+        effects=NoEffects(),
+        clock=lambda: datetime(2026, 8, 22, 12, tzinfo=UTC),
+    )
+    request = CoordinatorServiceRequest.create("coordinate")
+
+    first = coordinator_response(request, controller=executor)
+    second = coordinator_response(request, controller=executor)
+
+    assert first.result is not None and first.result["action"] == "persist_command"
+    assert second.result is not None and second.result["action"] == "claim_command"
+    assert first.result["identity"] != second.result["identity"]
+    assert state.applied == ["persist_command", "claim_command"]
+
+
+def test_request_allowlist_selects_only_the_authorized_ready_node() -> None:
+    state = DurableState()
+    state.current = snapshot(
+        node("dispatch_builder"),
+        node("schedule_soak"),
+        current_lease=lease(),
+        production_authorization=None,
+    )
+    executor = ProtectedCoordinatorExecutor._for_testing(
+        state=state,
+        effects=NoEffects(),
+        clock=lambda: datetime(2026, 8, 22, 12, tzinfo=UTC),
+    )
+    request = CoordinatorServiceRequest.create("coordinate", allowed_nodes=("schedule_soak",))
+
+    response = coordinator_response(request, controller=executor)
+
+    assert response.status == "completed"
+    assert response.result is not None
+    assert response.result["node"] == "schedule_soak"
+    assert response.result["action"] == "frozen"
+    assert response.result["reason"] == "protected_production_receipts_required"
+    assert state.applied == ["frozen"]
+
+
+def test_worker_with_no_applicable_node_is_canonical_idle() -> None:
+    state = DurableState(expected_command="observe")
+    state.current = snapshot(current_lease=lease())
+    executor = ProtectedCoordinatorExecutor._for_testing(
+        state=state,
+        effects=NoEffects(),
+        clock=lambda: datetime(2026, 8, 22, 12, tzinfo=UTC),
+    )
+
+    response = coordinator_response(
+        CoordinatorServiceRequest.create("observe"), controller=executor
+    )
+
+    assert response.result is not None
+    assert response.result["action"] == "idle"
+    assert response.result["reason"] == "no_applicable_node"
+    assert response.result["consequential"] is False
+    assert state.applied == []
+
+
+def test_empty_durable_queue_is_canonical_idle_without_a_mutation() -> None:
+    class EmptyState:
+        def __init__(self) -> None:
+            self.applied = False
+
+        def reconstruct(self, command: str, *, observed_at: datetime):
+            assert command == "observe"
+            assert observed_at == datetime(2026, 8, 22, 12, tzinfo=UTC)
+            return None
+
+        def apply(self, decision, *, observed_at: datetime):  # pragma: no cover
+            del decision, observed_at
+            self.applied = True
+            raise AssertionError("idle must not mutate")
+
+    state = EmptyState()
+    executor = ProtectedCoordinatorExecutor._for_testing(
+        state=state,
+        effects=NoEffects(),
+        clock=lambda: datetime(2026, 8, 22, 12, tzinfo=UTC),
+    )
+
+    response = coordinator_response(
+        CoordinatorServiceRequest.create("observe"), controller=executor
+    )
+
+    assert response.status == "completed"
+    assert response.result is not None
+    assert response.result["action"] == "idle"
+    assert response.result["reason"] == "no_applicable_node"
+    assert response.result["consequential"] is False
+    assert state.applied is False
+
+
+def test_storage_failure_is_a_bounded_rejection_not_a_service_crash() -> None:
+    class BrokenState:
+        def reconstruct(self, command: str, *, observed_at: datetime):
+            del command, observed_at
+            raise PostgresStateError("postgres_mutation_failed")
+
+        def apply(self, decision, *, observed_at: datetime):  # pragma: no cover
+            del decision, observed_at
+            raise AssertionError("unreachable")
+
+    executor = ProtectedCoordinatorExecutor._for_testing(
+        state=BrokenState(),
+        effects=NoEffects(),
+        clock=lambda: datetime(2026, 8, 22, 12, tzinfo=UTC),
+    )
+    request = CoordinatorServiceRequest.create("coordinate")
+
+    response = coordinator_response(request, controller=executor)
+
+    assert response.status == "rejected"
+    assert response.error_code == "coordinator_request_rejected"
+    assert response.result is None
+
+
+def test_protected_coordinator_has_a_zero_argument_packaged_entrypoint() -> None:
+    project = tomllib.loads((Path(__file__).parents[1] / "pyproject.toml").read_text())
+
+    assert project["project"]["scripts"]["carl-coordinator-service"] == (
+        "carl_bench.coordinator_service:main"
+    )
+    assert set(signature(coordinator_service.main).parameters) == set()
+
+    assert project["project"]["scripts"]["carl-coordinator-effect-service"] == (
+        "carl_bench.coordinator_effect_service:main"
+    )
+
+
+def test_production_controller_owns_fixed_state_and_effect_clients(monkeypatch) -> None:
+    constructed: list[str] = []
+
+    class Backend:
+        @classmethod
+        def from_protected_environment(cls):
+            constructed.append("postgres")
+            return object()
+
+    class GitHubClient:
+        @classmethod
+        def from_protected_environment(cls):
+            constructed.append("github")
+            return object()
+
+    class ArchiveReader:
+        @classmethod
+        def from_protected_environment(cls):
+            constructed.append("archive")
+            return object()
+
+    class EffectClients:
+        input_publisher = object()
+        observer = object()
+        archive = object()
+        evaluator = object()
+
+    def load_effect_clients():
+        constructed.append("effects")
+        return EffectClients()
+
+    monkeypatch.setattr(coordinator_service, "PostgresStateBackend", Backend)
+    monkeypatch.setattr(coordinator_service, "GitHubEffectSocketClient", GitHubClient)
+    monkeypatch.setattr(coordinator_service, "ProtectedArchiveSocketReader", ArchiveReader)
+    monkeypatch.setattr(
+        coordinator_service,
+        "load_protected_coordinator_effect_clients",
+        load_effect_clients,
+    )
+
+    controller = coordinator_service._build_protected_controller()
+
+    assert isinstance(controller, ProtectedCoordinatorExecutor)
+    assert constructed == ["postgres", "github", "archive", "effects"]
+
+
+def test_protected_receipt_failure_is_persisted_once_then_returns_durable_idle() -> None:
+    class State:
+        def __init__(self) -> None:
+            self.current = snapshot(
+                node("create_promotion_pr"),
+                current_lease=lease(),
+            )
+            self.applied: list[object] = []
+
+        def reconstruct(self, command: str, *, observed_at: datetime):
+            assert command == "commission-live"
+            assert observed_at == datetime(2026, 8, 22, 12, tzinfo=UTC)
+            return self.current
+
+        def apply(self, decision, *, observed_at: datetime):
+            assert observed_at == datetime(2026, 8, 22, 12, tzinfo=UTC)
+            self.applied.append(decision)
+            self.current = None
+            return decision
+
+    state = State()
+    controller = ProtectedCoordinatorExecutor._for_testing(
+        state=state,
+        effects=NoEffects(),
+        clock=lambda: datetime(2026, 8, 22, 12, tzinfo=UTC),
+    )
+
+    first = controller.advance("commission-live")
+    second = controller.advance("commission-live")
+
+    assert first.action == "frozen"
+    assert first.reason == "protected_production_receipts_required"
+    assert len(state.applied) == 1
+    assert second.action == "idle"
+    assert second.reason == "no_applicable_node"
+
+
+def test_sql_atomic_receipt_freeze_is_returned_without_a_second_state_mutation() -> None:
+    selected = node("observe_builder")
+    current = snapshot(
+        selected,
+        current_lease=lease(),
+        command=claimed_command_for(selected),
+        effect=EffectObservation(
+            effect_key=selected.effect_key,
+            status="applied",
+            result_digest="a" * 64,
+            observed_at=NOW_TEXT,
+        ),
+    )
+
+    class AtomicState:
+        def __init__(self) -> None:
+            self.mutations = 0
+            self.frozen = False
+
+        def reconstruct(self, command: str, *, observed_at: datetime):
+            del command, observed_at
+            return None if self.frozen else current
+
+        def frozen_status(self, command: str, *, observed_at: datetime) -> bool:
+            del command, observed_at
+            return self.frozen
+
+        def apply(self, decision, *, observed_at: datetime):
+            del observed_at
+            self.mutations += 1
+            self.frozen = True
+            assert decision.action == "complete_command"
+            identity = hashlib.sha256(
+                canonical_json_bytes(
+                    {
+                        "action": "frozen",
+                        "experiment_id": decision.experiment_id,
+                        "node_id": selected.node_id,
+                        "reason": "authoritative_completion_receipt_invalid",
+                        "revision": decision.revision,
+                    }
+                )
+            ).hexdigest()
+            return CloudCoordinatorDecision(
+                schema_version=1,
+                action="frozen",
+                reason="authoritative_completion_receipt_invalid",
+                identity=identity,
+                experiment_id=decision.experiment_id,
+                revision=decision.revision,
+                node=decision.node,
+                command=None,
+                effect_key=None,
+                result_digest=None,
+                consequential=True,
+                remote_effect=False,
+                event=None,
+            )
+
+    state = AtomicState()
+    controller = ProtectedCoordinatorExecutor._for_testing(
+        state=state,
+        effects=NoEffects(),
+        clock=lambda: datetime(2026, 8, 22, 12, tzinfo=UTC),
+    )
+
+    result = controller.advance("coordinate")
+    replay = controller.advance("coordinate")
+
+    assert result.action == "frozen"
+    assert result.reason == "authoritative_completion_receipt_invalid"
+    assert (replay.action, replay.reason) == ("idle", "already_frozen")
+    assert state.mutations == 1
+
+
+def test_atomic_prepare_freeze_never_reaches_the_protected_effect_service() -> None:
+    selected = node("publish_input")
+    decision = choose_next_action(
+        snapshot(
+            selected,
+            current_lease=lease(),
+            command=claimed_command_for(selected),
+        )
+    )
+    frozen_identity = hashlib.sha256(
+        canonical_json_bytes(
+            {
+                "action": "frozen",
+                "experiment_id": decision.experiment_id,
+                "node_id": selected.node_id,
+                "reason": "authoritative_completion_receipt_invalid",
+                "revision": decision.revision,
+            }
+        )
+    ).hexdigest()
+    frozen = CloudCoordinatorDecision(
+        schema_version=1,
+        action="frozen",
+        reason="authoritative_completion_receipt_invalid",
+        identity=frozen_identity,
+        experiment_id=decision.experiment_id,
+        revision=decision.revision,
+        node=decision.node,
+        command=None,
+        effect_key=None,
+        result_digest=None,
+        consequential=True,
+        remote_effect=False,
+        event=None,
+    )
+
+    class Backend:
+        def prepare_coordinator_effect(self, actual, *, expected_family, observed_at):
+            assert actual == decision
+            assert expected_family == "input"
+            assert observed_at == datetime(2026, 8, 22, 12, tzinfo=UTC)
+            return frozen
+
+        def complete_coordinator_effect(self, *args, **kwargs):  # pragma: no cover
+            del args, kwargs
+            raise AssertionError("an atomic prepare freeze is already terminal")
+
+    class InputPublisher:
+        def publish(self, request):  # pragma: no cover
+            del request
+            raise AssertionError("an invalid durable receipt must prevent the effect")
+
+    router = coordinator_service._ProtectedCoordinatorEffectRouter._for_testing(
+        backend=Backend(),
+        github=None,
+        input_publisher=InputPublisher(),
+        observer=None,
+        archive=None,
+        evaluator=None,
+    )
+
+    assert router.execute(decision, observed_at=datetime(2026, 8, 22, 12, tzinfo=UTC)) == frozen
+
+
+def test_systemd_commissions_every_fixed_effect_socket_before_coordinator_start() -> None:
+    root = Path(__file__).parents[2] / "infra/autonomy/systemd"
+    policy = Path(__file__).parents[2] / "infra/autonomy/policies/coordinator-effects-policy.json"
+    service = (root / "carl-coordinator.service").read_text(encoding="utf-8")
+    coordinator_socket = (root / "carl-coordinator.socket").read_text(encoding="utf-8")
+    units = {
+        "archive": "carl-archive-effect.socket",
+        "evaluator": "carl-evaluator-effect.socket",
+        "input": "carl-input-effect.socket",
+        "observer": "carl-observer-effect.socket",
+    }
+
+    for family, unit_name in units.items():
+        assert unit_name in service
+        unit = (root / unit_name).read_text(encoding="utf-8")
+        assert f"FileDescriptorName={family}-effect" in unit
+        assert f"ListenStream=/run/carl/{family}-effect.sock" in unit
+        assert "DirectoryMode=0711" in unit
+        assert "SocketMode=0600" in unit
+        assert "SocketUser=carl-autonomy-coordinator" in unit
+        assert "SocketGroup=carl-autonomy-coordinator" in unit
+        responder = (root / unit_name.replace(".socket", ".service")).read_text(encoding="utf-8")
+        assert f"User=carl-autonomy-{family}" in responder
+        assert f"Group=carl-autonomy-{family}" in responder
+        assert f"EnvironmentFile=/etc/carl/{family}-effect.env" in responder
+        assert (
+            "ExecStart=/opt/carl-autonomy/venv/bin/python3 -I "
+            "-m carl_bench.coordinator_effect_service" in responder
+        )
+        assert "NoNewPrivileges=true" in responder
+        assert "ProtectSystem=strict" in responder
+        assert "UnsetEnvironment=PYTHONPATH PYTHONHOME PYTHONSTARTUP PYTHONUSERBASE" in responder
+        assert "InaccessiblePaths=/etc/carl/coordinator.env" in responder
+        inaccessible = next(
+            line for line in responder.splitlines() if line.startswith("InaccessiblePaths=")
+        )
+        for other in units:
+            if other != family:
+                assert f"/etc/carl/{other}-effect.env" in inaccessible
+        assert "/etc/carl/github-effect.env" in inaccessible
+        if family == "archive":
+            assert "ReadOnlyPaths=/etc/carl/coordinator-recovery-signing-key.pem" in responder
+        else:
+            assert "/etc/carl/coordinator-recovery-signing-key.pem" in inaccessible
+        assert f"Service=carl-{family}-effect.service" in unit
+
+    assert "User=carl-autonomy-coordinator" in service
+    assert "Group=carl-autonomy-coordinator" in service
+    assert "User=root" not in service
+    assert "ReadOnlyPaths=/etc/carl/coordinator-effects-policy.json" in service
+    assert "/etc/carl/coordinator-recovery-keyring.json" in service
+    assert "/etc/carl/coordinator-recovery-signing-key.pem" in service
+    coordinator_inaccessible = next(
+        line for line in service.splitlines() if line.startswith("InaccessiblePaths=")
+    )
+    for protected_secret in (
+        "/etc/carl/github-effect.env",
+        "/etc/carl/archive-effect.env",
+        "/etc/carl/evaluator-effect.env",
+        "/etc/carl/input-effect.env",
+        "/etc/carl/observer-effect.env",
+        "/etc/carl/coordinator-recovery-signing-key.pem",
+    ):
+        assert protected_secret in coordinator_inaccessible
+    assert "DirectoryMode=0711" in coordinator_socket
+    assert "carl-github-effect.socket" in service
+    github_socket = (root / "carl-github-effect.socket").read_text(encoding="utf-8")
+    github_service = (root / "carl-github-effect.service").read_text(encoding="utf-8")
+    assert "ListenStream=/run/carl/github-effect.sock" in github_socket
+    assert "DirectoryMode=0711" in github_socket
+    assert "SocketMode=0600" in github_socket
+    assert "SocketUser=carl-autonomy-coordinator" in github_socket
+    assert "SocketGroup=carl-autonomy-coordinator" in github_socket
+    assert "Service=carl-github-effect.service" in github_socket
+    assert "User=root" in github_service
+    assert "Group=root" in github_service
+    assert "EnvironmentFile=/etc/carl/github-effect.env" in github_service
+    assert "InaccessiblePaths=/etc/carl/coordinator.env" in github_service
+    assert "/etc/carl/coordinator-recovery-signing-key.pem" in next(
+        line for line in github_service.splitlines() if line.startswith("InaccessiblePaths=")
+    )
+    assert json.loads(policy.read_text(encoding="utf-8")) == {
+        "coordinator_user": "carl-autonomy-coordinator",
+        "domain": "carl.coordinator-effect-policy.v1",
+        "required_families": ["archive", "evaluator", "input", "observer"],
+        "schema_version": 1,
+        "service_users": {
+            "archive": "carl-autonomy-archive",
+            "evaluator": "carl-autonomy-evaluator",
+            "input": "carl-autonomy-input",
+            "observer": "carl-autonomy-observer",
+        },
+    }
+
+
+def test_production_receipts_are_bound_to_an_independent_exact_archive_read() -> None:
+    payload = b"protected production evidence"
+    archive_digest = hashlib.sha256(payload).hexdigest()
+    receipts = durable_production_receipts()
+    receipts.update(
+        {
+            "archive_digest": archive_digest,
+            "archive_object_key": (
+                f"carl-evidence/v1/sha256/{archive_digest[:2]}/{archive_digest}"
+            ),
+            "archive_version_id": "version-9",
+        }
+    )
+    durable_snapshot = snapshot(
+        node("create_promotion_pr"),
+        current_lease=lease(),
+    )
+
+    class Backend:
+        def reconstruct_coordinator_snapshot(self, command, *, observed_at):
+            assert command == "commission-live"
+            assert observed_at == datetime(2026, 8, 22, 12, tzinfo=UTC)
+            return durable_snapshot, receipts
+
+    class Archive:
+        def __init__(self, *, checksum: str = archive_digest) -> None:
+            self.checksum = checksum
+            self.calls: list[tuple[str, str]] = []
+
+        def read_exact(self, object_key: str, version_id: str):
+            self.calls.append((object_key, version_id))
+            return ProtectedArchiveVersion(
+                object_key=object_key,
+                version_id=version_id,
+                payload=payload,
+                checksum_sha256=self.checksum,
+                byte_length=len(payload),
+                retention_mode="COMPLIANCE",
+                retain_until="2026-09-22T12:00:00Z",
+                created_at="2026-08-22T11:00:00Z",
+            )
+
+    archive = Archive()
+    state = coordinator_service._PostgresCoordinatorState(Backend(), archive)
+
+    rebuilt = state.reconstruct(
+        "commission-live", observed_at=datetime(2026, 8, 22, 12, tzinfo=UTC)
+    )
+
+    assert rebuilt is not None and rebuilt.production_authorization is not None
+    assert rebuilt.production_authorization.archive_digest == archive_digest
+    assert archive.calls == [(receipts["archive_object_key"], receipts["archive_version_id"])]
+
+    with pytest.raises(CloudCoordinatorError, match="protected_archive_receipt_mismatch"):
+        coordinator_service._PostgresCoordinatorState(
+            Backend(), Archive(checksum="f" * 64)
+        ).reconstruct("commission-live", observed_at=datetime(2026, 8, 22, 12, tzinfo=UTC))
+
+
+def test_activation_contract_requires_exact_coordinator_descriptor_name(monkeypatch) -> None:
+    captured: list[tuple[dict[str, str], int]] = []
+
+    def validate(*, environment, process_id):
+        captured.append((environment, process_id))
+        return 3
+
+    monkeypatch.setattr(coordinator_service, "_github_activation_descriptor", validate)
+    monkeypatch.setenv("LISTEN_FDNAMES", "coordinator")
+
+    assert coordinator_service._activation_descriptor_from_environment() == 3
+    assert captured == [({**os.environ, "LISTEN_FDNAMES": "github-effect"}, os.getpid())]
+
+    monkeypatch.setenv("LISTEN_FDNAMES", "github-effect")
+    with pytest.raises(RuntimeError, match="coordinator_service_activation_invalid"):
+        coordinator_service._activation_descriptor_from_environment()
+
+
+def test_production_authorization_is_minted_only_from_exact_current_durable_receipts() -> None:
+    observed_at = datetime(2026, 8, 22, 12, tzinfo=UTC)
+
+    authorized = coordinator_service._authorization_from_durable_receipts(
+        durable_production_receipts(), observed_at=observed_at
+    )
+
+    assert authorized.experiment_id == "experiment-1"
+    assert authorized.node_kind == "create_promotion_pr"
+    assert authorized.verified_at == NOW_TEXT
+
+    stale = durable_production_receipts()
+    stale["verified_at"] = "2026-08-22T11:59:59Z"
+    with pytest.raises(CloudCoordinatorError, match="protected_authorization_time_mismatch"):
+        coordinator_service._authorization_from_durable_receipts(stale, observed_at=observed_at)
+
+    with pytest.raises(CloudCoordinatorError, match="protected_authorization_receipts_invalid"):
+        coordinator_service._authorization_from_durable_receipts(
+            {**durable_production_receipts(), "synthetic": False},
+            observed_at=observed_at,
+        )
+
+
+def test_only_service_minted_exact_receipts_enable_production_nodes() -> None:
+    observed_at = datetime(2026, 8, 22, 12, tzinfo=UTC)
+    authorization = coordinator_service._authorization_from_durable_receipts(
+        durable_production_receipts(), observed_at=observed_at
+    )
+
+    allowed = choose_next_action(
+        snapshot(
+            node("create_promotion_pr"),
+            current_lease=lease(),
+            production_authorization=authorization,
+        )
+    )
+
+    assert allowed.action == "persist_command"
+    assert allowed.node == "create_promotion_pr"
+
+    wrong_node = coordinator_service._authorization_from_durable_receipts(
+        durable_production_receipts("enable_auto_merge"), observed_at=observed_at
+    )
+    blocked = choose_next_action(
+        snapshot(
+            node("create_promotion_pr"),
+            current_lease=lease(),
+            production_authorization=wrong_node,
+        )
+    )
+    assert blocked.action == "frozen"
+    assert blocked.reason == "production_node_identity_mismatch"
+
+
+def test_service_minted_soak_authorization_requires_exact_merge_bound_observation() -> None:
+    receipts = durable_production_receipts("accept_soak")
+    for field in (
+        "merge_commit",
+        "merge_tree",
+        "merged_at",
+        "soak_observation_digest",
+        "soak_observed_at",
+    ):
+        receipts[field] = None
+    with pytest.raises(CloudCoordinatorError, match="protected_authorization_merge_invalid"):
+        coordinator_service._authorization_from_durable_receipts(
+            receipts,
+            observed_at=datetime(2026, 8, 22, 12, tzinfo=UTC),
+        )
+
+
+def test_service_rejects_production_receipts_missing_the_node_specific_chain() -> None:
+    receipts = durable_production_receipts("enable_auto_merge")
+    receipts["required_checks_receipt_digest"] = None
+
+    with pytest.raises(CloudCoordinatorError, match="protected_authorization_checks_invalid"):
+        coordinator_service._authorization_from_durable_receipts(
+            receipts,
+            observed_at=datetime(2026, 8, 22, 12, tzinfo=UTC),
+        )
+
+
+def test_service_rejects_revert_without_exact_hard_failure_identity() -> None:
+    receipts = durable_production_receipts("create_revert")
+    receipts["hard_failure_digest"] = None
+
+    with pytest.raises(CloudCoordinatorError, match="protected_authorization_revert_invalid"):
+        coordinator_service._authorization_from_durable_receipts(
+            receipts,
+            observed_at=datetime(2026, 8, 22, 12, tzinfo=UTC),
+        )
+
+
+def _promotion_receipt_payloads(
+    *, check_conclusion: str = "success", protection_override: dict[str, object] | None = None
+) -> tuple[bytes, bytes]:
+    checks = canonical_json_bytes(
+        {
+            "checks": [
+                {"app_id": 15368, "conclusion": check_conclusion, "name": name}
+                for name in APPROVED_REQUIRED_CHECKS
+            ],
+            "head_sha": "2" * 40,
+            "kind": "github_required_checks",
+            "observed_at": NOW_TEXT,
+            "pull_request_number": 42,
+            "repository": "StephenBickel/carl-agent",
+            "schema_version": 1,
+        }
+    )
+    protection = {
+        "allow_auto_merge": True,
+        "allow_deletions": False,
+        "allow_force_pushes": False,
+        "allow_merge_commit": False,
+        "allow_rebase_merge": False,
+        "allow_squash_merge": True,
+        "branch": "main",
+        "delete_branch_on_merge": True,
+        "enforce_admins": True,
+        "head_sha": "2" * 40,
+        "kind": "github_branch_protection",
+        "observed_at": NOW_TEXT,
+        "pull_request_number": 42,
+        "repository": "StephenBickel/carl-agent",
+        "required_checks": [{"app_id": 15368, "name": name} for name in APPROVED_REQUIRED_CHECKS],
+        "required_conversation_resolution": True,
+        "required_linear_history": True,
+        "required_status_checks_strict": True,
+        "schema_version": 1,
+    }
+    protection.update(protection_override or {})
+    return checks, canonical_json_bytes(protection)
+
+
+def _receipt_bound_state(
+    *, checks: bytes, protection: bytes
+) -> coordinator_service._PostgresCoordinatorState:
+    archive_payload = b"protected production evidence"
+    archive_digest = hashlib.sha256(archive_payload).hexdigest()
+    checks_digest = hashlib.sha256(checks).hexdigest()
+    protection_digest = hashlib.sha256(protection).hexdigest()
+    receipts = durable_production_receipts("enable_auto_merge")
+    receipts.update(
+        {
+            "archive_digest": archive_digest,
+            "archive_object_key": f"carl-evidence/v1/sha256/{archive_digest[:2]}/{archive_digest}",
+            "archive_version_id": "archive-v1",
+            "required_checks_receipt_digest": checks_digest,
+            "branch_protection_receipt_digest": protection_digest,
+            "required_checks_object_key": f"evidence/{checks_digest}",
+            "required_checks_object_version": "checks-v1",
+            "required_checks_recorded_at": NOW_TEXT,
+            "required_checks_retain_until": "2026-09-22T12:00:00Z",
+            "branch_protection_object_key": f"evidence/{protection_digest}",
+            "branch_protection_object_version": "protection-v1",
+            "branch_protection_recorded_at": NOW_TEXT,
+            "branch_protection_retain_until": "2026-09-22T12:00:00Z",
+        }
+    )
+    durable_snapshot = snapshot(node("enable_auto_merge"), current_lease=lease())
+
+    class Backend:
+        def reconstruct_coordinator_snapshot(self, command, *, observed_at):
+            assert command == "commission-live"
+            return durable_snapshot, receipts
+
+    versions = {
+        receipts["archive_object_key"]: (archive_payload, "archive-v1"),
+        receipts["required_checks_object_key"]: (checks, "checks-v1"),
+        receipts["branch_protection_object_key"]: (protection, "protection-v1"),
+    }
+
+    class Archive:
+        def read_exact(self, object_key, version_id):
+            payload, expected_version = versions[object_key]
+            assert version_id == expected_version
+            return ProtectedArchiveVersion(
+                object_key=object_key,
+                version_id=version_id,
+                payload=payload,
+                checksum_sha256=hashlib.sha256(payload).hexdigest(),
+                byte_length=len(payload),
+                retention_mode="COMPLIANCE",
+                retain_until="2026-09-22T12:00:00Z",
+                created_at="2026-08-22T11:00:00Z",
+            )
+
+    return coordinator_service._PostgresCoordinatorState(Backend(), Archive())
+
+
+def test_enable_auto_merge_reads_and_verifies_exact_protected_payloads() -> None:
+    checks, protection = _promotion_receipt_payloads()
+
+    rebuilt = _receipt_bound_state(checks=checks, protection=protection).reconstruct(
+        "commission-live", observed_at=datetime(2026, 8, 22, 12, tzinfo=UTC)
+    )
+
+    assert rebuilt is not None
+    assert rebuilt.production_authorization is not None
+    assert rebuilt.production_authorization.node_kind == "enable_auto_merge"
+
+
+@pytest.mark.parametrize(
+    ("check_conclusion", "protection_override"),
+    (
+        ("failure", None),
+        ("success", {"enforce_admins": False}),
+        ("success", {"allow_force_pushes": True}),
+        ("success", {"head_sha": "9" * 40}),
+        ("success", {"repository": "attacker/fork"}),
+    ),
+)
+def test_enable_auto_merge_rejects_failed_checks_or_protection_drift(
+    check_conclusion: str, protection_override: dict[str, object] | None
+) -> None:
+    checks, protection = _promotion_receipt_payloads(
+        check_conclusion=check_conclusion, protection_override=protection_override
+    )
+
+    with pytest.raises(CloudCoordinatorError, match="protected_promotion_receipt_mismatch"):
+        _receipt_bound_state(checks=checks, protection=protection).reconstruct(
+            "commission-live", observed_at=datetime(2026, 8, 22, 12, tzinfo=UTC)
+        )
+
+
+@pytest.mark.parametrize(
+    ("path", "replacement"),
+    (
+        (("repository",), "attacker/fork"),
+        (("pull_request_number",), 43),
+        (("head_sha",), "9" * 40),
+        (("checks", 0, "name"), "Quality-copy"),
+        (("checks", 0, "app_id"), 1),
+    ),
+)
+def test_enable_auto_merge_rejects_each_mutated_check_identity(
+    path: tuple[str | int, ...], replacement: object
+) -> None:
+    checks_payload, protection = _promotion_receipt_payloads()
+    checks = json.loads(checks_payload)
+    target = checks
+    for key in path[:-1]:
+        target = target[key]
+    target[path[-1]] = replacement
+
+    with pytest.raises(CloudCoordinatorError, match="protected_promotion_receipt_mismatch"):
+        _receipt_bound_state(
+            checks=canonical_json_bytes(checks), protection=protection
+        ).reconstruct("commission-live", observed_at=datetime(2026, 8, 22, 12, tzinfo=UTC))
+
+
+def test_supervised_entrypoint_ignores_malicious_pythonpath_in_a_separate_process(
+    tmp_path: Path,
+) -> None:
+    unit_path = Path(__file__).parents[2] / "infra/autonomy/systemd/carl-coordinator.service"
+    unit = unit_path.read_text(encoding="utf-8")
+    assert (
+        "ExecStart=/opt/carl-autonomy/venv/bin/python3 -I -m carl_bench.coordinator_service" in unit
+    )
+    assert "UnsetEnvironment=PYTHONPATH PYTHONHOME PYTHONSTARTUP PYTHONUSERBASE" in unit
+    assert "Environment=PYTHONNOUSERSITE=1" in unit
+
+    malicious = tmp_path / "malicious"
+    package = malicious / "carl_bench"
+    package.mkdir(parents=True)
+    marker = tmp_path / "replacement-imported"
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "coordinator_service.py").write_text(
+        f"from pathlib import Path\nPath({str(marker)!r}).write_text('owned')\n",
+        encoding="utf-8",
+    )
+    source_root = Path(__file__).parents[1] / "src"
+    environment = dict(os.environ)
+    environment["PYTHONPATH"] = str(malicious)
+    probe = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            (
+                f"import sys; sys.path.insert(0, {str(source_root)!r}); "
+                "import carl_bench.coordinator_service as service; print(service.__file__)"
+            ),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+    assert probe.returncode == 0, probe.stderr
+    assert str(source_root / "carl_bench/coordinator_service.py") in probe.stdout
+    assert not marker.exists()

@@ -21,7 +21,7 @@ from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
-from carl_bench.canonical import canonical_json_bytes
+from carl_bench.canonical import CanonicalizationError, canonical_json_bytes
 
 _DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 _OBJECT_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
@@ -46,6 +46,7 @@ _CONCLUSIONS = _INFRASTRUCTURE_CONCLUSIONS | {
     "skipped",
     "success",
 }
+_MAX_CLOUD_CODEC_BYTES = 1_048_576
 
 CloudRunAction = Literal[
     "dispatch",
@@ -85,6 +86,50 @@ def _utc(name: str, value: str) -> datetime:
     if parsed.tzinfo != UTC or parsed.isoformat().replace("+00:00", "Z") != value:
         raise CloudExecutionError(f"invalid_{name}")
     return parsed
+
+
+def _codec_output(value: dict[str, Any]) -> dict[str, Any]:
+    try:
+        if len(canonical_json_bytes(value)) > _MAX_CLOUD_CODEC_BYTES:
+            raise CloudExecutionError("cloud_codec_payload_too_large")
+    except CanonicalizationError as error:
+        raise CloudExecutionError("cloud_codec_invalid") from error
+    return value
+
+
+def _codec_fields(value: object, fields: frozenset[str], code: str) -> dict[str, Any]:
+    if type(value) is not dict or set(value) != fields:
+        raise CloudExecutionError(code)
+    return _codec_output(value)
+
+
+def _codec_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise CloudExecutionError("cloud_codec_duplicate_json_key")
+        value[key] = item
+    return value
+
+
+def decode_cloud_wire_json(payload: bytes) -> dict[str, Any]:
+    """Decode one bounded canonical wire object without collapsing duplicate keys."""
+    if not isinstance(payload, bytes):
+        raise CloudExecutionError("cloud_codec_invalid")
+    if len(payload) > _MAX_CLOUD_CODEC_BYTES:
+        raise CloudExecutionError("cloud_codec_payload_too_large")
+    try:
+        value = json.loads(payload, object_pairs_hook=_codec_json_object)
+    except CloudExecutionError:
+        raise
+    except (json.JSONDecodeError, UnicodeError, TypeError) as error:
+        raise CloudExecutionError("cloud_codec_invalid") from error
+    if type(value) is not dict:
+        raise CloudExecutionError("cloud_codec_invalid")
+    value = _codec_output(value)
+    if canonical_json_bytes(value) != payload:
+        raise CloudExecutionError("cloud_codec_invalid")
+    return value
 
 
 def _request_payload(
@@ -136,7 +181,7 @@ class CloudRunRequest:
     dispatch_key: str
 
     def __post_init__(self) -> None:
-        if self.schema_version != 1:
+        if isinstance(self.schema_version, bool) or self.schema_version != 1:
             raise CloudExecutionError("cloud_request_schema_invalid")
         if not isinstance(self.repository, str) or not _REPOSITORY_RE.fullmatch(self.repository):
             raise CloudExecutionError("invalid_repository")
@@ -235,6 +280,17 @@ class CloudRunRequest:
             raise CloudExecutionError("invalid_cloud_attempt")
         return f"{self.dispatch_key}-attempt-{attempt}"
 
+    def to_canonical_dict(self) -> dict[str, Any]:
+        return _codec_output({name: getattr(self, name) for name in self.__dataclass_fields__})
+
+    @classmethod
+    def from_canonical_dict(cls, value: object) -> CloudRunRequest:
+        decoded = _codec_fields(value, frozenset(cls.__dataclass_fields__), "cloud_request_invalid")
+        try:
+            return cls(**decoded)
+        except TypeError as error:
+            raise CloudExecutionError("cloud_request_invalid") from error
+
 
 @dataclass(frozen=True, slots=True)
 class CloudArtifact:
@@ -259,6 +315,19 @@ class CloudArtifact:
         _digest("cloud_artifact_digest", self.digest)
         if self.downloaded_digest is not None:
             _digest("cloud_downloaded_artifact_digest", self.downloaded_digest)
+
+    def to_canonical_dict(self) -> dict[str, Any]:
+        return _codec_output({name: getattr(self, name) for name in self.__dataclass_fields__})
+
+    @classmethod
+    def from_canonical_dict(cls, value: object) -> CloudArtifact:
+        decoded = _codec_fields(
+            value, frozenset(cls.__dataclass_fields__), "cloud_artifact_invalid"
+        )
+        try:
+            return cls(**decoded)
+        except TypeError as error:
+            raise CloudExecutionError("cloud_artifact_invalid") from error
 
 
 @dataclass(frozen=True, slots=True)
@@ -322,11 +391,81 @@ class CommissioningReceipt:
             raise CloudExecutionError("invalid_cloud_commissioning_artifact_name")
 
     def to_canonical_dict(self) -> dict[str, Any]:
-        return {name: getattr(self, name) for name in self.__dataclass_fields__}
+        return _codec_output({name: getattr(self, name) for name in self.__dataclass_fields__})
+
+    @classmethod
+    def from_canonical_dict(cls, value: object) -> CommissioningReceipt:
+        decoded = _codec_fields(
+            value, frozenset(cls.__dataclass_fields__), "cloud_commissioning_receipt_invalid"
+        )
+        try:
+            return cls(**decoded)
+        except TypeError as error:
+            raise CloudExecutionError("cloud_commissioning_receipt_invalid") from error
 
     @property
     def digest(self) -> str:
         return hashlib.sha256(canonical_json_bytes(self.to_canonical_dict())).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class ProtectedReceiptBinding:
+    """Durable protected-signer/archive context carried with a commissioning receipt."""
+
+    schema_version: int
+    algorithm: str
+    purpose: str
+    domain: str
+    repository: str
+    signer_request_digest: str
+    archive_object_key: str
+    archive_version_id: str
+    archive_digest: str
+    archive_checksum_sha256: str
+    archive_record_digest: str
+    retention_mode: str
+    retain_until: str
+    occurred_at: str
+
+    def __post_init__(self) -> None:
+        if isinstance(self.schema_version, bool) or self.schema_version != 1:
+            raise CloudExecutionError("cloud_protected_receipt_binding_invalid")
+        if self.algorithm != "ED25519_SHA_512":
+            raise CloudExecutionError("cloud_protected_receipt_binding_invalid")
+        if self.purpose != "commissioning-receipt":
+            raise CloudExecutionError("cloud_protected_receipt_binding_invalid")
+        if self.domain != "carl-autonomy/cloud-evidence/v1":
+            raise CloudExecutionError("cloud_protected_receipt_binding_invalid")
+        if not isinstance(self.repository, str) or not _REPOSITORY_RE.fullmatch(self.repository):
+            raise CloudExecutionError("cloud_protected_receipt_binding_invalid")
+        for name in (
+            "signer_request_digest",
+            "archive_digest",
+            "archive_checksum_sha256",
+            "archive_record_digest",
+        ):
+            _digest(f"cloud_protected_{name}", getattr(self, name))
+        for name in ("archive_object_key", "archive_version_id"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value or len(value.encode("utf-8")) > 512:
+                raise CloudExecutionError("cloud_protected_receipt_binding_invalid")
+        if self.retention_mode != "COMPLIANCE":
+            raise CloudExecutionError("cloud_protected_receipt_binding_invalid")
+        _utc("cloud_protected_retain_until", self.retain_until)
+        _utc("cloud_protected_occurred_at", self.occurred_at)
+
+    def to_canonical_dict(self) -> dict[str, Any]:
+        return _codec_output({name: getattr(self, name) for name in self.__dataclass_fields__})
+
+    @classmethod
+    def from_canonical_dict(cls, value: object) -> ProtectedReceiptBinding:
+        decoded = _codec_fields(
+            value, frozenset(cls.__dataclass_fields__), "cloud_protected_receipt_binding_invalid"
+        )
+        try:
+            return cls(**decoded)
+        except TypeError as error:
+            raise CloudExecutionError("cloud_protected_receipt_binding_invalid") from error
 
 
 @dataclass(frozen=True, slots=True)
@@ -335,6 +474,7 @@ class SignedCommissioningReceipt:
     receipt_digest: str
     key_id: str
     signature_base64: str
+    protected_binding: ProtectedReceiptBinding | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.receipt, CommissioningReceipt):
@@ -348,10 +488,63 @@ class SignedCommissioningReceipt:
             raise CloudExecutionError("invalid_cloud_commissioning_signature") from error
         if len(signature) != 64:
             raise CloudExecutionError("invalid_cloud_commissioning_signature")
+        if self.protected_binding is not None:
+            if not isinstance(self.protected_binding, ProtectedReceiptBinding):
+                raise CloudExecutionError("cloud_protected_receipt_binding_invalid")
+            if (
+                self.protected_binding.repository != self.receipt.repository
+                or self.protected_binding.archive_digest != self.receipt.artifact_digest
+                or self.protected_binding.archive_checksum_sha256 != self.receipt.artifact_digest
+                or self.protected_binding.occurred_at != self.receipt.observed_at
+            ):
+                raise CloudExecutionError("cloud_protected_receipt_binding_invalid")
 
     @property
     def signature(self) -> bytes:
         return base64.b64decode(self.signature_base64, validate=True)
+
+    def to_canonical_dict(self) -> dict[str, Any]:
+        return _codec_output(
+            {
+                "receipt": self.receipt.to_canonical_dict(),
+                "receipt_digest": self.receipt_digest,
+                "key_id": self.key_id,
+                "signature_base64": self.signature_base64,
+                "protected_binding": (
+                    self.protected_binding.to_canonical_dict()
+                    if self.protected_binding is not None
+                    else None
+                ),
+            }
+        )
+
+    @classmethod
+    def from_canonical_dict(cls, value: object) -> SignedCommissioningReceipt:
+        current_fields = frozenset(cls.__dataclass_fields__)
+        legacy_fields = current_fields - {"protected_binding"}
+        if type(value) is not dict or set(value) not in {current_fields, legacy_fields}:
+            raise CloudExecutionError("signed_cloud_commissioning_receipt_invalid")
+        decoded = _codec_output(value)
+        receipt = CommissioningReceipt.from_canonical_dict(decoded["receipt"])
+        binding_value = decoded.get("protected_binding")
+        binding = (
+            None
+            if binding_value is None
+            else ProtectedReceiptBinding.from_canonical_dict(binding_value)
+        )
+        try:
+            result = cls(
+                receipt=receipt,
+                receipt_digest=decoded["receipt_digest"],
+                key_id=decoded["key_id"],
+                signature_base64=decoded["signature_base64"],
+                protected_binding=binding,
+            )
+        except TypeError as error:
+            raise CloudExecutionError("signed_cloud_commissioning_receipt_invalid") from error
+        if result.receipt_digest != result.receipt.digest:
+            raise CloudExecutionError("cloud_commissioning_receipt_digest_mismatch")
+        return result
 
 
 @dataclass(frozen=True, slots=True)
@@ -370,7 +563,7 @@ class CompletedRunObservation:
     observed_at: str
 
     def __post_init__(self) -> None:
-        if self.schema_version != 1:
+        if isinstance(self.schema_version, bool) or self.schema_version != 1:
             raise CloudExecutionError("cloud_completed_run_schema_invalid")
         if isinstance(self.run_id, bool) or not isinstance(self.run_id, int) or self.run_id <= 0:
             raise CloudExecutionError("invalid_cloud_run_id")
@@ -388,7 +581,17 @@ class CompletedRunObservation:
         _utc("cloud_completed_run_observed_at", self.observed_at)
 
     def to_canonical_dict(self) -> dict[str, Any]:
-        return {name: getattr(self, name) for name in self.__dataclass_fields__}
+        return _codec_output({name: getattr(self, name) for name in self.__dataclass_fields__})
+
+    @classmethod
+    def from_canonical_dict(cls, value: object) -> CompletedRunObservation:
+        decoded = _codec_fields(
+            value, frozenset(cls.__dataclass_fields__), "cloud_completed_run_invalid"
+        )
+        try:
+            return cls(**decoded)
+        except TypeError as error:
+            raise CloudExecutionError("cloud_completed_run_invalid") from error
 
     @property
     def digest(self) -> str:
@@ -418,6 +621,37 @@ class SignedCompletedRunObservation:
     @property
     def signature(self) -> bytes:
         return base64.b64decode(self.signature_base64, validate=True)
+
+    def to_canonical_dict(self) -> dict[str, Any]:
+        return _codec_output(
+            {
+                "observation": self.observation.to_canonical_dict(),
+                "observation_digest": self.observation_digest,
+                "key_id": self.key_id,
+                "signature_base64": self.signature_base64,
+            }
+        )
+
+    @classmethod
+    def from_canonical_dict(cls, value: object) -> SignedCompletedRunObservation:
+        decoded = _codec_fields(
+            value,
+            frozenset(cls.__dataclass_fields__),
+            "signed_cloud_completed_run_observation_invalid",
+        )
+        observation = CompletedRunObservation.from_canonical_dict(decoded["observation"])
+        try:
+            result = cls(
+                observation=observation,
+                observation_digest=decoded["observation_digest"],
+                key_id=decoded["key_id"],
+                signature_base64=decoded["signature_base64"],
+            )
+        except TypeError as error:
+            raise CloudExecutionError("signed_cloud_completed_run_observation_invalid") from error
+        if result.observation_digest != result.observation.digest:
+            raise CloudExecutionError("cloud_completed_run_observation_digest_mismatch")
+        return result
 
 
 @dataclass(frozen=True, slots=True)
@@ -491,9 +725,7 @@ class CloudRunSnapshot:
     artifacts: tuple[CloudArtifact, ...] = ()
     artifacts_expires_at: str | None = None
     commissioning_receipt: CommissioningReceipt | SignedCommissioningReceipt | None = None
-    completed_run_observation: (
-        CompletedRunObservation | SignedCompletedRunObservation | None
-    ) = None
+    completed_run_observation: CompletedRunObservation | SignedCompletedRunObservation | None = None
     local_fallback_command: str | None = None
 
     def __post_init__(self) -> None:
@@ -574,6 +806,96 @@ class CloudRunSnapshot:
         ):
             raise CloudExecutionError("invalid_local_fallback_command")
 
+    def to_canonical_dict(self) -> dict[str, Any]:
+        return _codec_output(
+            {
+                "remote_available": self.remote_available,
+                "observed_at": self.observed_at,
+                "repository": self.repository,
+                "workflow_file": self.workflow_file,
+                "workflow_path": self.workflow_path,
+                "workflow_blob_digest": self.workflow_blob_digest,
+                "request_digest": self.request_digest,
+                "dispatch_key": self.dispatch_key,
+                "run_id": self.run_id,
+                "head_sha": self.head_sha,
+                "status": self.status,
+                "conclusion": self.conclusion,
+                "attempt": self.attempt,
+                "max_attempts": self.max_attempts,
+                "attempt_key": self.attempt_key,
+                "prior_run_ids": list(self.prior_run_ids),
+                "artifacts": [artifact.to_canonical_dict() for artifact in self.artifacts],
+                "artifacts_expires_at": self.artifacts_expires_at,
+                "commissioning_receipt": (
+                    self.commissioning_receipt.to_canonical_dict()
+                    if self.commissioning_receipt is not None
+                    else None
+                ),
+                "completed_run_observation": (
+                    self.completed_run_observation.to_canonical_dict()
+                    if self.completed_run_observation is not None
+                    else None
+                ),
+                "local_fallback_command": self.local_fallback_command,
+            }
+        )
+
+    @classmethod
+    def from_canonical_dict(cls, value: object) -> CloudRunSnapshot:
+        decoded = _codec_fields(
+            value, frozenset(cls.__dataclass_fields__), "cloud_snapshot_invalid"
+        )
+        artifacts = decoded["artifacts"]
+        prior_run_ids = decoded["prior_run_ids"]
+        if not isinstance(artifacts, list) or not isinstance(prior_run_ids, list):
+            raise CloudExecutionError("cloud_snapshot_invalid")
+        receipt_value = decoded["commissioning_receipt"]
+        if receipt_value is None:
+            receipt: CommissioningReceipt | SignedCommissioningReceipt | None = None
+        elif type(receipt_value) is dict and frozenset(receipt_value) in {
+            frozenset(SignedCommissioningReceipt.__dataclass_fields__),
+            frozenset(SignedCommissioningReceipt.__dataclass_fields__) - {"protected_binding"},
+        }:
+            receipt = SignedCommissioningReceipt.from_canonical_dict(receipt_value)
+        else:
+            receipt = CommissioningReceipt.from_canonical_dict(receipt_value)
+        observation_value = decoded["completed_run_observation"]
+        if observation_value is None:
+            observation: CompletedRunObservation | SignedCompletedRunObservation | None = None
+        elif type(observation_value) is dict and set(observation_value) == set(
+            SignedCompletedRunObservation.__dataclass_fields__
+        ):
+            observation = SignedCompletedRunObservation.from_canonical_dict(observation_value)
+        else:
+            observation = CompletedRunObservation.from_canonical_dict(observation_value)
+        try:
+            return cls(
+                remote_available=decoded["remote_available"],
+                observed_at=decoded["observed_at"],
+                repository=decoded["repository"],
+                workflow_file=decoded["workflow_file"],
+                workflow_path=decoded["workflow_path"],
+                workflow_blob_digest=decoded["workflow_blob_digest"],
+                request_digest=decoded["request_digest"],
+                dispatch_key=decoded["dispatch_key"],
+                run_id=decoded["run_id"],
+                head_sha=decoded["head_sha"],
+                status=decoded["status"],
+                conclusion=decoded["conclusion"],
+                attempt=decoded["attempt"],
+                max_attempts=decoded["max_attempts"],
+                attempt_key=decoded["attempt_key"],
+                prior_run_ids=tuple(prior_run_ids),
+                artifacts=tuple(CloudArtifact.from_canonical_dict(item) for item in artifacts),
+                artifacts_expires_at=decoded["artifacts_expires_at"],
+                commissioning_receipt=receipt,
+                completed_run_observation=observation,
+                local_fallback_command=decoded["local_fallback_command"],
+            )
+        except TypeError as error:
+            raise CloudExecutionError("cloud_snapshot_invalid") from error
+
 
 @dataclass(frozen=True, slots=True)
 class CloudRunDecision:
@@ -598,6 +920,147 @@ class CloudRunDecision:
     retry_not_before: str | None = None
     observed_at: str | None = None
     completed_run_observation_digest: str | None = None
+
+    def __post_init__(self) -> None:
+        try:
+            if self.action not in {
+                "dispatch",
+                "await_run",
+                "download_artifacts",
+                "record_success",
+                "schedule_retry",
+                "blocked",
+            }:
+                raise ValueError
+            if not isinstance(self.reason, str) or not self.reason:
+                raise ValueError
+            if not isinstance(self.repository, str) or not _REPOSITORY_RE.fullmatch(
+                self.repository
+            ):
+                raise ValueError
+            if self.workflow_file not in _WORKFLOWS:
+                raise ValueError
+            _digest("cloud_request_digest", self.request_digest)
+            if self.dispatch_key != f"cloud-run-{self.request_digest}":
+                raise ValueError
+            _object("cloud_workflow_revision", self.workflow_revision)
+            if self.workflow_path != _WORKFLOW_PATHS[self.workflow_file]:
+                raise ValueError
+            _digest("cloud_workflow_blob_digest", self.workflow_blob_digest)
+            _object("cloud_candidate_commit", self.candidate_commit)
+            if self.run_id is not None and (
+                isinstance(self.run_id, bool)
+                or not isinstance(self.run_id, int)
+                or self.run_id <= 0
+            ):
+                raise ValueError
+            if self.head_sha is not None:
+                _object("cloud_head_sha", self.head_sha)
+            if self.conclusion is not None and self.conclusion not in _CONCLUSIONS:
+                raise ValueError
+            if self.artifact_id is not None and (
+                isinstance(self.artifact_id, bool)
+                or not isinstance(self.artifact_id, int)
+                or self.artifact_id <= 0
+            ):
+                raise ValueError
+            if self.artifact_name is not None and (
+                not isinstance(self.artifact_name, str)
+                or not self.artifact_name
+                or len(self.artifact_name.encode("utf-8")) > 180
+                or not re.fullmatch(r"[A-Za-z0-9_.-]+", self.artifact_name)
+            ):
+                raise ValueError
+            if self.artifact_digest is not None:
+                _digest("cloud_artifact_digest", self.artifact_digest)
+            artifact_identity = (self.artifact_id, self.artifact_name, self.artifact_digest)
+            if self.action in {"download_artifacts", "record_success"}:
+                if any(value is None for value in artifact_identity):
+                    raise ValueError
+            elif any(value is not None for value in artifact_identity):
+                raise ValueError
+            if self.next_attempt is not None and (
+                isinstance(self.next_attempt, bool)
+                or not isinstance(self.next_attempt, int)
+                or not 2 <= self.next_attempt <= 3
+            ):
+                raise ValueError
+            if self.next_attempt_key is not None and self.next_attempt_key != (
+                f"cloud-run-{self.request_digest}-attempt-{self.next_attempt}"
+            ):
+                raise ValueError
+            if self.retry_not_before is not None:
+                _utc("cloud_retry_not_before", self.retry_not_before)
+            retry_identity = (self.next_attempt, self.next_attempt_key, self.retry_not_before)
+            if self.action == "schedule_retry":
+                if any(value is None for value in retry_identity):
+                    raise ValueError
+            elif any(value is not None for value in retry_identity):
+                raise ValueError
+            if self.observed_at is None:
+                raise ValueError
+            _utc("cloud_observed_at", self.observed_at)
+            if self.completed_run_observation_digest is not None:
+                _digest(
+                    "cloud_completed_run_observation_digest",
+                    self.completed_run_observation_digest,
+                )
+            if self.action == "dispatch":
+                if any(
+                    value is not None
+                    for value in (
+                        self.run_id,
+                        self.head_sha,
+                        self.conclusion,
+                        self.completed_run_observation_digest,
+                    )
+                ):
+                    raise ValueError
+            elif self.action == "await_run":
+                if (
+                    self.conclusion is not None
+                    or self.completed_run_observation_digest is not None
+                    or (self.run_id is None) != (self.head_sha is None)
+                ):
+                    raise ValueError
+            elif self.action in {"download_artifacts", "record_success"}:
+                if (
+                    self.run_id is None
+                    or self.head_sha is None
+                    or self.conclusion != "success"
+                    or self.completed_run_observation_digest is not None
+                ):
+                    raise ValueError
+            elif self.action == "schedule_retry":
+                if self.run_id is None:
+                    if any(
+                        value is not None
+                        for value in (
+                            self.head_sha,
+                            self.conclusion,
+                            self.completed_run_observation_digest,
+                        )
+                    ):
+                        raise ValueError
+                elif self.head_sha is None or self.conclusion not in _INFRASTRUCTURE_CONCLUSIONS:
+                    raise ValueError
+        except CloudExecutionError as error:
+            raise CloudExecutionError("cloud_decision_invalid") from error
+        except (TypeError, ValueError, UnicodeError) as error:
+            raise CloudExecutionError("cloud_decision_invalid") from error
+
+    def to_canonical_dict(self) -> dict[str, Any]:
+        return _codec_output({name: getattr(self, name) for name in self.__dataclass_fields__})
+
+    @classmethod
+    def from_canonical_dict(cls, value: object) -> CloudRunDecision:
+        decoded = _codec_fields(
+            value, frozenset(cls.__dataclass_fields__), "cloud_decision_invalid"
+        )
+        try:
+            return cls(**decoded)
+        except TypeError as error:
+            raise CloudExecutionError("cloud_decision_invalid") from error
 
 
 @dataclass(frozen=True, slots=True)
@@ -642,16 +1105,13 @@ class CloudRetryState:
             or len(self.prior_run_ids) != self.attempt - 1
         ):
             raise CloudExecutionError("invalid_cloud_prior_runs")
-        if (
-            not isinstance(self.prior_observation_digests, tuple)
-            or len(self.prior_observation_digests) != len(self.prior_run_ids)
-        ):
+        if not isinstance(self.prior_observation_digests, tuple) or len(
+            self.prior_observation_digests
+        ) != len(self.prior_run_ids):
             raise CloudExecutionError("invalid_cloud_prior_observations")
         for digest in self.prior_observation_digests:
             _digest("cloud_prior_observation_digest", digest)
-        if len(set(self.prior_observation_digests)) != len(
-            self.prior_observation_digests
-        ):
+        if len(set(self.prior_observation_digests)) != len(self.prior_observation_digests):
             raise CloudExecutionError("invalid_cloud_prior_observations")
         if self.retry_not_before is not None:
             _utc("cloud_retry_not_before", self.retry_not_before)
@@ -700,9 +1160,7 @@ class CloudRetryState:
             raise CloudExecutionError("cloud_retry_state_invalid")
         prior_run_ids = value["prior_run_ids"]
         prior_observation_digests = value["prior_observation_digests"]
-        if not isinstance(prior_run_ids, list) or not isinstance(
-            prior_observation_digests, list
-        ):
+        if not isinstance(prior_run_ids, list) or not isinstance(prior_observation_digests, list):
             raise CloudExecutionError("cloud_retry_state_invalid")
         try:
             return cls(
@@ -889,15 +1347,13 @@ class CloudRetryStateStore:
             or len(replacement.prior_run_ids) != len(expected.prior_run_ids) + 1
             or replacement.prior_run_ids[-1] != retry_decision.run_id
             or retry_decision.run_id in expected.prior_run_ids
-            or replacement.prior_observation_digests[:-1]
-            != expected.prior_observation_digests
+            or replacement.prior_observation_digests[:-1] != expected.prior_observation_digests
             or len(replacement.prior_observation_digests)
             != len(expected.prior_observation_digests) + 1
             or retry_decision.completed_run_observation_digest is None
             or replacement.prior_observation_digests[-1]
             != retry_decision.completed_run_observation_digest
-            or retry_decision.completed_run_observation_digest
-            in expected.prior_observation_digests
+            or retry_decision.completed_run_observation_digest in expected.prior_observation_digests
         ):
             raise CloudExecutionError("cloud_retry_transition_invalid")
         with self._locked():
@@ -927,6 +1383,28 @@ def _decision(
     next_attempt: int | None = None,
     retry_not_before: str | None = None,
 ) -> CloudRunDecision:
+    completed_run_observation_digest = (
+        snapshot.completed_run_observation.observation_digest
+        if isinstance(snapshot.completed_run_observation, SignedCompletedRunObservation)
+        else None
+    )
+    if action == "dispatch":
+        run_id = head_sha = conclusion = completed_run_observation_digest = None
+    elif action == "await_run":
+        run_id = snapshot.run_id
+        head_sha = snapshot.head_sha
+        conclusion = completed_run_observation_digest = None
+    elif action in {"download_artifacts", "record_success"}:
+        run_id = snapshot.run_id
+        head_sha = snapshot.head_sha
+        conclusion = snapshot.conclusion
+        completed_run_observation_digest = None
+    elif action == "schedule_retry" and not snapshot.remote_available:
+        run_id = head_sha = conclusion = completed_run_observation_digest = None
+    else:
+        run_id = snapshot.run_id
+        head_sha = snapshot.head_sha
+        conclusion = snapshot.conclusion
     return CloudRunDecision(
         action=action,
         reason=reason,
@@ -938,9 +1416,9 @@ def _decision(
         workflow_path=request.expected_workflow_path,
         workflow_blob_digest=request.workflow_blob_digest,
         candidate_commit=request.candidate_commit,
-        run_id=snapshot.run_id,
-        head_sha=snapshot.head_sha,
-        conclusion=snapshot.conclusion,
+        run_id=run_id,
+        head_sha=head_sha,
+        conclusion=conclusion,
         artifact_id=artifact.artifact_id if artifact is not None else None,
         artifact_name=artifact.name if artifact is not None else None,
         artifact_digest=artifact.digest if artifact is not None else None,
@@ -948,11 +1426,7 @@ def _decision(
         next_attempt_key=(request.attempt_key(next_attempt) if next_attempt is not None else None),
         retry_not_before=retry_not_before,
         observed_at=snapshot.observed_at,
-        completed_run_observation_digest=(
-            snapshot.completed_run_observation.observation_digest
-            if isinstance(snapshot.completed_run_observation, SignedCompletedRunObservation)
-            else None
-        ),
+        completed_run_observation_digest=completed_run_observation_digest,
     )
 
 
@@ -963,9 +1437,7 @@ def _retry_decision(
         return _decision("blocked", "cloud_retry_budget_exhausted", request, snapshot)
     observed = _utc("cloud_observed_at", snapshot.observed_at)
     delay_minutes = 5 * snapshot.attempt
-    retry_at = (observed + timedelta(minutes=delay_minutes)).isoformat().replace(
-        "+00:00", "Z"
-    )
+    retry_at = (observed + timedelta(minutes=delay_minutes)).isoformat().replace("+00:00", "Z")
     return _decision(
         "schedule_retry",
         reason,
@@ -1150,21 +1622,40 @@ def _commissioning_failure(
     snapshot: CloudRunSnapshot,
     artifact: CloudArtifact,
     trusted_receipt_key: TrustedCloudReceiptKey | None,
+    *,
+    require_protected_archive: bool = True,
+    verified_at: str | None = None,
 ) -> str | None:
     envelope = snapshot.commissioning_receipt
     if envelope is None:
         return "cloud_commissioning_receipt_missing"
     if isinstance(envelope, CommissioningReceipt):
         return "cloud_commissioning_signature_missing"
+    if require_protected_archive and envelope.protected_binding is None:
+        return "cloud_commissioning_protected_archive_missing"
+    if (
+        envelope.protected_binding is not None
+        and envelope.receipt_digest != envelope.receipt.digest
+    ):
+        return "cloud_commissioning_receipt_digest_mismatch"
     try:
         signature = envelope.signature
     except (ValueError, binascii.Error):
         return "cloud_commissioning_signature_invalid"
     if len(signature) != 64:
         return "cloud_commissioning_signature_invalid"
+    if envelope.protected_binding is None:
+        signed_payload = envelope.receipt.to_canonical_dict()
+        claimed_digest = envelope.receipt_digest
+    else:
+        signed_payload = {
+            "protected_binding": envelope.protected_binding.to_canonical_dict(),
+            "receipt": envelope.receipt.to_canonical_dict(),
+        }
+        claimed_digest = hashlib.sha256(canonical_json_bytes(signed_payload)).hexdigest()
     signature_failure = _signed_payload_failure(
-        payload=envelope.receipt.to_canonical_dict(),
-        claimed_digest=envelope.receipt_digest,
+        payload=signed_payload,
+        claimed_digest=claimed_digest,
         key_id=envelope.key_id,
         signature=signature,
         trusted_key=trusted_receipt_key,
@@ -1172,6 +1663,16 @@ def _commissioning_failure(
     )
     if signature_failure is not None:
         return signature_failure
+    if envelope.protected_binding is not None:
+        if verified_at is None:
+            return "cloud_commissioning_verification_time_missing"
+        retention_end = _utc(
+            "cloud_commissioning_archive_retain_until",
+            envelope.protected_binding.retain_until,
+        )
+        verification_time = _utc("cloud_commissioning_verified_at", verified_at)
+        if retention_end <= verification_time:
+            return "cloud_commissioning_archive_retention_expired"
     receipt = envelope.receipt
     bindings: tuple[tuple[object, object, str], ...] = (
         (receipt.repository, request.repository, "cloud_commissioning_repository_mismatch"),
@@ -1244,13 +1745,19 @@ def reconcile_cloud_run(
     snapshot: CloudRunSnapshot,
     *,
     trusted_receipt_key: TrustedCloudReceiptKey | None = None,
+    require_protected_archive: bool = True,
+    verified_at: str | None = None,
 ) -> CloudRunDecision:
     """Choose one restart-safe control-plane action without executing local work."""
-    if not isinstance(request, CloudRunRequest) or not isinstance(snapshot, CloudRunSnapshot):
-        raise CloudExecutionError("invalid_cloud_reconciliation")
     if (
-        snapshot.local_fallback_command is not None
-        and _HEAVY_LOCAL_RE.search(snapshot.local_fallback_command)
+        not isinstance(request, CloudRunRequest)
+        or not isinstance(snapshot, CloudRunSnapshot)
+        or type(require_protected_archive) is not bool
+        or (verified_at is not None and not isinstance(verified_at, str))
+    ):
+        raise CloudExecutionError("invalid_cloud_reconciliation")
+    if snapshot.local_fallback_command is not None and _HEAVY_LOCAL_RE.search(
+        snapshot.local_fallback_command
     ):
         return _decision("blocked", "local_heavy_fallback_forbidden", request, snapshot)
     if snapshot.attempt_key is not None and snapshot.attempt_key != request.attempt_key(
@@ -1339,6 +1846,8 @@ def reconcile_cloud_run(
         snapshot,
         artifact,
         trusted_receipt_key,
+        require_protected_archive=require_protected_archive,
+        verified_at=verified_at,
     )
     if commissioning_failure is not None:
         return _decision("blocked", commissioning_failure, request, snapshot)

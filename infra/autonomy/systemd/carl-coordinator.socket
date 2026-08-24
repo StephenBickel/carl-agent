@@ -1,0 +1,14 @@
+[Unit]
+Description=Carl protected autonomy coordinator socket
+
+[Socket]
+ListenStream=/run/carl/coordinator.sock
+FileDescriptorName=coordinator
+DirectoryMode=0711
+SocketMode=0600
+SocketUser=root
+SocketGroup=root
+RemoveOnStop=false
+
+[Install]
+WantedBy=sockets.target

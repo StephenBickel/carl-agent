@@ -115,6 +115,19 @@ def test_soak_without_observation_for_26_hours_is_stale() -> None:
     assert "soak_observation_stale" in report.findings
 
 
+def test_soak_observation_is_not_critical_at_exactly_26_hours() -> None:
+    report = evaluate_promotion_health(
+        replace(
+            snapshot(),
+            soaking_since="2026-08-17T16:00:00Z",
+            last_soak_observation_at="2026-08-17T16:00:00Z",
+        ),
+        now=NOW,
+    )
+
+    assert "soak_observation_stale" not in report.findings
+
+
 def test_hard_failure_without_revert_within_two_hours_is_critical() -> None:
     report = evaluate_promotion_health(
         replace(snapshot(), hard_failure_at="2026-08-18T15:59:59Z"),
@@ -122,6 +135,15 @@ def test_hard_failure_without_revert_within_two_hours_is_critical() -> None:
     )
 
     assert "rollback_start_sla_missed" in report.findings
+
+
+def test_hard_failure_at_exactly_two_hours_has_not_missed_revert_sla() -> None:
+    report = evaluate_promotion_health(
+        replace(snapshot(), hard_failure_at="2026-08-18T16:00:00Z"),
+        now=NOW,
+    )
+
+    assert "rollback_start_sla_missed" not in report.findings
 
 
 def test_started_revert_satisfies_rollback_start_sla() -> None:

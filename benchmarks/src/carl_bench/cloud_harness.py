@@ -18,9 +18,11 @@ import selectors
 import signal
 import stat
 import subprocess
+import sys
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +33,29 @@ _ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 _MAX_CONTRACT_BYTES = 1_048_576
 _MAX_BINARY_BYTES = 512 * 1_048_576
 _LIVE_GATE_REASON = "live_acp_credential_missing"
+_HARNESS_EXECUTION_ORIGIN = object()
+_CONTRACT_FIELDS = {
+    "experiment": {
+        "affected_probe_ids",
+        "experiment_id",
+        "guard_probe_ids",
+        "held_out_probe_ids",
+        "objective",
+        "schema_version",
+    },
+    "task_set": {"adapter", "attempts", "probes", "schema_version"},
+    "metric_pack": {"algorithm", "probe_weights", "schema_version"},
+    "policy": {
+        "maximum_payload_bytes",
+        "maximum_probe_output_bytes",
+        "minimum_gain_basis_points",
+        "require_affected_improvement",
+        "require_guard_non_regression",
+        "require_held_out_non_regression",
+        "schema_version",
+        "soak_minimum_score_basis_points",
+    },
+}
 
 
 class CloudHarnessError(ValueError):
@@ -89,15 +114,87 @@ def _hash_regular_file(path: Path, *, code: str, maximum_bytes: int) -> str:
     return digest.hexdigest()
 
 
-def _load_contract(path: Path, *, kind: str) -> tuple[dict[str, Any], str]:
-    digest = _hash_regular_file(
-        path, code=f"{kind}_contract_invalid", maximum_bytes=_MAX_CONTRACT_BYTES
-    )
+def _read_held_regular_file(path: Path, *, code: str, maximum_bytes: int) -> bytes:
+    descriptor = -1
     try:
-        value = json.loads(path.read_bytes())
-    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        no_follow = getattr(os, "O_NOFOLLOW", 0)
+        if not no_follow:
+            raise CloudHarnessError(code)
+        descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | no_follow)
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or before.st_size > maximum_bytes
+        ):
+            raise CloudHarnessError(code)
+        chunks: list[bytes] = []
+        total = 0
+        while chunk := os.read(descriptor, min(64 * 1024, maximum_bytes + 1 - total)):
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > maximum_bytes:
+                raise CloudHarnessError(code)
+        after = os.fstat(descriptor)
+    except CloudHarnessError:
+        raise
+    except OSError as error:
+        raise CloudHarnessError(code) from error
+    finally:
+        if descriptor >= 0:
+            with contextlib.suppress(OSError):
+                os.close(descriptor)
+    identity = (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mode,
+        before.st_nlink,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    )
+    if identity != (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mode,
+        after.st_nlink,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    ):
+        raise CloudHarnessError(code)
+    payload = b"".join(chunks)
+    if len(payload) != before.st_size:
+        raise CloudHarnessError(code)
+    return payload
+
+
+def _object_without_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("duplicate key")
+        value[key] = item
+    return value
+
+
+def _load_contract(path: Path, *, kind: str) -> tuple[dict[str, Any], str]:
+    payload = _read_held_regular_file(
+        path,
+        code=f"{kind}_contract_invalid",
+        maximum_bytes=_MAX_CONTRACT_BYTES,
+    )
+    digest = hashlib.sha256(payload).hexdigest()
+    try:
+        value = json.loads(payload, object_pairs_hook=_object_without_duplicates)
+    except (UnicodeError, json.JSONDecodeError, ValueError) as error:
         raise CloudHarnessError(f"{kind}_contract_invalid") from error
-    if not isinstance(value, dict) or value.get("schema_version") != 1:
+    if (
+        not isinstance(value, dict)
+        or value.get("schema_version") != 1
+        or set(value) != _CONTRACT_FIELDS[kind]
+        or canonical_json_bytes(value) != payload
+    ):
         raise CloudHarnessError(f"{kind}_contract_invalid")
     return value, digest
 
@@ -200,9 +297,16 @@ class CloudHarnessResult:
     eligible: bool = False
     disposition: str = "insufficient_evidence"
     reasons: tuple[str, ...] = (_LIVE_GATE_REASON,)
+    live_evaluation_identity: object | None = None
+    _execution_origin: object | None = dataclass_field(
+        default=None,
+        init=False,
+        repr=False,
+        compare=False,
+    )
 
     def to_canonical_dict(self) -> dict[str, Any]:
-        return {
+        value = {
             "candidate": self.candidate.to_canonical_dict(),
             "contract_disposition": self.contract_disposition,
             "contract_eligible": self.contract_eligible,
@@ -217,6 +321,20 @@ class CloudHarnessResult:
             "reasons": list(self.reasons),
             "schema_version": 1,
         }
+        if self.live_evaluation_identity is not None:
+            from carl_bench.live_capability import LiveEvaluationIdentity
+
+            if not isinstance(self.live_evaluation_identity, LiveEvaluationIdentity):
+                raise CloudHarnessError("live_evaluation_identity_invalid")
+            value["live_evaluation_identity"] = self.live_evaluation_identity.to_canonical_dict()
+        return value
+
+
+def _is_executed_cloud_harness_result(value: object) -> bool:
+    """Recognize results minted by this process's real harness execution path."""
+    return (
+        type(value) is CloudHarnessResult and value._execution_origin is _HARNESS_EXECUTION_ORIGIN
+    )
 
 
 def _parse_contracts(
@@ -249,7 +367,14 @@ def _parse_contracts(
     probes: list[_Probe] = []
     probe_ids: list[str] = []
     for value in raw_probes:
-        if not isinstance(value, dict):
+        required_probe_fields = {"argv", "expected_exit", "id", "timeout_seconds"}
+        optional_probe_fields = {"stdout_contains", "stdout_regex"}
+        if (
+            not isinstance(value, dict)
+            or not required_probe_fields
+            <= set(value)
+            <= required_probe_fields | optional_probe_fields
+        ):
             raise CloudHarnessError("task_set_probe_invalid")
         probe_id = value.get("id")
         if not isinstance(probe_id, str) or not _ID_RE.fullmatch(probe_id):
@@ -370,18 +495,137 @@ def _parse_contracts(
 
 
 def _terminate(process: subprocess.Popen[bytes]) -> None:
-    if process.poll() is not None:
-        return
     try:
         if os.name == "posix":
             os.killpg(process.pid, signal.SIGKILL)
-        else:
+        elif process.poll() is None:
             process.kill()
     except ProcessLookupError:
         pass
     except OSError:
-        with contextlib.suppress(ProcessLookupError):
+        with contextlib.suppress(ProcessLookupError), contextlib.suppress(OSError):
             process.kill()
+    if process.poll() is None:
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            process.wait(timeout=1)
+
+
+def _process_group_empty(process_group_id: int) -> bool:
+    if os.name != "posix":  # pragma: no cover - protected harness is POSIX
+        return True
+    try:
+        os.killpg(process_group_id, 0)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        pass
+    try:
+        observed = subprocess.run(
+            ("ps", "-axo", "pgid=,stat="),
+            check=False,
+            capture_output=True,
+            env={"LANG": "C", "LC_ALL": "C", "PATH": os.defpath},
+            text=True,
+            timeout=2,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if observed.returncode != 0 or observed.stderr:
+        return False
+    for line in observed.stdout.splitlines():
+        fields = line.split()
+        if (
+            len(fields) == 2
+            and fields[0] == str(process_group_id)
+            and not fields[1].startswith("Z")
+        ):
+            return False
+    return True
+
+
+def _cleanup_process_group(process: subprocess.Popen[bytes]) -> None:
+    _terminate(process)
+    deadline = time.monotonic() + 2
+    while not _process_group_empty(process.pid) and time.monotonic() < deadline:
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(process.pid, signal.SIGKILL)
+        time.sleep(0.01)
+    if not _process_group_empty(process.pid):
+        raise CloudHarnessError("subject_process_cleanup_failed")
+
+
+def _collect_bounded_process(
+    process: subprocess.Popen[bytes], *, timeout_seconds: int, output_limit: int
+) -> tuple[int | None, bytes, bytes, bool, bool]:
+    assert process.stdout is not None and process.stderr is not None
+    selector = selectors.DefaultSelector()
+    streams = {process.stdout: bytearray(), process.stderr: bytearray()}
+    try:
+        for stream in streams:
+            os.set_blocking(stream.fileno(), False)
+            selector.register(stream, selectors.EVENT_READ)
+        deadline = time.monotonic() + timeout_seconds
+        timed_out = False
+        overflow = False
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                _terminate(process)
+            events = selector.select(max(0.0, min(remaining, 0.1)) if not timed_out else 0.1)
+            for key, _ in events:
+                stream = key.fileobj
+                try:
+                    chunk = os.read(stream.fileno(), 16 * 1024)
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    selector.unregister(stream)
+                    continue
+                target = streams[stream]
+                available = max(
+                    0,
+                    output_limit - sum(len(value) for value in streams.values()),
+                )
+                target.extend(chunk[:available])
+                if len(chunk) > available:
+                    overflow = True
+                    _terminate(process)
+            if process.poll() is not None and not events:
+                for stream in tuple(streams):
+                    try:
+                        chunk = os.read(stream.fileno(), 16 * 1024)
+                    except BlockingIOError:
+                        continue
+                    if not chunk:
+                        with contextlib.suppress(KeyError):
+                            selector.unregister(stream)
+                        continue
+                    target = streams[stream]
+                    available = max(
+                        0,
+                        output_limit - sum(len(value) for value in streams.values()),
+                    )
+                    target.extend(chunk[:available])
+                    if len(chunk) > available:
+                        overflow = True
+            if timed_out or overflow:
+                _terminate(process)
+        try:
+            exit_code = process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            _terminate(process)
+            exit_code = process.wait(timeout=1)
+        return (
+            exit_code,
+            bytes(streams[process.stdout]),
+            bytes(streams[process.stderr]),
+            timed_out,
+            overflow,
+        )
+    finally:
+        with contextlib.suppress(Exception):
+            selector.close()
 
 
 def _bounded_process(
@@ -391,87 +635,141 @@ def _bounded_process(
     timeout_seconds: int,
     output_limit: int,
     subject_identity: tuple[int, int] | None,
+    worker_isolation: object | None = None,
+    execution_attempt: int = 1,
 ) -> tuple[int | None, bytes, bytes, bool, bool]:
+    subject_environment = {
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PATH": os.defpath,
+    }
     demote = None
     if subject_identity is not None:
         uid, gid = subject_identity
 
         def demote() -> None:
+            os.umask(0o077)
             os.setgroups([])
             os.setgid(gid)
             os.setuid(uid)
 
+    if subject_identity is not None and not callable(getattr(worker_isolation, "begin", None)):
+        raise CloudHarnessError("subject_isolation_not_commissioned")
+    executable_descriptor = -1
+    read_descriptor = -1
+    write_descriptor = -1
+    isolation_scope: object | None = None
+    observed_identity = subject_identity or (os.geteuid(), os.getegid())
+    environment = dict(subject_environment)
+    command = [os.fspath(binary), *argv]
+    pass_descriptors: tuple[int, ...] = ()
+    process: subprocess.Popen[bytes] | None = None
     try:
-        process = subprocess.Popen(
-            [os.fspath(binary), *argv],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            close_fds=True,
-            start_new_session=True,
-            preexec_fn=demote,
-        )
-    except (OSError, subprocess.SubprocessError) as error:
-        raise CloudHarnessError("subject_binary_execution_failed") from error
-    assert process.stdout is not None and process.stderr is not None
-    selector = selectors.DefaultSelector()
-    streams = {process.stdout: bytearray(), process.stderr: bytearray()}
-    for stream in streams:
-        os.set_blocking(stream.fileno(), False)
-        selector.register(stream, selectors.EVENT_READ)
-    deadline = time.monotonic() + timeout_seconds
-    timed_out = False
-    overflow = False
-    while selector.get_map():
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            timed_out = True
-            _terminate(process)
-        events = selector.select(max(0.0, min(remaining, 0.1)) if not timed_out else 0.1)
-        for key, _ in events:
-            stream = key.fileobj
+        if worker_isolation is not None:
+            execution_digest = hashlib.sha256(
+                canonical_json_bytes(
+                    {
+                        "argv": list(argv),
+                        "binary_digest": _validate_binary(binary),
+                        "execution_attempt": execution_attempt,
+                        "subject_gid": observed_identity[1],
+                        "subject_uid": observed_identity[0],
+                        "timeout_seconds": timeout_seconds,
+                    }
+                )
+            ).hexdigest()
+            isolation_scope = worker_isolation.begin(execution_digest)
+            executable_descriptor = os.open(
+                binary,
+                os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+            )
+            read_descriptor, write_descriptor = os.pipe()
+            os.set_inheritable(executable_descriptor, True)
+            os.set_inheritable(read_descriptor, True)
+            environment.update(
+                {
+                    "CARL_PINNED_EXECUTABLE_FD": str(executable_descriptor),
+                    "CARL_WORKER_BARRIER_FD": str(read_descriptor),
+                }
+            )
+            command = [
+                sys.executable,
+                os.fspath(Path(__file__).with_name("deterministic_worker.py")),
+                os.fspath(binary),
+                *argv,
+            ]
+            pass_descriptors = (executable_descriptor, read_descriptor)
+        try:
+            process = subprocess.Popen(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                close_fds=True,
+                pass_fds=pass_descriptors,
+                env=environment,
+                start_new_session=True,
+                preexec_fn=demote,
+            )
+        except (OSError, subprocess.SubprocessError) as error:
+            raise CloudHarnessError("subject_binary_execution_failed") from error
+        if isolation_scope is not None:
+            os.close(read_descriptor)
+            read_descriptor = -1
             try:
-                chunk = os.read(stream.fileno(), 16 * 1024)
-            except BlockingIOError:
-                continue
-            if not chunk:
-                selector.unregister(stream)
-                continue
-            target = streams[stream]
-            available = max(0, output_limit - sum(len(value) for value in streams.values()))
-            target.extend(chunk[:available])
-            if len(chunk) > available:
-                overflow = True
-                _terminate(process)
-        if process.poll() is not None and not events:
-            for stream in tuple(streams):
+                observed = isolation_scope.attach_and_observe(
+                    process.pid,
+                    expected_uid=observed_identity[0],
+                    expected_gid=observed_identity[1],
+                )
+            except Exception as error:
+                raise CloudHarnessError("subject_isolation_attach_failed") from error
+            if observed != observed_identity:
+                raise CloudHarnessError("subject_identity_mismatch")
+            os.write(write_descriptor, b"1")
+            os.close(write_descriptor)
+            write_descriptor = -1
+        try:
+            return _collect_bounded_process(
+                process,
+                timeout_seconds=timeout_seconds,
+                output_limit=output_limit,
+            )
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as error:
+            raise CloudHarnessError("subject_process_collection_failed") from error
+    except CloudHarnessError:
+        raise
+    except Exception as error:
+        raise CloudHarnessError("subject_isolation_not_commissioned") from error
+    finally:
+        cleanup_errors: list[Exception] = []
+        try:
+            if process is not None:
                 try:
-                    chunk = os.read(stream.fileno(), 16 * 1024)
-                except BlockingIOError:
-                    continue
-                if not chunk:
-                    with contextlib.suppress(KeyError):
-                        selector.unregister(stream)
-                    continue
-                target = streams[stream]
-                available = max(0, output_limit - sum(len(value) for value in streams.values()))
-                target.extend(chunk[:available])
-                if len(chunk) > available:
-                    overflow = True
-        if timed_out or overflow:
-            _terminate(process)
-    try:
-        exit_code = process.wait(timeout=1)
-    except subprocess.TimeoutExpired:
-        _terminate(process)
-        exit_code = process.wait(timeout=1)
-    return (
-        exit_code,
-        bytes(streams[process.stdout]),
-        bytes(streams[process.stderr]),
-        timed_out,
-        overflow,
-    )
+                    _cleanup_process_group(process)
+                except Exception as error:
+                    cleanup_errors.append(error)
+        finally:
+            try:
+                if isolation_scope is not None:
+                    try:
+                        isolation_scope.cleanup_and_verify_empty()
+                    except Exception as error:
+                        cleanup_errors.append(CloudHarnessError("subject_isolation_cleanup_failed"))
+                        cleanup_errors[-1].__cause__ = error
+            finally:
+                for descriptor in (read_descriptor, write_descriptor, executable_descriptor):
+                    if descriptor >= 0:
+                        with contextlib.suppress(OSError):
+                            os.close(descriptor)
+        if len(cleanup_errors) == 1:
+            raise cleanup_errors[0]
+        if cleanup_errors:
+            raise CloudHarnessError("subject_cleanup_failed") from ExceptionGroup(
+                "subject cleanup failures", cleanup_errors
+            )
 
 
 def _observe(
@@ -481,6 +779,7 @@ def _observe(
     attempts: int,
     output_limit: int,
     subject_identity: tuple[int, int] | None,
+    worker_isolation: object | None,
 ) -> ProbeObservation:
     all_passed = True
     any_timeout = False
@@ -496,6 +795,8 @@ def _observe(
             timeout_seconds=probe.timeout_seconds,
             output_limit=output_limit,
             subject_identity=subject_identity,
+            worker_isolation=worker_isolation,
+            execution_attempt=attempt,
         )
         stdout = final_stdout.decode("utf-8", errors="replace")
         passed = (
@@ -549,6 +850,7 @@ def _subject(
     output_limit: int,
     weights: dict[str, int],
     subject_identity: tuple[int, int] | None,
+    worker_isolation: object | None,
 ) -> SubjectResult:
     observations = tuple(
         _observe(
@@ -557,6 +859,7 @@ def _subject(
             attempts=attempts,
             output_limit=output_limit,
             subject_identity=subject_identity,
+            worker_isolation=worker_isolation,
         )
         for probe in probes
     )
@@ -588,6 +891,8 @@ def evaluate_carl_pair(
     mode: str,
     parent_identity: tuple[int, int] | None = None,
     candidate_identity: tuple[int, int] | None = None,
+    live_evaluation_identity: object | None = None,
+    worker_isolation: object | None = None,
 ) -> CloudHarnessResult:
     """Run protected probes against exact binaries and emit bounded canonical evidence."""
     if not _COMMIT_RE.fullmatch(parent_commit) or not _COMMIT_RE.fullmatch(candidate_commit):
@@ -597,10 +902,12 @@ def evaluate_carl_pair(
     if (parent_identity is None) != (candidate_identity is None):
         raise CloudHarnessError("subject_identity_invalid")
     if parent_identity is not None and (
-        parent_identity == candidate_identity
+        parent_identity[0] == candidate_identity[0]
         or os.geteuid() in {parent_identity[0], candidate_identity[0]}
     ):
         raise CloudHarnessError("subject_identity_not_isolated")
+    if parent_identity is not None and not callable(getattr(worker_isolation, "begin", None)):
+        raise CloudHarnessError("subject_isolation_not_commissioned")
     parent_binary = Path(parent_binary)
     candidate_binary = Path(candidate_binary)
     digests = (_validate_binary(parent_binary), _validate_binary(candidate_binary))
@@ -610,6 +917,21 @@ def evaluate_carl_pair(
         metric_pack_path=Path(metric_pack_path),
         policy_path=Path(policy_path),
     )
+    if live_evaluation_identity is not None:
+        from carl_bench.live_capability import LiveEvaluationIdentity
+
+        if (
+            not isinstance(live_evaluation_identity, LiveEvaluationIdentity)
+            or live_evaluation_identity.parent_commit != parent_commit
+            or live_evaluation_identity.candidate_commit != candidate_commit
+            or live_evaluation_identity.experiment_digest != immutable_inputs["experiment"]
+            or live_evaluation_identity.task_set_digest != immutable_inputs["task_set"]
+            or live_evaluation_identity.metric_pack_digest != immutable_inputs["metric_pack"]
+            or live_evaluation_identity.policy_digest != immutable_inputs["policy"]
+            or live_evaluation_identity.task_order != tuple(probe.probe_id for probe in probes)
+            or live_evaluation_identity.attempts != attempts
+        ):
+            raise CloudHarnessError("live_evaluation_identity_mismatch")
     output_limit = policy["maximum_probe_output_bytes"]
     parent = _subject(
         parent_binary,
@@ -620,6 +942,7 @@ def evaluate_carl_pair(
         output_limit=output_limit,
         weights=weights,
         subject_identity=parent_identity,
+        worker_isolation=worker_isolation,
     )
     candidate = _subject(
         candidate_binary,
@@ -630,6 +953,7 @@ def evaluate_carl_pair(
         output_limit=output_limit,
         weights=weights,
         subject_identity=candidate_identity,
+        worker_isolation=worker_isolation,
     )
     gain = candidate.score_basis_points - parent.score_basis_points
     reasons: list[str] = []
@@ -666,7 +990,9 @@ def evaluate_carl_pair(
         contract_eligible=not reasons,
         contract_disposition="improvement" if not reasons else "rejected",
         contract_reasons=tuple(reasons),
+        live_evaluation_identity=live_evaluation_identity,
     )
+    object.__setattr__(result, "_execution_origin", _HARNESS_EXECUTION_ORIGIN)
     if len(canonical_json_bytes(result.to_canonical_dict())) > policy["maximum_payload_bytes"]:
         raise CloudHarnessError("evidence_payload_too_large")
     return result

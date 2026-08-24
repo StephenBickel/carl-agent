@@ -47,6 +47,26 @@ def test_sandbox_environment_scrubs_host_values_and_uses_private_writable_roots(
     assert environment["XDG_CACHE_HOME"] == os.fspath(writable)
 
 
+def test_sandbox_environment_cannot_receive_remote_commissioning_authority(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in (
+        "AWS_SESSION_TOKEN",
+        "CARL_KMS_SIGNING_KEY_ID",
+        "CARL_REMOTE_CLOUD_ACCEPTANCE",
+    ):
+        monkeypatch.setenv(name, "must-not-cross-candidate-boundary")
+    writable = tmp_path / "writable"
+    writable.mkdir()
+
+    environment = _sandbox_environment(writable)
+
+    assert "AWS_SESSION_TOKEN" not in environment
+    assert "CARL_KMS_SIGNING_KEY_ID" not in environment
+    assert "CARL_REMOTE_CLOUD_ACCEPTANCE" not in environment
+
+
 def test_linux_sandbox_command_has_explicit_mounts_and_no_host_root_bind(
     tmp_path: Path,
 ) -> None:

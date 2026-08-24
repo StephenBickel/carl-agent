@@ -135,6 +135,7 @@ class EventType(str, Enum):
     DRAFT_PR_RECORDED = "draft_pr_recorded"
     WORKSPACE_DISPOSED = "workspace_disposed"
     RETRY_SCHEDULED = "retry_scheduled"
+    COORDINATOR_NODE_COMPLETED = "coordinator_node_completed"
     EXPERIMENTAL_PUBLISHED = "experimental_published"
     PROTECTED_VALIDATION_RECORDED = "protected_validation_recorded"
     PROMOTION_RECORDED = "promotion_recorded"
@@ -145,6 +146,7 @@ class EventType(str, Enum):
 _AUTONOMY_EVENT_TYPES = frozenset(
     {
         EventType.RETRY_SCHEDULED,
+        EventType.COORDINATOR_NODE_COMPLETED,
         EventType.EXPERIMENTAL_PUBLISHED,
         EventType.PROTECTED_VALIDATION_RECORDED,
         EventType.PROMOTION_RECORDED,

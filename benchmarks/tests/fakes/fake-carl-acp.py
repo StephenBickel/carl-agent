@@ -11,6 +11,11 @@ from pathlib import Path
 workspace = Path.cwd()
 mode = (workspace / "acp-mode.txt").read_text(encoding="utf-8").strip()
 (workspace / "acp-argv.json").write_text(json.dumps(sys.argv[1:]), encoding="utf-8")
+if mode == "gateway-environment":
+    (workspace / "acp-environment.json").write_text(
+        json.dumps(dict(sorted(os.environ.items()))),
+        encoding="utf-8",
+    )
 
 
 def emit(value: object, *, partial: bool = False) -> None:

@@ -1,0 +1,32 @@
+[Unit]
+Description=Carl protected observer coordinator effect responder
+Requires=carl-observer-effect.socket
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=carl-autonomy-observer
+Group=carl-autonomy-observer
+EnvironmentFile=/etc/carl/observer-effect.env
+InaccessiblePaths=/etc/carl/coordinator.env /etc/carl/github-effect.env /etc/carl/archive-effect.env /etc/carl/evaluator-effect.env /etc/carl/input-effect.env /etc/carl/coordinator-recovery-signing-key.pem
+Environment=PYTHONNOUSERSITE=1
+UnsetEnvironment=PYTHONPATH PYTHONHOME PYTHONSTARTUP PYTHONUSERBASE
+ExecStart=/opt/carl-autonomy/venv/bin/python3 -I -m carl_bench.coordinator_effect_service
+Restart=on-failure
+RestartSec=5s
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

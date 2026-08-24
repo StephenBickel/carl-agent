@@ -10,14 +10,62 @@ import signal
 import stat
 import time
 from contextlib import suppress
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from carl_bench.models import AgentOutcome, AgentRequest
 
 MAX_FRAME_BYTES = 1_048_576
 MAX_STDERR_BYTES = 256 * 1_024
 MAX_NOTIFICATIONS = 10_000
+_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+_CAPABILITY_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{20,512}$")
+
+
+@dataclass(frozen=True, slots=True)
+class BoundedModelGatewayCapability:
+    """One-subject, one-task capability for a loopback protected model gateway."""
+
+    endpoint: str
+    token: str = field(repr=False)
+    pair_request_digest: str
+    subject: str
+    task_id: str
+    attempt: int
+
+    def __post_init__(self) -> None:
+        try:
+            parsed = urlsplit(self.endpoint)
+            port = parsed.port
+        except (TypeError, ValueError) as error:
+            raise ValueError("gateway capability is invalid") from error
+        if (
+            parsed.scheme != "http"
+            or parsed.hostname not in {"127.0.0.1", "::1"}
+            or port is None
+            or not 1 <= port <= 65_535
+            or parsed.path != "/v1/evaluate"
+            or parsed.query
+            or parsed.fragment
+            or parsed.username is not None
+            or parsed.password is not None
+            or _CAPABILITY_TOKEN_RE.fullmatch(self.token) is None
+            or _DIGEST_RE.fullmatch(self.pair_request_digest) is None
+            or self.subject not in {"parent", "candidate"}
+            or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,127}", self.task_id) is None
+            or isinstance(self.attempt, bool)
+            or not isinstance(self.attempt, int)
+            or not 1 <= self.attempt <= 3
+        ):
+            raise ValueError("gateway capability is invalid")
+
+    def subject_environment(self) -> dict[str, str]:
+        return {
+            "CARL_MODEL_GATEWAY_ENDPOINT": self.endpoint,
+            "CARL_MODEL_GATEWAY_TOKEN": self.token,
+        }
 
 
 class _ProtocolError(Exception):
@@ -200,6 +248,7 @@ class CarlAcpAdapter:
         model: str,
         effort: str,
         permission_mode: str = "default",
+        gateway_capability: BoundedModelGatewayCapability | None = None,
     ) -> None:
         if not _regular_executable(executable):
             raise ValueError("executable must be an absolute regular executable")
@@ -213,12 +262,17 @@ class CarlAcpAdapter:
             raise ValueError("effort is invalid")
         if permission_mode not in {"plan", "default", "acceptEdits", "dontAsk"}:
             raise ValueError("permission_mode is invalid")
+        if gateway_capability is not None and not isinstance(
+            gateway_capability, BoundedModelGatewayCapability
+        ):
+            raise ValueError("gateway capability is invalid")
         self._executable = executable
         self._codex_executable = codex_executable
         self._data_dir = data_dir
         self._model = model
         self._effort = effort
         self._permission_mode = permission_mode
+        self._gateway_capability = gateway_capability
 
     def version(self) -> str:
         return "0.1.0"
@@ -235,16 +289,24 @@ class CarlAcpAdapter:
             "LC_ALL": "C.UTF-8",
             "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
         }
+        arguments = [
+            "acp",
+            "--model",
+            self._model,
+            "--effort",
+            self._effort,
+            "--permission-mode",
+            self._permission_mode,
+        ]
+        if self._gateway_capability is not None:
+            if request.task_id != self._gateway_capability.task_id:
+                return AgentOutcome.failed(code="agent_protocol_error", elapsed_ms=0)
+            environment.update(self._gateway_capability.subject_environment())
+            arguments = ["acp", "--permission-mode", self._permission_mode]
         try:
             process = await asyncio.create_subprocess_exec(
                 os.fspath(self._executable),
-                "acp",
-                "--model",
-                self._model,
-                "--effort",
-                self._effort,
-                "--permission-mode",
-                self._permission_mode,
+                *arguments,
                 cwd=workspace,
                 env=environment,
                 stdin=asyncio.subprocess.PIPE,

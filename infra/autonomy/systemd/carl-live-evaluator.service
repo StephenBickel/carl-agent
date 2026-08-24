@@ -1,0 +1,27 @@
+[Unit]
+Description=Carl protected live evidence evaluator
+After=carl-live-gateway.service
+Requires=carl-live-evaluator.socket carl-live-gateway.service
+
+[Service]
+Type=simple
+ExecStart=/opt/carl/venv/bin/carl-live-evaluation-service
+EnvironmentFile=/etc/carl/live-evaluator.env
+User=root
+Group=root
+Delegate=pids
+TasksMax=256
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectControlGroups=no
+ProtectHome=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectSystem=strict
+ReadOnlyPaths=/srv/carl/checkouts /var/lib/carl/live-gateway/state.sqlite3
+RestrictAddressFamilies=AF_UNIX
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

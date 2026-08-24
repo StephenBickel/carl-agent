@@ -1,8 +1,13 @@
 name: Autonomous soak observation
+run-name: ${{ inputs.attempt_key }}
 
 "on":
   workflow_dispatch:
     inputs:
+      attempt_key:
+        description: Exact durable cloud dispatch attempt key
+        required: true
+        type: string
       experiment_digest:
         description: Immutable experiment manifest SHA-256
         required: true
@@ -12,11 +17,11 @@ name: Autonomous soak observation
         required: true
         type: string
       candidate_commit:
-        description: Exact two-parent merge commit to observe
+        description: Exact two-parent production merge commit
         required: true
         type: string
       task_set_digest:
-        description: Immutable health task-set archive SHA-256
+        description: Normalized immutable soak task-set archive SHA-256
         required: true
         type: string
       metric_pack_digest:
@@ -39,7 +44,6 @@ name: Autonomous soak observation
         description: Exact protected workflow file SHA-256
         required: true
         type: string
-
 permissions:
   contents: read
 
@@ -49,12 +53,12 @@ concurrency:
 
 jobs:
   commission:
-    name: Validate workflow, inputs, and exact merge topology
+    name: Bind exact merge topology and six-hour cadence
+    environment: carl-autonomy-soak
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    outputs:
-      trusted_inputs_digest: ${{ steps.inputs.outputs.trusted_inputs_digest }}
-      topology_digest: ${{ steps.topology.outputs.topology_digest }}
     steps:
       - name: Check out the protected parent
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -63,16 +67,16 @@ jobs:
           path: trusted-source
           fetch-depth: 1
           persist-credentials: false
-      - name: Check out the exact merge commit
+      - name: Check out the exact production merge
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           ref: ${{ inputs.candidate_commit }}
           path: merge-source
           fetch-depth: 2
           persist-credentials: false
-      - name: Validate request and exact immediate-parent topology
-        id: topology
+      - name: Validate request cadence and immediate-parent topology
         env:
+          ATTEMPT_KEY: ${{ inputs.attempt_key }}
           CANDIDATE_COMMIT: ${{ inputs.candidate_commit }}
           EXPERIMENT_DIGEST: ${{ inputs.experiment_digest }}
           METRIC_PACK_DIGEST: ${{ inputs.metric_pack_digest }}
@@ -81,6 +85,7 @@ jobs:
           REPOSITORY: ${{ github.repository }}
           REQUEST_DIGEST: ${{ inputs.request_digest }}
           RUN_HEAD_SHA: ${{ github.sha }}
+          SOAK_CADENCE_HOURS: "6"
           TASK_SET_DIGEST: ${{ inputs.task_set_digest }}
           WORKFLOW_BLOB_DIGEST: ${{ inputs.workflow_blob_digest }}
           WORKFLOW_PATH: .github/workflows/autonomous-soak.yml
@@ -89,6 +94,7 @@ jobs:
           WORKFLOW_SHA: ${{ github.workflow_sha }}
         run: |
           set -euo pipefail
+          test "$SOAK_CADENCE_HOURS" = "6"
           test "$RUN_HEAD_SHA" = "$WORKFLOW_REVISION"
           test "$WORKFLOW_SHA" = "$WORKFLOW_REVISION"
           test "${WORKFLOW_REF%%@*}" = "$REPOSITORY/$WORKFLOW_PATH"
@@ -100,10 +106,6 @@ jobs:
           test "${#MERGE_TOPOLOGY[@]}" -eq 3
           test "${MERGE_TOPOLOGY[0]}" = "$CANDIDATE_COMMIT"
           test "${MERGE_TOPOLOGY[1]}" = "$PARENT_COMMIT"
-          printf '%s\n' "${MERGE_TOPOLOGY[*]}" | sha256sum | {
-            read -r digest rest
-            printf 'topology_digest=%s\n' "$digest" >> "$GITHUB_OUTPUT"
-          }
           python3 - <<'PY'
           import hashlib, json, os, re
           digest = re.compile(r"[0-9a-f]{64}\Z")
@@ -113,13 +115,17 @@ jobs:
               if not digest.fullmatch(os.environ[name]): raise SystemExit(f"invalid {name.lower()}")
           for name in ("PARENT_COMMIT", "CANDIDATE_COMMIT", "WORKFLOW_REVISION"):
               if not commit.fullmatch(os.environ[name]): raise SystemExit(f"invalid {name.lower()}")
+          prefix = f"cloud-run-{os.environ['REQUEST_DIGEST']}-attempt-"
+          if os.environ["ATTEMPT_KEY"] not in {prefix + "1", prefix + "2", prefix + "3"}:
+              raise SystemExit("attempt_key mismatch")
           payload = {
               "candidate_commit": os.environ["CANDIDATE_COMMIT"],
               "experiment_digest": os.environ["EXPERIMENT_DIGEST"],
               "metric_pack_digest": os.environ["METRIC_PACK_DIGEST"],
               "parent_commit": os.environ["PARENT_COMMIT"],
               "policy_digest": os.environ["POLICY_DIGEST"],
-              "repository": os.environ["REPOSITORY"], "schema_version": 1,
+              "repository": os.environ["REPOSITORY"],
+              "schema_version": 1,
               "task_set_digest": os.environ["TASK_SET_DIGEST"],
               "workflow_file": "autonomous-soak.yml",
               "workflow_revision": os.environ["WORKFLOW_REVISION"],
@@ -135,37 +141,17 @@ jobs:
           go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7 \
             .github/workflows/autonomous-improvement.yml \
             .github/workflows/autonomous-soak.yml
-      - name: Resolve and verify protected immutable inputs
-        id: inputs
-        env:
-          EXPERIMENT_DIGEST: ${{ inputs.experiment_digest }}
-          METRIC_PACK_DIGEST: ${{ inputs.metric_pack_digest }}
-          POLICY_DIGEST: ${{ inputs.policy_digest }}
-          TASK_SET_DIGEST: ${{ inputs.task_set_digest }}
-        run: |
-          set -euo pipefail
-          resolved="$RUNNER_TEMP/immutable-inputs"; mkdir -p "$resolved"
-          resolve() {
-            kind="$1"; digest="$2"
-            source="trusted-source/benchmarks/immutable-inputs/$kind/$digest"
-            test -f "$source"; test ! -L "$source"
-            printf '%s  %s\n' "$digest" "$source" | sha256sum --check --strict -
-            cp -- "$source" "$resolved/$kind"
-          }
-          resolve experiment "$EXPERIMENT_DIGEST"
-          resolve task-set "$TASK_SET_DIGEST"
-          resolve metric-pack "$METRIC_PACK_DIGEST"
-          resolve policy "$POLICY_DIGEST"
-          aggregate="$(find "$resolved" -maxdepth 1 -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1)"
-          printf 'trusted_inputs_digest=%s\n' "$aggregate" >> "$GITHUB_OUTPUT"
 
   evaluate:
-    name: Run merge-bound health probes in isolated subject
+    name: Run merge-bound probes without protected credentials
     needs: [commission]
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
     outputs:
       health_result_digest: ${{ steps.health.outputs.health_result_digest }}
+    environment: carl-autonomy-subject
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - name: Check out trusted harness from protected parent
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -190,6 +176,7 @@ jobs:
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.97.0 --profile minimal --no-self-update
       - name: Verify immutable inputs outside subject authority
+        id: immutable_inputs
         env:
           EXPERIMENT_DIGEST: ${{ inputs.experiment_digest }}
           METRIC_PACK_DIGEST: ${{ inputs.metric_pack_digest }}
@@ -197,115 +184,1302 @@ jobs:
           TASK_SET_DIGEST: ${{ inputs.task_set_digest }}
         run: |
           set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/immutable-inputs"
-          resolve() {
-            kind="$1"; digest="$2"
-            source="trusted-source/benchmarks/immutable-inputs/$kind/$digest"
-            test -f "$source"; test ! -L "$source"
-            printf '%s  %s\n' "$digest" "$source" | sha256sum --check --strict -
-            cp -- "$source" "$RUNNER_TEMP/immutable-inputs/$kind"
-          }
-          resolve experiment "$EXPERIMENT_DIGEST"
-          resolve task-set "$TASK_SET_DIGEST"
-          resolve metric-pack "$METRIC_PACK_DIGEST"
-          resolve policy "$POLICY_DIGEST"
+          resolved="$RUNNER_TEMP/immutable-inputs"; mkdir -p "$resolved"
+          PYTHONPATH=trusted-source/benchmarks/src python -m carl_bench.immutable_inputs resolve-set \
+            --registry trusted-source/benchmarks/immutable-inputs/registry.json \
+            --root trusted-source/benchmarks/immutable-inputs \
+            --mode soak \
+            --task-media-type application/vnd.carl.soak-task-set+tar \
+            --experiment-digest "$EXPERIMENT_DIGEST" \
+            --task-set-digest "$TASK_SET_DIGEST" \
+            --metric-pack-digest "$METRIC_PACK_DIGEST" \
+            --policy-digest "$POLICY_DIGEST" \
+            --output-dir "$resolved" >/dev/null
+          printf '%s  %s\n' \
+            "$EXPERIMENT_DIGEST" "$resolved/experiment" \
+            "$TASK_SET_DIGEST" "$resolved/task-set" \
+            "$METRIC_PACK_DIGEST" "$resolved/metric-pack" \
+            "$POLICY_DIGEST" "$resolved/policy" \
+            | sha256sum --check --strict -
+          printf 'experiment=%s\n' "$resolved/experiment" >> "$GITHUB_OUTPUT"
+          printf 'task_set=%s\n' "$resolved/task-set" >> "$GITHUB_OUTPUT"
+          printf 'metric_pack=%s\n' "$resolved/metric-pack" >> "$GITHUB_OUTPUT"
+          printf 'policy=%s\n' "$resolved/policy" >> "$GITHUB_OUTPUT"
       - name: Run repository health probes without workflow commands or credentials
         id: health
         env:
+          EXPERIMENT_INPUT: ${{ steps.immutable_inputs.outputs.experiment }}
           MERGE_COMMIT: ${{ inputs.candidate_commit }}
+          METRIC_PACK_INPUT: ${{ steps.immutable_inputs.outputs.metric_pack }}
+          POLICY_INPUT: ${{ steps.immutable_inputs.outputs.policy }}
+          TASK_SET_INPUT: ${{ steps.immutable_inputs.outputs.task_set }}
         run: |
           set -euo pipefail
           chmod 700 "$(dirname "$GITHUB_ENV")"
           test "$(git -C subject-merge rev-parse HEAD)" = "$MERGE_COMMIT"
-          eval_root="$RUNNER_TEMP/eval-merge"; sandbox="$RUNNER_TEMP/sandbox-merge"
-          cp -R -- subject-merge "$eval_root"
-          rm -rf -- "$eval_root/benchmarks/tests" "$eval_root/benchmarks/tasks/dev"
-          cp -R -- trusted-source/benchmarks/tests "$eval_root/benchmarks/tests"
-          mkdir -p "$eval_root/benchmarks/tasks/dev"
-          tar --extract --file "$RUNNER_TEMP/immutable-inputs/task-set" \
-            --directory "$eval_root/benchmarks/tasks/dev" --no-same-owner --no-same-permissions
-          cp -- trusted-source/scripts/benchmark-smoke.sh "$eval_root/scripts/benchmark-smoke.sh"
-          chmod -R a-w "$eval_root"
-          mkdir -p "$sandbox/home" "$sandbox/tmp" "$sandbox/cargo" "$sandbox/target" "$sandbox/uv"
+          rust_probe_root="$RUNNER_TEMP/rust-probe"
+          python_probe_root="$RUNNER_TEMP/python-probe"
+          trusted_benchmark_root="$RUNNER_TEMP/trusted-benchmark-probe"
+          sandbox="$RUNNER_TEMP/sandbox-merge"
+          cp -R -- subject-merge "$rust_probe_root"
+          if find "$rust_probe_root" -type l -print -quit | grep -q .; then
+            echo "candidate symlinks cannot enter protected probes" >&2
+            exit 1
+          fi
+          rm -rf -- "$rust_probe_root/.cargo" "$rust_probe_root/tests"
+          rm -f -- "$rust_probe_root/build.rs"
+          cp -- trusted-source/Cargo.toml trusted-source/Cargo.lock "$rust_probe_root/"
+          cp -R -- trusted-source/tests "$rust_probe_root/tests"
+          cp -R -- trusted-source/benchmarks "$python_probe_root"
+          rm -rf -- "$python_probe_root/src/carl_bench"
+          test -d subject-merge/benchmarks/src/carl_bench
+          if find subject-merge/benchmarks/src/carl_bench -type l -print -quit | grep -q .; then
+            echo "candidate Python symlinks cannot enter protected probes" >&2
+            exit 1
+          fi
+          cp -R -- subject-merge/benchmarks/src/carl_bench "$python_probe_root/src/carl_bench"
+          cp -R -- trusted-source/benchmarks "$trusted_benchmark_root"
+          rm -rf -- "$trusted_benchmark_root/tasks/dev"
+          mkdir -p "$trusted_benchmark_root/tasks/dev"
+          tar --extract --file "$TASK_SET_INPUT" --directory "$trusted_benchmark_root/tasks/dev" \
+            --no-same-owner --no-same-permissions
+          chmod -R a-w "$rust_probe_root" "$python_probe_root" "$trusted_benchmark_root"
+          mkdir -p "$sandbox/home" "$sandbox/tmp" "$sandbox/cargo" "$sandbox/target" \
+            "$sandbox/uv" "$sandbox/python-venv" "$sandbox/trusted-venv"
           chown -R nobody:nogroup "$sandbox"
-          sudo -u nobody env -i HOME="$sandbox/home" PATH="$PATH" TMPDIR="$sandbox/tmp" \
-            CARGO_HOME="$sandbox/cargo" CARGO_TARGET_DIR="$sandbox/target" \
-            RUSTUP_HOME="$RUSTUP_HOME" UV_CACHE_DIR="$sandbox/uv" \
-            PYTHONDONTWRITEBYTECODE=1 \
-            PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
-            UV_PROJECT_ENVIRONMENT="$sandbox/venv" SUBJECT_ROOT="$eval_root" \
-            bash --noprofile --norc -c '
-              set -euo pipefail; cd "$SUBJECT_ROOT"
-              cargo +1.97.0 test --locked --test workflow_contract --test docs_contract
-              uv sync --project benchmarks --python 3.12 --locked
-              uv run --offline --project benchmarks --locked pytest -q \
-                -c /dev/null -p no:cacheprovider \
-                benchmarks/tests/test_integration_contract.py benchmarks/tests/test_cloud_execution.py
-              ./scripts/benchmark-smoke.sh
-            '
-          result="$RUNNER_TEMP/health-result.json"
-          python3 - "$result" "$MERGE_COMMIT" <<'PY'
-          import json, pathlib, sys
-          pathlib.Path(sys.argv[1]).write_text(
-              json.dumps({"merge_commit": sys.argv[2], "status": "passed"},
-                         sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+          run_subject() {
+            sudo -u nobody env -i HOME="$sandbox/home" PATH="$PATH" TMPDIR="$sandbox/tmp" \
+              CARGO_HOME="$sandbox/cargo" CARGO_TARGET_DIR="$sandbox/target" \
+              RUSTUP_HOME="$RUSTUP_HOME" UV_CACHE_DIR="$sandbox/uv" PYTHONDONTWRITEBYTECODE=1 \
+              PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 UV_PROJECT_ENVIRONMENT="$sandbox/python-venv" \
+              MERGE_COMMIT="$MERGE_COMMIT" PYTHON_PROBE_ROOT="$python_probe_root" \
+              RUST_PROBE_ROOT="$rust_probe_root" \
+              TRUSTED_BENCHMARK_ROOT="$trusted_benchmark_root" \
+              TRUSTED_VENV="$sandbox/trusted-venv" bash --noprofile --norc -c "$1"
+          }
+          rust_contracts=false
+          if run_subject 'set -euo pipefail; cd "$RUST_PROBE_ROOT"; cargo +1.97.0 test --locked --test workflow_contract --test docs_contract'; then rust_contracts=true; fi
+          python_contracts=false
+          if run_subject 'set -euo pipefail; cd "$TMPDIR"; uv sync --project "$PYTHON_PROBE_ROOT" --python 3.12 --locked; uv run --offline --project "$PYTHON_PROBE_ROOT" --locked pytest -q -c /dev/null -p no:cacheprovider --confcutdir "$PYTHON_PROBE_ROOT/tests" "$PYTHON_PROBE_ROOT/tests/test_integration_contract.py" "$PYTHON_PROBE_ROOT/tests/test_cloud_execution.py"'; then python_contracts=true; fi
+          benchmark_smoke=false
+          if run_subject 'set -euo pipefail; export UV_PROJECT_ENVIRONMENT="$TRUSTED_VENV"; cd "$TMPDIR"; uv sync --project "$TRUSTED_BENCHMARK_ROOT" --python 3.12 --locked; PYTHONPATH="$TRUSTED_BENCHMARK_ROOT/src" uv run --offline --project "$TRUSTED_BENCHMARK_ROOT" --locked carl-bench tasks validate --root "$TRUSTED_BENCHMARK_ROOT/tasks/dev"; PYTHONPATH="$TRUSTED_BENCHMARK_ROOT/src" uv run --offline --project "$TRUSTED_BENCHMARK_ROOT" --locked carl-bench run --tasks "$TRUSTED_BENCHMARK_ROOT/tasks/dev" --adapter scripted --attempts 1 --seed 20260810 --subject-commit "$MERGE_COMMIT" --public-result "$TMPDIR/scorecard.json"; PYTHONPATH="$TRUSTED_BENCHMARK_ROOT/src" uv run --offline --project "$TRUSTED_BENCHMARK_ROOT" --locked python -c '\''import json,sys; value=json.load(open(sys.argv[1], encoding="utf-8")); assert value["subject_commit"] == sys.argv[2]; assert value["passed_trials"] == 3; assert value["valid_trials"] == 3; assert value["invalid_trials"] == 0; assert value["pass_rate"] == 1.0'\'' "$TMPDIR/scorecard.json" "$MERGE_COMMIT"'; then benchmark_smoke=true; fi
+          observations="$RUNNER_TEMP/soak-observations.json"
+          printf '{"benchmark-smoke":%s,"python-contracts":%s,"rust-contracts":%s}' \
+            "$benchmark_smoke" "$python_contracts" "$rust_contracts" > "$observations"
+          PYTHONPATH=trusted-source/benchmarks/src python -m carl_bench.immutable_inputs soak-health \
+            --experiment "$EXPERIMENT_INPUT" --task-set "$TASK_SET_INPUT" \
+            --metric-pack "$METRIC_PACK_INPUT" --policy "$POLICY_INPUT" \
+            --observations "$observations" --output "$RUNNER_TEMP/health-result.json"
+          test -f "$RUNNER_TEMP/health-result.json"; test ! -L "$RUNNER_TEMP/health-result.json"
+          test "$(wc -c < "$RUNNER_TEMP/health-result.json")" -le 65536
+          health_result_digest="$(sha256sum "$RUNNER_TEMP/health-result.json" | cut -d' ' -f1)"
+          printf 'health_result_digest=%s\n' "$health_result_digest" >> "$GITHUB_OUTPUT"
+      - name: Hand exact health outcome to the protected observer
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: protected-soak-health-${{ inputs.request_digest }}
+          path: ${{ runner.temp }}/health-result.json
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+          overwrite: false
+          include-hidden-files: false
+
+  live_soak:
+    name: Require commissioned durable provider reconciliation
+    needs: [commission, evaluate]
+    outputs:
+      accept_ready: ${{ steps.observation.outputs.accept_ready }}
+      protected_health_receipt_digest: ${{ steps.observation.outputs.protected_health_receipt_digest }}
+      trusted_observed_at: ${{ steps.observation.outputs.trusted_observed_at }}
+    environment: carl-autonomy-soak
+    permissions:
+      contents: read
+      id-token: write
+    runs-on: [self-hosted, linux, x64, carl-autonomy-cloud]
+    timeout-minutes: 60
+    steps:
+      - name: Retrieve protected soak inputs and execute exact merge observation
+        id: observation
+        env:
+          ATTEMPT_KEY: ${{ inputs.attempt_key }}
+          CANDIDATE_COMMIT: ${{ inputs.candidate_commit }}
+          EXPECTED_OUTCOME_DIGEST: ${{ needs.evaluate.outputs.health_result_digest }}
+          PARENT_COMMIT: ${{ inputs.parent_commit }}
+          PREVIOUS_SOAK_RECEIPT_PATH: /var/lib/carl/soak/previous-signed-receipt.json
+          REQUEST_DIGEST: ${{ inputs.request_digest }}
+          SOAK_CADENCE_HOURS: "6"
+          SOAK_RECEIPT_KEYRING_PATH: /etc/carl/soak-observation-keyring.json
+          WORKFLOW_REVISION: ${{ inputs.workflow_revision }}
+        run: |
+          set -euo pipefail
+          /opt/carl-autonomy/venv/bin/python3 -I - <<'PY'
+          import base64, hashlib, json, os, pathlib, re
+          from datetime import UTC, datetime, timedelta
+          from cryptography.hazmat.primitives import serialization
+          from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+          from carl_bench.canonical import canonical_json_bytes
+
+          EXPECTED_CHAIN_LENGTH = 5
+          CADENCE_MIN = timedelta(hours=6)
+          CADENCE_MAX = timedelta(hours=6, minutes=30)
+          SOAK_MAX = timedelta(hours=26)
+          DIGEST = re.compile(r"[0-9a-f]{64}\Z")
+
+          def pairs(items):
+              value = {}
+              for key, item in items:
+                  if key in value: raise SystemExit("signed soak receipt duplicate key")
+                  value[key] = item
+              return value
+
+          def parse_time(value):
+              if not isinstance(value, str) or not value.endswith("Z"):
+                  raise SystemExit("signed soak receipt time invalid")
+              parsed = datetime.fromisoformat(value[:-1] + "+00:00")
+              if parsed.tzinfo != UTC or parsed.isoformat().replace("+00:00", "Z") != value:
+                  raise SystemExit("signed soak receipt time invalid")
+              return parsed
+
+          def load_previous_signed_soak_receipt():
+              raw = pathlib.Path(os.environ["PREVIOUS_SOAK_RECEIPT_PATH"]).read_bytes()
+              if not 0 < len(raw) <= 16384: raise SystemExit("signed soak receipt size invalid")
+              return json.loads(raw, object_pairs_hook=pairs)
+
+          def verify_previous_signed_soak_receipt(receipt):
+              if set(receipt) != {"domain", "key_id", "payload", "receipt_digest",
+                                  "schema_version", "signature_base64"}:
+                  raise SystemExit("signed soak receipt schema invalid")
+              if (receipt["domain"] != "carl.soak-observation.chain-receipt.v2"
+                      or receipt["schema_version"] != 2):
+                  raise SystemExit("signed soak receipt schema invalid")
+              payload = receipt["payload"]
+              if type(payload) is not dict or set(payload) != {
+                  "active_merge_commit", "health_receipt_digest", "merged_at",
+                  "observation_chain", "previous_receipt_digest", "request_digest",
+                  "schema_version"
+              } or payload["schema_version"] != 2:
+                  raise SystemExit("signed soak receipt payload invalid")
+              encoded = canonical_json_bytes(payload)
+              if (hashlib.sha256(encoded).hexdigest() != receipt["receipt_digest"]
+                      or DIGEST.fullmatch(receipt["receipt_digest"]) is None):
+                  raise SystemExit("signed soak receipt digest invalid")
+              keyring_raw = pathlib.Path(os.environ["SOAK_RECEIPT_KEYRING_PATH"]).read_bytes()
+              keyring = json.loads(keyring_raw, object_pairs_hook=pairs)
+              if (set(keyring) != {"domain", "keys", "schema_version"}
+                      or keyring["domain"] != "carl.soak-observation.keyring.v1"
+                      or keyring["schema_version"] != 1
+                      or type(keyring["keys"]) is not dict):
+                  raise SystemExit("signed soak keyring invalid")
+              pem = keyring["keys"].get(receipt["key_id"])
+              if not isinstance(pem, str): raise SystemExit("signed soak key invalid")
+              key = serialization.load_pem_public_key(pem.encode("ascii"))
+              if not isinstance(key, Ed25519PublicKey): raise SystemExit("signed soak key invalid")
+              key.verify(base64.b64decode(receipt["signature_base64"], validate=True), encoded)
+              return payload
+
+          def validate_observation_chain(payload):
+              if (payload["active_merge_commit"] != os.environ["CANDIDATE_COMMIT"]
+                      or payload["request_digest"] != os.environ["REQUEST_DIGEST"]
+                      or payload["health_receipt_digest"] != os.environ["EXPECTED_OUTCOME_DIGEST"]):
+                  raise SystemExit("signed soak chain binding mismatch")
+              chain = payload["observation_chain"]
+              if type(chain) is not list or not 1 <= len(chain) <= EXPECTED_CHAIN_LENGTH:
+                  raise SystemExit("signed soak chain length invalid")
+              if ((len(chain) == 1) != (payload["previous_receipt_digest"] is None)
+                      or (len(chain) > 1
+                          and DIGEST.fullmatch(payload["previous_receipt_digest"] or "") is None)):
+                  raise SystemExit("signed soak previous receipt invalid")
+              merged_at = parse_time(payload["merged_at"])
+              previous_time = None
+              previous_digest = None
+              seen_digests = set()
+              for index, item in enumerate(chain):
+                  if type(item) is not dict or set(item) != {
+                      "active_merge_commit", "health_receipt_digest", "merged_at",
+                      "observation_digest", "observed_at", "previous_observation_digest",
+                      "request_digest", "sequence"
+                  }:
+                      raise SystemExit("signed soak observation schema invalid")
+                  if (type(item["sequence"]) is not int or item["sequence"] != index
+                          or item["active_merge_commit"] != payload["active_merge_commit"]
+                          or item["health_receipt_digest"] != payload["health_receipt_digest"]
+                          or item["merged_at"] != payload["merged_at"]
+                          or item["request_digest"] != payload["request_digest"]
+                          or item["previous_observation_digest"] != previous_digest):
+                      raise SystemExit("signed soak observation binding invalid")
+                  core = {key: value for key, value in item.items() if key != "observation_digest"}
+                  observation_digest = hashlib.sha256(canonical_json_bytes(core)).hexdigest()
+                  if (item["observation_digest"] != observation_digest
+                          or observation_digest in seen_digests):
+                      raise SystemExit("signed soak observation replay invalid")
+                  observed_at = parse_time(item["observed_at"])
+                  if index == 0:
+                      if chain[0]["observed_at"] != payload["merged_at"]:
+                          raise SystemExit("signed soak chain anchor invalid")
+                  else:
+                      interval = observed_at - previous_time
+                      if interval < CADENCE_MIN or interval > CADENCE_MAX:
+                          raise SystemExit("signed soak observation cadence gap")
+                  seen_digests.add(observation_digest)
+                  previous_digest = observation_digest
+                  previous_time = observed_at
+              if previous_time > merged_at + SOAK_MAX:
+                  raise SystemExit("soak_observation_stale_critical")
+              return chain, merged_at, previous_time
+
+          def trusted_current_time():
+              return datetime.now(UTC)
+
+          previous = verify_previous_signed_soak_receipt(load_previous_signed_soak_receipt())
+          previous_chain, merged_at, previous_observed_at = validate_observation_chain(previous)
+          now = trusted_current_time()
+          if previous_observed_at > now:
+              raise SystemExit("signed soak chronology invalid")
+          if now > merged_at + SOAK_MAX:
+              raise SystemExit("soak_observation_stale_critical")
+          observation_due = len(previous_chain) < EXPECTED_CHAIN_LENGTH
+          if observation_due and now < previous_observed_at + CADENCE_MIN:
+              raise SystemExit("soak_observation_too_early")
+          if observation_due and now > previous_observed_at + CADENCE_MAX:
+              raise SystemExit("signed soak observation cadence gap")
+          context = {
+              "merged_at": previous["merged_at"],
+              "observation_due": observation_due,
+              "previous_observation_chain": previous_chain,
+              "previous_receipt_digest": hashlib.sha256(
+                  canonical_json_bytes(previous)
+              ).hexdigest(),
+              "trusted_before": now.isoformat().replace("+00:00", "Z"),
+          }
+          pathlib.Path(os.environ["RUNNER_TEMP"], "soak-cadence-context.json").write_bytes(
+              canonical_json_bytes(context) + b"\n"
+          )
           PY
-          printf 'health_result_digest=%s\n' "$(sha256sum "$result" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          output="$RUNNER_TEMP/observe-soak.json"
+          observation_due="$(/opt/carl-autonomy/venv/bin/python3 -I -c \
+            'import json,os,pathlib; print(str(json.loads(pathlib.Path(os.environ["RUNNER_TEMP"], "soak-cadence-context.json").read_bytes())["observation_due"]).lower())')"
+          if test "$observation_due" = "true"; then
+            /opt/carl-autonomy/venv/bin/python3 -I - \
+              commission-live observe_soak accept_soak "$REQUEST_DIGEST" \
+              "$EXPECTED_OUTCOME_DIGEST" "$output" <<'PY'
+          import hashlib, json, os, pathlib, re, stat, sys
+          from carl_bench.canonical import canonical_json_bytes
+          from carl_bench.cloud_coordinator import CloudCoordinatorDecision
+          from carl_bench.coordinator_client import CoordinatorSocketClient
+          from carl_bench.coordinator_ipc import CoordinatorServiceRequest
+
+          command, expected_node, expected_successor, workflow_request_digest, outcome_digest, output = sys.argv[1:]
+          digest = re.compile(r"[0-9a-f]{64}\Z")
+          client = CoordinatorSocketClient.from_protected_environment()
+          request = CoordinatorServiceRequest.create(command)
+          expected_ipc_digest = request.digest
+
+          FREEZE_ROOT = pathlib.Path("/var/lib/carl/protected-workflow-freezes")
+
+          def protected_freeze_directory(path):
+              metadata = os.lstat(path)
+              if (not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode)
+                      or metadata.st_uid != 0 or stat.S_IMODE(metadata.st_mode) != 0o700):
+                  raise SystemExit("workflow_stage_freeze_storage_invalid")
+
+          def reject_request_freeze() -> None:
+              if re.fullmatch(r"[0-9a-f]{64}", workflow_request_digest) is None:
+                  raise SystemExit("workflow_request_digest_invalid")
+              if not FREEZE_ROOT.exists():
+                  return
+              protected_freeze_directory(FREEZE_ROOT)
+              request_root = FREEZE_ROOT / workflow_request_digest
+              if not request_root.exists():
+                  return
+              protected_freeze_directory(request_root)
+              entries = sorted(request_root.iterdir())
+              if not entries:
+                  raise SystemExit("workflow_request_frozen")
+              for entry in entries:
+                  metadata = os.lstat(entry)
+                  raw = entry.read_bytes()
+                  if (not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode)
+                          or metadata.st_uid != 0 or stat.S_IMODE(metadata.st_mode) != 0o400
+                          or not 0 < len(raw) <= 4096):
+                      raise SystemExit("workflow_stage_freeze_receipt_invalid")
+                  value = json.loads(raw)
+                  core = {key: item for key, item in value.items() if key != "freeze_identity"}
+                  if (set(value) != {"domain", "freeze_identity", "node", "reason",
+                                    "request_digest", "schema_version", "status", "successor"}
+                          or canonical_json_bytes(value) + b"\n" != raw
+                          or value["domain"] != "carl.workflow-stage-freeze.v1"
+                          or value["schema_version"] != 1
+                          or value["status"] != "frozen"
+                          or value["request_digest"] != workflow_request_digest
+                          or hashlib.sha256(canonical_json_bytes(core)).hexdigest()
+                          != value["freeze_identity"]):
+                      raise SystemExit("workflow_stage_freeze_receipt_invalid")
+              raise SystemExit("workflow_request_frozen")
+
+          def persist_exact_node_freeze() -> None:
+              try:
+                  if (re.fullmatch(r"[0-9a-f]{64}", workflow_request_digest) is None
+                          or re.fullmatch(r"[a-z][a-z0-9_]{0,63}", expected_node) is None
+                          or re.fullmatch(r"[a-z][a-z0-9_]{0,63}", expected_successor) is None):
+                      raise SystemExit("workflow_stage_freeze_identity_invalid")
+                  FREEZE_ROOT.mkdir(parents=True, mode=0o700, exist_ok=True)
+                  protected_freeze_directory(FREEZE_ROOT)
+                  request_root = FREEZE_ROOT / workflow_request_digest
+                  request_root.mkdir(mode=0o700, exist_ok=True)
+                  protected_freeze_directory(request_root)
+                  core = {
+                      "domain": "carl.workflow-stage-freeze.v1",
+                      "node": expected_node,
+                      "reason": "workflow_stage_response_invalid",
+                      "request_digest": workflow_request_digest,
+                      "schema_version": 1,
+                      "status": "frozen",
+                      "successor": expected_successor,
+                  }
+                  receipt = {
+                      **core,
+                      "freeze_identity": hashlib.sha256(canonical_json_bytes(core)).hexdigest(),
+                  }
+                  raw = canonical_json_bytes(receipt) + b"\n"
+                  target = request_root / f"{expected_node}.json"
+                  try:
+                      descriptor = os.open(
+                          target,
+                          os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                          0o400,
+                      )
+                  except FileExistsError:
+                      if target.read_bytes() != raw:
+                          raise SystemExit("workflow_stage_freeze_receipt_conflict") from None
+                  else:
+                      try:
+                          written = 0
+                          while written < len(raw):
+                              count = os.write(descriptor, raw[written:])
+                              if count <= 0:
+                                  raise SystemExit("workflow_stage_freeze_write_failed")
+                              written += count
+                          os.fsync(descriptor)
+                      finally:
+                          os.close(descriptor)
+                      os.chmod(target, 0o400, follow_symlinks=False)
+                      directory = os.open(request_root, os.O_RDONLY | os.O_DIRECTORY)
+                      try:
+                          os.fsync(directory)
+                      finally:
+                          os.close(directory)
+                  try:
+                      client.execute(CoordinatorServiceRequest.create("health"))
+                  except Exception:
+                      pass
+              finally:
+                  raise SystemExit("workflow_stage_response_invalid")
+
+          reject_request_freeze()
+
+          try:
+              if expected_successor != "accept_soak" or digest.fullmatch(outcome_digest) is None:
+                  persist_exact_node_freeze()
+              for _ in range(6):
+                  response = client.execute(request)
+                  value = response.to_canonical_dict()
+                  if set(value) != {"domain", "error_code", "request_digest", "result",
+                                    "schema_version", "status"}:
+                      persist_exact_node_freeze()
+                  if (value["schema_version"] != 1
+                          or value["domain"] != "carl.coordinator.ipc.response.v1"
+                          or value["status"] != "completed"
+                          or value["error_code"] is not None
+                          or value["request_digest"] != expected_ipc_digest):
+                      persist_exact_node_freeze()
+                  result = CloudCoordinatorDecision.from_canonical_dict(value["result"]).to_canonical_dict()
+                  if result["node"] != expected_node:
+                      persist_exact_node_freeze()
+                  action = result["action"]
+                  command_value = result["command"]
+                  if type(command_value) is not dict or command_value.get("request_digest") != workflow_request_digest:
+                      persist_exact_node_freeze()
+                  if action == "complete_command":
+                      if (result["reason"] != "observed_effect_completion_required"
+                              or result["consequential"] is not True
+                              or result["remote_effect"] is not False
+                              or digest.fullmatch(result["result_digest"] or "") is None):
+                          persist_exact_node_freeze()
+                      stage = {
+                          "action": action,
+                          "domain": "carl.protected-workflow-stage.v1",
+                          "identity": result["identity"],
+                          "node": expected_node,
+                          "outcome_digest": outcome_digest,
+                          "protected_receipt_digest": result["result_digest"],
+                          "request_digest": workflow_request_digest,
+                          "schema_version": 1,
+                          "status": "completed",
+                          "successor": expected_successor,
+                      }
+                      pathlib.Path(output).write_bytes(canonical_json_bytes(stage) + b"\n")
+                      break
+                  reasons = {
+                      "claim_command": "command_claim_required",
+                      "execute_effect": "persisted_command_ready",
+                      "persist_command": "command_persistence_required",
+                      "reconcile_effect": {"effect_response_lost", "effect_retry_ready"},
+                  }
+                  expected_reason = reasons.get(action)
+                  if expected_reason is None or (
+                      result["reason"] not in expected_reason
+                      if isinstance(expected_reason, set)
+                      else result["reason"] != expected_reason
+                  ):
+                      persist_exact_node_freeze()
+                  expected_remote_effect = (
+                      action in {"execute_effect", "reconcile_effect"}
+                      and expected_node not in {"accept_soak", "record_disposition", "trigger_supervisor"}
+                  )
+                  if (result["consequential"] is not True
+                          or result["remote_effect"] is not expected_remote_effect
+                          or result["result_digest"] is not None):
+                      persist_exact_node_freeze()
+                  if action in {"persist_command", "claim_command"}:
+                      if result["effect_key"] is not None:
+                          persist_exact_node_freeze()
+                  elif result["effect_key"] != command_value["effect_key"]:
+                      persist_exact_node_freeze()
+              else:
+                  persist_exact_node_freeze()
+          except Exception:
+              persist_exact_node_freeze()
+          PY
+          fi
+          /opt/carl-autonomy/venv/bin/python3 -I - "$output" <<'PY'
+          import base64, hashlib, json, os, pathlib, re, sys
+          from datetime import UTC, datetime, timedelta
+          from cryptography.hazmat.primitives import serialization
+          from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+          from carl_bench.canonical import canonical_json_bytes
+
+          EXPECTED_CHAIN_LENGTH = 5
+          CADENCE_MIN = timedelta(hours=6)
+          CADENCE_MAX = timedelta(hours=6, minutes=30)
+          SOAK_MAX = timedelta(hours=26)
+          DIGEST = re.compile(r"[0-9a-f]{64}\Z")
+
+          def pairs(items):
+              value = {}
+              for key, item in items:
+                  if key in value: raise SystemExit("signed soak receipt duplicate key")
+                  value[key] = item
+              return value
+
+          def parse_time(value):
+              if not isinstance(value, str) or not value.endswith("Z"):
+                  raise SystemExit("signed soak receipt time invalid")
+              parsed = datetime.fromisoformat(value[:-1] + "+00:00")
+              if parsed.tzinfo != UTC or parsed.isoformat().replace("+00:00", "Z") != value:
+                  raise SystemExit("signed soak receipt time invalid")
+              return parsed
+
+          def verify_current_signed_soak_receipt(receipt):
+              if set(receipt) != {"domain", "key_id", "payload", "receipt_digest",
+                                  "schema_version", "signature_base64"}:
+                  raise SystemExit("current signed soak receipt schema invalid")
+              payload = receipt["payload"]
+              if (receipt["domain"] != "carl.soak-observation.chain-receipt.v2"
+                      or receipt["schema_version"] != 2
+                      or type(payload) is not dict
+                      or set(payload) != {"active_merge_commit", "health_receipt_digest",
+                                          "merged_at", "observation_chain",
+                                          "previous_receipt_digest", "request_digest",
+                                          "schema_version"}
+                      or payload["schema_version"] != 2):
+                  raise SystemExit("current signed soak receipt schema invalid")
+              encoded = canonical_json_bytes(payload)
+              if (hashlib.sha256(encoded).hexdigest() != receipt["receipt_digest"]
+                      or DIGEST.fullmatch(receipt["receipt_digest"]) is None):
+                  raise SystemExit("current signed soak receipt invalid")
+              keyring = json.loads(
+                  pathlib.Path(os.environ["SOAK_RECEIPT_KEYRING_PATH"]).read_bytes(),
+                  object_pairs_hook=pairs,
+              )
+              if (set(keyring) != {"domain", "keys", "schema_version"}
+                      or keyring["domain"] != "carl.soak-observation.keyring.v1"
+                      or keyring["schema_version"] != 1
+                      or type(keyring["keys"]) is not dict):
+                  raise SystemExit("current signed soak keyring invalid")
+              pem = keyring["keys"].get(receipt["key_id"])
+              if not isinstance(pem, str): raise SystemExit("current signed soak key invalid")
+              key = serialization.load_pem_public_key(pem.encode("ascii"))
+              if not isinstance(key, Ed25519PublicKey):
+                  raise SystemExit("current signed soak key invalid")
+              key.verify(base64.b64decode(receipt["signature_base64"], validate=True), encoded)
+              return payload
+
+          def validate_observation_chain(payload):
+              if (payload["active_merge_commit"] != os.environ["CANDIDATE_COMMIT"]
+                      or payload["request_digest"] != os.environ["REQUEST_DIGEST"]
+                      or payload["health_receipt_digest"] != os.environ["EXPECTED_OUTCOME_DIGEST"]):
+                  raise SystemExit("current signed soak chain binding mismatch")
+              chain = payload["observation_chain"]
+              if type(chain) is not list or not 1 <= len(chain) <= EXPECTED_CHAIN_LENGTH:
+                  raise SystemExit("current signed soak chain length invalid")
+              if ((len(chain) == 1) != (payload["previous_receipt_digest"] is None)
+                      or (len(chain) > 1
+                          and DIGEST.fullmatch(payload["previous_receipt_digest"] or "") is None)):
+                  raise SystemExit("current signed soak previous receipt invalid")
+              merged_at = parse_time(payload["merged_at"])
+              previous_time = None
+              previous_digest = None
+              seen_digests = set()
+              for index, item in enumerate(chain):
+                  if type(item) is not dict or set(item) != {
+                      "active_merge_commit", "health_receipt_digest", "merged_at",
+                      "observation_digest", "observed_at", "previous_observation_digest",
+                      "request_digest", "sequence"
+                  }:
+                      raise SystemExit("current signed soak observation schema invalid")
+                  if (type(item["sequence"]) is not int or item["sequence"] != index
+                          or item["active_merge_commit"] != payload["active_merge_commit"]
+                          or item["health_receipt_digest"] != payload["health_receipt_digest"]
+                          or item["merged_at"] != payload["merged_at"]
+                          or item["request_digest"] != payload["request_digest"]
+                          or item["previous_observation_digest"] != previous_digest):
+                      raise SystemExit("current signed soak observation binding invalid")
+                  core = {key: value for key, value in item.items() if key != "observation_digest"}
+                  observation_digest = hashlib.sha256(canonical_json_bytes(core)).hexdigest()
+                  if (item["observation_digest"] != observation_digest
+                          or observation_digest in seen_digests):
+                      raise SystemExit("current signed soak observation replay invalid")
+                  observed_at = parse_time(item["observed_at"])
+                  if index == 0:
+                      if chain[0]["observed_at"] != payload["merged_at"]:
+                          raise SystemExit("current signed soak chain anchor invalid")
+                  else:
+                      interval = observed_at - previous_time
+                      if interval < CADENCE_MIN or interval > CADENCE_MAX:
+                          raise SystemExit("current signed soak observation cadence gap")
+                  seen_digests.add(observation_digest)
+                  previous_digest = observation_digest
+                  previous_time = observed_at
+              if previous_time > merged_at + SOAK_MAX:
+                  raise SystemExit("soak_observation_stale_critical")
+              return chain, merged_at, previous_time
+
+          context = json.loads(
+              pathlib.Path(os.environ["RUNNER_TEMP"], "soak-cadence-context.json").read_bytes(),
+              object_pairs_hook=pairs,
+          )
+          receipt = json.loads(
+              pathlib.Path(os.environ["PREVIOUS_SOAK_RECEIPT_PATH"]).read_bytes(),
+              object_pairs_hook=pairs,
+          )
+          payload = verify_current_signed_soak_receipt(receipt)
+          current_chain, merged_at, observed_at = validate_observation_chain(payload)
+          if payload["merged_at"] != context["merged_at"]:
+              raise SystemExit("current signed soak receipt binding mismatch")
+          trusted_before = parse_time(context["trusted_before"])
+          now = datetime.now(UTC)
+          if observed_at > now or now > merged_at + SOAK_MAX:
+              raise SystemExit("soak_observation_stale_critical")
+          if context["observation_due"]:
+              stage = json.loads(pathlib.Path(sys.argv[1]).read_bytes(), object_pairs_hook=pairs)
+              if (payload["previous_receipt_digest"] != context["previous_receipt_digest"]
+                      or current_chain[:-1] != context["previous_observation_chain"]
+                      or len(current_chain) != len(context["previous_observation_chain"]) + 1
+                      or stage["protected_receipt_digest"] != receipt["receipt_digest"]
+                      or not trusted_before <= observed_at <= now
+                      or observed_at > trusted_before + timedelta(hours=1)):
+                  raise SystemExit("current signed soak chain extension invalid")
+          elif (receipt["receipt_digest"] != context["previous_receipt_digest"]
+                  or current_chain != context["previous_observation_chain"]
+                  or len(current_chain) != EXPECTED_CHAIN_LENGTH):
+              raise SystemExit("current signed soak receipt replay invalid")
+          accept_ready = len(current_chain) == EXPECTED_CHAIN_LENGTH
+          handoff_root = pathlib.Path(os.environ["RUNNER_TEMP"], "protected-soak-receipt-handoff")
+          handoff_root.mkdir(mode=0o700)
+          handoff = handoff_root / "soak-receipt.json"
+          handoff.write_bytes(canonical_json_bytes(receipt) + b"\n")
+          handoff.chmod(0o400)
+          with pathlib.Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as outputs:
+              outputs.write(f"accept_ready={str(accept_ready).lower()}\n")
+              outputs.write(f"protected_health_receipt_digest={receipt['receipt_digest']}\n")
+              outputs.write(f"trusted_observed_at={current_chain[-1]['observed_at']}\n")
+          PY
+      - name: Hand exact signed soak receipt to the independent acceptor
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: protected-soak-receipt-${{ inputs.request_digest }}
+          path: ${{ runner.temp }}/protected-soak-receipt-handoff/soak-receipt.json
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+          overwrite: false
+          include-hidden-files: false
 
   evidence:
-    name: Create trusted bounded soak evidence
-    needs: [commission, evaluate]
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
+    name: Independently observe archive sign and ingest exact merge evidence
+    needs: [evaluate, live_soak]
+    outputs:
+      protected_receipt_digest: ${{ steps.handoff.outputs.protected_receipt_digest }}
+    environment: carl-autonomy-observer
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+    runs-on: [self-hosted, linux, x64, carl-autonomy-cloud]
+    timeout-minutes: 20
     steps:
-      - name: Write fresh trusted merge observation
+      - name: Independently retrieve exact health outcome object
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: protected-soak-health-${{ inputs.request_digest }}
+          path: ${{ runner.temp }}/protected-soak-health
+      - name: Independently retrieve exact signed soak receipt
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: protected-soak-receipt-${{ inputs.request_digest }}
+          path: ${{ runner.temp }}/protected-soak-receipt
+      - name: Complete protected soak evidence and acceptance handoffs
+        id: handoff
         env:
+          ACCEPT_READY: ${{ needs.live_soak.outputs.accept_ready }}
+          ATTEMPT_KEY: ${{ inputs.attempt_key }}
+          CANDIDATE_COMMIT: ${{ inputs.candidate_commit }}
+          EXPECTED_HEALTH_RECEIPT: ${{ needs.live_soak.outputs.protected_health_receipt_digest }}
+          EXPECTED_OUTCOME_DIGEST: ${{ needs.evaluate.outputs.health_result_digest }}
           EXPERIMENT_DIGEST: ${{ inputs.experiment_digest }}
-          HEALTH_RESULT_DIGEST: ${{ needs.evaluate.outputs.health_result_digest }}
-          MERGE_COMMIT: ${{ inputs.candidate_commit }}
+          MAX_PUBLIC_HANDOFF_BYTES: 1048576
           METRIC_PACK_DIGEST: ${{ inputs.metric_pack_digest }}
           PARENT_COMMIT: ${{ inputs.parent_commit }}
           POLICY_DIGEST: ${{ inputs.policy_digest }}
-          REPOSITORY: ${{ github.repository }}
           REQUEST_DIGEST: ${{ inputs.request_digest }}
-          RUN_ID: ${{ github.run_id }}
+          SOAK_CADENCE_HOURS: "6"
           TASK_SET_DIGEST: ${{ inputs.task_set_digest }}
-          TOPOLOGY_DIGEST: ${{ needs.commission.outputs.topology_digest }}
-          TRUSTED_INPUTS_DIGEST: ${{ needs.commission.outputs.trusted_inputs_digest }}
-          WORKFLOW_BLOB_DIGEST: ${{ inputs.workflow_blob_digest }}
+          TRUSTED_OBSERVED_AT: ${{ needs.live_soak.outputs.trusted_observed_at }}
           WORKFLOW_REVISION: ${{ inputs.workflow_revision }}
         run: |
-          mkdir -p cloud-evidence
+          set -euo pipefail
+          mkdir -p cloud-handoff
+          outcome="$RUNNER_TEMP/protected-soak-health/health-result.json"
+          receipt="$RUNNER_TEMP/protected-soak-receipt/soak-receipt.json"
+          /opt/carl-autonomy/venv/bin/python3 -I - "$outcome" "$receipt" <<'PY'
+          import base64, hashlib, json, os, pathlib, re, sys
+          from datetime import UTC, datetime, timedelta
+          from cryptography.hazmat.primitives import serialization
+          from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+          from carl_bench.canonical import canonical_json_bytes
+
+          EXPECTED_CHAIN_LENGTH = 5
+          CADENCE_MIN = timedelta(hours=6)
+          CADENCE_MAX = timedelta(hours=6, minutes=30)
+          SOAK_MAX = timedelta(hours=26)
+          DIGEST = re.compile(r"[0-9a-f]{64}\Z")
+
+          def pairs(items):
+              value = {}
+              for key, item in items:
+                  if key in value: raise SystemExit("health outcome duplicate key")
+                  value[key] = item
+              return value
+          raw = pathlib.Path(sys.argv[1]).read_bytes()
+          if not 0 < len(raw) <= 65536 or hashlib.sha256(raw).hexdigest() != os.environ["EXPECTED_OUTCOME_DIGEST"]:
+              raise SystemExit("health outcome digest mismatch")
+          value = json.loads(raw, object_pairs_hook=pairs)
+          canonical = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+          if canonical != raw: raise SystemExit("health outcome not canonical")
+          if set(value) != {"healthy", "input_digests", "kind", "reasons", "schema_version", "score_basis_points"}:
+              raise SystemExit("health outcome schema mismatch")
+          if value["schema_version"] != 1 or value["kind"] != "immutable_soak_health_decision":
+              raise SystemExit("health outcome schema mismatch")
+          if value["healthy"] is not True or value["reasons"] != []:
+              raise SystemExit("health outcome is not healthy")
+          expected_inputs = {
+              "experiment": os.environ["EXPERIMENT_DIGEST"],
+              "metric_pack": os.environ["METRIC_PACK_DIGEST"],
+              "policy": os.environ["POLICY_DIGEST"],
+              "task_set": os.environ["TASK_SET_DIGEST"],
+          }
+          if value["input_digests"] != expected_inputs:
+              raise SystemExit("health immutable inputs mismatch")
+
+          def verify_exact_health_receipt(path):
+              raw = pathlib.Path(path).read_bytes()
+              if not 0 < len(raw) <= 16384:
+                  raise SystemExit("signed health receipt size invalid")
+              receipt = json.loads(raw, object_pairs_hook=pairs)
+              if canonical_json_bytes(receipt) + b"\n" != raw:
+                  raise SystemExit("signed health receipt not canonical")
+              if set(receipt) != {"domain", "key_id", "payload", "receipt_digest",
+                                  "schema_version", "signature_base64"}:
+                  raise SystemExit("signed health receipt schema invalid")
+              payload = receipt["payload"]
+              if (receipt["domain"] != "carl.soak-observation.chain-receipt.v2"
+                      or receipt["schema_version"] != 2
+                      or type(payload) is not dict
+                      or set(payload) != {"active_merge_commit", "health_receipt_digest",
+                                          "merged_at", "observation_chain",
+                                          "previous_receipt_digest", "request_digest",
+                                          "schema_version"}
+                      or payload["schema_version"] != 2):
+                  raise SystemExit("signed health receipt schema invalid")
+              encoded = canonical_json_bytes(payload)
+              if (hashlib.sha256(encoded).hexdigest() != receipt["receipt_digest"]
+                      or receipt["receipt_digest"] != os.environ["EXPECTED_HEALTH_RECEIPT"]
+                      or payload["active_merge_commit"] != os.environ["CANDIDATE_COMMIT"]
+                      or payload["request_digest"] != os.environ["REQUEST_DIGEST"]
+                      or payload["health_receipt_digest"] != os.environ["EXPECTED_OUTCOME_DIGEST"]):
+                  raise SystemExit("signed health receipt binding mismatch")
+              keyring_raw = pathlib.Path(
+                  "/etc/carl/soak-observation-keyring.json"
+              ).read_bytes()
+              if not 0 < len(keyring_raw) <= 16384:
+                  raise SystemExit("signed health keyring size invalid")
+              keyring = json.loads(keyring_raw, object_pairs_hook=pairs)
+              if (set(keyring) != {"domain", "keys", "schema_version"}
+                      or keyring["domain"] != "carl.soak-observation.keyring.v1"
+                      or keyring["schema_version"] != 1
+                      or type(keyring["keys"]) is not dict
+                      or receipt["key_id"] not in keyring["keys"]):
+                  raise SystemExit("signed health keyring invalid")
+              pem = keyring["keys"][receipt["key_id"]]
+              key = serialization.load_pem_public_key(pem.encode("ascii"))
+              if not isinstance(key, Ed25519PublicKey):
+                  raise SystemExit("signed health key invalid")
+              key.verify(base64.b64decode(receipt["signature_base64"], validate=True), encoded)
+              if DIGEST.fullmatch(receipt["receipt_digest"]) is None:
+                  raise SystemExit("signed health receipt digest invalid")
+
+              def parse_time(timestamp):
+                  if not isinstance(timestamp, str) or not timestamp.endswith("Z"):
+                      raise SystemExit("signed soak observation time invalid")
+                  parsed = datetime.fromisoformat(timestamp[:-1] + "+00:00")
+                  if parsed.tzinfo != UTC or parsed.isoformat().replace("+00:00", "Z") != timestamp:
+                      raise SystemExit("signed soak observation time invalid")
+                  return parsed
+
+              def validate_observation_chain():
+                  chain = payload["observation_chain"]
+                  if type(chain) is not list or not 1 <= len(chain) <= EXPECTED_CHAIN_LENGTH:
+                      raise SystemExit("signed soak chain length invalid")
+                  if ((len(chain) == 1) != (payload["previous_receipt_digest"] is None)
+                          or (len(chain) > 1
+                              and DIGEST.fullmatch(payload["previous_receipt_digest"] or "") is None)):
+                      raise SystemExit("signed soak previous receipt invalid")
+                  merged_at = parse_time(payload["merged_at"])
+                  previous_time = None
+                  previous_digest = None
+                  seen_digests = set()
+                  for index, item in enumerate(chain):
+                      if type(item) is not dict or set(item) != {
+                          "active_merge_commit", "health_receipt_digest", "merged_at",
+                          "observation_digest", "observed_at", "previous_observation_digest",
+                          "request_digest", "sequence"
+                      }:
+                          raise SystemExit("signed soak observation schema invalid")
+                      if (type(item["sequence"]) is not int or item["sequence"] != index
+                              or item["active_merge_commit"] != payload["active_merge_commit"]
+                              or item["health_receipt_digest"] != payload["health_receipt_digest"]
+                              or item["merged_at"] != payload["merged_at"]
+                              or item["request_digest"] != payload["request_digest"]
+                              or item["previous_observation_digest"] != previous_digest):
+                          raise SystemExit("signed soak observation binding invalid")
+                      core = {
+                          key: item_value
+                          for key, item_value in item.items()
+                          if key != "observation_digest"
+                      }
+                      observation_digest = hashlib.sha256(canonical_json_bytes(core)).hexdigest()
+                      if (item["observation_digest"] != observation_digest
+                              or observation_digest in seen_digests):
+                          raise SystemExit("signed soak observation replay invalid")
+                      observed_at = parse_time(item["observed_at"])
+                      if index == 0:
+                          if chain[0]["observed_at"] != payload["merged_at"]:
+                              raise SystemExit("signed soak chain anchor invalid")
+                      else:
+                          interval = observed_at - previous_time
+                          if interval < CADENCE_MIN or interval > CADENCE_MAX:
+                              raise SystemExit("signed soak observation cadence gap")
+                      seen_digests.add(observation_digest)
+                      previous_digest = observation_digest
+                      previous_time = observed_at
+                  if previous_time > merged_at + SOAK_MAX:
+                      raise SystemExit("soak_observation_stale_critical")
+                  return chain
+
+              chain = validate_observation_chain()
+              chain_complete = len(chain) == EXPECTED_CHAIN_LENGTH
+              if (payload["observation_chain"][-1]["observed_at"]
+                      != os.environ["TRUSTED_OBSERVED_AT"]
+                      or os.environ["ACCEPT_READY"] != str(chain_complete).lower()):
+                  raise SystemExit("signed soak chain readiness mismatch")
+
+          verify_exact_health_receipt(sys.argv[2])
+          PY
+          python3 - <<'PY'
+          import os, re
+          digest = re.compile(r"[0-9a-f]{64}\Z")
+          if digest.fullmatch(os.environ["EXPECTED_HEALTH_RECEIPT"]) is None:
+              raise SystemExit("protected health receipt missing")
+          if os.environ["ACCEPT_READY"] not in {"true", "false"}:
+              raise SystemExit("protected soak readiness invalid")
+          PY
+          run_node() {
+            expected_node="$1"; expected_successor="$2"; output="cloud-handoff/$expected_node.json"
+            /opt/carl-autonomy/venv/bin/python3 -I - \
+              commission-live "$expected_node" "$expected_successor" "$REQUEST_DIGEST" \
+              "$EXPECTED_OUTCOME_DIGEST" "$EXPECTED_HEALTH_RECEIPT" "$output" <<'PY'
+          import hashlib, json, os, pathlib, re, stat, sys
+          from carl_bench.canonical import canonical_json_bytes
+          from carl_bench.cloud_coordinator import CloudCoordinatorDecision
+          from carl_bench.coordinator_client import CoordinatorSocketClient
+          from carl_bench.coordinator_ipc import CoordinatorServiceRequest
+
+          (command, expected_node, expected_successor, workflow_request_digest,
+           outcome_digest, expected_health_receipt, output) = sys.argv[1:]
+          digest = re.compile(r"[0-9a-f]{64}\Z")
+          client = CoordinatorSocketClient.from_protected_environment()
+          request = CoordinatorServiceRequest.create(command)
+          expected_ipc_digest = request.digest
+
+          FREEZE_ROOT = pathlib.Path("/var/lib/carl/protected-workflow-freezes")
+
+          def protected_freeze_directory(path):
+              metadata = os.lstat(path)
+              if (not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode)
+                      or metadata.st_uid != 0 or stat.S_IMODE(metadata.st_mode) != 0o700):
+                  raise SystemExit("workflow_stage_freeze_storage_invalid")
+
+          def reject_request_freeze() -> None:
+              if re.fullmatch(r"[0-9a-f]{64}", workflow_request_digest) is None:
+                  raise SystemExit("workflow_request_digest_invalid")
+              if not FREEZE_ROOT.exists():
+                  return
+              protected_freeze_directory(FREEZE_ROOT)
+              request_root = FREEZE_ROOT / workflow_request_digest
+              if not request_root.exists():
+                  return
+              protected_freeze_directory(request_root)
+              entries = sorted(request_root.iterdir())
+              if not entries:
+                  raise SystemExit("workflow_request_frozen")
+              for entry in entries:
+                  metadata = os.lstat(entry)
+                  raw = entry.read_bytes()
+                  if (not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode)
+                          or metadata.st_uid != 0 or stat.S_IMODE(metadata.st_mode) != 0o400
+                          or not 0 < len(raw) <= 4096):
+                      raise SystemExit("workflow_stage_freeze_receipt_invalid")
+                  value = json.loads(raw)
+                  core = {key: item for key, item in value.items() if key != "freeze_identity"}
+                  if (set(value) != {"domain", "freeze_identity", "node", "reason",
+                                    "request_digest", "schema_version", "status", "successor"}
+                          or canonical_json_bytes(value) + b"\n" != raw
+                          or value["domain"] != "carl.workflow-stage-freeze.v1"
+                          or value["schema_version"] != 1
+                          or value["status"] != "frozen"
+                          or value["request_digest"] != workflow_request_digest
+                          or hashlib.sha256(canonical_json_bytes(core)).hexdigest()
+                          != value["freeze_identity"]):
+                      raise SystemExit("workflow_stage_freeze_receipt_invalid")
+              raise SystemExit("workflow_request_frozen")
+
+          def persist_exact_node_freeze() -> None:
+              try:
+                  if (re.fullmatch(r"[0-9a-f]{64}", workflow_request_digest) is None
+                          or re.fullmatch(r"[a-z][a-z0-9_]{0,63}", expected_node) is None
+                          or re.fullmatch(r"[a-z][a-z0-9_]{0,63}", expected_successor) is None):
+                      raise SystemExit("workflow_stage_freeze_identity_invalid")
+                  FREEZE_ROOT.mkdir(parents=True, mode=0o700, exist_ok=True)
+                  protected_freeze_directory(FREEZE_ROOT)
+                  request_root = FREEZE_ROOT / workflow_request_digest
+                  request_root.mkdir(mode=0o700, exist_ok=True)
+                  protected_freeze_directory(request_root)
+                  core = {
+                      "domain": "carl.workflow-stage-freeze.v1",
+                      "node": expected_node,
+                      "reason": "workflow_stage_response_invalid",
+                      "request_digest": workflow_request_digest,
+                      "schema_version": 1,
+                      "status": "frozen",
+                      "successor": expected_successor,
+                  }
+                  receipt = {
+                      **core,
+                      "freeze_identity": hashlib.sha256(canonical_json_bytes(core)).hexdigest(),
+                  }
+                  raw = canonical_json_bytes(receipt) + b"\n"
+                  target = request_root / f"{expected_node}.json"
+                  try:
+                      descriptor = os.open(
+                          target,
+                          os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                          0o400,
+                      )
+                  except FileExistsError:
+                      if target.read_bytes() != raw:
+                          raise SystemExit("workflow_stage_freeze_receipt_conflict") from None
+                  else:
+                      try:
+                          written = 0
+                          while written < len(raw):
+                              count = os.write(descriptor, raw[written:])
+                              if count <= 0:
+                                  raise SystemExit("workflow_stage_freeze_write_failed")
+                              written += count
+                          os.fsync(descriptor)
+                      finally:
+                          os.close(descriptor)
+                      os.chmod(target, 0o400, follow_symlinks=False)
+                      directory = os.open(request_root, os.O_RDONLY | os.O_DIRECTORY)
+                      try:
+                          os.fsync(directory)
+                      finally:
+                          os.close(directory)
+                  try:
+                      client.execute(CoordinatorServiceRequest.create("health"))
+                  except Exception:
+                      pass
+              finally:
+                  raise SystemExit("workflow_stage_response_invalid")
+
+          reject_request_freeze()
+
+          try:
+              if (expected_successor != "production_accepted"
+                      or digest.fullmatch(outcome_digest) is None
+                      or digest.fullmatch(expected_health_receipt) is None):
+                  persist_exact_node_freeze()
+              for _ in range(6):
+                  response = client.execute(request)
+                  value = response.to_canonical_dict()
+                  if set(value) != {"domain", "error_code", "request_digest", "result",
+                                    "schema_version", "status"}:
+                      persist_exact_node_freeze()
+                  if (value["schema_version"] != 1
+                          or value["domain"] != "carl.coordinator.ipc.response.v1"
+                          or value["status"] != "completed"
+                          or value["error_code"] is not None
+                          or value["request_digest"] != expected_ipc_digest):
+                      persist_exact_node_freeze()
+                  result = CloudCoordinatorDecision.from_canonical_dict(value["result"]).to_canonical_dict()
+                  if result["node"] != expected_node:
+                      persist_exact_node_freeze()
+                  action = result["action"]
+                  command_value = result["command"]
+                  if type(command_value) is not dict or command_value.get("request_digest") != workflow_request_digest:
+                      persist_exact_node_freeze()
+                  if action == "complete_command":
+                      if (result["reason"] != "observed_effect_completion_required"
+                              or result["consequential"] is not True
+                              or result["remote_effect"] is not False
+                              or digest.fullmatch(result["result_digest"] or "") is None):
+                          persist_exact_node_freeze()
+                      stage = {
+                          "action": action,
+                          "domain": "carl.protected-workflow-stage.v1",
+                          "health_receipt_digest": expected_health_receipt,
+                          "identity": result["identity"],
+                          "node": expected_node,
+                          "outcome_digest": outcome_digest,
+                          "protected_receipt_digest": result["result_digest"],
+                          "request_digest": workflow_request_digest,
+                          "schema_version": 1,
+                          "status": "completed",
+                          "successor": expected_successor,
+                      }
+                      pathlib.Path(output).write_bytes(canonical_json_bytes(stage) + b"\n")
+                      break
+                  reasons = {
+                      "claim_command": "command_claim_required",
+                      "execute_effect": "persisted_command_ready",
+                      "persist_command": "command_persistence_required",
+                      "reconcile_effect": {"effect_response_lost", "effect_retry_ready"},
+                  }
+                  expected_reason = reasons.get(action)
+                  if expected_reason is None or (
+                      result["reason"] not in expected_reason
+                      if isinstance(expected_reason, set)
+                      else result["reason"] != expected_reason
+                  ):
+                      persist_exact_node_freeze()
+                  expected_remote_effect = (
+                      action in {"execute_effect", "reconcile_effect"}
+                      and expected_node not in {"accept_soak", "record_disposition", "trigger_supervisor"}
+                  )
+                  if (result["consequential"] is not True
+                          or result["remote_effect"] is not expected_remote_effect
+                          or result["result_digest"] is not None):
+                      persist_exact_node_freeze()
+                  if action in {"persist_command", "claim_command"}:
+                      if result["effect_key"] is not None:
+                          persist_exact_node_freeze()
+                  elif result["effect_key"] != command_value["effect_key"]:
+                      persist_exact_node_freeze()
+              else:
+                  persist_exact_node_freeze()
+          except Exception:
+              persist_exact_node_freeze()
+          PY
+          }
+          if test "$ACCEPT_READY" = "true"; then
+            PROTECTED_NODE=accept_soak run_node accept_soak production_accepted
+          fi
           python3 - <<'PY'
           import json, os, pathlib
-          evidence = {
-              "experiment_digest": os.environ["EXPERIMENT_DIGEST"],
-              "health_result_digest": os.environ["HEALTH_RESULT_DIGEST"],
-              "kind": "autonomous_soak_observation", "merge_commit": os.environ["MERGE_COMMIT"],
-              "metric_pack_digest": os.environ["METRIC_PACK_DIGEST"],
+          root = pathlib.Path("cloud-handoff")
+          accepted = os.environ["ACCEPT_READY"] == "true"
+          acceptance = json.loads((root / "accept_soak.json").read_text()) if accepted else None
+          protected_receipt_digest = (
+              acceptance["protected_receipt_digest"]
+              if acceptance is not None else os.environ["EXPECTED_HEALTH_RECEIPT"]
+          )
+          handoff = {
+              "accepted": accepted,
+              "attempt_key": os.environ["ATTEMPT_KEY"],
+              "cadence_hours": 6,
+              "health_receipt_digest": os.environ["EXPECTED_HEALTH_RECEIPT"],
+              "kind": "protected_soak_handoff",
+              "merge_commit": os.environ["CANDIDATE_COMMIT"],
+              "outcome_digest": os.environ["EXPECTED_OUTCOME_DIGEST"],
               "parent_commit": os.environ["PARENT_COMMIT"],
-              "policy_digest": os.environ["POLICY_DIGEST"],
-              "repository": os.environ["REPOSITORY"],
+              "protected_receipt_digest": protected_receipt_digest,
               "request_digest": os.environ["REQUEST_DIGEST"],
-              "run_id": int(os.environ["RUN_ID"]), "schema_version": 2,
-              "task_set_digest": os.environ["TASK_SET_DIGEST"],
-              "topology_digest": os.environ["TOPOLOGY_DIGEST"],
-              "trusted_inputs_digest": os.environ["TRUSTED_INPUTS_DIGEST"],
-              "workflow_file": "autonomous-soak.yml",
+              "schema_version": 1,
+              "trusted_observed_at": os.environ["TRUSTED_OBSERVED_AT"],
               "workflow_revision": os.environ["WORKFLOW_REVISION"],
-              "workflow_blob_digest": os.environ["WORKFLOW_BLOB_DIGEST"],
           }
-          target = pathlib.Path("cloud-evidence/autonomous-soak.json")
-          target.write_text(json.dumps(evidence, sort_keys=True, separators=(",", ":")) + "\n")
-          if target.stat().st_size > 1_048_576: raise SystemExit("observation exceeds bound")
+          if acceptance is not None:
+              handoff["acceptance_receipt"] = acceptance
+          target = root / f"autonomous-soak-{os.environ['REQUEST_DIGEST']}.json"
+          target.write_text(json.dumps(handoff, sort_keys=True, separators=(",", ":")) + "\n")
+          if target.stat().st_size > min(int(os.environ["MAX_PUBLIC_HANDOFF_BYTES"]), 1_048_576):
+              raise SystemExit("public handoff exceeds bound")
+          with pathlib.Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as outputs:
+              outputs.write(f"protected_receipt_digest={protected_receipt_digest}\n")
           PY
       - name: Upload the one request-named soak artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: autonomous-soak-observation-${{ inputs.request_digest }}
-          path: cloud-evidence/autonomous-soak.json
+          path: cloud-handoff/autonomous-soak-${{ inputs.request_digest }}.json
           if-no-files-found: error
           retention-days: 7
           compression-level: 9
           overwrite: false
           include-hidden-files: false
+
+  rollback_handoff:
+    name: Explicitly dispatch protected rollback health recovery
+    needs: [evidence]
+    environment: carl-autonomy-promoter
+    permissions:
+      contents: read
+    runs-on: [self-hosted, linux, x64, carl-autonomy-cloud]
+    timeout-minutes: 10
+    steps:
+      - name: Dispatch without default token recursion
+        env:
+          ATTEMPT_KEY: ${{ inputs.attempt_key }}
+          CANDIDATE_COMMIT: ${{ inputs.candidate_commit }}
+          EXPECTED_HEALTH_RECEIPT: ${{ needs.evidence.outputs.protected_receipt_digest }}
+          PARENT_COMMIT: ${{ inputs.parent_commit }}
+          PROTECTED_NODE: trigger_supervisor
+          REQUEST_DIGEST: ${{ inputs.request_digest }}
+          WORKFLOW_REVISION: ${{ inputs.workflow_revision }}
+        run: |
+          set -euo pipefail
+          output="$RUNNER_TEMP/rollback-handoff.json"
+          /opt/carl-autonomy/venv/bin/python3 -I - \
+            health "$PROTECTED_NODE" supervisor_reconciled "$REQUEST_DIGEST" \
+            "$EXPECTED_HEALTH_RECEIPT" "$output" <<'PY'
+          import hashlib, json, os, pathlib, re, stat, sys
+          from carl_bench.canonical import canonical_json_bytes
+          from carl_bench.cloud_coordinator import CloudCoordinatorDecision
+          from carl_bench.coordinator_client import CoordinatorSocketClient
+          from carl_bench.coordinator_ipc import CoordinatorServiceRequest
+
+          command, expected_node, expected_successor, workflow_request_digest, health_receipt, output = sys.argv[1:]
+          digest = re.compile(r"[0-9a-f]{64}\Z")
+          if digest.fullmatch(health_receipt) is None:
+              raise SystemExit("protected health receipt missing")
+          client = CoordinatorSocketClient.from_protected_environment()
+          request = CoordinatorServiceRequest.create(command)
+          expected_ipc_digest = request.digest
+
+          FREEZE_ROOT = pathlib.Path("/var/lib/carl/protected-workflow-freezes")
+
+          def protected_freeze_directory(path):
+              metadata = os.lstat(path)
+              if (not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode)
+                      or metadata.st_uid != 0 or stat.S_IMODE(metadata.st_mode) != 0o700):
+                  raise SystemExit("workflow_stage_freeze_storage_invalid")
+
+          def reject_request_freeze() -> None:
+              if re.fullmatch(r"[0-9a-f]{64}", workflow_request_digest) is None:
+                  raise SystemExit("workflow_request_digest_invalid")
+              if not FREEZE_ROOT.exists():
+                  return
+              protected_freeze_directory(FREEZE_ROOT)
+              request_root = FREEZE_ROOT / workflow_request_digest
+              if not request_root.exists():
+                  return
+              protected_freeze_directory(request_root)
+              entries = sorted(request_root.iterdir())
+              if not entries:
+                  raise SystemExit("workflow_request_frozen")
+              for entry in entries:
+                  metadata = os.lstat(entry)
+                  raw = entry.read_bytes()
+                  if (not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode)
+                          or metadata.st_uid != 0 or stat.S_IMODE(metadata.st_mode) != 0o400
+                          or not 0 < len(raw) <= 4096):
+                      raise SystemExit("workflow_stage_freeze_receipt_invalid")
+                  value = json.loads(raw)
+                  core = {key: item for key, item in value.items() if key != "freeze_identity"}
+                  if (set(value) != {"domain", "freeze_identity", "node", "reason",
+                                    "request_digest", "schema_version", "status", "successor"}
+                          or canonical_json_bytes(value) + b"\n" != raw
+                          or value["domain"] != "carl.workflow-stage-freeze.v1"
+                          or value["schema_version"] != 1
+                          or value["status"] != "frozen"
+                          or value["request_digest"] != workflow_request_digest
+                          or hashlib.sha256(canonical_json_bytes(core)).hexdigest()
+                          != value["freeze_identity"]):
+                      raise SystemExit("workflow_stage_freeze_receipt_invalid")
+              raise SystemExit("workflow_request_frozen")
+
+          def persist_exact_node_freeze() -> None:
+              try:
+                  if (re.fullmatch(r"[0-9a-f]{64}", workflow_request_digest) is None
+                          or re.fullmatch(r"[a-z][a-z0-9_]{0,63}", expected_node) is None
+                          or re.fullmatch(r"[a-z][a-z0-9_]{0,63}", expected_successor) is None):
+                      raise SystemExit("workflow_stage_freeze_identity_invalid")
+                  FREEZE_ROOT.mkdir(parents=True, mode=0o700, exist_ok=True)
+                  protected_freeze_directory(FREEZE_ROOT)
+                  request_root = FREEZE_ROOT / workflow_request_digest
+                  request_root.mkdir(mode=0o700, exist_ok=True)
+                  protected_freeze_directory(request_root)
+                  core = {
+                      "domain": "carl.workflow-stage-freeze.v1",
+                      "node": expected_node,
+                      "reason": "workflow_stage_response_invalid",
+                      "request_digest": workflow_request_digest,
+                      "schema_version": 1,
+                      "status": "frozen",
+                      "successor": expected_successor,
+                  }
+                  receipt = {
+                      **core,
+                      "freeze_identity": hashlib.sha256(canonical_json_bytes(core)).hexdigest(),
+                  }
+                  raw = canonical_json_bytes(receipt) + b"\n"
+                  target = request_root / f"{expected_node}.json"
+                  try:
+                      descriptor = os.open(
+                          target,
+                          os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                          0o400,
+                      )
+                  except FileExistsError:
+                      if target.read_bytes() != raw:
+                          raise SystemExit("workflow_stage_freeze_receipt_conflict") from None
+                  else:
+                      try:
+                          written = 0
+                          while written < len(raw):
+                              count = os.write(descriptor, raw[written:])
+                              if count <= 0:
+                                  raise SystemExit("workflow_stage_freeze_write_failed")
+                              written += count
+                          os.fsync(descriptor)
+                      finally:
+                          os.close(descriptor)
+                      os.chmod(target, 0o400, follow_symlinks=False)
+                      directory = os.open(request_root, os.O_RDONLY | os.O_DIRECTORY)
+                      try:
+                          os.fsync(directory)
+                      finally:
+                          os.close(directory)
+                  try:
+                      client.execute(CoordinatorServiceRequest.create("health"))
+                  except Exception:
+                      pass
+              finally:
+                  raise SystemExit("workflow_stage_response_invalid")
+
+          reject_request_freeze()
+
+          try:
+              if expected_successor != "supervisor_reconciled":
+                  persist_exact_node_freeze()
+              for _ in range(6):
+                  response = client.execute(request)
+                  value = response.to_canonical_dict()
+                  if set(value) != {"domain", "error_code", "request_digest", "result",
+                                    "schema_version", "status"}:
+                      persist_exact_node_freeze()
+                  if (value["schema_version"] != 1
+                          or value["domain"] != "carl.coordinator.ipc.response.v1"
+                          or value["status"] != "completed"
+                          or value["error_code"] is not None
+                          or value["request_digest"] != expected_ipc_digest):
+                      persist_exact_node_freeze()
+                  result = CloudCoordinatorDecision.from_canonical_dict(value["result"]).to_canonical_dict()
+                  if result["node"] != expected_node:
+                      persist_exact_node_freeze()
+                  action = result["action"]
+                  command_value = result["command"]
+                  if type(command_value) is not dict or command_value.get("request_digest") != workflow_request_digest:
+                      persist_exact_node_freeze()
+                  if action == "complete_command":
+                      if (result["reason"] != "observed_effect_completion_required"
+                              or result["consequential"] is not True
+                              or result["remote_effect"] is not False
+                              or digest.fullmatch(result["result_digest"] or "") is None):
+                          persist_exact_node_freeze()
+                      stage = {
+                          "action": action,
+                          "domain": "carl.protected-workflow-stage.v1",
+                          "health_receipt_digest": health_receipt,
+                          "identity": result["identity"],
+                          "node": expected_node,
+                          "protected_receipt_digest": result["result_digest"],
+                          "request_digest": workflow_request_digest,
+                          "schema_version": 1,
+                          "status": "completed",
+                          "successor": expected_successor,
+                      }
+                      pathlib.Path(output).write_bytes(canonical_json_bytes(stage) + b"\n")
+                      break
+                  reasons = {
+                      "claim_command": "command_claim_required",
+                      "execute_effect": "persisted_command_ready",
+                      "persist_command": "command_persistence_required",
+                      "reconcile_effect": {"effect_response_lost", "effect_retry_ready"},
+                  }
+                  expected_reason = reasons.get(action)
+                  if expected_reason is None or (
+                      result["reason"] not in expected_reason
+                      if isinstance(expected_reason, set)
+                      else result["reason"] != expected_reason
+                  ):
+                      persist_exact_node_freeze()
+                  expected_remote_effect = (
+                      action in {"execute_effect", "reconcile_effect"}
+                      and expected_node not in {"accept_soak", "record_disposition", "trigger_supervisor"}
+                  )
+                  if (result["consequential"] is not True
+                          or result["remote_effect"] is not expected_remote_effect
+                          or result["result_digest"] is not None):
+                      persist_exact_node_freeze()
+                  if action in {"persist_command", "claim_command"}:
+                      if result["effect_key"] is not None:
+                          persist_exact_node_freeze()
+                  elif result["effect_key"] != command_value["effect_key"]:
+                      persist_exact_node_freeze()
+              else:
+                  persist_exact_node_freeze()
+          except Exception:
+              persist_exact_node_freeze()
+          PY

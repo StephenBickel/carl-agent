@@ -16,6 +16,7 @@ const PUBLIC_DOCS: &[&str] = &[
     "docs/buzz.md",
     "docs/long-horizon-tasks.md",
     "docs/autonomous-improvement.md",
+    "docs/autonomy-operations.md",
     "docs/benchmarks.md",
     "docs/memory.md",
     "docs/telegram.md",
@@ -697,28 +698,57 @@ fn readme_points_to_the_carl_design_and_public_contract() {
 fn public_autonomy_graph_is_commissioning_scoped_and_truthful() {
     let readme = read_readme();
 
-    for relative_path in ["README.md", "docs/autonomous-improvement.md"] {
+    for relative_path in [
+        "README.md",
+        "docs/autonomous-improvement.md",
+        "docs/autonomy-operations.md",
+    ] {
         assert_document_contains(
             relative_path,
             &[
-                "autonomous improvement: commissioning",
-                "experimental",
-                "protected main",
-                "independent validation",
-                "24-hour soak",
-                "exact revert",
-                "no routine human approval",
-                "capability transfer",
+                "self-improving project",
+                "status: commissioning",
+                "remote_cloud_acceptance_receipt",
+                "current zero-human operation",
             ],
+        );
+        assert!(
+            !normalized_document(relative_path).contains("status: operational"),
+            "{relative_path} must remain commissioning without a live acceptance receipt"
         );
     }
 
     assert!(readme.contains("[autonomous improvement graph](docs/autonomous-improvement.md)"));
+    assert!(readme.contains("[autonomy operations](docs/autonomy-operations.md)"));
     assert!(
         readme
             .to_lowercase()
             .contains("does not claim that all historical commits were autonomous"),
         "README must not claim all historical commits were autonomous"
+    );
+
+    assert_document_contains(
+        "docs/autonomy-operations.md",
+        &[
+            "hypothesis",
+            "builder",
+            "paired evaluation",
+            "immutable experimental",
+            "independent disposition",
+            "protected production",
+            "soak",
+            "revert",
+            "retained learning",
+            "cloud-heavy execution",
+            "no direct `main` push",
+            "held-out",
+            "novelty",
+            "provenance",
+            "supervisor",
+            "pushed, disposed, promoted, soaked, reverted, or frozen",
+            "exact identity",
+            "authoritative time",
+        ],
     );
 }
 

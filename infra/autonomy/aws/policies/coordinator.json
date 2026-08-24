@@ -1,0 +1,11 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ConnectAsCoordinator",
+      "Effect": "Allow",
+      "Action": "rds-db:connect",
+      "Resource": ${database_user_arn}
+    }
+  ]
+}

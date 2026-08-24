@@ -21,6 +21,9 @@ const TEST_RUN_COMMANDS: &[&str] = &[
 ];
 const SETUP_UV_ACTION: &str = "astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990";
 const SETUP_UV_TAG: &str = "v8.3.2";
+const SETUP_TERRAFORM_ACTION: &str =
+    "hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd";
+const SETUP_TERRAFORM_TAG: &str = "v3.1.2";
 
 fn repository_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -335,6 +338,88 @@ fn validate_required_job(mapping: &Mapping, context: &str) -> Result<(), String>
     validate_required_gating(mapping, context)
 }
 
+fn validate_benchmark_postgres_job(mapping: &Mapping, context: &str) -> Result<(), String> {
+    reject_keys(mapping, context, &["needs", "defaults", "container"])?;
+    validate_required_gating(mapping, context)?;
+
+    let environment = value_map(field(mapping, "env", context)?, &format!("{context}.env"))?;
+    if environment.len() != 1
+        || string_field(
+            environment,
+            "CARL_POSTGRES_TEST_DSN",
+            &format!("{context}.env"),
+        )? != "postgresql://postgres:postgres@127.0.0.1:5432/carl_test"
+    {
+        return Err(format!(
+            "{context} must define only the exact loopback PostgreSQL DSN"
+        ));
+    }
+
+    let services = value_map(
+        field(mapping, "services", context)?,
+        &format!("{context}.services"),
+    )?;
+    if services.len() != 1 {
+        return Err(format!(
+            "{context} must define only the pinned PostgreSQL 16.10 service"
+        ));
+    }
+    let postgres = value_map(
+        field(services, "postgres", &format!("{context}.services"))?,
+        &format!("{context}.services.postgres"),
+    )?;
+    if postgres.len() != 4
+        || string_field(postgres, "image", &format!("{context}.services.postgres"))?
+            != "postgres:16.10-bookworm"
+    {
+        return Err(format!(
+            "{context} must define only the pinned PostgreSQL 16.10 service"
+        ));
+    }
+    let postgres_environment = value_map(
+        field(postgres, "env", &format!("{context}.services.postgres"))?,
+        &format!("{context}.services.postgres.env"),
+    )?;
+    if postgres_environment.len() != 3
+        || string_field(
+            postgres_environment,
+            "POSTGRES_DB",
+            &format!("{context}.services.postgres.env"),
+        )? != "carl_test"
+        || string_field(
+            postgres_environment,
+            "POSTGRES_PASSWORD",
+            &format!("{context}.services.postgres.env"),
+        )? != "postgres"
+        || string_field(
+            postgres_environment,
+            "POSTGRES_USER",
+            &format!("{context}.services.postgres.env"),
+        )? != "postgres"
+    {
+        return Err(format!(
+            "{context} PostgreSQL service environment must remain closed and exact"
+        ));
+    }
+    let ports = field(postgres, "ports", &format!("{context}.services.postgres"))?
+        .as_sequence()
+        .ok_or_else(|| format!("{context}.services.postgres.ports must be a sequence"))?;
+    if ports.as_slice() != [Value::String("5432:5432".to_owned())] {
+        return Err(format!(
+            "{context} PostgreSQL service must expose only loopback test port 5432"
+        ));
+    }
+    let options = string_field(postgres, "options", &format!("{context}.services.postgres"))?;
+    if options.trim()
+        != "--health-cmd \"pg_isready -U postgres -d carl_test\" --health-interval 5s --health-timeout 5s --health-retries 12"
+    {
+        return Err(format!(
+            "{context} PostgreSQL service health check must remain exact"
+        ));
+    }
+    Ok(())
+}
+
 fn validate_required_job_steps(mapping: &Mapping, context: &str) -> Result<(), String> {
     for (index, step) in steps(mapping, context)?.into_iter().enumerate() {
         validate_step_execution_overrides(step, &format!("{context}.steps[{index}]"))?;
@@ -458,6 +543,9 @@ fn validate_ci_workflow(workflow: &str) -> Result<(), String> {
     if string_field(test, "runs-on", "jobs.test")? != "${{ matrix.os }}" {
         return Err("jobs.test.runs-on must use matrix.os".to_owned());
     }
+    if field(test, "timeout-minutes", "jobs.test")?.as_u64() != Some(40) {
+        return Err("jobs.test.timeout-minutes must equal `40`".to_owned());
+    }
     let strategy = value_map(field(test, "strategy", "jobs.test")?, "jobs.test.strategy")?;
     let matrix = value_map(
         field(strategy, "matrix", "jobs.test.strategy")?,
@@ -539,14 +627,24 @@ fn validate_ci_workflow(workflow: &str) -> Result<(), String> {
 fn validate_security_workflow(workflow: &str) -> Result<(), String> {
     let document = parse_workflow(workflow)?;
     let root = value_map(&document, "workflow")?;
-    validate_common(root, workflow, &[(CHECKOUT_ACTION, CHECKOUT_TAG)])?;
+    validate_common(
+        root,
+        workflow,
+        &[
+            (CHECKOUT_ACTION, CHECKOUT_TAG),
+            (SETUP_TERRAFORM_ACTION, SETUP_TERRAFORM_TAG),
+        ],
+    )?;
 
     let triggers = triggers(root)?;
     validate_exact_trigger_keys(
         triggers,
-        &["schedule", "workflow_dispatch"],
-        "`schedule` and `workflow_dispatch`",
+        &["pull_request", "schedule", "workflow_dispatch"],
+        "`pull_request`, `schedule`, and `workflow_dispatch`",
     )?;
+    if !trigger_is_unrestricted(field(triggers, "pull_request", "workflow.on")?) {
+        return Err("workflow.on.pull_request must be null or an empty mapping".to_owned());
+    }
     let schedule = field(triggers, "schedule", "workflow.on")?
         .as_sequence()
         .ok_or_else(|| {
@@ -626,7 +724,7 @@ fn validate_benchmark_workflow(workflow: &str) -> Result<(), String> {
         return Err("benchmark workflow must contain exactly one job".to_owned());
     }
     let benchmark = job(jobs, "benchmark-contracts")?;
-    validate_required_job(benchmark, "jobs.benchmark-contracts")?;
+    validate_benchmark_postgres_job(benchmark, "jobs.benchmark-contracts")?;
     if string_field(benchmark, "name", "jobs.benchmark-contracts")? != "Benchmark contracts" {
         return Err("benchmark job must retain its stable name".to_owned());
     }
@@ -713,6 +811,15 @@ fn assert_security_rejected(workflow: &str, expected_error: &str) {
     );
 }
 
+fn assert_benchmark_rejected(workflow: &str, expected_error: &str) {
+    let error =
+        validate_benchmark_workflow(workflow).expect_err("benchmark workflow must be rejected");
+    assert!(
+        error.contains(expected_error),
+        "unexpected benchmark validation error: {error}"
+    );
+}
+
 #[test]
 fn fixture_replacement_normalizes_crlf_before_matching_lf_snippets() {
     let fixture_path =
@@ -736,8 +843,41 @@ fn ci_workflow_enforces_required_cross_platform_checks() {
 }
 
 #[test]
+fn checker_rejects_an_insufficient_cross_platform_timeout() {
+    let workflow = replace_in_workflow(
+        "ci.yml",
+        "    timeout-minutes: 40\n    steps:\n",
+        "    timeout-minutes: 30\n    steps:\n",
+    );
+
+    assert_ci_rejected(&workflow, "jobs.test.timeout-minutes must equal `40`");
+}
+
+#[test]
 fn benchmark_workflow_enforces_pinned_offline_contract_checks() {
     assert_benchmark_workflow(&read_workflow("benchmark-contracts.yml"));
+}
+
+#[test]
+fn benchmark_workflow_rejects_an_unpinned_postgres_service() {
+    let workflow = replace_in_workflow(
+        "benchmark-contracts.yml",
+        "image: postgres:16.10-bookworm",
+        "image: postgres:latest",
+    );
+
+    assert_benchmark_rejected(&workflow, "pinned PostgreSQL 16.10 service");
+}
+
+#[test]
+fn benchmark_workflow_rejects_a_changed_postgres_dsn() {
+    let workflow = replace_in_workflow(
+        "benchmark-contracts.yml",
+        "postgresql://postgres:postgres@127.0.0.1:5432/carl_test",
+        "postgresql://postgres:postgres@postgres:5432/carl_test",
+    );
+
+    assert_benchmark_rejected(&workflow, "exact loopback PostgreSQL DSN");
 }
 
 #[test]
@@ -1286,7 +1426,7 @@ fn checker_rejects_extra_security_trigger() {
 
     assert_security_rejected(
         &workflow,
-        "workflow.on must contain exactly `schedule` and `workflow_dispatch`",
+        "workflow.on must contain exactly `pull_request`, `schedule`, and `workflow_dispatch`",
     );
 }
 

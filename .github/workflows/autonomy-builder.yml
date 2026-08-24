@@ -1,0 +1,285 @@
+name: Carl autonomous remote product builder
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      request_digest:
+        required: true
+        type: string
+      parent_commit:
+        required: true
+        type: string
+      immutable_inputs_digest:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: carl-autonomy-builder-${{ github.event.repository.default_branch }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    name: Build one preregistered product candidate
+    environment: carl-autonomy-builder
+    permissions:
+      contents: read
+      id-token: write
+    runs-on: [self-hosted, linux, x64, carl-autonomy-cloud]
+    timeout-minutes: 45
+    outputs:
+      candidate_packet_digest: ${{ steps.build.outputs.candidate_packet_digest }}
+      expected_revision: ${{ steps.build.outputs.expected_revision }}
+      experiment_id: ${{ steps.build.outputs.experiment_id }}
+      parent_commit: ${{ steps.build.outputs.parent_commit }}
+      publication_idempotency_key: ${{ steps.build.outputs.publication_idempotency_key }}
+      publication_request_digest: ${{ steps.build.outputs.publication_request_digest }}
+      request_digest: ${{ steps.build.outputs.request_digest }}
+      validation_idempotency_key: ${{ steps.build.outputs.validation_idempotency_key }}
+      outcome: ${{ steps.build.outputs.outcome }}
+    steps:
+      - name: Check out the exact protected default-branch revision
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Install pinned uv and Python
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          version: "0.10.4"
+          python-version: "3.12"
+          enable-cache: false
+      - name: Reconstruct request and run the stateful protected builder
+        id: build
+        env:
+          CHECKED_OUT_REVISION: ${{ github.sha }}
+          DISPATCH_IMMUTABLE_INPUTS_DIGEST: ${{ inputs.immutable_inputs_digest }}
+          DISPATCH_PARENT_COMMIT: ${{ inputs.parent_commit }}
+          DISPATCH_REQUEST_DIGEST: ${{ inputs.request_digest }}
+          EVENT_NAME: ${{ github.event_name }}
+          MAX_BUILDER_COST_MICRODOLLARS: "2000000"
+          MAX_BUILDER_ELAPSED_SECONDS: "1800"
+          MAX_BUILDER_REPAIRS: "2"
+          PRODUCT_BUILDER_PROMPT: docs/automation-prompts/carl-product-builder.md
+        run: |
+          set -euo pipefail
+          umask 077
+          test "$MAX_BUILDER_REPAIRS" = "2"
+          test "$MAX_BUILDER_ELAPSED_SECONDS" = "1800"
+          test "$MAX_BUILDER_COST_MICRODOLLARS" = "2000000"
+          sandbox_home="$RUNNER_TEMP/carl-candidate-home"
+          install -d -m 0700 "$sandbox_home"
+          SANDBOX_HOME="$sandbox_home" uv run --offline --project benchmarks --locked python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          from carl_bench.product_builder import credential_free_candidate_environment
+
+          environment = credential_free_candidate_environment(
+              dict(os.environ), sandbox_home=Path(os.environ["SANDBOX_HOME"])
+          )
+          destination = Path(os.environ["RUNNER_TEMP"]) / "candidate-environment.json"
+          destination.write_text(
+              json.dumps(environment, sort_keys=True, separators=(",", ":")),
+              encoding="utf-8",
+          )
+          PY
+          test -s "$RUNNER_TEMP/candidate-environment.json"
+          builder_args=(
+            --parent-commit "$CHECKED_OUT_REVISION"
+            --candidate-environment "$RUNNER_TEMP/candidate-environment.json"
+            --prompt "$PRODUCT_BUILDER_PROMPT"
+            --result "$RUNNER_TEMP/builder-terminal.json"
+          )
+          if test "$EVENT_NAME" = schedule; then
+            builder_args+=(--scheduled)
+          else
+            case "$DISPATCH_REQUEST_DIGEST" in *[!0-9a-f]*|'') exit 2 ;; esac
+            case "$DISPATCH_IMMUTABLE_INPUTS_DIGEST" in *[!0-9a-f]*|'') exit 2 ;; esac
+            test "${#DISPATCH_REQUEST_DIGEST}" -eq 64
+            test "${#DISPATCH_IMMUTABLE_INPUTS_DIGEST}" -eq 64
+            test "$DISPATCH_PARENT_COMMIT" = "$CHECKED_OUT_REVISION"
+            builder_args+=(
+              --request-digest "$DISPATCH_REQUEST_DIGEST"
+              --immutable-inputs-digest "$DISPATCH_IMMUTABLE_INPUTS_DIGEST"
+            )
+          fi
+          # This exact command claims durable state, preregisters, calls the protected gateway,
+          # executes the credential-free sandbox, and persists a packet. It has no publish authority.
+          uv run --offline --project benchmarks --locked python -m carl_bench.product_builder \
+            run-protected "${builder_args[@]}"
+          RESULT_PATH="$RUNNER_TEMP/builder-terminal.json" uv run --offline --project benchmarks --locked python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          from carl_bench.canonical import canonical_json_bytes
+          from carl_bench.product_builder_effects import (
+              BuilderTerminalDocument,
+              PurposeBoundEffectRequest,
+          )
+          from carl_bench.product_builder_terminal import BuilderOutcomeTerminalDocument
+
+          path = Path(os.environ["RESULT_PATH"])
+          raw = path.read_bytes()
+          value = json.loads(raw)
+          if canonical_json_bytes(value) != raw:
+              raise SystemExit("builder_terminal_not_canonical")
+          if value.get("outcome") == "candidate_packet":
+              terminal = BuilderTerminalDocument.from_canonical_dict(value)
+              publication = PurposeBoundEffectRequest.for_publication(terminal)
+              validation = PurposeBoundEffectRequest.for_validation(terminal)
+              candidate_values = {
+                  "candidate_packet_digest": terminal.candidate_packet_digest,
+                  "publication_idempotency_key": publication.idempotency_key,
+                  "publication_request_digest": terminal.publication_request_digest,
+                  "validation_idempotency_key": validation.idempotency_key,
+              }
+          else:
+              terminal = BuilderOutcomeTerminalDocument.from_canonical_dict(value)
+              candidate_values = {
+                  "candidate_packet_digest": "",
+                  "publication_idempotency_key": "",
+                  "publication_request_digest": "",
+                  "validation_idempotency_key": "",
+              }
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as output:
+              values = {
+                  "expected_revision": terminal.expected_revision,
+                  "experiment_id": terminal.experiment_id,
+                  "outcome": terminal.outcome,
+                  "parent_commit": terminal.parent_commit,
+                  "request_digest": terminal.request_digest,
+                  **candidate_values,
+              }
+              for name, item in values.items():
+                  print(f"{name}={item}", file=output)
+          PY
+
+  publish:
+    if: needs.build.outputs.candidate_packet_digest != ''
+    needs: build
+    name: Publish one immutable experimental ref
+    environment: carl-autonomy-builder
+    permissions:
+      contents: read
+      id-token: write
+    runs-on: [self-hosted, linux, x64, carl-autonomy-cloud]
+    timeout-minutes: 10
+    outputs:
+      authoritative_revision: ${{ steps.publication_outputs.outputs.authoritative_revision }}
+    steps:
+      - name: Check out the exact protected default-branch revision
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Install pinned uv and Python
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          version: "0.10.4"
+          python-version: "3.12"
+          enable-cache: false
+      - name: Publish through the protected GitHub App effect boundary
+        id: publish
+        env:
+          CANDIDATE_PACKET_DIGEST: ${{ needs.build.outputs.candidate_packet_digest }}
+          CARL_GITHUB_APP_EFFECT_SOCKET: /run/carl/github-effect.sock
+          EXPECTED_REVISION: ${{ needs.build.outputs.expected_revision }}
+          EXPERIMENT_ID: ${{ needs.build.outputs.experiment_id }}
+          IDEMPOTENCY_KEY: ${{ needs.build.outputs.publication_idempotency_key }}
+          PARENT_COMMIT: ${{ needs.build.outputs.parent_commit }}
+          PUBLICATION_REQUEST_DIGEST: ${{ needs.build.outputs.publication_request_digest }}
+          REQUEST_DIGEST: ${{ needs.build.outputs.request_digest }}
+        run: |
+          set -euo pipefail
+          test -S "$CARL_GITHUB_APP_EFFECT_SOCKET"
+          uv run --offline --project benchmarks --locked python -m carl_bench.product_builder \
+            publish-protected \
+            --experiment-id "$EXPERIMENT_ID" \
+            --request-digest "$REQUEST_DIGEST" \
+            --publication-request-digest "$PUBLICATION_REQUEST_DIGEST" \
+            --candidate-packet-digest "$CANDIDATE_PACKET_DIGEST" \
+            --parent-commit "$PARENT_COMMIT" \
+            --expected-revision "$EXPECTED_REVISION" \
+            --idempotency-key "$IDEMPOTENCY_KEY" \
+            --result "$RUNNER_TEMP/publication-terminal.json"
+      - name: Export exact authoritative post-publication revision
+        id: publication_outputs
+        env:
+          RESULT_PATH: ${{ runner.temp }}/publication-terminal.json
+        run: |
+          set -euo pipefail
+          RESULT_PATH="$RESULT_PATH" uv run --offline --project benchmarks --locked python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          from carl_bench.canonical import canonical_json_bytes
+          from carl_bench.product_builder_effects import PurposeBoundEffectResponse
+
+          raw = Path(os.environ["RESULT_PATH"]).read_bytes()
+          value = json.loads(raw)
+          if canonical_json_bytes(value) != raw:
+              raise SystemExit("builder_effect_response_not_canonical")
+          response = PurposeBoundEffectResponse.from_canonical_dict(value)
+          if response.status != "completed" or response.authoritative_revision is None:
+              raise SystemExit("builder_publication_not_authoritatively_completed")
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as output:
+              print(f"authoritative_revision={response.authoritative_revision}", file=output)
+          PY
+
+  dispatch_validation:
+    if: needs.publish.result == 'success'
+    needs: [build, publish]
+    name: Explicitly dispatch protected validation
+    environment: carl-autonomy-coordinator
+    permissions:
+      contents: read
+      id-token: write
+    runs-on: [self-hosted, linux, x64, carl-autonomy-cloud]
+    timeout-minutes: 10
+    steps:
+      - name: Check out the exact protected default-branch revision
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Install pinned uv and Python
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          version: "0.10.4"
+          python-version: "3.12"
+          enable-cache: false
+      - name: Dispatch validation through the protected GitHub App client
+        env:
+          CARL_GITHUB_APP_EFFECT_SOCKET: /run/carl/github-effect.sock
+          CANDIDATE_PACKET_DIGEST: ${{ needs.build.outputs.candidate_packet_digest }}
+          EXPECTED_REVISION: ${{ needs.publish.outputs.authoritative_revision }}
+          EXPERIMENT_ID: ${{ needs.build.outputs.experiment_id }}
+          IDEMPOTENCY_KEY: ${{ needs.build.outputs.validation_idempotency_key }}
+          PARENT_COMMIT: ${{ needs.build.outputs.parent_commit }}
+          PUBLICATION_REQUEST_DIGEST: ${{ needs.build.outputs.publication_request_digest }}
+          REQUEST_DIGEST: ${{ needs.build.outputs.request_digest }}
+        run: |
+          set -euo pipefail
+          test -S "$CARL_GITHUB_APP_EFFECT_SOCKET"
+          uv run --offline --project benchmarks --locked python -m carl_bench.product_builder \
+            dispatch-validation-protected \
+            --experiment-id "$EXPERIMENT_ID" \
+            --request-digest "$REQUEST_DIGEST" \
+            --publication-request-digest "$PUBLICATION_REQUEST_DIGEST" \
+            --candidate-packet-digest "$CANDIDATE_PACKET_DIGEST" \
+            --parent-commit "$PARENT_COMMIT" \
+            --expected-revision "$EXPECTED_REVISION" \
+            --idempotency-key "$IDEMPOTENCY_KEY" \
+            --result "$RUNNER_TEMP/validation-terminal.json"

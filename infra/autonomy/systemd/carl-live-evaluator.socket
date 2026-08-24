@@ -1,0 +1,12 @@
+[Unit]
+Description=Carl protected live evidence evaluator socket
+
+[Socket]
+FileDescriptorName=live-evaluator
+ListenStream=/run/carl-live-evaluator/live-evaluator.sock
+DirectoryMode=0700
+SocketMode=0600
+Service=carl-live-evaluator.service
+
+[Install]
+WantedBy=sockets.target

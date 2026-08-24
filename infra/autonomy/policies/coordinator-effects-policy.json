@@ -1,0 +1,1 @@
+{"coordinator_user":"carl-autonomy-coordinator","domain":"carl.coordinator-effect-policy.v1","required_families":["archive","evaluator","input","observer"],"schema_version":1,"service_users":{"archive":"carl-autonomy-archive","evaluator":"carl-autonomy-evaluator","input":"carl-autonomy-input","observer":"carl-autonomy-observer"}}

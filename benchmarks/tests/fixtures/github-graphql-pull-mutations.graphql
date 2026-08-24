@@ -1,0 +1,25 @@
+# Pinned excerpt from GitHub's official public GraphQL schema.
+# Source: https://docs.github.com/public/fpt/schema.docs.graphql
+# Retrieved: 2026-08-21
+# Full-schema SHA-256: 30347e4f3bb975195f982351e55636ca03c76969c279980ca515a96ea7b40c3d
+
+input MarkPullRequestReadyForReviewInput {
+  pullRequestId: ID!
+}
+
+input EnablePullRequestAutoMergeInput {
+  expectedHeadOid: GitObjectID
+  mergeMethod: PullRequestMergeMethod = MERGE
+  pullRequestId: ID!
+}
+
+type Mutation {
+  markPullRequestReadyForReview(input: MarkPullRequestReadyForReviewInput!): MarkPullRequestReadyForReviewPayload
+  enablePullRequestAutoMerge(input: EnablePullRequestAutoMergeInput!): EnablePullRequestAutoMergePayload
+}
+
+enum PullRequestMergeMethod {
+  MERGE
+  REBASE
+  SQUASH
+}

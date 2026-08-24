@@ -1,4 +1,10 @@
 {
+  "autonomy_status": {
+    "acceptance_receipt": null,
+    "evidence": "docs/autonomy-operations.md#commissioning-and-live-acceptance",
+    "operational_claim_requires": "remote_cloud_acceptance_receipt",
+    "status": "commissioning"
+  },
   "automations": [
     {
       "configuration": {
@@ -22,7 +28,7 @@
         "rrule": "RRULE:FREQ=DAILY;BYHOUR=0;BYMINUTE=0"
       },
       "id": "daily-carl-self-improvement-graph",
-      "prompt_sha256": "1a46431d859adcf59a2fac6ed349b4d6db4ebc1f46040cc9a571af374585ea3c",
+      "prompt_sha256": "0c0a703bf09a5b7900932082e96e0115f8b09ba21fe0510be51937cd0f54b287",
       "status": "ACTIVE"
     },
     {
@@ -47,7 +53,7 @@
         "rrule": "RRULE:FREQ=HOURLY;INTERVAL=6;BYMINUTE=15"
       },
       "id": "daily-carl-production-review",
-      "prompt_sha256": "669e499c196b84fea86972c7c80fc188799a9dd601436540b135c3702302212d",
+      "prompt_sha256": "8c9a1d540590ece04463612490b8aac05f2704a8b1c77f0f286bc3258bb48b23",
       "status": "ACTIVE"
     },
     {
@@ -72,7 +78,7 @@
         "rrule": "RRULE:FREQ=HOURLY;INTERVAL=2;BYMINUTE=30"
       },
       "id": "carl-promotion-and-rollback-watchdog",
-      "prompt_sha256": "22502f1b0a8a8f5a9298062c1aa7a20c8996b149742a2641c748e8dcb41b89fb",
+      "prompt_sha256": "b520b663d13e5ba0cb32173621d268e14eed74591cc387671459f7311e48e61c",
       "status": "ACTIVE"
     },
     {
@@ -97,7 +103,7 @@
         "rrule": "RRULE:FREQ=DAILY;BYHOUR=8;BYMINUTE=0"
       },
       "id": "daily-carl-autonomy-outcome-monitor",
-      "prompt_sha256": "66db7b7f9bd39e31e7fc4fa5162f30d36d7164fcd18b3c592c9fa41ddfdda926",
+      "prompt_sha256": "d96df75cf7e275a0b391252c154716dd1aea1952100f2c946b2ffa5bd40e240d",
       "status": "ACTIVE"
     },
     {
@@ -122,7 +128,7 @@
         "rrule": "RRULE:FREQ=HOURLY;INTERVAL=6;BYMINUTE=45"
       },
       "id": "carl-autonomy-loop-supervisor",
-      "prompt_sha256": "5ce057a1e42cf521ebf9eb937d2c487241efb050e9f1660d6f6bbb180d85ba2b",
+      "prompt_sha256": "51b96417ffac61e88c9e5cc0c5c1d1c9ce9384b53552bf7b75d17a01462677d8",
       "status": "ACTIVE"
     },
     {
@@ -147,8 +153,91 @@
         "rrule": "RRULE:FREQ=WEEKLY;BYDAY=MO;BYHOUR=9;BYMINUTE=0"
       },
       "id": "weekly-carl-feature-and-autonomy-report",
-      "prompt_sha256": "39760972c5ee27fcf2c6c6d0b32e30b0b4fa176c88c2fea7cc0c45620a3d2ae4",
+      "prompt_sha256": "13525d0cde2f0b99a102e9ab56fb25b7fc6d81212257d21069d31d9d5f51077c",
       "status": "ACTIVE"
+    }
+  ],
+  "cloud_workflows": [
+    {
+      "configuration": {
+        "default_branch_only": true,
+        "durable_state": "postgresql_and_protected_object_storage",
+        "identity": "coordinator",
+        "maximum_consequential_nodes_per_run": 1,
+        "no_idle_narrative_ledger_event": true,
+        "oidc_state_role_only": true,
+        "runner_label": "carl-autonomy-cloud",
+        "schedule": "0 */2 * * *",
+        "workflow_dispatch": true
+      },
+      "id": "autonomy-coordinator",
+      "status": "PENDING_COMMISSIONING",
+      "workflow_path": ".github/workflows/autonomy-coordinator.yml"
+    },
+    {
+      "configuration": {
+        "default_branch_only": true,
+        "durable_state": "postgresql_and_protected_object_storage",
+        "identity": "builder",
+        "maximum_consequential_nodes_per_run": 1,
+        "runner_label": "carl-autonomy-cloud",
+        "schedule": "17 3 * * *",
+        "workflow_dispatch": true
+      },
+      "id": "autonomy-builder",
+      "status": "PENDING_COMMISSIONING",
+      "workflow_path": ".github/workflows/autonomy-builder.yml"
+    },
+    {
+      "configuration": {
+        "default_branch_only": true,
+        "durable_state": "postgresql_and_protected_object_storage",
+        "identity": "supervisor",
+        "maximum_consequential_nodes_per_run": 1,
+        "runner_label": "carl-autonomy-cloud",
+        "schedule": "17 */6 * * *",
+        "workflow_dispatch": true
+      },
+      "id": "autonomy-supervisor",
+      "status": "PENDING_COMMISSIONING",
+      "workflow_path": ".github/workflows/autonomy-supervisor.yml"
+    },
+    {
+      "configuration": {
+        "default_branch_only": true,
+        "durable_state": "postgresql_and_protected_object_storage",
+        "identity": "soak",
+        "maximum_consequential_nodes_per_run": 1,
+        "runner_label": "carl-autonomy-cloud",
+        "schedule": "23 */6 * * *",
+        "workflow_dispatch": true
+      },
+      "id": "autonomy-soak-scheduler",
+      "status": "PENDING_COMMISSIONING",
+      "workflow_path": ".github/workflows/autonomy-soak-scheduler.yml"
+    },
+    {
+      "configuration": {
+        "default_branch_only": true,
+        "identity": "validator_promoter",
+        "protected_evidence_only": true,
+        "workflow_dispatch": true
+      },
+      "id": "autonomous-improvement",
+      "status": "PENDING_COMMISSIONING",
+      "workflow_path": ".github/workflows/autonomous-improvement.yml"
+    },
+    {
+      "configuration": {
+        "default_branch_only": true,
+        "identity": "soak_observer",
+        "merge_bound": true,
+        "protected_evidence_only": true,
+        "workflow_dispatch": true
+      },
+      "id": "autonomous-soak",
+      "status": "PENDING_COMMISSIONING",
+      "workflow_path": ".github/workflows/autonomous-soak.yml"
     }
   ],
   "schema_version": 1,

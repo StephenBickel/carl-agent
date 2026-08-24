@@ -1,0 +1,35 @@
+[Unit]
+Description=Carl protected autonomy coordinator
+Requires=carl-coordinator.socket carl-github-effect.socket carl-archive-effect.socket carl-evaluator-effect.socket carl-input-effect.socket carl-observer-effect.socket
+After=network-online.target carl-github-effect.socket carl-archive-effect.socket carl-evaluator-effect.socket carl-input-effect.socket carl-observer-effect.socket
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=carl-autonomy-coordinator
+Group=carl-autonomy-coordinator
+EnvironmentFile=/etc/carl/coordinator.env
+Environment=PYTHONNOUSERSITE=1
+UnsetEnvironment=PYTHONPATH PYTHONHOME PYTHONSTARTUP PYTHONUSERBASE
+ExecStart=/opt/carl-autonomy/venv/bin/python3 -I -m carl_bench.coordinator_service
+Restart=on-failure
+RestartSec=5s
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ReadOnlyPaths=/etc/carl/coordinator-effects-policy.json /etc/carl/coordinator-recovery-keyring.json
+InaccessiblePaths=/etc/carl/github-effect.env /etc/carl/archive-effect.env /etc/carl/evaluator-effect.env /etc/carl/input-effect.env /etc/carl/observer-effect.env /etc/carl/coordinator-recovery-signing-key.pem
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

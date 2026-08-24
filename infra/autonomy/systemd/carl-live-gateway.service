@@ -1,0 +1,36 @@
+[Unit]
+Description=Carl protected live model gateway
+After=network-online.target
+Wants=network-online.target
+Requires=carl-live-gateway.socket carl-live-runner.socket
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+ExecStart=/opt/carl/venv/bin/carl-live-gateway-service
+Restart=on-failure
+RestartSec=5s
+EnvironmentFile=/etc/carl/live-gateway.env
+User=root
+Group=root
+Delegate=pids
+TasksMax=256
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectControlGroups=no
+ProtectHome=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectSystem=strict
+ReadOnlyPaths=/srv/carl/checkouts
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RuntimeDirectory=carl-live-gateway
+RuntimeDirectoryMode=0700
+StateDirectory=carl/live-gateway
+StateDirectoryMode=0700
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,43 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ConnectAsObserver",
+      "Effect": "Allow",
+      "Action": "rds-db:connect",
+      "Resource": ${database_user_arn}
+    },
+    {
+      "Sid": "ArchiveExactEvidenceVersions",
+      "Effect": "Allow",
+      "Action": [
+        "s3:AbortMultipartUpload",
+        "s3:GetObject",
+        "s3:GetObjectAttributes",
+        "s3:GetObjectVersion",
+        "s3:PutObject",
+        "s3:PutObjectRetention",
+        "s3:PutObjectTagging"
+      ],
+      "Resource": ${evidence_object_arn}
+    },
+    {
+      "Sid": "EncryptAndVerifyEvidenceObjects",
+      "Effect": "Allow",
+      "Action": ["kms:Decrypt", "kms:Encrypt", "kms:GenerateDataKey"],
+      "Resource": ${storage_key_arn},
+      "Condition": {
+        "StringEquals": {
+          "kms:ViaService": ${s3_via_service},
+          "kms:EncryptionContext:aws:s3:arn": ${evidence_bucket_arn}
+        }
+      }
+    },
+    {
+      "Sid": "SignVerifiedReceipts",
+      "Effect": "Allow",
+      "Action": ["kms:DescribeKey", "kms:GetPublicKey", "kms:Sign", "kms:Verify"],
+      "Resource": ${signing_key_arn}
+    }
+  ]
+}

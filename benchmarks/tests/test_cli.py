@@ -9,6 +9,11 @@ from pathlib import Path
 import pytest
 
 from carl_bench import cli
+from carl_bench.coordinator_client import CoordinatorClientError
+from carl_bench.coordinator_ipc import (
+    COORDINATOR_RESPONSE_DOMAIN,
+    CoordinatorServiceResponse,
+)
 
 TASK_ROOT = Path(__file__).parents[1] / "tasks" / "dev"
 
@@ -51,6 +56,275 @@ def test_candidate_publish_experimental_command_is_available() -> None:
         cli.main(["candidate", "publish-experimental", "--help"])
 
     assert help_exit.value.code == 0
+
+
+@pytest.mark.parametrize(
+    "subcommand",
+    (
+        "request",
+        "coordinate",
+        "observe",
+        "ingest",
+        "publish-input",
+        "health",
+        "commission-live",
+    ),
+)
+def test_exact_cloud_command_surface_is_available(subcommand: str) -> None:
+    with pytest.raises(SystemExit) as help_exit:
+        cli.main(["cloud", subcommand, "--help"])
+
+    assert help_exit.value.code == 0
+
+
+def test_supervisor_inspect_idle_is_canonical_and_exits_zero(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    class Runner:
+        def inspect(self):
+            return {"action": "idle", "outcome": "idle: healthy", "schema_version": 1}
+
+    monkeypatch.setattr(
+        cli.SupervisorRecoveryRunner,
+        "from_protected_environment",
+        classmethod(lambda cls, *, repository: Runner()),
+    )
+
+    assert cli.main(["supervisor", "inspect"]) == 0
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert captured.out == '{"action":"idle","outcome":"idle: healthy","schema_version":1}\n'
+
+
+def test_cloud_command_emits_one_canonical_json_result_without_prose(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    expected = {
+        "action": "idle",
+        "identity": "1" * 64,
+        "reason": "no_ready_node",
+        "schema_version": 1,
+    }
+    observed = []
+
+    class Client:
+        def execute(self, request):
+            observed.append(request)
+            return CoordinatorServiceResponse(
+                schema_version=1,
+                domain=COORDINATOR_RESPONSE_DOMAIN,
+                status="completed",
+                request_digest=request.digest,
+                result=expected,
+                error_code=None,
+            )
+
+    monkeypatch.setattr(
+        cli.CoordinatorSocketClient,
+        "from_protected_environment",
+        classmethod(lambda cls: Client()),
+    )
+
+    assert cli.main(["cloud", "coordinate"]) == 0
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert captured.out == json.dumps(expected, separators=(",", ":"), sort_keys=True) + "\n"
+    assert len(observed) == 1
+    assert observed[0].to_canonical_dict() == {
+        "allowed_nodes": [
+            "create_revert",
+            "observe_revert",
+            "publish_input",
+            "register_hypothesis",
+            "request_builder",
+            "dispatch_builder",
+            "observe_builder",
+            "archive_builder",
+            "ingest_builder",
+            "publish_experimental",
+            "dispatch_validation",
+            "observe_validation",
+            "archive_validation",
+            "ingest_validation",
+            "record_disposition",
+            "create_promotion_pr",
+            "observe_required_checks",
+            "enable_auto_merge",
+            "schedule_soak",
+            "observe_soak",
+            "accept_soak",
+            "trigger_supervisor",
+        ],
+        "command": "coordinate",
+        "domain": "carl.coordinator.ipc.request.v1",
+        "schema_version": 1,
+    }
+
+
+def test_missing_cloud_configuration_freezes_only_the_requested_node(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    class MissingClient:
+        def execute(self, request):
+            del request
+            raise CoordinatorClientError("coordinator_service_unavailable")
+
+    monkeypatch.setattr(
+        cli.CoordinatorSocketClient,
+        "from_protected_environment",
+        classmethod(lambda cls: MissingClient()),
+    )
+    result = cli.main(["cloud", "observe"])
+    captured = capsys.readouterr()
+    value = json.loads(captured.out)
+
+    assert result == 2
+    assert captured.err == ""
+    assert value["action"] == "frozen"
+    assert value["reason"] == "cloud_configuration_unavailable"
+    assert value["node"] == "observe"
+    assert len(value["identity"]) == 64
+    assert "dsn" not in captured.out.casefold()
+
+
+def test_cloud_cli_ignores_caller_snapshot_clock_authority_and_evidence(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv(
+        "CARL_CLOUD_COMMAND_INPUT_B64",
+        "caller-selected-snapshot-with-production-evidence",
+    )
+    observed = []
+
+    class Client:
+        def execute(self, request):
+            observed.append(request.to_canonical_dict())
+            result = {
+                "action": "idle",
+                "command": None,
+                "consequential": False,
+                "effect_key": None,
+                "event": None,
+                "experiment_id": "experiment-1",
+                "identity": "1" * 64,
+                "node": None,
+                "reason": "no_ready_node",
+                "remote_effect": False,
+                "result_digest": None,
+                "revision": 7,
+                "schema_version": 1,
+            }
+            return CoordinatorServiceResponse(
+                1,
+                COORDINATOR_RESPONSE_DOMAIN,
+                "completed",
+                request.digest,
+                result,
+                None,
+            )
+
+    monkeypatch.setattr(
+        cli.CoordinatorSocketClient,
+        "from_protected_environment",
+        classmethod(lambda cls: Client()),
+    )
+
+    assert cli.main(["cloud", "coordinate"]) == 0
+    assert json.loads(capsys.readouterr().out)["action"] == "idle"
+    assert observed == [
+        {
+            "allowed_nodes": [
+                "create_revert",
+                "observe_revert",
+                "publish_input",
+                "register_hypothesis",
+                "request_builder",
+                "dispatch_builder",
+                "observe_builder",
+                "archive_builder",
+                "ingest_builder",
+                "publish_experimental",
+                "dispatch_validation",
+                "observe_validation",
+                "archive_validation",
+                "ingest_validation",
+                "record_disposition",
+                "create_promotion_pr",
+                "observe_required_checks",
+                "enable_auto_merge",
+                "schedule_soak",
+                "observe_soak",
+                "accept_soak",
+                "trigger_supervisor",
+            ],
+            "command": "coordinate",
+            "domain": "carl.coordinator.ipc.request.v1",
+            "schema_version": 1,
+        }
+    ]
+
+
+def test_cloud_cli_passes_a_closed_node_allowlist_to_the_protected_service(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    observed = []
+
+    class Client:
+        def execute(self, request):
+            observed.append(request)
+            return CoordinatorServiceResponse(
+                schema_version=1,
+                domain=COORDINATOR_RESPONSE_DOMAIN,
+                status="completed",
+                request_digest=request.digest,
+                result={
+                    "action": "idle",
+                    "command": None,
+                    "consequential": False,
+                    "effect_key": None,
+                    "event": None,
+                    "experiment_id": "experiment-1",
+                    "identity": "1" * 64,
+                    "node": None,
+                    "reason": "no_applicable_node",
+                    "remote_effect": False,
+                    "result_digest": None,
+                    "revision": 7,
+                    "schema_version": 1,
+                },
+                error_code=None,
+            )
+
+    monkeypatch.setattr(
+        cli.CoordinatorSocketClient,
+        "from_protected_environment",
+        classmethod(lambda cls: Client()),
+    )
+
+    assert (
+        cli.main(
+            [
+                "cloud",
+                "coordinate",
+                "--allowed-node",
+                "create_revert",
+                "--allowed-node",
+                "observe_revert",
+                "--allowed-node",
+                "schedule_soak",
+                "--allowed-node",
+                "observe_soak",
+            ]
+        )
+        == 0
+    )
+    assert json.loads(capsys.readouterr().out)["action"] == "idle"
+    assert observed[0].allowed_nodes == (
+        "create_revert",
+        "observe_revert",
+        "schedule_soak",
+        "observe_soak",
+    )
 
 
 def test_scripted_run_writes_only_sanitized_scorecard(tmp_path: Path) -> None:

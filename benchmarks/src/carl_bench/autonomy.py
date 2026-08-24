@@ -23,6 +23,7 @@ _IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
 _AUTONOMY_EVENT_TYPES = frozenset(
     {
         EventType.RETRY_SCHEDULED,
+        EventType.COORDINATOR_NODE_COMPLETED,
         EventType.EXPERIMENTAL_PUBLISHED,
         EventType.PROTECTED_VALIDATION_RECORDED,
         EventType.PROMOTION_RECORDED,
@@ -229,6 +230,7 @@ class AutonomyProjection:
     promotion: PromotionRecord | None
     soak_observations: tuple[SoakObservation, ...]
     revert: RevertRecord | None
+    accepted_at: str | None = None
 
     def to_canonical_dict(self) -> dict[str, Any]:
         return {
@@ -248,6 +250,7 @@ class AutonomyProjection:
             "retry": self.retry.to_canonical_dict() if self.retry is not None else None,
             "revert": self.revert.to_canonical_dict() if self.revert is not None else None,
             "soak_observations": [item.to_canonical_dict() for item in self.soak_observations],
+            "accepted_at": self.accepted_at,
         }
 
     @property
@@ -289,6 +292,7 @@ def reduce_autonomy_events(
     promotion: PromotionRecord | None = None
     soak_observations: list[SoakObservation] = []
     revert: RevertRecord | None = None
+    accepted_at: str | None = None
     seen_attempts: set[str] = set()
     registered_at = _utc(manifest.registered_at)
 
@@ -424,16 +428,18 @@ def reduce_autonomy_events(
                 raise GraphContractError("hard_failure_required")
             revert = recorded_revert
         elif _accepted(event):
+            if accepted_at is not None:
+                raise GraphContractError("acceptance_already_recorded")
             if promotion is None:
                 raise GraphContractError("soak_healthy_observation_required")
-            accepted_at = occurred_at
             if not any(
                 observation.healthy
-                and _utc(observation.observed_at) <= accepted_at
+                and _utc(observation.observed_at) <= occurred_at
                 and _utc(observation.observed_at) - _utc(promotion.merged_at) >= timedelta(hours=24)
                 for observation in soak_observations
             ):
                 raise GraphContractError("soak_healthy_observation_required")
+            accepted_at = event.occurred_at
         elif event.event_type not in _AUTONOMY_EVENT_TYPES:
             continue
 
@@ -454,4 +460,5 @@ def reduce_autonomy_events(
         promotion=promotion,
         soak_observations=tuple(soak_observations),
         revert=revert,
+        accepted_at=accepted_at,
     )

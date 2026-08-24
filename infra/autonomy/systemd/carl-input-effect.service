@@ -1,0 +1,30 @@
+[Unit]
+Description=Carl protected immutable-input coordinator effect responder
+Requires=carl-input-effect.socket
+
+[Service]
+Type=simple
+User=carl-autonomy-input
+Group=carl-autonomy-input
+EnvironmentFile=/etc/carl/input-effect.env
+InaccessiblePaths=/etc/carl/coordinator.env /etc/carl/github-effect.env /etc/carl/archive-effect.env /etc/carl/evaluator-effect.env /etc/carl/observer-effect.env /etc/carl/coordinator-recovery-signing-key.pem
+Environment=PYTHONNOUSERSITE=1
+UnsetEnvironment=PYTHONPATH PYTHONHOME PYTHONSTARTUP PYTHONUSERBASE
+ExecStart=/opt/carl-autonomy/venv/bin/python3 -I -m carl_bench.coordinator_effect_service
+Restart=on-failure
+RestartSec=5s
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

@@ -9,10 +9,17 @@ description = "Reproducible benchmark lab for the Carl agent harness"
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "cryptography==46.0.5",
+    "psycopg[binary]==3.2.9",
 ]
 
 [project.scripts]
 carl-bench = "carl_bench.cli:main"
+carl-coordinator-service = "carl_bench.coordinator_service:main"
+carl-coordinator-effect-service = "carl_bench.coordinator_effect_service:main"
+carl-github-effect-service = "carl_bench.github_effect_service:main"
+carl-live-evaluation-service = "carl_bench.live_evaluation_service:main"
+carl-live-gateway-service = "carl_bench.live_gateway_service:main"
+carl-live-runner = "carl_bench.live_runner_client:main"
 
 [dependency-groups]
 dev = [

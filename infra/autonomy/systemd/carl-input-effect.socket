@@ -1,0 +1,15 @@
+[Unit]
+Description=Carl protected immutable-input effect socket
+
+[Socket]
+Service=carl-input-effect.service
+FileDescriptorName=input-effect
+ListenStream=/run/carl/input-effect.sock
+DirectoryMode=0711
+SocketMode=0600
+SocketUser=carl-autonomy-coordinator
+SocketGroup=carl-autonomy-coordinator
+RemoveOnStop=false
+
+[Install]
+WantedBy=sockets.target

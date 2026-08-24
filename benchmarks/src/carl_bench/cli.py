@@ -32,13 +32,15 @@ from carl_bench.candidate import (
 )
 from carl_bench.candidate_evidence import (
     bind_paired_evidence,
-    capability_report_from_public,
     issue_review_packet,
     record_review_attestation,
     scorecard_from_public,
 )
 from carl_bench.candidate_git import CandidateGitManager, TrustedCheckRegistry
 from carl_bench.canonical import canonical_json_bytes
+from carl_bench.cloud_coordinator import NODE_ORDER, protected_cloud_failure
+from carl_bench.coordinator_client import CoordinatorClientError, CoordinatorSocketClient
+from carl_bench.coordinator_ipc import CoordinatorServiceRequest
 from carl_bench.experiment import (
     EventType,
     ExperimentEvent,
@@ -51,7 +53,10 @@ from carl_bench.experiment import (
     reduce_events,
 )
 from carl_bench.experimental_publication import (
+    ExperimentalEligibilityVerifier,
+    ExperimentalPublicationPolicy,
     ExperimentalPublicationRequest,
+    SignedExperimentalPublicationEligibility,
     candidate_tree,
     publish_experimental_branch,
 )
@@ -62,11 +67,14 @@ from carl_bench.report import compare_runs, summarize_run
 from carl_bench.run_attestation import attest_run
 from carl_bench.runner import BenchmarkRunner
 from carl_bench.sanitize import PublicSafetyError, assert_public_safe, write_public_json
+from carl_bench.supervisor_recovery import SupervisorProposal, SupervisorRecoveryRunner
 from carl_bench.tasks import BenchmarkTask, TaskContractError, discover_tasks
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
 MAX_SCORECARD_BYTES = 4 * 1_048_576
 MAX_CONTROL_INPUT_BYTES = 1_048_576
+_EXPERIMENTAL_ELIGIBILITY_POLICY = Path("/etc/carl/experimental-eligibility-policy.json")
+_MAX_EXPERIMENTAL_POLICY_BYTES = 32 * 1024
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -267,11 +275,9 @@ def _parser() -> argparse.ArgumentParser:
     publish.add_argument("--ledger", required=True, type=Path)
     publish.add_argument("--experiment-id", required=True)
     publish.add_argument("--repository", required=True, type=Path)
-    publish.add_argument("--remote", required=True)
     publish.add_argument("--branch", required=True)
     publish.add_argument("--candidate-packet", required=True, type=Path)
-    publish.add_argument("--capability-report", required=True, type=Path)
-    publish.add_argument("--git-executable", required=True, type=Path)
+    publish.add_argument("--eligibility-receipt", required=True, type=Path)
     publish.add_argument("--stage-attempt-id", required=True)
     publish.add_argument("--occurred-at", required=True)
     publish.add_argument("--public-result", required=True, type=Path)
@@ -281,6 +287,35 @@ def _parser() -> argparse.ArgumentParser:
     )
     add_mutation(dispose)
     dispose.add_argument("--public-result", required=True, type=Path)
+
+    cloud = commands.add_parser("cloud", help="advance one protected cloud autonomy node")
+    cloud_commands = cloud.add_subparsers(dest="cloud_command", required=True)
+    for name in (
+        "request",
+        "coordinate",
+        "observe",
+        "ingest",
+        "publish-input",
+        "health",
+        "commission-live",
+    ):
+        command = cloud_commands.add_parser(name, help=f"run one protected {name} node")
+        command.add_argument(
+            "--allowed-node",
+            action="append",
+            choices=NODE_ORDER,
+            dest="allowed_nodes",
+        )
+    supervisor = commands.add_parser(
+        "supervisor", help="execute one PostgreSQL-authoritative recovery"
+    )
+    supervisor_commands = supervisor.add_subparsers(dest="supervisor_command", required=True)
+    supervisor_commands.add_parser("inspect", help="select one exact prioritized trigger")
+    recover = supervisor_commands.add_parser(
+        "recover", help="claim, execute, and bind one proposed recovery"
+    )
+    recover.add_argument("--proposal", required=True, type=Path)
+    recover.add_argument("--repository", required=True, type=Path)
     return parser
 
 
@@ -462,6 +497,107 @@ def _read_control_object(path: Path) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError("control input must be a JSON object")
     return value
+
+
+def _experimental_eligibility_policy_path() -> Path:
+    return _EXPERIMENTAL_ELIGIBILITY_POLICY
+
+
+def _experimental_eligibility_policy_root() -> Path:
+    return Path(os.sep)
+
+
+def _trusted_controller_owner(owner: int) -> bool:
+    allowed = {0}
+    if hasattr(os, "geteuid"):
+        allowed.add(os.geteuid())
+    return owner in allowed
+
+
+def _secure_directory(fd: int) -> None:
+    metadata = os.fstat(fd)
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or not _trusted_controller_owner(metadata.st_uid)
+        or stat.S_IMODE(metadata.st_mode) & 0o022
+    ):
+        raise ValueError("experimental eligibility protected policy directory is unsafe")
+
+
+def _experimental_eligibility_policy() -> ExperimentalPublicationPolicy:
+    """Load the fixed controller policy without following mutable path components."""
+    source = _experimental_eligibility_policy_path()
+    root = _experimental_eligibility_policy_root()
+    try:
+        relative = source.relative_to(root)
+    except ValueError as error:
+        raise ValueError("experimental eligibility protected policy path is invalid") from error
+    if (
+        not source.is_absolute()
+        or not root.is_absolute()
+        or not relative.parts
+        or any(part in {"", ".", ".."} for part in relative.parts)
+    ):
+        raise ValueError("experimental eligibility protected policy path is invalid")
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    file_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    directory_fd: int | None = None
+    file_fd: int | None = None
+    try:
+        directory_fd = os.open(root, directory_flags)
+        _secure_directory(directory_fd)
+        for component in relative.parts[:-1]:
+            next_fd: int | None = None
+            try:
+                next_fd = os.open(component, directory_flags, dir_fd=directory_fd)
+                _secure_directory(next_fd)
+            except BaseException:
+                if next_fd is not None:
+                    os.close(next_fd)
+                raise
+            os.close(directory_fd)
+            directory_fd = next_fd
+        file_fd = os.open(relative.parts[-1], file_flags, dir_fd=directory_fd)
+        metadata = os.fstat(file_fd)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or metadata.st_size > _MAX_EXPERIMENTAL_POLICY_BYTES
+            or not _trusted_controller_owner(metadata.st_uid)
+            or stat.S_IMODE(metadata.st_mode) & 0o022
+        ):
+            raise ValueError("experimental eligibility protected policy file is unsafe")
+        chunks: list[bytes] = []
+        total = 0
+        while total <= _MAX_EXPERIMENTAL_POLICY_BYTES:
+            chunk = os.read(file_fd, min(8192, _MAX_EXPERIMENTAL_POLICY_BYTES + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+        raw = b"".join(chunks)
+        if len(raw) > _MAX_EXPERIMENTAL_POLICY_BYTES or len(raw) != metadata.st_size:
+            raise ValueError("experimental eligibility protected policy is invalid")
+        value = json.loads(raw.decode("utf-8"), object_pairs_hook=_object_without_duplicates)
+        policy = ExperimentalPublicationPolicy.from_canonical_dict(value)
+        if raw != canonical_json_bytes(policy.to_canonical_dict()):
+            raise ValueError("experimental eligibility protected policy is noncanonical")
+        return policy
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
+        if isinstance(error, ValueError) and str(error).startswith(
+            "experimental eligibility protected policy"
+        ):
+            raise
+        raise ValueError("experimental eligibility protected policy is unavailable") from error
+    finally:
+        if file_fd is not None:
+            os.close(file_fd)
+        if directory_fd is not None:
+            os.close(directory_fd)
+
+
+def _experimental_eligibility_verifier() -> ExperimentalEligibilityVerifier:
+    return ExperimentalEligibilityVerifier(policy=_experimental_eligibility_policy())
 
 
 def _private_ledger(path: Path) -> ExperimentLedger:
@@ -869,21 +1005,26 @@ def _candidate_command(args: argparse.Namespace) -> int:
 
     if args.candidate_command == "publish-experimental":
         packet = SealedCandidate.from_canonical_dict(_read_control_object(args.candidate_packet))
-        report = capability_report_from_public(_read_control_object(args.capability_report))
+        eligibility = SignedExperimentalPublicationEligibility.from_canonical_dict(
+            _read_control_object(args.eligibility_receipt)
+        )
+        verifier = _experimental_eligibility_verifier()
+        repository = _anchored(args.repository)
         request = ExperimentalPublicationRequest(
             experiment_id=args.experiment_id,
             branch=args.branch,
             candidate_packet=packet,
-            candidate_tree=candidate_tree(
-                _anchored(args.repository), packet.candidate_commit, _anchored(args.git_executable)
-            ),
-            capability_report=report,
+            candidate_tree=candidate_tree(repository, packet.candidate_commit),
+            request_id=args.stage_attempt_id,
+            requested_at=args.occurred_at,
+            repository_id=verifier.repository_id,
+            remote_url=verifier.remote_url,
         )
         decision = publish_experimental_branch(
             request,
-            repository=_anchored(args.repository),
-            remote=args.remote,
-            git_executable=_anchored(args.git_executable),
+            verifier=verifier,
+            eligibility=eligibility,
+            repository=repository,
         )
         if decision.outcome.startswith("blocked_"):
             raise ValueError("experimental publication is not eligible")
@@ -1269,6 +1410,37 @@ def _validate_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cloud_command(args: argparse.Namespace) -> int:
+    request = CoordinatorServiceRequest.create(
+        args.cloud_command,
+        allowed_nodes=(None if args.allowed_nodes is None else tuple(args.allowed_nodes)),
+    )
+    try:
+        response = CoordinatorSocketClient.from_protected_environment().execute(request)
+    except CoordinatorClientError:
+        value = protected_cloud_failure(args.cloud_command, "cloud_configuration_unavailable")
+    else:
+        value = (
+            response.result
+            if response.status == "completed" and response.result is not None
+            else protected_cloud_failure(args.cloud_command, "cloud_request_rejected")
+        )
+    sys.stdout.write(canonical_json_bytes(value).decode("utf-8") + "\n")
+    return 2 if value.get("action") == "frozen" else 0
+
+
+def _supervisor_command(args: argparse.Namespace) -> int:
+    repository = REPOSITORY_ROOT if args.supervisor_command == "inspect" else args.repository
+    runner = SupervisorRecoveryRunner.from_protected_environment(repository=repository)
+    if args.supervisor_command == "inspect":
+        value = runner.inspect()
+    else:
+        proposal = SupervisorProposal.from_bytes(args.proposal.read_bytes())
+        value = runner.recover(proposal)
+    sys.stdout.write(canonical_json_bytes(value).decode("utf-8") + "\n")
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
@@ -1280,6 +1452,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _experiment_command(args)
         if args.command == "candidate":
             return _candidate_command(args)
+        if args.command == "cloud":
+            return _cloud_command(args)
+        if args.command == "supervisor":
+            return _supervisor_command(args)
         if args.command == "attestation-key":
             return _init_attestation_key(args)
         if args.command == "run-attested":

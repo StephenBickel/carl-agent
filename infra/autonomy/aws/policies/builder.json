@@ -1,0 +1,35 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ConnectAsBuilder",
+      "Effect": "Allow",
+      "Action": "rds-db:connect",
+      "Resource": ${database_user_arn}
+    },
+    {
+      "Sid": "ReadPublicImmutableInputs",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:GetObjectVersion", "s3:GetObjectAttributes"],
+      "Resource": ${input_object_arn}
+    },
+    {
+      "Sid": "DecryptPublicImmutableInputs",
+      "Effect": "Allow",
+      "Action": "kms:Decrypt",
+      "Resource": ${storage_key_arn},
+      "Condition": {
+        "StringEquals": {
+          "kms:ViaService": ${s3_via_service},
+          "kms:EncryptionContext:aws:s3:arn": ${input_bucket_arn}
+        }
+      }
+    },
+    {
+      "Sid": "ReadBuilderModelCredential",
+      "Effect": "Allow",
+      "Action": "secretsmanager:GetSecretValue",
+      "Resource": ${secret_arn}
+    }
+  ]
+}

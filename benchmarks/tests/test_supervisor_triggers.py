@@ -35,13 +35,15 @@ def _trigger(
     *,
     trigger_id: str = "trigger-1",
     created_at: str = "2026-08-19T12:00:00Z",
+    unsafe_boundary: str = "promotion:evidence_acceptance",
+    attempt_history: tuple[RecoveryAttempt, ...] | None = None,
 ) -> SupervisorTrigger:
     return SupervisorTrigger(
         schema_version=1,
         trigger_id=trigger_id,
         evidence_digest="a" * 64,
-        unsafe_boundary="promotion:evidence_acceptance",
-        attempt_history=(_attempt(),),
+        unsafe_boundary=unsafe_boundary,
+        attempt_history=(_attempt(),) if attempt_history is None else attempt_history,
         next_safe_node_key="experiment-17:protected-validation",
         created_at=created_at,
     )
@@ -150,6 +152,91 @@ def test_claim_rejects_stale_or_unchanged_recovery_actions(tmp_path: Path) -> No
         )
 
 
+@pytest.mark.parametrize("prior_count", range(4))
+def test_infrastructure_recovery_budget_allows_three_attempts_and_rejects_fourth(
+    tmp_path: Path, prior_count: int
+) -> None:
+    attempts = tuple(
+        _attempt(
+            f"infrastructure-attempt-{index}",
+            f"{index}" * 64,
+            outcome="infrastructure_attempted",
+        )
+        for index in range(1, prior_count + 1)
+    )
+    store = _store(tmp_path)
+    store.append(_trigger(attempt_history=attempts))
+
+    def claim() -> supervisor_triggers.TriggerMutation:
+        return store.claim_and_record_action(
+            trigger_id="trigger-1",
+            claim_id="supervisor-run-44",
+            expected_revision=0,
+            attempt=_attempt(
+                f"infrastructure-attempt-{prior_count + 1}",
+                f"{prior_count + 1}" * 64,
+                outcome="infrastructure_attempted",
+            ),
+        )
+
+    if prior_count < 3:
+        assert claim().applied is True
+    else:
+        with pytest.raises(SupervisorTriggerError, match="infrastructure_attempt_budget_exhausted"):
+            claim()
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        "state_reconciled",
+        "repair_pr_opened",
+        "safe_node_redispatched",
+        "stable_boundary_frozen",
+    ],
+)
+def test_resolution_accepts_only_material_recovery_successes(tmp_path: Path, outcome: str) -> None:
+    store = _store(tmp_path)
+    store.append(_trigger())
+    action = _attempt("supervisor-attempt-1", "c" * 64, outcome=outcome)
+    claimed = store.claim_and_record_action(
+        trigger_id="trigger-1",
+        claim_id="supervisor-run-44",
+        expected_revision=0,
+        attempt=action,
+    )
+
+    resolved = store.resolve(
+        trigger_id="trigger-1",
+        claim_id="supervisor-run-44",
+        expected_revision=claimed.revision,
+        resolution=_resolution(action),
+    )
+
+    assert resolved.record.resolution is not None
+    assert resolved.record.resolution.status == "resolved"
+
+
+def test_resolution_rejects_diagnosis_only_success(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    store.append(_trigger())
+    action = _attempt("supervisor-attempt-1", "c" * 64, outcome="diagnosis_recorded")
+    claimed = store.claim_and_record_action(
+        trigger_id="trigger-1",
+        claim_id="supervisor-run-44",
+        expected_revision=0,
+        attempt=action,
+    )
+
+    with pytest.raises(SupervisorTriggerError, match="recovery_outcome_not_material"):
+        store.resolve(
+            trigger_id="trigger-1",
+            claim_id="supervisor-run-44",
+            expected_revision=claimed.revision,
+            resolution=_resolution(action),
+        )
+
+
 def test_concurrent_claimers_cannot_both_own_the_trigger(tmp_path: Path) -> None:
     path = tmp_path / "private" / "supervisor-triggers.sqlite3"
     SupervisorTriggerStore(path).append(_trigger())
@@ -196,6 +283,39 @@ def test_fresh_store_enumerates_pending_oldest_first_with_stable_ties(
         "later",
     ]
     assert [record.revision for record in pending] == [0, 0, 0, 0]
+
+
+def test_pending_rollback_outranks_older_commissioning_and_acp_outages(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    store.append(
+        _trigger(
+            trigger_id="commissioning",
+            created_at="2026-08-19T12:00:00Z",
+            unsafe_boundary="commissioning:live_capability",
+        )
+    )
+    store.append(
+        _trigger(
+            trigger_id="acp",
+            created_at="2026-08-19T12:01:00Z",
+            unsafe_boundary="infrastructure:acp_unavailable",
+        )
+    )
+    store.append(
+        _trigger(
+            trigger_id="rollback",
+            created_at="2026-08-19T12:02:00Z",
+            unsafe_boundary="rollback:hard_production_failure",
+        )
+    )
+
+    assert [record.trigger.trigger_id for record in store.list_pending()] == [
+        "rollback",
+        "commissioning",
+        "acp",
+    ]
 
 
 @pytest.mark.parametrize("status", ["resolved", "rejected"])
@@ -302,9 +422,7 @@ def test_resolution_must_bind_exact_claimed_action_and_trigger_evidence(
             trigger_id="trigger-1",
             claim_id="supervisor-run-44",
             expected_revision=claimed.revision,
-            resolution=_resolution(
-                _attempt("other-action", "d" * 64, outcome="state_reconciled")
-            ),
+            resolution=_resolution(_attempt("other-action", "d" * 64, outcome="state_reconciled")),
         )
     with pytest.raises(SupervisorTriggerError, match="resolution_evidence_mismatch"):
         store.resolve(

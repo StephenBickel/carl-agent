@@ -19,7 +19,12 @@ import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from test_experiment import manifest as base_manifest
+from test_experimental_publication import (
+    _signed_eligibility as signed_experimental_eligibility,
+)
+from test_experimental_publication import _verifier as experimental_eligibility_verifier
 
+import carl_bench.experimental_publication as experimental_publication
 from carl_bench.artifacts import ArtifactRef, PrivateArtifactStore
 from carl_bench.autonomy import (
     AutonomyProjection,
@@ -51,18 +56,22 @@ from carl_bench.cloud_execution import (
     CloudArtifact,
     CloudRunRequest,
     CloudRunSnapshot,
+    TrustedCloudReceiptKey,
     reconcile_cloud_run,
 )
 from carl_bench.commissioning import (
     CommissioningArtifactError,
     CommissioningArtifactStore,
+    RemoteCloudAcceptanceReceipt,
     SyntheticCommissioningReceipt,
     SyntheticCommissioningSources,
+    require_remote_cloud_acceptance,
 )
 from carl_bench.experiment import (
     EventType,
     ExperimentEvent,
     ExperimentState,
+    MutableStageLease,
     ReviewRole,
     ReviewVerdict,
 )
@@ -78,7 +87,7 @@ from carl_bench.github_promotion import (
     PullRequestSnapshot,
     RevertSnapshot,
 )
-from carl_bench.ledger import ExperimentLedger
+from carl_bench.ledger import ExperimentLedger, LedgerIntegrityError
 from carl_bench.promotion import (
     PromotionContractError,
     PromotionExpectation,
@@ -676,7 +685,6 @@ def _controller_snapshot(
     request: PromotionRequest,
     promotion_snapshot: PromotionSnapshot,
     soak_result: SoakResult | None = None,
-    accepted: bool = False,
 ) -> ControllerSnapshot:
     return ControllerSnapshot(
         autonomy=ExperimentLedger(ledger_path).autonomy_projection(EXPERIMENT_ID),
@@ -689,7 +697,6 @@ def _controller_snapshot(
         required_checks=APPROVED_REQUIRED_CHECKS,
         soak_result=soak_result,
         changed_paths=("src/runtime/capability.txt",),
-        accepted=accepted,
     )
 
 
@@ -761,6 +768,7 @@ def _append_accepted_lifecycle(
     promotion_commit: str,
     artifact_store: PrivateArtifactStore,
     paired: PairedEvidence,
+    append_acceptance: bool = True,
 ) -> None:
     ledger = ExperimentLedger(ledger_path)
     for source, target, attempt, occurred_at in (
@@ -1042,7 +1050,9 @@ def _append_accepted_lifecycle(
             },
         )
     )
-    ledger.append(
+    if not append_acceptance:
+        return
+    ledger.append_trusted_authority(
         _lifecycle_transition(
             source=ExperimentState.SOAKING,
             target=ExperimentState.ACCEPTED,
@@ -1198,8 +1208,106 @@ def test_accepted_lifecycle_is_derived_from_fresh_ledger_and_bare_refs(
         promotion_commit=promotion_commit,
         artifact_store=evidence,
         paired=paired,
+        append_acceptance=False,
     )
-    assert ExperimentLedger(ledger_path).projection(EXPERIMENT_ID).state is ExperimentState.ACCEPTED
+    before_acceptance = ExperimentLedger(ledger_path)
+    lifecycle = before_acceptance.projection(EXPERIMENT_ID)
+    assert lifecycle.state is ExperimentState.SOAKING
+    assert lifecycle.lease is not None
+    promotion_id = "promotion-exp-commissioning-001-acceptance"
+    request = PromotionRequest(
+        promotion_id=promotion_id,
+        experiment_id=EXPERIMENT_ID,
+        repository="fixture/carl-agent",
+        base_branch="main",
+        head_branch=f"experimental/{EXPERIMENT_ID}",
+        parent_commit=manifest.parent_commit,
+        candidate_commit=packet.candidate_commit,
+        candidate_tree=disposable_git.valid_tree,
+        protected_receipt_digest=protected_run.receipt.digest,
+    )
+    acceptance_snapshot = ControllerSnapshot(
+        autonomy=before_acceptance.autonomy_projection(EXPERIMENT_ID),
+        capability_report=None,
+        protected_validation=None,
+        protected_public_key_pem=None,
+        promotion_expectation=None,
+        promotion_request=request,
+        promotion_snapshot=PromotionSnapshot(
+            production_commit=promotion_commit,
+            active_promotion_id=promotion_id,
+            pull_request=None,
+        ),
+        required_checks=APPROVED_REQUIRED_CHECKS,
+        lifecycle_lease=lifecycle.lease,
+    )
+    command_time = "2026-08-20T10:05:00Z"
+    accepted_at = datetime(2026, 8, 20, 10, 5, tzinfo=UTC)
+    first_action = next_controller_action(
+        acceptance_snapshot,
+        accepted_at,
+        command_key="accept-lifecycle-001",
+        command_occurred_at=command_time,
+    )
+    replay_action = next_controller_action(
+        acceptance_snapshot,
+        accepted_at,
+        command_key="accept-lifecycle-001",
+        command_occurred_at=command_time,
+    )
+    conflicting_action = next_controller_action(
+        acceptance_snapshot,
+        accepted_at + timedelta(minutes=1),
+        command_key="accept-lifecycle-001",
+        command_occurred_at="2026-08-20T10:06:00Z",
+    )
+
+    assert first_action.action == "accept"
+    assert first_action.event_authority == "trusted_controller"
+    assert first_action.event is not None
+    assert first_action.event.payload == {
+        "_lease": {
+            "owner_id": "commissioning-acceptance-controller",
+            "stage_attempt_id": "commissioning-acceptance-lease",
+        },
+        "from_state": "soaking",
+        "to_state": "accepted",
+    }
+    assert replay_action.event == first_action.event
+    assert replay_action.event.digest == first_action.event.digest
+
+    first_append = first_action.append_event(ExperimentLedger(ledger_path))
+    replay_append = replay_action.append_event(ExperimentLedger(ledger_path))
+    assert first_append is not None and first_append.appended
+    assert replay_append is not None and not replay_append.appended
+    assert replay_append.event_digest == first_append.event_digest
+    assert replay_append.chain_digest == first_append.chain_digest
+    with pytest.raises(LedgerIntegrityError, match="stage_attempt_conflict"):
+        conflicting_action.append_event(ExperimentLedger(ledger_path))
+    ExperimentLedger(ledger_path).append(
+        ExperimentEvent.create(
+            experiment_id=EXPERIMENT_ID,
+            stage_attempt_id="commissioning-release-acceptance-lease",
+            event_type=EventType.LEASE_RELEASED,
+            occurred_at="2026-08-20T10:07:00Z",
+            payload={"lease_stage_attempt_id": "commissioning-acceptance-lease"},
+        )
+    )
+
+    reloaded = ExperimentLedger(ledger_path)
+    assert reloaded.projection(EXPERIMENT_ID).state is ExperimentState.ACCEPTED
+    assert reloaded.projection(EXPERIMENT_ID).lease is None
+    assert reloaded.autonomy_projection(EXPERIMENT_ID).accepted_at == command_time
+    terminal = next_controller_action(
+        replace(
+            acceptance_snapshot,
+            autonomy=reloaded.autonomy_projection(EXPERIMENT_ID),
+            lifecycle_lease=reloaded.projection(EXPERIMENT_ID).lease,
+        ),
+        accepted_at,
+    )
+    assert terminal.action == "idle"
+    assert terminal.reason == "experiment_accepted"
     lifecycle_ref = evidence.put(
         evidence_kind="lifecycle_ledger",
         media_type="application/json",
@@ -3011,6 +3119,7 @@ def test_changed_main_receipt_replay_and_exact_revert_are_durable_real_effects(
 def test_component_scenarios_cannot_self_issue_commissioning_pass(
     tmp_path: Path,
     disposable_git: DisposableGitFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     automation_data_root = tmp_path / "owner-private-automation-data"
     commissioning_store = CommissioningArtifactStore(
@@ -3086,16 +3195,37 @@ def test_component_scenarios_cannot_self_issue_commissioning_pass(
         branch=f"experimental/{EXPERIMENT_ID}",
         candidate_packet=packet,
         candidate_tree=disposable_git.valid_tree,
-        capability_report=capability_report,
+        request_id="publish-commissioning-001",
+        requested_at="2026-08-19T12:00:00Z",
+        repository_id="StephenBickel/carl-agent",
+        remote_url="https://github.com/StephenBickel/carl-agent.git",
     )
-    git_executable = Path(shutil.which("git") or "/missing-git")
+    publication_eligibility = signed_experimental_eligibility(
+        publication_request,
+        issued_at="2026-08-19T11:59:00Z",
+        expires_at="2026-08-19T13:00:00Z",
+    )
+    publication_verifier = experimental_eligibility_verifier(NOW)
+
+    class CommissioningTransport:
+        def local(self, repository: Path, *args: str) -> str:
+            return _git(repository, *args)
+
+        def network(self, repository: Path, operation: str, remote_url: str, *args: str) -> str:
+            assert remote_url == "https://github.com/StephenBickel/carl-agent.git"
+            if operation == "ls-remote":
+                return _git(repository, operation, "--refs", disposable_git.origin, *args)
+            return _git(repository, operation, args[0], disposable_git.origin, args[1])
+
+    transport = CommissioningTransport()
+    monkeypatch.setattr(experimental_publication, "_protected_git_transport", lambda: transport)
 
     # The branch effect succeeds and the controller is killed before its ledger receipt.
     first_publication = publish_experimental_branch(
         publication_request,
+        verifier=publication_verifier,
+        eligibility=publication_eligibility,
         repository=disposable_git.builder,
-        remote="origin",
-        git_executable=git_executable,
     )
     assert first_publication.outcome == "record_existing_exact_branch"
     assert (
@@ -3106,9 +3236,9 @@ def test_component_scenarios_cannot_self_issue_commissioning_pass(
     # A fresh process reconciles the exact ref instead of pushing or duplicating it.
     recovered_publication = publish_experimental_branch(
         publication_request,
+        verifier=publication_verifier,
+        eligibility=publication_eligibility,
         repository=disposable_git.builder,
-        remote="origin",
-        git_executable=git_executable,
     )
     assert recovered_publication == first_publication
     assert _append_publication(ledger_path, packet, disposable_git.valid_tree) is True
@@ -3354,24 +3484,34 @@ def test_component_scenarios_cannot_self_issue_commissioning_pass(
         assert replayed is not None and not replayed.appended
 
     accepted_at = NOW + timedelta(hours=24)
-    accepted_snapshot = _controller_snapshot(
-        ledger_path=ledger_path,
-        report=capability_report,
-        envelope=envelope,
-        public_key=runner.public_key_pem,
-        expectation=expectation,
-        request=request,
-        promotion_snapshot=runner.snapshot(request),
+    accepted_snapshot = replace(
+        _controller_snapshot(
+            ledger_path=ledger_path,
+            report=capability_report,
+            envelope=envelope,
+            public_key=runner.public_key_pem,
+            expectation=expectation,
+            request=request,
+            promotion_snapshot=runner.snapshot(request),
+        ),
+        lifecycle_lease=MutableStageLease(
+            stage_attempt_id="commissioning-controller-acceptance-lease",
+            owner_id="commissioning-controller",
+            acquired_at=(accepted_at - timedelta(minutes=1)).isoformat().replace("+00:00", "Z"),
+            expires_at=(accepted_at + timedelta(hours=1)).isoformat().replace("+00:00", "Z"),
+        ),
     )
-    accepted = next_controller_action(accepted_snapshot, accepted_at)
+    accepted_command_occurred_at = accepted_at.isoformat().replace("+00:00", "Z")
+    accepted = next_controller_action(
+        accepted_snapshot,
+        accepted_at,
+        command_key="accept-commissioning-001",
+        command_occurred_at=accepted_command_occurred_at,
+    )
     assert accepted.action == "accept"
     assert accepted.merge_commit == merged_pr.merge_commit
-    terminal = next_controller_action(
-        replace(accepted_snapshot, accepted=True),
-        accepted_at,
-    )
-    assert terminal.action == "idle"
-    assert terminal.reason == "experiment_accepted"
+    assert accepted.event is not None
+    assert accepted.event.occurred_at == accepted_command_occurred_at
 
     final_projection = ExperimentLedger(ledger_path).autonomy_projection(EXPERIMENT_ID)
     assert final_projection.experimental_publication is not None
@@ -3810,3 +3950,69 @@ def test_synthetic_commissioning_artifacts_cannot_claim_remote_acceptance_or_liv
             automation_data_root=REPOSITORY_ROOT / ".private-commissioning",
             repository_root=REPOSITORY_ROOT,
         )
+
+
+def test_synthetic_receipt_shape_cannot_be_reinterpreted_as_remote_cloud_acceptance() -> None:
+    signer = Ed25519PrivateKey.generate()
+    trusted_key = TrustedCloudReceiptKey(
+        key_id="remote-cloud-acceptance-v1",
+        public_key_pem=signer.public_key().public_bytes(
+            serialization.Encoding.PEM,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        ),
+    )
+
+    with pytest.raises(
+        CommissioningArtifactError,
+        match="remote_cloud_acceptance_receipt_type_required",
+    ):
+        require_remote_cloud_acceptance(_synthetic_receipt(), trusted_key=trusted_key)
+
+    forged = {
+        **_synthetic_receipt().to_canonical_dict(),
+        "authority_kind": "remote_cloud_acceptance",
+        "remote_cloud_acceptance": "commissioned",
+        "signature_base64": base64.b64encode(b"x" * 64).decode("ascii"),
+        "synthetic_test_only": False,
+    }
+    with pytest.raises(
+        CommissioningArtifactError,
+        match="invalid_remote_cloud_acceptance_receipt",
+    ):
+        RemoteCloudAcceptanceReceipt.from_canonical_dict(forged)
+
+
+def test_live_workflows_require_durable_provider_reconciliation_and_never_fake_success() -> None:
+    improvement = (REPOSITORY_ROOT / ".github/workflows/autonomous-improvement.yml").read_text(
+        encoding="utf-8"
+    )
+    soak = (REPOSITORY_ROOT / ".github/workflows/autonomous-soak.yml").read_text(encoding="utf-8")
+
+    for workflow in (improvement, soak):
+        assert "Require commissioned durable provider reconciliation" in workflow
+        assert "commission-live" in workflow
+        assert "CoordinatorSocketClient.from_protected_environment()" in workflow
+        assert "direct-openai" not in workflow.lower()
+        assert "OPENAI_API_KEY" not in workflow
+        assert "synthetic" not in workflow.lower()
+        assert "hard-coded" not in workflow.lower()
+        assert 'value["status"] != "completed"' in workflow
+        assert 'result["node"] != expected_node' in workflow
+        assert "persist_exact_node_freeze" in workflow
+
+
+def test_protected_workflow_handoffs_bind_request_attempt_parent_and_exact_subject() -> None:
+    for workflow_name in ("autonomous-improvement.yml", "autonomous-soak.yml"):
+        workflow = (REPOSITORY_ROOT / ".github/workflows" / workflow_name).read_text(
+            encoding="utf-8"
+        )
+        for binding in (
+            "ATTEMPT_KEY: ${{ inputs.attempt_key }}",
+            "CANDIDATE_COMMIT: ${{ inputs.candidate_commit }}",
+            "PARENT_COMMIT: ${{ inputs.parent_commit }}",
+            "REQUEST_DIGEST: ${{ inputs.request_digest }}",
+            "WORKFLOW_REVISION: ${{ inputs.workflow_revision }}",
+        ):
+            assert workflow.count(binding) >= 2, (workflow_name, binding)
+        assert "cloud_configuration_unavailable" not in workflow
+        assert "carl.coordinator.ipc.response.v1" in workflow
